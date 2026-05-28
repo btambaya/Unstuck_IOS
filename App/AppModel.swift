@@ -14,6 +14,7 @@ final class AppModel {
     let router = AppRouter()
     private(set) var coordinator: SyncCoordinator?
     private(set) var db: AppDatabase?
+    private(set) var taskRepo: TaskRepository?
     var signedIn = false
     var configured = true
 
@@ -25,6 +26,7 @@ final class AppModel {
         }
         guard let database = try? AppDatabase.make(path: Self.databasePath()) else { return }
         db = database
+        taskRepo = TaskRepository(database)
         let provider = SupabaseClientProvider(config)
         let coord = SyncCoordinator(provider: provider, db: database)
         coordinator = coord
@@ -46,6 +48,20 @@ final class AppModel {
     func handleDeepLink(_ url: URL) {
         guard let coord = coordinator else { return }
         Task { _ = await coord.auth.handleCallback(url: url) }
+    }
+
+    /// Optimistic task write (local GRDB + server outbox). Drives the UI
+    /// instantly via the repository's ValueObservation.
+    func saveTask(_ task: TaskItem) {
+        guard let write = coordinator?.write else { return }
+        let now = Self.isoNow()
+        Task { try? await write.upsertTask(task, nowISO: now) }
+    }
+
+    static func isoNow() -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: Date())
     }
 
     // MARK: config

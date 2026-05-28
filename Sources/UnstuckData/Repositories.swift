@@ -34,4 +34,10 @@ public struct TaskRepository: Sendable {
             try TaskItem.order(Column("createdAt")).fetchAll(db)
         }
     }
+
+    /// Async sequence of all-tasks snapshots — convenient for SwiftUI
+    /// `.task { for await tasks in repo.observeAllValues() { ... } }`.
+    public func observeAllValues() -> AsyncValueObservation<[TaskItem]> {
+        observeAll().values(in: db.writer)
+    }
 }
