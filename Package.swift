@@ -22,6 +22,7 @@ let package = Package(
         .library(name: "UnstuckCore", targets: ["UnstuckCore"]),
         .library(name: "UnstuckData", targets: ["UnstuckData"]),
         .library(name: "UnstuckSync", targets: ["UnstuckSync"]),
+        .library(name: "UnstuckDesign", targets: ["UnstuckDesign"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
@@ -50,5 +51,9 @@ let package = Package(
                 .product(name: "Supabase", package: "supabase-swift"),
             ]),
         .testTarget(name: "UnstuckSyncTests", dependencies: ["UnstuckSync", "UnstuckCore"]),
+
+        // Brand-v2 design system: oklch tokens + Theme + SwiftUI components.
+        .target(name: "UnstuckDesign"),
+        .testTarget(name: "UnstuckDesignTests", dependencies: ["UnstuckDesign"]),
     ]
 )

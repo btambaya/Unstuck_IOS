@@ -1,0 +1,9 @@
+// Public build config — committed. Real secrets go in App/Secrets.xcconfig
+// (gitignored), which this file optionally includes to override the blank
+// anon key below. The Supabase URL is built in code as https://<host> to
+// dodge the xcconfig "//" comment gotcha.
+
+SUPABASE_HOST = uaxfteluwctrlgwmmfzi.supabase.co
+SUPABASE_ANON_KEY =
+
+#include? "Secrets.xcconfig"

@@ -26,7 +26,7 @@ tests with no Xcode project or code signing:
 | `UnstuckCore` | Pure domain models + full logic layer (no UI/Supabase) | ✅ done + tested (174 tests) |
 | `UnstuckData` | GRDB local store + outbox + live session | ✅ done + tested (15 tests) |
 | `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ✅ done (13 tests; networked paths runtime-validated in-app) |
-| `UnstuckDesign` | Brand-v2 tokens + SwiftUI components | ⏳ planned |
+| `UnstuckDesign` | Brand-v2 oklch tokens + Theme + SwiftUI components | ✅ done (8 tests) |
 | `UnstuckShared` | App-Group snapshot shared with widgets/Live Activity | ⏳ planned |
 | `UnstuckFeatures` | SwiftUI feature modules (the ~41 screens) | ⏳ planned |
 
@@ -50,6 +50,25 @@ web's `lib/*.test.ts` cases as XCTest so behavior stays in lockstep.
 
 - Xcode 26.3+ / Swift 6.2 (Swift tools 6.0)
 - iOS 17+ deployment target
+- [XcodeGen](https://github.com/yonohub/XcodeGen) (`brew install xcodegen`) to generate the app project
+
+## The app
+
+The iOS app target is generated from [`project.yml`](project.yml) (the
+`.xcodeproj` is gitignored). Generate + build:
+
+```sh
+xcodegen generate
+xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
+  -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO
+```
+
+App sources live in [`App/`](App): `UnstuckApp` (composition root) →
+`AppModel` (builds the store + `SyncCoordinator`, observes auth) →
+`RootView` → `MainTabScaffold` (Today · Tasks · [+FAB] · Calendar · Lists).
+Config comes from `App/Config.xcconfig` (committed; `SUPABASE_HOST`) +
+`App/Secrets.xcconfig` (gitignored; `SUPABASE_ANON_KEY`). Until those are
+set the app launches to a setup screen.
 
 ## Build & test
 

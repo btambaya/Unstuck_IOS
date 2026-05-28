@@ -5,8 +5,18 @@ phases land. Newest status at the top.
 
 ## Where things stand (2026-05-29)
 
-**P0 + UnstuckCore + UnstuckData + UnstuckSync (all of P1): DONE.** The
-SwiftUI design system + Xcode app shell (task #31) is next.
+**P0 + P1 (Core/Data/Sync) + UnstuckDesign + the Xcode app shell: DONE.**
+The app **builds for the iOS simulator** (`xcodebuild … BUILD SUCCEEDED`),
+wiring the whole stack together. Feature screens (P2–P6, task #32) next.
+
+- `UnstuckDesign`: exact oklch→sRGB converter (unit-tested), the full
+  brand-v2 palette (light+dark) + `UTheme` env, fonts, and components
+  (Mark/Wordmark/AreaDot/UButton/Chip/Card/SectionLabel).
+- App (`App/`, generated via XcodeGen from `project.yml`): UnstuckApp →
+  AppModel (builds AppDatabase + SyncCoordinator from Config.xcconfig,
+  observes auth) → RootView → MainTabScaffold (5-item bar + coral FAB) +
+  AuthView + feature stubs. `.onOpenURL` → `auth.handleCallback`.
+  Bundle id `tech.csalliance.unstuck`, `unstuck://` scheme.
 
 - Repo initialized; SwiftPM package `UnstuckKit` builds and tests
   standalone (no Xcode project / signing needed yet).
@@ -84,7 +94,27 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
 
 ## Next up
 
-**UI — `UnstuckDesign` + the Xcode app shell** (task #31):
+**Feature screens (P2–P6, task #32)** — build the real surfaces on the
+shell, each reading the local GRDB store via a repository +
+`ValueObservation` and writing via `coordinator.write` (WriteThrough):
+1. **Tasks** (P2): list with All/Today/Backlog/Upcoming/Later/Completed
+   (use `UnstuckCore.visibleTasks`), create/edit sheet, recurrence editor
+   (`materializeOccurrences`/`regenerateForTask`), slip mode, move-count.
+2. **Today** (P2): Start Next (`pickStartNext`) + Up Next + today's plan.
+3. **Focus** (P3): timer (`FocusTimer` + `LiveSessionStore`), 3 treatments,
+   pause reasons → reason_logs, mid-session captures, re-entry.
+4. **Calendar** (P4): day/week/month + block-time + drag; Google connect
+   via `coordinator.calendar` + ASWebAuthenticationSession (HTTPS
+   Universal-Link redirect) + pull/push.
+5. **Collections / Areas / Tags / Captures** (P5).
+6. **Analytics (Swift Charts ← UnstuckCore.Analytics) / Settings /
+   Onboarding / Command palette** (P6).
+
+Add the per-entity repositories as needed (copy `TaskRepository`). Wire
+real Supabase creds into `App/Secrets.xcconfig` to exercise sync on device.
+
+--- (completed) earlier "next up": UnstuckDesign + Xcode app shell ---
+Reference for whoever picks up the design polish:
 - `UnstuckDesign` SPM target: brand-v2 tokens (cream/ink/indigo/coral +
   dark palette, the AA coralDeep CTA), Geist/Instrument Serif/IBM Plex
   Mono fonts, a `Theme` `@Environment`, and core components (Btn/Chip/
@@ -137,5 +167,7 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --enable-code-coverage     # 202 tests, all green
+TZ=UTC swift test --enable-code-coverage     # 210 tests, all green (logic/data/sync/design)
+xcodegen generate && xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
+  -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app shell
 ```

@@ -33,3 +33,18 @@ jobs:
             xcrun llvm-cov report "$XC" -instr-profile "$PROF" \
               -ignore-filename-regex='Tests|\.build'
           fi
+
+  app:
+    name: Build iOS app (simulator)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate project
+        run: xcodegen generate
+      - name: Build for iOS Simulator (no signing)
+        run: |
+          xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
+            -destination 'generic/platform=iOS Simulator' \
+            build CODE_SIGNING_ALLOWED=NO | tail -40

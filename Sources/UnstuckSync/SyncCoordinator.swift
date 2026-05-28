@@ -11,9 +11,11 @@ import Supabase
 import UnstuckData
 
 public actor SyncCoordinator {
-    public let auth: AuthService
-    public let write: WriteThrough
-    public let calendar: CalendarClient
+    // Sendable + immutable → safe to read synchronously from any actor
+    // (the app's @MainActor UI reaches these directly).
+    public nonisolated let auth: AuthService
+    public nonisolated let write: WriteThrough
+    public nonisolated let calendar: CalendarClient
     private let hydrator: Hydrator
     private let realtime: RealtimeMirror
     private let flusher: OutboxFlusher
