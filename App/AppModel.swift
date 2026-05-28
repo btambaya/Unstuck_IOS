@@ -15,6 +15,7 @@ final class AppModel {
     private(set) var coordinator: SyncCoordinator?
     private(set) var db: AppDatabase?
     private(set) var taskRepo: TaskRepository?
+    private(set) var liveStore: LiveSessionStore?
     var signedIn = false
     var configured = true
 
@@ -27,6 +28,7 @@ final class AppModel {
         guard let database = try? AppDatabase.make(path: Self.databasePath()) else { return }
         db = database
         taskRepo = TaskRepository(database)
+        liveStore = LiveSessionStore(database)
         let provider = SupabaseClientProvider(config)
         let coord = SyncCoordinator(provider: provider, db: database)
         coordinator = coord
@@ -56,6 +58,12 @@ final class AppModel {
         guard let write = coordinator?.write else { return }
         let now = Self.isoNow()
         Task { try? await write.upsertTask(task, nowISO: now) }
+    }
+
+    func saveSession(_ session: Session) {
+        guard let write = coordinator?.write else { return }
+        let now = Self.isoNow()
+        Task { try? await write.upsertSession(session, nowISO: now) }
     }
 
     static func isoNow() -> String {

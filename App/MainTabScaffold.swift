@@ -33,6 +33,9 @@ struct MainTabScaffold: View {
             case .quickCapture: NewTaskSheet()   // placeholder until capture lands
             }
         }
+        .fullScreenCover(item: $router.focusTask) { task in
+            FocusView(task: task)
+        }
     }
 
     private var fab: some View {

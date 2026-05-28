@@ -67,7 +67,7 @@ struct TodayView: View {
                         if let area = t.lifeArea { AreaDot(area); Text(area).font(UFont.mono(11)).foregroundStyle(theme.palette.ink3) }
                         Text("\(t.estimateMin) min").font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
                     }
-                    UButton("Begin focus") { model.router.select(.tasks) }   // Focus surface lands in P3
+                    UButton("Begin focus") { model.router.beginFocus(t) }
                 } else {
                     Text("All clear. Add a task to get going.")
                         .font(UFont.sans(15)).foregroundStyle(theme.palette.ink2)
