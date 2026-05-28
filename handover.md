@@ -5,9 +5,18 @@ phases land. Newest status at the top.
 
 ## Where things stand (2026-05-29)
 
-**P0 + P1 (Core/Data/Sync) + UnstuckDesign + the Xcode app shell: DONE.**
-The app **builds for the iOS simulator** (`xcodebuild … BUILD SUCCEEDED`),
-wiring the whole stack together. Feature screens (P2–P6, task #32) next.
+**Foundation + 3 feature slices DONE; app builds for iOS simulator.**
+P0 + P1 (Core/Data/Sync) + UnstuckDesign + app shell, plus the first
+feature surfaces wired end-to-end through the live GRDB store:
+- **Tasks** (P2): live list + view-filter chips (visibleTasks) + create +
+  done-toggle (applyCompletion) via WriteThrough.
+- **Today** (P2): Start Next + Up Next (pickStartNext/pickUpNext).
+- **Focus** (P3 core): live timer on FocusTimer + LiveSessionStore +
+  Session writeback; full-screen from Today's "Begin focus".
+
+These prove the repeatable vertical-slice pattern (repository →
+ValueObservation → UnstuckCore logic → SwiftUI → WriteThrough). Remaining
+P2–P6 surfaces + native surfaces (#33) follow the same shape.
 
 - `UnstuckDesign`: exact oklch→sRGB converter (unit-tested), the full
   brand-v2 palette (light+dark) + `UTheme` env, fonts, and components
@@ -94,24 +103,23 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
 
 ## Next up
 
-**Feature screens (P2–P6, task #32)** — build the real surfaces on the
-shell, each reading the local GRDB store via a repository +
-`ValueObservation` and writing via `coordinator.write` (WriteThrough):
-1. **Tasks** (P2): list with All/Today/Backlog/Upcoming/Later/Completed
-   (use `UnstuckCore.visibleTasks`), create/edit sheet, recurrence editor
-   (`materializeOccurrences`/`regenerateForTask`), slip mode, move-count.
-2. **Today** (P2): Start Next (`pickStartNext`) + Up Next + today's plan.
-3. **Focus** (P3): timer (`FocusTimer` + `LiveSessionStore`), 3 treatments,
-   pause reasons → reason_logs, mid-session captures, re-entry.
-4. **Calendar** (P4): day/week/month + block-time + drag; Google connect
-   via `coordinator.calendar` + ASWebAuthenticationSession (HTTPS
-   Universal-Link redirect) + pull/push.
-5. **Collections / Areas / Tags / Captures** (P5).
-6. **Analytics (Swift Charts ← UnstuckCore.Analytics) / Settings /
-   Onboarding / Command palette** (P6).
+**Remaining feature surfaces (task #32)** — same vertical-slice pattern,
+each reading the local store via a repository + `ValueObservation` and
+writing via `coordinator.write`:
+- **Tasks polish**: edit sheet, recurrence editor
+  (`materializeOccurrences`/`regenerateForTask`), slip mode, move-count,
+  and observe cal_blocks so Backlog/Today/Upcoming bucket exactly.
+- **Focus polish**: 3 treatments (ambient/cockpit/monk), pause reasons →
+  reason_logs, mid-session captures, re-entry, ambient audio.
+- **Calendar** (P4): day/week/month + block-time + drag; Google connect
+  via `coordinator.calendar` + ASWebAuthenticationSession (HTTPS
+  Universal-Link redirect) + pull/push.
+- **Collections / Areas / Tags / Captures** (P5).
+- **Analytics (Swift Charts ← UnstuckCore.Analytics) / Settings /
+  Onboarding / Command palette** (P6).
 
-Add the per-entity repositories as needed (copy `TaskRepository`). Wire
-real Supabase creds into `App/Secrets.xcconfig` to exercise sync on device.
+Add per-entity repositories as needed (copy `TaskRepository`). Wire real
+Supabase creds into `App/Secrets.xcconfig` to exercise sync on device.
 
 --- (completed) earlier "next up": UnstuckDesign + Xcode app shell ---
 Reference for whoever picks up the design polish:
