@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# UTC keeps the date/bucket logic deterministic, matching the web CI and
+# the local `TZ=UTC swift test` convention (see UnstuckCore time helpers).
+env:
+  TZ: UTC
+
+jobs:
+  test:
+    name: Build + test (UnstuckKit)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build + test with coverage
+        run: swift test --enable-code-coverage
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          BIN=$(swift build --show-bin-path)
+          XC="$BIN/UnstuckKitPackageTests.xctest/Contents/MacOS/UnstuckKitPackageTests"
+          PROF="$BIN/codecov/default.profdata"
+          if [ -f "$PROF" ]; then
+            xcrun llvm-cov report "$XC" -instr-profile "$PROF" \
+              -ignore-filename-regex='Tests|\.build'
+          fi
