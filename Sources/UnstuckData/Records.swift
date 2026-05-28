@@ -39,6 +39,10 @@ extension TagRow: FetchableRecord, PersistableRecord {
     public static let databaseTableName = "tags"
 }
 
+extension LifeArea: FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "life_areas"
+}
+
 extension CalendarConnection: FetchableRecord, PersistableRecord {
     public static let databaseTableName = "calendar_connections"
 }

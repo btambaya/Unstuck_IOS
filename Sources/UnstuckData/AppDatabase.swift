@@ -115,6 +115,13 @@ public final class AppDatabase: Sendable {
                 t.column("sortOrder", .integer).notNull()
             }
 
+            try db.create(table: "life_areas") { t in
+                t.primaryKey("id", .text)
+                t.column("name", .text).notNull()
+                t.column("color", .text).notNull()
+                t.column("sortOrder", .integer).notNull()
+            }
+
             try db.create(table: "calendar_connections") { t in
                 t.primaryKey("id", .text)
                 t.column("provider", .text).notNull()

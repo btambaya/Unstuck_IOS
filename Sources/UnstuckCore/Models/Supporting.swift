@@ -77,6 +77,23 @@ public enum Recurrence: Codable, Equatable, Sendable {
     }
 }
 
+/// User-owned life area (Work / Personal / …). Tasks reference areas by
+/// name via `lifeArea`; this row is the canonical editable vocabulary +
+/// its color token.
+public struct LifeArea: Codable, Equatable, Sendable, Identifiable {
+    public var id: String
+    public var name: String
+    public var color: String
+    public var sortOrder: Int
+
+    public init(id: String, name: String, color: String, sortOrder: Int) {
+        self.id = id
+        self.name = name
+        self.color = color
+        self.sortOrder = sortOrder
+    }
+}
+
 /// Curated tag (migration 010). Tasks reference tag names via their
 /// `tags: [String]` array — this row is the canonical user-owned
 /// vocabulary edited in Settings → Tags.

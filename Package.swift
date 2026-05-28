@@ -21,9 +21,11 @@ let package = Package(
     products: [
         .library(name: "UnstuckCore", targets: ["UnstuckCore"]),
         .library(name: "UnstuckData", targets: ["UnstuckData"]),
+        .library(name: "UnstuckSync", targets: ["UnstuckSync"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
+        .package(url: "https://github.com/supabase/supabase-swift.git", from: "2.46.0"),
     ],
     targets: [
         .target(name: "UnstuckCore"),
@@ -37,5 +39,16 @@ let package = Package(
         .testTarget(
             name: "UnstuckDataTests",
             dependencies: ["UnstuckData", "UnstuckCore", .product(name: "GRDB", package: "GRDB.swift")]),
+
+        // supabase-swift wiring + offline-first sync engine. The DbRowCodec
+        // (PostgREST snake_case ↔ camelCase boundary) is pure + unit-tested;
+        // the networked auth/hydrate/realtime/write-through pieces are thin.
+        .target(
+            name: "UnstuckSync",
+            dependencies: [
+                "UnstuckCore", "UnstuckData",
+                .product(name: "Supabase", package: "supabase-swift"),
+            ]),
+        .testTarget(name: "UnstuckSyncTests", dependencies: ["UnstuckSync", "UnstuckCore"]),
     ]
 )
