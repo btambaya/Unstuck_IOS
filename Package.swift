@@ -20,9 +20,22 @@ let package = Package(
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "UnstuckCore", targets: ["UnstuckCore"]),
+        .library(name: "UnstuckData", targets: ["UnstuckData"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
     ],
     targets: [
         .target(name: "UnstuckCore"),
         .testTarget(name: "UnstuckCoreTests", dependencies: ["UnstuckCore"]),
+
+        // Offline-first local store: GRDB schema mirroring the server
+        // tables + a write-ahead outbox + device-local live session.
+        .target(
+            name: "UnstuckData",
+            dependencies: ["UnstuckCore", .product(name: "GRDB", package: "GRDB.swift")]),
+        .testTarget(
+            name: "UnstuckDataTests",
+            dependencies: ["UnstuckData", "UnstuckCore", .product(name: "GRDB", package: "GRDB.swift")]),
     ]
 )

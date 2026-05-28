@@ -5,13 +5,21 @@ phases land. Newest status at the top.
 
 ## Where things stand (2026-05-29)
 
-**Phase P0 (Foundation) + UnstuckCore (full logic layer): DONE.**
+**P0 (Foundation) + UnstuckCore (full logic layer) + UnstuckData (local
+store): DONE.** UnstuckSync (the other half of P1) is next.
 
 - Repo initialized; SwiftPM package `UnstuckKit` builds and tests
   standalone (no Xcode project / signing needed yet).
 - `UnstuckCore` is **complete**: domain models + ALL pure-logic ports
-  from the web `lib/*`. Green: **174 tests, 97% line / 88% region
-  coverage** (`TZ=UTC swift test --enable-code-coverage`).
+  from the web `lib/*`.
+- `UnstuckData` is **done**: GRDB (7.10.0, pinned in Package.resolved)
+  local store — `AppDatabase` (migrator + in-memory/on-disk factories),
+  GRDB conformances for all 8 synced Core models (JSON columns for
+  arrays/Codable, raw strings for enums), `OutboxStore` (FIFO +
+  dependency-ordered `nextFlushable`), `LiveSessionStore` (single-row
+  device-local), `TaskRepository` (CRUD + `observeAll` ValueObservation).
+- Green: **189 tests** (174 Core + 15 Data); ~97% line cov on Core.
+  `TZ=UTC swift test --enable-code-coverage`.
 - CI runs the suite + prints coverage on every push/PR.
 
 ### What exists
@@ -60,13 +68,10 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
 
 ## Next up
 
-**P1 — UnstuckData + UnstuckSync** (task #30). Add two new SPM targets to
-`Package.swift` with external deps:
-- `UnstuckData`: depends on **GRDB.swift** (~v7). Local SQLite schema =
-  one table per synced server table (column names match Postgres);
-  JSONB columns (objectives/comments/recurrence/collection items) stored
-  as TEXT, decoded to the Core models. Two local-only tables: `outbox`
-  and `live_session`. Repositories expose `ValueObservation` streams.
+**P1 second half — UnstuckSync** (task #30). UnstuckData is done; add the
+sync engine. Repositories for the remaining 7 entities follow
+`TaskRepository` verbatim (mechanical) — add as features need them.
+
 - `UnstuckSync`: depends on **supabase-swift** (~v2.46) + UnstuckData +
   UnstuckCore. SupabaseClientProvider, AuthService (PKCE + `unstuck://`
   deep links + Google app sign-in), Hydrator (server-canonical
