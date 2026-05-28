@@ -8,10 +8,10 @@ shares its Supabase backend (project `uaxfteluwctrlgwmmfzi`). The goal is
 notifications, home/lock widgets, Live Activities / Dynamic Island, iOS
 Focus Filter).
 
-> Status: **early build.** `UnstuckCore` domain models + a first slice of
-> the pure-logic ports are complete and tested. Remaining logic ports,
-> data/sync, UI, and native surfaces are in progress — see
-> [`handover.md`](handover.md) for the live state.
+> Status: **early build.** `UnstuckCore` (domain models + the full
+> pure-logic layer ported from the web `lib/*`) is complete and tested —
+> 174 tests, ~97% line coverage. Data/sync, UI, and native surfaces are
+> next — see [`handover.md`](handover.md) for the live state.
 
 ## Architecture
 
@@ -21,7 +21,7 @@ tests with no Xcode project or code signing:
 
 | Module | Role | Status |
 |---|---|---|
-| `UnstuckCore` | Pure domain models + logic ports (no UI/Supabase) | ✅ done + tested |
+| `UnstuckCore` | Pure domain models + full logic layer (no UI/Supabase) | ✅ done + tested (174 tests) |
 | `UnstuckData` | GRDB local store + outbox | ⏳ planned |
 | `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ⏳ planned |
 | `UnstuckDesign` | Brand-v2 tokens + SwiftUI components | ⏳ planned |

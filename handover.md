@@ -3,15 +3,15 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-05-28)
+## Where things stand (2026-05-29)
 
-**Phase P0 (Foundation) + first slice of UnstuckCore: DONE.**
+**Phase P0 (Foundation) + UnstuckCore (full logic layer): DONE.**
 
 - Repo initialized; SwiftPM package `UnstuckKit` builds and tests
   standalone (no Xcode project / signing needed yet).
-- `UnstuckCore` domain layer + the first, most test-covered logic ports
-  are complete and green: **66 tests, 98% line / 94% region coverage**
-  (`TZ=UTC swift test --enable-code-coverage`).
+- `UnstuckCore` is **complete**: domain models + ALL pure-logic ports
+  from the web `lib/*`. Green: **174 tests, 97% line / 88% region
+  coverage** (`TZ=UTC swift test --enable-code-coverage`).
 - CI runs the suite + prints coverage on every push/PR.
 
 ### What exists
@@ -26,12 +26,20 @@ Sources/UnstuckCore/
   Models/Entities.swift            # Session, CalBlock, ReasonLog, Capture,
                                    #   CalendarConnection, ExternalEvent, LiveSession
   Support/Time.swift               # Time.parseMillis / startOfDayMillis; Clock.todayISO/dateISO
+  Support/CivilDate.swift          # JS Date(y,m,d) local arithmetic + getDay (0=Sun)
   Logic/UUID.swift                 # newUUID(), isUUID()             ← lib/uuid.ts
   Logic/CalBlockKind.swift         # blockKind/isTaskBlock/…         ← lib/cal-block-kind.ts
   Logic/TaskBucket.swift           # isCompletedToday/isCreatedToday ← lib/task-bucket.ts
   Logic/VisibleTasks.swift         # visibleTasks/matchesArea/isSlipping/… ← lib/visible-tasks.ts
   Logic/PickStartNext.swift        # pickStartNext/pickUpNext        ← lib/pick-start-next.ts
-Tests/UnstuckCoreTests/            # VisibleTasksTests is a 1:1 port of lib/visible-tasks.test.ts
+  Logic/Recurrence.swift           # materialize/regenerate/label     ← lib/recurrence.ts
+  Logic/FreeSlots.swift            # findFreeSlots/findConflicts/…    ← lib/free-slots.ts
+  Logic/FocusTimer.swift           # pure timer reducers + derivations← lib/use-focus-timer.ts
+  Logic/Analytics.swift            # all chart/insight derivations    ← lib/analytics.ts
+  Logic/AuthErrors.swift           # humanizeAuthError/nextSafePath   ← lib/auth-helpers.ts
+  Logic/GoogleSyncMapping.swift    # externalEventToBlock/…           ← lib/sync/google-sync.ts
+  Logic/TaskMutations.swift        # completedAt stamp + bumpMoveCount← lib/use-tasks.ts
+Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they exist
 .github/workflows/ci.yml
 ```
 
@@ -52,27 +60,36 @@ Tests/UnstuckCoreTests/            # VisibleTasksTests is a 1:1 port of lib/visi
 
 ## Next up
 
-**Finish UnstuckCore logic ports** (task #29 — same package, add files +
-mirrored tests, keep each commit green):
+**P1 — UnstuckData + UnstuckSync** (task #30). Add two new SPM targets to
+`Package.swift` with external deps:
+- `UnstuckData`: depends on **GRDB.swift** (~v7). Local SQLite schema =
+  one table per synced server table (column names match Postgres);
+  JSONB columns (objectives/comments/recurrence/collection items) stored
+  as TEXT, decoded to the Core models. Two local-only tables: `outbox`
+  and `live_session`. Repositories expose `ValueObservation` streams.
+- `UnstuckSync`: depends on **supabase-swift** (~v2.46) + UnstuckData +
+  UnstuckCore. SupabaseClientProvider, AuthService (PKCE + `unstuck://`
+  deep links + Google app sign-in), Hydrator (server-canonical
+  replace-per-table, preserve local `g_*` external blocks), RealtimeMirror
+  (postgres_changes per table; skip calendar_connections), WriteThrough +
+  OutboxFlusher (dependency ordering: cal_block op `dependsOn` task.id),
+  SyncCoordinator (authStateChanges → hydrate→subscribe→autosync; cache
+  wipe rules). Snake_case ↔ camelCase: use `keyDecodingStrategy =
+  .convertFromSnakeCase` (or explicit CodingKeys) in the Sync layer —
+  Core models stay as-is. Reuse the Core logic (uuid gate, mappings).
 
-1. `Recurrence` logic ← `lib/recurrence.ts` + `recurrence.test.ts`
-   (⚠ 8-week HORIZON materialization, regen future-only, weekday 0=Sun).
-2. `FreeSlots` ← `lib/free-slots.ts` + `free-slots.test.ts`.
-3. `FocusTimer` (pure state/derivations) ← `lib/use-focus-timer.ts` +
-   `use-focus-timer.test.ts` (states, `priorAccumulatedSec`, overrun).
-4. `Analytics` ← `lib/analytics.ts` + `analytics.test.ts`.
-5. `AuthErrors` (`humanizeAuthError`) ← `lib/auth-helpers.ts` +
-   `auth-helpers.test.ts`.
-6. `GoogleSyncMapping` ← `lib/sync/google-sync.ts` + `google-sync.test.ts`.
-7. `bumpMoveCount` + `completedAt` first-flip rules ← `lib/use-tasks.ts`
-   (+ `task-completion.test.ts`).
+Port references (read-only in `../unstuck`): `lib/sync/bridge.ts`,
+`lib/sync/hydrate.ts`, `lib/sync/realtime.ts`,
+`lib/supabase/bootstrap-listener.tsx`, `lib/sync/calendar-sync.ts`,
+`lib/use-sync-status.ts`, `lib/storage-keys.ts` (synced-vs-device split).
 
-Then **P1** (task #30): add `UnstuckData` (GRDB + outbox) and
-`UnstuckSync` (supabase-swift auth + Hydrator/RealtimeMirror/
-WriteThrough/OutboxFlusher/SyncCoordinator). This adds external SPM deps
-(GRDB.swift, supabase-swift) to `Package.swift`. Snake_case ↔ camelCase
-mapping for PostgREST happens in UnstuckSync (keyDecodingStrategy or
-explicit CodingKeys) — Core models stay as-is.
+Tests to add in P1: outbox FIFO + dependency ordering; hydrate
+replace-per-table (only successful tables replaced; failed left intact);
+external-block preservation.
+
+Then UI (task #31): `UnstuckDesign` + the Xcode app project + the
+SwiftPM packages wired in; then features (P2–P6, task #32); then backend
++ native surfaces (task #33).
 
 Full roadmap + rationale: the build plan at
 `~/.claude/plans/streamed-juggling-book.md` (in the agent's plan dir).
@@ -94,5 +111,5 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --enable-code-coverage     # 66 tests, all green
+TZ=UTC swift test --enable-code-coverage     # 174 tests, all green, ~97% line cov
 ```

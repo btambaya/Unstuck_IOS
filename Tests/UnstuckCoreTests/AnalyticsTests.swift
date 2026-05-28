@@ -146,4 +146,16 @@ final class TopInsightsTests: XCTestCase {
         let out = topInsights(sessions: [], tasks: [mkTask(name: "Old slip", moveCount: 5)], captures: [], reasonLogs: [])
         XCTAssertTrue(out.contains { $0.title.contains("Old slip") })
     }
+
+    func testRichDataSurfacesWeekdayAndCalibration() {
+        // 5 Monday sessions of 25 min on a 25-min-estimate task → best
+        // weekday + 100% calibration insights (sessions ≥ REAL_DATA_THRESHOLD).
+        let tasks = [mkTask(id: "t1", estimateMin: 25)]
+        let sessions = (0..<5).map {
+            sess("s\($0)", taskId: "t1", actualSec: 25 * 60, completedAt: "2026-05-18T10:0\($0):00.000Z") // Mon
+        }
+        let out = topInsights(sessions: sessions, tasks: tasks, captures: [], reasonLogs: [])
+        XCTAssertTrue(out.contains { $0.title.contains("strongest day") })
+        XCTAssertTrue(out.contains { $0.title.contains("Estimates within 5 min") })
+    }
 }
