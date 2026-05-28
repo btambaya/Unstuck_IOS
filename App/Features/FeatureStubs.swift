@@ -44,10 +44,6 @@ private struct EmptyHint: View {
     }
 }
 
-struct TodayView: View {
-    var body: some View { TabScaffold("Today", "What's next.") { EmptyHint(text: "Start Next + today's plan land in P2.") } }
-}
-
 struct CalendarView: View {
     var body: some View { TabScaffold("Calendar", "Your time.") { EmptyHint(text: "Day / week / month + Google sync land in P4.") } }
 }
