@@ -5,8 +5,8 @@ phases land. Newest status at the top.
 
 ## Where things stand (2026-05-29)
 
-**P0 (Foundation) + UnstuckCore (full logic layer) + UnstuckData (local
-store): DONE.** UnstuckSync (the other half of P1) is next.
+**P0 + UnstuckCore + UnstuckData + UnstuckSync (all of P1): DONE.** The
+SwiftUI design system + Xcode app shell (task #31) is next.
 
 - Repo initialized; SwiftPM package `UnstuckKit` builds and tests
   standalone (no Xcode project / signing needed yet).
@@ -18,9 +18,25 @@ store): DONE.** UnstuckSync (the other half of P1) is next.
   arrays/Codable, raw strings for enums), `OutboxStore` (FIFO +
   dependency-ordered `nextFlushable`), `LiveSessionStore` (single-row
   device-local), `TaskRepository` (CRUD + `observeAll` ValueObservation).
-- Green: **189 tests** (174 Core + 15 Data); ~97% line cov on Core.
-  `TZ=UTC swift test --enable-code-coverage`.
+- `UnstuckSync` is **done** (supabase-swift 2.46.0, pinned): DbRowCodec
+  (PostgREST snake_case↔camelCase boundary, explicit-null clearing, uuid
+  filtering), SupabaseClientProvider (PKCE), SyncGateway (CRUD + user_id
+  injection), AuthService (email/OTP/Google/deep-link/sign-out), Hydrator
+  (per-table server-canonical replace + external-block preservation),
+  RealtimeMirror (postgres_changes per table; calendar_connections
+  excluded), OutboxFlusher (dependency-ordered drain), WriteThrough
+  (optimistic local + outbox), SyncCoordinator (auth-state → wipe/flush/
+  hydrate/subscribe), CalendarClient (calendar-sync Edge Function). API
+  verified against supabase-swift v2.46.0 source.
+- Green: **202 tests** (174 Core + 15 Data + 13 Sync); ~97% line cov on
+  Core. `TZ=UTC swift test --enable-code-coverage`.
 - CI runs the suite + prints coverage on every push/PR.
+
+  Note: the networked sync pieces compile + mirror the web contract but
+  are runtime-validated only once wired into the Xcode app against the
+  live Supabase project (no headless integration test here). The pure
+  pieces (codec, cache-wipe decision, external-block merge, outbox
+  ordering) ARE unit-tested.
 
 ### What exists
 
@@ -68,33 +84,38 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
 
 ## Next up
 
-**P1 second half — UnstuckSync** (task #30). UnstuckData is done; add the
-sync engine. Repositories for the remaining 7 entities follow
-`TaskRepository` verbatim (mechanical) — add as features need them.
+**UI — `UnstuckDesign` + the Xcode app shell** (task #31):
+- `UnstuckDesign` SPM target: brand-v2 tokens (cream/ink/indigo/coral +
+  dark palette, the AA coralDeep CTA), Geist/Instrument Serif/IBM Plex
+  Mono fonts, a `Theme` `@Environment`, and core components (Btn/Chip/
+  Pill/Card/AreaDot/Avatar/SectionLabel/Wordmark/bottom-sheet). Port from
+  `../unstuck/app/globals.css` + `components/ui/*`. SwiftUI compiles under
+  SPM for macOS, so cross-platform views can have lightweight tests/previews.
+- Xcode app project (`tech.csalliance.unstuck`, App Group
+  `group.tech.csalliance.unstuck`, entitlements: Push/Time-Sensitive/Live
+  Activities; `unstuck://` scheme + Associated Domains; `.xcconfig` for
+  SUPABASE_URL/ANON_KEY) referencing the local `UnstuckKit` package.
+  RootView → Auth / Onboarding / MainTabScaffold (5 tabs + center FAB +
+  `@Observable AppRouter`); `.onOpenURL` → `auth.handleCallback(url:)` and
+  calendar redirect. Instantiate `SyncCoordinator(provider:db:)` at launch
+  and call `.start()`.
 
-- `UnstuckSync`: depends on **supabase-swift** (~v2.46) + UnstuckData +
-  UnstuckCore. SupabaseClientProvider, AuthService (PKCE + `unstuck://`
-  deep links + Google app sign-in), Hydrator (server-canonical
-  replace-per-table, preserve local `g_*` external blocks), RealtimeMirror
-  (postgres_changes per table; skip calendar_connections), WriteThrough +
-  OutboxFlusher (dependency ordering: cal_block op `dependsOn` task.id),
-  SyncCoordinator (authStateChanges → hydrate→subscribe→autosync; cache
-  wipe rules). Snake_case ↔ camelCase: use `keyDecodingStrategy =
-  .convertFromSnakeCase` (or explicit CodingKeys) in the Sync layer —
-  Core models stay as-is. Reuse the Core logic (uuid gate, mappings).
+Wiring notes for the app:
+- `SyncConfig(url:anonKey:authRedirectURL:)` from the xcconfig; build a
+  `SupabaseClientProvider`, an `AppDatabase.make(path:)` (App-Group
+  container path), then `SyncCoordinator`.
+- Repositories for the remaining entities follow `TaskRepository`
+  verbatim (mechanical) — add as features need them.
+- The Google-calendar consent (ASWebAuthenticationSession) lives in the
+  calendar feature: `calendar.authorize(redirectUri:)` → present consent
+  → capture the HTTPS Universal-Link redirect's `?code=` → `calendar
+  .connectGoogle(code:redirectUri:state:)`.
 
-Port references (read-only in `../unstuck`): `lib/sync/bridge.ts`,
-`lib/sync/hydrate.ts`, `lib/sync/realtime.ts`,
+Then features (P2–P6, task #32) and backend + native surfaces (task #33).
+
+Port references (read-only in `../unstuck`): `lib/sync/*`,
 `lib/supabase/bootstrap-listener.tsx`, `lib/sync/calendar-sync.ts`,
-`lib/use-sync-status.ts`, `lib/storage-keys.ts` (synced-vs-device split).
-
-Tests to add in P1: outbox FIFO + dependency ordering; hydrate
-replace-per-table (only successful tables replaced; failed left intact);
-external-block preservation.
-
-Then UI (task #31): `UnstuckDesign` + the Xcode app project + the
-SwiftPM packages wired in; then features (P2–P6, task #32); then backend
-+ native surfaces (task #33).
+`lib/storage-keys.ts`, `app/globals.css`, `components/**`.
 
 Full roadmap + rationale: the build plan at
 `~/.claude/plans/streamed-juggling-book.md` (in the agent's plan dir).
@@ -116,5 +137,5 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --enable-code-coverage     # 174 tests, all green, ~97% line cov
+TZ=UTC swift test --enable-code-coverage     # 202 tests, all green
 ```

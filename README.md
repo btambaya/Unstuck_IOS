@@ -8,10 +8,12 @@ shares its Supabase backend (project `uaxfteluwctrlgwmmfzi`). The goal is
 notifications, home/lock widgets, Live Activities / Dynamic Island, iOS
 Focus Filter).
 
-> Status: **early build.** `UnstuckCore` (full pure-logic layer ported
-> from the web `lib/*`) and `UnstuckData` (GRDB offline store + outbox)
-> are complete and tested — 189 tests. The sync engine (`UnstuckSync`),
-> UI, and native surfaces are next — see [`handover.md`](handover.md).
+> Status: **early build.** The full data + sync foundation is in:
+> `UnstuckCore` (pure-logic layer), `UnstuckData` (GRDB offline store +
+> outbox), and `UnstuckSync` (supabase-swift auth + offline-first sync
+> engine) — 202 tests. The SwiftUI design system, the Xcode app shell,
+> the feature screens, and native surfaces are next — see
+> [`handover.md`](handover.md).
 
 ## Architecture
 
@@ -23,7 +25,7 @@ tests with no Xcode project or code signing:
 |---|---|---|
 | `UnstuckCore` | Pure domain models + full logic layer (no UI/Supabase) | ✅ done + tested (174 tests) |
 | `UnstuckData` | GRDB local store + outbox + live session | ✅ done + tested (15 tests) |
-| `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ⏳ planned |
+| `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ✅ done (13 tests; networked paths runtime-validated in-app) |
 | `UnstuckDesign` | Brand-v2 tokens + SwiftUI components | ⏳ planned |
 | `UnstuckShared` | App-Group snapshot shared with widgets/Live Activity | ⏳ planned |
 | `UnstuckFeatures` | SwiftUI feature modules (the ~41 screens) | ⏳ planned |
