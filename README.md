@@ -31,7 +31,7 @@ tests with no Xcode project or code signing:
 | `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ✅ done (13 tests; networked paths runtime-validated in-app) |
 | `UnstuckDesign` | Brand-v2 oklch tokens + Theme + SwiftUI components | ✅ done (8 tests) |
 | `UnstuckShared` | App-Group snapshot + Live Activity attributes + Focus Filter flag | ✅ done |
-| App `App/Features/*` | SwiftUI surfaces (Today, Tasks, Focus, Calendar, Lists, Settings, Insights) | 🔨 in progress |
+| App `App/Features/*` | Today, Tasks (+recurrence), Focus (+treatments/reasons/captures), Calendar (+Google connect), Lists, Tags & Areas, Insights, Settings, Onboarding, Command palette | ✅ built |
 | `Widgets/` | Start Next widget + Focus Live Activity / Dynamic Island | ✅ builds |
 
 **Offline-first**: a local store drives the UI; Supabase is canonical.

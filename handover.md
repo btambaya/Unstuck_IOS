@@ -129,23 +129,24 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
 
 ## Next up
 
-All major surfaces + native surfaces are scaffolded + building. What's
-left is **depth/polish** (same vertical-slice pattern: repository +
-`ValueObservation` in, `coordinator.write` out):
-- **Tasks**: edit sheet, recurrence editor
-  (`materializeOccurrences`/`regenerateForTask`), slip mode, observe
-  cal_blocks so Backlog/Today/Upcoming bucket exactly.
-- **Focus**: 3 treatments (ambient/cockpit/monk), pause reasons →
-  reason_logs, mid-session captures, ambient audio.
-- **Calendar**: block-time create + drag-to-schedule; Google connect UI
-  (`coordinator.calendar` + ASWebAuthenticationSession; needs the
-  Universal-Link redirect + AASA — see manual step 6) + pull/push.
-- **Collections**: detail live-refresh (observe the single row); pin/done.
-- **Areas / Tags / Captures** surfaces (repos exist via `Repository<T>`).
-- **Onboarding** (needs a `UserPreferences` model + table mapping) +
-  **Command palette**.
-- Wire the `send-*` Edge Function calls (recap on session end, paused-
-  checkin cap) from the app once the functions are deployed.
+All P2–P6 feature surfaces are built + building: **Tasks** (list + filters
++ create/edit + recurrence editor + cal_blocks bucketing), **Today**
+(Start Next/Up Next), **Focus** (timer + 3 treatments + pause reasons +
+captures + Live Activity + paused-checkin), **Calendar** (agenda + Google
+connect via ASWebAuthenticationSession + pull/ingest), **Collections**
+(live + pin), **Tags & Areas** management, **Analytics** (Swift Charts),
+**Settings**, **Onboarding**, **Command palette**, + native surfaces
+(push, widget, Dynamic Island, Focus Filter).
+
+What's left (deep niceties + the manual deploy/capability steps):
+- Calendar **block-time create + drag-to-schedule** + **push task blocks**
+  to Google (`coordinator.calendar.insert/patch`).
+- Wire the **send-session-recap** call on session end + the
+  **send-paused-checkin** cap call (once the functions are deployed).
+- Sync **onboarding struggles → user_preferences** (PK'd on user_id, so
+  needs a dedicated upsert path; stored locally today).
+- Ambient **audio** for focus treatments; slip-mode toggle in Tasks.
+- Live-Activity **push backstop** (APNs) + widget reload on more events.
 
 --- (completed) earlier "next up": UnstuckDesign + Xcode app shell ---
 Reference for whoever picks up the design polish:
