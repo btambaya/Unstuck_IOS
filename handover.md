@@ -138,15 +138,22 @@ connect via ASWebAuthenticationSession + pull/ingest), **Collections**
 **Settings**, **Onboarding**, **Command palette**, + native surfaces
 (push, widget, Dynamic Island, Focus Filter).
 
-What's left (deep niceties + the manual deploy/capability steps):
-- Calendar **block-time create + drag-to-schedule** + **push task blocks**
-  to Google (`coordinator.calendar.insert/patch`).
-- Wire the **send-session-recap** call on session end + the
-  **send-paused-checkin** cap call (once the functions are deployed).
-- Sync **onboarding struggles → user_preferences** (PK'd on user_id, so
-  needs a dedicated upsert path; stored locally today).
-- Ambient **audio** for focus treatments; slip-mode toggle in Tasks.
-- Live-Activity **push backstop** (APNs) + widget reload on more events.
+The step-3 polish is now DONE too: Calendar **block-time create**,
+**schedule-to-slot**, and **push task blocks to Google**; **session-recap**
++ **paused-checkin** wired; **onboarding → user_preferences** sync;
+**ambient audio** + **slip-mode**; **Live-Activity APNs push-token**
+backstop.
+
+What genuinely remains:
+- **Drag-to-schedule day-grid** (the agenda is a list + tap-to-schedule
+  today; a draggable time-grid is the remaining UI build).
+- Edit/patch/delete an existing Google-pushed block (insert is wired; the
+  patch/delete round-trip on later edits isn't).
+- Server-side Live-Activity push + the send-* calls only matter once the
+  Edge Functions are deployed (manual steps below).
+- The **manual deploy/capability/secret steps** (functions deploy, APNs p8,
+  anon key in Secrets.xcconfig, Apple capabilities, Universal-Link redirect,
+  cron) — see "Manual steps" above.
 
 --- (completed) earlier "next up": UnstuckDesign + Xcode app shell ---
 Reference for whoever picks up the design polish:
