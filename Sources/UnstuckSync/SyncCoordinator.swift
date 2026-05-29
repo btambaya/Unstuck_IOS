@@ -16,6 +16,7 @@ public actor SyncCoordinator {
     public nonisolated let auth: AuthService
     public nonisolated let write: WriteThrough
     public nonisolated let calendar: CalendarClient
+    public nonisolated let push: PushClient
     private let hydrator: Hydrator
     private let realtime: RealtimeMirror
     private let flusher: OutboxFlusher
@@ -28,6 +29,7 @@ public actor SyncCoordinator {
         self.auth = AuthService(provider.client)
         self.write = WriteThrough(db: db)
         self.calendar = CalendarClient(provider.client)
+        self.push = PushClient(provider.client)
         self.hydrator = Hydrator(gateway: gateway, db: db)
         self.realtime = RealtimeMirror(client: provider.client, db: db)
         self.flusher = OutboxFlusher(gateway: gateway, db: db)
