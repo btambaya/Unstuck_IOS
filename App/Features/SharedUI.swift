@@ -1,11 +1,9 @@
-// Tab screen scaffolds. These render the brand chrome + an empty state
-// today; the real lists/calendar/focus surfaces land in P2–P6, reading
-// from the local GRDB store via repositories + ValueObservation.
+// Small shared building blocks for the feature screens.
 
 import SwiftUI
 import UnstuckDesign
 
-private struct TabScaffold<Content: View>: View {
+struct TabScaffold<Content: View>: View {
     @Environment(\.uTheme) private var theme
     let eyebrow: String
     let title: String
@@ -18,9 +16,7 @@ private struct TabScaffold<Content: View>: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     SectionLabel(eyebrow)
-                    Text(title)
-                        .font(UFont.serifItalic(34))
-                        .foregroundStyle(theme.palette.ink)
+                    Text(title).font(UFont.serifItalic(34)).foregroundStyle(theme.palette.ink)
                     content
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -31,7 +27,7 @@ private struct TabScaffold<Content: View>: View {
     }
 }
 
-private struct EmptyHint: View {
+struct EmptyHint: View {
     @Environment(\.uTheme) private var theme
     let text: String
     var body: some View {
@@ -42,12 +38,4 @@ private struct EmptyHint: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
-}
-
-struct CalendarView: View {
-    var body: some View { TabScaffold("Calendar", "Your time.") { EmptyHint(text: "Day / week / month + Google sync land in P4.") } }
-}
-
-struct ListsView: View {
-    var body: some View { TabScaffold("Lists", "Kept.") { EmptyHint(text: "Collections land in P5.") } }
 }

@@ -30,6 +30,7 @@ struct TodayView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @State private var vm: TodayModel?
+    @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
@@ -49,6 +50,12 @@ struct TodayView: View {
                 .padding(20)
             }
             .background(theme.palette.bg.ignoresSafeArea())
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                }
+            }
+            .sheet(isPresented: $showSettings) { SettingsView() }
         }
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }

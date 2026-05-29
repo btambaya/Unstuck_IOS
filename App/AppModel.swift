@@ -52,8 +52,15 @@ final class AppModel {
         Task { _ = await coord.auth.handleCallback(url: url) }
     }
 
-    /// Optimistic task write (local GRDB + server outbox). Drives the UI
-    /// instantly via the repository's ValueObservation.
+    /// The optimistic write API (local GRDB + server outbox), for features.
+    /// Drives the UI instantly via each repository's ValueObservation.
+    var write: WriteThrough? { coordinator?.write }
+
+    func signOut() {
+        guard let coord = coordinator else { return }
+        Task { await coord.auth.signOut() }
+    }
+
     func saveTask(_ task: TaskItem) {
         guard let write = coordinator?.write else { return }
         let now = Self.isoNow()

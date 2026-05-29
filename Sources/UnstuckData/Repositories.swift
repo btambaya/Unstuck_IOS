@@ -8,6 +8,28 @@ import Foundation
 import GRDB
 import UnstuckCore
 
+/// Generic read/observe repository for any synced entity. Writes go
+/// through WriteThrough (UnstuckSync); this is the read side the SwiftUI
+/// surfaces observe.
+public struct Repository<Row: FetchableRecord & PersistableRecord & TableRecord & Sendable>: Sendable {
+    let db: AppDatabase
+    let orderColumn: String
+
+    public init(_ db: AppDatabase, orderColumn: String) {
+        self.db = db
+        self.orderColumn = orderColumn
+    }
+
+    public func all() throws -> [Row] {
+        try db.writer.read { try Row.order(Column(orderColumn)).fetchAll($0) }
+    }
+
+    public func observeValues() -> AsyncValueObservation<[Row]> {
+        let col = orderColumn
+        return ValueObservation.tracking { try Row.order(Column(col)).fetchAll($0) }.values(in: db.writer)
+    }
+}
+
 public struct TaskRepository: Sendable {
     let db: AppDatabase
     public init(_ db: AppDatabase) { self.db = db }
