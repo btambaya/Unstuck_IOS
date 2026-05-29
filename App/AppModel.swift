@@ -105,6 +105,18 @@ final class AppModel {
         Task { try? await write.upsertSession(session, nowISO: now) }
     }
 
+    func saveReasonLog(_ log: ReasonLog) {
+        guard let write = coordinator?.write else { return }
+        let now = Self.isoNow()
+        Task { try? await write.upsertReasonLog(log, nowISO: now) }
+    }
+
+    func saveCapture(_ capture: Capture) {
+        guard let write = coordinator?.write else { return }
+        let now = Self.isoNow()
+        Task { try? await write.upsertCapture(capture, nowISO: now) }
+    }
+
     static func isoNow() -> String {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
