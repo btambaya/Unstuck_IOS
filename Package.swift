@@ -23,6 +23,7 @@ let package = Package(
         .library(name: "UnstuckData", targets: ["UnstuckData"]),
         .library(name: "UnstuckSync", targets: ["UnstuckSync"]),
         .library(name: "UnstuckDesign", targets: ["UnstuckDesign"]),
+        .library(name: "UnstuckShared", targets: ["UnstuckShared"]),
     ],
     dependencies: [
         .package(url: "https://github.com/groue/GRDB.swift.git", from: "7.0.0"),
@@ -55,5 +56,9 @@ let package = Package(
         // Brand-v2 design system: oklch tokens + Theme + SwiftUI components.
         .target(name: "UnstuckDesign"),
         .testTarget(name: "UnstuckDesignTests", dependencies: ["UnstuckDesign"]),
+
+        // App-Group snapshot + Live Activity attributes — linked by BOTH
+        // the app and the widget/Live-Activity extension. Foundation-only.
+        .target(name: "UnstuckShared"),
     ]
 )

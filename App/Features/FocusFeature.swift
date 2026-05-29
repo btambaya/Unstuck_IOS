@@ -25,10 +25,17 @@ final class FocusModel {
         // Resume-aware: start() continues a paused session for the same task.
         live = FocusTimer.start(existing ?? .empty, taskId: task.id, estimateMin: task.estimateMin, now: Self.now())
         persist()
+        LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: task.estimateMin)
     }
 
-    func pause() { live = FocusTimer.pause(live, now: Self.now()); persist() }
-    func resume() { live = FocusTimer.resume(live, now: Self.now()); persist() }
+    func pause() {
+        live = FocusTimer.pause(live, now: Self.now()); persist()
+        LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: true, estimateMin: task.estimateMin)
+    }
+    func resume() {
+        live = FocusTimer.resume(live, now: Self.now()); persist()
+        LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: false, estimateMin: task.estimateMin)
+    }
 
     func finish() {
         let elapsed = FocusTimer.elapsedSec(live, now: Self.now())
@@ -36,11 +43,13 @@ final class FocusModel {
                            estimateMin: task.estimateMin, actualSec: elapsed, completedAt: AppModel.isoNow()))
         live = FocusTimer.done(live)
         persist()
+        LiveActivityController.shared.end()
     }
 
     func cancel() {
         live = FocusTimer.cancel(live)
         persist()
+        LiveActivityController.shared.end()
     }
 
     private func persist() {

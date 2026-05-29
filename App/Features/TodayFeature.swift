@@ -3,9 +3,11 @@
 // "Begin focus" action is a placeholder until the Focus surface (P3).
 
 import SwiftUI
+import WidgetKit
 import UnstuckCore
 import UnstuckData
 import UnstuckDesign
+import UnstuckShared
 
 @MainActor
 @Observable
@@ -15,7 +17,23 @@ final class TodayModel {
     init(_ repo: TaskRepository) { self.repo = repo }
 
     func observe() async {
-        do { for try await rows in repo.observeAllValues() { all = rows } } catch {}
+        do {
+            for try await rows in repo.observeAllValues() {
+                all = rows
+                writeWidgetSnapshot()
+            }
+        } catch {}
+    }
+
+    /// Mirror Start Next into the App Group so the home/lock widgets render
+    /// it without the network, and nudge WidgetKit to reload.
+    private func writeWidgetSnapshot() {
+        let next = startNext
+        let openCount = all.filter { !$0.done && !($0.later ?? false) }.count
+        AppGroup.writeStartNext(StartNextSnapshot(
+            taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
+            openCount: openCount, updatedAt: Date()))
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     var startNext: TaskItem? { pickStartNext(tasks: all, blocks: [], liveTaskId: nil) }

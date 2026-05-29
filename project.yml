@@ -31,6 +31,7 @@ targets:
         PRODUCT_NAME: Unstuck
         INFOPLIST_FILE: App/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: App/Unstuck.entitlements
         TARGETED_DEVICE_FAMILY: "1"
         ENABLE_USER_SCRIPT_SANDBOXING: "YES"
     dependencies:
@@ -42,5 +43,29 @@ targets:
         product: UnstuckSync
       - package: UnstuckKit
         product: UnstuckDesign
+      - package: UnstuckKit
+        product: UnstuckShared
+      - target: UnstuckWidgets
+        embed: true
     scheme:
       testTargets: []
+
+  UnstuckWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Widgets
+    configFiles:
+      Debug: App/Config.xcconfig
+      Release: App/Config.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tech.csalliance.unstuck.widgets
+        PRODUCT_NAME: UnstuckWidgets
+        INFOPLIST_FILE: Widgets/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: Widgets/UnstuckWidgets.entitlements
+        TARGETED_DEVICE_FAMILY: "1"
+    dependencies:
+      - package: UnstuckKit
+        product: UnstuckShared
