@@ -31,10 +31,12 @@ final class FocusModel {
     func pause() {
         live = FocusTimer.pause(live, now: Self.now()); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: true, estimateMin: task.estimateMin)
+        PausedCheckinScheduler.schedule(taskName: task.name)
     }
     func resume() {
         live = FocusTimer.resume(live, now: Self.now()); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: false, estimateMin: task.estimateMin)
+        PausedCheckinScheduler.cancel()
     }
 
     func finish() {
@@ -44,12 +46,14 @@ final class FocusModel {
         live = FocusTimer.done(live)
         persist()
         LiveActivityController.shared.end()
+        PausedCheckinScheduler.cancel()
     }
 
     func cancel() {
         live = FocusTimer.cancel(live)
         persist()
         LiveActivityController.shared.end()
+        PausedCheckinScheduler.cancel()
     }
 
     private func persist() {

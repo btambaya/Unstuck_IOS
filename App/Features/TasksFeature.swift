@@ -8,6 +8,7 @@ import SwiftUI
 import UnstuckCore
 import UnstuckData
 import UnstuckDesign
+import UnstuckShared
 
 @MainActor
 @Observable
@@ -46,6 +47,9 @@ struct TasksView: View {
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }
             let m = TasksModel(repo)
+            // Honor an active iOS Focus Filter (reconcile on appear — iOS 18
+            // perform() can be flaky, so reading the App-Group flag here too).
+            if AppGroup.focusFilterActive(), AppGroup.focusFilterHideNonToday() { m.view = .today }
             vm = m
             await m.observe()
         }
