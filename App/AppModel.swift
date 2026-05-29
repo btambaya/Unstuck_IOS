@@ -4,6 +4,7 @@
 // the auth→hydrate→subscribe loop, and exposes signed-in state to the UI.
 
 import SwiftUI
+import UIKit
 import UnstuckCore
 import UnstuckData
 import UnstuckSync
@@ -35,6 +36,16 @@ final class AppModel {
         signedIn = coord.auth.currentUserId != nil
         await coord.start()
         await observeAuth(coord)
+
+        // Register the APNs token (now or when it arrives).
+        PushRegistrar.shared.onToken = { [weak self] hex in self?.registerPush(hex) }
+        if let existing = PushRegistrar.shared.apnsTokenHex { registerPush(existing) }
+    }
+
+    func registerPush(_ tokenHex: String) {
+        guard let coord = coordinator else { return }
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        Task { try? await coord.push.register(deviceId: deviceId, apnsToken: tokenHex) }
     }
 
     private func observeAuth(_ coord: SyncCoordinator) async {

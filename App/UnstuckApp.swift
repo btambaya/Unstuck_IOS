@@ -3,6 +3,7 @@ import UnstuckDesign
 
 @main
 struct UnstuckApp: App {
+    @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var pushDelegate
     @State private var model = AppModel()
 
     var body: some Scene {
