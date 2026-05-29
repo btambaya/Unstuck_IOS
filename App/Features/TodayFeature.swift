@@ -13,13 +13,15 @@ import UnstuckShared
 @Observable
 final class TodayModel {
     var all: [TaskItem] = []
+    var blocks: [CalBlock] = []
     private let repo: TaskRepository
     init(_ repo: TaskRepository) { self.repo = repo }
 
     func observe() async {
         do {
-            for try await rows in repo.observeAllValues() {
-                all = rows
+            for try await snap in repo.observeTasksAndBlocks() {
+                all = snap.tasks
+                blocks = snap.blocks
                 writeWidgetSnapshot()
             }
         } catch {}
@@ -39,7 +41,7 @@ final class TodayModel {
     var startNext: TaskItem? { pickStartNext(tasks: all, blocks: [], liveTaskId: nil) }
     var upNext: [TaskItem] { pickUpNext(tasks: all, blocks: [], liveTaskId: nil, startNextId: startNext?.id) }
     var today: [TaskItem] {
-        visibleTasks(view: .today, tasks: all, blocks: [],
+        visibleTasks(view: .today, tasks: all, blocks: blocks,
                      now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false)
     }
 }

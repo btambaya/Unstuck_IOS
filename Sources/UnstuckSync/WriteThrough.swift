@@ -69,4 +69,16 @@ public actor WriteThrough {
     public func enqueueDelete(table: String, id: String, nowISO: String) throws {
         try box.enqueue(table: table, rowId: id, kind: .delete, nowISO: nowISO)
     }
+
+    /// Delete a cal_block locally + enqueue the server delete (used by the
+    /// recurrence regen to drop mismatched future occurrences).
+    public func deleteCalBlock(id: String, nowISO: String) throws {
+        try db.deleteById(CalBlock.self, id: id)
+        try box.enqueue(table: "cal_blocks", rowId: id, kind: .delete, nowISO: nowISO)
+    }
+
+    public func deleteTask(id: String, nowISO: String) throws {
+        try db.deleteById(TaskItem.self, id: id)
+        try box.enqueue(table: "tasks", rowId: id, kind: .delete, nowISO: nowISO)
+    }
 }

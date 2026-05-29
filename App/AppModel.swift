@@ -78,6 +78,27 @@ final class AppModel {
         Task { try? await write.upsertTask(task, nowISO: now) }
     }
 
+    /// Save a task + reconcile its recurrence: materialize future cal_blocks
+    /// (regenerateForTask) and drop mismatched ones. `existingBlocks` is the
+    /// task's current blocks from the observed store.
+    func saveTaskWithRecurrence(_ task: TaskItem, existingBlocks: [CalBlock]) {
+        saveTask(task)
+        guard let write = coordinator?.write else { return }
+        let plan = regenerateForTask(
+            task: task, recurrence: task.recurrence, existingBlocks: existingBlocks,
+            todayIso: Clock.todayISO(), startTime: "09:00", startDate: Date())
+        let now = Self.isoNow()
+        Task {
+            for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }
+            for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
+        }
+    }
+
+    func deleteTask(_ id: String) {
+        guard let write = coordinator?.write else { return }
+        Task { try? await write.deleteTask(id: id, nowISO: Self.isoNow()) }
+    }
+
     func saveSession(_ session: Session) {
         guard let write = coordinator?.write else { return }
         let now = Self.isoNow()

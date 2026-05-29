@@ -62,4 +62,19 @@ public struct TaskRepository: Sendable {
     public func observeAllValues() -> AsyncValueObservation<[TaskItem]> {
         observeAll().values(in: db.writer)
     }
+
+    /// Tasks + cal_blocks together so the list can bucket Backlog/Today/
+    /// Upcoming exactly (visibleTasks needs the blocks).
+    public func observeTasksAndBlocks() -> AsyncValueObservation<TasksAndBlocks> {
+        ValueObservation.tracking { db in
+            TasksAndBlocks(
+                tasks: try TaskItem.order(Column("createdAt")).fetchAll(db),
+                blocks: try CalBlock.fetchAll(db))
+        }.values(in: db.writer)
+    }
+}
+
+public struct TasksAndBlocks: Sendable {
+    public let tasks: [TaskItem]
+    public let blocks: [CalBlock]
 }

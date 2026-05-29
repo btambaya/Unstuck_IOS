@@ -14,6 +14,7 @@ import UnstuckShared
 @Observable
 final class TasksModel {
     var all: [TaskItem] = []
+    var blocks: [CalBlock] = []
     var view: TaskListView = .all
     private let repo: TaskRepository
 
@@ -21,21 +22,27 @@ final class TasksModel {
 
     func observe() async {
         do {
-            for try await rows in repo.observeAllValues() { all = rows }
+            for try await snap in repo.observeTasksAndBlocks() {
+                all = snap.tasks
+                blocks = snap.blocks
+            }
         } catch { /* observation ended */ }
     }
 
     var visible: [TaskItem] {
-        visibleTasks(view: view, tasks: all, blocks: [],
+        visibleTasks(view: view, tasks: all, blocks: blocks,
                      now: Date().timeIntervalSince1970 * 1000,
                      activeArea: nil, slipMode: false)
     }
+
+    func blocks(forTask id: String) -> [CalBlock] { blocks.filter { $0.taskId == id } }
 }
 
 struct TasksView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @State private var vm: TasksModel?
+    @State private var editing: TaskItem?
 
     var body: some View {
         NavigationStack {
@@ -43,6 +50,9 @@ struct TasksView: View {
                 if let vm { list(vm) } else { loading }
             }
             .background(theme.palette.bg.ignoresSafeArea())
+            .sheet(item: $editing) { task in
+                TaskEditor(task: task, existingBlocks: vm?.blocks(forTask: task.id) ?? [])
+            }
         }
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }
@@ -86,7 +96,7 @@ struct TasksView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(vm.visible) { task in
-                            TaskRowView(task: task) { toggleDone(task) }
+                            TaskRowView(task: task, onToggle: { toggleDone(task) }, onOpen: { editing = task })
                         }
                     }
                     .padding(.horizontal, 20).padding(.top, 4)
@@ -108,6 +118,7 @@ struct TaskRowView: View {
     @Environment(\.uTheme) private var theme
     let task: TaskItem
     let onToggle: () -> Void
+    let onOpen: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -118,20 +129,28 @@ struct TaskRowView: View {
             }
             .buttonStyle(.plain)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(task.name)
-                    .font(UFont.sans(15))
-                    .strikethrough(task.done)
-                    .foregroundStyle(task.done ? theme.palette.ink3 : theme.palette.ink)
-                HStack(spacing: 6) {
-                    if let area = task.lifeArea { AreaDot(area); Text(area).font(UFont.mono(10)).foregroundStyle(theme.palette.ink3) }
-                    Text("\(task.estimateMin)m").font(UFont.mono(10)).foregroundStyle(theme.palette.ink3)
+            Button(action: onOpen) {
+                HStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(task.name)
+                            .font(UFont.sans(15))
+                            .strikethrough(task.done)
+                            .foregroundStyle(task.done ? theme.palette.ink3 : theme.palette.ink)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        HStack(spacing: 6) {
+                            if let area = task.lifeArea { AreaDot(area); Text(area).font(UFont.mono(10)).foregroundStyle(theme.palette.ink3) }
+                            Text("\(task.estimateMin)m").font(UFont.mono(10)).foregroundStyle(theme.palette.ink3)
+                            if task.recurrence != nil {
+                                Image(systemName: "repeat").font(.system(size: 9)).foregroundStyle(theme.palette.ink3)
+                            }
+                        }
+                    }
+                    if let p = task.priority, p == .urgent || p == .high {
+                        Text(p.rawValue.uppercased()).font(UFont.mono(9, .bold)).foregroundStyle(theme.palette.coralDeep)
+                    }
                 }
             }
-            Spacer()
-            if let p = task.priority, p == .urgent || p == .high {
-                Text(p.rawValue.uppercased()).font(UFont.mono(9, .bold)).foregroundStyle(theme.palette.coralDeep)
-            }
+            .buttonStyle(.plain)
         }
         .padding(12)
         .background(theme.palette.surface)
