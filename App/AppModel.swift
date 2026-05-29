@@ -99,6 +99,26 @@ final class AppModel {
         Task { try? await write.deleteTask(id: id, nowISO: Self.isoNow()) }
     }
 
+    var calendar: CalendarClient? { coordinator?.calendar }
+
+    /// Ingest pulled Google events as local external cal_blocks (g_ ids;
+    /// not synced — they live device-side, preserved across hydrate).
+    func ingestExternalBlocks(_ events: [ExternalEvent]) {
+        guard let db else { return }
+        for ev in events { try? db.save(externalEventToBlock(ev, calendarId: ev.calendarId)) }
+    }
+
+    func pullGoogleCalendar() async {
+        guard let calendar = coordinator?.calendar else { return }
+        let f = ISO8601DateFormatter()
+        let now = Date()
+        let from = f.string(from: now.addingTimeInterval(-7 * 86_400))
+        let to = f.string(from: now.addingTimeInterval(14 * 86_400))
+        if let events = try? await calendar.pullEvents(from: from, to: to) {
+            ingestExternalBlocks(events)
+        }
+    }
+
     func saveSession(_ session: Session) {
         guard let write = coordinator?.write else { return }
         let now = Self.isoNow()
