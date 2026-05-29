@@ -27,15 +27,16 @@ UnstuckCore logic → SwiftUI → WriteThrough):
   **paused-too-long** local notification.
 - **Analytics** (P6): Swift Charts over UnstuckCore.Analytics (Settings → Insights).
 
-Backend (in `../unstuck`): migrations 014–016 **applied** to the live
-project; Edge Functions register-push-token + send-session-recap /
-send-paused-checkin / send-morning-brief + `_shared/apns.ts` (ES256)
-**written + committed** (not deployed); cron in `supabase/manual/`.
+Backend (in `../unstuck`): migrations 014–016 **applied**; Edge Functions
+register-push-token + send-session-recap / send-paused-checkin /
+send-morning-brief (+ `_shared/apns.ts` ES256) **DEPLOYED + ACTIVE** on
+project uaxfteluwctrlgwmmfzi; cron in `supabase/manual/`. register-push-token
++ send-paused-checkin work now; send-session-recap's in-app card works (push
+needs APNs secrets); send-morning-brief needs APNs secrets + CRON_SECRET + cron.
 
-## Manual steps (outside the agent's authorization)
-1. Deploy the functions:
-   `supabase functions deploy register-push-token send-session-recap send-paused-checkin send-morning-brief`
-2. Set secrets: `supabase secrets set APNS_AUTH_KEY=… APNS_KEY_ID=… APNS_TEAM_ID=… APNS_BUNDLE_ID=tech.csalliance.unstuck CRON_SECRET=…`
+## Manual steps (need your credentials)
+1. ✅ Functions deployed (done by the agent).
+2. Set secrets so the push side fires: `supabase secrets set APNS_AUTH_KEY=… APNS_KEY_ID=… APNS_TEAM_ID=… APNS_BUNDLE_ID=tech.csalliance.unstuck CRON_SECRET=…` (needs your Apple p8 key).
 3. Put the Supabase anon key in `App/Secrets.xcconfig` (else the app shows the setup screen).
 4. Target capabilities (signing): Push, Time-Sensitive, App Groups
    `group.tech.csalliance.unstuck`, Live Activities.
