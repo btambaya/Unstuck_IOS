@@ -144,16 +144,18 @@ The step-3 polish is now DONE too: Calendar **block-time create**,
 **ambient audio** + **slip-mode**; **Live-Activity APNs push-token**
 backstop.
 
-What genuinely remains:
-- **Drag-to-schedule day-grid** (the agenda is a list + tap-to-schedule
-  today; a draggable time-grid is the remaining UI build).
-- Edit/patch/delete an existing Google-pushed block (insert is wired; the
-  patch/delete round-trip on later edits isn't).
-- Server-side Live-Activity push + the send-* calls only matter once the
-  Edge Functions are deployed (manual steps below).
-- The **manual deploy/capability/secret steps** (functions deploy, APNs p8,
-  anon key in Secrets.xcconfig, Apple capabilities, Universal-Link redirect,
-  cron) — see "Manual steps" above.
+The remaining-in-reach items are now DONE too: the **drag-to-schedule day
+grid** (draggable unscheduled tray + drop-to-time + drag-to-reschedule),
+and **Google patch/delete/move** of pushed blocks. The app is
+feature-complete against the plan.
+
+All that's left is **work only you can do** (see "Manual steps" above):
+deploy the Edge Functions + APNs p8/`CRON_SECRET` secrets, put the anon
+key in `App/Secrets.xcconfig`, enable the Apple capabilities under a
+signing team, register the Universal-Link redirect + ship the AASA, and
+run `supabase/manual/notification_cron.sql`. After those, everything —
+sync, push, widgets, Live Activities, Focus Filter, Google two-way sync —
+is live.
 
 --- (completed) earlier "next up": UnstuckDesign + Xcode app shell ---
 Reference for whoever picks up the design polish:
