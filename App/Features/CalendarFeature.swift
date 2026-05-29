@@ -11,31 +11,42 @@ import UnstuckDesign
 @MainActor
 @Observable
 final class CalendarModel {
+    var tasks: [TaskItem] = []
     var blocks: [CalBlock] = []
     var connections: [CalendarConnection] = []
-    private let repo: Repository<CalBlock>
+    private let repo: TaskRepository
     private let connRepo: Repository<CalendarConnection>
-    init(_ repo: Repository<CalBlock>, _ connRepo: Repository<CalendarConnection>) {
+    init(_ repo: TaskRepository, _ connRepo: Repository<CalendarConnection>) {
         self.repo = repo
         self.connRepo = connRepo
     }
     func observe() async {
-        async let a: Void = observeBlocks()
+        async let a: Void = observeData()
         async let b: Void = observeConnections()
         _ = await (a, b)
     }
-    private func observeBlocks() async {
-        do { for try await rows in repo.observeValues() { blocks = rows } } catch {}
+    private func observeData() async {
+        do { for try await snap in repo.observeTasksAndBlocks() { tasks = snap.tasks; blocks = snap.blocks } } catch {}
     }
     private func observeConnections() async {
         do { for try await rows in connRepo.observeValues() { connections = rows } } catch {}
     }
     var connected: Bool { !connections.isEmpty }
+
     /// Blocks grouped by date (ascending), each day's blocks sorted by start.
     var byDate: [(date: String, blocks: [CalBlock])] {
         Dictionary(grouping: blocks, by: { $0.date })
             .map { ($0.key, $0.value.sorted { $0.startTime < $1.startTime }) }
             .sorted { $0.date < $1.date }
+    }
+    func blocks(on iso: String) -> [CalBlock] {
+        blocks.filter { $0.date == iso }.sorted { $0.startTime < $1.startTime }
+    }
+    /// Open tasks with no block on `iso` — the day grid's drag tray.
+    func unscheduled(on iso: String) -> [TaskItem] {
+        tasks.filter { t in
+            !t.done && !(t.later ?? false) && !blocks.contains { $0.taskId == t.id && $0.date == iso }
+        }
     }
 }
 
@@ -46,6 +57,8 @@ struct CalendarView: View {
     @State private var connecting = false
     @State private var connectError: String?
     @State private var showBlock = false
+    @State private var dayMode = true
+    @State private var selectedDate = Date()
 
     var body: some View {
         NavigationStack {
@@ -67,26 +80,37 @@ struct CalendarView: View {
             .sheet(isPresented: $showBlock) { BlockTimeSheet() }
         }
         .task {
-            guard vm == nil, let db = model.db else { return }
-            let m = CalendarModel(
-                Repository<CalBlock>(db, orderColumn: "date"),
-                Repository<CalendarConnection>(db, orderColumn: "connectedAt"))
+            guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }
+            let m = CalendarModel(taskRepo, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))
             vm = m; await m.observe()
         }
     }
 
     @ViewBuilder
     private func content(_ vm: CalendarModel) -> some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-                if !vm.connected { connectBanner }
-                if vm.byDate.isEmpty {
-                    EmptyHint(text: "No scheduled blocks yet. Schedule a task, or connect Google Calendar above.")
-                } else {
-                    agenda(vm)
+        VStack(spacing: 0) {
+            Picker("Mode", selection: $dayMode) {
+                Text("Day").tag(true)
+                Text("Agenda").tag(false)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 20).padding(.bottom, 8)
+
+            if dayMode {
+                DayGridView(vm: vm, date: $selectedDate)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !vm.connected { connectBanner }
+                        if vm.byDate.isEmpty {
+                            EmptyHint(text: "No scheduled blocks yet. Schedule a task, or connect Google Calendar above.")
+                        } else {
+                            agenda(vm)
+                        }
+                    }
+                    .padding(20)
                 }
             }
-            .padding(20)
         }
     }
 
@@ -149,6 +173,9 @@ struct CalendarView: View {
         .background(theme.palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).stroke(theme.palette.line))
+        .contextMenu {
+            Button(role: .destructive) { model.deleteBlock(block) } label: { Label("Delete", systemImage: "trash") }
+        }
     }
 }
 
@@ -184,7 +211,151 @@ struct BlockTimeSheet: View {
         let block = CalBlock(id: newUUID(), taskId: nil,
                              taskName: label.trimmingCharacters(in: .whitespaces).isEmpty ? "Busy" : label,
                              startTime: hhmm, durationMinutes: duration, date: iso, kind: .task)
-        model.createBlock(block)
+        model.saveBlock(block)
         dismiss()
+    }
+}
+
+// Day view with a draggable unscheduled-task tray + a time grid. Dropping
+// a task creates a block at the dropped time; dragging a block reschedules
+// it. Both push to Google when connected.
+struct DayGridView: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    let vm: CalendarModel
+    @Binding var date: Date
+
+    private let firstHour = 6
+    private let lastHour = 22
+    private let pxPerHour: CGFloat = 56
+    private var gridHeight: CGFloat { CGFloat(lastHour - firstHour) * pxPerHour }
+    private var iso: String { Clock.dateISO(date) }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            dateHeader
+            tray
+            Divider()
+            ScrollView {
+                GeometryReader { geo in grid(width: geo.size.width) }
+                    .frame(height: gridHeight)
+            }
+        }
+    }
+
+    private var dateHeader: some View {
+        HStack {
+            Button { shift(-1) } label: { Image(systemName: "chevron.left") }.buttonStyle(.plain)
+            Spacer()
+            Text(dayLabel).font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink)
+            Spacer()
+            Button { shift(1) } label: { Image(systemName: "chevron.right") }.buttonStyle(.plain)
+        }
+        .foregroundStyle(theme.palette.ink2)
+        .padding(.horizontal, 24).padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var tray: some View {
+        let items = vm.unscheduled(on: iso)
+        if items.isEmpty {
+            Text("All scheduled — drag a block to move it.")
+                .font(UFont.mono(10)).foregroundStyle(theme.palette.ink3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20).padding(.bottom, 8)
+        } else {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(items) { task in
+                        Text("\(task.name) · \(task.estimateMin)m")
+                            .font(UFont.sans(12)).lineLimit(1)
+                            .padding(.vertical, 6).padding(.horizontal, 10)
+                            .background(theme.palette.primarySoft)
+                            .foregroundStyle(theme.palette.primaryDeep)
+                            .clipShape(Capsule())
+                            .draggable("task:\(task.id)")
+                    }
+                }
+                .padding(.horizontal, 20).padding(.bottom, 8)
+            }
+        }
+    }
+
+    private func grid(width: CGFloat) -> some View {
+        ZStack(alignment: .topLeading) {
+            VStack(spacing: 0) {
+                ForEach(firstHour..<lastHour, id: \.self) { hour in
+                    HStack(alignment: .top, spacing: 8) {
+                        Text(hourLabel(hour)).font(UFont.mono(9)).foregroundStyle(theme.palette.ink4)
+                            .frame(width: 44, alignment: .trailing)
+                        Rectangle().fill(theme.palette.line).frame(height: 1)
+                    }
+                    .frame(height: pxPerHour, alignment: .top)
+                }
+            }
+            ForEach(vm.blocks(on: iso)) { block in
+                blockCard(block, width: max(80, width - 64))
+                    .offset(x: 52, y: yFor(block))
+                    .draggable("block:\(block.id)")
+            }
+        }
+        .frame(width: width, height: gridHeight, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .dropDestination(for: String.self) { items, location in handleDrop(items, location) }
+    }
+
+    private func blockCard(_ block: CalBlock, width: CGFloat) -> some View {
+        let h = max(22, CGFloat(block.durationMinutes) / 60 * pxPerHour - 2)
+        return VStack(alignment: .leading, spacing: 1) {
+            Text(block.taskName).font(UFont.sans(12, .medium)).lineLimit(1).foregroundStyle(theme.palette.ink)
+            if h > 30 { Text(formatTime(block.startTime)).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3) }
+        }
+        .padding(6)
+        .frame(width: width, height: h, alignment: .topLeading)
+        .background(isExternalBlock(block) ? theme.palette.blue.opacity(0.18) : theme.palette.primarySoft)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .contextMenu {
+            Button(role: .destructive) { model.deleteBlock(block) } label: { Label("Delete", systemImage: "trash") }
+        }
+    }
+
+    private func yFor(_ block: CalBlock) -> CGFloat {
+        CGFloat(minutesOf(block.startTime) - firstHour * 60) / 60 * pxPerHour
+    }
+
+    private func handleDrop(_ items: [String], _ location: CGPoint) -> Bool {
+        guard let payload = items.first else { return false }
+        let minutesFromTop = Double(location.y) / Double(pxPerHour) * 60
+        let snapped = max(0, (minutesFromTop / 15).rounded() * 15)
+        let total = firstHour * 60 + Int(snapped)
+        let startTime = String(format: "%02d:%02d", min(23, total / 60), total % 60)
+        if payload.hasPrefix("task:") {
+            let id = String(payload.dropFirst(5))
+            guard let task = vm.tasks.first(where: { $0.id == id }) else { return false }
+            model.scheduleTaskAt(task, date: iso, startTime: startTime)
+            return true
+        }
+        if payload.hasPrefix("block:") {
+            let id = String(payload.dropFirst(6))
+            guard let block = vm.blocks.first(where: { $0.id == id }) else { return false }
+            model.moveBlock(block, toDate: iso, startTime: startTime)
+            return true
+        }
+        return false
+    }
+
+    private func shift(_ days: Int) {
+        date = Calendar.current.date(byAdding: .day, value: days, to: date) ?? date
+    }
+    private var dayLabel: String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEE, MMM d"
+        return f.string(from: date)
+    }
+    private func hourLabel(_ hour: Int) -> String {
+        "\(((hour + 11) % 12) + 1) \(hour >= 12 ? "PM" : "AM")"
+    }
+    private func minutesOf(_ hhmm: String) -> Int {
+        let p = hhmm.split(separator: ":").compactMap { Int($0) }
+        return (p.first ?? 0) * 60 + (p.count > 1 ? p[1] : 0)
     }
 }

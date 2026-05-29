@@ -158,23 +158,53 @@ final class AppModel {
 
     var calendar: CalendarClient? { coordinator?.calendar }
 
-    /// Create a cal_block (block-time or scheduled task) + push it to Google
-    /// when a connection exists, persisting the returned event id.
-    func createBlock(_ block: CalBlock) {
+    /// Save a cal_block (create or edit) + reconcile Google: PATCH if it
+    /// already has an event id, otherwise INSERT and persist the new id.
+    func saveBlock(_ block: CalBlock) {
         guard let write = coordinator?.write else { return }
         Task {
             try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
             guard let calendar = coordinator?.calendar, let database = db,
                   let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
             let range = blockToIsoRange(block)
-            if let eventId = try? await calendar.insertEvent(
-                connectionId: conn.id, calendarId: conn.selectedCalendarIds.first ?? "primary",
+            let calId = conn.selectedCalendarIds.first ?? "primary"
+            if let eventId = block.externalEventId {
+                try? await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
+                                               summary: block.taskName, start: range.start, end: range.end)
+            } else if let newId = try? await calendar.insertEvent(
+                connectionId: conn.id, calendarId: calId,
                 summary: block.taskName, start: range.start, end: range.end) {
                 var updated = block
-                updated.externalEventId = eventId
+                updated.externalEventId = newId
                 try? await write.upsertCalBlock(updated, nowISO: Self.isoNow())
             }
         }
+    }
+
+    /// Delete a block locally + on Google (if it was pushed).
+    func deleteBlock(_ block: CalBlock) {
+        guard let write = coordinator?.write else { return }
+        Task {
+            if let eventId = block.externalEventId, let calendar = coordinator?.calendar,
+               let database = db, let conn = (try? database.firstCalendarConnection()) ?? nil {
+                try? await calendar.deleteEvent(eventId: eventId, connectionId: conn.id,
+                                                calendarId: conn.selectedCalendarIds.first ?? "primary")
+            }
+            try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
+        }
+    }
+
+    /// Move a block to a new day/time (drag-to-reschedule) + bump the task's
+    /// moveCount. Pushes the change to Google.
+    func moveBlock(_ block: CalBlock, toDate iso: String, startTime: String) {
+        var next = block
+        next.date = iso
+        next.startTime = startTime
+        saveBlock(next)
+        guard let taskId = block.taskId, isUUID(taskId), let write = coordinator?.write,
+              let repo = taskRepo, let task = (try? repo.fetch(id: taskId)) ?? nil else { return }
+        let bumped = bumpMoveCount(task, nowISO: Self.isoNow())
+        Task { try? await write.upsertTask(bumped, nowISO: Self.isoNow()) }
     }
 
     /// Schedule a task into the first free slot on `date` (default today).
@@ -182,10 +212,13 @@ final class AppModel {
         let blocks = (try? db?.blocks(forTask: task.id)) ?? []
         let iso = Clock.dateISO(date)
         let slots = findFreeSlotsForDate(blocks, durationMin: task.estimateMin, isoDate: iso, now: date, limit: 1)
-        let startTime = slots.first?.startTime ?? "09:00"
-        let block = CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
-                             startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task)
-        createBlock(block)
+        scheduleTaskAt(task, date: iso, startTime: slots.first?.startTime ?? "09:00")
+    }
+
+    /// Schedule a task at an explicit day + time (drag-to-schedule).
+    func scheduleTaskAt(_ task: TaskItem, date iso: String, startTime: String) {
+        saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
+                           startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))
     }
 
     /// Ingest pulled Google events as local external cal_blocks (g_ ids;
