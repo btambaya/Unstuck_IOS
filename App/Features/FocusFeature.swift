@@ -93,7 +93,7 @@ struct FocusView: View {
             ForEach(reasons, id: \.self) { reason in
                 Button(reason) { pauseWith(reason) }
             }
-            Button("Just pause", role: .cancel) { fm?.pause() }
+            Button("Just pause", role: .cancel) { fm?.pause(); coordinateCheckin() }
         }
         .sheet(isPresented: $showCapture) { captureSheet }
     }
@@ -205,6 +205,15 @@ struct FocusView: View {
     private func pauseWith(_ reason: String) {
         model.saveReasonLog(ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow()))
         fm?.pause()
+        coordinateCheckin()
+    }
+
+    /// FocusModel.pause() pre-schedules the local paused-too-long notif; ask
+    /// the server whether the daily cap allows it, and cancel if not.
+    private func coordinateCheckin() {
+        model.requestPausedCheckin { allowed in
+            if !allowed { PausedCheckinScheduler.cancel() }
+        }
     }
 
     private func saveCapture() {

@@ -19,15 +19,31 @@ final class AppModel {
     private(set) var liveStore: LiveSessionStore?
     var signedIn = false
     var configured = true
-    // Local first-run flag. Struggles are stored locally for now; syncing
-    // them to user_preferences.adhd_struggles is a follow-up (that table
-    // is PK'd on user_id, so it needs a dedicated upsert path).
+    // Local first-run flag; struggles also sync to user_preferences.
     var onboarded = UserDefaults.standard.bool(forKey: "unstuck.onboarded")
 
     func completeOnboarding(struggles: [String]) {
         UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
+        if let coord = coordinator, let uid = coord.auth.currentUserId {
+            Task { try? await coord.preferences.setAdhdStruggles(userId: uid, struggles: struggles) }
+        }
+    }
+
+    func sendSessionRecap(taskName: String, away: Bool = false) {
+        guard let n = coordinator?.notifications else { return }
+        Task { try? await n.sessionRecap(taskName: taskName, away: away) }
+    }
+
+    /// Coordinate the paused-too-long cap; calls back (main actor) with
+    /// whether the local notification should fire.
+    func requestPausedCheckin(_ completion: @escaping @MainActor (Bool) -> Void) {
+        guard let n = coordinator?.notifications else { completion(true); return }
+        Task {
+            let allowed = (try? await n.pausedCheckin()) ?? true
+            await MainActor.run { completion(allowed) }
+        }
     }
 
     func start() async {

@@ -16,6 +16,7 @@ final class TasksModel {
     var all: [TaskItem] = []
     var blocks: [CalBlock] = []
     var view: TaskListView = .all
+    var slipMode = false
     private let repo: TaskRepository
 
     init(_ repo: TaskRepository) { self.repo = repo }
@@ -32,7 +33,7 @@ final class TasksModel {
     var visible: [TaskItem] {
         visibleTasks(view: view, tasks: all, blocks: blocks,
                      now: Date().timeIntervalSince1970 * 1000,
-                     activeArea: nil, slipMode: false)
+                     activeArea: nil, slipMode: slipMode)
     }
 
     func blocks(forTask id: String) -> [CalBlock] { blocks.filter { $0.taskId == id } }
@@ -50,6 +51,15 @@ struct TasksView: View {
                 if let vm { list(vm) } else { loading }
             }
             .background(theme.palette.bg.ignoresSafeArea())
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    if let vm {
+                        Button { vm.slipMode.toggle() } label: {
+                            Image(systemName: vm.slipMode ? "exclamationmark.triangle.fill" : "exclamationmark.triangle")
+                        }
+                    }
+                }
+            }
             .sheet(item: $editing) { task in
                 TaskEditor(task: task, existingBlocks: vm?.blocks(forTask: task.id) ?? [])
             }
