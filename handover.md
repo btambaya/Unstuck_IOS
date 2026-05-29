@@ -20,16 +20,28 @@ UnstuckCore logic → SwiftUI → WriteThrough):
 - **Push registration** (#33): PushAppDelegate → PushClient →
   register-push-token → device_tokens.
 
-Backend (in `../unstuck`, applied to the live project): migrations 014–016
-+ the register-push-token Edge Function (committed; deploy is a manual step).
+- **Native surfaces** (#33): `UnstuckShared` App-Group store; Start Next
+  home/lock **widget** + **Focus Live Activity / Dynamic Island** (widget
+  extension, builds); **LiveActivityController** driven by the focus timer;
+  **WorkFocusFilter** SetFocusFilterIntent + Tasks reconcile;
+  **paused-too-long** local notification.
+- **Analytics** (P6): Swift Charts over UnstuckCore.Analytics (Settings → Insights).
+
+Backend (in `../unstuck`): migrations 014–016 **applied** to the live
+project; Edge Functions register-push-token + send-session-recap /
+send-paused-checkin / send-morning-brief + `_shared/apns.ts` (ES256)
+**written + committed** (not deployed); cron in `supabase/manual/`.
 
 ## Manual steps (outside the agent's authorization)
-1. Deploy the push function: `supabase functions deploy register-push-token`.
-2. Put the Supabase anon key in `App/Secrets.xcconfig` so the app leaves the
-   setup screen + sync runs.
-3. Enable target capabilities (signing): Push, Time-Sensitive, App Groups
-   `group.tech.csalliance.unstuck`, Live Activities; + an APNs p8 key in
-   Supabase secrets when the send-side lands.
+1. Deploy the functions:
+   `supabase functions deploy register-push-token send-session-recap send-paused-checkin send-morning-brief`
+2. Set secrets: `supabase secrets set APNS_AUTH_KEY=… APNS_KEY_ID=… APNS_TEAM_ID=… APNS_BUNDLE_ID=tech.csalliance.unstuck CRON_SECRET=…`
+3. Put the Supabase anon key in `App/Secrets.xcconfig` (else the app shows the setup screen).
+4. Target capabilities (signing): Push, Time-Sensitive, App Groups
+   `group.tech.csalliance.unstuck`, Live Activities.
+5. Enable pg_cron + pg_net, set the cron config, then run `supabase/manual/notification_cron.sql`.
+6. Register an HTTPS Universal-Link redirect on the existing web Google OAuth
+   client + ship the AASA for the calendar connect flow.
 
 - `UnstuckDesign`: exact oklch→sRGB converter (unit-tested), the full
   brand-v2 palette (light+dark) + `UTheme` env, fonts, and components
@@ -60,8 +72,9 @@ Backend (in `../unstuck`, applied to the live project): migrations 014–016
   (optimistic local + outbox), SyncCoordinator (auth-state → wipe/flush/
   hydrate/subscribe), CalendarClient (calendar-sync Edge Function). API
   verified against supabase-swift v2.46.0 source.
-- Green: **202 tests** (174 Core + 15 Data + 13 Sync); ~97% line cov on
-  Core. `TZ=UTC swift test --enable-code-coverage`.
+- Green: **210 tests** (174 Core + 15 Data + 13 Sync + 8 Design); ~97%
+  line cov on Core. The app + widget extension build for the iOS simulator
+  (`xcodebuild … BUILD SUCCEEDED`).
 - CI runs the suite + prints coverage on every push/PR.
 
   Note: the networked sync pieces compile + mirror the web contract but
@@ -116,23 +129,23 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
 
 ## Next up
 
-**Remaining feature surfaces (task #32)** — same vertical-slice pattern,
-each reading the local store via a repository + `ValueObservation` and
-writing via `coordinator.write`:
-- **Tasks polish**: edit sheet, recurrence editor
-  (`materializeOccurrences`/`regenerateForTask`), slip mode, move-count,
-  and observe cal_blocks so Backlog/Today/Upcoming bucket exactly.
-- **Focus polish**: 3 treatments (ambient/cockpit/monk), pause reasons →
-  reason_logs, mid-session captures, re-entry, ambient audio.
-- **Calendar** (P4): day/week/month + block-time + drag; Google connect
-  via `coordinator.calendar` + ASWebAuthenticationSession (HTTPS
-  Universal-Link redirect) + pull/push.
-- **Collections / Areas / Tags / Captures** (P5).
-- **Analytics (Swift Charts ← UnstuckCore.Analytics) / Settings /
-  Onboarding / Command palette** (P6).
-
-Add per-entity repositories as needed (copy `TaskRepository`). Wire real
-Supabase creds into `App/Secrets.xcconfig` to exercise sync on device.
+All major surfaces + native surfaces are scaffolded + building. What's
+left is **depth/polish** (same vertical-slice pattern: repository +
+`ValueObservation` in, `coordinator.write` out):
+- **Tasks**: edit sheet, recurrence editor
+  (`materializeOccurrences`/`regenerateForTask`), slip mode, observe
+  cal_blocks so Backlog/Today/Upcoming bucket exactly.
+- **Focus**: 3 treatments (ambient/cockpit/monk), pause reasons →
+  reason_logs, mid-session captures, ambient audio.
+- **Calendar**: block-time create + drag-to-schedule; Google connect UI
+  (`coordinator.calendar` + ASWebAuthenticationSession; needs the
+  Universal-Link redirect + AASA — see manual step 6) + pull/push.
+- **Collections**: detail live-refresh (observe the single row); pin/done.
+- **Areas / Tags / Captures** surfaces (repos exist via `Repository<T>`).
+- **Onboarding** (needs a `UserPreferences` model + table mapping) +
+  **Command palette**.
+- Wire the `send-*` Edge Function calls (recap on session end, paused-
+  checkin cap) from the app once the functions are deployed.
 
 --- (completed) earlier "next up": UnstuckDesign + Xcode app shell ---
 Reference for whoever picks up the design polish:

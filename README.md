@@ -8,12 +8,15 @@ shares its Supabase backend (project `uaxfteluwctrlgwmmfzi`). The goal is
 notifications, home/lock widgets, Live Activities / Dynamic Island, iOS
 Focus Filter).
 
-> Status: **early build.** The full data + sync foundation is in:
-> `UnstuckCore` (pure-logic layer), `UnstuckData` (GRDB offline store +
-> outbox), and `UnstuckSync` (supabase-swift auth + offline-first sync
-> engine) — 202 tests. The SwiftUI design system, the Xcode app shell,
-> the feature screens, and native surfaces are next — see
-> [`handover.md`](handover.md).
+> Status: **working build.** Full data + sync + design foundation
+> (`UnstuckCore` / `UnstuckData` / `UnstuckSync` / `UnstuckDesign` /
+> `UnstuckShared`, 210 tests); the app + widget extension build for the
+> iOS simulator; feature surfaces (Today, Tasks, Focus, Calendar, Lists,
+> Settings, Insights) + native surfaces (push, Start Next widget, Focus
+> Live Activity / Dynamic Island, Focus Filter, paused-checkin) are wired;
+> the notification DB backend (migrations 014–016) is applied + the push
+> Edge Functions are written. Remaining = feature polish + the manual
+> deploy/capability steps — see [`handover.md`](handover.md).
 
 ## Architecture
 
@@ -27,8 +30,9 @@ tests with no Xcode project or code signing:
 | `UnstuckData` | GRDB local store + outbox + live session | ✅ done + tested (15 tests) |
 | `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ✅ done (13 tests; networked paths runtime-validated in-app) |
 | `UnstuckDesign` | Brand-v2 oklch tokens + Theme + SwiftUI components | ✅ done (8 tests) |
-| `UnstuckShared` | App-Group snapshot shared with widgets/Live Activity | ⏳ planned |
-| `UnstuckFeatures` | SwiftUI feature modules (the ~41 screens) | ⏳ planned |
+| `UnstuckShared` | App-Group snapshot + Live Activity attributes + Focus Filter flag | ✅ done |
+| App `App/Features/*` | SwiftUI surfaces (Today, Tasks, Focus, Calendar, Lists, Settings, Insights) | 🔨 in progress |
+| `Widgets/` | Start Next widget + Focus Live Activity / Dynamic Island | ✅ builds |
 
 **Offline-first**: a local store drives the UI; Supabase is canonical.
 The sync engine mirrors the web's `lib/sync/*` contract (hydrate =
