@@ -109,6 +109,23 @@ final class AppModel {
         Task { try? await write.deleteTask(id: id, nowISO: Self.isoNow()) }
     }
 
+    func saveTag(_ tag: TagRow) {
+        guard let write = coordinator?.write else { return }
+        Task { try? await write.upsertTag(tag, nowISO: Self.isoNow()) }
+    }
+    func deleteTag(_ id: String) {
+        guard let write = coordinator?.write else { return }
+        Task { try? await write.deleteTag(id: id, nowISO: Self.isoNow()) }
+    }
+    func saveLifeArea(_ area: LifeArea) {
+        guard let write = coordinator?.write else { return }
+        Task { try? await write.upsertLifeArea(area, nowISO: Self.isoNow()) }
+    }
+    func deleteLifeArea(_ id: String) {
+        guard let write = coordinator?.write else { return }
+        Task { try? await write.deleteLifeArea(id: id, nowISO: Self.isoNow()) }
+    }
+
     var calendar: CalendarClient? { coordinator?.calendar }
 
     /// Ingest pulled Google events as local external cal_blocks (g_ ids;

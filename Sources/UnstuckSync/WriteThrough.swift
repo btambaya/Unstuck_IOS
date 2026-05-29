@@ -81,4 +81,14 @@ public actor WriteThrough {
         try db.deleteById(TaskItem.self, id: id)
         try box.enqueue(table: "tasks", rowId: id, kind: .delete, nowISO: nowISO)
     }
+
+    public func deleteTag(id: String, nowISO: String) throws {
+        try db.deleteById(TagRow.self, id: id)
+        try box.enqueue(table: "tags", rowId: id, kind: .delete, nowISO: nowISO)
+    }
+
+    public func deleteLifeArea(id: String, nowISO: String) throws {
+        try db.deleteById(LifeArea.self, id: id)
+        try box.enqueue(table: "life_areas", rowId: id, kind: .delete, nowISO: nowISO)
+    }
 }

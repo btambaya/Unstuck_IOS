@@ -38,6 +38,17 @@ struct SettingsView: View {
                         .buttonStyle(.plain)
                     }
 
+                    section("Organize") {
+                        NavigationLink { TagsAreasView() } label: {
+                            HStack {
+                                Text("Tags & areas").font(UFont.sans(14)).foregroundStyle(theme.palette.ink2)
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.system(size: 12)).foregroundStyle(theme.palette.ink4)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+
                     section("Appearance") {
                         row("Theme", "Follows system")
                     }
