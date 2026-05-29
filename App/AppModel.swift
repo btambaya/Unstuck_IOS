@@ -66,12 +66,26 @@ final class AppModel {
         // Register the APNs token (now or when it arrives).
         PushRegistrar.shared.onToken = { [weak self] hex in self?.registerPush(hex) }
         if let existing = PushRegistrar.shared.apnsTokenHex { registerPush(existing) }
+
+        // Register Live Activity per-update push tokens as they're issued.
+        LiveActivityController.shared.onPushToken = { [weak self] activityId, token in
+            self?.registerLiveActivityToken(activityId: activityId, token: token)
+        }
     }
 
     func registerPush(_ tokenHex: String) {
         guard let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
         Task { try? await coord.push.register(deviceId: deviceId, apnsToken: tokenHex) }
+    }
+
+    func registerLiveActivityToken(activityId: String, token: String) {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        Task {
+            try? await coord.push.registerLiveActivityToken(
+                userId: uid, deviceId: deviceId, activityId: activityId, pushToken: token, sessionId: nil)
+        }
     }
 
     private func observeAuth(_ coord: SyncCoordinator) async {

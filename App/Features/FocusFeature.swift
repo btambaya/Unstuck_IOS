@@ -76,6 +76,7 @@ struct FocusView: View {
     @State private var showReasons = false
     @State private var showCapture = false
     @State private var captureText = ""
+    @State private var soundOn = true
 
     private let reasons = ["Bathroom", "Distracted", "Switching tasks", "Quick break", "Interrupted"]
 
@@ -96,6 +97,12 @@ struct FocusView: View {
             Button("Just pause", role: .cancel) { fm?.pause(); coordinateCheckin() }
         }
         .sheet(isPresented: $showCapture) { captureSheet }
+        .onDisappear { AmbientAudio.shared.stop() }
+    }
+
+    private func updateAudio(_ fm: FocusModel) {
+        if soundOn && fm.treatment == .ambient { AmbientAudio.shared.start() }
+        else { AmbientAudio.shared.stop() }
     }
 
     @ViewBuilder
@@ -121,9 +128,15 @@ struct FocusView: View {
                 Spacer()
                 SectionLabel("Focus")
                 Spacer()
-                Button { showCapture = true } label: {
-                    Image(systemName: "square.and.pencil").font(.system(size: 17)).foregroundStyle(theme.palette.ink3)
-                }.buttonStyle(.plain)
+                HStack(spacing: 16) {
+                    Button { soundOn.toggle(); updateAudio(fm) } label: {
+                        Image(systemName: soundOn ? "speaker.wave.2" : "speaker.slash")
+                            .font(.system(size: 16)).foregroundStyle(theme.palette.ink3)
+                    }.buttonStyle(.plain)
+                    Button { showCapture = true } label: {
+                        Image(systemName: "square.and.pencil").font(.system(size: 17)).foregroundStyle(theme.palette.ink3)
+                    }.buttonStyle(.plain)
+                }
             }
 
             if fm.treatment != .monk {
@@ -169,6 +182,8 @@ struct FocusView: View {
             Spacer()
         }
         .padding(20)
+        .onAppear { updateAudio(fm) }
+        .onChange(of: fm.treatment) { updateAudio(fm) }
     }
 
     @ViewBuilder

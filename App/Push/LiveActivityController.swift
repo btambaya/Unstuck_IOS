@@ -1,7 +1,9 @@
 // Starts / updates / ends the focus Live Activity (Dynamic Island + lock
 // screen). The timer self-ticks in the widget via Text(timerInterval:),
-// so we only push state transitions (start / pause / resume / end). Local
-// updates only; APNs push-to-update is a later backstop.
+// so we only push state transitions (start / pause / resume / end)
+// locally. The per-activity APNs push token is captured + handed to
+// `onPushToken` so the server can update it as a backstop when the app is
+// suspended/killed.
 
 import Foundation
 import ActivityKit
@@ -11,6 +13,10 @@ import UnstuckShared
 final class LiveActivityController {
     static let shared = LiveActivityController()
     private var activity: Activity<FocusSessionAttributes>?
+    private var tokenTask: Task<Void, Never>?
+
+    /// (activityId, hex push token) — set by AppModel to register the token.
+    var onPushToken: ((String, String) -> Void)?
 
     func start(taskName: String, sessionStartMs: Double, estimateMin: Int) {
         guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
@@ -21,7 +27,22 @@ final class LiveActivityController {
         activity = try? Activity.request(
             attributes: attributes,
             content: ActivityContent(state: state, staleDate: nil),
-            pushType: nil)
+            pushType: .token)
+        observePushToken()
+    }
+
+    private func observePushToken() {
+        tokenTask?.cancel()
+        guard let activity else { return }
+        let id = activity.id
+        if #available(iOS 17.2, *) {
+            tokenTask = Task { [weak self] in
+                for await tokenData in activity.pushTokenUpdates {
+                    let hex = tokenData.map { String(format: "%02x", $0) }.joined()
+                    await MainActor.run { self?.onPushToken?(id, hex) }
+                }
+            }
+        }
     }
 
     func update(sessionStartMs: Double, paused: Bool, estimateMin: Int) {
@@ -32,6 +53,7 @@ final class LiveActivityController {
     }
 
     func end() {
+        tokenTask?.cancel(); tokenTask = nil
         guard let finished = activity else { return }
         Task { await finished.end(nil, dismissalPolicy: .immediate) }
         activity = nil
