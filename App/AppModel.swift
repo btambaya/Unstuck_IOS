@@ -19,6 +19,16 @@ final class AppModel {
     private(set) var liveStore: LiveSessionStore?
     var signedIn = false
     var configured = true
+    // Local first-run flag. Struggles are stored locally for now; syncing
+    // them to user_preferences.adhd_struggles is a follow-up (that table
+    // is PK'd on user_id, so it needs a dedicated upsert path).
+    var onboarded = UserDefaults.standard.bool(forKey: "unstuck.onboarded")
+
+    func completeOnboarding(struggles: [String]) {
+        UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
+        UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
+        onboarded = true
+    }
 
     func start() async {
         guard coordinator == nil else { return }

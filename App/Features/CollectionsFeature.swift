@@ -59,7 +59,7 @@ struct ListsView: View {
             ScrollView {
                 LazyVStack(spacing: 10) {
                     ForEach(vm.collections) { col in
-                        NavigationLink { CollectionDetailView(collection: col) } label: { row(col) }
+                        NavigationLink { CollectionDetailView(vm: vm, id: col.id) } label: { row(col) }
                             .buttonStyle(.plain)
                     }
                 }
@@ -98,18 +98,30 @@ struct ListsView: View {
 struct CollectionDetailView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
-    let collection: ItemCollection
+    let vm: CollectionsModel
+    let id: String
     @State private var newItem = ""
+
+    // Live row from the observed store — added items appear immediately.
+    private var collection: ItemCollection? { vm.collections.first { $0.id == id } }
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                ForEach(collection.items) { item in
-                    HStack(spacing: 10) {
-                        Image(systemName: (item.pinned ?? false) ? "pin.fill" : "circle.fill")
-                            .font(.system(size: 6)).foregroundStyle(theme.palette.ink4)
-                        Text(item.body).font(UFont.sans(15)).foregroundStyle(theme.palette.ink)
-                        Spacer()
+                if let collection {
+                    ForEach(collection.items) { item in
+                        Button { togglePinned(item, in: collection) } label: {
+                            HStack(spacing: 10) {
+                                Image(systemName: (item.pinned ?? false) ? "pin.fill" : "circle.fill")
+                                    .font(.system(size: 6)).foregroundStyle((item.pinned ?? false) ? theme.palette.coral : theme.palette.ink4)
+                                Text(item.body)
+                                    .font(UFont.sans(15))
+                                    .strikethrough(item.done ?? false)
+                                    .foregroundStyle((item.done ?? false) ? theme.palette.ink3 : theme.palette.ink)
+                                Spacer()
+                            }
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
                 HStack {
@@ -127,15 +139,22 @@ struct CollectionDetailView: View {
             .padding(20)
         }
         .background(theme.palette.bg.ignoresSafeArea())
-        .navigationTitle(collection.name)
+        .navigationTitle(collection?.name ?? "List")
     }
 
     private func addItem() {
         let trimmed = newItem.trimmingCharacters(in: .whitespacesAndNewlines)
         newItem = ""
-        guard !trimmed.isEmpty, let write = model.write else { return }
+        guard !trimmed.isEmpty, let collection, let write = model.write else { return }
         var next = collection
         next.items.append(CollectionItem(id: newUUID(), body: trimmed, at: AppModel.isoNow()))
+        Task { try? await write.upsertCollection(next, nowISO: AppModel.isoNow()) }
+    }
+
+    private func togglePinned(_ item: CollectionItem, in collection: ItemCollection) {
+        guard let write = model.write, let idx = collection.items.firstIndex(where: { $0.id == item.id }) else { return }
+        var next = collection
+        next.items[idx].pinned = !(item.pinned ?? false)
         Task { try? await write.upsertCollection(next, nowISO: AppModel.isoNow()) }
     }
 }

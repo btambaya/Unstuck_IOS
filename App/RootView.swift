@@ -9,10 +9,12 @@ struct RootView: View {
         Group {
             if !model.configured {
                 ConfigNeededView()
-            } else if model.signedIn {
-                MainTabScaffold()
-            } else {
+            } else if !model.signedIn {
                 AuthView()
+            } else if !model.onboarded {
+                OnboardingView()
+            } else {
+                MainTabScaffold()
             }
         }
         .background(theme.palette.bg.ignoresSafeArea())
