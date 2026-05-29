@@ -51,6 +51,7 @@ struct TodayView: View {
     @Environment(\.uTheme) private var theme
     @State private var vm: TodayModel?
     @State private var showSettings = false
+    @State private var showPalette = false
 
     var body: some View {
         NavigationStack {
@@ -71,10 +72,14 @@ struct TodayView: View {
             }
             .background(theme.palette.bg.ignoresSafeArea())
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showPalette = true } label: { Image(systemName: "magnifyingglass") }
+                }
                 ToolbarItem(placement: .primaryAction) {
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
             }
+            .sheet(isPresented: $showPalette) { CommandPalette() }
             .sheet(isPresented: $showSettings) { SettingsView() }
         }
         .task {
