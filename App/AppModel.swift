@@ -158,6 +158,36 @@ final class AppModel {
 
     var calendar: CalendarClient? { coordinator?.calendar }
 
+    /// Create a cal_block (block-time or scheduled task) + push it to Google
+    /// when a connection exists, persisting the returned event id.
+    func createBlock(_ block: CalBlock) {
+        guard let write = coordinator?.write else { return }
+        Task {
+            try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
+            guard let calendar = coordinator?.calendar, let database = db,
+                  let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
+            let range = blockToIsoRange(block)
+            if let eventId = try? await calendar.insertEvent(
+                connectionId: conn.id, calendarId: conn.selectedCalendarIds.first ?? "primary",
+                summary: block.taskName, start: range.start, end: range.end) {
+                var updated = block
+                updated.externalEventId = eventId
+                try? await write.upsertCalBlock(updated, nowISO: Self.isoNow())
+            }
+        }
+    }
+
+    /// Schedule a task into the first free slot on `date` (default today).
+    func scheduleTask(_ task: TaskItem, on date: Date = Date()) {
+        let blocks = (try? db?.blocks(forTask: task.id)) ?? []
+        let iso = Clock.dateISO(date)
+        let slots = findFreeSlotsForDate(blocks, durationMin: task.estimateMin, isoDate: iso, now: date, limit: 1)
+        let startTime = slots.first?.startTime ?? "09:00"
+        let block = CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
+                             startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task)
+        createBlock(block)
+    }
+
     /// Ingest pulled Google events as local external cal_blocks (g_ ids;
     /// not synced — they live device-side, preserved across hydrate).
     func ingestExternalBlocks(_ events: [ExternalEvent]) {

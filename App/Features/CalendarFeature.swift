@@ -45,6 +45,7 @@ struct CalendarView: View {
     @State private var vm: CalendarModel?
     @State private var connecting = false
     @State private var connectError: String?
+    @State private var showBlock = false
 
     var body: some View {
         NavigationStack {
@@ -54,12 +55,16 @@ struct CalendarView: View {
             .background(theme.palette.bg.ignoresSafeArea())
             .navigationTitle("Calendar")
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showBlock = true } label: { Image(systemName: "plus") }
+                }
                 ToolbarItem(placement: .primaryAction) {
                     if vm?.connected == true {
                         Button { Task { await model.pullGoogleCalendar() } } label: { Image(systemName: "arrow.clockwise") }
                     }
                 }
             }
+            .sheet(isPresented: $showBlock) { BlockTimeSheet() }
         }
         .task {
             guard vm == nil, let db = model.db else { return }
@@ -144,5 +149,42 @@ struct CalendarView: View {
         .background(theme.palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).stroke(theme.palette.line))
+    }
+}
+
+// Create a time block (no task). Pushes to Google when connected.
+struct BlockTimeSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.dismiss) private var dismiss
+    @State private var label = ""
+    @State private var day = Date()
+    @State private var start = Date()
+    @State private var duration = 60
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Label (e.g. Lunch, Gym)", text: $label)
+                DatePicker("Day", selection: $day, displayedComponents: .date)
+                DatePicker("Start", selection: $start, displayedComponents: .hourAndMinute)
+                Stepper("Duration \(duration)m", value: $duration, in: 15...480, step: 15)
+            }
+            .navigationTitle("Block time")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Add") { save() } }
+            }
+        }
+    }
+
+    private func save() {
+        let iso = Clock.dateISO(day)
+        let c = Calendar.current.dateComponents([.hour, .minute], from: start)
+        let hhmm = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
+        let block = CalBlock(id: newUUID(), taskId: nil,
+                             taskName: label.trimmingCharacters(in: .whitespaces).isEmpty ? "Busy" : label,
+                             startTime: hhmm, durationMinutes: duration, date: iso, kind: .task)
+        model.createBlock(block)
+        dismiss()
     }
 }

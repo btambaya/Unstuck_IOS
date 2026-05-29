@@ -67,10 +67,14 @@ struct TaskEditor: View {
                         if untilOn { DatePicker("Until", selection: $until, displayedComponents: .date) }
                     }
                 }
-                if task != nil {
+                if let task {
                     Section {
+                        Button("Schedule for today") {
+                            model.scheduleTask(task)
+                            dismiss()
+                        }
                         Button("Delete task", role: .destructive) {
-                            if let id = task?.id { model.deleteTask(id) }
+                            model.deleteTask(task.id)
                             dismiss()
                         }
                     }

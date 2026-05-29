@@ -34,6 +34,15 @@ public extension AppDatabase {
         }
     }
 
+    /// The user's first calendar connection (for choosing a Google push target).
+    func firstCalendarConnection() throws -> CalendarConnection? {
+        try writer.read { try CalendarConnection.fetchOne($0) }
+    }
+
+    func blocks(forTask id: String) throws -> [CalBlock] {
+        try writer.read { db in try CalBlock.filter(Column("taskId") == id).fetchAll(db) }
+    }
+
     /// Wipe every synced table (sign-out / shared-device privacy). Local-
     /// only tables (outbox, live_session) are intentionally left alone.
     func wipeSyncedTables() throws {
