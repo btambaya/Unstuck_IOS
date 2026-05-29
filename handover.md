@@ -5,18 +5,31 @@ phases land. Newest status at the top.
 
 ## Where things stand (2026-05-29)
 
-**Foundation + 3 feature slices DONE; app builds for iOS simulator.**
-P0 + P1 (Core/Data/Sync) + UnstuckDesign + app shell, plus the first
-feature surfaces wired end-to-end through the live GRDB store:
+**Foundation + 7 feature slices + push-registration vertical + the
+notification DB backend are in; app builds for iOS simulator.** Surfaces
+wired end-to-end through the live store (repository → ValueObservation →
+UnstuckCore logic → SwiftUI → WriteThrough):
 - **Tasks** (P2): live list + view-filter chips (visibleTasks) + create +
-  done-toggle (applyCompletion) via WriteThrough.
+  done-toggle (applyCompletion).
 - **Today** (P2): Start Next + Up Next (pickStartNext/pickUpNext).
 - **Focus** (P3 core): live timer on FocusTimer + LiveSessionStore +
-  Session writeback; full-screen from Today's "Begin focus".
+  Session writeback.
+- **Collections** (P5): live lists + new-list + detail add-item.
+- **Calendar** (P4, read): cal_blocks agenda grouped by date.
+- **Settings** (P6): account + sign-out + app info.
+- **Push registration** (#33): PushAppDelegate → PushClient →
+  register-push-token → device_tokens.
 
-These prove the repeatable vertical-slice pattern (repository →
-ValueObservation → UnstuckCore logic → SwiftUI → WriteThrough). Remaining
-P2–P6 surfaces + native surfaces (#33) follow the same shape.
+Backend (in `../unstuck`, applied to the live project): migrations 014–016
++ the register-push-token Edge Function (committed; deploy is a manual step).
+
+## Manual steps (outside the agent's authorization)
+1. Deploy the push function: `supabase functions deploy register-push-token`.
+2. Put the Supabase anon key in `App/Secrets.xcconfig` so the app leaves the
+   setup screen + sync runs.
+3. Enable target capabilities (signing): Push, Time-Sensitive, App Groups
+   `group.tech.csalliance.unstuck`, Live Activities; + an APNs p8 key in
+   Supabase secrets when the send-side lands.
 
 - `UnstuckDesign`: exact oklch→sRGB converter (unit-tested), the full
   brand-v2 palette (light+dark) + `UTheme` env, fonts, and components
