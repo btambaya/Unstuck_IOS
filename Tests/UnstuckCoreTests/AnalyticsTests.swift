@@ -127,6 +127,22 @@ final class CaptureBreakdownTests: XCTestCase {
 }
 
 final class TimeOfDayHeatmapTests: XCTestCase {
+    // timeOfDayHeatmap buckets sessions by LOCAL hour-of-day, so the UTC fixture
+    // timestamps below only land in the expected hour bucket when local == UTC.
+    // Pin the process default to UTC rather than relying on an external `TZ=UTC`.
+    private var savedTimeZone: TimeZone!
+
+    override func setUp() {
+        super.setUp()
+        savedTimeZone = NSTimeZone.default
+        NSTimeZone.default = TimeZone(identifier: "UTC")!
+    }
+
+    override func tearDown() {
+        NSTimeZone.default = savedTimeZone
+        super.tearDown()
+    }
+
     func testSkipsWeekendsAndClamps() {
         let sessions = [
             sess("s1", taskId: "t", actualSec: 3600, completedAt: "2026-05-23T10:00:00.000Z"), // Sat — skipped

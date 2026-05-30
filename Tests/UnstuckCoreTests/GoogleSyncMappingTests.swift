@@ -53,8 +53,25 @@ final class ExternalEventToBlockTests: XCTestCase {
 }
 
 final class BlockToIsoRangeTests: XCTestCase {
+    // blockToIsoRange anchors the civil date+time in the LOCAL zone (Calendar.current),
+    // so the expected UTC strings only hold when local == UTC. Pin the process default
+    // to UTC for this test instead of relying on an external `TZ=UTC` env var, so it
+    // passes on any developer's machine.
+    private var savedTimeZone: TimeZone!
+
+    override func setUp() {
+        super.setUp()
+        savedTimeZone = NSTimeZone.default
+        NSTimeZone.default = TimeZone(identifier: "UTC")!
+    }
+
+    override func tearDown() {
+        NSTimeZone.default = savedTimeZone
+        super.tearDown()
+    }
+
     func testBuildsUtcRangeFromDateAndTime() {
-        // Under TZ=UTC, local civil time == UTC.
+        // Under TZ=UTC (pinned above), local civil time == UTC.
         let b = mkBlock(taskId: "t", startTime: "09:00", durationMinutes: 90, date: "2026-05-21")
         let r = blockToIsoRange(b)
         XCTAssertEqual(r.start, "2026-05-21T09:00:00.000Z")
