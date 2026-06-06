@@ -11,8 +11,10 @@ public struct Palette: Sendable {
     public let primary, primarySoft, primaryDeep: Color
     public let coral, coralSoft, coralDeep: Color
     public let violet, blue, green, amber, red: Color
-    /// Darker, readable "ink" green for small status text (e.g. "done by … ✓").
-    public let greenInk: Color
+    /// Soft fills + readable "ink" shades for status chips / rollups (Android parity).
+    public let greenInk, greenSoft, blueSoft, blueInk, amberSoft, amberInk: Color
+    /// Start-Next hero gradient (lavender→pink light, indigo→plum dark).
+    public let heroGradient: [Color]
 
     public static let light = Palette(
         bg: Color(hex: "#FAFAF7"), bg2: Color(hex: "#F4F2EC"), surface: Color(hex: "#FFFFFF"),
@@ -21,12 +23,15 @@ public struct Palette: Sendable {
         line: OKLCH(0.92, 0.005, 280).color, line2: OKLCH(0.88, 0.008, 280).color,
         primary: OKLCH(0.58, 0.13, 280).color, primarySoft: OKLCH(0.93, 0.04, 280).color,
         primaryDeep: OKLCH(0.42, 0.13, 280).color,
-        coral: OKLCH(0.72, 0.13, 35).color, coralSoft: OKLCH(0.94, 0.05, 40).color,
+        coral: Color(hex: "#E89077"), coralSoft: OKLCH(0.94, 0.05, 40).color,
         coralDeep: OKLCH(0.48, 0.16, 35).color,
         violet: OKLCH(0.55, 0.13, 300).color, blue: OKLCH(0.70, 0.10, 240).color,
         green: OKLCH(0.72, 0.10, 155).color, amber: OKLCH(0.80, 0.13, 75).color,
         red: OKLCH(0.66, 0.13, 25).color,
-        greenInk: OKLCH(0.40, 0.10, 155).color)
+        greenInk: OKLCH(0.40, 0.10, 155).color, greenSoft: OKLCH(0.94, 0.04, 155).color,
+        blueSoft: OKLCH(0.94, 0.03, 240).color, blueInk: OKLCH(0.40, 0.10, 240).color,
+        amberSoft: OKLCH(0.95, 0.05, 75).color, amberInk: OKLCH(0.45, 0.13, 75).color,
+        heroGradient: [OKLCH(0.96, 0.04, 280).color, OKLCH(0.95, 0.05, 320).color])
 
     public static let dark = Palette(
         bg: OKLCH(0.205, 0.025, 270).color, bg2: OKLCH(0.24, 0.03, 270).color, surface: OKLCH(0.26, 0.03, 270).color,
@@ -35,12 +40,15 @@ public struct Palette: Sendable {
         line: OKLCH(0.34, 0.025, 270).color, line2: OKLCH(0.38, 0.03, 270).color,
         primary: OKLCH(0.72, 0.13, 280).color, primarySoft: OKLCH(0.32, 0.07, 280).color,
         primaryDeep: OKLCH(0.82, 0.12, 280).color,
-        coral: OKLCH(0.72, 0.13, 35).color, coralSoft: OKLCH(0.36, 0.08, 35).color,
-        coralDeep: OKLCH(0.48, 0.16, 35).color,
+        coral: Color(hex: "#E89077"), coralSoft: OKLCH(0.36, 0.08, 35).color,
+        coralDeep: OKLCH(0.58, 0.16, 35).color,
         violet: OKLCH(0.74, 0.13, 300).color, blue: OKLCH(0.70, 0.10, 240).color,
         green: OKLCH(0.72, 0.10, 155).color, amber: OKLCH(0.80, 0.13, 75).color,
         red: OKLCH(0.66, 0.13, 25).color,
-        greenInk: OKLCH(0.86, 0.10, 155).color)
+        greenInk: OKLCH(0.86, 0.10, 155).color, greenSoft: OKLCH(0.34, 0.07, 155).color,
+        blueSoft: OKLCH(0.34, 0.06, 240).color, blueInk: OKLCH(0.86, 0.08, 240).color,
+        amberSoft: OKLCH(0.36, 0.08, 75).color, amberInk: OKLCH(0.88, 0.11, 75).color,
+        heroGradient: [OKLCH(0.34, 0.09, 280).color, OKLCH(0.30, 0.07, 322).color])
 
     /// Resolve a life-area / collection color token (indigo, coral, …) to
     /// a Color. Mirrors the web area palette mapping.

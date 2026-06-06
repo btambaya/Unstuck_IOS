@@ -1,6 +1,7 @@
-// The 5-item bottom bar from the iOS design: Today · Tasks · [+FAB] ·
-// Calendar · Lists. The center "+" is a floating coral FAB overlaid on a
-// 4-tab TabView; it opens the New-Task sheet via the shared router.
+// Root scaffold matching the Android design: a custom bottom nav
+// (Today · Tasks · [coral FAB] · Calendar · Collections) with a pill active
+// indicator + a floating rounded-square coral FAB. The selected tab's screen
+// fills the area above the bar; each screen keeps its own NavigationStack.
 
 import SwiftUI
 import UnstuckCore
@@ -13,33 +14,34 @@ struct MainTabScaffold: View {
     var body: some View {
         @Bindable var router = model.router
         ZStack(alignment: .bottom) {
-            TabView(selection: $router.tab) {
-                TodayView()
-                    .tabItem { Label("Today", systemImage: "sun.max") }.tag(AppRouter.Tab.today)
-                TasksView()
-                    .tabItem { Label("Tasks", systemImage: "checklist") }.tag(AppRouter.Tab.tasks)
-                CalendarView()
-                    .tabItem { Label("Calendar", systemImage: "calendar") }.tag(AppRouter.Tab.calendar)
-                ListsView()
-                    .tabItem { Label("Lists", systemImage: "tray.full") }.tag(AppRouter.Tab.lists)
+            tabContent(router.tab)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            BottomNavBar(active: router.tab,
+                         onSelect: { router.tab = $0 },
+                         onFab: { router.present(.newTask) })
+        }
+            .background(theme.palette.bg.ignoresSafeArea())
+            .sheet(item: $router.activeSheet) { sheet in
+                switch sheet {
+                case .newTask: TaskEditor(task: nil, existingBlocks: [])
+                case .quickCapture: TaskEditor(task: nil, existingBlocks: [])
+                }
             }
-            .tint(theme.palette.primary)
+            .sheet(isPresented: $router.showFeedback) {
+                FeedbackSheet(screen: screenLabel(router.tab))
+            }
+            .fullScreenCover(item: $router.focusTask) { task in
+                FocusView(task: task)
+            }
+    }
 
-            fab
-        }
-        // The feedback bubble lives INSIDE each tab (.feedbackBubble()) so a
-        // pushed detail screen covers it; the composer is presented here.
-        .sheet(item: $router.activeSheet) { sheet in
-            switch sheet {
-            case .newTask: TaskEditor(task: nil, existingBlocks: [])
-            case .quickCapture: TaskEditor(task: nil, existingBlocks: [])
-            }
-        }
-        .sheet(isPresented: $router.showFeedback) {
-            FeedbackSheet(screen: screenLabel(router.tab))
-        }
-        .fullScreenCover(item: $router.focusTask) { task in
-            FocusView(task: task)
+    @ViewBuilder
+    private func tabContent(_ tab: AppRouter.Tab) -> some View {
+        switch tab {
+        case .today: TodayView()
+        case .tasks: TasksView()
+        case .calendar: CalendarView()
+        case .lists: ListsView()
         }
     }
 
@@ -50,20 +52,5 @@ struct MainTabScaffold: View {
         case .calendar: return "calendar"
         case .lists: return "lists"
         }
-    }
-
-    private var fab: some View {
-        Button { model.router.present(.newTask) } label: {
-            Image(systemName: "plus")
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 56, height: 56)
-                .background(theme.palette.coralDeep)
-                .clipShape(Circle())
-                .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
-        }
-        .buttonStyle(.plain)
-        .offset(y: -28)
-        .accessibilityLabel("New task")
     }
 }
