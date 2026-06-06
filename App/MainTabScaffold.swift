@@ -9,6 +9,7 @@ import UnstuckDesign
 struct MainTabScaffold: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
+    @State private var showFeedback = false
 
     var body: some View {
         @Bindable var router = model.router
@@ -25,6 +26,13 @@ struct MainTabScaffold: View {
             }
             .tint(theme.palette.primary)
 
+            // Floating beta-feedback bubble (bottom-trailing, lifted above the
+            // tab bar). Modally covered when a sheet / focus cover is up.
+            FeedbackBubble { showFeedback = true }
+                .frame(maxWidth: .infinity, alignment: .trailing)
+                .padding(.trailing, 16)
+                .padding(.bottom, 64)
+
             fab
         }
         .sheet(item: $router.activeSheet) { sheet in
@@ -33,8 +41,20 @@ struct MainTabScaffold: View {
             case .quickCapture: TaskEditor(task: nil, existingBlocks: [])
             }
         }
+        .sheet(isPresented: $showFeedback) {
+            FeedbackSheet(screen: screenLabel(router.tab))
+        }
         .fullScreenCover(item: $router.focusTask) { task in
             FocusView(task: task)
+        }
+    }
+
+    private func screenLabel(_ tab: AppRouter.Tab) -> String {
+        switch tab {
+        case .today: return "today"
+        case .tasks: return "tasks"
+        case .calendar: return "calendar"
+        case .lists: return "lists"
         }
     }
 
