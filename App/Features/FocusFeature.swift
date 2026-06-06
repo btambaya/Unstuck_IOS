@@ -66,6 +66,9 @@ final class FocusModel {
     func setTreatment(_ t: FocusTreatment) { live = FocusTimer.setTreatment(live, t); persist() }
     var sessionId: String? { live.id }
 
+    /// Extend the session estimate (overrun check-in: "+10" / "in the zone").
+    func extendFocus(_ minutes: Int) { live = FocusTimer.extend(live, minutes: minutes); persist() }
+
     private func persist() {
         try? store?.set(live.sessionStart == nil ? nil : live)
     }
@@ -184,6 +187,20 @@ struct FocusView: View {
                     if fm.treatment == .cockpit {
                         Text("Estimate \(task.estimateMin)m").font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
                     }
+                    // Overrun check-in (web/Android parity): past the estimate, offer to
+                    // extend or stop — not just a recolored timer.
+                    if state == .overrun && !fm.live.paused {
+                        VStack(spacing: 8) {
+                            Text("Past your estimate — still going well?")
+                                .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                            HStack(spacing: 8) {
+                                overrunButton("+10 min") { fm.extendFocus(10) }
+                                overrunButton("In the zone") { fm.extendFocus(15) }
+                                overrunButton("Stop here") { finishSession(markDone: false) }
+                            }
+                        }
+                        .padding(.top, 10)
+                    }
                 }
             }
 
@@ -212,6 +229,15 @@ struct FocusView: View {
             UButton("Done") { showFinish = true }
         }
         .padding(.horizontal, 32)
+    }
+
+    private func overrunButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title).font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink)
+                .padding(.horizontal, 14).padding(.vertical, 8)
+                .background(theme.palette.surface).clipShape(Capsule())
+                .overlay(Capsule().stroke(theme.palette.line2))
+        }.buttonStyle(.plain)
     }
 
     /// Finish the live session, accumulate focused time, and optionally complete
