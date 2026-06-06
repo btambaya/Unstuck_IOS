@@ -25,6 +25,13 @@ public extension AppDatabase {
         _ = try writer.write { try type.deleteOne($0, key: id) }
     }
 
+    /// Read a single row by primary key (nil if absent). Used by the realtime
+    /// mirror to preserve client-only fields (collection members/myRole) across
+    /// an incoming server row that carries neither.
+    func fetchById<T: FetchableRecord & PersistableRecord & Sendable>(_ type: T.Type, id: String) throws -> T? {
+        try writer.read { try type.fetchOne($0, key: id) }
+    }
+
     /// Locally-cached Google external blocks (kind == external) — preserved
     /// across a cal_blocks hydrate since their ids aren't UUIDs and never
     /// live on the server.

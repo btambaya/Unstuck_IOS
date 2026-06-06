@@ -71,6 +71,23 @@ public struct AuthService: Sendable {
         client.auth.currentSession?.user.id.uuidString
     }
 
+    /// Signed-in user's email (denormalized into feedback + "who's on it" labels).
+    public var currentEmail: String? {
+        client.auth.currentSession?.user.email
+    }
+
+    /// Display name from auth metadata, falling back to the email's local-part.
+    /// Mirrors the web `currentUserName` helper used for accountability chips.
+    public var currentUserName: String? {
+        let meta = client.auth.currentSession?.user.userMetadata
+        if let v = meta?["full_name"], case let .string(s) = v, !s.isEmpty { return s }
+        if let v = meta?["display_name"], case let .string(s) = v, !s.isEmpty { return s }
+        if let email = currentEmail, let at = email.firstIndex(of: "@") {
+            return String(email[..<at])
+        }
+        return currentEmail
+    }
+
     public var authStateChanges: AsyncStream<(event: AuthChangeEvent, session: Supabase.Session?)> {
         client.auth.authStateChanges
     }

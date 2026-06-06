@@ -19,6 +19,8 @@ public actor SyncCoordinator {
     public nonisolated let push: PushClient
     public nonisolated let notifications: NotificationsClient
     public nonisolated let preferences: PreferencesClient
+    public nonisolated let share: CollectionShareClient
+    public nonisolated let feedback: FeedbackClient
     private let hydrator: Hydrator
     private let realtime: RealtimeMirror
     private let flusher: OutboxFlusher
@@ -34,6 +36,8 @@ public actor SyncCoordinator {
         self.push = PushClient(provider.client)
         self.notifications = NotificationsClient(provider.client)
         self.preferences = PreferencesClient(provider.client)
+        self.share = CollectionShareClient(provider.client)
+        self.feedback = FeedbackClient(provider.client)
         self.hydrator = Hydrator(gateway: gateway, db: db)
         self.realtime = RealtimeMirror(client: provider.client, db: db)
         self.flusher = OutboxFlusher(gateway: gateway, db: db)
@@ -75,8 +79,11 @@ public actor SyncCoordinator {
             // Push offline edits first so local changes reach the server,
             // then pull server-canonical, then mirror live.
             await flusher.flush(userId: uid)
-            await hydrator.hydrate()
-            await realtime.subscribeAll(userId: uid)
+            await hydrator.hydrate(userId: uid)
+            let hydrator = self.hydrator
+            await realtime.subscribeAll(userId: uid, onMembersChanged: {
+                await hydrator.hydrateCollections(userId: uid)
+            })
 
         case .signedOut:
             await realtime.unsubscribeAll()

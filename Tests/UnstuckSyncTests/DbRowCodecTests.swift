@@ -55,6 +55,53 @@ final class DbRowCodecTests: XCTestCase {
         XCTAssertEqual(back, task)
     }
 
+    // ── Move-to-task / accountability columns (migration 025) ───────────────
+    func testTaskSourceColumnsSnakeCase() throws {
+        let task = TaskItem(id: "t", name: "N", estimateMin: 25, createdAt: "c", updatedAt: "u",
+                            sourceCollectionId: "cid", sourceItemId: "iid", dueAt: "2026-06-15T18:00:00.000Z")
+        let dict = try jsonObject(TaskRow(task))
+        XCTAssertEqual(dict["source_collection_id"] as? String, "cid")
+        XCTAssertEqual(dict["source_item_id"] as? String, "iid")
+        XCTAssertEqual(dict["due_at"] as? String, "2026-06-15T18:00:00.000Z")
+        XCTAssertNil(dict["sourceCollectionId"])      // camelCase must NOT leak
+    }
+
+    func testTaskSourceColumnsRoundTrip() throws {
+        let task = TaskItem(id: "t", name: "N", estimateMin: 25, createdAt: "c", updatedAt: "u",
+                            sourceCollectionId: "cid-123", sourceItemId: "iid-456", dueAt: "2026-06-15T18:00:00.000Z")
+        let back = TaskRow(task).model()
+        XCTAssertEqual(back.sourceCollectionId, "cid-123")
+        XCTAssertEqual(back.sourceItemId, "iid-456")
+        XCTAssertEqual(back.dueAt, "2026-06-15T18:00:00.000Z")
+    }
+
+    func testTaskSourceColumnsNilEncodeAsNull() throws {
+        let dict = try jsonObject(TaskRow(TaskItem(id: "t", name: "N", estimateMin: 25, createdAt: "c", updatedAt: "u")))
+        // nil → explicit null (so an upsert CLEARS the link), never omitted.
+        XCTAssertTrue(dict["source_collection_id"] is NSNull)
+        XCTAssertTrue(dict["source_item_id"] is NSNull)
+        XCTAssertTrue(dict["due_at"] is NSNull)
+    }
+
+    // ── Collection sharing fields (migrations 020/026) ──────────────────────
+    func testCollectionArchivedRoundTrips() throws {
+        let col = ItemCollection(id: "c1", name: "Trip", color: "indigo", items: [], sortOrder: 0, archived: true)
+        let dict = try jsonObject(CollectionRow(col))
+        XCTAssertEqual(dict["archived"] as? Bool, true)
+        XCTAssertNil(dict["user_id"])                 // ownerId is decode-only — never encoded
+        XCTAssertEqual(CollectionRow(col).model().archived, true)
+    }
+
+    func testCollectionDecodesOwnerIdFromUserId() throws {
+        let json = """
+        {"id":"c1","name":"Trip","color":"indigo","subtitle":"","items":[],"sort_order":0,
+         "archived":false,"user_id":"owner-uuid"}
+        """.data(using: .utf8)!
+        let model = try JSONDecoder().decode(CollectionRow.self, from: json).model()
+        XCTAssertEqual(model.ownerId, "owner-uuid")
+        XCTAssertEqual(model.archived, false)
+    }
+
     func testDecodeServerShapedJson() throws {
         let json = """
         {"id":"t1","name":"N","estimate_min":30,"total_focused":0,"done":false,
@@ -104,8 +151,10 @@ final class DbRowCodecTests: XCTestCase {
                        Capture(id: "c", taskId: u, sessionId: u, tag: .idea, body: "b", at: "a"))
         XCTAssertEqual(ReasonLogRow(ReasonLog(id: "r", taskId: u, reason: "x", action: .switch, at: "a", durationSec: 10)).model(),
                        ReasonLog(id: "r", taskId: u, reason: "x", action: .switch, at: "a", durationSec: 10))
+        // archived normalizes nil → false on round-trip (web/Android parity), so
+        // the input carries archived: false for the identity comparison.
         let col = ItemCollection(id: "c", name: "Books", color: "indigo", subtitle: "read",
-                                 items: [CollectionItem(id: "i", body: "x", at: "a")], sortOrder: 1)
+                                 items: [CollectionItem(id: "i", body: "x", at: "a")], sortOrder: 1, archived: false)
         XCTAssertEqual(CollectionRow(col).model(), col)
         XCTAssertEqual(TagDbRow(TagRow(id: "t", name: "urgent", color: "coral", sortOrder: 0)).model(),
                        TagRow(id: "t", name: "urgent", color: "coral", sortOrder: 0))

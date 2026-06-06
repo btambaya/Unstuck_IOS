@@ -44,6 +44,9 @@ struct TaskRow: Codable, Sendable {
     var completedAt: String?
     var later: Bool
     var recurrence: Recurrence?
+    var sourceCollectionId: String?
+    var sourceItemId: String?
+    var dueAt: String?
     var createdAt: String
     var updatedAt: String
 
@@ -59,6 +62,9 @@ struct TaskRow: Codable, Sendable {
         case moveCount = "move_count"
         case completedAt = "completed_at"
         case later, recurrence
+        case sourceCollectionId = "source_collection_id"
+        case sourceItemId = "source_item_id"
+        case dueAt = "due_at"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
@@ -69,6 +75,7 @@ struct TaskRow: Codable, Sendable {
         comments = t.comments ?? []; intentWhen = t.intentWhen; intentThen = t.intentThen
         lifeArea = t.lifeArea; firstPhysicalAction = t.firstPhysicalAction; moveCount = t.moveCount ?? 0
         completedAt = t.completedAt; later = t.later ?? false; recurrence = t.recurrence
+        sourceCollectionId = t.sourceCollectionId; sourceItemId = t.sourceItemId; dueAt = t.dueAt
         createdAt = t.createdAt; updatedAt = t.updatedAt
     }
 
@@ -91,6 +98,9 @@ struct TaskRow: Codable, Sendable {
         try c.encode(completedAt, forKey: .completedAt)
         try c.encode(later, forKey: .later)
         try c.encode(recurrence, forKey: .recurrence)
+        try c.encode(sourceCollectionId, forKey: .sourceCollectionId)
+        try c.encode(sourceItemId, forKey: .sourceItemId)
+        try c.encode(dueAt, forKey: .dueAt)
         try c.encode(createdAt, forKey: .createdAt)
         try c.encode(updatedAt, forKey: .updatedAt)
     }
@@ -100,7 +110,9 @@ struct TaskRow: Codable, Sendable {
                  priority: priority, tags: tags, objectives: objectives, comments: comments,
                  intentWhen: intentWhen, intentThen: intentThen, lifeArea: lifeArea,
                  firstPhysicalAction: firstPhysicalAction, moveCount: moveCount, completedAt: completedAt,
-                 later: later, recurrence: recurrence, createdAt: createdAt, updatedAt: updatedAt)
+                 later: later, recurrence: recurrence,
+                 createdAt: createdAt, updatedAt: updatedAt,
+                 sourceCollectionId: sourceCollectionId, sourceItemId: sourceItemId, dueAt: dueAt)
     }
 }
 
@@ -273,15 +285,21 @@ struct CollectionRow: Codable, Sendable {
     var subtitle: String?
     var items: [CollectionItem]?
     var sortOrder: Int
+    var archived: Bool?
+    // ownerId rides on the raw row's `user_id` (migration 020) — decode-only.
+    // It never round-trips into an upsert payload (encode skips it; the write
+    // layer attaches user_id itself). The Hydrator derives members/myRole.
+    var ownerId: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, color, subtitle, items
+        case id, name, color, subtitle, items, archived
         case sortOrder = "sort_order"
+        case ownerId = "user_id"
     }
 
     init(_ c: ItemCollection) {
         id = c.id; name = c.name; color = c.color; subtitle = c.subtitle ?? ""
-        items = c.items; sortOrder = c.sortOrder
+        items = c.items; sortOrder = c.sortOrder; archived = c.archived ?? false; ownerId = nil
     }
 
     func encode(to encoder: Encoder) throws {
@@ -292,12 +310,15 @@ struct CollectionRow: Codable, Sendable {
         try c.encode(subtitle, forKey: .subtitle)
         try c.encode(items, forKey: .items)
         try c.encode(sortOrder, forKey: .sortOrder)
+        try c.encode(archived ?? false, forKey: .archived)
+        // ownerId/user_id intentionally NOT encoded — the write layer owns it.
     }
 
     func model() -> ItemCollection {
         ItemCollection(id: id, name: name, color: color,
                        subtitle: (subtitle?.isEmpty == true) ? nil : subtitle,
-                       items: items ?? [], sortOrder: sortOrder)
+                       items: items ?? [], sortOrder: sortOrder,
+                       ownerId: ownerId, archived: archived ?? false)
     }
 }
 
