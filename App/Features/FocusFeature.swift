@@ -21,7 +21,10 @@ final class FocusModel {
         self.store = store
         let existing: LiveSession? = (try? store?.get()) ?? nil
         // Resume-aware: start() continues a paused session for the same task.
-        live = FocusTimer.start(existing ?? .empty, taskId: task.id, estimateMin: task.estimateMin, now: Self.now())
+        // priorAccumulatedSec seeds the displayed timer so reopening after
+        // "Just finish" continues from the accumulated total, not 0 (Android parity).
+        live = FocusTimer.start(existing ?? .empty, taskId: task.id, estimateMin: task.estimateMin,
+                                priorAccumulatedSec: task.totalFocused, now: Self.now())
         persist()
         LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: task.estimateMin)
     }
@@ -91,6 +94,9 @@ struct FocusView: View {
         }
         .task {
             if fm == nil {
+                // Finalize a different task's in-flight session before this one
+                // overwrites the live session (so its elapsed time isn't lost).
+                model.finalizeDisplacedFocus(forNewTaskId: task.id)
                 fm = FocusModel(task: task, store: model.liveStore)
             }
         }

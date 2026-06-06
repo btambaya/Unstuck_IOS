@@ -15,6 +15,8 @@ final class AppRouter {
 
     var tab: Tab = .today
     var activeSheet: Sheet?
+    /// Beta-feedback composer presentation (driven by the floating bubble).
+    var showFeedback = false
     /// When set, the Focus surface is presented full-screen for this task.
     var focusTask: TaskItem?
 

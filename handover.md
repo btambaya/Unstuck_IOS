@@ -3,6 +3,46 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
+## Where things stand (2026-06-06) — aligned to current Android (shared collections + accountability + feedback)
+
+The iOS app predated Android's shared-collections / accountability /
+feedback feature set. This pass brought it up to a 1:1 replica of the
+**current** Android across sync + orchestration + the highest-value UI:
+
+- **Sync layer (UnstuckSync)** — `CollectionShareClient` (share/unshare/
+  cancelInvite/leave/listMembers via the `share-collection` edge fn; atomic
+  item RPCs `collection_add_item`/`_update_item`/`_remove_item`/
+  `_set_item_flag`/`_set_item_promotion`; `updateCollectionFields`
+  metadata-only UPDATE; `collection-task-done`); `FeedbackClient` (one-way
+  insert to `feedback`, platform `ios`). `DbRowCodec.TaskRow` gained
+  `source_collection_id`/`source_item_id`/`due_at` (explicit-null);
+  `CollectionRow` gained `archived` + decode-only `ownerId` (from `user_id`).
+  `Hydrator.hydrateCollections(userId:)` joins `collection_members` →
+  members[]/myRole. `RealtimeMirror` subscribes collections WITHOUT the
+  user_id filter (shared rows arrive via RLS, members/myRole preserved) +
+  a `collection_members` channel that re-hydrates. `AuthService` exposes
+  `currentEmail`/`currentUserName`. `WriteThrough.deleteCollection`.
+- **Orchestration (App/AppModel+Collections.swift)** — `isShared`/`isOwner`/
+  `canEdit` (uid-guarded routing), `mutateCollection`/`mutateCollectionItem`
+  (own → outbox upsert, shared → optimistic local + atomic RPC), collection
+  + item CRUD, `moveItemToTask(SELF/LOOP)` + `markItemPromoted`, `toggleDone`
+  + `finishFocus` with the `collection-task-done` hook, sharing proxies,
+  `sendFeedback`.
+- **UI (Phase 4)** — in-app **feedback bubble** + composer (MainTabScaffold);
+  **Collections** rebuilt 1:1 (overview grid w/ SHARED badge + Archived
+  filter + search; detail rename/recolor/archive/delete/leave; item rows
+  done/pin/move-to-task/remove + accountability chips; move-to-task chooser
+  + by-time picker; share sheet); **Focus** "Done" now accumulates
+  totalFocused + marks complete + fires the shared-task notification.
+- **Tests:** `TZ=UTC swift test` → **217 / 0** (DbRowCodecTests +5 for the
+  new columns + sharing fields). App target builds for the simulator.
+
+Still divergent from Android (next pass, lower value): Focus **overrun
+check-in** (+10 / in-the-zone / stop), Today **notifications-off banner** +
+recap-expiry, week-view nav polish, Settings bug-sweep refinements
+(teal/red errors, tag-delete confirm, real backup export), Start-Next
+firstPhysicalAction headline, command-palette + analytics deep-dive parity.
+
 ## Where things stand (2026-05-29)
 
 **Foundation + 7 feature slices + push-registration vertical + the

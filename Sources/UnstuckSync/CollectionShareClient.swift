@@ -79,7 +79,8 @@ public struct CollectionShareClient: Sendable {
         var members: [MemberRow] = []
         var pending: [PendingRow] = []
         var isOwner: Bool? = nil
-        enum CodingKeys: String, CodingKey { case ok, members, pending; case isOwner = "is_owner" }
+        // The share-collection edge fn returns camelCase `isOwner` (matches Android).
+        enum CodingKeys: String, CodingKey { case ok, members, pending, isOwner }
     }
 
     private func call(_ body: ShareBody) async throws -> ShareResponse {

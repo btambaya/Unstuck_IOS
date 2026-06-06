@@ -11,6 +11,8 @@ public struct Palette: Sendable {
     public let primary, primarySoft, primaryDeep: Color
     public let coral, coralSoft, coralDeep: Color
     public let violet, blue, green, amber, red: Color
+    /// Darker, readable "ink" green for small status text (e.g. "done by … ✓").
+    public let greenInk: Color
 
     public static let light = Palette(
         bg: Color(hex: "#FAFAF7"), bg2: Color(hex: "#F4F2EC"), surface: Color(hex: "#FFFFFF"),
@@ -23,7 +25,8 @@ public struct Palette: Sendable {
         coralDeep: OKLCH(0.48, 0.16, 35).color,
         violet: OKLCH(0.55, 0.13, 300).color, blue: OKLCH(0.70, 0.10, 240).color,
         green: OKLCH(0.72, 0.10, 155).color, amber: OKLCH(0.80, 0.13, 75).color,
-        red: OKLCH(0.66, 0.13, 25).color)
+        red: OKLCH(0.66, 0.13, 25).color,
+        greenInk: OKLCH(0.40, 0.10, 155).color)
 
     public static let dark = Palette(
         bg: OKLCH(0.205, 0.025, 270).color, bg2: OKLCH(0.24, 0.03, 270).color, surface: OKLCH(0.26, 0.03, 270).color,
@@ -36,7 +39,8 @@ public struct Palette: Sendable {
         coralDeep: OKLCH(0.48, 0.16, 35).color,
         violet: OKLCH(0.74, 0.13, 300).color, blue: OKLCH(0.70, 0.10, 240).color,
         green: OKLCH(0.72, 0.10, 155).color, amber: OKLCH(0.80, 0.13, 75).color,
-        red: OKLCH(0.66, 0.13, 25).color)
+        red: OKLCH(0.66, 0.13, 25).color,
+        greenInk: OKLCH(0.86, 0.10, 155).color)
 
     /// Resolve a life-area / collection color token (indigo, coral, …) to
     /// a Color. Mirrors the web area palette mapping.

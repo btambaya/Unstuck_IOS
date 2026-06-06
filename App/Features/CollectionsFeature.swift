@@ -48,6 +48,7 @@ struct ListsView: View {
                 Button("Add") { addCollection() }
                 Button("Cancel", role: .cancel) { newName = "" }
             }
+            .feedbackBubble()
         }
         .task {
             guard vm == nil, let db = model.db else { return }
@@ -430,7 +431,7 @@ private struct CollItemRow: View {
         let dueDate = item.dueAt.flatMap(parseISO)
         let overdue = !promotedDone && (dueDate.map { $0 < Date() } ?? false)
         if overdue { return theme.palette.red }
-        if promotedDone { return theme.palette.green }
+        if promotedDone { return theme.palette.greenInk }
         return theme.palette.primaryDeep
     }
 }

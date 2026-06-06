@@ -81,6 +81,7 @@ struct TodayView: View {
             }
             .sheet(isPresented: $showPalette) { CommandPalette() }
             .sheet(isPresented: $showSettings) { SettingsView() }
+            .feedbackBubble()
         }
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }

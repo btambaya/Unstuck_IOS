@@ -27,6 +27,24 @@ struct FeedbackBubble: View {
     }
 }
 
+/// Overlays the feedback bubble on a tab's ROOT content (bottom-trailing).
+/// Applied INSIDE each tab's NavigationStack so a pushed detail screen covers
+/// it — mirroring Android's `stack.isEmpty()` gate.
+struct FeedbackBubbleModifier: ViewModifier {
+    @Environment(AppModel.self) private var model
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .bottomTrailing) {
+            FeedbackBubble { model.router.showFeedback = true }
+                .padding(.trailing, 16)
+                .padding(.bottom, 18)
+        }
+    }
+}
+
+extension View {
+    func feedbackBubble() -> some View { modifier(FeedbackBubbleModifier()) }
+}
+
 private enum FeedbackCategory: String, CaseIterable, Identifiable {
     case bug = "Bug", idea = "Idea", praise = "Praise", other = "Other"
     var id: String { rawValue }
@@ -100,6 +118,7 @@ struct FeedbackSheet: View {
                     .frame(minHeight: 120)
                     .scrollContentBackground(.hidden)
                     .focused($fieldFocused)
+                    .disabled(sending)   // lock the field while a send is in flight (Android parity)
             }
             .padding(8)
             .background(theme.palette.surface)

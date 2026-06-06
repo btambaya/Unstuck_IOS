@@ -47,8 +47,10 @@ extension AppModel {
         if isShared(latest) {
             try? db.save(next)
             let share = coord.share
-            Task { await share.updateCollectionFields(id: id, name: next.name, color: next.color,
-                                                      subtitle: next.subtitle ?? "", archived: next.archived ?? false) }
+            enqueueCollectionRPC(id) {
+                await share.updateCollectionFields(id: id, name: next.name, color: next.color,
+                                                   subtitle: next.subtitle ?? "", archived: next.archived ?? false)
+            }
         } else {
             Task { try? await coord.write.upsertCollection(next, nowISO: Self.isoNow()) }
         }
@@ -66,7 +68,7 @@ extension AppModel {
         if isShared(latest) {
             try? db.save(next)
             let share = coord.share
-            Task { await rpc(share, next) }
+            enqueueCollectionRPC(id) { await rpc(share, next) }
         } else {
             Task { try? await coord.write.upsertCollection(next, nowISO: Self.isoNow()) }
         }
@@ -223,6 +225,24 @@ extension AppModel {
         let share = coordinator?.share
         let by = currentUserName ?? "Someone"
         Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by) }
+    }
+
+    /// Before starting Focus on `newTaskId`, finalize a still-in-flight session
+    /// that belongs to a DIFFERENT task — write its Session row + accumulate its
+    /// focus time — so opening Focus on B doesn't silently discard A's elapsed
+    /// time when FocusTimer.start overwrites the live session. 1:1 with the
+    /// Android startFocus finalize.
+    func finalizeDisplacedFocus(forNewTaskId newTaskId: String) {
+        guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
+              cur.sessionStart != nil, cur.taskId != newTaskId,
+              let prev = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else { return }
+        let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        saveSession(Session(id: cur.id ?? newUUID(), taskId: prev.id, taskName: prev.name,
+                            estimateMin: prev.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+        var bumped = prev
+        bumped.totalFocused += elapsed
+        bumped.updatedAt = Self.isoNow()
+        saveTask(bumped)
     }
 
     /// Finish a Focus session: persist the Session, accumulate the task's

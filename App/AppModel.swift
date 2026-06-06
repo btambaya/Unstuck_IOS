@@ -19,6 +19,18 @@ final class AppModel {
     private(set) var liveStore: LiveSessionStore?
     var signedIn = false
     var configured = true
+    // Per-collection serial RPC queue. The optimistic local write happens
+    // synchronously on the main actor; the server RPC dispatch is chained so two
+    // rapid edits to the same shared collection can't reach the server out of
+    // order (replaces Android's collectionMutex).
+    private var collectionRPCChains: [String: Task<Void, Never>] = [:]
+
+    /// Enqueue a shared-collection RPC, ordered after any pending RPC for the
+    /// same collection.
+    func enqueueCollectionRPC(_ collectionId: String, _ op: @escaping @Sendable () async -> Void) {
+        let prev = collectionRPCChains[collectionId]
+        collectionRPCChains[collectionId] = Task { await prev?.value; await op() }
+    }
     // Local first-run flag; struggles also sync to user_preferences.
     var onboarded = UserDefaults.standard.bool(forKey: "unstuck.onboarded")
 
@@ -215,10 +227,55 @@ final class AppModel {
         scheduleTaskAt(task, date: iso, startTime: slots.first?.startTime ?? "09:00")
     }
 
-    /// Schedule a task at an explicit day + time (drag-to-schedule).
+    /// Schedule a task at an explicit day + time. Persist-or-move (1:1 with the
+    /// Android scheduleTask): reuse/move the task's existing block in place,
+    /// bump moveCount only on a real date/time change, and diff recurrence via
+    /// regenerateForTask — so re-tapping "Schedule" or dragging an already-
+    /// scheduled task doesn't create duplicate blocks or falsely trip the slip
+    /// detector. Brand-new tasks (e.g. move-to-task promote) fall through to a
+    /// single insert.
     func scheduleTaskAt(_ task: TaskItem, date iso: String, startTime: String) {
-        saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
-                           startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))
+        guard let write = coordinator?.write else { return }
+        let existing = ((try? db?.blocks(forTask: task.id)) ?? []).filter { isTaskBlock($0) }
+        let now = Self.isoNow()
+
+        func earliest(_ blocks: [CalBlock]) -> CalBlock? {
+            blocks.min { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
+        }
+
+        if let recurrence = task.recurrence {
+            let parts = iso.split(separator: "-").compactMap { Int($0) }
+            let startDate = parts.count == 3 ? Time.civil(parts[0], parts[1], parts[2]) : Date()
+            let plan = regenerateForTask(task: task, recurrence: recurrence, existingBlocks: existing,
+                                         todayIso: Clock.todayISO(), startTime: startTime, startDate: startDate)
+            Task {
+                for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
+                for b in plan.toUpsert { try? await write.upsertCalBlock(b, nowISO: now) }
+            }
+            // Guarantee the chosen slot is materialized (the horizon regen skips
+            // today / off-pattern picks). Only when nothing already covers it.
+            let coversChosen = existing.contains { $0.date == iso } || plan.toUpsert.contains { $0.date == iso }
+            if !coversChosen {
+                saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
+                                   startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))
+            }
+            if let anchor = earliest(existing), anchor.date != iso || anchor.startTime != startTime {
+                let bumped = bumpMoveCount(task, nowISO: now)
+                Task { try? await write.upsertTask(bumped, nowISO: now) }
+            }
+        } else if let cur = earliest(existing) {
+            if cur.date != iso || cur.startTime != startTime {
+                var moved = cur
+                moved.date = iso
+                moved.startTime = startTime
+                saveBlock(moved)   // moves the Google event too (PATCH) when pushed
+                let bumped = bumpMoveCount(task, nowISO: now)
+                Task { try? await write.upsertTask(bumped, nowISO: now) }
+            }
+        } else {
+            saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
+                               startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))
+        }
     }
 
     /// Ingest pulled Google events as local external cal_blocks (g_ ids;

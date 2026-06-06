@@ -78,6 +78,7 @@ struct CalendarView: View {
                 }
             }
             .sheet(isPresented: $showBlock) { BlockTimeSheet() }
+            .feedbackBubble()
         }
         .task {
             guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }

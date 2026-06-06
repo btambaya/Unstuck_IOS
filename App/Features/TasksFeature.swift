@@ -63,6 +63,7 @@ struct TasksView: View {
             .sheet(item: $editing) { task in
                 TaskEditor(task: task, existingBlocks: vm?.blocks(forTask: task.id) ?? [])
             }
+            .feedbackBubble()
         }
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }
