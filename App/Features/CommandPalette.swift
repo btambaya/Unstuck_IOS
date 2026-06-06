@@ -16,10 +16,13 @@ struct CommandPalette: View {
             List {
                 Section("Actions") {
                     Button { dismiss(); model.router.present(.newTask) } label: { Label("New task", systemImage: "plus") }
-                    Button { dismiss(); model.router.select(.lists) } label: { Label("Lists", systemImage: "tray.full") }
                     if let next = pickStartNext(tasks: tasks, blocks: [], liveTaskId: nil) {
                         Button { dismiss(); model.router.beginFocus(next) } label: { Label("Focus: \(next.name)", systemImage: "timer") }
                     }
+                    Button { dismiss(); model.router.select(.today) } label: { Label("Go to Today", systemImage: "sun.max") }
+                    Button { dismiss(); model.router.select(.tasks) } label: { Label("Go to Tasks", systemImage: "checklist") }
+                    Button { dismiss(); model.router.select(.calendar) } label: { Label("Go to Calendar", systemImage: "calendar") }
+                    Button { dismiss(); model.router.select(.lists) } label: { Label("Go to Lists", systemImage: "tray.full") }
                 }
                 if !filtered.isEmpty {
                     Section("Tasks") {
