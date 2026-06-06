@@ -155,9 +155,25 @@ final class AppModel {
         guard let write = coordinator?.write else { return }
         Task { try? await write.upsertTag(tag, nowISO: Self.isoNow()) }
     }
+    /// Delete a tag and strip its name from every task (case-insensitive
+    /// cascade), mirroring the web/Android deleteTag — otherwise tasks keep a
+    /// dangling reference to a vocabulary entry that no longer exists.
     func deleteTag(_ id: String) {
         guard let write = coordinator?.write else { return }
-        Task { try? await write.deleteTag(id: id, nowISO: Self.isoNow()) }
+        var name: String?
+        if let db, let fetched = try? db.fetchById(TagRow.self, id: id) { name = fetched.name }
+        let tasks = (try? taskRepo?.all()) ?? []
+        Task {
+            try? await write.deleteTag(id: id, nowISO: Self.isoNow())
+            guard let name else { return }
+            for t in tasks where (t.tags ?? []).contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+                var next = t
+                let stripped = (t.tags ?? []).filter { $0.caseInsensitiveCompare(name) != .orderedSame }
+                next.tags = stripped.isEmpty ? nil : stripped
+                next.updatedAt = Self.isoNow()
+                try? await write.upsertTask(next, nowISO: Self.isoNow())
+            }
+        }
     }
     func saveLifeArea(_ area: LifeArea) {
         guard let write = coordinator?.write else { return }

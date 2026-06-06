@@ -3,12 +3,14 @@
 // density, focus prefs, data export, and delete-account land as follow-ups.
 
 import SwiftUI
+import UIKit
 import UnstuckDesign
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
+    @State private var exportURL: URL?
 
     var body: some View {
         NavigationStack {
@@ -18,11 +20,22 @@ struct SettingsView: View {
 
                     section("Account") {
                         row("Status", model.signedIn ? "Signed in" : "Signed out")
-                        if let uid = model.coordinator?.auth.currentUserId {
+                        if let email = model.currentEmail {
+                            row("Email", email)
+                        } else if let uid = model.coordinator?.auth.currentUserId {
                             row("User", String(uid.prefix(8)) + "…")
                         }
                         UButton("Sign out", kind: .ghost) {
                             model.signOut(); dismiss()
+                        }
+                        .padding(.top, 4)
+                    }
+
+                    section("Backup") {
+                        Text("Export everything — tasks, sessions, lists, calendar — as a JSON file you keep.")
+                            .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                        UButton("Export data", kind: .ghost) {
+                            exportURL = model.makeExportFile()
                         }
                         .padding(.top, 4)
                     }
@@ -68,6 +81,7 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .sheet(item: $exportURL) { url in ActivityView(items: [url]) }
         }
     }
 
@@ -83,7 +97,18 @@ struct SettingsView: View {
         HStack {
             Text(label).font(UFont.sans(14)).foregroundStyle(theme.palette.ink2)
             Spacer()
-            Text(value).font(UFont.mono(12)).foregroundStyle(theme.palette.ink3)
+            Text(value).font(UFont.mono(12)).foregroundStyle(theme.palette.ink3).lineLimit(1)
         }
     }
+}
+
+extension URL: @retroactive Identifiable { public var id: String { absoluteString } }
+
+/// UIActivityViewController bridge for the export share sheet.
+struct ActivityView: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
