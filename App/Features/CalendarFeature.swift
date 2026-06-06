@@ -57,8 +57,11 @@ struct CalendarView: View {
     @State private var connecting = false
     @State private var connectError: String?
     @State private var showBlock = false
-    @State private var dayMode = true
+    @State private var mode: CalMode = .day
     @State private var selectedDate = Date()
+    @State private var weekOffset = 0
+
+    enum CalMode: Hashable { case day, week, agenda }
 
     var body: some View {
         NavigationStack {
@@ -90,16 +93,20 @@ struct CalendarView: View {
     @ViewBuilder
     private func content(_ vm: CalendarModel) -> some View {
         VStack(spacing: 0) {
-            Picker("Mode", selection: $dayMode) {
-                Text("Day").tag(true)
-                Text("Agenda").tag(false)
+            Picker("Mode", selection: $mode) {
+                Text("Day").tag(CalMode.day)
+                Text("Week").tag(CalMode.week)
+                Text("Agenda").tag(CalMode.agenda)
             }
             .pickerStyle(.segmented)
             .padding(.horizontal, 20).padding(.bottom, 8)
 
-            if dayMode {
+            switch mode {
+            case .day:
                 DayGridView(vm: vm, date: $selectedDate)
-            } else {
+            case .week:
+                weekView(vm)
+            case .agenda:
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         if !vm.connected { connectBanner }
@@ -113,6 +120,102 @@ struct CalendarView: View {
                 }
             }
         }
+    }
+
+    // Monday-anchored week overview: ‹ / Today / › navigation, focus-planned
+    // rollup (busiest / lightest day), and a per-day load list that drills into
+    // the Day grid. 1:1 intent with the Android WeekView.
+    @ViewBuilder
+    private func weekView(_ vm: CalendarModel) -> some View {
+        let cal = Calendar.current
+        let weekdaySun1 = cal.component(.weekday, from: Date())          // 1=Sun … 7=Sat
+        let thisMonday = cal.date(byAdding: .day, value: -((weekdaySun1 + 5) % 7), to: cal.startOfDay(for: Date()))!
+        let monday = cal.date(byAdding: .day, value: weekOffset * 7, to: thisMonday)!
+        let days = (0..<7).map { cal.date(byAdding: .day, value: $0, to: monday)! }
+        let labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        let planned = days.map { d in vm.blocks(on: Clock.dateISO(d)).filter { isTaskBlock($0) }.reduce(0) { $0 + $1.durationMinutes } }
+        let total = planned.reduce(0, +)
+        let maxP = planned.max() ?? 0, minP = planned.min() ?? 0
+        let flat = maxP == minP
+        let busiest = flat ? "—" : labels[planned.firstIndex(of: maxP) ?? 0]
+        let lightest = flat ? "—" : labels[planned.firstIndex(of: minP) ?? 0]
+        let todayISO = Clock.todayISO()
+
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        SectionLabel(weekOffset == 0 ? "This week" : "Week")
+                        Text(weekRangeLabel(days.first!, days.last!))
+                            .font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
+                    }
+                    Spacer()
+                    Button { weekOffset -= 1 } label: { Text("‹").font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink2) }.buttonStyle(.plain)
+                    if weekOffset != 0 {
+                        Button { weekOffset = 0 } label: { Text("Today").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep) }.buttonStyle(.plain)
+                    }
+                    Button { weekOffset += 1 } label: { Text("›").font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink2) }.buttonStyle(.plain)
+                }
+
+                HStack(spacing: 8) {
+                    rollup("Focus planned", total >= 60 ? "\(total / 60)h \(total % 60)m" : "\(total)m", theme.palette.primaryDeep)
+                    rollup("Busiest", busiest, theme.palette.amber)
+                    rollup("Lightest", lightest, theme.palette.greenInk)
+                }
+
+                VStack(spacing: 8) {
+                    ForEach(Array(days.enumerated()), id: \.offset) { i, d in
+                        let iso = Clock.dateISO(d)
+                        let isToday = iso == todayISO
+                        Button {
+                            selectedDate = d; mode = .day
+                        } label: {
+                            HStack(spacing: 12) {
+                                VStack(spacing: 1) {
+                                    Text(labels[i]).font(UFont.mono(9, .medium)).foregroundStyle(isToday ? theme.palette.coral : theme.palette.ink3)
+                                    Text("\(cal.component(.day, from: d))").font(UFont.sans(15, .semibold)).foregroundStyle(isToday ? theme.palette.coral : theme.palette.ink)
+                                }
+                                .frame(width: 34)
+                                let count = vm.blocks(on: iso).count
+                                if count == 0 {
+                                    Text("Clear").font(UFont.sans(13)).foregroundStyle(theme.palette.ink4)
+                                } else {
+                                    Text("\(count) block\(count == 1 ? "" : "s") · \(planned[i])m focus")
+                                        .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                                }
+                                Spacer()
+                                Image(systemName: "chevron.right").font(.system(size: 11)).foregroundStyle(theme.palette.ink4)
+                            }
+                            .padding(.horizontal, 12).padding(.vertical, 11)
+                            .background(theme.palette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(isToday ? theme.palette.coral.opacity(0.4) : theme.palette.line))
+                        }.buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(20)
+        }
+    }
+
+    private func rollup(_ label: String, _ value: String, _ tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label.uppercased()).font(UFont.mono(9, .medium)).foregroundStyle(theme.palette.ink3)
+            Text(value).font(UFont.sans(16, .semibold)).foregroundStyle(tint)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(tint.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func weekRangeLabel(_ start: Date, _ end: Date) -> String {
+        let df = DateFormatter(); df.locale = Locale(identifier: "en_US"); df.dateFormat = "MMM d"
+        let cal = Calendar.current
+        if cal.component(.month, from: start) == cal.component(.month, from: end) {
+            return "\(df.string(from: start))–\(cal.component(.day, from: end))"
+        }
+        return "\(df.string(from: start)) – \(df.string(from: end))"
     }
 
     private var connectBanner: some View {
