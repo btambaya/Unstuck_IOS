@@ -75,6 +75,11 @@ final class AppModel {
         signedIn = true
         onboarded = true
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
+        // Debug hook: jump straight into Focus on launch (crash isolation).
+        if ProcessInfo.processInfo.environment["UITEST_FOCUS"] == "1",
+           let t = (try? taskRepo?.fetch(id: "t-proposal")) ?? nil {
+            router.beginFocus(t)
+        }
     }
     #endif
 

@@ -1,9 +1,12 @@
-// Collections ("Lists") — calm memory containers. 1:1 with the Android
-// CollectionsScreen + CollectionDetailScreen + ShareCollectionSheet:
-//  • Overview grid with search, a SHARED badge, and an Archived (N) filter.
-//  • Detail: inline rename, recolor swatches, archive/delete (owner), Leave
-//    (member), per-item done/pin/remove + inline edit, and move-to-task with
-//    the "just me / keep everyone in the loop" accountability chooser.
+// Collections — calm memory containers. 1:1 with the Android CollectionsScreen
+// + CollectionDetailScreen + ShareCollectionSheet:
+//  • Overview: shared AppBar, "Things you don't need to remember." serif title,
+//    a search pill + "+ New", an Archived (N) toggle, and a 2-COLUMN grid of
+//    cards (rounded color chip + SHARED badge + item count + first 2 items).
+//  • Detail: colored chip + inline-rename title + archive/delete/share (owner)
+//    or Leave (member), "shared with N" line, recolor swatches, Pinned/All item
+//    rows (checkbox + body + ellipsis reveal: pin / move-to-task / remove +
+//    accountability chips), add-item pill, move-to-task chooser + by-time picker.
 //  • Share sheet: invite by email + role, live member/pending list.
 // Reads via Repository<ItemCollection>; writes route through AppModel
 // (own → outbox upsert, shared → atomic item RPCs).
@@ -27,6 +30,22 @@ final class CollectionsModel {
 
 private let COLLECTION_PALETTE = ["indigo", "coral", "green", "amber", "blue", "violet"]
 
+/// Rounded-square color chip with a centered dot (1:1 with the Android
+/// ColorChip the overview cards + detail title use).
+private struct ColorChip: View {
+    @Environment(\.uTheme) private var theme
+    let token: String?
+    var box: CGFloat = 26
+    var dot: CGFloat = 8
+    var body: some View {
+        let color = theme.palette.areaColor(token)
+        RoundedRectangle(cornerRadius: box * 0.32, style: .continuous)
+            .fill(color.opacity(0.22))
+            .frame(width: box, height: box)
+            .overlay(Circle().fill(color).frame(width: dot, height: dot))
+    }
+}
+
 struct ListsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
@@ -35,15 +54,20 @@ struct ListsView: View {
     @State private var showNew = false
     @State private var query = ""
     @State private var showArchived = false
+    @State private var showSettings = false
+    @State private var showPalette = false
 
     var body: some View {
         NavigationStack {
-            Group {
-                if let vm { content(vm) } else { ProgressView() }
+            VStack(alignment: .leading, spacing: 0) {
+                AppBar(title: "Collections", onSearch: { showPalette = true }, onAvatar: { showSettings = true })
+                if let vm { content(vm) } else { ProgressView().frame(maxWidth: .infinity).padding(.top, 60) }
             }
             .background(theme.palette.bg.ignoresSafeArea())
-            .navigationTitle("Lists")
-            .alert("New list", isPresented: $showNew) {
+            .navigationBarHidden(true)
+            .sheet(isPresented: $showSettings) { SettingsView() }
+            .sheet(isPresented: $showPalette) { CommandPalette() }
+            .alert("New collection", isPresented: $showNew) {
                 TextField("Name", text: $newName)
                 Button("Add") { addCollection() }
                 Button("Cancel", role: .cancel) { newName = "" }
@@ -71,12 +95,16 @@ struct ListsView: View {
         let archivedCount = vm.collections.filter { $0.archived ?? false }.count
         let list = shown(vm.collections)
         ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 0) {
+                // Serif headline + subtitle.
                 Text("Things you don't need to remember.")
                     .font(UFont.serifItalic(26)).foregroundStyle(theme.palette.ink)
+                    .padding(.top, 4)
                 Text("A calm shelf. Nothing here is a task.")
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                    .padding(.top, 8).padding(.bottom, 8)
 
+                // Search pill + "+ New".
                 HStack(spacing: 8) {
                     HStack(spacing: 8) {
                         Image(systemName: "magnifyingglass").font(.system(size: 14)).foregroundStyle(theme.palette.ink3)
@@ -84,6 +112,7 @@ struct ListsView: View {
                             .textFieldStyle(.plain).font(UFont.sans(13))
                     }
                     .padding(.horizontal, 14).padding(.vertical, 10)
+                    .frame(maxWidth: .infinity)
                     .background(theme.palette.bg2).clipShape(Capsule())
                     if !showArchived {
                         Button { showNew = true } label: {
@@ -94,21 +123,22 @@ struct ListsView: View {
                     }
                 }
 
+                // Archived filter toggle — only when there are archived lists (or while viewing them).
                 if archivedCount > 0 || showArchived {
                     Button { showArchived.toggle() } label: {
                         Text(showArchived ? "← Back to active" : "Archived (\(archivedCount))")
                             .font(UFont.sans(12, .medium))
-                            .foregroundStyle(showArchived ? theme.palette.amber : theme.palette.ink2)
+                            .foregroundStyle(showArchived ? theme.palette.amberInk : theme.palette.ink2)
                             .padding(.horizontal, 12).padding(.vertical, 6)
-                            .background((showArchived ? theme.palette.amber.opacity(0.18) : theme.palette.bg2))
+                            .background((showArchived ? theme.palette.amberSoft : theme.palette.bg2))
                             .clipShape(Capsule())
-                    }.buttonStyle(.plain)
+                    }.buttonStyle(.plain).padding(.top, 10)
                 }
 
                 if list.isEmpty {
-                    Text(showArchived ? "No archived lists." : "No lists yet. Tap + New to start one.")
+                    Text(showArchived ? "No archived lists." : "No lists yet. Tap + to start one.")
                         .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
-                        .frame(maxWidth: .infinity).padding(.top, 40)
+                        .frame(maxWidth: .infinity).padding(.top, 48)
                 } else {
                     LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                         ForEach(list) { col in
@@ -116,9 +146,11 @@ struct ListsView: View {
                                 .buttonStyle(.plain)
                         }
                     }
+                    .padding(.top, 14)
                 }
             }
-            .padding(20)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 96)   // clear the floating bottom nav
         }
     }
 
@@ -126,12 +158,14 @@ struct ListsView: View {
         let shared = model.isShared(col)
         return VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top) {
-                AreaDot(col.color, size: 10)
+                ColorChip(token: col.color, box: 26, dot: 8)
                 Spacer()
-                if shared {
-                    Text("SHARED").font(UFont.sans(8, .bold)).foregroundStyle(theme.palette.primaryDeep)
+                HStack(spacing: 6) {
+                    if shared {
+                        Text("SHARED").font(UFont.sans(8, .bold)).foregroundStyle(theme.palette.primaryDeep)
+                    }
+                    Text("\(col.items.count)").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
                 }
-                Text("\(col.items.count)").font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
             }
             Text(col.name).font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
                 .lineLimit(1)
@@ -141,6 +175,7 @@ struct ListsView: View {
                         .lineLimit(1)
                 }
             }
+            .padding(.top, 2)
             Spacer(minLength: 0)
         }
         .padding(14)
@@ -187,6 +222,7 @@ struct CollectionDetailView: View {
         }
         .background(theme.palette.bg.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarHidden(false)   // keep the standard back button (overview hides its bar)
         .sheet(isPresented: $showShare) {
             if let col = collection { CollectionShareView(collectionId: col.id, collectionName: col.name) }
         }
@@ -222,35 +258,39 @@ struct CollectionDetailView: View {
         let rest = col.items.filter { $0.pinned != true }
 
         VStack(alignment: .leading, spacing: 0) {
-            // Pinned header — title + share/leave + shared-with line.
-            VStack(alignment: .leading, spacing: 8) {
+            // Pinned header — colored chip + inline-rename title + share/leave +
+            // shared-with line. Stays put while the items below scroll.
+            VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 11) {
-                    AreaDot(col.color, size: 11)
+                    ColorChip(token: col.color, box: 30, dot: 9)
                     if editingTitle && owner {
                         TextField("Name", text: $titleDraft)
-                            .font(UFont.serifItalic(24)).textFieldStyle(.plain)
+                            .font(UFont.serifItalic(26)).textFieldStyle(.plain)
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         Button { model.renameCollection(col, name: titleDraft); editingTitle = false } label: {
-                            Image(systemName: "checkmark").foregroundStyle(theme.palette.green)
+                            Image(systemName: "checkmark").font(.system(size: 18)).foregroundStyle(theme.palette.green).padding(4)
                         }.buttonStyle(.plain)
                     } else {
-                        Text(col.name).font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
+                        Text(col.name).font(UFont.serifItalic(26)).foregroundStyle(theme.palette.ink)
                             .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
                             .onTapGesture { if owner { titleDraft = col.name; editingTitle = true } }
                         if owner {
-                            HStack(spacing: 10) {
+                            HStack(spacing: 4) {
                                 Button { model.archiveCollection(col.id, archived: !archived); dismiss() } label: {
-                                    Image(systemName: archived ? "tray.and.arrow.up" : "archivebox").foregroundStyle(theme.palette.ink3)
+                                    Image(systemName: archived ? "tray.and.arrow.up" : "archivebox")
+                                        .font(.system(size: 19)).foregroundStyle(theme.palette.ink3).padding(1)
                                 }.buttonStyle(.plain)
                                 Button { confirmDelete = true } label: {
-                                    Image(systemName: "trash").foregroundStyle(theme.palette.ink3)
+                                    Image(systemName: "trash").font(.system(size: 19)).foregroundStyle(theme.palette.ink3).padding(1)
                                 }.buttonStyle(.plain)
                                 Button { showShare = true } label: {
-                                    Image(systemName: "square.and.arrow.up").foregroundStyle(theme.palette.ink2)
+                                    Image(systemName: "square.and.arrow.up").font(.system(size: 20)).foregroundStyle(theme.palette.ink2)
                                 }.buttonStyle(.plain)
-                            }.font(.system(size: 17))
+                            }
                         } else {
                             Button { model.leaveCollection(col.id); dismiss() } label: {
                                 Text("Leave").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink3)
+                                    .padding(.horizontal, 6).padding(.vertical, 4)
                             }.buttonStyle(.plain)
                         }
                     }
@@ -259,12 +299,15 @@ struct CollectionDetailView: View {
                     Text(owner ? "Shared with \(col.members?.count ?? 0)"
                          : (canEdit ? "Shared with you · you can edit" : "Shared with you · view only"))
                         .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                        .padding(.top, 8).padding(.leading, 2)
                 }
             }
-            .padding(.horizontal, 18).padding(.vertical, 8)
+            .padding(.horizontal, 18).padding(.vertical, 6)
+            .background(theme.palette.bg)
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
+                    // Recolor swatches — owner only.
                     if owner {
                         HStack(spacing: 8) {
                             ForEach(COLLECTION_PALETTE, id: \.self) { token in
@@ -272,7 +315,7 @@ struct CollectionDetailView: View {
                                     .overlay(Circle().stroke(theme.palette.ink, lineWidth: col.color == token ? 2 : 0))
                                     .onTapGesture { model.recolorCollection(col, color: token) }
                             }
-                        }.padding(.top, 12).padding(.bottom, 4)
+                        }.padding(.top, 12)
                     }
 
                     if col.items.isEmpty {
@@ -280,7 +323,7 @@ struct CollectionDetailView: View {
                             Text("Keep small things here.").font(UFont.serifItalic(19)).foregroundStyle(theme.palette.ink2)
                             Text("Type below. Hit return. Done.").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                         }
-                        .frame(maxWidth: .infinity).padding(.vertical, 38)
+                        .frame(maxWidth: .infinity).padding(.vertical, 38).padding(.horizontal, 20)
                         .background(theme.palette.bg2).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line2))
                         .padding(.top, 24)
@@ -295,6 +338,8 @@ struct CollectionDetailView: View {
                         }
                     }
 
+                    // Add-item pill — at the BOTTOM so new items append right above it.
+                    // Hidden for view-only members.
                     if canEdit {
                         HStack(spacing: 10) {
                             Image(systemName: "plus").foregroundStyle(theme.palette.ink3)
@@ -309,7 +354,7 @@ struct CollectionDetailView: View {
                         .padding(.top, 18)
                     }
                 }
-                .padding(.horizontal, 18).padding(.bottom, 30)
+                .padding(.horizontal, 18).padding(.bottom, 96)
             }
         }
     }
@@ -353,10 +398,10 @@ private struct CollItemRow: View {
     var body: some View {
         let done = item.done == true
         let promoted = item.promoted == true
-        let struck = done || promoted
+        let struck = done || promoted        // promoted items read as "handled / in flight"
 
         HStack(spacing: 10) {
-            // Done checkbox
+            // Done checkbox (always visible).
             Button { if !readOnly { model.toggleCollectionItemDone(col, itemId: item.id) } } label: {
                 ZStack {
                     Circle().fill(done ? theme.palette.coral : theme.palette.surface).frame(width: 18, height: 18)
@@ -370,7 +415,7 @@ private struct CollItemRow: View {
                     HStack {
                         TextField("Item", text: $draft).textFieldStyle(.plain).font(UFont.sans(14))
                         Button { model.updateCollectionItemBody(col, itemId: item.id, body: draft); editing = false } label: {
-                            Image(systemName: "checkmark").foregroundStyle(theme.palette.green)
+                            Image(systemName: "checkmark").font(.system(size: 16)).foregroundStyle(theme.palette.green).padding(2)
                         }.buttonStyle(.plain)
                     }
                 } else {
@@ -383,30 +428,34 @@ private struct CollItemRow: View {
                 }
                 if promoted, let label = promotedLabel() {
                     Text(label).font(UFont.sans(11, .medium)).foregroundStyle(promotedColor())
+                        .padding(.top, 2)
                 }
             }
 
-            if !readOnly {
+            if !readOnly && !revealed {
                 Button { onReveal() } label: {
                     Image(systemName: "ellipsis").font(.system(size: 15)).foregroundStyle(theme.palette.ink4)
                 }.buttonStyle(.plain)
             }
 
+            // Action bar — hidden by default, revealed on tap of the ellipsis.
             if !readOnly && revealed {
                 HStack(spacing: 8) {
                     Button { model.toggleCollectionItemPin(col, itemId: item.id) } label: {
                         Image(systemName: "pin\(item.pinned == true ? ".fill" : "")")
+                            .font(.system(size: 17))
                             .foregroundStyle(item.pinned == true ? theme.palette.coral : theme.palette.ink4)
                     }.buttonStyle(.plain)
+                    // Hide Move-to-task while a promotion is in flight (avoids a duplicate task).
                     if !(item.promoted == true) || item.promotedDone == true {
                         Button { onMoveToTask() } label: {
-                            Image(systemName: "arrow.up.forward.app").foregroundStyle(theme.palette.ink4)
+                            Image(systemName: "arrow.up.forward.app").font(.system(size: 17)).foregroundStyle(theme.palette.ink4)
                         }.buttonStyle(.plain)
                     }
                     Button { model.removeCollectionItem(col, itemId: item.id) } label: {
-                        Image(systemName: "xmark").foregroundStyle(theme.palette.ink4)
+                        Image(systemName: "xmark").font(.system(size: 16)).foregroundStyle(theme.palette.ink4)
                     }.buttonStyle(.plain)
-                }.font(.system(size: 15))
+                }
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
@@ -527,7 +576,7 @@ struct CollectionShareView: View {
                     }
 
                     if let m = message {
-                        Text(m.text).font(UFont.sans(13)).foregroundStyle(m.ok ? theme.palette.green : theme.palette.coralDeep)
+                        Text(m.text).font(UFont.sans(13)).foregroundStyle(m.ok ? theme.palette.greenInk : theme.palette.coralDeep)
                     }
 
                     SectionLabel(memberSummary)
@@ -559,9 +608,9 @@ struct CollectionShareView: View {
         HStack(spacing: 8) {
             Text(m.email).font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if m.pending { Text("PENDING").font(UFont.sans(9, .bold)).foregroundStyle(theme.palette.amber) }
+            if m.pending { Text("PENDING").font(UFont.sans(9, .bold)).foregroundStyle(theme.palette.amberInk) }
             Text(m.role == "viewer" ? "VIEW" : "EDIT").font(UFont.sans(10, .bold)).foregroundStyle(theme.palette.ink3)
-            Button { remove(m) } label: { Image(systemName: "xmark").foregroundStyle(theme.palette.ink3) }
+            Button { remove(m) } label: { Image(systemName: "xmark").foregroundStyle(theme.palette.ink3).padding(2) }
                 .buttonStyle(.plain)
         }
         .padding(.horizontal, 12).padding(.vertical, 9)

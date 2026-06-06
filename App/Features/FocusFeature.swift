@@ -1,8 +1,15 @@
 // P3 — Focus (core). Drives the well-tested UnstuckCore.FocusTimer engine
 // with a TimelineView tick, persists every transition to LiveSessionStore
 // (so a relaunch resumes), and writes a Session on finish via WriteThrough.
-// Treatments (ambient/cockpit/monk), pause reasons, and mid-session
-// captures are P3 follow-ups.
+//
+// Visual reskin: 1:1 with the Android FocusScreen — a dark indigo radial
+// background (for every treatment), a "← Out" pill, the FOCUSING/PAUSED
+// eyebrow, white-on-dark treatment chips (always shown, incl. Monk so you
+// can step back out), the ambient progress ring with a white Orbit, the
+// serif task name + first-physical-action + estimate, a big light timer with
+// "<remaining> left", the overrun check-in (+10 / In the zone / Stop here),
+// and the Capture / Pause·Resume / Done action row plus the Save-for-later /
+// End-for-now secondary row. The FocusModel + AppModel wiring is unchanged.
 
 import SwiftUI
 import UnstuckCore
@@ -88,12 +95,19 @@ struct FocusView: View {
     @State private var captureText = ""
     @State private var soundOn = true
 
-    private let reasons = ["Bathroom", "Distracted", "Switching tasks", "Quick break", "Interrupted"]
+    private let reasons = ["Bathroom", "Drink", "Quick question", "Stuck — need a moment", "Other"]
+
+    // The Android focus screen is dark for every treatment: a deep indigo
+    // radial gradient. We render the whole screen on this regardless of the
+    // system color scheme, so the chrome/colors are hand-picked white-on-dark.
+    private let bgTop = OKLCH(0.30, 0.10, 280).color
+    private let bgBottom = OKLCH(0.16, 0.02, 280).color
 
     var body: some View {
         ZStack {
-            backgroundFor(fm?.treatment ?? .ambient).ignoresSafeArea()
-            if let fm { content(fm) } else { ProgressView() }
+            RadialGradient(colors: [bgTop, bgBottom], center: .top, startRadius: 0, endRadius: 900)
+                .ignoresSafeArea()
+            if let fm { content(fm) } else { ProgressView().tint(.white) }
         }
         .task {
             if fm == nil {
@@ -124,119 +138,180 @@ struct FocusView: View {
     }
 
     @ViewBuilder
-    private func backgroundFor(_ treatment: FocusTreatment) -> some View {
-        switch treatment {
-        case .ambient:
-            LinearGradient(colors: [theme.palette.primarySoft, theme.palette.bg], startPoint: .top, endPoint: .bottom)
-        case .cockpit:
-            theme.palette.bg2
-        case .monk:
-            theme.palette.bg
-        }
-    }
-
-    @ViewBuilder
     private func content(_ fm: FocusModel) -> some View {
         @Bindable var fm = fm
-        VStack(spacing: 24) {
+        VStack(spacing: 0) {
+            // ── "← Out" leaves focus (current iOS behavior: cancels the live
+            //    session then dismisses). Styled as Android's white-on-dark pill.
             HStack {
                 Button { fm.cancel(); dismiss() } label: {
-                    Image(systemName: "xmark").font(.system(size: 17, weight: .medium)).foregroundStyle(theme.palette.ink3)
+                    Text("← Out")
+                        .font(UFont.sans(12))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(.white.opacity(0.10), in: Capsule())
                 }.buttonStyle(.plain)
                 Spacer()
-                SectionLabel("Focus")
-                Spacer()
-                HStack(spacing: 16) {
-                    Button { soundOn.toggle(); updateAudio(fm) } label: {
-                        Image(systemName: soundOn ? "speaker.wave.2" : "speaker.slash")
-                            .font(.system(size: 16)).foregroundStyle(theme.palette.ink3)
-                    }.buttonStyle(.plain)
-                    Button { showCapture = true } label: {
-                        Image(systemName: "square.and.pencil").font(.system(size: 17)).foregroundStyle(theme.palette.ink3)
-                    }.buttonStyle(.plain)
-                }
+                // Sound toggle (ambient loop) lives where Android's mute-less
+                // header has space; keeps the existing soundOn behavior.
+                Button { soundOn.toggle(); updateAudio(fm) } label: {
+                    Image(systemName: soundOn ? "speaker.wave.2" : "speaker.slash")
+                        .font(.system(size: 15)).foregroundStyle(.white.opacity(0.6))
+                        .frame(width: 32, height: 32)
+                        .background(.white.opacity(0.10), in: Circle())
+                }.buttonStyle(.plain)
             }
+            .padding(.bottom, 8)
 
-            if fm.treatment != .monk {
-                Picker("Treatment", selection: Binding(get: { fm.treatment }, set: { fm.setTreatment($0) })) {
-                    Text("Ambient").tag(FocusTreatment.ambient)
-                    Text("Cockpit").tag(FocusTreatment.cockpit)
-                    Text("Monk").tag(FocusTreatment.monk)
+            phaseLabel(fm.live.paused ? "PAUSED" : "FOCUSING")
+
+            // Treatment switcher — always shown (incl. Monk) so picking Monk
+            // doesn't trap the user with no way back out.
+            HStack(spacing: 8) {
+                ForEach([FocusTreatment.ambient, .cockpit, .monk], id: \.self) { t in
+                    treatmentChip(t, selected: fm.treatment == t) { fm.setTreatment(t) }
                 }
-                .pickerStyle(.segmented)
             }
+            .padding(.top, 8)
 
             Spacer()
 
-            if fm.treatment != .monk {
-                Text(task.name)
-                    .font(UFont.serifItalic(26)).foregroundStyle(theme.palette.ink)
-                    .multilineTextAlignment(.center).padding(.horizontal, 32)
-            }
-
-            TimelineView(.periodic(from: .now, by: 1)) { ctx in
-                let now = ctx.date.timeIntervalSince1970 * 1000
-                let elapsed = FocusTimer.displayedElapsedSec(fm.live, now: now)
-                let state = FocusTimer.deriveState(fm.live, now: now, overrunGraceSec: 1)
-                VStack(spacing: 6) {
-                    Text(formatMMSS(elapsed))
-                        .font(UFont.mono(56, .medium))
-                        .foregroundStyle(state == .overrun ? theme.palette.coralDeep : theme.palette.ink)
-                        .monospacedDigit()
-                    Text(label(for: state)).font(UFont.mono(12)).foregroundStyle(theme.palette.ink3)
-                    if fm.treatment == .cockpit {
-                        Text("Estimate \(task.estimateMin)m").font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
-                    }
-                    // Overrun check-in (web/Android parity): past the estimate, offer to
-                    // extend or stop — not just a recolored timer.
-                    if state == .overrun && !fm.live.paused {
-                        VStack(spacing: 8) {
-                            Text("Past your estimate — still going well?")
-                                .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
-                            HStack(spacing: 8) {
-                                overrunButton("+10 min") { fm.extendFocus(10) }
-                                overrunButton("In the zone") { fm.extendFocus(15) }
-                                overrunButton("Stop here") { finishSession(markDone: false) }
-                            }
-                        }
-                        .padding(.top, 10)
-                    }
-                }
-            }
+            timeline(fm)
 
             Spacer()
-            controls(fm)
-            // From monk, let the user step back up to a richer treatment.
-            if fm.treatment == .monk {
-                Button("Treatments") { fm.setTreatment(.ambient) }
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).buttonStyle(.plain)
-            }
-            Spacer()
+
+            actions(fm)
         }
-        .padding(20)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 14)
         .onAppear { updateAudio(fm) }
         .onChange(of: fm.treatment) { updateAudio(fm) }
     }
 
-    @ViewBuilder
-    private func controls(_ fm: FocusModel) -> some View {
-        VStack(spacing: 12) {
-            if fm.live.paused {
-                UButton("Resume") { fm.resume() }
-            } else {
-                UButton("Pause", kind: .ghost) { showReasons = true }
-            }
-            UButton("Done") { showFinish = true }
-        }
-        .padding(.horizontal, 32)
+    private func phaseLabel(_ text: String) -> some View {
+        Text(text)
+            .font(UFont.mono(11, .medium)).tracking(0.8)
+            .foregroundStyle(.white.opacity(0.55))
     }
 
-    private func overrunButton(_ title: String, action: @escaping () -> Void) -> some View {
+    private func treatmentChip(_ t: FocusTreatment, selected: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(title).font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink)
+            Text(treatmentName(t))
+                .font(UFont.sans(12, .medium))
+                .foregroundStyle(selected ? OKLCH(0.18, 0.05, 280).color : .white.opacity(0.7))
+                .padding(.horizontal, 13).padding(.vertical, 6)
+                .background(selected ? AnyShapeStyle(Color.white.opacity(0.92)) : AnyShapeStyle(Color.white.opacity(0.08)),
+                            in: Capsule())
+        }.buttonStyle(.plain)
+    }
+
+    private func treatmentName(_ t: FocusTreatment) -> String {
+        switch t {
+        case .ambient: return "ambient"
+        case .cockpit: return "cockpit"
+        case .monk: return "monk"
+        }
+    }
+
+    // MARK: timer + ring
+
+    @ViewBuilder
+    private func timeline(_ fm: FocusModel) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let now = ctx.date.timeIntervalSince1970 * 1000
+            let elapsed = FocusTimer.displayedElapsedSec(fm.live, now: now)
+            let estimateSec = FocusTimer.estimateSec(fm.live)
+            let remaining = max(0, estimateSec - elapsed)
+            let progress = estimateSec > 0 ? min(1, max(0, Double(elapsed) / Double(estimateSec))) : 0
+            let state = FocusTimer.deriveState(fm.live, now: now, overrunGraceSec: 1)
+            let isPaused = fm.live.paused
+
+            VStack(spacing: 0) {
+                if fm.treatment == .ambient {
+                    ProgressRing(progress: progress, paused: isPaused)
+                        .frame(width: 220, height: 220)
+                        .padding(.bottom, 20)
+                }
+
+                if fm.treatment != .monk {
+                    Text(task.name)
+                        .font(UFont.serifItalic(24)).foregroundStyle(.white)
+                        .multilineTextAlignment(.center).padding(.horizontal, 24)
+                    if let step = task.firstPhysicalAction?.trimmingCharacters(in: .whitespacesAndNewlines), !step.isEmpty {
+                        Text("→ \(step)")
+                            .font(UFont.sans(13)).foregroundStyle(.white.opacity(0.82))
+                            .multilineTextAlignment(.center).lineLimit(2)
+                            .padding(.top, 6).padding(.horizontal, 24)
+                    }
+                    Text("\(task.estimateMin)m estimate")
+                        .font(UFont.sans(13)).foregroundStyle(.white.opacity(0.65))
+                        .padding(.top, 6)
+                }
+
+                Text(formatMMSS(elapsed))
+                    .font(UFont.sans(52, .light))
+                    .foregroundStyle(state == .overrun ? theme.palette.coral : .white)
+                    .monospacedDigit()
+                    .padding(.top, 20)
+                Text("\(formatMMSS(remaining)) left")
+                    .font(UFont.sans(12)).foregroundStyle(.white.opacity(0.5))
+
+                // Overrun check-in (web/Android parity): past the estimate,
+                // offer to extend or stop — not just a recolored timer.
+                if state == .overrun && !isPaused {
+                    Text("Past your estimate — still going well?")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.coral.opacity(0.9))
+                        .padding(.top, 10)
+                    HStack(spacing: 8) {
+                        focusBtn("+10 min", soft: true) { fm.extendFocus(10) }
+                        focusBtn("In the zone", soft: true) { fm.extendFocus(15) }
+                        focusBtn("Stop here", soft: false) { finishSession(markDone: false) }
+                    }
+                    .padding(.top, 8)
+                }
+            }
+        }
+    }
+
+    // MARK: actions
+
+    @ViewBuilder
+    private func actions(_ fm: FocusModel) -> some View {
+        let isPaused = fm.live.paused
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                focusBtn("Capture", soft: true) { showCapture = true }
+                focusBtn(isPaused ? "Resume" : "Pause", soft: true) {
+                    if isPaused { fm.resume() }
+                    else { fm.pause(); showReasons = true }
+                }
+                focusBtn("Done", soft: false) { showFinish = true }
+            }
+            // Secondary actions: "Save for later" pauses (resumable from Today);
+            // "End for now" records the session without completing the task.
+            HStack(spacing: 14) {
+                secondaryBtn("Save for later") { fm.pause(); coordinateCheckin(); dismiss() }
+                secondaryBtn("End for now") { finishSession(markDone: false) }
+            }
+            .padding(.top, 12).padding(.bottom, 6)
+        }
+    }
+
+    private func focusBtn(_ title: String, soft: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(UFont.sans(14, .medium)).foregroundStyle(.white)
+                .padding(.horizontal, 22).padding(.vertical, 12)
+                .background(soft ? AnyShapeStyle(Color.white.opacity(0.10)) : AnyShapeStyle(theme.palette.coral),
+                            in: Capsule())
+        }.buttonStyle(.plain)
+    }
+
+    private func secondaryBtn(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(UFont.sans(13, .medium)).foregroundStyle(.white.opacity(0.72))
                 .padding(.horizontal, 14).padding(.vertical, 8)
-                .background(theme.palette.surface).clipShape(Capsule())
-                .overlay(Capsule().stroke(theme.palette.line2))
         }.buttonStyle(.plain)
     }
 
@@ -251,9 +326,9 @@ struct FocusView: View {
 
     private var captureSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SectionLabel("Capture")
+            SectionLabel("Capture · stays attached")
             Text("Park a thought without losing focus.").font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
-            TextField("Note to self…", text: $captureText, axis: .vertical)
+            TextField("What just popped up?", text: $captureText, axis: .vertical)
                 .font(UFont.sans(16)).textFieldStyle(.plain)
                 .padding(12).background(theme.palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
@@ -288,14 +363,54 @@ struct FocusView: View {
         guard !text.isEmpty else { return }
         model.saveCapture(Capture(id: newUUID(), taskId: task.id, sessionId: fm?.sessionId, tag: .idea, body: text, at: AppModel.isoNow()))
     }
+}
 
-    private func label(for state: UnstuckCore.FocusState) -> String {
-        switch state {
-        case .running: return "FOCUSING"
-        case .pause: return "PAUSED"
-        case .overrun: return "OVERTIME"
-        case .done: return "DONE"
-        default: return ""
+/// Ambient progress ring with a white Orbit mark in the center.
+/// Background arc = white 10%; the progress arc sweeps from 12 o'clock
+/// (amber while paused, white while running) — 1:1 with the Android Canvas.
+private struct ProgressRing: View {
+    let progress: Double
+    let paused: Bool
+
+    private let pausedColor = OKLCH(0.80, 0.13, 75).color   // amber, matches Android
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(.white.opacity(0.10), lineWidth: 4)
+                .padding(10)
+            Circle()
+                .trim(from: 0, to: progress)
+                .stroke(paused ? pausedColor : Color.white,
+                        style: StrokeStyle(lineWidth: 4, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .padding(10)
+            WhiteOrbit(size: 130)
         }
+    }
+}
+
+/// White-on-dark Orbit mark (the shared `Mark` reads the theme ink, which is
+/// dark on the light theme — but the focus screen is always dark, so we draw
+/// the ring + anchor + coral dot in white here). Geometry mirrors `Mark`.
+private struct WhiteOrbit: View {
+    let size: CGFloat
+    private let coral = Color(hex: "#E89077")
+
+    var body: some View {
+        let ring = size * 21 / 32
+        let stroke = size * 2.2 / 32
+        let anchor = size * 6.8 / 32
+        let dot = size * 4.2 / 32
+        ZStack {
+            Circle()
+                .trim(from: 0.125, to: 0.875)
+                .stroke(.white, style: StrokeStyle(lineWidth: stroke, lineCap: .round))
+                .frame(width: ring, height: ring)
+            Circle().fill(.white).frame(width: anchor, height: anchor)
+            Circle().fill(coral).frame(width: dot, height: dot)
+                .offset(x: ring / 2)
+        }
+        .frame(width: size, height: size)
     }
 }

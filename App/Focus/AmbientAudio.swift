@@ -30,8 +30,26 @@ final class AmbientAudio {
         guard !running else { return }
         configureSession()
         let format = engine.outputNode.inputFormat(forBus: 0)
-        let noise = self.noise
-        let node = AVAudioSourceNode { _, _, frameCount, audioBufferList in
+        // A 0-channel / 0-rate output format (no audio route — e.g. the
+        // simulator) makes engine.connect throw an uncatchable ObjC exception.
+        // Bail before connecting; ambient sound is best-effort.
+        guard format.channelCount > 0, format.sampleRate > 0 else { return }
+        // The render block runs on the real-time AUDIO thread, so it must NOT be
+        // main-actor-isolated — build it in a nonisolated context, else Swift 6's
+        // executor check (swift_task_checkIsolatedSwift) SIGTRAPs at render time.
+        let node = AVAudioSourceNode(renderBlock: Self.renderBlock(noise))
+        engine.attach(node)
+        engine.connect(node, to: engine.mainMixerNode, format: format)
+        sourceNode = node
+        do { try engine.start(); running = true } catch { teardown() }
+    }
+
+    /// Build the real-time render block in a NONISOLATED context so the closure
+    /// doesn't inherit AmbientAudio's @MainActor isolation. It runs on the audio
+    /// IO thread; a main-actor executor check there fires SIGTRAP under Swift 6.
+    /// Captures only `noise` (a Sendable box).
+    private nonisolated static func renderBlock(_ noise: Noise) -> AVAudioSourceNodeRenderBlock {
+        { _, _, frameCount, audioBufferList in
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
             for frame in 0..<Int(frameCount) {
                 noise.last = (noise.last + 0.02 * noise.white()) / 1.02
@@ -44,10 +62,6 @@ final class AmbientAudio {
             }
             return noErr
         }
-        engine.attach(node)
-        engine.connect(node, to: engine.mainMixerNode, format: format)
-        sourceNode = node
-        do { try engine.start(); running = true } catch { teardown() }
     }
 
     func stop() {
