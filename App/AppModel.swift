@@ -19,6 +19,8 @@ final class AppModel {
     private(set) var liveStore: LiveSessionStore?
     var signedIn = false
     var configured = true
+    /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
+    var uiTestWrite: WriteThrough?
     // Per-collection serial RPC queue. The optimistic local write happens
     // synchronously on the main actor; the server RPC dispatch is chained so two
     // rapid edits to the same shared collection can't reach the server out of
@@ -57,6 +59,24 @@ final class AppModel {
             await MainActor.run { completion(allowed) }
         }
     }
+
+    #if DEBUG
+    /// Boot straight into the signed-in app with seeded local data and no
+    /// network — for XCUITest. Triggered by the UITEST_SEED launch env var.
+    func startUITestMode() {
+        guard coordinator == nil, db == nil else { return }
+        guard let database = try? AppDatabase.makeInMemory() else { return }
+        db = database
+        taskRepo = TaskRepository(database)
+        liveStore = LiveSessionStore(database)
+        uiTestWrite = WriteThrough(db: database)
+        DemoSeed.seed(database)
+        configured = true
+        signedIn = true
+        onboarded = true
+        UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
+    }
+    #endif
 
     func start() async {
         guard coordinator == nil else { return }
@@ -116,8 +136,9 @@ final class AppModel {
     }
 
     /// The optimistic write API (local GRDB + server outbox), for features.
-    /// Drives the UI instantly via each repository's ValueObservation.
-    var write: WriteThrough? { coordinator?.write }
+    /// Drives the UI instantly via each repository's ValueObservation. Falls
+    /// back to the local-only writer in the XCUITest demo boot.
+    var write: WriteThrough? { coordinator?.write ?? uiTestWrite }
 
     func signOut() {
         guard let coord = coordinator else { return }

@@ -24,6 +24,11 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         UNUserNotificationCenter.current().delegate = self
+        // Skip the auth prompt under XCUITest so the system alert doesn't block
+        // the run (the demo boot needs no push).
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["UITEST_SEED"] == "1" { return true }
+        #endif
         Task { @MainActor in
             let granted = (try? await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])) ?? false

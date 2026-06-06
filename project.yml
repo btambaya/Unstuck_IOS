@@ -48,7 +48,22 @@ targets:
       - target: UnstuckWidgets
         embed: true
     scheme:
-      testTargets: []
+      testTargets:
+        - UnstuckUITests
+
+  UnstuckUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: Unstuck
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tech.csalliance.unstuck.uitests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: Unstuck
+        TARGETED_DEVICE_FAMILY: "1"
 
   UnstuckWidgets:
     type: app-extension

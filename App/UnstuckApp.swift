@@ -12,7 +12,15 @@ struct UnstuckApp: App {
                 .environment(model)
                 .unstuckTheme()
                 .onOpenURL { model.handleDeepLink($0) }
-                .task { await model.start() }
+                .task {
+                    #if DEBUG
+                    if ProcessInfo.processInfo.environment["UITEST_SEED"] == "1" {
+                        model.startUITestMode()
+                        return
+                    }
+                    #endif
+                    await model.start()
+                }
         }
     }
 }
