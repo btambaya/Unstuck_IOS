@@ -57,6 +57,9 @@ public final class AppDatabase: Sendable {
                 t.column("recurrence", .text)      // JSON Recurrence
                 t.column("createdAt", .text).notNull()
                 t.column("updatedAt", .text).notNull()
+                t.column("sourceCollectionId", .text)   // move-to-task link (migration 025)
+                t.column("sourceItemId", .text)
+                t.column("dueAt", .text)
             }
 
             try db.create(table: "cal_blocks") { t in
@@ -106,6 +109,10 @@ public final class AppDatabase: Sendable {
                 t.column("subtitle", .text)
                 t.column("items", .text).notNull()  // JSON [CollectionItem]
                 t.column("sortOrder", .integer).notNull()
+                t.column("ownerId", .text)          // sharing fields (client-only, hydrate-populated)
+                t.column("members", .text)          // JSON [String]
+                t.column("myRole", .text)
+                t.column("archived", .boolean)      // migration 026
             }
 
             try db.create(table: "tags") { t in
