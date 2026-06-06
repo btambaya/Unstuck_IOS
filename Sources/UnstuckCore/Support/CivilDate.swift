@@ -39,6 +39,13 @@ public extension Time {
         Calendar.current.component(.day, from: d)
     }
 
+    /// Number of days in the month containing `d` (28–31). Mirrors Android
+    /// `Time.daysInMonth` — used to clamp a day-31 monthly recurrence to each
+    /// month's last day (so Feb/Apr/etc. still get an occurrence).
+    static func daysInMonth(_ d: Date) -> Int {
+        Calendar.current.range(of: .day, in: .month, for: d)?.count ?? 30
+    }
+
     /// Whole-day difference `floor(a) - floor(b)` rounded — matches the
     /// web's `Math.round((midnightA - midnightB)/oneDay)`.
     static func wholeDaysBetween(_ a: Date, _ b: Date) -> Int {

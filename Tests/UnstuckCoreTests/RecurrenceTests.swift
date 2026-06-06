@@ -27,6 +27,19 @@ final class MaterializeOccurrencesTests: XCTestCase {
         XCTAssertEqual(occ.map(\.date), ["2026-05-21", "2026-06-21", "2026-07-21", "2026-08-21"])
     }
 
+    // A day-31 monthly start clamps to each month's last day (Feb 28 in a non-leap
+    // year), then RECOVERS to 31 in long months — it doesn't drift down. (Android parity.)
+    func testMonthlyDay31ClampsToShortMonthEnd() {
+        let occ = materializeOccurrences(.monthly(until: nil), startDate: Time.civil(2026, 1, 31), startTime: "09:00", horizonDays: 95)
+        XCTAssertEqual(occ.map(\.date), ["2026-01-31", "2026-02-28", "2026-03-31", "2026-04-30"])
+    }
+
+    // Same start in a leap year clamps Feb to the 29th.
+    func testMonthlyDay31ClampsToLeapFeb() {
+        let occ = materializeOccurrences(.monthly(until: nil), startDate: Time.civil(2024, 1, 31), startTime: "09:00", horizonDays: 95)
+        XCTAssertEqual(occ.map(\.date), ["2024-01-31", "2024-02-29", "2024-03-31", "2024-04-30"])
+    }
+
     func testDefaultHorizonIs8Weeks() {
         let occ = materializeOccurrences(.daily(until: nil), startDate: start, startTime: "09:00")
         XCTAssertEqual(occ.count, RECURRENCE_HORIZON_DAYS)

@@ -29,6 +29,12 @@ public struct TaskItem: Codable, Equatable, Sendable, Identifiable {
     public var recurrence: Recurrence?
     public var createdAt: String
     public var updatedAt: String
+    // Move-to-task / accountability (migration 025). Set when this task was promoted
+    // from a shared collection item, so completion/lateness flows back to everyone.
+    public var sourceCollectionId: String?
+    public var sourceItemId: String?
+    /// ISO "by" time for a keep-everyone-in-the-loop promotion.
+    public var dueAt: String?
 
     public init(
         id: String,
@@ -49,7 +55,10 @@ public struct TaskItem: Codable, Equatable, Sendable, Identifiable {
         later: Bool? = nil,
         recurrence: Recurrence? = nil,
         createdAt: String,
-        updatedAt: String
+        updatedAt: String,
+        sourceCollectionId: String? = nil,
+        sourceItemId: String? = nil,
+        dueAt: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -70,5 +79,8 @@ public struct TaskItem: Codable, Equatable, Sendable, Identifiable {
         self.recurrence = recurrence
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.sourceCollectionId = sourceCollectionId
+        self.sourceItemId = sourceItemId
+        self.dueAt = dueAt
     }
 }

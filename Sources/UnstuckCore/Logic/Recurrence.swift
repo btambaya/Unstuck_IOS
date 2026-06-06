@@ -39,7 +39,9 @@ private func matchesRecurrence(_ r: Recurrence, startDate: Date, candidate: Date
     case .weekly(let days, _):
         return days.contains(Time.dayOfWeekJS(candidate))
     case .monthly:
-        return Time.dayOfMonth(candidate) == Time.dayOfMonth(startDate)
+        // Clamp a day-31 start to each month's last day (Feb 28/29, Apr 30, …),
+        // recovering to 31 in long months — matches current Android (the v0.4.23 fix).
+        return Time.dayOfMonth(candidate) == min(Time.dayOfMonth(startDate), Time.daysInMonth(candidate))
     }
 }
 

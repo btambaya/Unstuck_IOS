@@ -121,13 +121,28 @@ public struct CollectionItem: Codable, Equatable, Sendable, Identifiable {
     public var done: Bool?
     /// ISO timestamp the item was added.
     public var at: String
+    // Move-to-task / accountability (migration 025). Stored in the items JSONB; the
+    // collection_set_item_promotion RPC writes these exact camelCase keys.
+    /// Promoted to a real task (struck-through + status chip).
+    public var promoted: Bool?
+    /// Display name of whoever is on it (keep-everyone-in-the-loop).
+    public var assignee: String?
+    /// True once the assignee's linked task is completed ("done by <name> ✓").
+    public var promotedDone: Bool?
+    /// ISO "by" time for the loop promotion.
+    public var dueAt: String?
 
-    public init(id: String, body: String, pinned: Bool? = nil, done: Bool? = nil, at: String) {
+    public init(id: String, body: String, pinned: Bool? = nil, done: Bool? = nil, at: String,
+                promoted: Bool? = nil, assignee: String? = nil, promotedDone: Bool? = nil, dueAt: String? = nil) {
         self.id = id
         self.body = body
         self.pinned = pinned
         self.done = done
         self.at = at
+        self.promoted = promoted
+        self.assignee = assignee
+        self.promotedDone = promotedDone
+        self.dueAt = dueAt
     }
 }
 
@@ -143,13 +158,29 @@ public struct ItemCollection: Codable, Equatable, Sendable, Identifiable {
     public var subtitle: String?
     public var items: [CollectionItem]
     public var sortOrder: Int
+    // Shared-collection fields (migration 020/022/026). Client-only — populated by the
+    // Hydrator from collections.user_id + collection_members; never written back to the
+    // DB row (the CollectionRow codec drops them). Optional so a row that omits them decodes.
+    /// Owner's user id (the collection's user_id). Nil for local/demo rows.
+    public var ownerId: String?
+    /// Shared-with user ids (excludes the owner). Nil/empty = not shared.
+    public var members: [String]?
+    /// Current user's role: "owner" | "editor" | "viewer". Nil = local/own.
+    public var myRole: String?
+    /// Archived (migration 026) — hidden from the main overview; restorable.
+    public var archived: Bool?
 
-    public init(id: String, name: String, color: String, subtitle: String? = nil, items: [CollectionItem], sortOrder: Int) {
+    public init(id: String, name: String, color: String, subtitle: String? = nil, items: [CollectionItem], sortOrder: Int,
+                ownerId: String? = nil, members: [String]? = nil, myRole: String? = nil, archived: Bool? = nil) {
         self.id = id
         self.name = name
         self.color = color
         self.subtitle = subtitle
         self.items = items
         self.sortOrder = sortOrder
+        self.ownerId = ownerId
+        self.members = members
+        self.myRole = myRole
+        self.archived = archived
     }
 }
