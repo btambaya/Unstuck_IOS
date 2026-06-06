@@ -15,12 +15,10 @@ final class FocusModel {
     var live: LiveSession
     let task: TaskItem
     private let store: LiveSessionStore?
-    private let onComplete: (Session) -> Void
 
-    init(task: TaskItem, store: LiveSessionStore?, onComplete: @escaping (Session) -> Void) {
+    init(task: TaskItem, store: LiveSessionStore?) {
         self.task = task
         self.store = store
-        self.onComplete = onComplete
         let existing: LiveSession? = (try? store?.get()) ?? nil
         // Resume-aware: start() continues a paused session for the same task.
         live = FocusTimer.start(existing ?? .empty, taskId: task.id, estimateMin: task.estimateMin, now: Self.now())
@@ -39,14 +37,19 @@ final class FocusModel {
         PausedCheckinScheduler.cancel()
     }
 
-    func finish() {
+    /// Stop the session + return the Session row (reusing the live id so
+    /// captures taken during the session join back) + elapsed seconds, for the
+    /// view to hand to AppModel.finishFocus.
+    @discardableResult
+    func finish() -> (session: Session, elapsedSec: Int) {
         let elapsed = FocusTimer.elapsedSec(live, now: Self.now())
-        onComplete(Session(id: newUUID(), taskId: task.id, taskName: task.name,
-                           estimateMin: task.estimateMin, actualSec: elapsed, completedAt: AppModel.isoNow()))
+        let session = Session(id: live.id ?? newUUID(), taskId: task.id, taskName: task.name,
+                              estimateMin: task.estimateMin, actualSec: elapsed, completedAt: AppModel.isoNow())
         live = FocusTimer.done(live)
         persist()
         LiveActivityController.shared.end()
         PausedCheckinScheduler.cancel()
+        return (session, elapsed)
     }
 
     func cancel() {
@@ -75,6 +78,7 @@ struct FocusView: View {
     @State private var fm: FocusModel?
     @State private var showReasons = false
     @State private var showCapture = false
+    @State private var showFinish = false
     @State private var captureText = ""
     @State private var soundOn = true
 
@@ -87,7 +91,7 @@ struct FocusView: View {
         }
         .task {
             if fm == nil {
-                fm = FocusModel(task: task, store: model.liveStore, onComplete: { model.saveSession($0) })
+                fm = FocusModel(task: task, store: model.liveStore)
             }
         }
         .confirmationDialog("Why are you pausing?", isPresented: $showReasons, titleVisibility: .visible) {
@@ -95,6 +99,11 @@ struct FocusView: View {
                 Button(reason) { pauseWith(reason) }
             }
             Button("Just pause", role: .cancel) { fm?.pause(); coordinateCheckin() }
+        }
+        .confirmationDialog("Wrap up this session?", isPresented: $showFinish, titleVisibility: .visible) {
+            Button("Mark task complete") { finishSession(markDone: true) }
+            Button("Just finish") { finishSession(markDone: false) }
+            Button("Keep going", role: .cancel) {}
         }
         .sheet(isPresented: $showCapture) { captureSheet }
         .onDisappear { AmbientAudio.shared.stop() }
@@ -194,9 +203,18 @@ struct FocusView: View {
             } else {
                 UButton("Pause", kind: .ghost) { showReasons = true }
             }
-            UButton("Done") { fm.finish(); dismiss() }
+            UButton("Done") { showFinish = true }
         }
         .padding(.horizontal, 32)
+    }
+
+    /// Finish the live session, accumulate focused time, and optionally complete
+    /// the task (fires the shared-collection done notification for promoted tasks).
+    private func finishSession(markDone: Bool) {
+        guard let fm else { return }
+        let result = fm.finish()
+        model.finishFocus(task: task, session: result.session, elapsedSec: result.elapsedSec, markDone: markDone)
+        dismiss()
     }
 
     private var captureSheet: some View {

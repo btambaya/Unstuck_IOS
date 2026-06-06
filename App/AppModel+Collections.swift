@@ -225,6 +225,26 @@ extension AppModel {
         Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by) }
     }
 
+    /// Finish a Focus session: persist the Session, accumulate the task's
+    /// totalFocused, optionally mark it done (with completion stamping + the
+    /// shared-item notification), and record a session recap. 1:1 with the
+    /// Android finishFocus.
+    func finishFocus(task: TaskItem, session: Session, elapsedSec: Int, markDone: Bool) {
+        saveSession(session)
+        var focused = task
+        focused.totalFocused += elapsedSec
+        focused.updatedAt = Self.isoNow()
+        if markDone {
+            var done = focused
+            done.done = true
+            saveTask(applyCompletion(done, prior: task, nowISO: Self.isoNow()))
+            notifyTaskDoneIfShared(task)
+        } else {
+            saveTask(focused)
+        }
+        sendSessionRecap(taskName: task.name, away: false)
+    }
+
     // MARK: - sharing (edge-function backed)
 
     func shareCollection(_ collectionId: String, email: String, role: String) async -> ShareOutcome {
