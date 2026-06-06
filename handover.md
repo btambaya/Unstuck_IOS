@@ -37,11 +37,24 @@ feedback feature set. This pass brought it up to a 1:1 replica of the
 - **Tests:** `TZ=UTC swift test` → **217 / 0** (DbRowCodecTests +5 for the
   new columns + sharing fields). App target builds for the simulator.
 
-Still divergent from Android (next pass, lower value): Focus **overrun
-check-in** (+10 / in-the-zone / stop), Today **notifications-off banner** +
-recap-expiry, week-view nav polish, Settings bug-sweep refinements
-(teal/red errors, tag-delete confirm, real backup export), Start-Next
-firstPhysicalAction headline, command-palette + analytics deep-dive parity.
+Remaining-parity pass (all now DONE): Focus **overrun check-in** (+10 / in-the-
+zone / Stop here); Today **notifications-off banner** (UNUserNotificationCenter
++ didBecomeActive) and **Start-Next** firstPhysicalAction headline + "Pick
+another"; Calendar **Week view** (Mon-anchored ‹/Today/› nav + Focus-planned/
+busiest/lightest rollup + per-day drill-in); **Settings** account email + real
+**data export** (JSON backup via share sheet) + **deleteTag cascade**;
+**command palette** Go-to-tab nav actions; **Insights deep-dive** (Report/Deep
+dive toggle → interruption histogram, re-entry distribution, time-of-day
+heatmap, pause anatomy, slip detector). Plus a `greenInk` palette token.
+
+Verified runtime: the **full app (with the WidgetKit extension) installs +
+launches** on the iPhone 17 simulator — a missing `CFBundleExecutable` in
+`Widgets/Info.plist` (GENERATE_INFOPLIST_FILE=NO) had silently blocked install
+on any device; now fixed. `TZ=UTC swift test` = 217/0.
+
+Smaller deltas still open: Settings teal/error-red micro-styling, Calendar
+Month view, the full per-hour week grid (Day mode already has the hour grid),
+recap-card expiry on Today.
 
 ## Where things stand (2026-05-29)
 
