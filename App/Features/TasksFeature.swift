@@ -117,10 +117,9 @@ struct TasksView: View {
     }
 
     private func toggleDone(_ task: TaskItem) {
-        var next = task
-        next.done.toggle()
-        let stamped = applyCompletion(next, prior: task, nowISO: AppModel.isoNow())
-        model.saveTask(stamped)
+        // Routes through AppModel so a task promoted from a shared collection item
+        // fires the taskDone notification on completion.
+        model.toggleDone(task)
     }
 }
 
