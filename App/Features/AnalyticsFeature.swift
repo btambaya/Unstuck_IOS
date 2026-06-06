@@ -28,6 +28,11 @@ final class AnalyticsModel {
         self.taskRepo = taskRepo
     }
 
+    /// Reflection time window (Android parity). Derivations read the windowed
+    /// slices; the slip detector stays task-based (always-on).
+    enum Window: Hashable { case week, month, all }
+    var window: Window = .week
+
     func load() async {
         tasks = (try? taskRepo.all()) ?? []
         captures = (try? captureRepo.all()) ?? []
@@ -35,15 +40,35 @@ final class AnalyticsModel {
         do { for try await rows in sessionRepo.observeValues() { sessions = rows } } catch {}
     }
 
-    var insights: [Insight] { topInsights(sessions: sessions, tasks: tasks, captures: captures, reasonLogs: reasonLogs) }
-    var weekday: [StackedBar] { weekdayAreaHours(sessions, tasks) }
-    var hitRate: Double { calibrationHitRate(calibrationDots(sessions, tasks)) }
-    var enoughData: Bool { sessions.count >= REAL_DATA_THRESHOLD }
-    var interruptions: [Int] { interruptionBins(captures, sessions) }
-    var reEntry: [Int] { reEntryDistribution(sessions) }
-    var heatmap: Heatmap { timeOfDayHeatmap(sessions) }
-    var slips: [SlipRow] { slipping(tasks) }
-    var pauses: [PauseBar] { pauseAnatomy(reasonLogs) }
+    /// Cutoff (epoch ms) for the window — Monday 00:00 (week), 1st 00:00 (month),
+    /// 0 (all). Mirrors the Android calendar-anchored cutoff.
+    private var cutoff: Double {
+        let cal = Calendar.current
+        switch window {
+        case .all: return 0
+        case .week:
+            let wd = cal.component(.weekday, from: Date())            // 1=Sun … 7=Sat
+            let monday = cal.date(byAdding: .day, value: -((wd + 5) % 7), to: cal.startOfDay(for: Date())) ?? Date()
+            return monday.timeIntervalSince1970 * 1000
+        case .month:
+            let first = cal.date(from: cal.dateComponents([.year, .month], from: Date())) ?? Date()
+            return first.timeIntervalSince1970 * 1000
+        }
+    }
+    private func inWindow(_ iso: String) -> Bool { (Time.parseMillis(iso) ?? 0) >= cutoff }
+    private var wSessions: [Session] { sessions.filter { inWindow($0.completedAt) } }
+    private var wCaptures: [Capture] { captures.filter { inWindow($0.at) } }
+    private var wReasons: [ReasonLog] { reasonLogs.filter { inWindow($0.at) } }
+
+    var insights: [Insight] { topInsights(sessions: wSessions, tasks: tasks, captures: wCaptures, reasonLogs: wReasons) }
+    var weekday: [StackedBar] { weekdayAreaHours(wSessions, tasks) }
+    var hitRate: Double { calibrationHitRate(calibrationDots(wSessions, tasks)) }
+    var enoughData: Bool { wSessions.count >= REAL_DATA_THRESHOLD }
+    var interruptions: [Int] { interruptionBins(wCaptures, wSessions) }
+    var reEntry: [Int] { reEntryDistribution(wSessions) }
+    var heatmap: Heatmap { timeOfDayHeatmap(wSessions) }
+    var slips: [SlipRow] { slipping(tasks) }                  // task-based, not windowed (Android parity)
+    var pauses: [PauseBar] { pauseAnatomy(wReasons) }
 }
 
 struct AnalyticsView: View {
@@ -56,25 +81,7 @@ struct AnalyticsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 if let vm {
-                    Picker("Mode", selection: $deep) {
-                        Text("Report").tag(false)
-                        Text("Deep dive").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-
-                    if !vm.enoughData {
-                        EmptyHint(text: "A few focus sessions in and your patterns show up here — strongest day, estimate calibration, what keeps slipping.")
-                    }
-                    if !vm.insights.isEmpty { insightCards(vm) }
-                    weekdayChart(vm)
-                    calibration(vm)
-                    if deep {
-                        histogram("When interruptions happen", vm.interruptions, theme.palette.coral, unit: "min")
-                        histogram("How fast you come back", vm.reEntry, theme.palette.primary, unit: "min")
-                        timeOfDayHeatmapView(vm)
-                        if !vm.pauses.isEmpty { pauseAnatomyView(vm) }
-                        if !vm.slips.isEmpty { slipDetector(vm) }
-                    }
+                    content(vm)
                 } else {
                     ProgressView()
                 }
@@ -94,24 +101,62 @@ struct AnalyticsView: View {
         }
     }
 
-    // Bar histogram over time bins (interruptions / re-entry). Each bin is
-    // `binMin` minutes wide (Core uses 3 / 5 respectively).
     @ViewBuilder
-    private func histogram(_ title: String, _ bins: [Int], _ color: Color, unit: String) -> some View {
+    private func content(_ vm: AnalyticsModel) -> some View {
+        @Bindable var vm = vm
+        Picker("Window", selection: $vm.window) {
+            Text("Week").tag(AnalyticsModel.Window.week)
+            Text("Month").tag(AnalyticsModel.Window.month)
+            Text("All").tag(AnalyticsModel.Window.all)
+        }
+        .pickerStyle(.segmented)
+        Picker("Mode", selection: $deep) {
+            Text("Report").tag(false)
+            Text("Deep dive").tag(true)
+        }
+        .pickerStyle(.segmented)
+
+        if !vm.insights.isEmpty { insightCards(vm) }
+
+        // Numbers stay gentle until there's enough signal (Android parity): the
+        // data-bearing charts only appear past the threshold; the slip detector
+        // is intentionally low-threshold and always shown in Deep dive.
+        if vm.enoughData {
+            weekdayChart(vm)
+            calibration(vm)
+            if deep {
+                histogram("When interruptions happen", vm.interruptions, theme.palette.coral, binMin: 3)
+                histogram("How fast you come back", vm.reEntry, theme.palette.primary, binMin: 5)
+                timeOfDayHeatmapView(vm)
+                if !vm.pauses.isEmpty { pauseAnatomyView(vm) }
+            }
+        } else {
+            EmptyHint(text: "A few focus sessions in and your patterns show up here — strongest day, estimate calibration, what keeps slipping.")
+        }
+        if deep && !vm.slips.isEmpty { slipDetector(vm) }
+    }
+
+    // Bar histogram over time bins (interruptions / re-entry). Each bin is
+    // `binMin` minutes wide; the x-axis labels the start of each bin (Nm).
+    @ViewBuilder
+    private func histogram(_ title: String, _ bins: [Int], _ color: Color, binMin: Int) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel(title)
             Card {
                 Chart(Array(bins.enumerated()), id: \.offset) { i, count in
-                    BarMark(x: .value("Bin", "\(i)"), y: .value("Count", count))
+                    BarMark(x: .value("Bin", "\(i * binMin)m"), y: .value("Count", count))
                         .foregroundStyle(color)
                 }
-                .chartXAxis(.hidden)
+                .chartXAxis {
+                    AxisMarks(values: .automatic(desiredCount: 5)) { AxisValueLabel() }
+                }
                 .frame(height: 130)
             }
         }
     }
 
-    // Day-of-week × time-of-day grid (darker = more focus). 7 rows × 4 buckets.
+    // Day-of-week × time-of-day grid (darker = more focus): 5 weekday rows
+    // (Mon–Fri) × 6 two-hour buckets (7a–5p).
     @ViewBuilder
     private func timeOfDayHeatmapView(_ vm: AnalyticsModel) -> some View {
         let grid = vm.heatmap          // 5 weekday rows (Mon–Fri) × 6 time buckets (7a–7p)

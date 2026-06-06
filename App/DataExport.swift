@@ -1,6 +1,7 @@
 // Data export — a real "Backup" that writes the local store to a JSON file the
-// user can save/share. Mirrors the web lib/data-export.ts ExportBundle shape
-// (snake_case top-level table keys; each row is the camelCase model JSON).
+// user can save/share. Same ExportBundle shape as the web/Android exporters
+// (snake_case top-level table keys; each row is the camelCase model JSON), plus
+// the locally-stored preferences (adhd_struggles).
 
 import Foundation
 import UnstuckCore
@@ -19,8 +20,10 @@ private struct ExportBundle: Encodable {
     let tags: [TagRow]
     let collections: [ItemCollection]
     let calendar_connections: [CalendarConnection]
+    let preferences: Preferences
 
     struct User: Encodable { let email: String?; let displayName: String? }
+    struct Preferences: Encodable { let adhd_struggles: [String] }
 }
 
 extension AppModel {
@@ -38,7 +41,8 @@ extension AppModel {
             life_areas: (try? Repository<LifeArea>(db, orderColumn: "sortOrder").all()) ?? [],
             tags: (try? Repository<TagRow>(db, orderColumn: "sortOrder").all()) ?? [],
             collections: (try? Repository<ItemCollection>(db, orderColumn: "sortOrder").all()) ?? [],
-            calendar_connections: (try? Repository<CalendarConnection>(db, orderColumn: "connectedAt").all()) ?? [])
+            calendar_connections: (try? Repository<CalendarConnection>(db, orderColumn: "connectedAt").all()) ?? [],
+            preferences: .init(adhd_struggles: UserDefaults.standard.stringArray(forKey: "unstuck.adhdStruggles") ?? []))
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         return try? enc.encode(bundle)
