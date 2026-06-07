@@ -13,8 +13,9 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    DEVELOPMENT_TEAM: D57M85TRUC
     CODE_SIGN_STYLE: Automatic
+    # No DEVELOPMENT_TEAM hardcoded — whoever opens the project selects their
+    # own team in Signing & Capabilities (portable across machines/accounts).
   configs:
     # Simulator/dev builds skip signing; Release (archive) signs automatically.
     Debug:
@@ -39,7 +40,6 @@ targets:
         CODE_SIGN_ENTITLEMENTS: App/Unstuck.entitlements
         TARGETED_DEVICE_FAMILY: "1"
         ENABLE_USER_SCRIPT_SANDBOXING: "YES"
-        DEVELOPMENT_TEAM: D57M85TRUC
         CODE_SIGN_STYLE: Automatic
     dependencies:
       - package: UnstuckKit
