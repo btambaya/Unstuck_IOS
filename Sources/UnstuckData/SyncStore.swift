@@ -41,6 +41,13 @@ public extension AppDatabase {
         }
     }
 
+    /// Every locally-cached cal block. The hydrator derives both the
+    /// preserved-external set and the §1.3 `localPending` preservation set
+    /// (unsynced optimistic task blocks) from this snapshot.
+    func fetchAllCalBlocks() throws -> [CalBlock] {
+        try writer.read { try CalBlock.fetchAll($0) }
+    }
+
     /// The user's first calendar connection (for choosing a Google push target).
     func firstCalendarConnection() throws -> CalendarConnection? {
         try writer.read { try CalendarConnection.fetchOne($0) }
@@ -50,11 +57,16 @@ public extension AppDatabase {
         try writer.read { db in try CalBlock.filter(Column("taskId") == id).fetchAll(db) }
     }
 
-    /// Wipe every synced table (sign-out / shared-device privacy). Local-
-    /// only tables (outbox, live_session) are intentionally left alone.
-    func wipeSyncedTables() throws {
+    /// Wipe EVERYTHING for a user change / sign-out: the synced tables PLUS
+    /// the local-only outbox + live_session (spec 02-sync-engine §1.7/§2.2
+    /// clearAll). Leaving the outbox behind would let the next sign-in stamp
+    /// the previous user's queued ops with the new user's id (cross-account
+    /// leak); the pre-signout drain in SyncCoordinator.signOutAndUnregister
+    /// gives pending edits their chance to flush first.
+    func clearAll() throws {
         let tables = ["tasks", "sessions", "cal_blocks", "captures", "reason_logs",
-                      "collections", "tags", "life_areas", "calendar_connections"]
+                      "collections", "tags", "life_areas", "calendar_connections",
+                      "outbox", "live_session"]
         try writer.write { db in
             for t in tables { try db.execute(sql: "DELETE FROM \(t)") }
         }

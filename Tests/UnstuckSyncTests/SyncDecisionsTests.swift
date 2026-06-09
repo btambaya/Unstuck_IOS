@@ -4,9 +4,11 @@ import UnstuckCore
 
 final class SyncDecisionsTests: XCTestCase {
 
-    func testSignedInAlwaysWipes() {
-        XCTAssertTrue(SyncDecision.shouldWipeCache(event: .signedIn, prevUserId: "u1", currentUserId: "u1"))
+    func testSignedInWipesOnlyIfUserChanged() {
+        // same-user re-auth must NOT wipe (would drop pending offline edits + live session)
+        XCTAssertFalse(SyncDecision.shouldWipeCache(event: .signedIn, prevUserId: "u1", currentUserId: "u1"))
         XCTAssertTrue(SyncDecision.shouldWipeCache(event: .signedIn, prevUserId: nil, currentUserId: "u1"))
+        XCTAssertTrue(SyncDecision.shouldWipeCache(event: .signedIn, prevUserId: "u1", currentUserId: "u2"))
     }
 
     func testInitialSessionWipesOnlyIfUserChanged() {

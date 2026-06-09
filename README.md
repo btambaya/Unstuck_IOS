@@ -1,22 +1,32 @@
 # unstuck — iOS
 
 Native SwiftUI app for **unstuck**, an external executive-function layer
-for ADHD. This is the iOS sibling of the web app
-([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)) and
-shares its Supabase backend (project `uaxfteluwctrlgwmmfzi`). The goal is
-**full feature parity with the web app** plus native surfaces (push
-notifications, home/lock widgets, Live Activities / Dynamic Island, iOS
-Focus Filter).
+for ADHD. The goal is a **1:1 behavioral replica of the Android app**
+(`../unstuck_android`) — Android is the reference client; the
+authoritative spec is
+[`unstuck_android/docs/ios-rebuild-spec/`](../unstuck_android/docs/ios-rebuild-spec/)
+(15 sections — where any doc disagrees with Android, follow Android) —
+plus the iOS-native surfaces (push notifications, home/lock widgets,
+Live Activities / Dynamic Island, iOS Focus Filter). It shares the
+Supabase backend (project `uaxfteluwctrlgwmmfzi`) that lives in the web
+repo ([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)).
 
-> Status: **working build.** Full data + sync + design foundation
-> (`UnstuckCore` / `UnstuckData` / `UnstuckSync` / `UnstuckDesign` /
-> `UnstuckShared`, 210 tests); the app + widget extension build for the
-> iOS simulator; feature surfaces (Today, Tasks, Focus, Calendar, Lists,
-> Settings, Insights) + native surfaces (push, Start Next widget, Focus
-> Live Activity / Dynamic Island, Focus Filter, paused-checkin) are wired;
-> the notification DB backend (migrations 014–016) is applied + the push
-> Edge Functions are written. Remaining = feature polish + the manual
-> deploy/capability steps — see [`handover.md`](handover.md).
+> Status: **working build, near Android parity.** Full data + sync +
+> design foundation (`UnstuckCore` / `UnstuckData` / `UnstuckSync` /
+> `UnstuckDesign` / `UnstuckShared`, **250 tests**); the app + widget
+> extension build and launch on the iOS simulator. All feature surfaces
+> (Today, Tasks, Focus, Calendar, Lists/Collections + sharing, Settings,
+> Insights, Onboarding, Command palette) and native surfaces (push,
+> Start Next widget, Focus Live Activity / Dynamic Island, Focus Filter)
+> are wired; the spec-§10 notification subsystem (reminder scheduler,
+> Notification Center, levels, action routing) and the audit-driven sync
+> hardening (poison-pill outbox, per-row FIFO, sign-out drain +
+> push-token unregister, scenePhase/BG-refresh sync triggers, Google
+> pull reconcile, privacy manifest) landed 2026-06-09. Remaining gaps:
+> the Android assistant/voice bubble (not in the spec, not ported), the
+> Today recap card, server push payload custom keys (backend), and the
+> manual deploy/capability steps — see [`handover.md`](handover.md) for
+> the honest list.
 
 ## Architecture
 
@@ -26,18 +36,24 @@ tests with no Xcode project or code signing:
 
 | Module | Role | Status |
 |---|---|---|
-| `UnstuckCore` | Pure domain models + full logic layer (no UI/Supabase) | ✅ done + tested (174 tests) |
-| `UnstuckData` | GRDB local store + outbox + live session | ✅ done + tested (15 tests) |
-| `UnstuckSync` | supabase-swift wiring + offline-first sync engine | ✅ done (13 tests; networked paths runtime-validated in-app) |
+| `UnstuckCore` | Pure domain models + full logic layer incl. reminder planning + calendar-pull reconcile (no UI/Supabase) | ✅ done + tested (204 tests) |
+| `UnstuckData` | GRDB local store + outbox + live session | ✅ done + tested (16 tests) |
+| `UnstuckSync` | supabase-swift wiring + offline-first sync engine (flusher hardening tested via a gateway fake) | ✅ done (22 tests; networked paths runtime-validated in-app) |
 | `UnstuckDesign` | Brand-v2 oklch tokens + Theme + SwiftUI components | ✅ done (8 tests) |
 | `UnstuckShared` | App-Group snapshot + Live Activity attributes + Focus Filter flag | ✅ done |
-| App `App/Features/*` | Today, Tasks (+recurrence), Focus (+treatments/reasons/captures), Calendar (+Google connect), Lists, Tags & Areas, Insights, Settings, Onboarding, Command palette | ✅ built |
+| App `App/Features/*` + `App/Notifications/*` | Today, Tasks (+recurrence), Focus (+treatments/reasons/captures), Calendar (+Google connect/pull/push), Lists/Collections (+sharing), Tags & Areas, Insights, Settings, Onboarding, Command palette, reminder scheduler + Notification Center | ✅ built |
 | `Widgets/` | Start Next widget + Focus Live Activity / Dynamic Island | ✅ builds |
 
 **Offline-first**: a local store drives the UI; Supabase is canonical.
-The sync engine mirrors the web's `lib/sync/*` contract (hydrate =
-server-canonical replace-per-table; realtime mirror; write-through +
-outbox for offline mutations).
+The sync engine is the port of the Android engine specced in
+[`02-sync-engine.md`](../unstuck_android/docs/ios-rebuild-spec/02-sync-engine.md):
+hydrate = server-canonical replace-per-table (preserving external
+`g_` blocks + locally-pending optimistic blocks), realtime mirror,
+write-through + outbox for offline mutations (dependency-ordered,
+per-row FIFO, FAIL_CAP poison pill), with sync triggers on auth events,
+foreground (`scenePhase .active`), a debounced post-write kick, and a
+best-effort `BGAppRefreshTask`. Sign-out drains the outbox, unregisters
+the device push token, and clears everything local.
 
 ### Name mappings (web → Swift)
 
@@ -46,15 +62,17 @@ To avoid clashing with Swift standard types, two domain types are renamed:
 - web `Task` → `TaskItem` (Swift Concurrency owns `Task`)
 - web `Collection` → `ItemCollection` (stdlib owns `Collection`)
 
-All other types keep their web names. Logic ports keep the web function
-names (`pickStartNext`, `visibleTasks`, `isSlipping`, …) and mirror the
-web's `lib/*.test.ts` cases as XCTest so behavior stays in lockstep.
+All other types keep their web names. Logic ports keep the shared
+function names (`pickStartNext`, `visibleTasks`, `isSlipping`, … — the
+same names Android's `:core` uses) and mirror the web's `lib/*.test.ts`
+cases / Android's `:core` JUnit parity suite as XCTest so behavior stays
+in lockstep across all three clients.
 
 ## Requirements
 
 - Xcode 26.3+ / Swift 6.2 (Swift tools 6.0)
 - iOS 17+ deployment target
-- [XcodeGen](https://github.com/yonohub/XcodeGen) (`brew install xcodegen`) to generate the app project
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`) to generate the app project
 
 ## The app
 
@@ -91,9 +109,17 @@ xcrun llvm-cov report \
 
 CI (`.github/workflows/ci.yml`) runs the same on every push/PR.
 
-## Backend
+## Backend & spec
 
 The shared Supabase backend lives in the **web** repo under
 `unstuck/supabase/` (migrations + Edge Functions). iOS-specific backend
 additions (push tokens, notification scheduling, APNs) land there too —
 this repo consumes them.
+
+The **behavioral** spec lives in the **Android** repo:
+[`unstuck_android/docs/ios-rebuild-spec/`](../unstuck_android/docs/ios-rebuild-spec/)
+— 15 sections covering data model, sync engine, every surface,
+notifications, and backend contracts, generated from the live Android
+Kotlin. Android is the reference client; consult the spec (and the
+Android sources at `../unstuck_android`, read-only) before changing
+sync or feature behavior here.

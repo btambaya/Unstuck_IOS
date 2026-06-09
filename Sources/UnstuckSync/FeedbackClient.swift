@@ -39,7 +39,8 @@ public struct FeedbackClient: Sendable {
         device: String?,
         screen: String?
     ) async -> Bool {
-        guard let userId = client.auth.currentSession?.user.id.uuidString else { return false }
+        // Lowercased like AuthService.currentUserId — server uuids are lowercase.
+        guard let userId = client.auth.currentSession?.user.id.uuidString.lowercased() else { return false }
         do {
             _ = try await client.from("feedback").insert(
                 Row(id: id, body: body, category: category, user_id: userId, email: email,

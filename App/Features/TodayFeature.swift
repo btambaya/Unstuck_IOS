@@ -20,18 +20,18 @@ final class TodayModel {
     var areas: [LifeArea] = []
     var sessions: [Session] = []
     private let repo: TaskRepository
-    private let db: AppDatabase
-    init(_ repo: TaskRepository, _ db: AppDatabase) { self.repo = repo; self.db = db }
+    init(_ repo: TaskRepository) { self.repo = repo }
 
     func observe() async {
-        areas = (try? Repository<LifeArea>(db, orderColumn: "sortOrder").all()) ?? []
-        sessions = (try? Repository<Session>(db, orderColumn: "completedAt").all()) ?? []
         do {
+            // areas/sessions come from the same tracked snapshot, so an area
+            // rename or a realtime session arrival refreshes the pills and
+            // the week-focused stat without waiting for a task edit.
             for try await snap in repo.observeTasksAndBlocks() {
                 all = snap.tasks
                 blocks = snap.blocks
-                areas = (try? Repository<LifeArea>(db, orderColumn: "sortOrder").all()) ?? []
-                sessions = (try? Repository<Session>(db, orderColumn: "completedAt").all()) ?? []
+                areas = snap.areas
+                sessions = snap.sessions
                 writeWidgetSnapshot()
             }
         } catch {}
@@ -69,6 +69,7 @@ struct TodayView: View {
     @Environment(\.colorScheme) private var scheme
     @State private var vm: TodayModel?
     @State private var showSettings = false
+    @State private var showNotifCenter = false
     @State private var showPalette = false
     @State private var notifsEnabled = true
     @State private var areaFilter: String?
@@ -91,11 +92,12 @@ struct TodayView: View {
         }
         .background(theme.palette.bg.ignoresSafeArea())
         .sheet(isPresented: $showSettings) { SettingsView() }
+        .sheet(isPresented: $showNotifCenter) { NotificationCenterView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .feedbackBubble()
         .task {
-            guard vm == nil, let repo = model.taskRepo, let db = model.db else { return }
-            let m = TodayModel(repo, db); vm = m; await m.observe()
+            guard vm == nil, let repo = model.taskRepo else { return }
+            let m = TodayModel(repo); vm = m; await m.observe()
         }
         .task { await refreshNotifStatus() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
@@ -110,8 +112,16 @@ struct TodayView: View {
             HStack {
                 Mark(size: 24)
                 Spacer()
-                Button { showSettings = true } label: {
+                // Bell → in-app Notification Center; the dot is the unread
+                // badge (newest log entry vs lastSeen — spec 10 §1.9).
+                Button { showNotifCenter = true } label: {
                     Image(systemName: "bell").font(.system(size: 18)).foregroundStyle(theme.palette.ink2).frame(width: 40, height: 40)
+                        .overlay(alignment: .topTrailing) {
+                            if NotificationLog.shared.hasUnread {
+                                Circle().fill(theme.palette.coral).frame(width: 8, height: 8)
+                                    .offset(x: -8, y: 8)
+                            }
+                        }
                 }.buttonStyle(.plain)
                 Button { showSettings = true } label: {
                     Text(model.avatarInitials)

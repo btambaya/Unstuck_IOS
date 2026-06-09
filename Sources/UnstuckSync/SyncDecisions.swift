@@ -15,15 +15,16 @@ public enum SyncAuthEvent: Sendable, Equatable {
 
 public enum SyncDecision {
 
-    /// Cache-wipe rule (mirrors bootstrap-listener.tsx):
-    /// - SIGNED_IN: always wipe (fresh sign-in on this device).
-    /// - INITIAL_SESSION: wipe only if the user changed since last run
-    ///   (shared device); a plain reload as the same user keeps the cache.
+    /// Cache-wipe rule (mirrors bootstrap-listener.tsx / Android SyncDecision):
+    /// wipe ONLY when the user actually changed (or first sign-in, prev=nil) —
+    /// never for a same-user re-auth, so a SIGNED_IN re-emit can't clobber the
+    /// already-signed-in user's pending offline edits + live focus session
+    /// before the outbox flushes (spec 02-sync-engine §1.8 / gotcha 9).
+    /// - SIGNED_IN / INITIAL_SESSION: wipe iff the user changed since last run.
     /// - USER_UPDATED: never wipe (same user, metadata change).
     public static func shouldWipeCache(event: SyncAuthEvent, prevUserId: String?, currentUserId: String) -> Bool {
         switch event {
-        case .signedIn: return true
-        case .initialSession: return prevUserId != currentUserId
+        case .signedIn, .initialSession: return prevUserId != currentUserId
         case .userUpdated: return false
         }
     }

@@ -19,6 +19,9 @@ final class AppRouter {
     var showFeedback = false
     /// When set, the Focus surface is presented full-screen for this task.
     var focusTask: TaskItem?
+    /// When set, the task editor is presented for this task (notification
+    /// deep links: unstuck://task/<id> — Android Route.Detail).
+    var detailTask: TaskItem?
 
     func select(_ tab: Tab) { self.tab = tab }
     func present(_ sheet: Sheet) { activeSheet = sheet }

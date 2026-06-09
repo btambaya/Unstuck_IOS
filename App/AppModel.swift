@@ -7,7 +7,9 @@ import SwiftUI
 import UIKit
 import UnstuckCore
 import UnstuckData
+import UnstuckShared
 import UnstuckSync
+import WidgetKit
 
 @MainActor
 @Observable
@@ -108,6 +110,43 @@ final class AppModel {
         LiveActivityController.shared.onPushToken = { [weak self] activityId, token in
             self?.registerLiveActivityToken(activityId: activityId, token: token)
         }
+
+        // BG app refresh (spec 02-sync-engine §5): flush + hydrate, then
+        // rebuild the Start-Next widget snapshot (the in-app updater only
+        // runs while TodayModel is alive — mirrors Android's SyncWorker).
+        BackgroundSync.perform = { [weak coord, weak self] in
+            await coord?.syncNow()
+            await self?.refreshWidgetSnapshot()
+        }
+
+        // Reminder scheduler + notification log + buffered push gestures
+        // (spec 10): must come after repos exist so a cold launch from a
+        // notification tap can resolve its task.
+        startNotifications()
+    }
+
+    /// Foreground/manual sync trigger (scenePhase .active, BG refresh):
+    /// flush the outbox + hydrate for the current user. No-op signed out.
+    /// Also re-extends the 48h reminder horizon (spec 10 §5.3) and catches
+    /// the Notification Log up on anything delivered while away.
+    func syncNow() {
+        ReminderScheduler.shared.resync()
+        NotificationLog.shared.sweepDelivered()
+        guard let coord = coordinator else { return }
+        Task { await coord.syncNow() }
+    }
+
+    /// Recompute + write the Start-Next widget snapshot from the local
+    /// store, then poke WidgetKit (used by the BG refresh task).
+    func refreshWidgetSnapshot() {
+        guard let repo = taskRepo else { return }
+        let tasks = (try? repo.all()) ?? []
+        let next = pickStartNext(tasks: tasks, blocks: [], liveTaskId: nil)
+        let openCount = tasks.filter { !$0.done && !($0.later ?? false) }.count
+        AppGroup.writeStartNext(StartNextSnapshot(
+            taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
+            openCount: openCount, updatedAt: Date()))
+        WidgetCenter.shared.reloadAllTimelines()
     }
 
     func registerPush(_ tokenHex: String) {
@@ -130,14 +169,31 @@ final class AppModel {
         Task { [weak self] in
             for await (event, session) in coord.auth.authStateChanges {
                 _ = event
-                await MainActor.run { self?.signedIn = session != nil }
+                let isAuthed = session != nil
+                await MainActor.run {
+                    self?.signedIn = isAuthed
+                    // Re-register the APNs token on every transition to
+                    // authenticated (spec 10 §1.8): sign-out deletes this
+                    // device's token row, so a user switch within one launch
+                    // must recreate it for the NEW user.
+                    if isAuthed, let hex = PushRegistrar.shared.apnsTokenHex {
+                        self?.registerPush(hex)
+                    }
+                }
             }
         }
     }
 
     func handleDeepLink(_ url: URL) {
-        guard let coord = coordinator else { return }
-        Task { _ = await coord.auth.handleCallback(url: url) }
+        // OAuth / magic-link PKCE callback → the auth client; everything
+        // else (unstuck://task/…, /focus/…, /today, capture) routes to the
+        // matching surface (spec 10 §1.7 push-tap deep links).
+        if url.host == "auth-callback" {
+            guard let coord = coordinator else { return }
+            Task { _ = await coord.auth.handleCallback(url: url) }
+            return
+        }
+        routeDeepLink(url.absoluteString)
     }
 
     /// The optimistic write API (local GRDB + server outbox), for features.
@@ -145,9 +201,23 @@ final class AppModel {
     /// back to the local-only writer in the XCUITest demo boot.
     var write: WriteThrough? { coordinator?.write ?? uiTestWrite }
 
+    /// Sign out via the coordinator's spec'd path: drain the outbox
+    /// (bounded), unregister this device's push token while the JWT is
+    /// still valid, then sign out (spec 02 §1.7 signOutAndUnregister).
+    /// Also wipe the device-local notification state (spec 10 §1.8/§1.11):
+    /// the log + per-task reminder overrides, every scheduled reminder, and
+    /// the pending paused check-in — so the next account on this device
+    /// starts clean and never sees the previous user's task names.
     func signOut() {
         guard let coord = coordinator else { return }
-        Task { await coord.auth.signOut() }
+        let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
+        NotificationLog.shared.clear()
+        NotificationPrefs.clearUserContent()
+        PausedCheckinScheduler.cancel()
+        Task {
+            await ReminderScheduler.shared.cancelAll()
+            await coord.signOutAndUnregister(deviceId: deviceId)
+        }
     }
 
     func saveTask(_ task: TaskItem) {
@@ -218,10 +288,18 @@ final class AppModel {
         guard let write = coordinator?.write else { return }
         Task {
             try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
+            // Only TASK blocks mirror to Google (spec §1.6): external g_
+            // blocks are read-only mirrors of the remote calendar and must
+            // never be (re-)pushed; placeholders have nothing to push.
+            guard isTaskBlock(block) else { return }
             guard let calendar = coordinator?.calendar, let database = db,
                   let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
             let range = blockToIsoRange(block)
-            let calId = conn.selectedCalendarIds.first ?? "primary"
+            // Always write task blocks to the user's PRIMARY calendar —
+            // selectedCalendarIds can include read-only/subscribed calendars
+            // (which 403 on insert). "primary" is Google's alias for the
+            // main, always-writable calendar (Android pushBlockUpsert).
+            let calId = "primary"
             if let eventId = block.externalEventId {
                 try? await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
                                                summary: block.taskName, start: range.start, end: range.end)
@@ -235,14 +313,18 @@ final class AppModel {
         }
     }
 
-    /// Delete a block locally + on Google (if it was pushed).
+    /// Delete a block locally + on Google (if it was pushed). External g_
+    /// blocks never delete the underlying Google event — they only mirror
+    /// it (Android pushBlockDelete returns early for EXTERNAL).
     func deleteBlock(_ block: CalBlock) {
         guard let write = coordinator?.write else { return }
         Task {
-            if let eventId = block.externalEventId, let calendar = coordinator?.calendar,
+            if let eventId = block.externalEventId, !isExternalBlock(block),
+               let calendar = coordinator?.calendar,
                let database = db, let conn = (try? database.firstCalendarConnection()) ?? nil {
+                // Task blocks are inserted on "primary" — delete there too.
                 try? await calendar.deleteEvent(eventId: eventId, connectionId: conn.id,
-                                                calendarId: conn.selectedCalendarIds.first ?? "primary")
+                                                calendarId: "primary")
             }
             try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
         }
@@ -320,22 +402,12 @@ final class AppModel {
         }
     }
 
-    /// Ingest pulled Google events as local external cal_blocks (g_ ids;
-    /// not synced — they live device-side, preserved across hydrate).
-    func ingestExternalBlocks(_ events: [ExternalEvent]) {
-        guard let db else { return }
-        for ev in events { try? db.save(externalEventToBlock(ev, calendarId: ev.calendarId)) }
-    }
-
+    /// Manual "Sync now" pull — the reconciled [-7d, +30d] Google pull
+    /// (own-event + all-day filters, deletion reconcile) lives on the
+    /// coordinator, which also runs it from the sign-in pipeline + syncNow.
     func pullGoogleCalendar() async {
-        guard let calendar = coordinator?.calendar else { return }
-        let f = ISO8601DateFormatter()
-        let now = Date()
-        let from = f.string(from: now.addingTimeInterval(-7 * 86_400))
-        let to = f.string(from: now.addingTimeInterval(14 * 86_400))
-        if let events = try? await calendar.pullEvents(from: from, to: to) {
-            ingestExternalBlocks(events)
-        }
+        guard let coord = coordinator else { return }
+        await coord.pullCalendar()
     }
 
     func saveSession(_ session: Session) {

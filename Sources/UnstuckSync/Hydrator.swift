@@ -12,10 +12,12 @@ import UnstuckData
 public actor Hydrator {
     private let gateway: SyncGateway
     private let db: AppDatabase
+    private let box: OutboxStore
 
     public init(gateway: SyncGateway, db: AppDatabase) {
         self.gateway = gateway
         self.db = db
+        self.box = OutboxStore(db)
     }
 
     public func hydrate(userId: String) async {
@@ -79,9 +81,22 @@ public actor Hydrator {
     private func hydrateCalBlocks() async {
         do {
             let remote = try await gateway.fetchAll(CalBlockRow.self, table: "cal_blocks").map { $0.model() }
-            let localExternal = (try? db.fetchExternalCalBlocks()) ?? []
+            let local = (try? db.fetchAllCalBlocks()) ?? []
+            let localExternal = local.filter { isExternalBlock($0) }
             let merged = SyncDecision.mergeHydratedCalBlocks(remote: remote, localExternal: localExternal)
-            try db.replaceAll(CalBlock.self, with: merged)
+            // Preserve unsynced optimistic TASK blocks (those with a pending
+            // cal_blocks upsert op in the outbox): they're in neither `remote`
+            // nor `localExternal`, so the replace would wipe a just-scheduled
+            // block off the UI until the next flush (spec 02-sync-engine §1.3
+            // localPending). Keep any not already present from the server.
+            let pendingIds = Set(((try? box.pending()) ?? [])
+                .filter { $0.tableName == "cal_blocks" && $0.kind == .upsert }
+                .map(\.rowId))
+            let mergedIds = Set(merged.map(\.id))
+            let localPending = local.filter {
+                pendingIds.contains($0.id) && !mergedIds.contains($0.id) && !isExternalBlock($0)
+            }
+            try db.replaceAll(CalBlock.self, with: merged + localPending)
         } catch {
             print("[hydrate] cal_blocks failed, leaving local intact: \(error)")
         }

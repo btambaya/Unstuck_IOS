@@ -30,6 +30,11 @@ struct MainTabScaffold: View {
             .sheet(isPresented: $router.showFeedback) {
                 FeedbackSheet(screen: screenLabel(router.tab))
             }
+            // Notification deep links (unstuck://task/<id>) open the task
+            // editor from anywhere — Android's Route.Detail push.
+            .sheet(item: $router.detailTask) { task in
+                TaskEditor(task: task, existingBlocks: ((try? model.db?.blocks(forTask: task.id)) ?? nil) ?? [])
+            }
             .fullScreenCover(item: $router.focusTask) { task in
                 FocusView(task: task)
             }

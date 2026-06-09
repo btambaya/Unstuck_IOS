@@ -67,8 +67,13 @@ public struct AuthService: Sendable {
         try? await client.auth.signOut()
     }
 
+    /// Lowercased to match the server: Foundation's UUID.uuidString is
+    /// UPPERCASE, but every user_id string PostgREST/realtime returns is
+    /// lowercase — an uppercase uid breaks every ownership/membership
+    /// comparison (collections myRole/isOwner) and realtime filters.
+    /// Matches UnstuckCore.newUUID(), which also lowercases.
     public var currentUserId: String? {
-        client.auth.currentSession?.user.id.uuidString
+        client.auth.currentSession?.user.id.uuidString.lowercased()
     }
 
     /// Signed-in user's email (denormalized into feedback + "who's on it" labels).

@@ -3,11 +3,164 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
+**Parity frame (don't lose this):** the ANDROID app
+(`../unstuck_android`) is the reference client — NOT the web app. The
+authoritative spec is
+`../unstuck_android/docs/ios-rebuild-spec/` (15 sections, generated from
+the live Android Kotlin): *"Android is the reference client … where this
+doc and the old discarded iOS app disagree, follow Android."* The web
+repo (`../unstuck`) is only the backend home (migrations + Edge
+Functions) and the historical port source for `UnstuckCore` logic names.
+
+## Where things stand (2026-06-09, later) — tri-platform audit: sync hardening pass
+
+A 114-agent tri-platform review
+(`../unstuck/audit/tri-platform-review-2026-06-09.md`) found the iOS
+sync engine had regressed every documented Android outbox lesson, plus a
+cluster of smaller spec divergences. All iOS findings from that audit
+are now fixed in this pass:
+
+- **Lowercase uids (was CRITICAL):** `AuthService.currentUserId`,
+  `FeedbackClient`, and `SyncCoordinator.handle` now lowercase
+  `UUID.uuidString` — Foundation uppercases it while every server uuid
+  is lowercase, which broke ALL collection ownership/membership checks
+  (owners saw their own lists as shared) and routed offline edits to the
+  no-outbox RPC path. The stored `prevUserId` is lowercased on read too.
+- **Outbox cross-account leak (was CRITICAL):** `wipeSyncedTables()` →
+  `AppDatabase.clearAll()`, which now also clears `outbox` +
+  `live_session` on sign-out/user-switch (a kept outbox was replayed
+  stamped with the NEXT user's id). `SyncDecision.shouldWipeCache` wipes
+  iff the user actually changed (a same-user `SIGNED_IN` re-auth no
+  longer clobbers pending edits + the live session);
+  `SyncDecisionsTests` re-pinned to the spec behavior.
+- **Pre-signout drain + push unregister:**
+  `SyncCoordinator.signOutAndUnregister(deviceId:)` drains the outbox
+  (bounded 5 s, guarded on the live user), deletes this device's
+  `device_tokens`/`live_activity_tokens` rows while the JWT is still
+  valid (`PushClient.unregister`), then signs out. `AppModel.signOut`
+  also wipes the notification log + per-task reminder overrides and
+  cancels all scheduled reminders + the paused check-in; the APNs token
+  re-registers on the next authenticated transition.
+- **OutboxFlusher = the Android port (spec §1.2/§1.4):** FAIL_CAP=5
+  poison pill + orphan-drop of dependents, `blockedRows` per-row FIFO
+  after a failure (an older retried upsert can never clobber a newer
+  one), and a mid-drain live-user re-check. The drain now runs against a
+  `SyncGatewayProtocol` seam; `OutboxFlusherTests` script failures
+  through a fake gateway over a real GRDB outbox.
+- **Sync triggers beyond auth events (spec §5):** debounced post-write
+  flush kick (1.5 s after every `WriteThrough` enqueue), `syncNow()`
+  (flush → hydrate → calendar pull) on scenePhase `.active`, and a
+  chained `BGAppRefreshTask` (`tech.csalliance.unstuck.refresh`, 30-min
+  best-effort, Info.plist `UIBackgroundModes: fetch`) that also rebuilds
+  the Start-Next widget snapshot. Offline edits no longer wait for an
+  app relaunch.
+- **§1.6 external-block guards:** `g_`/external cal_blocks are never
+  enqueued to Postgres (`WriteThrough.upsertCalBlock` early-returns),
+  never pushed/patched/deleted on Google, aren't draggable and have no
+  Delete context menu in the day grid. Every delete cancels the row's
+  still-queued upserts (`OutboxStore.cancelPendingUpserts`) so a
+  held-back upsert can't resurrect a deleted row (§1.8). Task blocks now
+  push to Google's `"primary"` calendar (not
+  `selectedCalendarIds.first`, which can 403 on read-only calendars).
+- **Hydrate preserves localPending (§1.3):** `hydrateCalBlocks` re-adds
+  unsynced optimistic TASK blocks (pending cal_blocks upserts in the
+  outbox) so a transiently-failed flush can't wipe a just-scheduled
+  block off the UI.
+- **Google pull reconciled (Android `pullCalendar` port):**
+  `reconcileCalendarPull` (pure, in `UnstuckCore`, unit-tested) filters
+  the app's own pushed events + all-day events and drops in-window
+  external blocks Google no longer returns; window is [-7d, +30d]; runs
+  from the sign-in pipeline, `syncNow()`, and the manual Sync button.
+- **Push registration:** explicit `platform: "ios"` in the
+  register-push-token body, and `apnsEnvironment` is `sandbox` for
+  DEBUG builds (dev devices carry sandbox tokens — registering them as
+  production made every server push silently fail).
+- **Release blocker cleared:** `App/PrivacyInfo.xcprivacy` added
+  (required-reason `UserDefaults` CA92.1 + the nutrition-label
+  data-collection entries), bundled into BOTH the app and the widget
+  target via `project.yml`.
+- **Smaller fixes:** Google OAuth `state` echo is validated against the
+  minted state (`GoogleConnectController`); the full-PII data export now
+  writes to a swept staging dir with `.completeFileProtection` and is
+  deleted when the share sheet finishes; Today/Calendar observe
+  life_areas + sessions in the same tracked GRDB snapshot (area renames
+  / realtime sessions refresh the pills + week-focused stat).
+- **Tests: `TZ=UTC swift test` → 250 / 0** (204 Core + 16 Data + 22
+  Sync + 8 Design). New: `ReminderPlanTests`,
+  `CalendarPullReconcileTests`, `OutboxFlusherTests`, plus an
+  `AppDatabase.clearAll` coverage test in `SyncStoreTests`.
+
+### Genuinely remaining gaps (the honest list)
+
+- **Backend:** server pushes to iOS still carry only the APNs alert —
+  no `kind`/`deepLink` custom keys (the client reads them when present
+  and falls back to Today). `notification_preferences.timezone` is a
+  known cross-platform backend gap tracked in the audit.
+- **Documented divergence (spec §5.5):** the paused check-in's server
+  allow-check runs at *arm* time, not fire time (iOS local
+  notifications can't run code before display).
+- **Android assistant + voice "Talk" bubble:** not in the 15-section
+  spec and not ported to iOS yet (Android-only for now).
+- **Today recap "Just now" card** (spec 05, 6h expiry) isn't built;
+  Settings teal/error-red micro-styling still pending. (The Calendar
+  Month heatmap and the 7-column per-hour Week grid, previously listed
+  as open, ARE built now.)
+- **BG sync is best-effort** — `BGAppRefreshTask` has no guaranteed
+  cadence on iOS; the scenePhase trigger covers the common path.
+- **Manual/credential steps** (see "Manual steps" below): APNs p8
+  secrets, signing team + capabilities, the Google Cloud Console HTTPS
+  redirect + AASA for calendar connect, cron SQL.
+
+## Where things stand (2026-06-09) — spec §10 notifications subsystem
+
+Implemented `ios-rebuild-spec/10-notifications.md` end-to-end:
+
+- **Pure decision logic** (`UnstuckCore/Logic/Notifications.swift`, unit-
+  tested in `ReminderPlanTests`): `NotificationLevel` (Calm/Balanced/Coach
+  with the verbatim blurbs + derived gates), `planReminders` (LEAD/ATSTART/
+  DRIFTED over the 48h horizon, per-task lead overrides, done-task skip,
+  external-event lead-only), `upcomingReminders`, `relFuture`/`relPast`,
+  `notificationAccent`.
+- **ReminderScheduler** (`App/Notifications/`): GRDB observation over
+  blocks + tasks + live_session → UNCalendarNotificationTrigger requests
+  with the `unstuck.rem.<tag>:<blockId>` identifier scheme and prev−now
+  stale cancellation; re-syncs on foreground/BG-refresh (syncNow) and on
+  settings change. **Gotcha-8 inversion:** iOS can't re-check at fire time,
+  so completing a task or starting Focus on it cancels its pending
+  ATSTART/DRIFTED via the same observation.
+- **Actions + routing:** `UNNotificationCategory` Start/Reschedule (A2/A4)
+  and Resume/Snooze/End (paused check-in); `didReceive` routes action ids +
+  `data.deepLink` through `PushActionHub` → AppModel (buffered across cold
+  launches); background one-tap Reschedule ports `ScheduleCommands`
+  (next-free-slot + moveCount bump + 8s "Rescheduled" confirmation).
+- **Notification Center** (bell on Today, unread badge): Upcoming (live,
+  48h, ≤20) + Recent (60-entry `NotificationLog` persisted to UserDefaults,
+  fed from willPresent/didReceive + a delivered-notifications sweep).
+- **Level mirror:** Settings → Notifications writes the level device-
+  locally and mirrors `morning_brief_enabled`/`paused_checkin_enabled` to
+  `notification_preferences` (`PreferencesClient.setNotificationLevel`),
+  best-effort, only on change. Global reminder lead + per-task "Remind me"
+  chips (Default/Off/5/10/15m) in the task editor.
+- **Sign-out hygiene:** log + overrides wiped, scheduled reminders +
+  paused check-in cancelled, APNs token unregistered while the JWT is
+  valid (`SyncCoordinator.signOutAndUnregister`); token re-registers on
+  the next authenticated transition.
+- **Documented divergence (spec §5.5):** the paused check-in is a plain
+  14-min `UNTimeIntervalNotificationTrigger` pre-armed at pause time and
+  cancelled on resume/end; the server `send-paused-checkin` allow-check
+  runs at *arm* time (AppModel.requestPausedCheckin cancels on deny), not
+  at fire time — iOS local notifications can't run code before display.
+  Server pushes to iOS currently carry only the APNs alert (no
+  `kind`/`deepLink` custom keys yet — backend gap); the client reads them
+  when present and falls back to Today.
+
 ## Where things stand (2026-06-06) — aligned to current Android (shared collections + accountability + feedback)
 
 The iOS app predated Android's shared-collections / accountability /
-feedback feature set. This pass brought it up to a 1:1 replica of the
-**current** Android across sync + orchestration + the highest-value UI:
+feedback feature set. This pass aligned sync + orchestration + the
+highest-value UI with the **current** Android (the 2026-06-09 audit
+later found and fixed the remaining engine-level divergences — see the
+sections above):
 
 - **Sync layer (UnstuckSync)** — `CollectionShareClient` (share/unshare/
   cancelInvite/leave/listMembers via the `share-collection` edge fn; atomic
@@ -37,7 +190,9 @@ feedback feature set. This pass brought it up to a 1:1 replica of the
 - **Tests:** `TZ=UTC swift test` → **217 / 0** (DbRowCodecTests +5 for the
   new columns + sharing fields). App target builds for the simulator.
 
-Remaining-parity pass (all now DONE): Focus **overrun check-in** (+10 / in-the-
+UI remaining-parity pass (these surface items are DONE — the engine +
+notification gaps they didn't cover are the 2026-06-09 sections above):
+Focus **overrun check-in** (+10 / in-the-
 zone / Stop here); Today **notifications-off banner** (UNUserNotificationCenter
 + didBecomeActive) and **Start-Next** firstPhysicalAction headline + "Pick
 another"; Calendar **Week view** (Mon-anchored ‹/Today/› nav + Focus-planned/
@@ -52,9 +207,11 @@ launches** on the iPhone 17 simulator — a missing `CFBundleExecutable` in
 `Widgets/Info.plist` (GENERATE_INFOPLIST_FILE=NO) had silently blocked install
 on any device; now fixed. `TZ=UTC swift test` = 217/0.
 
-Smaller deltas still open: Settings teal/error-red micro-styling, Calendar
-Month view, the full per-hour week grid (Day mode already has the hour grid),
-recap-card expiry on Today.
+Smaller deltas still open as of this pass: Settings teal/error-red
+micro-styling and the Today recap "Just now" card. (Calendar Month view
+and the full per-hour week grid, listed open here originally, have since
+landed — see "Genuinely remaining gaps" at the top for the current
+list.)
 
 ## Where things stand (2026-05-29)
 
@@ -181,7 +338,10 @@ Tests/UnstuckCoreTests/            # 1:1 ports of the web *.test.ts where they e
   because Swift's `sort` isn't guaranteed stable (the web relies on V8's
   stable sort).
 
-## Next up
+## Next up (historical)
+
+This is the original build-plan status against the old web-parity plan —
+for what's actually open NOW, see "Genuinely remaining gaps" at the top.
 
 All P2–P6 feature surfaces are built + building: **Tasks** (list + filters
 + create/edit + recurrence editor + cal_blocks bucketing), **Today**
@@ -200,10 +360,11 @@ backstop.
 
 The remaining-in-reach items are now DONE too: the **drag-to-schedule day
 grid** (draggable unscheduled tray + drop-to-time + drag-to-reschedule),
-and **Google patch/delete/move** of pushed blocks. The app is
-feature-complete against the plan.
+and **Google patch/delete/move** of pushed blocks. The app was
+feature-complete against that (web-parity) plan; the Android-parity
+deltas that remained are tracked in the dated sections above.
 
-All that's left is **work only you can do** (see "Manual steps" above):
+The credential-gated work is **work only you can do** (see "Manual steps" above):
 deploy the Edge Functions + APNs p8/`CRON_SECRET` secrets, put the anon
 key in `App/Secrets.xcconfig`, enable the Apple capabilities under a
 signing team, register the Universal-Link redirect + ship the AASA, and
@@ -251,7 +412,12 @@ Full roadmap + rationale: the build plan at
 ## Repo / backend facts
 
 - Remote: `github.com/btambaya/Unstuck_IOS.git`, branch `main`.
-- Web app (port source + executable spec): `../unstuck`
+- **Reference client:** the Android app at `../unstuck_android`; the
+  authoritative behavioral spec is
+  `../unstuck_android/docs/ios-rebuild-spec/` (15 sections). Where any
+  doc disagrees with Android, follow Android.
+- Web app (backend home + original `lib/*` port source for the
+  UnstuckCore logic names): `../unstuck`
   (`github.com/btambaya/Unstuck.git`).
 - Supabase project ref: `uaxfteluwctrlgwmmfzi`; schema migrations 001–013
   live in `../unstuck/supabase/`. iOS backend additions (014–016 + push
@@ -265,7 +431,7 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --enable-code-coverage     # 210 tests, all green (logic/data/sync/design)
+TZ=UTC swift test --enable-code-coverage     # 250 tests, all green (204 Core + 16 Data + 22 Sync + 8 Design)
 xcodegen generate && xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
-  -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app shell
+  -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app + widget
 ```

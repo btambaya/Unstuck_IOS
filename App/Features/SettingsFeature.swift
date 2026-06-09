@@ -45,7 +45,11 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .sheet(item: $exportURL) { url in ActivityView(items: [url]) }
+            .sheet(item: $exportURL) { url in
+                // Delete the full-PII dump once the share finishes/cancels so
+                // it doesn't linger in tmp (makeExportFile sweeps stragglers).
+                ActivityView(items: [url]) { AppModel.removeExportFile(url) }
+            }
         }
     }
 
@@ -58,6 +62,10 @@ struct SettingsView: View {
                 withAnimation(.easeInOut(duration: 0.2)) { accountOpen.toggle() }
             }
             if accountOpen { divider; accountBody }
+
+            divider
+            // Notification level (Calm/Balanced/Coach) + reminder lead.
+            navRow("Notifications") { NotificationSettingsView() }
 
             divider
             navRow("Insights") { AnalyticsView() }
@@ -187,8 +195,11 @@ extension URL: @retroactive Identifiable { public var id: String { absoluteStrin
 /// UIActivityViewController bridge for the export share sheet.
 struct ActivityView: UIViewControllerRepresentable {
     let items: [Any]
+    var onComplete: () -> Void = {}
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let vc = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        vc.completionWithItemsHandler = { _, _, _, _ in onComplete() }
+        return vc
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }

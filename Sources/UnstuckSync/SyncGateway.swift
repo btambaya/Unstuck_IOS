@@ -9,7 +9,15 @@
 import Foundation
 import Supabase
 
-public struct SyncGateway: Sendable {
+/// The CRUD seam the outbox drain builds on — SyncGateway in production;
+/// tests inject a scripted fake (the real gateway needs a network +
+/// Supabase client) to exercise the flusher's poison-pill/ordering logic.
+public protocol SyncGatewayProtocol: Sendable {
+    func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws
+    func delete(table: String, id: String) async throws
+}
+
+public struct SyncGateway: Sendable, SyncGatewayProtocol {
     let client: SupabaseClient
 
     public init(_ client: SupabaseClient) { self.client = client }

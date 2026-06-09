@@ -50,6 +50,46 @@ public func externalEventToBlock(_ ev: ExternalEvent, calendarId: String) -> Cal
         kind: .external)
 }
 
+/// One reconciled Google pull: the external blocks to upsert plus the
+/// stale in-window external block ids to drop. Pure — the Edge-Function
+/// pull and the local reads/writes happen in SyncCoordinator.pullCalendar.
+public struct CalendarPullPlan: Equatable, Sendable {
+    public var toUpsert: [CalBlock]
+    public var toDelete: [String]
+
+    public init(toUpsert: [CalBlock], toDelete: [String]) {
+        self.toUpsert = toUpsert
+        self.toDelete = toDelete
+    }
+}
+
+/// Reconcile pulled Google events against the local cache — port of the
+/// Android SyncCoordinator.pullCalendar filtering (spec 02-sync-engine §1.8):
+/// - skip events the app itself pushed (a task block's externalEventId) —
+///   the originating task block already represents them, otherwise a
+///   duplicate g_ block sits next to it (and double-counts in findFreeSlots);
+/// - skip all-day events (date-only start, no 'T') — they'd collapse to
+///   15-min 00:00 slivers stacked on the time grid;
+/// - drop in-window EXTERNAL blocks Google no longer returns (deleted or
+///   moved in Google); `fromYmd...toYmd` are the date-only pull bounds.
+public func reconcileCalendarPull(
+    events: [ExternalEvent], localBlocks: [CalBlock], fromYmd: String, toYmd: String
+) -> CalendarPullPlan {
+    let ownEventIds = Set(localBlocks
+        .filter { blockKind($0) == .task }
+        .compactMap { $0.externalEventId }
+        .filter { !$0.isEmpty })
+    let toUpsert = events
+        .filter { !ownEventIds.contains($0.id) }
+        .filter { $0.start.contains("T") }
+        .map { externalEventToBlock($0, calendarId: $0.calendarId) }
+    let keep = Set(toUpsert.map(\.id))
+    let toDelete = localBlocks
+        .filter { isExternalBlock($0) && $0.date >= fromYmd && $0.date <= toYmd && !keep.contains($0.id) }
+        .map(\.id)
+    return CalendarPullPlan(toUpsert: toUpsert, toDelete: toDelete)
+}
+
 /// Convert a block's date + HH:MM into a Google-friendly ISO start/end,
 /// anchored in local time. Port of `blockToIsoRange`.
 public func blockToIsoRange(_ b: CalBlock) -> (start: String, end: String) {

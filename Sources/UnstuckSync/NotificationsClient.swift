@@ -40,4 +40,20 @@ public struct PreferencesClient: Sendable {
             .upsert(Row(user_id: userId, adhd_struggles: struggles), onConflict: "user_id")
             .execute()
     }
+
+    /// Mirror the device NotificationLevel to notification_preferences
+    /// (owner-self RLS) so the server-driven morning brief + paused-checkin
+    /// cap honour it (spec 10 §1.12). Only the level-derived toggles are
+    /// sent; other columns keep their values (Android PreferencesClient).
+    public func setNotificationLevel(userId: String, morningBrief: Bool, pausedCheckin: Bool) async throws {
+        struct Row: Encodable {
+            let user_id: String
+            let morning_brief_enabled: Bool
+            let paused_checkin_enabled: Bool
+        }
+        _ = try await client.from("notification_preferences")
+            .upsert(Row(user_id: userId, morning_brief_enabled: morningBrief,
+                        paused_checkin_enabled: pausedCheckin), onConflict: "user_id")
+            .execute()
+    }
 }

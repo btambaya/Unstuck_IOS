@@ -51,7 +51,7 @@ let package = Package(
                 "UnstuckCore", "UnstuckData",
                 .product(name: "Supabase", package: "supabase-swift"),
             ]),
-        .testTarget(name: "UnstuckSyncTests", dependencies: ["UnstuckSync", "UnstuckCore"]),
+        .testTarget(name: "UnstuckSyncTests", dependencies: ["UnstuckSync", "UnstuckCore", "UnstuckData"]),
 
         // Brand-v2 design system: oklch tokens + Theme + SwiftUI components.
         .target(name: "UnstuckDesign"),

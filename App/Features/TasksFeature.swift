@@ -23,24 +23,19 @@ final class TasksModel {
     var activeArea: String?
     var slipMode = false
     private let repo: TaskRepository
-    private let db: AppDatabase?
 
-    init(_ repo: TaskRepository, _ db: AppDatabase? = nil) { self.repo = repo; self.db = db }
+    init(_ repo: TaskRepository) { self.repo = repo }
 
     func observe() async {
-        areas = (try? loadAreas()) ?? []
         do {
+            // areas come from the same tracked snapshot, so an area rename
+            // refreshes the filter pills without waiting for a task edit.
             for try await snap in repo.observeTasksAndBlocks() {
                 all = snap.tasks
                 blocks = snap.blocks
-                areas = (try? loadAreas()) ?? []
+                areas = snap.areas
             }
         } catch { /* observation ended */ }
-    }
-
-    private func loadAreas() throws -> [LifeArea] {
-        guard let db else { return [] }
-        return try Repository<LifeArea>(db, orderColumn: "sortOrder").all()
     }
 
     var visible: [TaskItem] {
@@ -84,7 +79,7 @@ struct TasksView: View {
         .feedbackBubble()
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }
-            let m = TasksModel(repo, model.db)
+            let m = TasksModel(repo)
             // Honor an active iOS Focus Filter (reconcile on appear — iOS 18
             // perform() can be flaky, so reading the App-Group flag here too).
             if AppGroup.focusFilterActive(), AppGroup.focusFilterHideNonToday() { m.view = .today }

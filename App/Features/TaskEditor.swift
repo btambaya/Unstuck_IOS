@@ -24,10 +24,12 @@ struct TaskEditor: View {
     @State private var days: Set<Int>
     @State private var untilOn: Bool
     @State private var until: Date
+    @State private var reminderOverride: Int?
 
     init(task: TaskItem?, existingBlocks: [CalBlock]) {
         self.task = task
         self.existingBlocks = existingBlocks
+        _reminderOverride = State(initialValue: task.flatMap { NotificationPrefs.reminderOverride(taskId: $0.id) })
         _name = State(initialValue: task?.name ?? "")
         _estimate = State(initialValue: task?.estimateMin ?? 25)
         _priority = State(initialValue: task?.priority ?? .medium)
@@ -65,6 +67,27 @@ struct TaskEditor: View {
                     if repeatKind != .none {
                         Toggle("Ends on a date", isOn: $untilOn)
                         if untilOn { DatePicker("Until", selection: $until, displayedComponents: .date) }
+                    }
+                }
+                // Per-task reminder override (spec 10 §1.11): Default uses
+                // the global lead; Off / 5 / 10 / 15 min before. Scheduled,
+                // non-Later tasks only (a Later task has no block to fire
+                // on). Device-local; cleared on sign-out.
+                if let task, !later, !existingBlocks.isEmpty {
+                    Section("Remind me") {
+                        Picker("Remind me", selection: $reminderOverride) {
+                            Text("Default").tag(Int?.none)
+                            Text("Off").tag(Int?.some(0))
+                            Text("5m").tag(Int?.some(5))
+                            Text("10m").tag(Int?.some(10))
+                            Text("15m").tag(Int?.some(15))
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .onChange(of: reminderOverride) { _, value in
+                            NotificationPrefs.setReminderOverride(taskId: task.id, leadMin: value)
+                            ReminderScheduler.shared.resync()
+                        }
                     }
                 }
                 if let task {

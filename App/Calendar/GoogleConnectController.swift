@@ -29,6 +29,14 @@ final class GoogleConnectController: NSObject, ASWebAuthenticationPresentationCo
             let auth = try await calendar.authorize(redirectUri: redirectUri)
             guard let url = URL(string: auth.url) else { return .failure(ConnectError.badURL) }
             let callback = try await presentConsent(url: url)
+            // RFC 6749 §10.12: the state echoed back in the redirect must
+            // equal the one minted for THIS consent — otherwise an
+            // attacker-substituted callback could have its code exchanged
+            // under our valid signed state (Android completeGoogleConnect
+            // applies the same guard).
+            guard queryItem(callback, "state") == auth.state else {
+                return .failure(ConnectError.stateMismatch)
+            }
             guard let code = queryItem(callback, "code") else { return .failure(ConnectError.noCode) }
             let conn = try await calendar.connectGoogle(code: code, redirectUri: redirectUri, state: auth.state)
             return .success(conn)
@@ -61,5 +69,5 @@ final class GoogleConnectController: NSObject, ASWebAuthenticationPresentationCo
         URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == name }?.value
     }
 
-    enum ConnectError: Error { case badURL, noCode, cancelled }
+    enum ConnectError: Error { case badURL, noCode, stateMismatch, cancelled }
 }

@@ -19,11 +19,9 @@ final class CalendarModel {
     var sessions: [Session] = []
     var connections: [CalendarConnection] = []
     private let repo: TaskRepository
-    private let db: AppDatabase
     private let connRepo: Repository<CalendarConnection>
-    init(_ repo: TaskRepository, _ db: AppDatabase, _ connRepo: Repository<CalendarConnection>) {
+    init(_ repo: TaskRepository, _ connRepo: Repository<CalendarConnection>) {
         self.repo = repo
-        self.db = db
         self.connRepo = connRepo
     }
     func observe() async {
@@ -32,14 +30,15 @@ final class CalendarModel {
         _ = await (a, b)
     }
     private func observeData() async {
-        areas = (try? Repository<LifeArea>(db, orderColumn: "sortOrder").all()) ?? []
-        sessions = (try? Repository<Session>(db, orderColumn: "completedAt").all()) ?? []
         do {
+            // areas/sessions come from the same tracked snapshot, so an area
+            // rename or a realtime session arrival refreshes the pills and
+            // the Month heatmap without waiting for a task edit.
             for try await snap in repo.observeTasksAndBlocks() {
                 tasks = snap.tasks
                 blocks = snap.blocks
-                areas = (try? Repository<LifeArea>(db, orderColumn: "sortOrder").all()) ?? []
-                sessions = (try? Repository<Session>(db, orderColumn: "completedAt").all()) ?? []
+                areas = snap.areas
+                sessions = snap.sessions
             }
         } catch {}
     }
@@ -116,7 +115,7 @@ struct CalendarView: View {
         .feedbackBubble()
         .task {
             guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }
-            let m = CalendarModel(taskRepo, db, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))
+            let m = CalendarModel(taskRepo, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))
             vm = m; await m.observe()
         }
     }
@@ -697,12 +696,21 @@ struct DayGridView: View {
                 }
             }
             // Blocks for the day, positioned by start time, lane-split on overlap.
+            // Only TASK blocks are draggable — external/Google + placeholder
+            // blocks are display-only (they mirror the remote calendar; moving
+            // one would enqueue a non-UUID g_ row Postgres rejects forever, and
+            // only changes local state that reverts on the next sync). Mirrors
+            // the Android DayGrid gating.
             ForEach(layoutLanes(vm.blocks(on: iso)), id: \.block.id) { item in
                 let b = item.block
                 let laneW = item.lanes > 1 ? (width - 82) / CGFloat(item.lanes) : (width - 82)
-                blockCard(b, width: max(20, laneW - 3))
+                let card = blockCard(b, width: max(20, laneW - 3))
                     .offset(x: 70 + laneW * CGFloat(item.lane), y: yFor(b))
-                    .draggable("block:\(b.id)")
+                if isTaskBlock(b) {
+                    card.draggable("block:\(b.id)")
+                } else {
+                    card
+                }
             }
             // NOW line on today's grid.
             if iso == Clock.todayISO() {
@@ -744,7 +752,12 @@ struct DayGridView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).stroke(theme.palette.line))
         .contextMenu {
-            Button(role: .destructive) { model.deleteBlock(block) } label: { Label("Delete", systemImage: "trash") }
+            // External/Google blocks can't be deleted from here — they mirror
+            // the remote calendar (delete them in Google; the next pull drops
+            // the local copy). Spec 02-sync-engine §1.6.
+            if !isExternalBlock(block) {
+                Button(role: .destructive) { model.deleteBlock(block) } label: { Label("Delete", systemImage: "trash") }
+            }
         }
     }
 

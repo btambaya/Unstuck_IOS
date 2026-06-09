@@ -27,6 +27,9 @@ targets:
     type: application
     platform: iOS
     sources:
+      # The App glob bundles App/PrivacyInfo.xcprivacy (the privacy manifest —
+      # required-reason UserDefaults declaration + nutrition-label data) as a
+      # resource; the widget target shares the same file below.
       - App
     configFiles:
       Debug: App/Config.xcconfig
@@ -77,6 +80,10 @@ targets:
     platform: iOS
     sources:
       - Widgets
+      # Shared privacy manifest — the widget also touches UserDefaults via the
+      # App Group suite (AppGroup.swift), so it needs its own bundled copy.
+      - path: App/PrivacyInfo.xcprivacy
+        buildPhase: resources
     configFiles:
       Debug: App/Config.xcconfig
       Release: App/Config.xcconfig

@@ -49,11 +49,23 @@ extension AppModel {
     }
 
     /// Write the export to a temp .json file and return its URL (for the share
-    /// sheet). nil on failure.
+    /// sheet). nil on failure. The dump is full PII (email, every task/session/
+    /// capture, adhd_struggles), so it goes into a dedicated staging dir that's
+    /// purged on every export, with complete file protection; the share sheet
+    /// deletes it again on completion (removeExportFile).
     func makeExportFile() -> URL? {
         guard let data = exportBundleData() else { return nil }
+        let fm = FileManager.default
+        let dir = fm.temporaryDirectory.appendingPathComponent("exports", isDirectory: true)
+        try? fm.removeItem(at: dir)   // sweep any export a prior share left behind
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         let day = String(Self.isoNow().prefix(10))
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("unstuck-backup-\(day).json")
-        return (try? data.write(to: url)) != nil ? url : nil
+        let url = dir.appendingPathComponent("unstuck-backup-\(day).json")
+        return (try? data.write(to: url, options: [.completeFileProtection])) != nil ? url : nil
+    }
+
+    /// Remove a finished export so the plaintext dump doesn't linger in tmp.
+    nonisolated static func removeExportFile(_ url: URL) {
+        try? FileManager.default.removeItem(at: url)
     }
 }

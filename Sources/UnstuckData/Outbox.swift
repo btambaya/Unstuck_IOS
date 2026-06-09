@@ -75,6 +75,20 @@ public struct OutboxStore: Sendable {
         _ = try db.writer.write { try OutboxOp.deleteOne($0, key: opSeq) }
     }
 
+    /// Drop any queued upsert ops for a row about to be deleted, so a
+    /// held-back upsert (e.g. a cal_block waiting on its parent task via
+    /// `dependsOn`) can't flush AFTER the delete and resurrect the row
+    /// server-side (spec 02-sync-engine §1.6/§1.8).
+    public func cancelPendingUpserts(table: String, rowId: String) throws {
+        _ = try db.writer.write { db in
+            try OutboxOp
+                .filter(Column("tableName") == table)
+                .filter(Column("rowId") == rowId)
+                .filter(Column("kind") == OutboxKind.upsert.rawValue)
+                .deleteAll(db)
+        }
+    }
+
     public func bumpAttempts(_ opSeq: Int64) throws {
         try db.writer.write { db in
             if var op = try OutboxOp.fetchOne(db, key: opSeq) {
