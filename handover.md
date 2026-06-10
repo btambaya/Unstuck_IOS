@@ -12,6 +12,70 @@ doc and the old discarded iOS app disagree, follow Android."* The web
 repo (`../unstuck`) is only the backend home (migrations + Edge
 Functions) and the historical port source for `UnstuckCore` logic names.
 
+## Where things stand (2026-06-10) — Android-parity build-out
+
+A focused pass closing the big parity gaps the 14-agent iOS↔Android audit
+flagged. iOS was substantially behind; this brought data/sync/recurring/
+settings/account/inbox/auth/onboarding/assistant to parity. `swift test`
+stays green (258) and the `Unstuck` scheme builds clean after each step.
+
+- **Recurring tasks (phases 0+2+4a).** A task with `recurrence` is a hidden
+  TEMPLATE; per-occurrence state (`done`/`skipped`/`completedAt`) lives on the
+  fronting `cal_block` (migration 033), projected at read time into synthetic
+  one-day rows. `CalBlock` carries the 3 fields (model + `DbRowCodec` tolerant
+  decode + a GRDB v2 migration). `Occurrences.swift` (isTemplate /
+  projectOccurrences / occurrenceBlockFor / taskForBlock); `VisibleTasks` gains
+  a `Recurring` view + composes occurrences into every other view;
+  `PickStartNext` excludes templates. UI: the **Recurring pill**, per-day
+  Mark-done/Skip-this-day routing (occurrence id = block id → writes the block,
+  never the series), occurrence→template editor guard (no phantom task), and
+  focus-on-occurrence routing (`LiveSession.occurrenceBlockId` → session runs
+  on the template, completion marks the day's block; captures attach to the
+  template). Today rows show ↻ + a skip menu. `OccurrencesTests` (7).
+- **Sync hardening (phase 1).** `upsertCapture` carries `dependsOn=sessionId`;
+  `OutboxFlusher` holds a child op (cal_block→tasks, capture→sessions) until
+  its FK parent exists LOCALLY (a live-session capture has no pending session
+  op yet — the old filter poison-dropped it); `deleteSession/Capture/ReasonLog`
+  added; `Hydrator.hydrateCollections` preserves unsynced optimistic
+  collections. (Google calendar push was already done at the AppModel layer.)
+- **Settings depth + account mgmt (phase 3).** Device-local `SettingsState`
+  (UserDefaults) + Focus/Sound/Accessibility/Interface sub-screens — NO dead
+  toggles (theme→`.preferredColorScheme` at root; focusDefaultMin→new-task
+  estimate; focusOverrunMin→overrun grace; defaultTreatment→fresh session;
+  focusSoftExit→"← Out" leaves the session running/resumable; focusPauseReasons;
+  reduceMotion→focus ring; ambient→focus loop). Account: display name / change
+  password (reauth-gated) / delete account (type-to-confirm) / export / sign
+  out, on a new `AuthService` backbone (changePassword/updateDisplayName/
+  deleteAccount/reauthenticate/hasPassword). Omitted (no iOS seam / dead on
+  Android too): chime/bell/completion sounds, largerType/highContrast/accent/
+  density.
+- **Capture Inbox.** `promoteCapture`/`archive`/`unarchive`/`discard` (archive
+  = device-local UserDefaults id set, NOT a DB column), `observeCaptures`,
+  `InboxView` (open + Archived toggle, per-row Promote/Open/Done/Discard),
+  reached from a tray icon in the Today header (Android's access point).
+- **Auth: forgot-password + recovery.** AuthView gains a "Forgot your
+  password?" link (sends a RESET link, not a sign-in link). Recovery is
+  detected via the `.passwordRecovery` event (PKCE flow has no type=recovery in
+  the URL) + a URL fast-path; `RootView` shows `SetNewPasswordView` until
+  consumed. Plus the iOS **`track-login`** client (LoginTrackerClient, fired on
+  the authed transition, throttled 12h/user).
+- **5-step onboarding.** Welcome → areas → struggles → first task → focus
+  treatment; `completeOnboarding` seeds picked areas (only when empty), the
+  first task, and the default treatment.
+- **In-app Assistant (text).** `AssistantClient` (the `assistant` edge-fn
+  transport) + `AssistantModel` (agentic turn loop ≤5 iterations, the 11-tool
+  dispatcher mapped to the offline-first AppModel methods, compact context
+  builder, UserDefaults history windowed to 40, scrubbed on sign-out/delete).
+  The floating bubble is now a dual Assistant | Feedback sheet. **Voice
+  deferred** (the ~850-LOC realtime Qwen-Omni mode needs device audio + the CF
+  proxy + AEC — a separate effort). The `assistant` edge fn returns
+  `not_configured` until `QWEN_API_KEY` is set on prod (handled gracefully).
+- **Server.** `send-session-recap` APNS push is now a silent banner
+  (`sound:false`, Calm by default) — deployed.
+
+Remaining parity gaps: **voice assistant** (realtime, device-tested) and minor
+Insights/notification-thread polish.
+
 ## Where things stand (2026-06-09, later) — tri-platform audit: sync hardening pass
 
 A 114-agent tri-platform review
