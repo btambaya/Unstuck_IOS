@@ -65,6 +65,10 @@ struct UnstuckApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
+                // Theme override (Settings · Interface): system=nil follows the
+                // OS, light/dark force the scheme. This flows into colorScheme
+                // and thus unstuckTheme()'s palette resolution below.
+                .preferredColorScheme(model.settings.theme.colorScheme)
                 .unstuckTheme()
                 .onOpenURL { model.handleDeepLink($0) }
                 .task {

@@ -12,6 +12,10 @@ struct TaskEditor: View {
 
     let task: TaskItem?
     let existingBlocks: [CalBlock]
+    /// New-task default estimate (Settings · Focus → "Default focus length").
+    /// Only used when creating a task (`task == nil`); an existing task keeps
+    /// its own estimate.
+    let defaultEstimate: Int
 
     enum RepeatKind: String, CaseIterable { case none = "None", daily = "Daily", weekly = "Weekly", monthly = "Monthly" }
 
@@ -26,12 +30,13 @@ struct TaskEditor: View {
     @State private var until: Date
     @State private var reminderOverride: Int?
 
-    init(task: TaskItem?, existingBlocks: [CalBlock]) {
+    init(task: TaskItem?, existingBlocks: [CalBlock], defaultEstimate: Int = 25) {
         self.task = task
         self.existingBlocks = existingBlocks
+        self.defaultEstimate = defaultEstimate
         _reminderOverride = State(initialValue: task.flatMap { NotificationPrefs.reminderOverride(taskId: $0.id) })
         _name = State(initialValue: task?.name ?? "")
-        _estimate = State(initialValue: task?.estimateMin ?? 25)
+        _estimate = State(initialValue: task?.estimateMin ?? defaultEstimate)
         _priority = State(initialValue: task?.priority ?? .medium)
         _lifeArea = State(initialValue: task?.lifeArea ?? "")
         _later = State(initialValue: task?.later ?? false)

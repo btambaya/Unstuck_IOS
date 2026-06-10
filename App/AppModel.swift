@@ -15,6 +15,9 @@ import WidgetKit
 @Observable
 final class AppModel {
     let router = AppRouter()
+    /// Device-local user preferences (theme / focus / sound / accessibility),
+    /// UserDefaults-backed. Single shared instance the whole app observes.
+    let settings = SettingsState.loaded()
     private(set) var coordinator: SyncCoordinator?
     private(set) var db: AppDatabase?
     private(set) var taskRepo: TaskRepository?

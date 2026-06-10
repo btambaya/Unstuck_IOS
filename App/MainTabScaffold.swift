@@ -23,8 +23,8 @@ struct MainTabScaffold: View {
             .background(theme.palette.bg.ignoresSafeArea())
             .sheet(item: $router.activeSheet) { sheet in
                 switch sheet {
-                case .newTask: TaskEditor(task: nil, existingBlocks: [])
-                case .quickCapture: TaskEditor(task: nil, existingBlocks: [])
+                case .newTask: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
+                case .quickCapture: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
                 }
             }
             .sheet(isPresented: $router.showFeedback) {

@@ -27,6 +27,7 @@ final class FocusModel {
     private let store: LiveSessionStore?
 
     init(task: TaskItem, store: LiveSessionStore?,
+         defaultTreatment: FocusTreatment = .ambient,
          occurrence: (templateId: String, templateName: String, blockId: String, priorFocused: Int)? = nil) {
         self.task = task
         self.store = store
@@ -41,9 +42,16 @@ final class FocusModel {
         // Resume-aware: start() continues a paused session for the same task.
         // priorAccumulatedSec seeds the displayed timer so reopening after
         // "Just finish" continues from the accumulated total, not 0 (Android parity).
-        live = FocusTimer.start(existing ?? .empty, taskId: focusId, estimateMin: task.estimateMin,
+        var session = FocusTimer.start(existing ?? .empty, taskId: focusId, estimateMin: task.estimateMin,
                                 priorAccumulatedSec: prior, now: Self.now(),
                                 occurrenceBlockId: occurrence?.blockId)
+        // Seed a FRESH session's treatment from the Settings default (Android
+        // parity). start() carries the prior treatment for a resume of the same
+        // task, so only override when this is a brand-new session (no existing
+        // live session for this task).
+        let isFresh = (existing?.sessionStart == nil) || (existing?.taskId != focusId)
+        if isFresh { session = FocusTimer.setTreatment(session, defaultTreatment) }
+        live = session
         persist()
         LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: task.estimateMin)
     }
@@ -110,7 +118,13 @@ struct FocusView: View {
     @State private var showCapture = false
     @State private var showFinish = false
     @State private var captureText = ""
+    /// Header mute toggle. Seeded from the Settings ambient choice in .task so
+    /// the speaker starts in the state the user picked (off → muted).
     @State private var soundOn = true
+    @State private var soundSeeded = false
+    /// Soft-exit confirm ("Leave focus?") — Android parity: the timer keeps
+    /// running and stays resumable from Today; we just stop showing it.
+    @State private var showLeaveConfirm = false
 
     private let reasons = ["Bathroom", "Drink", "Quick question", "Stuck — need a moment", "Other"]
 
@@ -127,6 +141,9 @@ struct FocusView: View {
             if let fm { content(fm) } else { ProgressView().tint(.white) }
         }
         .task {
+            // Seed the mute toggle from the Settings ambient choice (off →
+            // start muted) once, before the first audio update.
+            if !soundSeeded { soundOn = model.settings.ambient != .off; soundSeeded = true }
             if fm == nil {
                 // Recurring occurrence? Run the session on the template, mark the
                 // day's block on finish. Resolve before finalize/start so the
@@ -134,6 +151,7 @@ struct FocusView: View {
                 let occ = model.occurrenceFocusTarget(task.id)
                 model.finalizeDisplacedFocus(forNewTaskId: occ?.template.id ?? task.id)
                 fm = FocusModel(task: task, store: model.liveStore,
+                                defaultTreatment: model.settings.defaultTreatment,
                                 occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) })
             }
         }
@@ -148,12 +166,22 @@ struct FocusView: View {
             Button("Just finish") { finishSession(markDone: false) }
             Button("Keep going", role: .cancel) {}
         }
+        .confirmationDialog("Leave focus?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
+            Button("Leave") { dismiss() }
+            Button("Stay", role: .cancel) {}
+        } message: {
+            Text("Your timer keeps running — you can pick it back up from Today.")
+        }
         .sheet(isPresented: $showCapture) { captureSheet }
         .onDisappear { AmbientAudio.shared.stop() }
     }
 
+    /// Ambient loop plays while focusing when the Settings ambient bed is on
+    /// (off | brown | pink — iOS generates one procedural brown bed; pink reuses
+    /// it) AND the header mute toggle is on. Android plays it for every
+    /// treatment, so we no longer gate on treatment == .ambient.
     private func updateAudio(_ fm: FocusModel) {
-        if soundOn && fm.treatment == .ambient { AmbientAudio.shared.start() }
+        if soundOn && model.settings.ambient != .off { AmbientAudio.shared.start() }
         else { AmbientAudio.shared.stop() }
     }
 
@@ -164,7 +192,7 @@ struct FocusView: View {
             // ── "← Out" leaves focus (current iOS behavior: cancels the live
             //    session then dismisses). Styled as Android's white-on-dark pill.
             HStack {
-                Button { fm.cancel(); dismiss() } label: {
+                Button { leaveFocus(fm) } label: {
                     Text("← Out")
                         .font(UFont.sans(12))
                         .foregroundStyle(.white.opacity(0.7))
@@ -243,12 +271,15 @@ struct FocusView: View {
             let estimateSec = FocusTimer.estimateSec(fm.live)
             let remaining = max(0, estimateSec - elapsed)
             let progress = estimateSec > 0 ? min(1, max(0, Double(elapsed) / Double(estimateSec))) : 0
-            let state = FocusTimer.deriveState(fm.live, now: now, overrunGraceSec: 1)
+            // Soft-overrun grace from Settings · Focus (minutes; 0 = Never →
+            // .infinity, so the timer never escalates to the overrun check-in).
+            let graceSec = model.settings.focusOverrunMin <= 0 ? Double.infinity : Double(model.settings.focusOverrunMin) * 60
+            let state = FocusTimer.deriveState(fm.live, now: now, overrunGraceSec: graceSec)
             let isPaused = fm.live.paused
 
             VStack(spacing: 0) {
                 if fm.treatment == .ambient {
-                    ProgressRing(progress: progress, paused: isPaused)
+                    ProgressRing(progress: progress, paused: isPaused, animated: !model.settings.reduceMotion)
                         .frame(width: 220, height: 220)
                         .padding(.bottom, 20)
                 }
@@ -303,7 +334,10 @@ struct FocusView: View {
                 focusBtn("Capture", soft: true) { showCapture = true }
                 focusBtn(isPaused ? "Resume" : "Pause", soft: true) {
                     if isPaused { fm.resume() }
-                    else { fm.pause(); showReasons = true }
+                    // Pause-reasons setting off → pause silently (no "Why are you
+                    // pausing?" sheet), but still coordinate the paused check-in.
+                    else if model.settings.focusPauseReasons { fm.pause(); showReasons = true }
+                    else { fm.pause(); coordinateCheckin() }
                 }
                 focusBtn("Done", soft: false) { showFinish = true }
             }
@@ -333,6 +367,17 @@ struct FocusView: View {
                 .font(UFont.sans(13, .medium)).foregroundStyle(.white.opacity(0.72))
                 .padding(.horizontal, 14).padding(.vertical, 8)
         }.buttonStyle(.plain)
+    }
+
+    /// "← Out" — Android parity: leaving keeps the timer RUNNING (the live
+    /// session persists, so Today can resume it); it never discards. With the
+    /// Soft-exit setting on, a running, un-paused session asks to confirm first.
+    private func leaveFocus(_ fm: FocusModel) {
+        if model.settings.focusSoftExit, !fm.live.paused, fm.live.sessionStart != nil {
+            showLeaveConfirm = true
+        } else {
+            dismiss()
+        }
     }
 
     /// Finish the live session, accumulate focused time, and optionally complete
@@ -401,6 +446,9 @@ struct FocusView: View {
 private struct ProgressRing: View {
     let progress: Double
     let paused: Bool
+    /// When false (Settings · Accessibility → Reduce motion), the arc snaps to
+    /// each per-second value instead of easing between them.
+    var animated: Bool = true
 
     private let pausedColor = OKLCH(0.80, 0.13, 75).color   // amber, matches Android
 
@@ -415,6 +463,7 @@ private struct ProgressRing: View {
                         style: StrokeStyle(lineWidth: 4, lineCap: .round))
                 .rotationEffect(.degrees(-90))
                 .padding(10)
+                .animation(animated ? .easeInOut(duration: 0.5) : nil, value: progress)
             WhiteOrbit(size: 130)
         }
     }
