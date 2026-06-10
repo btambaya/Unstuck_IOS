@@ -63,8 +63,10 @@ struct TasksView: View {
     @State private var showPalette = false
 
     // Tab order mirrors the web TaskListPane / Android: Backlog first (the
-    // triage stack), then All / Today / Upcoming / Later / Completed.
-    private let tabOrder: [TaskListView] = [.backlog, .all, .today, .upcoming, .later, .completed]
+    // triage stack), then All / Today / Upcoming / Later / Recurring / Completed.
+    // "Recurring" lists the repeating TEMPLATES (their per-day occurrences
+    // surface in Today/All/Upcoming as independent rows).
+    private let tabOrder: [TaskListView] = [.backlog, .all, .today, .upcoming, .later, .recurring, .completed]
 
     var body: some View {
         Group {
@@ -161,6 +163,7 @@ struct TasksView: View {
         case .today:     return (theme.palette.coralSoft, theme.palette.coralDeep)
         case .upcoming:  return (theme.palette.blueSoft, theme.palette.blueInk)
         case .later:     return (theme.palette.primarySoft, theme.palette.primaryDeep)
+        case .recurring: return (theme.palette.blueSoft, theme.palette.blueInk)
         case .completed: return (theme.palette.greenSoft, theme.palette.greenInk)
         case .all:       return nil
         }
@@ -212,21 +215,42 @@ struct TasksView: View {
                         .padding(.vertical, 32)
                 } else {
                     ForEach(rows) { task in
+                        let isOccurrence = model.occurrenceBlockForId(task.id) != nil
                         TaskRowView(
                             task: task,
                             areaColor: areaColor(task.lifeArea, vm.areas),
                             ageDays: vm.view == .backlog ? vm.ageDays(task) : nil,
-                            onOpen: { editing = task }
+                            isRecurring: task.recurrence != nil || isOccurrence,
+                            // Opening an occurrence edits its TEMPLATE (the series),
+                            // never a phantom task keyed by the block id.
+                            onOpen: { editing = model.editableTask(for: task) }
                         )
                         // Android's row has no checkbox (completion lives in the
                         // detail sheet). Preserve the iOS toggleDone path via a
-                        // long-press menu so the resting look stays 1:1.
+                        // long-press menu so the resting look stays 1:1. For a
+                        // recurring OCCURRENCE row, toggleDone marks just that day's
+                        // block, plus a "Skip this day" that cancels the one day
+                        // without ending the series.
                         .contextMenu {
-                            Button {
-                                model.toggleDone(task)
-                            } label: {
-                                Label(task.done ? "Mark not done" : "Mark done",
-                                      systemImage: task.done ? "circle" : "checkmark.circle")
+                            // A template row (Recurring tab) has no per-day done —
+                            // open it to edit the series instead.
+                            if task.recurrence == nil {
+                                Button {
+                                    model.toggleDone(task)
+                                } label: {
+                                    Label(task.done ? "Mark not done" : "Mark done",
+                                          systemImage: task.done ? "circle" : "checkmark.circle")
+                                }
+                            }
+                            if isOccurrence {
+                                Button(role: .destructive) {
+                                    model.skipOccurrence(task.id)
+                                } label: {
+                                    Label("Skip this day", systemImage: "calendar.badge.minus")
+                                }
+                            }
+                            Button { editing = model.editableTask(for: task) } label: {
+                                Label(task.recurrence != nil ? "Edit series" : "Edit", systemImage: "pencil")
                             }
                         }
                     }
@@ -250,6 +274,7 @@ struct TaskRowView: View {
     let task: TaskItem
     let areaColor: Color
     let ageDays: Int?
+    var isRecurring: Bool = false
     let onOpen: () -> Void
 
     var body: some View {
@@ -266,7 +291,7 @@ struct TaskRowView: View {
                         Circle().fill(areaColor).frame(width: 5, height: 5)
                         Text(task.lifeArea ?? "—")
                             .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                        if task.recurrence != nil {
+                        if isRecurring {
                             Text("· ↻").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                         }
                         ForEach(Array((task.tags ?? []).prefix(3)), id: \.self) { tag in

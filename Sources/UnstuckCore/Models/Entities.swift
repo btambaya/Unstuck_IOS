@@ -156,8 +156,14 @@ public struct LiveSession: Codable, Equatable, Sendable {
     public var treatment: FocusTreatment
     /// Seconds of cumulative focus this task already had at session start.
     public var priorAccumulatedSec: Int?
+    /// When focusing a recurring OCCURRENCE: the cal_block id of the day being
+    /// worked. The session runs on the TEMPLATE (`taskId`, so totalFocused
+    /// accrues on the series) but completion marks THIS block done — so one day
+    /// is ticked off without ending the series. nil for a normal task focus.
+    /// Device-local (not synced; lives only in the live_session JSON).
+    public var occurrenceBlockId: String?
 
-    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil) {
+    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.sessionStart = sessionStart
@@ -168,5 +174,6 @@ public struct LiveSession: Codable, Equatable, Sendable {
         self.overrunPromptFired = overrunPromptFired
         self.treatment = treatment
         self.priorAccumulatedSec = priorAccumulatedSec
+        self.occurrenceBlockId = occurrenceBlockId
     }
 }

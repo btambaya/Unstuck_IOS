@@ -207,6 +207,17 @@ extension AppModel {
     /// shared collection item flips the shared item to "done by <name>" + notifies
     /// the other members (best-effort).
     func toggleDone(_ task: TaskItem) {
+        // A recurring OCCURRENCE's id is its cal_block id — complete the BLOCK,
+        // never the template (which would end the whole series). Mirrors Android.
+        if let occ = occurrenceBlockForId(task.id) {
+            var next = occ
+            let nextDone = !occ.done
+            next.done = nextDone
+            next.skipped = false
+            next.completedAt = nextDone ? Self.isoNow() : nil
+            saveBlock(next)
+            return
+        }
         var flipped = task
         flipped.done.toggle()
         let stamped = applyCompletion(flipped, prior: task, nowISO: Self.isoNow())
@@ -216,6 +227,53 @@ extension AppModel {
             let by = currentUserName ?? "Someone"
             Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by) }
         }
+    }
+
+    /// Resolve a list-row id to the recurring OCCURRENCE cal_block behind it
+    /// (nil for a normal task). Reads the live local store so callers (toggle,
+    /// skip, focus) don't need to thread the tasks/blocks lists through.
+    func occurrenceBlockForId(_ rowId: String) -> CalBlock? {
+        let tasks = (try? taskRepo?.all()) ?? []
+        let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+        return occurrenceBlockFor(rowId, tasks: tasks, blocks: blocks)
+    }
+
+    /// The task to OPEN in the editor for a list row: an occurrence row (id =
+    /// block id) resolves to its TEMPLATE so edits apply to the series and never
+    /// mint a phantom task; a normal row returns itself.
+    func editableTask(for row: TaskItem) -> TaskItem {
+        guard let block = occurrenceBlockForId(row.id),
+              let tpl = (try? taskRepo?.all())?.first(where: { $0.id == block.taskId }) else { return row }
+        return tpl
+    }
+
+    /// Skip ("cancel today") one recurring occurrence — hides just this day; the
+    /// series keeps generating tomorrow. `blockId` is the occurrence row's id.
+    func skipOccurrence(_ blockId: String) {
+        guard let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == blockId }) else { return }
+        var next = block
+        next.skipped = true
+        next.done = false
+        next.completedAt = nil
+        saveBlock(next)
+    }
+
+    /// Defer / undefer a task to "Later".
+    func setLater(_ task: TaskItem, _ later: Bool) {
+        var next = task
+        next.later = later
+        next.updatedAt = Self.isoNow()
+        saveTask(next)
+    }
+
+    /// Set/clear a task's recurrence and realign its future cal_blocks
+    /// (regenerateForTask, anchored on the task's earliest existing block).
+    func setRecurrence(_ task: TaskItem, _ recurrence: Recurrence?) {
+        var next = task
+        next.recurrence = recurrence
+        next.updatedAt = Self.isoNow()
+        let existing = (try? db?.blocks(forTask: task.id)) ?? []
+        saveTaskWithRecurrence(next, existingBlocks: existing)
     }
 
     /// Fire the shared-item completion notification after a Focus session that
@@ -245,16 +303,38 @@ extension AppModel {
         saveTask(bumped)
     }
 
+    /// For a focus row id: if it's a recurring OCCURRENCE, the (block, template)
+    /// pair — the session runs on the template but completion marks the block;
+    /// else nil (focus the task as-is). Used by FocusView to build the live
+    /// session with the right identity.
+    func occurrenceFocusTarget(_ rowId: String) -> (block: CalBlock, template: TaskItem)? {
+        guard let block = occurrenceBlockForId(rowId),
+              let tpl = (try? taskRepo?.all())?.first(where: { $0.id == block.taskId }) else { return nil }
+        return (block, tpl)
+    }
+
     /// Finish a Focus session: persist the Session, accumulate the task's
     /// totalFocused, optionally mark it done (with completion stamping + the
     /// shared-item notification), and record a session recap. 1:1 with the
-    /// Android finishFocus.
-    func finishFocus(task: TaskItem, session: Session, elapsedSec: Int, markDone: Bool) {
+    /// Android finishFocus. When `occurrenceBlockId` is set the session/focus
+    /// time accrue on the TEMPLATE (`task`) but completion marks the BLOCK done,
+    /// so just that day is ticked off without ending the series.
+    func finishFocus(task: TaskItem, session: Session, elapsedSec: Int, markDone: Bool, occurrenceBlockId: String? = nil) {
         saveSession(session)
         var focused = task
         focused.totalFocused += elapsedSec
         focused.updatedAt = Self.isoNow()
-        if markDone {
+        if let occurrenceBlockId, let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == occurrenceBlockId }) {
+            // Always accrue focus on the template; mark the DAY's block done.
+            saveTask(focused)
+            if markDone {
+                var doneBlock = block
+                doneBlock.done = true
+                doneBlock.skipped = false
+                doneBlock.completedAt = Self.isoNow()
+                saveBlock(doneBlock)
+            }
+        } else if markDone {
             var done = focused
             done.done = true
             saveTask(applyCompletion(done, prior: task, nowISO: Self.isoNow()))

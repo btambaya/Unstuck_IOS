@@ -263,10 +263,14 @@ struct TodayView: View {
     }
 
     private func taskRow(_ t: TaskItem) -> some View {
-        Button { model.toggleDone(t) } label: {
+        let isOccurrence = model.occurrenceBlockForId(t.id) != nil
+        return Button { model.toggleDone(t) } label: {
             HStack(spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(t.name).font(UFont.sans(16, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
+                    HStack(spacing: 5) {
+                        Text(t.name).font(UFont.sans(16, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
+                        if isOccurrence { Text("↻").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3) }
+                    }
                     HStack(spacing: 6) {
                         Circle().fill(theme.palette.areaColor(t.lifeArea)).frame(width: 6, height: 6)
                         Text(t.lifeArea ?? "—").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
@@ -279,6 +283,18 @@ struct TodayView: View {
             .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(theme.palette.line))
         }.buttonStyle(.plain)
+        .contextMenu {
+            Button { model.toggleDone(t) } label: {
+                Label(t.done ? "Mark not done" : "Mark done",
+                      systemImage: t.done ? "circle" : "checkmark.circle")
+            }
+            Button { model.router.beginFocus(t) } label: { Label("Focus", systemImage: "play.fill") }
+            if isOccurrence {
+                Button(role: .destructive) { model.skipOccurrence(t.id) } label: {
+                    Label("Skip this day", systemImage: "calendar.badge.minus")
+                }
+            }
+        }
     }
 
     // MARK: notifications banner + helpers

@@ -21,17 +21,29 @@ import UnstuckDesign
 final class FocusModel {
     var live: LiveSession
     let task: TaskItem
+    /// When focusing a recurring occurrence: the (template id/name, day's block
+    /// id). The session runs on the TEMPLATE; completion marks the block.
+    let occurrence: (templateId: String, templateName: String, blockId: String)?
     private let store: LiveSessionStore?
 
-    init(task: TaskItem, store: LiveSessionStore?) {
+    init(task: TaskItem, store: LiveSessionStore?,
+         occurrence: (templateId: String, templateName: String, blockId: String, priorFocused: Int)? = nil) {
         self.task = task
         self.store = store
+        self.occurrence = occurrence.map { ($0.templateId, $0.templateName, $0.blockId) }
         let existing: LiveSession? = (try? store?.get()) ?? nil
+        // The live session is keyed to the TEMPLATE when focusing an occurrence
+        // (so totalFocused accrues on the series), and carries the block id so
+        // finish marks just this day. Display still uses the occurrence's name/
+        // estimate (which it inherits from the template).
+        let focusId = occurrence?.templateId ?? task.id
+        let prior = occurrence?.priorFocused ?? task.totalFocused
         // Resume-aware: start() continues a paused session for the same task.
         // priorAccumulatedSec seeds the displayed timer so reopening after
         // "Just finish" continues from the accumulated total, not 0 (Android parity).
-        live = FocusTimer.start(existing ?? .empty, taskId: task.id, estimateMin: task.estimateMin,
-                                priorAccumulatedSec: task.totalFocused, now: Self.now())
+        live = FocusTimer.start(existing ?? .empty, taskId: focusId, estimateMin: task.estimateMin,
+                                priorAccumulatedSec: prior, now: Self.now(),
+                                occurrenceBlockId: occurrence?.blockId)
         persist()
         LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: task.estimateMin)
     }
@@ -53,7 +65,12 @@ final class FocusModel {
     @discardableResult
     func finish() -> (session: Session, elapsedSec: Int) {
         let elapsed = FocusTimer.elapsedSec(live, now: Self.now())
-        let session = Session(id: live.id ?? newUUID(), taskId: task.id, taskName: task.name,
+        // Attribute the Session to the TEMPLATE for an occurrence focus (so the
+        // analytics + totalFocused continuity stay on the series, never a row
+        // whose id is a block id — which would mint a phantom task).
+        let sTaskId = occurrence?.templateId ?? task.id
+        let sName = occurrence?.templateName ?? task.name
+        let session = Session(id: live.id ?? newUUID(), taskId: sTaskId, taskName: sName,
                               estimateMin: task.estimateMin, actualSec: elapsed, completedAt: AppModel.isoNow())
         live = FocusTimer.done(live)
         persist()
@@ -111,10 +128,13 @@ struct FocusView: View {
         }
         .task {
             if fm == nil {
-                // Finalize a different task's in-flight session before this one
-                // overwrites the live session (so its elapsed time isn't lost).
-                model.finalizeDisplacedFocus(forNewTaskId: task.id)
-                fm = FocusModel(task: task, store: model.liveStore)
+                // Recurring occurrence? Run the session on the template, mark the
+                // day's block on finish. Resolve before finalize/start so the
+                // displaced-session check compares against the TEMPLATE id.
+                let occ = model.occurrenceFocusTarget(task.id)
+                model.finalizeDisplacedFocus(forNewTaskId: occ?.template.id ?? task.id)
+                fm = FocusModel(task: task, store: model.liveStore,
+                                occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) })
             }
         }
         .confirmationDialog("Why are you pausing?", isPresented: $showReasons, titleVisibility: .visible) {
@@ -320,7 +340,14 @@ struct FocusView: View {
     private func finishSession(markDone: Bool) {
         guard let fm else { return }
         let result = fm.finish()
-        model.finishFocus(task: task, session: result.session, elapsedSec: result.elapsedSec, markDone: markDone)
+        // For an occurrence focus the Session is attributed to the template; pass
+        // its id as the focus `task` so totalFocused accrues there, and the block
+        // id so a "Mark complete" marks just this day done.
+        let focusTask = fm.occurrence.flatMap { occ in
+            (try? model.taskRepo?.all())?.first(where: { $0.id == occ.templateId })
+        } ?? task
+        model.finishFocus(task: focusTask, session: result.session, elapsedSec: result.elapsedSec,
+                          markDone: markDone, occurrenceBlockId: fm.occurrence?.blockId)
         dismiss()
     }
 
@@ -361,7 +388,10 @@ struct FocusView: View {
         captureText = ""
         showCapture = false
         guard !text.isEmpty else { return }
-        model.saveCapture(Capture(id: newUUID(), taskId: task.id, sessionId: fm?.sessionId, tag: .idea, body: text, at: AppModel.isoNow()))
+        // Attach captures to the TEMPLATE for an occurrence focus (task.id is the
+        // block id there) so they show on the series' detail, not a phantom row.
+        let captureTaskId = fm?.occurrence?.templateId ?? task.id
+        model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId, sessionId: fm?.sessionId, tag: .idea, body: text, at: AppModel.isoNow()))
     }
 }
 

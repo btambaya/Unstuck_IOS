@@ -228,13 +228,23 @@ final class AppModel {
 
     /// Save a task + reconcile its recurrence: materialize future cal_blocks
     /// (regenerateForTask) and drop mismatched ones. `existingBlocks` is the
-    /// task's current blocks from the observed store.
+    /// task's current blocks from the observed store. The horizon is anchored on
+    /// the task's EARLIEST existing task-block (its real start day/time) so a
+    /// recurrence change keeps the series in place instead of snapping it to
+    /// 09:00 today — matching the Android setRecurrence anchor.
     func saveTaskWithRecurrence(_ task: TaskItem, existingBlocks: [CalBlock]) {
         saveTask(task)
         guard let write = coordinator?.write else { return }
+        let anchor = existingBlocks.filter { isTaskBlock($0) }
+            .min { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
+        let startTime = anchor?.startTime ?? "09:00"
+        let startDate: Date = anchor.flatMap { a in
+            let parts = a.date.split(separator: "-").compactMap { Int($0) }
+            return parts.count == 3 ? Time.civil(parts[0], parts[1], parts[2]) : nil
+        } ?? Date()
         let plan = regenerateForTask(
             task: task, recurrence: task.recurrence, existingBlocks: existingBlocks,
-            todayIso: Clock.todayISO(), startTime: "09:00", startDate: Date())
+            todayIso: Clock.todayISO(), startTime: startTime, startDate: startDate)
         let now = Self.isoNow()
         Task {
             for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }

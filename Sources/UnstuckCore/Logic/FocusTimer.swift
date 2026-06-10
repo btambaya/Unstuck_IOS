@@ -73,12 +73,17 @@ public enum FocusTimer {
         estimateMin: Int? = nil,
         priorAccumulatedSec: Int? = nil,
         now: EpochMillis,
+        occurrenceBlockId: String? = nil,
         newId: () -> String = newUUID
     ) -> LiveSession {
-        if cur.sessionStart != nil, cur.taskId == taskId, cur.paused {
+        // Re-entering the SAME occurrence (same template + same day's block) keeps
+        // its state; a different occurrence of the same template starts fresh.
+        if cur.sessionStart != nil, cur.taskId == taskId,
+           cur.occurrenceBlockId == occurrenceBlockId, cur.paused {
             return resume(cur, now: now)
         }
-        if cur.sessionStart != nil, cur.taskId == taskId, !cur.paused {
+        if cur.sessionStart != nil, cur.taskId == taskId,
+           cur.occurrenceBlockId == occurrenceBlockId, !cur.paused {
             return cur
         }
         var next = cur
@@ -91,6 +96,7 @@ public enum FocusTimer {
         next.nudge80Fired = false
         next.overrunPromptFired = false
         next.priorAccumulatedSec = priorAccumulatedSec ?? 0
+        next.occurrenceBlockId = occurrenceBlockId
         return next
     }
 
