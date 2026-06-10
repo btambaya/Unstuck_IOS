@@ -167,6 +167,12 @@ struct CalBlockRow: Codable, Sendable {
     var externalEventId: String?
     var externalConnectionId: String?
     var kind: CalBlockKind
+    // Per-occurrence state (migration 033). The DB columns are `not null
+    // default false`, so the server always sends them; we still decode
+    // tolerantly (missing → false) to survive any legacy/partial payload.
+    var done: Bool
+    var skipped: Bool
+    var completedAt: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -178,12 +184,32 @@ struct CalBlockRow: Codable, Sendable {
         case externalEventId = "external_event_id"
         case externalConnectionId = "external_connection_id"
         case kind
+        case done
+        case skipped
+        case completedAt = "completed_at"
     }
 
     init(_ b: CalBlock) {
         id = b.id; taskId = uuidOrNull(b.taskId); taskName = b.taskName; startTime = b.startTime
         durationMinutes = b.durationMinutes; date = b.date; externalEventId = b.externalEventId
         externalConnectionId = uuidOrNull(b.externalConnectionId); kind = b.kind ?? .task
+        done = b.done; skipped = b.skipped; completedAt = b.completedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        taskId = try c.decodeIfPresent(String.self, forKey: .taskId)
+        taskName = try c.decode(String.self, forKey: .taskName)
+        startTime = try c.decode(String.self, forKey: .startTime)
+        durationMinutes = try c.decode(Int.self, forKey: .durationMinutes)
+        date = try c.decode(String.self, forKey: .date)
+        externalEventId = try c.decodeIfPresent(String.self, forKey: .externalEventId)
+        externalConnectionId = try c.decodeIfPresent(String.self, forKey: .externalConnectionId)
+        kind = try c.decode(CalBlockKind.self, forKey: .kind)
+        done = try c.decodeIfPresent(Bool.self, forKey: .done) ?? false
+        skipped = try c.decodeIfPresent(Bool.self, forKey: .skipped) ?? false
+        completedAt = try c.decodeIfPresent(String.self, forKey: .completedAt)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -197,12 +223,16 @@ struct CalBlockRow: Codable, Sendable {
         try c.encode(externalEventId, forKey: .externalEventId)
         try c.encode(externalConnectionId, forKey: .externalConnectionId)
         try c.encode(kind, forKey: .kind)
+        try c.encode(done, forKey: .done)
+        try c.encode(skipped, forKey: .skipped)
+        try c.encode(completedAt, forKey: .completedAt)
     }
 
     func model() -> CalBlock {
         CalBlock(id: id, taskId: taskId, taskName: taskName, startTime: startTime,
                  durationMinutes: durationMinutes, date: date, externalEventId: externalEventId,
-                 externalConnectionId: externalConnectionId, kind: kind)
+                 externalConnectionId: externalConnectionId, kind: kind,
+                 done: done, skipped: skipped, completedAt: completedAt)
     }
 }
 

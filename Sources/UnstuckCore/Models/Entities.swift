@@ -37,8 +37,16 @@ public struct CalBlock: Codable, Equatable, Sendable, Identifiable {
     /// Backed by migration 006; falls back to a derived kind in
     /// `blockKind(_:)` when the column isn't populated.
     public var kind: CalBlockKind?
+    /// Per-occurrence state (migration 033). For a recurring template's
+    /// occurrence blocks, completion/skip live HERE (per day), not on the
+    /// template task — so one day can be ticked off or cancelled without
+    /// ending the series. See `Occurrences.swift`. For a normal one-off block
+    /// these stay false/nil and are ignored.
+    public var done: Bool
+    public var skipped: Bool
+    public var completedAt: String?
 
-    public init(id: String, taskId: String?, taskName: String, startTime: String, durationMinutes: Int, date: String, externalEventId: String? = nil, externalConnectionId: String? = nil, kind: CalBlockKind? = nil) {
+    public init(id: String, taskId: String?, taskName: String, startTime: String, durationMinutes: Int, date: String, externalEventId: String? = nil, externalConnectionId: String? = nil, kind: CalBlockKind? = nil, done: Bool = false, skipped: Bool = false, completedAt: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.taskName = taskName
@@ -48,6 +56,9 @@ public struct CalBlock: Codable, Equatable, Sendable, Identifiable {
         self.externalEventId = externalEventId
         self.externalConnectionId = externalConnectionId
         self.kind = kind
+        self.done = done
+        self.skipped = skipped
+        self.completedAt = completedAt
     }
 }
 

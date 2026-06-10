@@ -159,6 +159,19 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        // Per-occurrence state for recurring tasks (migration 033). A cal_block
+        // that fronts a recurring template's occurrence carries its own
+        // done/skipped/completedAt so each day can be completed/skipped without
+        // touching the series. Defaults match the server columns
+        // (not null default false / null).
+        m.registerMigration("v2_cal_block_occurrence_state") { db in
+            try db.alter(table: "cal_blocks") { t in
+                t.add(column: "done", .boolean).notNull().defaults(to: false)
+                t.add(column: "skipped", .boolean).notNull().defaults(to: false)
+                t.add(column: "completedAt", .text)
+            }
+        }
+
         return m
     }()
 }

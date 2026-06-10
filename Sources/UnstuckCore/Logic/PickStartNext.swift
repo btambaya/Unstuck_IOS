@@ -36,8 +36,9 @@ public func pickStartNext(
 ) -> TaskItem? {
     let candidates = tasks
         // !later: a deferred task must never be the top "Start now"
-        // suggestion (matches visible-tasks everywhere else).
-        .filter { !$0.done && !($0.later ?? false) && $0.id != liveTaskId }
+        // suggestion. recurrence == nil: skip hidden recurring TEMPLATES —
+        // their per-day occurrences surface in Today on their own.
+        .filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && $0.id != liveTaskId }
         .filter { matchesArea($0.lifeArea, areaFilter) }
     return candidates.sorted(by: ranksBefore).first
 }
@@ -52,6 +53,6 @@ public func pickUpNext(
     var skip = Set<String>()
     if let liveTaskId { skip.insert(liveTaskId) }
     if let startNextId { skip.insert(startNextId) }
-    let open = tasks.filter { !$0.done && !($0.later ?? false) && !skip.contains($0.id) }
+    let open = tasks.filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && !skip.contains($0.id) }
     return Array(open.sorted(by: ranksBefore).prefix(limit))
 }
