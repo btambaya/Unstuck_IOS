@@ -48,6 +48,12 @@ public extension AppDatabase {
         try writer.read { try CalBlock.fetchAll($0) }
     }
 
+    /// Every locally-cached collection. The hydrator derives the §1.3
+    /// `localPending` preservation set (unsynced optimistic collections) from it.
+    func fetchAllCollections() throws -> [ItemCollection] {
+        try writer.read { try ItemCollection.fetchAll($0) }
+    }
+
     /// The user's first calendar connection (for choosing a Google push target).
     func firstCalendarConnection() throws -> CalendarConnection? {
         try writer.read { try CalendarConnection.fetchOne($0) }
@@ -55,6 +61,23 @@ public extension AppDatabase {
 
     func blocks(forTask id: String) throws -> [CalBlock] {
         try writer.read { db in try CalBlock.filter(Column("taskId") == id).fetchAll(db) }
+    }
+
+    /// Primary-key ids currently present locally for a dependsOn PARENT table
+    /// (only `tasks` / `sessions` are dependsOn parents). The OutboxFlusher uses
+    /// this to hold a child op (cal_block→task, capture→session) back until its
+    /// FK parent exists locally — e.g. a capture taken DURING a live focus
+    /// session, whose `sessions` row is only written at session end (spec
+    /// 02-sync-engine §1.4 parent-row-exists). Pushing it before then would hit
+    /// the `captures.session_id` FK on every drain and poison-drop a valid write.
+    func localRowIds(table: String) throws -> Set<String> {
+        try writer.read { db in
+            switch table {
+            case "tasks":    return Set(try TaskItem.fetchAll(db).map(\.id))
+            case "sessions": return Set(try Session.fetchAll(db).map(\.id))
+            default:         return []
+            }
+        }
     }
 
     /// Wipe EVERYTHING for a user change / sign-out: the synced tables PLUS

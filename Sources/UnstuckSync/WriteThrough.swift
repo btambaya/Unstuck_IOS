@@ -64,7 +64,14 @@ public actor WriteThrough {
 
     public func upsertCapture(_ c: Capture, nowISO: String) throws {
         try db.save(c)
-        try enqueue(table: "captures", rowId: c.id, kind: .upsert, payload: try jsonString(CaptureRow(c)), nowISO: nowISO)
+        // Wait for the parent session row to flush first — a capture taken DURING
+        // a session references a session_id (FK) whose `sessions` row is only
+        // written at session end. The OutboxFlusher holds a dependsOn op while the
+        // parent has a pending op OR doesn't exist locally yet (the live-session
+        // case), so the capture can't push ahead, hit the FK, and be poison-dropped.
+        let dependsOn = c.sessionId.flatMap { isUUID($0) ? $0 : nil }
+        try enqueue(table: "captures", rowId: c.id, kind: .upsert,
+                    payload: try jsonString(CaptureRow(c)), dependsOn: dependsOn, nowISO: nowISO)
     }
 
     public func upsertReasonLog(_ r: ReasonLog, nowISO: String) throws {
@@ -130,5 +137,23 @@ public actor WriteThrough {
         try db.deleteById(ItemCollection.self, id: id)
         try box.cancelPendingUpserts(table: "collections", rowId: id)
         try enqueue(table: "collections", rowId: id, kind: .delete, nowISO: nowISO)
+    }
+
+    public func deleteSession(id: String, nowISO: String) throws {
+        try db.deleteById(Session.self, id: id)
+        try box.cancelPendingUpserts(table: "sessions", rowId: id)
+        try enqueue(table: "sessions", rowId: id, kind: .delete, nowISO: nowISO)
+    }
+
+    public func deleteCapture(id: String, nowISO: String) throws {
+        try db.deleteById(Capture.self, id: id)
+        try box.cancelPendingUpserts(table: "captures", rowId: id)
+        try enqueue(table: "captures", rowId: id, kind: .delete, nowISO: nowISO)
+    }
+
+    public func deleteReasonLog(id: String, nowISO: String) throws {
+        try db.deleteById(ReasonLog.self, id: id)
+        try box.cancelPendingUpserts(table: "reason_logs", rowId: id)
+        try enqueue(table: "reason_logs", rowId: id, kind: .delete, nowISO: nowISO)
     }
 }

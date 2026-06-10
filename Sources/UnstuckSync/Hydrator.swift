@@ -52,7 +52,19 @@ public actor Hydrator {
                 out.myRole = c.ownerId == userId ? "owner" : ms.first { $0.0 == userId }?.1
                 return out
             }
-            try db.replaceAll(ItemCollection.self, with: enriched)
+            // Preserve unsynced optimistic collections (those with a pending
+            // collections upsert op in the outbox): a just-created/edited list
+            // isn't in `base` yet, so the replace would wipe it off the UI until
+            // the next flush (spec 02-sync-engine §1.3 localPending — same guard
+            // as hydrateCalBlocks).
+            let serverIds = Set(enriched.map(\.id))
+            let pendingIds = Set(((try? box.pending()) ?? [])
+                .filter { $0.tableName == "collections" && $0.kind == .upsert }
+                .map(\.rowId))
+            let localPending = (try? db.fetchAllCollections())?.filter {
+                pendingIds.contains($0.id) && !serverIds.contains($0.id)
+            } ?? []
+            try db.replaceAll(ItemCollection.self, with: enriched + localPending)
         } catch {
             print("[hydrate] collections failed, leaving local intact: \(error)")
         }

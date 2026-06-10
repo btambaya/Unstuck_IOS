@@ -66,6 +66,11 @@ final class OutboxFlusherTests: XCTestCase {
         return String(data: try JSONEncoder().encode(CalBlockRow(b)), encoding: .utf8)!
     }
 
+    private func capturePayload(id: String, sessionId: String?) throws -> String {
+        let c = Capture(id: id, sessionId: sessionId, tag: .idea, body: "x", at: now)
+        return String(data: try JSONEncoder().encode(CaptureRow(c)), encoding: .utf8)!
+    }
+
     func testUserSwitchGuardBailsWithoutFlushing() async throws {
         _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
                             payload: try taskPayload(id: "t1"), nowISO: now)
@@ -115,6 +120,28 @@ final class OutboxFlusherTests: XCTestCase {
         XCTAssertEqual(try box.count(), 0)
         upserts = await gateway.upserts
         XCTAssertEqual(upserts.map { $0.name }, ["old", "new"])
+    }
+
+    func testCaptureHeldBackUntilParentSessionExistsLocally() async throws {
+        // A capture taken DURING a live focus session depends on a session whose
+        // `sessions` row isn't written until session end: no pending session op,
+        // and not in the local store yet. It must NOT flush (it would hit the
+        // captures.session_id FK on every drain and get poison-dropped).
+        _ = try box.enqueue(table: "captures", rowId: "c1", kind: .upsert,
+                            payload: try capturePayload(id: "c1", sessionId: "s1"),
+                            dependsOn: "s1", nowISO: now)
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 1, "capture stays queued until its session exists locally")
+        var upserts = await gateway.upserts
+        XCTAssertTrue(upserts.isEmpty)
+
+        // Once the session row lands locally (flushed or hydrated), the FK is
+        // satisfied server-side, so the capture is now flushable.
+        try db.save(Session(id: "s1", taskName: "S", actualSec: 60, completedAt: now))
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0)
+        upserts = await gateway.upserts
+        XCTAssertEqual(upserts.map(\.id), ["c1"])
     }
 
     func testOtherRowsStillFlushWhenOneRowFails() async throws {

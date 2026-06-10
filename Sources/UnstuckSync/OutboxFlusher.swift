@@ -19,6 +19,7 @@ import UnstuckData
 public actor OutboxFlusher {
     private let gateway: any SyncGatewayProtocol
     private let box: OutboxStore
+    private let db: AppDatabase
     private let decoder = JSONDecoder()
 
     // Per-op consecutive-failure tally (keyed by outbox seq). In-memory and
@@ -31,6 +32,17 @@ public actor OutboxFlusher {
     public init(gateway: any SyncGatewayProtocol, db: AppDatabase) {
         self.gateway = gateway
         self.box = OutboxStore(db)
+        self.db = db
+    }
+
+    /// The FK-parent table a child table's `dependsOn` rowId lives in:
+    /// cal_block → tasks, capture → sessions. Other tables have no FK parent.
+    static func dependsOnParentTable(_ childTable: String) -> String? {
+        switch childTable {
+        case "cal_blocks": return "tasks"
+        case "captures":   return "sessions"
+        default:           return nil
+        }
     }
 
     public func flush(userId: String) async {
@@ -46,10 +58,25 @@ public actor OutboxFlusher {
             let all = (try? box.pending()) ?? []   // FIFO by seq
             if all.isEmpty { break }
             let pendingRowIds = Set(all.map(\.rowId))
-            // An op is held back while its dependsOn rowId still has a pending op.
+            // Per-pass cache of a parent table's local row ids (only queried for
+            // the dependsOn parent tables tasks / sessions).
+            var localCache: [String: Set<String>] = [:]
+            func localIds(_ table: String) -> Set<String> {
+                if let c = localCache[table] { return c }
+                let ids = (try? db.localRowIds(table: table)) ?? []
+                localCache[table] = ids
+                return ids
+            }
+            // An op is held back while its dependsOn rowId still has a pending op,
+            // OR while its FK parent row doesn't exist locally yet — e.g. a capture
+            // taken during a LIVE focus session (the sessions row is only written
+            // at session end). A parent present locally with no pending op has been
+            // flushed/hydrated, so the FK is satisfied server-side.
             let flushable = all.filter { op in
                 guard let dep = op.dependsOn else { return true }
-                return !pendingRowIds.contains(dep)
+                if pendingRowIds.contains(dep) { return false }
+                guard let parent = Self.dependsOnParentTable(op.tableName) else { return true }
+                return localIds(parent).contains(dep)
             }
             if flushable.isEmpty { break }
             var progressed = false
