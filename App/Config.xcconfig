@@ -6,4 +6,9 @@
 SUPABASE_HOST = uaxfteluwctrlgwmmfzi.supabase.co
 SUPABASE_ANON_KEY =
 
+// Realtime voice proxy (CF Worker → DashScope Qwen-Omni). Blank by default —
+// the real wss://unstuck-voice-proxy.<subdomain>.workers.dev goes in
+// Secrets.xcconfig. voiceConfigured() gates the Talk button on this being set.
+VOICE_PROXY_URL =
+
 #include? "Secrets.xcconfig"

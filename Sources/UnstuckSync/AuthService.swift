@@ -119,6 +119,13 @@ public struct AuthService: Sendable {
         client.auth.currentSession?.user.id.uuidString.lowercased()
     }
 
+    /// The current session's JWT access token. The voice realtime proxy (CF
+    /// Worker) validates it before bridging to DashScope, so the realtime client
+    /// sends it as the `Authorization: Bearer` header.
+    public var accessToken: String? {
+        client.auth.currentSession?.accessToken
+    }
+
     /// Signed-in user's email (denormalized into feedback + "who's on it" labels).
     public var currentEmail: String? {
         client.auth.currentSession?.user.email

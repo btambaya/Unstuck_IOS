@@ -390,6 +390,105 @@ final class AssistantModel {
               let loaded = try? JSONDecoder().decode([ChatMessage].self, from: data) else { return }
         history = loaded
     }
+
+    // MARK: - voice (realtime "Talk" mode wiring)
+    //
+    // The realtime session is configured CLIENT-side (session.update), so the
+    // instructions + tool schemas live here; tool execution reuses the SAME
+    // dispatcher as text mode, with a per-call scratch for mid-session entities.
+    // The VoiceRealtimeClient (+ VoiceAudioEngine) drive the audio; the UI screen
+    // is the remaining step.
+
+    private var voiceNewTasks: [String: TaskItem] = [:]
+    private var voiceNewLists: [String: ItemCollection] = [:]
+    /// Reset the mid-call scratch at the start of a voice session.
+    func resetVoiceScratch() { voiceNewTasks = [:]; voiceNewLists = [:] }
+
+    /// Execute one realtime tool call (args arrive as a JSON string from the
+    /// model) → the short result string. Reuses the text dispatcher + a session
+    /// scratch so a later call can reference an entity created earlier this call.
+    func runVoiceTool(name: String, argsJSON: String) -> String {
+        let args = parseArgs(argsJSON)
+        return runTool(name: name, args: args, newTasks: &voiceNewTasks, newLists: &voiceNewLists)
+    }
+
+    /// The system prompt + a compact live snapshot, for the realtime session.
+    /// 1:1 with Android voiceInstructions.
+    func voiceInstructions() -> String {
+        let ctx = buildContext()
+        let json = (try? JSONEncoder().encode(ctx)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        return """
+        You are Unstuck's voice assistant — a calm, concise scheduling partner for someone with ADHD. \
+        Speak naturally and briefly, like a helpful friend. When the user asks you to do something (add a task, \
+        schedule, add to a list), call the matching tool, then say what you did in one short sentence. Ask a quick \
+        question only when something essential is missing. Confirm out loud before deleting anything. Reference \
+        existing tasks/lists by their id from the state below. Dates are YYYY-MM-DD, times 24h HH:MM, computed from \
+        the current time.
+
+        Current app state:
+        \(json)
+        """
+    }
+
+    /// Tool schemas for the realtime session (OpenAI/DashScope function shape).
+    /// Names + params mirror the text dispatcher — keep in sync. 1:1 with the
+    /// Android voiceTools().
+    func voiceTools() -> [[String: Any]] {
+        func prop(_ type: String, _ desc: String) -> [String: Any] { ["type": type, "description": desc] }
+        func tool(_ name: String, _ desc: String, _ required: [String],
+                  _ props: [String: [String: Any]]) -> [String: Any] {
+            ["type": "function", "name": name, "description": desc,
+             "parameters": ["type": "object", "properties": props, "required": required]]
+        }
+        return [
+            tool("create_task", "Create a task.", ["name"], [
+                "name": prop("string", "Task title."),
+                "estimateMin": prop("integer", "Estimated minutes (default 25)."),
+                "lifeArea": prop("string", "A life-area name from context, else omit."),
+                "dueAt": prop("string", "Optional ISO 'by' time."),
+                "later": prop("boolean", "true to park in Later."),
+            ]),
+            tool("schedule_task", "Place a task on the calendar.", ["taskId", "date", "startTime"], [
+                "taskId": prop("string", "Existing task id."),
+                "date": prop("string", "YYYY-MM-DD."),
+                "startTime": prop("string", "24h HH:MM."),
+            ]),
+            tool("update_task", "Edit a task's fields (only pass what changes).", ["taskId"], [
+                "taskId": prop("string", "Task id."),
+                "name": prop("string", "New title."),
+                "estimateMin": prop("integer", "Minutes."),
+                "lifeArea": prop("string", "Area name."),
+            ]),
+            tool("set_task_later", "Park in Later or bring back.", ["taskId", "later"], [
+                "taskId": prop("string", "Task id."),
+                "later": prop("boolean", "true=Later."),
+            ]),
+            tool("set_task_recurrence", "Repeat a task or stop (kind=none).", ["taskId", "kind"], [
+                "taskId": prop("string", "Task id."),
+                "kind": prop("string", "daily | weekly | monthly | none."),
+                "until": prop("string", "Optional end date YYYY-MM-DD."),
+                "daysOfWeek": ["type": "array", "items": ["type": "integer"],
+                               "description": "Weekly: 0=Sun..6=Sat."],
+            ]),
+            tool("complete_task", "Mark a task done.", ["taskId"], ["taskId": prop("string", "Task id.")]),
+            tool("delete_task", "Delete a task — only after the user confirms aloud.", ["taskId"],
+                 ["taskId": prop("string", "Task id.")]),
+            tool("create_list", "Create a new list.", ["name"], [
+                "name": prop("string", "List name."),
+                "color": prop("string", "Optional palette token."),
+            ]),
+            tool("add_to_list", "Add an item to a list.", ["listId", "body"], [
+                "listId": prop("string", "List id."),
+                "body": prop("string", "Item text."),
+            ]),
+            tool("promote_item_to_task", "Turn a list item into a task.", ["listId", "itemId", "mode"], [
+                "listId": prop("string", "List id."),
+                "itemId": prop("string", "Item id."),
+                "mode": prop("string", "self | loop."),
+                "dueAt": prop("string", "ISO 'by' time (loop)."),
+            ]),
+        ]
+    }
 }
 
 /// Map an edge-fn error code to a calm inline message. Covers every code the

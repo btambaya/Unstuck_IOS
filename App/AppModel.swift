@@ -115,6 +115,21 @@ final class AppModel {
         }
     }
 
+    // MARK: - voice (realtime "Talk" mode config)
+
+    /// The CF Worker proxy URL (wss://…workers.dev) from Info.plist
+    /// (VOICE_PROXY_URL ← Config/Secrets.xcconfig). Blank → voice unconfigured.
+    var voiceProxyURL: String {
+        (Bundle.main.infoDictionary?["VOICE_PROXY_URL"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+    /// Gate the Talk button: a non-blank proxy URL + a signed-in session.
+    var voiceConfigured: Bool { !voiceProxyURL.isEmpty && coordinator?.auth.accessToken != nil }
+    /// The realtime model id (DashScope Qwen-Omni).
+    var voiceModel: String { "qwen3.5-omni-flash-realtime" }
+    /// The Supabase access token the proxy validates.
+    var voiceAccessToken: String? { coordinator?.auth.accessToken }
+
     func sendSessionRecap(taskName: String, away: Bool = false) {
         guard let n = coordinator?.notifications else { return }
         Task { try? await n.sessionRecap(taskName: taskName, away: away) }
