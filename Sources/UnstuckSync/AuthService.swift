@@ -57,6 +57,49 @@ public struct AuthService: Sendable {
         catch { return .error(friendly(error)) }
     }
 
+    /// Change / add the account password (auth.updateUser). Mirrors Android.
+    public func changePassword(_ newPassword: String) async -> AuthOutcome {
+        do { _ = try await client.auth.update(user: UserAttributes(password: newPassword)); return .ok }
+        catch { return .error(friendly(error)) }
+    }
+
+    /// Update the display name in user metadata (both keys, like sign-up).
+    public func updateDisplayName(_ name: String) async -> AuthOutcome {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .error("Name can't be empty.") }
+        do {
+            _ = try await client.auth.update(user: UserAttributes(
+                data: ["full_name": .string(trimmed), "display_name": .string(trimmed)]))
+            return .ok
+        } catch { return .error(friendly(error)) }
+    }
+
+    /// Delete the account via the server-side `account-delete` Edge Function
+    /// (service-role wipe of every owned row + the auth user), then sign out.
+    public func deleteAccount() async -> AuthOutcome {
+        struct Empty: Encodable {}
+        do {
+            try await client.functions.invoke("account-delete",
+                options: FunctionInvokeOptions(method: .post, body: Empty()))
+            try? await client.auth.signOut()
+            return .ok
+        } catch { return .error(friendly(error)) }
+    }
+
+    /// True if the account has an email/password identity (vs Google-only) —
+    /// gates "Change password" vs "Add a password" in Settings.
+    public var hasPassword: Bool {
+        client.auth.currentSession?.user.identities?.contains { $0.provider == "email" } ?? true
+    }
+
+    /// Re-authenticate with the current password before a sensitive change
+    /// (password update). Returns .ok if the password is correct. Mirrors the
+    /// Android Settings change-password reauth guard.
+    public func reauthenticate(email: String, password: String) async -> AuthOutcome {
+        do { _ = try await client.auth.signIn(email: email, password: password); return .ok }
+        catch { return .error("Current password incorrect.") }
+    }
+
     /// Exchange a deep-link callback URL for a session (PKCE).
     public func handleCallback(url: URL) async -> AuthOutcome {
         do { _ = try await client.auth.session(from: url); return .ok }

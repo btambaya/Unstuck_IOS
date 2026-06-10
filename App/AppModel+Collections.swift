@@ -37,6 +37,48 @@ extension AppModel {
     var currentUserName: String? { coordinator?.auth.currentUserName }
     var currentEmail: String? { coordinator?.auth.currentEmail }
 
+    // MARK: - account management (Settings · Account)
+
+    /// True for an email/password account (vs Google-only) — gates "Change
+    /// password" vs "Add a password" copy in Settings.
+    var hasPassword: Bool { coordinator?.auth.hasPassword ?? true }
+
+    func updateDisplayName(_ name: String) async -> AuthOutcome {
+        guard let auth = coordinator?.auth else { return .error("Not signed in.") }
+        return await auth.updateDisplayName(name)
+    }
+
+    /// Re-auth with the current password, then set the new one (Android parity:
+    /// a password change requires proving the current password first).
+    func changePassword(current: String?, new: String) async -> AuthOutcome {
+        guard let auth = coordinator?.auth else { return .error("Not signed in.") }
+        if hasPassword {
+            guard let email = currentEmail, !email.isEmpty else {
+                return .error("Can't verify your current password — no email is set on this account.")
+            }
+            guard let current, !current.isEmpty else { return .error("Enter your current password.") }
+            if case .error(let msg) = await auth.reauthenticate(email: email, password: current) {
+                return .error(msg)
+            }
+        }
+        return await auth.changePassword(new)
+    }
+
+    func deleteAccount() async -> AuthOutcome {
+        guard let auth = coordinator?.auth else { return .error("Not signed in.") }
+        let outcome = await auth.deleteAccount()
+        if case .ok = outcome {
+            // The server wipe + signOut already happened; clear device-local
+            // state the same way signOut does so nothing leaks to the next user.
+            NotificationLog.shared.clear()
+            NotificationPrefs.clearUserContent()
+            PausedCheckinScheduler.cancel()
+            Task { await ReminderScheduler.shared.cancelAll() }
+            try? db?.clearAll()
+        }
+        return outcome
+    }
+
     // MARK: - mutate helpers (route shared vs own)
 
     /// Metadata-only change (name/color/subtitle/archived). Shared → a partial
