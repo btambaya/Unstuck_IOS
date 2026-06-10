@@ -66,15 +66,30 @@ stays green (258) and the `Unstuck` scheme builds clean after each step.
   transport) + `AssistantModel` (agentic turn loop ≤5 iterations, the 11-tool
   dispatcher mapped to the offline-first AppModel methods, compact context
   builder, UserDefaults history windowed to 40, scrubbed on sign-out/delete).
-  The floating bubble is now a dual Assistant | Feedback sheet. **Voice
-  deferred** (the ~850-LOC realtime Qwen-Omni mode needs device audio + the CF
-  proxy + AEC — a separate effort). The `assistant` edge fn returns
-  `not_configured` until `QWEN_API_KEY` is set on prod (handled gracefully).
+  The floating bubble is now a dual Assistant | Feedback sheet. The `assistant`
+  edge fn returns `not_configured` until `QWEN_API_KEY` is set on prod (handled
+  gracefully).
+- **Voice assistant (now DONE).** `App/Voice/`: VoiceRealtimeClient
+  (URLSessionWebSocketTask → the CF proxy; the exact DashScope realtime
+  protocol, args cross the Task boundary as a Sendable JSON string),
+  VoiceAudioEngine (AVAudioEngine 16k capture / 24k playback + voice-processing
+  AEC for full-duplex barge-in), VoiceController (on-device SFSpeechRecognizer
+  STT + AVSpeechSynthesizer TTS). VoiceModeScreen + VoiceSessionModel orchestrate
+  the realtime "Talk" mode (orb / captions / Interrupt / End, ends on an
+  AVAudioSession interruption); the chat bubble gains a Talk button (gated on
+  `voiceConfigured`), an on-device dictation mic, and a read-aloud toggle. Tool
+  calls reuse the text dispatcher (`runVoiceTool`). Config: `VOICE_PROXY_URL` via
+  Config/Secrets.xcconfig + Info.plist; `AuthService.accessToken`. Fixed: the
+  floating bubble was occluded by the bottom nav (raised to 96pt). XCUITests
+  (testAssistantBubble / testSettingsSubScreens) pass on the iPhone 17 sim.
+  **TODO (not code):** put the real `wss://unstuck-voice-proxy.<subdomain>.workers.dev`
+  in Secrets.xcconfig, and validate audio (levels/echo/barge-in) ON A DEVICE —
+  the sim can't.
 - **Server.** `send-session-recap` APNS push is now a silent banner
   (`sound:false`, Calm by default) — deployed.
 
-Remaining parity gaps: **voice assistant** (realtime, device-tested) and minor
-Insights/notification-thread polish.
+Remaining parity gaps: none of substance — only minor Insights/notification-
+thread polish + the on-device voice validation noted above.
 
 ## Where things stand (2026-06-09, later) — tri-platform audit: sync hardening pass
 
