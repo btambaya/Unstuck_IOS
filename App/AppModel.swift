@@ -52,11 +52,49 @@ final class AppModel {
     /// extensions can't add stored properties — observing this drives the Inbox.
     var archivedCaptureIdsBacking: Set<String> = []
 
-    func completeOnboarding(struggles: [String]) {
+    /// Finish onboarding. Mirrors the Android completeOnboarding: seed the
+    /// user's PICKED life areas (or canonical defaults) — but only when they
+    /// have none yet, so an existing account whose areas already hydrated isn't
+    /// double-seeded — sync the ADHD-struggle selections, optionally create the
+    /// first task (+ its smallest first action), and adopt the chosen default
+    /// focus treatment.
+    func completeOnboarding(struggles: [String], areas: [String] = [],
+                            firstTask: String = "", firstAction: String = "",
+                            treatment: FocusTreatment? = nil) {
         UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
-        if let coord = coordinator, let uid = coord.auth.currentUserId {
+
+        // Seed life areas (single source — only when empty).
+        if let write = coordinator?.write, ((try? db?.fetchAllLifeAreas())?.isEmpty ?? true) {
+            let palette = ["indigo", "coral", "green", "amber", "teal", "blue", "violet", "red"]
+            let seed = areas.isEmpty ? ["Work", "Personal", "Home", "Health"] : areas
+            let now = Self.isoNow()
+            Task {
+                for (i, name) in seed.enumerated() {
+                    try? await write.upsertLifeArea(
+                        LifeArea(id: newUUID(), name: name, color: palette[i % palette.count], sortOrder: i),
+                        nowISO: now)
+                }
+            }
+        }
+
+        // Create the first task (with an optional first physical action).
+        let taskName = firstTask.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !taskName.isEmpty {
+            var t = addTask(name: taskName, estimateMin: settings.focusDefaultMin)
+            let action = firstAction.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !action.isEmpty {
+                t.firstPhysicalAction = action
+                t.updatedAt = Self.isoNow()
+                saveTask(t)
+            }
+        }
+
+        // Adopt the chosen default focus treatment.
+        if let treatment { settings.defaultTreatment = treatment }
+
+        if let coord = coordinator, let uid = coord.auth.currentUserId, !struggles.isEmpty {
             Task { try? await coord.preferences.setAdhdStruggles(userId: uid, struggles: struggles) }
         }
     }

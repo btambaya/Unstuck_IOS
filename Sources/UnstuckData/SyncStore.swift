@@ -54,6 +54,13 @@ public extension AppDatabase {
         try writer.read { try ItemCollection.fetchAll($0) }
     }
 
+    /// Every locally-cached life area. Onboarding uses this to seed default
+    /// areas only when the user has none yet (avoids double-seeding on an
+    /// existing account whose areas already hydrated).
+    func fetchAllLifeAreas() throws -> [LifeArea] {
+        try writer.read { try LifeArea.fetchAll($0) }
+    }
+
     /// The user's first calendar connection (for choosing a Google push target).
     func firstCalendarConnection() throws -> CalendarConnection? {
         try writer.read { try CalendarConnection.fetchOne($0) }
