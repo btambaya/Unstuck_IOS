@@ -25,6 +25,7 @@ struct MainTabScaffold: View {
                 switch sheet {
                 case .newTask: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
                 case .quickCapture: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
+                case .inbox: InboxView()
                 }
             }
             .sheet(isPresented: $router.showFeedback) {

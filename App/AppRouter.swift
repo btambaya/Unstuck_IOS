@@ -9,7 +9,7 @@ import UnstuckCore
 final class AppRouter {
     enum Tab: Hashable, CaseIterable { case today, tasks, calendar, lists }
     enum Sheet: Identifiable {
-        case newTask, quickCapture
+        case newTask, quickCapture, inbox
         var id: Int { hashValue }
     }
 

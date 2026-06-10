@@ -73,6 +73,7 @@ extension AppModel {
             NotificationLog.shared.clear()
             NotificationPrefs.clearUserContent()
             PausedCheckinScheduler.cancel()
+            archivedCaptureIds = []
             Task { await ReminderScheduler.shared.cancelAll() }
             try? db?.clearAll()
         }

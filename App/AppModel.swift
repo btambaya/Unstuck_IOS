@@ -40,6 +40,11 @@ final class AppModel {
     }
     // Local first-run flag; struggles also sync to user_preferences.
     var onboarded = UserDefaults.standard.bool(forKey: "unstuck.onboarded")
+    /// In-memory backing for the device-local archived-capture id set (the
+    /// Inbox triage tray). Persisted to UserDefaults via the `archivedCaptureIds`
+    /// computed property in AppModel+Captures. Stored here because @Observable
+    /// extensions can't add stored properties — observing this drives the Inbox.
+    var archivedCaptureIdsBacking: Set<String> = []
 
     func completeOnboarding(struggles: [String]) {
         UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
@@ -98,6 +103,7 @@ final class AppModel {
         db = database
         taskRepo = TaskRepository(database)
         liveStore = LiveSessionStore(database)
+        loadArchivedCaptureIds()   // restore the Inbox archived view across relaunch
         let provider = SupabaseClientProvider(config)
         let coord = SyncCoordinator(provider: provider, db: database)
         coordinator = coord
@@ -217,6 +223,7 @@ final class AppModel {
         NotificationLog.shared.clear()
         NotificationPrefs.clearUserContent()
         PausedCheckinScheduler.cancel()
+        archivedCaptureIds = []   // device-local Inbox archive set — don't leak to the next account
         Task {
             await ReminderScheduler.shared.cancelAll()
             await coord.signOutAndUnregister(deviceId: deviceId)

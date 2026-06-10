@@ -78,6 +78,16 @@ public struct TaskRepository: Sendable {
         }.values(in: db.writer)
     }
 
+    /// Live stream of all captures (newest first) for the Inbox triage tray.
+    /// Captures are the quick thoughts parked during a focus session or on the
+    /// fly; the Inbox observes this to show the open + archived sets. Ordered by
+    /// `at` descending so the freshest capture is at the top (Android parity).
+    public func observeCaptures() -> AsyncValueObservation<[Capture]> {
+        ValueObservation.tracking { db in
+            try Capture.order(Column("at").desc).fetchAll(db)
+        }.values(in: db.writer)
+    }
+
     /// Everything the ReminderScheduler re-syncs on: blocks + tasks (the
     /// alarm inputs) AND the live focus session — so completing a task or
     /// starting Focus on it cancels its pending ATSTART/DRIFTED requests

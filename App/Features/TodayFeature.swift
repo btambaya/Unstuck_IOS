@@ -19,10 +19,17 @@ final class TodayModel {
     var blocks: [CalBlock] = []
     var areas: [LifeArea] = []
     var sessions: [Session] = []
+    var captures: [Capture] = []
     private let repo: TaskRepository
     init(_ repo: TaskRepository) { self.repo = repo }
 
     func observe() async {
+        async let tb: Void = observeTasksAndBlocks()
+        async let cap: Void = observeCaptures()
+        _ = await (tb, cap)
+    }
+
+    private func observeTasksAndBlocks() async {
         do {
             // areas/sessions come from the same tracked snapshot, so an area
             // rename or a realtime session arrival refreshes the pills and
@@ -35,6 +42,18 @@ final class TodayModel {
                 writeWidgetSnapshot()
             }
         } catch {}
+    }
+
+    private func observeCaptures() async {
+        do {
+            for try await snap in repo.observeCaptures() { captures = snap }
+        } catch {}
+    }
+
+    /// Captures still awaiting triage (not device-local archived) — drives the
+    /// coral dot on the header Inbox icon (Android `inboxCount`).
+    func openCaptureCount(archivedIds: Set<String>) -> Int {
+        captures.filter { !archivedIds.contains($0.id) }.count
     }
 
     private func writeWidgetSnapshot() {
@@ -112,6 +131,18 @@ struct TodayView: View {
             HStack {
                 Mark(size: 24)
                 Spacer()
+                // Inbox (MoveToInbox) → the capture triage tray; the coral dot
+                // marks open (untriaged) captures (Android Today header parity).
+                Button { model.router.present(.inbox) } label: {
+                    Image(systemName: "tray.and.arrow.down").font(.system(size: 18))
+                        .foregroundStyle(theme.palette.ink2).frame(width: 40, height: 40)
+                        .overlay(alignment: .topTrailing) {
+                            if (vm?.openCaptureCount(archivedIds: model.archivedCaptureIds) ?? 0) > 0 {
+                                Circle().fill(theme.palette.coral).frame(width: 8, height: 8)
+                                    .offset(x: -8, y: 8)
+                            }
+                        }
+                }.buttonStyle(.plain)
                 // Bell → in-app Notification Center; the dot is the unread
                 // badge (newest log entry vs lastSeen — spec 10 §1.9).
                 Button { showNotifCenter = true } label: {
