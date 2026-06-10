@@ -61,6 +61,12 @@ public extension AppDatabase {
         try writer.read { try LifeArea.fetchAll($0) }
     }
 
+    /// Every locally-cached tag. The assistant context builder reads this to
+    /// give the agent the user's curated tag vocabulary.
+    func fetchAllTags() throws -> [TagRow] {
+        try writer.read { try TagRow.order(Column("sortOrder")).fetchAll($0) }
+    }
+
     /// The user's first calendar connection (for choosing a Google push target).
     func firstCalendarConnection() throws -> CalendarConnection? {
         try writer.read { try CalendarConnection.fetchOne($0) }

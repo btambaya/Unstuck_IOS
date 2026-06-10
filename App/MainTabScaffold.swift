@@ -28,8 +28,8 @@ struct MainTabScaffold: View {
                 case .inbox: InboxView()
                 }
             }
-            .sheet(isPresented: $router.showFeedback) {
-                FeedbackSheet(screen: screenLabel(router.tab))
+            .sheet(isPresented: $router.showBubble) {
+                BubbleSheet(screen: screenLabel(router.tab), startTab: router.bubbleStartTab)
             }
             // Notification deep links (unstuck://task/<id>) open the task
             // editor from anywhere — Android's Route.Detail push.

@@ -74,6 +74,10 @@ extension AppModel {
             NotificationPrefs.clearUserContent()
             PausedCheckinScheduler.cancel()
             archivedCaptureIds = []
+            // Scrub the assistant chat — same cross-account leak class. Clear the
+            // live model if opened; always wipe the persisted store.
+            _assistant?.clear()
+            AssistantModel.scrubPersisted()
             Task { await ReminderScheduler.shared.cancelAll() }
             try? db?.clearAll()
         }

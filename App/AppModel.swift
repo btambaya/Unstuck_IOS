@@ -52,6 +52,22 @@ final class AppModel {
     /// extensions can't add stored properties — observing this drives the Inbox.
     var archivedCaptureIdsBacking: Set<String> = []
 
+    /// Backing for the lazily-built assistant. Observation-ignored: AppModel
+    /// holds the reference but never needs to observe the swap (AssistantModel
+    /// is itself @Observable and drives the chat UI). A lazy stored var conflicts
+    /// with the @Observable macro's init accessor, so it's built on first access.
+    @ObservationIgnored private(set) var _assistant: AssistantModel?
+
+    /// The in-app agent (text chat + client-side tool execution). Built on first
+    /// bubble open so the persisted history load + the client are only touched
+    /// when the user actually uses it. Voice is deferred.
+    var assistant: AssistantModel {
+        if let a = _assistant { return a }
+        let a = AssistantModel(model: self, client: coordinator?.assistant)
+        _assistant = a
+        return a
+    }
+
     /// Finish onboarding. Mirrors the Android completeOnboarding: seed the
     /// user's PICKED life areas (or canonical defaults) — but only when they
     /// have none yet, so an existing account whose areas already hydrated isn't
@@ -300,6 +316,11 @@ final class AppModel {
         NotificationPrefs.clearUserContent()
         PausedCheckinScheduler.cancel()
         archivedCaptureIds = []   // device-local Inbox archive set — don't leak to the next account
+        // Assistant chat/brain-dump — same cross-account leak class as the
+        // notification log. Clear the live model if it was opened; always wipe
+        // the persisted store (so an un-opened agent still scrubs cleanly).
+        _assistant?.clear()
+        AssistantModel.scrubPersisted()
         Task {
             await ReminderScheduler.shared.cancelAll()
             await coord.signOutAndUnregister(deviceId: deviceId)

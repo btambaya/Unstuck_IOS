@@ -15,8 +15,14 @@ final class AppRouter {
 
     var tab: Tab = .today
     var activeSheet: Sheet?
-    /// Beta-feedback composer presentation (driven by the floating bubble).
-    var showFeedback = false
+    /// The floating bubble's dual-purpose sheet (Assistant chat + Feedback),
+    /// driven by the bottom-trailing bubble. Matches Android's bubble, which
+    /// exposes both surfaces behind one entry point.
+    var showBubble = false
+    /// Which tab the bubble sheet opens on. The bubble itself opens Assistant;
+    /// kept here so a future "report a bug" entry can deep-link to Feedback.
+    var bubbleStartTab: BubbleTab = .assistant
+    enum BubbleTab { case assistant, feedback }
     /// When set, the Focus surface is presented full-screen for this task.
     var focusTask: TaskItem?
     /// When set, the task editor is presented for this task (notification

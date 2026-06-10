@@ -9,12 +9,14 @@ import UnstuckCore
 import UnstuckDesign
 
 /// The floating coral bubble, overlaid bottom-trailing over the tab content.
+/// Opens the dual-purpose sheet (Assistant chat + Feedback) — matching Android,
+/// whose bubble exposes both surfaces behind one entry point.
 struct FeedbackBubble: View {
     @Environment(\.uTheme) private var theme
     let action: () -> Void
     var body: some View {
         Button(action: action) {
-            Image(systemName: "bubble.left.and.text.bubble.right")
+            Image(systemName: "sparkles")
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 46, height: 46)
@@ -23,20 +25,24 @@ struct FeedbackBubble: View {
                 .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Send feedback")
+        .accessibilityLabel("Assistant")
     }
 }
 
-/// Overlays the feedback bubble on a tab's ROOT content (bottom-trailing).
-/// Applied INSIDE each tab's NavigationStack so a pushed detail screen covers
-/// it — mirroring Android's `stack.isEmpty()` gate.
+/// Overlays the bubble on a tab's ROOT content (bottom-trailing). Applied
+/// INSIDE each tab's NavigationStack so a pushed detail screen covers it —
+/// mirroring Android's `stack.isEmpty()` gate. Opens the bubble sheet on the
+/// Assistant tab.
 struct FeedbackBubbleModifier: ViewModifier {
     @Environment(AppModel.self) private var model
     func body(content: Content) -> some View {
         content.overlay(alignment: .bottomTrailing) {
-            FeedbackBubble { model.router.showFeedback = true }
-                .padding(.trailing, 16)
-                .padding(.bottom, 18)
+            FeedbackBubble {
+                model.router.bubbleStartTab = .assistant
+                model.router.showBubble = true
+            }
+            .padding(.trailing, 16)
+            .padding(.bottom, 18)
         }
     }
 }
@@ -51,15 +57,22 @@ private enum FeedbackCategory: String, CaseIterable, Identifiable {
     var apiValue: String { rawValue.lowercased() }
 }
 
-struct FeedbackSheet: View {
+/// The feedback composer CONTENT (no chrome) — embedded in the bubble's dual
+/// sheet under the Feedback tab. `onDone` dismisses the host sheet after a
+/// successful send. Mirrors Android's FeedbackForm reused inside AssistantSheet.
+struct FeedbackForm: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
-    @Environment(\.dismiss) private var dismiss
 
     /// The tab the user was on (today / tasks / calendar / lists), for triage.
     let screen: String
+    /// Called after a successful send so the host can dismiss.
+    let onDone: () -> Void
 
-    init(screen: String) { self.screen = screen }
+    init(screen: String, onDone: @escaping () -> Void) {
+        self.screen = screen
+        self.onDone = onDone
+    }
 
     @State private var category: FeedbackCategory = .bug
     @State private var body_ = ""
@@ -69,27 +82,13 @@ struct FeedbackSheet: View {
     @SwiftUI.FocusState private var fieldFocused: Bool
 
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if sent {
-                        thanks
-                    } else {
-                        composer
-                    }
-                }
-                .padding(20)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if sent { thanks } else { composer }
             }
-            .background(theme.palette.bg.ignoresSafeArea())
-            .navigationTitle("Send feedback")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-            }
+            .padding(20)
         }
-        .presentationDetents([.medium, .large])
+        .background(theme.palette.bg)
         .onAppear { fieldFocused = true }
     }
 
@@ -161,7 +160,7 @@ struct FeedbackSheet: View {
             if ok {
                 sent = true
                 try? await Task.sleep(nanoseconds: 1_100_000_000)
-                dismiss()
+                onDone()
             } else {
                 failed = true
             }
