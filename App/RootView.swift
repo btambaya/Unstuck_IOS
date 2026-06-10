@@ -11,6 +11,10 @@ struct RootView: View {
                 ConfigNeededView()
             } else if !model.signedIn {
                 AuthView()
+            } else if model.pendingPasswordRecovery {
+                // A recovery session lands authenticated — let them set a new
+                // password before dropping into the app.
+                SetNewPasswordView()
             } else if !model.onboarded {
                 OnboardingView()
             } else {

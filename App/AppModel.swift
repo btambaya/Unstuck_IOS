@@ -24,6 +24,12 @@ final class AppModel {
     private(set) var liveStore: LiveSessionStore?
     var signedIn = false
     var configured = true
+    /// Set when a password-RECOVERY link lands (the user tapped "Forgot
+    /// password" → the email link). The recovery session authenticates them but
+    /// RootView shows the set-new-password screen instead of the app until they
+    /// pick a new password (a recovery session can change the password without
+    /// the old one). Mirrors Android's pendingPasswordRecovery.
+    var pendingPasswordRecovery = false
     /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
     var uiTestWrite: WriteThrough?
     // Per-collection serial RPC queue. The optimistic local write happens
@@ -164,6 +170,20 @@ final class AppModel {
         Task { try? await coord.push.register(deviceId: deviceId, apnsToken: tokenHex) }
     }
 
+    /// Best-effort usage-analytics ping on sign-in (platform + device; the
+    /// server derives country/city from the IP). Throttled to once per 12h per
+    /// user via UserDefaults, mirroring the Android SyncCoordinator loginPing.
+    private func trackLogin() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        let key = "unstuck.loginPing.\(uid)"
+        let now = Date().timeIntervalSince1970
+        let last = UserDefaults.standard.double(forKey: key)
+        if now - last < 12 * 60 * 60 { return }
+        UserDefaults.standard.set(now, forKey: key)
+        let device = "\(Self.deviceModelName) · iOS \(UIDevice.current.systemVersion)"
+        Task { await coord.loginTracker.track(device: device) }
+    }
+
     func registerLiveActivityToken(activityId: String, token: String) {
         guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
@@ -177,10 +197,15 @@ final class AppModel {
         // Reflect auth changes into UI state. Runs for the app lifetime.
         Task { [weak self] in
             for await (event, session) in coord.auth.authStateChanges {
-                _ = event
+                // A password-recovery link establishes an authenticated session
+                // whose intent is "set a new password" — flag it so RootView shows
+                // the set-new-password screen (the PKCE recovery flow carries no
+                // type=recovery in the URL, so the SDK event is the reliable signal).
+                let isRecovery: Bool = { if case .passwordRecovery = event { return true }; return false }()
                 let isAuthed = session != nil
                 await MainActor.run {
                     self?.signedIn = isAuthed
+                    if isRecovery { self?.pendingPasswordRecovery = true }
                     // Re-register the APNs token on every transition to
                     // authenticated (spec 10 §1.8): sign-out deletes this
                     // device's token row, so a user switch within one launch
@@ -188,16 +213,29 @@ final class AppModel {
                     if isAuthed, let hex = PushRegistrar.shared.apnsTokenHex {
                         self?.registerPush(hex)
                     }
+                    // Usage-analytics sign-in ping (not on recovery — that's a
+                    // re-auth, not a real login). Throttled to once / 12h / user.
+                    if isAuthed, !isRecovery { self?.trackLogin() }
                 }
             }
         }
     }
+
+    /// Finish password recovery: the user has set a new password, drop the flag
+    /// so RootView leaves the set-new-password screen for the app.
+    func consumeRecovery() { pendingPasswordRecovery = false }
 
     func handleDeepLink(_ url: URL) {
         // OAuth / magic-link PKCE callback → the auth client; everything
         // else (unstuck://task/…, /focus/…, /today, capture) routes to the
         // matching surface (spec 10 §1.7 push-tap deep links).
         if url.host == "auth-callback" {
+            // Implicit-flow recovery links carry type=recovery in the URL — flag
+            // it early so the set-new-password screen shows the moment the session
+            // resolves (the PKCE flow relies on the .passwordRecovery event above).
+            if url.absoluteString.range(of: "type=recovery", options: .caseInsensitive) != nil {
+                pendingPasswordRecovery = true
+            }
             guard let coord = coordinator else { return }
             Task { _ = await coord.auth.handleCallback(url: url) }
             return

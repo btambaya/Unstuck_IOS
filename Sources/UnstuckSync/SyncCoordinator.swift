@@ -26,6 +26,7 @@ public actor SyncCoordinator {
     public nonisolated let preferences: PreferencesClient
     public nonisolated let share: CollectionShareClient
     public nonisolated let feedback: FeedbackClient
+    public nonisolated let loginTracker: LoginTrackerClient
     private let hydrator: Hydrator
     private let realtime: RealtimeMirror
     private let flusher: OutboxFlusher
@@ -44,6 +45,7 @@ public actor SyncCoordinator {
         self.preferences = PreferencesClient(provider.client)
         self.share = CollectionShareClient(provider.client)
         self.feedback = FeedbackClient(provider.client)
+        self.loginTracker = LoginTrackerClient(provider.client)
         self.hydrator = Hydrator(gateway: gateway, db: db)
         self.realtime = RealtimeMirror(client: provider.client, db: db)
         self.flusher = OutboxFlusher(gateway: gateway, db: db)

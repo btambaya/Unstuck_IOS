@@ -57,3 +57,21 @@ public struct PreferencesClient: Sendable {
             .execute()
     }
 }
+
+/// Records a sign-in for usage analytics via the `track-login` Edge Function
+/// (platform + device; the server derives country/city from the request IP, no
+/// raw IP stored). Best-effort: usage analytics must never affect sign-in, so
+/// failures are swallowed. Throttling is the caller's job. Mirrors the Android
+/// LoginTrackerClient.
+public struct LoginTrackerClient: Sendable {
+    let client: SupabaseClient
+    public init(_ client: SupabaseClient) { self.client = client }
+
+    public func track(device: String) async {
+        struct Body: Encodable { let platform = "ios"; let device: String }
+        // Returns nothing; ignore decode + swallow any error.
+        try? await client.functions.invoke(
+            "track-login",
+            options: FunctionInvokeOptions(method: .post, body: Body(device: device)))
+    }
+}
