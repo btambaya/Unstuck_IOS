@@ -81,6 +81,9 @@ private struct AssistantChat: View {
     @Environment(\.uTheme) private var theme
 
     @State private var input = ""
+    @State private var showVoice = false        // realtime "Talk" mode
+    @State private var speakReplies = false      // TTS read-aloud toggle
+    @State private var voice = VoiceController()
     @SwiftUI.FocusState private var fieldFocused: Bool
 
     private var assistant: AssistantModel { model.assistant }
@@ -88,8 +91,20 @@ private struct AssistantChat: View {
     var body: some View {
         let shown = assistant.transcript
         VStack(spacing: 0) {
-            // Header: "New chat" clear (only when there's a conversation).
+            // Header: a "Talk" entry into realtime voice (when configured) +
+            // "New chat" clear (only when there's a conversation).
             HStack {
+                if model.voiceConfigured {
+                    Button { showVoice = true } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "waveform").font(.system(size: 12))
+                            Text("Talk").font(UFont.sans(12, .semibold))
+                        }
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(theme.palette.coral, in: Capsule())
+                    }.buttonStyle(.plain)
+                }
                 Spacer()
                 if !shown.isEmpty {
                     Button("New chat") { assistant.clear(); input = "" }
@@ -120,6 +135,14 @@ private struct AssistantChat: View {
 
             inputBar
         }
+        .fullScreenCover(isPresented: $showVoice) { VoiceModeScreen() }
+        // Read each new assistant reply aloud while the speaker toggle is on.
+        .onChange(of: assistant.lastReplyTick) { _, _ in
+            if speakReplies, let r = assistant.lastReply { voice.speak(r) }
+        }
+        // On-device dictation streams into the input field via the model bridge.
+        .onChange(of: assistant.voiceDraft) { _, v in if assistant.dictating || !v.isEmpty { input = v } }
+        .onDisappear { voice.stopListening(); assistant.dictating = false }
     }
 
     private var emptyHint: some View {
@@ -156,6 +179,16 @@ private struct AssistantChat: View {
 
     private var inputBar: some View {
         HStack(spacing: 8) {
+            // Read replies aloud (on-device TTS).
+            Button { speakReplies.toggle(); if !speakReplies { voice.stopSpeaking() } } label: {
+                Image(systemName: speakReplies ? "speaker.wave.2.fill" : "speaker.slash")
+                    .font(.system(size: 15))
+                    .foregroundStyle(speakReplies ? theme.palette.coral : theme.palette.ink3)
+                    .frame(width: 34, height: 34)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(speakReplies ? "Stop reading replies aloud" : "Read replies aloud")
+
             TextField("Message…", text: $input, axis: .vertical)
                 .font(UFont.sans(15))
                 .textFieldStyle(.plain)
@@ -166,6 +199,19 @@ private struct AssistantChat: View {
                 .padding(.horizontal, 16).padding(.vertical, 12)
                 .background(theme.palette.bg2)
                 .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+
+            // On-device dictation (STT) into the input field.
+            Button(action: toggleMic) {
+                Image(systemName: assistant.dictating ? "mic.fill" : "mic")
+                    .font(.system(size: 16))
+                    .foregroundStyle(assistant.dictating ? Color.white : theme.palette.ink2)
+                    .frame(width: 40, height: 40)
+                    .background(assistant.dictating ? theme.palette.coral : theme.palette.bg2)
+                    .clipShape(Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(assistant.sending)
+            .accessibilityLabel(assistant.dictating ? "Stop dictation" : "Dictate")
 
             Button(action: send) {
                 Image(systemName: "arrow.up")
@@ -180,6 +226,19 @@ private struct AssistantChat: View {
             .accessibilityLabel("Send")
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
+    }
+
+    /// Toggle on-device dictation: stream the transcript into the input field
+    /// (via the AssistantModel bridge), stop on the next tap or when it ends.
+    private func toggleMic() {
+        let assistant = self.assistant
+        if assistant.dictating { voice.stopListening(); assistant.dictating = false; return }
+        guard voice.sttAvailable else { return }
+        assistant.dictating = true
+        voice.startListening(
+            onPartial: { p in Task { @MainActor in assistant.setVoiceDraft(p) } },
+            onFinal: { f in Task { @MainActor in assistant.setVoiceDraft(f) } },
+            onDone: { Task { @MainActor in assistant.dictating = false } })
     }
 
     private var canSend: Bool {

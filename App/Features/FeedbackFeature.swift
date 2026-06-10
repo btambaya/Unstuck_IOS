@@ -42,7 +42,10 @@ struct FeedbackBubbleModifier: ViewModifier {
                 model.router.showBubble = true
             }
             .padding(.trailing, 16)
-            .padding(.bottom, 18)
+            // Clear the floating bottom nav (~84pt incl. the safe area) so the
+            // bubble — now the Assistant entry — isn't occluded by / mis-tapped
+            // into the Collections tab beneath it. Content already pads 96pt here.
+            .padding(.bottom, 96)
         }
     }
 }

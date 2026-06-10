@@ -35,6 +35,18 @@ final class AssistantModel {
     private(set) var sending = false
     /// Error code of the last failed turn (nil = none); survives sheet reopen.
     private(set) var error: String?
+    /// The most recent completed assistant reply text + a monotonic tick, so the
+    /// chat's "read aloud" toggle can speak each new reply exactly once.
+    private(set) var lastReply: String?
+    private(set) var lastReplyTick = 0
+    /// Live transcript target for the chat's on-device dictation (STT). The chat
+    /// observes this and copies it into its input field — keeps the @Sendable STT
+    /// callbacks off the SwiftUI @State binding.
+    var voiceDraft = ""
+    func setVoiceDraft(_ s: String) { voiceDraft = s }
+    /// On-device dictation in progress. Lives here (not @State) so the @Sendable
+    /// STT callbacks can flip it back off from the recognizer's queue.
+    var dictating = false
 
     /// The app model — the dispatcher + context builder reach its write methods
     /// + repos through this. Weak isn't needed (AppModel owns this lazily and
@@ -74,7 +86,9 @@ final class AssistantModel {
             guard let self else { return }
             let outcome = await self.runTurn()
             switch outcome {
-            case .reply: break       // already appended to history by the loop
+            case .reply(let text):   // already appended to history by the loop
+                self.lastReply = text
+                self.lastReplyTick += 1
             case .error(let code): self.error = code
             }
             self.persist()

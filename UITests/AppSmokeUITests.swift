@@ -55,6 +55,39 @@ final class AppSmokeUITests: XCTestCase {
         }
     }
 
+    /// The in-app Assistant bubble → chat sheet with the voice affordances
+    /// (dictate mic + read-aloud toggle), and Feedback still reachable. The
+    /// realtime "Talk" button only appears when VOICE_PROXY_URL is configured
+    /// (not in the demo boot), so we don't assert it here.
+    func testAssistantBubble() throws {
+        _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
+        usleep(600_000)
+        let bubble = app.buttons["Assistant"].firstMatch
+        XCTAssertTrue(bubble.waitForExistence(timeout: 6), "assistant bubble missing")
+        bubble.tap(); usleep(900_000); snap("12-assistant-chat")
+        XCTAssertTrue(app.buttons["Dictate"].firstMatch.waitForExistence(timeout: 4), "dictation mic missing")
+        XCTAssertTrue(app.buttons["Read replies aloud"].firstMatch.exists, "read-aloud toggle missing")
+        // Feedback surface still reachable via the toggle.
+        let feedback = app.buttons["Feedback"].firstMatch
+        if feedback.waitForExistence(timeout: 3) { feedback.tap(); usleep(600_000); snap("13-feedback") }
+    }
+
+    /// The new Settings depth: the hub links into the Focus + Account sub-screens.
+    func testSettingsSubScreens() throws {
+        _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
+        usleep(600_000)
+        let avatar = app.buttons["U"].firstMatch
+        guard avatar.waitForExistence(timeout: 4) else { return }
+        avatar.tap(); usleep(800_000)
+        if app.staticTexts["Focus"].firstMatch.waitForExistence(timeout: 3) {
+            app.staticTexts["Focus"].firstMatch.tap(); usleep(700_000); snap("14-settings-focus")
+            if app.navigationBars.buttons.firstMatch.exists { app.navigationBars.buttons.firstMatch.tap(); usleep(500_000) }
+        }
+        if app.staticTexts["Account"].firstMatch.waitForExistence(timeout: 3) {
+            app.staticTexts["Account"].firstMatch.tap(); usleep(700_000); snap("15-settings-account")
+        }
+    }
+
     func testSettingsAndInsights() throws {
         _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
         usleep(600_000)
