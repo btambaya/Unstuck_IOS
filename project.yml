@@ -38,6 +38,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.unstucknow.app
         PRODUCT_NAME: Unstuck
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         INFOPLIST_FILE: App/Info.plist
         GENERATE_INFOPLIST_FILE: "NO"
         CODE_SIGN_ENTITLEMENTS: App/Unstuck.entitlements
