@@ -62,7 +62,7 @@ final class VoiceController: @unchecked Sendable {
         req.shouldReportPartialResults = true
         // Keep audio on-device when the model supports it (privacy + $0).
         if recognizer.supportsOnDeviceRecognition { req.requiresOnDeviceRecognition = true }
-        request = req
+        lock.lock(); request = req; lock.unlock()   // guarded — stopListening() reads under lock
 
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
@@ -72,7 +72,7 @@ final class VoiceController: @unchecked Sendable {
         engine.prepare()
         do { try engine.start() } catch { stopListening(); onDone(); return }
 
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+        let recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             if let result {
                 let text = result.bestTranscription.formattedString
                 if result.isFinal {
@@ -86,6 +86,7 @@ final class VoiceController: @unchecked Sendable {
                 self?.stopListening(); onDone()
             }
         }
+        lock.lock(); task = recognitionTask; lock.unlock()   // guarded
     }
 
     func stopListening() {

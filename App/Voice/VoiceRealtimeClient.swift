@@ -42,7 +42,7 @@ enum VoiceState: Sendable { case connecting, listening, speaking, error, closed 
 /// `@unchecked Sendable`: the socket (URLSessionWebSocketTask) is thread-safe to
 /// send on from any thread, and the few mutable flags are guarded by `lock`.
 /// Mirrors the Android client's `@Volatile` flags + single OkHttp socket.
-final class VoiceRealtimeClient: @unchecked Sendable {
+final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
     private let proxyURL: String          // wss://…workers.dev (token added as a header)
     private let token: String             // Supabase access token (the Worker validates it)
     private let model: String
@@ -56,11 +56,15 @@ final class VoiceRealtimeClient: @unchecked Sendable {
     private let onCaption: @Sendable (_ role: String, _ text: String, _ done: Bool) -> Void
     private let onError: @Sendable (String) -> Void
 
-    private let session: URLSession = {
+    // A per-session URLSession with `self` as the WebSocket delegate (so onOpen
+    // fires only AFTER the handshake). It RETAINS the delegate until
+    // invalidateAndCancel() in stop(), which also releases the session's queue —
+    // without that, each ended call leaks the session + its operation queue.
+    private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
         cfg.timeoutIntervalForRequest = 0   // long-lived socket
         cfg.waitsForConnectivity = true
-        return URLSession(configuration: cfg)
+        return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }()
     private var task: URLSessionWebSocketTask?
 
@@ -70,6 +74,9 @@ final class VoiceRealtimeClient: @unchecked Sendable {
     // After a manual interrupt we drop still-in-flight audio from the cancelled
     // response until the next turn begins (user speaks / a new response starts).
     private var _muted = false
+    // Guards against double error-reporting from the receive loop AND the
+    // didCompleteWithError delegate for the same failed connection.
+    private var _reportedError = false
     private func get(_ kp: () -> Bool) -> Bool { lock.lock(); defer { lock.unlock() }; return kp() }
 
     init(proxyURL: String, token: String, model: String, instructions: String,
@@ -88,6 +95,7 @@ final class VoiceRealtimeClient: @unchecked Sendable {
         self.onState = onState
         self.onCaption = onCaption
         self.onError = onError
+        super.init()
     }
 
     // MARK: lifecycle
@@ -104,8 +112,30 @@ final class VoiceRealtimeClient: @unchecked Sendable {
         let t = session.webSocketTask(with: req)
         task = t
         t.resume()
+        // onOpen() runs in the delegate's didOpenWithProtocol — only after the
+        // handshake succeeds — so the mic/playback/"Listening" don't spin up on an
+        // unreachable proxy or a rejected token. receiveLoop starts there too.
+    }
+
+    // URLSessionWebSocketDelegate: the socket finished its upgrade handshake.
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol protocol: String?) {
         onOpen()
         receiveLoop()
+    }
+
+    // The connection ended/failed (incl. a pre-handshake failure — unreachable
+    // proxy, rejected token — where didOpen never fires and receiveLoop never
+    // started). Ignore the invalidation we trigger ourselves on stop().
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
+        lock.lock()
+        if _stopped || _reportedError { lock.unlock(); return }   // our own invalidate / already reported
+        _open = false; _reportedError = true
+        lock.unlock()
+        guard let error else { return }                           // clean close, no error → no-op
+        audio.shutdown()
+        onError(String((error.localizedDescription).prefix(160)))
+        onState(.error)
     }
 
     func stop() {
@@ -116,6 +146,7 @@ final class VoiceRealtimeClient: @unchecked Sendable {
         task = nil
         lock.unlock()
         socket?.cancel(with: .goingAway, reason: nil)
+        session.invalidateAndCancel()   // release the session + its op queue + the delegate retain
         audio.shutdown()
         onState(.closed)
     }
@@ -150,8 +181,10 @@ final class VoiceRealtimeClient: @unchecked Sendable {
             guard let self else { return }
             switch result {
             case .failure(let err):
-                guard self.get({ self._open }) else { return }   // expected on stop()
-                self.lock.lock(); self._open = false; self.lock.unlock()
+                self.lock.lock()
+                guard self._open, !self._reportedError else { self.lock.unlock(); return }   // stop() / already reported
+                self._open = false; self._reportedError = true
+                self.lock.unlock()
                 self.audio.shutdown()
                 self.onError(String(err.localizedDescription.prefix(160)))
                 self.onState(.error)

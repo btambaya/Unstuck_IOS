@@ -144,7 +144,7 @@ struct InboxView: View {
             // tag dot + tag label + age + optional "from <task>"
             HStack(spacing: 8) {
                 Circle().fill(tagColor(cap.tag)).frame(width: 7, height: 7)
-                Text(cap.tag.rawValue).font(UFont.mono(10, .bold)).foregroundStyle(tagColor(cap.tag))
+                Text(cap.tag.rawValue.uppercased()).font(UFont.mono(10, .bold)).foregroundStyle(tagColor(cap.tag))
                 Text(rel).font(UFont.mono(10)).foregroundStyle(theme.palette.ink3)
                 if let sourceTaskName {
                     Text("· from \(sourceTaskName)").font(UFont.sans(11))

@@ -57,7 +57,7 @@ final class TodayModel {
     }
 
     private func writeWidgetSnapshot() {
-        let next = startNext
+        let next = startNext(liveTaskId: nil, area: nil)
         let openCount = all.filter { !$0.done && !($0.later ?? false) }.count
         AppGroup.writeStartNext(StartNextSnapshot(
             taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
@@ -65,13 +65,28 @@ final class TodayModel {
         WidgetCenter.shared.reloadAllTimelines()
     }
 
-    var startNext: TaskItem? { pickStartNext(tasks: all, blocks: [], liveTaskId: nil) }
-    var upNext: [TaskItem] { pickUpNext(tasks: all, blocks: [], liveTaskId: nil, startNextId: startNext?.id) }
+    /// The Start-Next suggestion. Excludes the live-focused task + honours the
+    /// area filter (1:1 with Android TodayScreen.kt:126).
+    func startNext(liveTaskId: String?, area: String?) -> TaskItem? {
+        pickStartNext(tasks: all, blocks: blocks, liveTaskId: liveTaskId, areaFilter: area)
+    }
 
-    func rows(backlog: Bool, area: String?) -> [TaskItem] {
+    func rows(backlog: Bool, area: String?, startNextId: String?, liveTaskId: String?) -> [TaskItem] {
         let now = Date().timeIntervalSince1970 * 1000
-        return visibleTasks(view: backlog ? .backlog : .today, tasks: all, blocks: blocks,
-                            now: now, activeArea: backlog ? nil : area, slipMode: false)
+        if backlog {
+            return visibleTasks(view: .backlog, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
+                .filter { $0.id != startNextId && $0.id != liveTaskId }
+        }
+        // Today: open rows (area-agnostic bucket) PLUS today's completions kept as
+        // struck-through wins (sorted last) until tomorrow, then area-filtered and
+        // with the hero/live task subtracted — 1:1 with Android TodayScreen.kt:127-136.
+        let open = visibleTasks(view: .today, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
+        let today = Clock.todayISO()
+        let doneToday = (all.filter { !isTemplate($0) } + projectOccurrences(all, blocks, fromISO: today))
+            .filter { t in isCompletedToday(t, now: now) && !open.contains { $0.id == t.id } }
+        return (open + doneToday).filter {
+            (area == nil || $0.lifeArea == area) && $0.id != startNextId && $0.id != liveTaskId
+        }
     }
 
     /// Minutes focused in the last 7 days (the header pill).
@@ -191,7 +206,7 @@ struct TodayView: View {
 
     @ViewBuilder
     private func heroOrEmpty(_ vm: TodayModel) -> some View {
-        if let t = vm.startNext {
+        if let t = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter) {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     Image(systemName: "bolt.fill").font(.system(size: 11)).foregroundStyle(theme.palette.primaryDeep)
@@ -279,7 +294,9 @@ struct TodayView: View {
 
     @ViewBuilder
     private func list(_ vm: TodayModel) -> some View {
-        let rows = vm.rows(backlog: backlogActive, area: areaFilter)
+        let live = model.liveTaskId
+        let startNextId = vm.startNext(liveTaskId: live, area: areaFilter)?.id
+        let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: live)
         if rows.isEmpty {
             Text(backlogActive ? "Backlog's clear — nothing waiting."
                  : (areaFilter != nil ? "Nothing in \(areaFilter!) right now." : "Nothing scheduled. Tap + to add."))

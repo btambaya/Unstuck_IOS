@@ -231,15 +231,10 @@ final class AssistantModel {
         switch name {
         case "create_task":
             guard let nm = str("name") else { return "error: name required" }
-            // addTask's signature lacks lifeArea/firstPhysicalAction/later/dueAt
-            // — set them after on the returned task + saveTask, like promoteCapture.
-            var t = model.addTask(name: nm, estimateMin: int("estimateMin") ?? 25, tags: strList("tags"))
-            t.lifeArea = str("lifeArea") ?? t.lifeArea
-            t.firstPhysicalAction = str("firstPhysicalAction") ?? t.firstPhysicalAction
-            t.dueAt = str("dueAt") ?? t.dueAt
-            t.later = bool("later") ?? t.later
-            t.updatedAt = AppModel.isoNow()
-            model.saveTask(t)
+            // One write via the wide addTask — no mutate-then-resave race.
+            let t = model.addTask(name: nm, estimateMin: int("estimateMin") ?? 25, tags: strList("tags"),
+                                  lifeArea: str("lifeArea"), firstPhysicalAction: str("firstPhysicalAction"),
+                                  later: bool("later"), dueAt: str("dueAt"))
             newTasks[t.id] = t
             return "ok: created task id=\(t.id) name=\"\(t.name)\""
 

@@ -112,7 +112,8 @@ struct CalendarView: View {
         .sheet(isPresented: $showBlock) { BlockTimeSheet() }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
-        .feedbackBubble()
+        // No bubble on Calendar (Android gates it off `tab == "calendar"`): it
+        // sits bottom-trailing over the drag-to-schedule gesture area.
         .task {
             guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }
             let m = CalendarModel(taskRepo, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))

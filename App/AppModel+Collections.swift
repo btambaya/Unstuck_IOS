@@ -68,17 +68,10 @@ extension AppModel {
         guard let auth = coordinator?.auth else { return .error("Not signed in.") }
         let outcome = await auth.deleteAccount()
         if case .ok = outcome {
-            // The server wipe + signOut already happened; clear device-local
-            // state the same way signOut does so nothing leaks to the next user.
-            NotificationLog.shared.clear()
-            NotificationPrefs.clearUserContent()
-            PausedCheckinScheduler.cancel()
-            archivedCaptureIds = []
-            // Scrub the assistant chat — same cross-account leak class. Clear the
-            // live model if opened; always wipe the persisted store.
-            _assistant?.clear()
-            AssistantModel.scrubPersisted()
-            Task { await ReminderScheduler.shared.cancelAll() }
+            // The server wipe + signOut already happened (the latter also fires
+            // the reactive scrub in observeAuth); scrub device-local content +
+            // wipe the local DB here too in case that event is delayed.
+            scrubDeviceLocalUserContent()
             try? db?.clearAll()
         }
         return outcome
@@ -241,11 +234,19 @@ extension AppModel {
 
     @discardableResult
     func addTask(name: String, estimateMin: Int = 25, tags: [String]? = nil,
+                 lifeArea: String? = nil, firstPhysicalAction: String? = nil, later: Bool? = nil,
                  sourceCollectionId: String? = nil, sourceItemId: String? = nil, dueAt: String? = nil) -> TaskItem {
         let now = Self.isoNow()
-        let t = TaskItem(id: newUUID(), name: name, estimateMin: estimateMin, tags: tags,
+        // Build the COMPLETE task in one write — mirrors Android's wide addTask.
+        // The old mutate-then-resave idiom (set lifeArea / firstPhysicalAction
+        // after) issued a second saveTask whose unordered Task could clobber the
+        // first, and flashed a half-populated row to observers.
+        var t = TaskItem(id: newUUID(), name: name, estimateMin: estimateMin, tags: tags,
                          createdAt: now, updatedAt: now,
                          sourceCollectionId: sourceCollectionId, sourceItemId: sourceItemId, dueAt: dueAt)
+        t.lifeArea = lifeArea
+        t.firstPhysicalAction = firstPhysicalAction
+        t.later = later
         saveTask(t)
         return t
     }

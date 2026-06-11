@@ -60,14 +60,10 @@ extension AppModel {
     /// calling this (Android parity), so promote itself does not archive.
     @discardableResult
     func promoteCapture(_ capture: Capture) -> TaskItem {
-        let task = addTask(name: capture.body, estimateMin: 25, tags: ["from-capture", capture.tag.rawValue])
-        // The task model carries lifeArea separately from addTask's signature; set
-        // it to "Work" to match Android's promoteCapture (lifeArea = "Work").
-        var seeded = task
-        seeded.lifeArea = "Work"
-        seeded.updatedAt = Self.isoNow()
-        saveTask(seeded)
-        return seeded
+        // One write (estimate 25, lifeArea "Work", tags [from-capture, <tag>]) —
+        // 1:1 with Android's promoteCapture; no mutate-then-resave double upsert.
+        addTask(name: capture.body, estimateMin: 25, tags: ["from-capture", capture.tag.rawValue],
+                lifeArea: "Work")
     }
 
     /// Discard a capture for good ("Discard"): delete the row + drop any

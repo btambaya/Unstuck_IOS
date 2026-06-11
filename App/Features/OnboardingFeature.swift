@@ -15,7 +15,9 @@ struct OnboardingView: View {
     private static let steps = 5
 
     @State private var step = 0
-    @State private var areas: Set<String> = ["Work", "Personal", "Home"]
+    // Ordered (not a Set) so the FIRST picked area can file the onboarding first
+    // task + seed colors in pick order, matching Android's pickedAreas list.
+    @State private var areas: [String] = ["Work", "Personal", "Home"]
     @State private var struggles: Set<String> = []
     @State private var firstTask = ""
     @State private var firstAction = ""
@@ -73,7 +75,7 @@ struct OnboardingView: View {
 
     private func finish() {
         model.completeOnboarding(
-            struggles: Array(struggles), areas: Array(areas),
+            struggles: Array(struggles), areas: areas,
             firstTask: firstTask, firstAction: firstAction, treatment: treatment)
     }
 
@@ -91,7 +93,9 @@ struct OnboardingView: View {
             }
         case 1:
             stepHeader("What parts of life share your attention?", "Pick a few. You can change these any time.")
-            wrap(areaOptions, selected: areas) { toggle($0, in: &areas) }
+            wrap(areaOptions, selected: Set(areas)) { v in
+                if let i = areas.firstIndex(of: v) { areas.remove(at: i) } else { areas.append(v) }
+            }
         case 2:
             stepHeader("What gets you stuck?", "Pick what rings true. It helps us meet you where you are.")
             wrap(struggleOptions, selected: struggles) { toggle($0, in: &struggles) }

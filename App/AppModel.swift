@@ -101,16 +101,15 @@ final class AppModel {
             }
         }
 
-        // Create the first task (with an optional first physical action).
+        // Create the first task in ONE write (no mutate-then-resave race):
+        // filed under the first picked area, estimate 15 ("Small is good"),
+        // with its first physical action — 1:1 with Android.
         let taskName = firstTask.trimmingCharacters(in: .whitespacesAndNewlines)
         if !taskName.isEmpty {
-            var t = addTask(name: taskName, estimateMin: settings.focusDefaultMin)
             let action = firstAction.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !action.isEmpty {
-                t.firstPhysicalAction = action
-                t.updatedAt = Self.isoNow()
-                saveTask(t)
-            }
+            addTask(name: taskName, estimateMin: 15,
+                    lifeArea: areas.first,
+                    firstPhysicalAction: action.isEmpty ? nil : action)
         }
 
         // Adopt the chosen default focus treatment.
@@ -282,6 +281,10 @@ final class AppModel {
                 let isAuthed = session != nil
                 await MainActor.run {
                     guard let self else { return }
+                    // Any session→nil transition (button OR server revocation /
+                    // refresh failure) scrubs device-local personal content so the
+                    // next account on this device starts clean. Idempotent.
+                    if self.signedIn && !isAuthed { self.scrubDeviceLocalUserContent() }
                     self.signedIn = isAuthed
                     // PKCE: classify the just-exchanged session via `amr` once.
                     var isRecovery = isRecoveryEvent
@@ -348,6 +351,13 @@ final class AppModel {
         routeDeepLink(url.absoluteString)
     }
 
+    /// The task id of the active live focus session (nil when idle). Today uses
+    /// it to exclude the in-progress task from the Start-Next suggestion + list.
+    var liveTaskId: String? {
+        guard let live = (try? liveStore?.get()) ?? nil, live.sessionStart != nil else { return nil }
+        return live.taskId
+    }
+
     /// The optimistic write API (local GRDB + server outbox), for features.
     /// Drives the UI instantly via each repository's ValueObservation. Falls
     /// back to the local-only writer in the XCUITest demo boot.
@@ -363,19 +373,28 @@ final class AppModel {
     func signOut() {
         guard let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
-        NotificationLog.shared.clear()
-        NotificationPrefs.clearUserContent()
-        PausedCheckinScheduler.cancel()
-        archivedCaptureIds = []   // device-local Inbox archive set — don't leak to the next account
-        // Assistant chat/brain-dump — same cross-account leak class as the
-        // notification log. Clear the live model if it was opened; always wipe
-        // the persisted store (so an un-opened agent still scrubs cleanly).
-        _assistant?.clear()
-        AssistantModel.scrubPersisted()
+        scrubDeviceLocalUserContent()
         Task {
             await ReminderScheduler.shared.cancelAll()
             await coord.signOutAndUnregister(deviceId: deviceId)
         }
+    }
+
+    /// Wipe device-local personal content (notification log + per-task reminder
+    /// overrides, the pending paused check-in, the Inbox archive set, the
+    /// assistant chat) so the next account on this device starts clean and never
+    /// sees the prior user's content. Idempotent — runs from the Sign-out button
+    /// (immediate) AND reactively in observeAuth on ANY session→nil transition
+    /// (server revocation, refresh failure, password-change-elsewhere), since
+    /// those never route through the button.
+    func scrubDeviceLocalUserContent() {
+        NotificationLog.shared.clear()
+        NotificationPrefs.clearUserContent()
+        PausedCheckinScheduler.cancel()
+        archivedCaptureIds = []
+        _assistant?.clear()
+        AssistantModel.scrubPersisted()
+        Task { await ReminderScheduler.shared.cancelAll() }
     }
 
     func saveTask(_ task: TaskItem) {

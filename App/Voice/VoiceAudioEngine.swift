@@ -153,8 +153,11 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
 
     func flushPlayback() {
         guard started else { return }
+        // Barge-in: drop only PLAYBACK. `pending` is the CAPTURE accumulator —
+        // clearing it here would discard ~100ms of the user's just-spoken audio
+        // that triggered the barge-in (Android's flushPlayback touches only
+        // playback). Capture state is cleared on teardown, not here.
         player.stop()                 // drops scheduled buffers
-        lock.lock(); pending.removeAll(keepingCapacity: true); lock.unlock()
         player.play()                 // ready for the next response
     }
 
