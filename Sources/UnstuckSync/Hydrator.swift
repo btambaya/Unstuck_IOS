@@ -13,11 +13,39 @@ public actor Hydrator {
     private let gateway: SyncGateway
     private let db: AppDatabase
     private let box: OutboxStore
+    private let decoder = JSONDecoder()
 
     public init(gateway: SyncGateway, db: AppDatabase) {
         self.gateway = gateway
         self.db = db
         self.box = OutboxStore(db)
+    }
+
+    /// Drop queued `tasks` upsert ops the server already supersedes (its row is
+    /// STRICTLY newer by updatedAt). Run BEFORE the flush: without it, a stale
+    /// local op — e.g. an old `done=false` edit still sitting in the outbox —
+    /// re-pushes and clobbers a newer server change (a completion made on the
+    /// WEB), which the following hydrate then faithfully pulls back as not-done.
+    /// This is the load-bearing fix for "completed on web, didn't reflect on the
+    /// phone". Only reads the server when task ops are actually queued, so it's
+    /// free in the common empty-outbox case. (Genuine offline edits — whose op is
+    /// newer than the server — survive and flush normally.)
+    public func pruneStaleTaskOps() async {
+        let ops = (try? box.pending()) ?? []
+        let taskOps = ops.filter { $0.tableName == "tasks" && $0.kind == .upsert }
+        guard !taskOps.isEmpty else { return }
+        guard let serverRows = try? await gateway.fetchAll(TaskRow.self, table: "tasks") else { return }
+        var serverUpdatedAt: [String: String] = [:]
+        for r in serverRows { serverUpdatedAt[r.id] = r.updatedAt }
+        for op in taskOps {
+            guard let seq = op.opSeq, let data = op.payload?.data(using: .utf8),
+                  let row = try? decoder.decode(TaskRow.self, from: data),
+                  let serverTime = serverUpdatedAt[op.rowId] else { continue }
+            if serverTime > row.updatedAt {
+                print("[outbox] pruning stale tasks op \(op.rowId) — server is newer")
+                try? box.markDone(seq)
+            }
+        }
     }
 
     public func hydrate(userId: String) async {

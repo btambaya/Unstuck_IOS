@@ -65,10 +65,18 @@ final class TodayModel {
         WidgetCenter.shared.reloadAllTimelines()
     }
 
-    /// The Start-Next suggestion. Excludes the live-focused task + honours the
-    /// area filter (1:1 with Android TodayScreen.kt:126).
+    /// The Start-Next hero — scoped to TODAY (next-scheduled by time → else
+    /// shortest-estimate → else nil so the hero points to the Backlog instead of
+    /// pulling a backlog task). Excludes the live-focused task + honours the area.
     func startNext(liveTaskId: String?, area: String?) -> TaskItem? {
-        pickStartNext(tasks: all, blocks: blocks, liveTaskId: liveTaskId, areaFilter: area)
+        pickTodayHero(tasks: all, blocks: blocks, now: Date().timeIntervalSince1970 * 1000,
+                      liveTaskId: liveTaskId, areaFilter: area)
+    }
+
+    /// How many tasks sit in the Backlog (for the empty-hero pointer).
+    var backlogCount: Int {
+        visibleTasks(view: .backlog, tasks: all, blocks: blocks,
+                     now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false).count
     }
 
     func rows(backlog: Bool, area: String?, startNextId: String?, liveTaskId: String?) -> [TaskItem] {
@@ -233,6 +241,26 @@ struct TodayView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
                         in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+        } else if vm.backlogCount > 0 {
+            // Nothing scheduled today — point to the Backlog (don't pull a backlog
+            // task into the hero). Tapping flips the list below to the Backlog.
+            Button { backlogActive = true } label: {
+                VStack(alignment: .leading, spacing: 6) {
+                    SectionLabel("Nothing scheduled today").foregroundStyle(theme.palette.primaryDeep)
+                    Text("Pick something to start.")
+                        .font(UFont.sans(21, .bold)).foregroundStyle(theme.palette.ink)
+                    HStack(spacing: 6) {
+                        Text("\(vm.backlogCount) in your backlog")
+                            .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                        Image(systemName: "arrow.right").font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(theme.palette.primaryDeep)
+                    }.padding(.top, 4)
+                }
+                .padding(18)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            }.buttonStyle(.plain)
         } else {
             VStack(spacing: 8) {
                 Text("All clear.").font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)

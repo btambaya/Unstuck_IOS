@@ -83,6 +83,10 @@ public actor SyncCoordinator {
     public func syncNow() async {
         guard let uid = auth.currentUserId else { return }
         let auth = self.auth
+        // Drop stale local task ops the server already superseded BEFORE flushing,
+        // so a queued done=false can't clobber a completion made on another
+        // platform (which the hydrate would then pull back). Then push + pull.
+        await hydrator.pruneStaleTaskOps()
         await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
         await hydrator.hydrate(userId: uid)
         await pullCalendar()   // ingest Google events if connected (best-effort)
@@ -182,11 +186,12 @@ public actor SyncCoordinator {
                 try? db.clearAll()
             }
             UserDefaults.standard.set(uid, forKey: prevUserKey)
-            // Push offline edits first so local changes reach the server,
-            // then pull server-canonical, then mirror live. Guard the drain
-            // on the LIVE user id so a sign-out + switch mid-flush doesn't
-            // keep stamping queued ops with the prior user.
+            // Prune stale task ops (server already newer) so they can't clobber
+            // another platform's change, then push offline edits, pull
+            // server-canonical, and mirror live. Guard the drain on the LIVE user
+            // id so a sign-out + switch mid-flush doesn't stamp ops with the prior user.
             let auth = self.auth
+            await hydrator.pruneStaleTaskOps()
             await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
             await hydrator.hydrate(userId: uid)
             let hydrator = self.hydrator

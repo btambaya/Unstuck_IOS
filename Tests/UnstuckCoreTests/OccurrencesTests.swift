@@ -71,4 +71,46 @@ final class OccurrencesTests: XCTestCase {
         XCTAssertTrue(today.contains { $0.id == "b1" })
         XCTAssertFalse(today.contains { $0.id == "t1" })
     }
+
+    // Recurring occurrences must NOT flood All (a Friday task once per horizon).
+    func testRecurringAbsentFromAll() {
+        let tpl = template()   // daily
+        let blocks = [block("b0", todayPlus(0)), block("b1", todayPlus(1)), block("b2", todayPlus(2))]
+        let all = visibleTasks(view: .all, tasks: [tpl], blocks: blocks, now: NOW, activeArea: nil, slipMode: false)
+        XCTAssertTrue(all.isEmpty, "neither the template nor its occurrences belong in All")
+        // A normal task still appears in All alongside the recurring series.
+        let normal = mkTask(id: "n1", createdAt: "2026-05-21T10:00:00.000Z")
+        let all2 = visibleTasks(view: .all, tasks: [tpl, normal], blocks: blocks, now: NOW, activeArea: nil, slipMode: false)
+        XCTAssertEqual(all2.map(\.id), ["n1"])
+    }
+
+    // Upcoming shows only the SINGLE next occurrence per series, not the horizon.
+    func testUpcomingShowsOnlyNextOccurrence() {
+        let tpl = template()
+        let blocks = [block("b1", todayPlus(1)), block("b2", todayPlus(2)), block("b3", todayPlus(3))]
+        let up = visibleTasks(view: .upcoming, tasks: [tpl], blocks: blocks, now: NOW, activeArea: nil, slipMode: false)
+        XCTAssertEqual(up.map(\.id), ["b1"])
+    }
+
+    // MARK: pickTodayHero (today-scoped, never backlog)
+
+    func testHeroPrefersScheduledOverShorterUnscheduled() {
+        let sched = mkTask(id: "sched", estimateMin: 25)   // scheduled today (longer)
+        let quick = mkTask(id: "quick", estimateMin: 5)    // created today, unscheduled (shorter)
+        let blocks = [mkBlock(id: "bs", taskId: "sched", startTime: "16:00", date: todayPlus(0))]
+        let hero = pickTodayHero(tasks: [sched, quick], blocks: blocks, now: NOW)
+        XCTAssertEqual(hero?.id, "sched", "a scheduled-today task wins over a shorter unscheduled one")
+    }
+
+    func testHeroShortestWhenNoneScheduled() {
+        let a = mkTask(id: "a", estimateMin: 25)
+        let b = mkTask(id: "b", estimateMin: 10)
+        let hero = pickTodayHero(tasks: [a, b], blocks: [], now: NOW)
+        XCTAssertEqual(hero?.id, "b", "lowest-friction (shortest estimate) when nothing is scheduled today")
+    }
+
+    func testHeroNilWhenNoTodayTasks() {
+        let old = mkTask(id: "old", createdAt: "2026-04-01T10:00:00.000Z")   // backlog, not today
+        XCTAssertNil(pickTodayHero(tasks: [old], blocks: [], now: NOW), "the hero never pulls from the backlog")
+    }
 }
