@@ -12,6 +12,35 @@ doc and the old discarded iOS app disagree, follow Android."* The web
 repo (`../unstuck`) is only the backend home (migrations + Edge
 Functions) and the historical port source for `UnstuckCore` logic names.
 
+## Where things stand (2026-06-11) — parity bug-sweep + fixes
+
+A 31-agent adversarial review of the whole 2026-06-10 parity build (9 area
+reviewers diffing each fresh surface against Android, every finding re-verified
+by a second agent) found **20 real bugs** — report in
+`audit/parity-bug-sweep-2026-06-11.md`. **All 19 distinct issues are now fixed**
+(2 commits; 258 unit tests + the assistant/settings XCUITests green):
+
+- **Critical:** PKCE forgot-password was fully broken (the SDK emits `.signedIn`,
+  not `.passwordRecovery`, and the callback has no `type=recovery`) — ported
+  Android's one-shot JWT `amr`-probe (`AppModel.isRecoverySession`) so the reset
+  link routes to SetNewPasswordView. *(The earlier handover note claiming the
+  `.passwordRecovery` event was reliable was wrong — corrected.)*
+- **Highs:** OutboxFlusher had no drain serialization (actor reentrancy) + miscounted
+  cancelled drains as failures (poison-dropping valid offline writes) — now chains
+  drains + re-throws on cancellation; `scheduleTaskAt` could drop a just-scheduled
+  recurring task (coversChosen ignored `plan.toDelete`); Inbox/notification "Open"
+  silently no-op'd (two sheets from one host) — deferred via `router.pendingDeepLink`
+  flushed on the host's `onDismiss`; STT `engine.start()` failure leaked the tap →
+  crash on next dictation.
+- **Mediums/lows:** Today completed-wins + Start-Next dedup/live/area; widened
+  `addTask` (kills four mutate-then-resave double-writes); reactive sign-out scrub
+  (cross-account leak); voice — handshake-gated `onOpen` via URLSessionWebSocketDelegate,
+  session `invalidateAndCancel` on stop, `flushPlayback` no longer drops barge-in mic
+  audio, VoiceController off-lock; no bubble on Calendar; uppercase capture tag.
+
+The voice realtime stack still needs ON-DEVICE audio validation + the real
+VOICE_PROXY_URL in Secrets.xcconfig (the sim can't exercise it).
+
 ## Where things stand (2026-06-10) — Android-parity build-out
 
 A focused pass closing the big parity gaps the 14-agent iOS↔Android audit
