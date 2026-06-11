@@ -314,9 +314,18 @@ struct TodayView: View {
         let isOccurrence = model.occurrenceBlockForId(t.id) != nil
         return Button { model.toggleDone(t) } label: {
             HStack(spacing: 12) {
+                // Completed-today rows stay visible as wins — a green check +
+                // struck-through/greyed name distinguishes them from open work
+                // (mirrors Android TodayScreen + the Tasks list).
+                if t.done {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 16)).foregroundStyle(theme.palette.greenInk)
+                }
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 5) {
-                        Text(t.name).font(UFont.sans(16, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
+                        Text(t.name).font(UFont.sans(16, .medium))
+                            .strikethrough(t.done)
+                            .foregroundStyle(t.done ? theme.palette.ink3 : theme.palette.ink).lineLimit(1)
                         if isOccurrence { Text("↻").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3) }
                     }
                     HStack(spacing: 6) {
