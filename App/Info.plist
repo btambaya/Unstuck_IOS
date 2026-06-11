@@ -35,6 +35,9 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<!-- Only standard HTTPS/TLS — exempt; skips the TestFlight compliance prompt. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSSupportsLiveActivities</key>
