@@ -1,15 +1,18 @@
-# Building Unstuck for TestFlight (handoff)
+# Building Unstuck for TestFlight
 
-Quick steps for the person doing the App Store Connect / TestFlight upload from
-their own Mac + Apple Developer account (account holder of team that owns the
-`tech.csalliance.unstuck` app record — App "Unstuck Now", Apple ID 6777491816).
+Steps for the App Store Connect / TestFlight upload under Ahmad's own Apple
+Developer team (`M9ULD6M5Z3`, active since 2026-06-11 — the earlier friend's-team
+handoff plan is obsolete). The app record for `io.unstucknow.app` must exist in
+App Store Connect before upload (Apps → "+" → New App). Note: the app *name*
+"Unstuck Now" may still be claimed by the abandoned record on the friend's team
+(Apple ID 6777491816) — have him delete that record, or pick a different name.
 
 > **Automated alternative (no manual Xcode steps):** if you can get an **App Store
 > Connect API key** for the team (App Store Connect → Users and Access → Integrations
 > → Keys → generate a key with App Manager role → download the `.p8`, note the **Key ID**
 > + **Issuer ID**), the upload can be scripted instead — `xcodebuild archive` +
 > `-exportArchive -exportOptionsPlist ExportOptions.plist` (already set to team
-> `D57M85TRUC`, `method app-store-connect`) + `xcrun altool --upload-app` /
+> `M9ULD6M5Z3`, `method app-store-connect`) + `xcrun altool --upload-app` /
 > `notarytool`-style auth with the key. Put the `.p8` in `~/.appstoreconnect/private_keys/`.
 > This is the preferred path for repeat uploads; the manual steps below are the
 > one-time fallback.
@@ -46,10 +49,10 @@ In Xcode, select the **Unstuck** project → for the **Unstuck** target AND the
 - ✅ Automatically manage signing
 - **Team** → your team
 - If a **Fix Issue** appears, click it (registers the bundle IDs +
-  `group.tech.csalliance.unstuck` App Group on your team — needs Admin/Account
+  `group.io.unstucknow.app` App Group on your team — needs Admin/Account
   Holder, which you are).
 
-Bundle IDs: app `tech.csalliance.unstuck`, widget `tech.csalliance.unstuck.widgets`.
+Bundle IDs: app `io.unstucknow.app`, widget `io.unstucknow.app.widgets`.
 
 ## 5. Archive + upload
 - Top bar destination → **Any iOS Device (arm64)**.
@@ -60,7 +63,7 @@ Bundle IDs: app `tech.csalliance.unstuck`, widget `tech.csalliance.unstuck.widge
   of processing; then add internal testers.
 
 ## Notes
-- Verified green: `swift test` 217/0; app + widget build + launch on the simulator.
+- Verified green: `swift test` 263/0; app + widget build + launch on the simulator.
 - Push notifications (APNs) are intentionally NOT enabled in this first build —
   no `aps-environment` entitlement — so it uploads without APNs setup. Re-add
   `aps-environment = production` once an APNs key is configured.

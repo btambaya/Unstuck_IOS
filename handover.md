@@ -39,8 +39,8 @@ but uploading needs one of: (a) an **App Store Connect API key from the team** (
 + Key ID + Issuer ID — App Store Connect → Users and Access → Integrations → Keys) so
 `xcodebuild archive`/`-exportArchive` + upload can run non-interactively (there is no
 `.p8` in `~/.appstoreconnect/private_keys/` and no `fastlane` set up); or (b) a **one-time
-manual Xcode upload** (sign into team `D57M85TRUC`, Product → Archive → Distribute →
-TestFlight — see `HANDOFF-TESTFLIGHT.md`). The app record for `tech.csalliance.unstuck`
+manual Xcode upload** (sign into team `M9ULD6M5Z3`, Product → Archive → Distribute →
+TestFlight — see `HANDOFF-TESTFLIGHT.md`). The app record for `io.unstucknow.app`
 must already exist in that team's App Store Connect. User asked (2026-06-11) for iOS on
 TestFlight for themselves + Sven; pending this. Voice realtime still needs on-device audio
 validation + the real `VOICE_PROXY_URL` in `App/Secrets.xcconfig`.
@@ -191,7 +191,7 @@ are now fixed in this pass:
 - **Sync triggers beyond auth events (spec §5):** debounced post-write
   flush kick (1.5 s after every `WriteThrough` enqueue), `syncNow()`
   (flush → hydrate → calendar pull) on scenePhase `.active`, and a
-  chained `BGAppRefreshTask` (`tech.csalliance.unstuck.refresh`, 30-min
+  chained `BGAppRefreshTask` (`io.unstucknow.app.refresh`, 30-min
   best-effort, Info.plist `UIBackgroundModes: fetch`) that also rebuilds
   the Start-Next widget snapshot. Offline edits no longer wait for an
   app relaunch.
@@ -387,10 +387,10 @@ needs APNs secrets); send-morning-brief needs APNs secrets + CRON_SECRET + cron.
 
 ## Manual steps (need your credentials)
 1. ✅ Functions deployed (done by the agent).
-2. Set secrets so the push side fires: `supabase secrets set APNS_AUTH_KEY=… APNS_KEY_ID=… APNS_TEAM_ID=… APNS_BUNDLE_ID=tech.csalliance.unstuck CRON_SECRET=…` (needs your Apple p8 key).
+2. Set secrets so the push side fires: `supabase secrets set APNS_AUTH_KEY=… APNS_KEY_ID=… APNS_TEAM_ID=… APNS_BUNDLE_ID=io.unstucknow.app CRON_SECRET=…` (needs your Apple p8 key).
 3. Put the Supabase anon key in `App/Secrets.xcconfig` (else the app shows the setup screen).
 4. Target capabilities (signing): Push, Time-Sensitive, App Groups
-   `group.tech.csalliance.unstuck`, Live Activities.
+   `group.io.unstucknow.app`, Live Activities.
 5. Enable pg_cron + pg_net, set the cron config, then run `supabase/manual/notification_cron.sql`.
 6. Register an HTTPS Universal-Link redirect on the existing web Google OAuth
    client + ship the AASA for the calendar connect flow.
@@ -402,7 +402,7 @@ needs APNs secrets); send-morning-brief needs APNs secrets + CRON_SECRET + cron.
   AppModel (builds AppDatabase + SyncCoordinator from Config.xcconfig,
   observes auth) → RootView → MainTabScaffold (5-item bar + coral FAB) +
   AuthView + feature stubs. `.onOpenURL` → `auth.handleCallback`.
-  Bundle id `tech.csalliance.unstuck`, `unstuck://` scheme.
+  Bundle id `io.unstucknow.app`, `unstuck://` scheme.
 
 - Repo initialized; SwiftPM package `UnstuckKit` builds and tests
   standalone (no Xcode project / signing needed yet).
@@ -521,8 +521,8 @@ Reference for whoever picks up the design polish:
   Pill/Card/AreaDot/Avatar/SectionLabel/Wordmark/bottom-sheet). Port from
   `../unstuck/app/globals.css` + `components/ui/*`. SwiftUI compiles under
   SPM for macOS, so cross-platform views can have lightweight tests/previews.
-- Xcode app project (`tech.csalliance.unstuck`, App Group
-  `group.tech.csalliance.unstuck`, entitlements: Push/Time-Sensitive/Live
+- Xcode app project (`io.unstucknow.app`, App Group
+  `group.io.unstucknow.app`, entitlements: Push/Time-Sensitive/Live
   Activities; `unstuck://` scheme + Associated Domains; `.xcconfig` for
   SUPABASE_URL/ANON_KEY) referencing the local `UnstuckKit` package.
   RootView → Auth / Onboarding / MainTabScaffold (5 tabs + center FAB +
@@ -563,8 +563,8 @@ Full roadmap + rationale: the build plan at
 - Supabase project ref: `uaxfteluwctrlgwmmfzi`; schema migrations 001–013
   live in `../unstuck/supabase/`. iOS backend additions (014–016 + push
   Edge Functions) will also land in `../unstuck/supabase/`.
-- Planned bundle id `tech.csalliance.unstuck`; App Group
-  `group.tech.csalliance.unstuck`.
+- Planned bundle id `io.unstucknow.app`; App Group
+  `group.io.unstucknow.app`.
 - Note: `~/Desktop/.git` is a stray repo (remote `focus-app.git`); this
   repo's own `.git` overrides it inside `unstuck_ios/`.
 

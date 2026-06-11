@@ -9,7 +9,7 @@ import UnstuckDesign
 // `perform` (syncNow + widget snapshot refresh, wired by AppModel) and
 // chains the next refresh request.
 enum BackgroundSync {
-    static let taskId = "tech.csalliance.unstuck.refresh"
+    static let taskId = "io.unstucknow.app.refresh"
 
     /// Wired by AppModel once the coordinator exists (flush + hydrate +
     /// widget refresh). Nil until then — the handler just completes.

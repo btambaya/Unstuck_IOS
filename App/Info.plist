@@ -4,7 +4,7 @@
 <dict>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>tech.csalliance.unstuck.refresh</string>
+		<string>io.unstucknow.app.refresh</string>
 	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
@@ -26,7 +26,7 @@
 	<array>
 		<dict>
 			<key>CFBundleURLName</key>
-			<string>tech.csalliance.unstuck.auth</string>
+			<string>io.unstucknow.app.auth</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>unstuck</string>

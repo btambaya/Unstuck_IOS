@@ -27,7 +27,7 @@ public struct StartNextSnapshot: Codable, Sendable, Equatable {
 }
 
 public enum AppGroup {
-    public static let id = "group.tech.csalliance.unstuck"
+    public static let id = "group.io.unstucknow.app"
     private static let startNextKey = "startNextSnapshot"
     private static let focusFilterKey = "focusFilter.hideNonToday"
 
