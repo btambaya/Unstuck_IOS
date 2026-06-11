@@ -93,7 +93,13 @@ final class AnalyticsModel {
     var weekday: [StackedBar] { weekdayAreaHours(wSessions, tasks, areas: areaNames) }
     var hitRate: Double { calibrationHitRate(calibrationDots(wSessions, tasks)) }
     var hitPct: Int { Int((hitRate * 100).rounded()) }
-    var enoughData: Bool { wSessions.count >= REAL_DATA_THRESHOLD }
+    /// Show real numbers + charts from the FIRST session (kept calm) instead of
+    /// blanking everything to "—" until 5 (Android parity). The qualitative
+    /// "Worth noticing" insights keep their own REAL_DATA_THRESHOLD floor.
+    var enoughData: Bool { !wSessions.isEmpty }
+    /// Estimate-hit % only means something once there's at least one calibration
+    /// dot (an estimated, completed task) — otherwise the card reads "—".
+    var hasDots: Bool { !calibrationDots(wSessions, tasks).isEmpty }
     var interruptions: [Int] { interruptionBins(wCaptures, wSessions) }
     var reEntry: [Int] { reEntryDistribution(wSessions) }
     var heatmap: Heatmap { timeOfDayHeatmap(wSessions) }
@@ -184,10 +190,10 @@ struct AnalyticsView: View {
 
     @ViewBuilder
     private func reportBody(_ vm: AnalyticsModel) -> some View {
-        if !vm.enoughData { ThresholdNote(n: vm.sessionCount).padding(.top, 8) }
+        if !vm.enoughData { ThresholdNote().padding(.top, 8) }
 
         VStack(spacing: 10) {
-            StatCard(label: "Estimates", value: vm.enoughData ? "\(vm.hitPct)%" : "—",
+            StatCard(label: "Estimates", value: vm.hasDots ? "\(vm.hitPct)%" : "—",
                      badge: "\(vm.sessionCount) sessions", badgeBg: theme.palette.greenSoft, badgeFg: theme.palette.greenInk,
                      caption: "landed within 5 min")
             // The headline is the session COUNT — the real <5m re-entry rate
@@ -227,13 +233,13 @@ struct AnalyticsView: View {
 
     @ViewBuilder
     private func deepBody(_ vm: AnalyticsModel) -> some View {
-        if !vm.enoughData { ThresholdNote(n: vm.sessionCount).padding(.top, 8) }
+        if !vm.enoughData { ThresholdNote().padding(.top, 8) }
 
         VStack(spacing: 8) {
             HStack(spacing: 8) {
                 StatCard(label: "Median", value: vm.enoughData ? "\(vm.medianMin)m" : "—",
                          caption: "across \(vm.sessionCount) sessions")
-                StatCard(label: "On estimate", value: vm.enoughData ? "\(vm.hitPct)%" : "—",
+                StatCard(label: "On estimate", value: vm.hasDots ? "\(vm.hitPct)%" : "—",
                          caption: "within 5 min")
             }
             HStack(spacing: 8) {
@@ -478,13 +484,12 @@ private struct LabeledBar: View {
 /// Threshold note shown below the segments until there are ≥5 sessions.
 private struct ThresholdNote: View {
     @Environment(\.uTheme) private var theme
-    let n: Int
     var body: some View {
         Card {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Patterns appear after a few sessions.")
+                Text("No focus sessions yet.")
                     .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-                Text("\(n) of 5 focus sessions so far — numbers stay gentle until then.")
+                Text("Your reflection fills in here as you focus — come back after a session or two.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
             }
             .frame(maxWidth: .infinity, alignment: .leading)

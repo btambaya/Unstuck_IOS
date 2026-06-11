@@ -5,7 +5,11 @@
 
 import Foundation
 
-public let REAL_DATA_THRESHOLD = 5      // < this many sessions → show demo
+// Floor for the qualitative "Worth noticing" insights only — a single session
+// shouldn't claim a "strongest day". The numeric cards + charts no longer gate
+// on this (they show real data from the first session via enoughData/hasDots);
+// kept low so the prose insights still surface early (Android parity).
+public let REAL_DATA_THRESHOLD = 3
 private let HOUR: Double = 3600
 
 private func parseDate(_ iso: String) -> Date? {
