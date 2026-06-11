@@ -12,6 +12,39 @@ doc and the old discarded iOS app disagree, follow Android."* The web
 repo (`../unstuck`) is only the backend home (migrations + Edge
 Functions) and the historical port source for `UnstuckCore` logic names.
 
+## Where things stand (2026-06-11, later) — reported-bug fixes + Insights; TestFlight still blocked
+
+Three real-testing bugs (reported on Android, fixed across all 3 platforms — web is
+live on Cloudflare, Android shipped as **v0.4.47/vc60** to the 2 testers) are now in
+the iOS code too, plus the Insights change:
+
+1. **Recurring tasks confined to the Recurring view + per-day occurrences.**
+   `Sources/UnstuckCore/Logic/VisibleTasks.swift` — occurrences appear only in Today
+   (today-dated) + the single next per template in Upcoming; All/Backlog/Later/Completed
+   use non-templates only.
+2. **Cross-device sync fix.** `Sources/UnstuckSync/Hydrator.swift` `pruneStaleTaskOps()`
+   drops queued `tasks` ops the server already supersedes (strictly newer `updatedAt`),
+   called BEFORE `flusher.flush` in `SyncCoordinator.syncNow()` + the sign-in `handle`
+   path — stops a stale offline `done=false` from clobbering a web completion.
+3. **Start-Next hero.** `Sources/UnstuckCore/Logic/PickStartNext.swift` `pickTodayHero()`:
+   next scheduled today → else shortest estimate → else nil + `TodayFeature.swift`
+   `BacklogPointerCard` (never pulls from backlog). 5 new tests in `OccurrencesTests.swift`.
+4. **Insights from the first session.** `App/Features/AnalyticsFeature.swift` — `enoughData`
+   now `!wSessions.isEmpty`; new `hasDots` gate for estimate-hit %; `ThresholdNote` reworded
+   (dropped its count param); `Sources/UnstuckCore/Logic/Analytics.swift` `REAL_DATA_THRESHOLD`
+   5→3 (qualitative insights floor only). `swift build` + Xcode `Unstuck` scheme build green.
+
+**iOS is NOT on TestFlight yet — the only blocker is a credential.** The app archives,
+but uploading needs one of: (a) an **App Store Connect API key from the team** (a `.p8`
++ Key ID + Issuer ID — App Store Connect → Users and Access → Integrations → Keys) so
+`xcodebuild archive`/`-exportArchive` + upload can run non-interactively (there is no
+`.p8` in `~/.appstoreconnect/private_keys/` and no `fastlane` set up); or (b) a **one-time
+manual Xcode upload** (sign into team `D57M85TRUC`, Product → Archive → Distribute →
+TestFlight — see `HANDOFF-TESTFLIGHT.md`). The app record for `tech.csalliance.unstuck`
+must already exist in that team's App Store Connect. User asked (2026-06-11) for iOS on
+TestFlight for themselves + Sven; pending this. Voice realtime still needs on-device audio
+validation + the real `VOICE_PROXY_URL` in `App/Secrets.xcconfig`.
+
 ## Where things stand (2026-06-11) — parity bug-sweep + fixes
 
 A 31-agent adversarial review of the whole 2026-06-10 parity build (9 area

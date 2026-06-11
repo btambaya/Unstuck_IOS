@@ -4,6 +4,16 @@ Quick steps for the person doing the App Store Connect / TestFlight upload from
 their own Mac + Apple Developer account (account holder of team that owns the
 `tech.csalliance.unstuck` app record — App "Unstuck Now", Apple ID 6777491816).
 
+> **Automated alternative (no manual Xcode steps):** if you can get an **App Store
+> Connect API key** for the team (App Store Connect → Users and Access → Integrations
+> → Keys → generate a key with App Manager role → download the `.p8`, note the **Key ID**
+> + **Issuer ID**), the upload can be scripted instead — `xcodebuild archive` +
+> `-exportArchive -exportOptionsPlist ExportOptions.plist` (already set to team
+> `D57M85TRUC`, `method app-store-connect`) + `xcrun altool --upload-app` /
+> `notarytool`-style auth with the key. Put the `.p8` in `~/.appstoreconnect/private_keys/`.
+> This is the preferred path for repeat uploads; the manual steps below are the
+> one-time fallback.
+
 ## 0. Prerequisites
 - macOS + **Xcode 26.x** (signed into your Apple ID under **Xcode → Settings →
   Accounts**, with your paid Developer team).
