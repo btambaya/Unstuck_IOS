@@ -21,7 +21,7 @@ struct MainTabScaffold: View {
                          onFab: { router.present(.newTask) })
         }
             .background(theme.palette.bg.ignoresSafeArea())
-            .sheet(item: $router.activeSheet) { sheet in
+            .sheet(item: $router.activeSheet, onDismiss: { model.flushPendingDeepLink() }) { sheet in
                 switch sheet {
                 case .newTask: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
                 case .quickCapture: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)

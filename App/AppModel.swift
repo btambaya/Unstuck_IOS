@@ -30,6 +30,12 @@ final class AppModel {
     /// pick a new password (a recovery session can change the password without
     /// the old one). Mirrors Android's pendingPasswordRecovery.
     var pendingPasswordRecovery = false
+    /// One-shot: armed when an `auth-callback` deep link lands so the NEXT
+    /// authenticated transition classifies the session. The PKCE recovery flow
+    /// returns `?code=…` with NO `type=recovery` and the SDK emits only
+    /// `.signedIn` (never `.passwordRecovery`), so the only reliable signal is
+    /// the exchanged session's JWT `amr` claim — see `isRecoverySession`.
+    private var pendingRecoveryProbe = false
     /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
     var uiTestWrite: WriteThrough?
     // Per-collection serial RPC queue. The optimistic local write happens
@@ -267,41 +273,71 @@ final class AppModel {
         Task { [weak self] in
             for await (event, session) in coord.auth.authStateChanges {
                 // A password-recovery link establishes an authenticated session
-                // whose intent is "set a new password" — flag it so RootView shows
-                // the set-new-password screen (the PKCE recovery flow carries no
-                // type=recovery in the URL, so the SDK event is the reliable signal).
-                let isRecovery: Bool = { if case .passwordRecovery = event { return true }; return false }()
+                // whose intent is "set a new password". The implicit flow emits a
+                // `.passwordRecovery` event; the PKCE flow (what we ship) emits only
+                // `.signedIn`, so we additionally probe the session's JWT `amr`
+                // claim when a recovery deep link armed the probe.
+                let isRecoveryEvent: Bool = { if case .passwordRecovery = event { return true }; return false }()
+                let token = session?.accessToken
                 let isAuthed = session != nil
                 await MainActor.run {
-                    self?.signedIn = isAuthed
-                    if isRecovery { self?.pendingPasswordRecovery = true }
+                    guard let self else { return }
+                    self.signedIn = isAuthed
+                    // PKCE: classify the just-exchanged session via `amr` once.
+                    var isRecovery = isRecoveryEvent
+                    if isAuthed, self.pendingRecoveryProbe {
+                        self.pendingRecoveryProbe = false   // one-shot
+                        if let token, Self.isRecoverySession(token) { isRecovery = true }
+                    }
+                    if isRecovery { self.pendingPasswordRecovery = true }
                     // Re-register the APNs token on every transition to
                     // authenticated (spec 10 §1.8): sign-out deletes this
                     // device's token row, so a user switch within one launch
                     // must recreate it for the NEW user.
                     if isAuthed, let hex = PushRegistrar.shared.apnsTokenHex {
-                        self?.registerPush(hex)
+                        self.registerPush(hex)
                     }
                     // Usage-analytics sign-in ping (not on recovery — that's a
                     // re-auth, not a real login). Throttled to once / 12h / user.
-                    if isAuthed, !isRecovery { self?.trackLogin() }
+                    if isAuthed, !isRecovery { self.trackLogin() }
                 }
             }
         }
     }
 
+    /// True if the access-token JWT's `amr` (authentication-methods-reference)
+    /// claim contains a `recovery` entry — i.e. this session came from a
+    /// password-reset link. Best-effort decode of the unsigned middle segment
+    /// (base64url). Mirrors the Android isRecoverySession amr probe.
+    static func isRecoverySession(_ jwt: String) -> Bool {
+        let parts = jwt.split(separator: ".")
+        guard parts.count >= 2 else { return false }
+        var b64 = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let amr = obj["amr"] as? [Any] else { return false }
+        return amr.contains { entry in
+            if let s = entry as? String { return s == "recovery" }
+            if let d = entry as? [String: Any] { return (d["method"] as? String) == "recovery" }
+            return false
+        }
+    }
+
     /// Finish password recovery: the user has set a new password, drop the flag
     /// so RootView leaves the set-new-password screen for the app.
-    func consumeRecovery() { pendingPasswordRecovery = false }
+    func consumeRecovery() { pendingPasswordRecovery = false; pendingRecoveryProbe = false }
 
     func handleDeepLink(_ url: URL) {
         // OAuth / magic-link PKCE callback → the auth client; everything
         // else (unstuck://task/…, /focus/…, /today, capture) routes to the
         // matching surface (spec 10 §1.7 push-tap deep links).
         if url.host == "auth-callback" {
-            // Implicit-flow recovery links carry type=recovery in the URL — flag
-            // it early so the set-new-password screen shows the moment the session
-            // resolves (the PKCE flow relies on the .passwordRecovery event above).
+            // Arm the one-shot recovery probe for the session this callback is
+            // about to exchange — observeAuth then classifies it via the JWT `amr`
+            // (PKCE recovery carries no type=recovery in the URL). The implicit
+            // flow's type=recovery is kept as an early belt-and-suspenders flag.
+            pendingRecoveryProbe = true
             if url.absoluteString.range(of: "type=recovery", options: .caseInsensitive) != nil {
                 pendingPasswordRecovery = true
             }
@@ -510,7 +546,13 @@ final class AppModel {
             }
             // Guarantee the chosen slot is materialized (the horizon regen skips
             // today / off-pattern picks). Only when nothing already covers it.
-            let coversChosen = existing.contains { $0.date == iso } || plan.toUpsert.contains { $0.date == iso }
+            // Coverage must be computed POST-plan: an existing block on the chosen
+            // date that the regen is about to DELETE doesn't count, or we'd skip
+            // the guarantee-upsert, run the delete, and leave the date with no
+            // block — the task silently vanishes from the day just scheduled.
+            let deleting = Set(plan.toDelete)
+            let coversChosen = existing.contains { $0.date == iso && !deleting.contains($0.id) }
+                || plan.toUpsert.contains { $0.date == iso }
             if !coversChosen {
                 saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
                                    startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))

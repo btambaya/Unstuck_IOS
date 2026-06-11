@@ -90,10 +90,12 @@ final class VoiceController: @unchecked Sendable {
 
     func stopListening() {
         lock.lock(); defer { lock.unlock() }
-        if engine.isRunning {
-            engine.stop()
-            engine.inputNode.removeTap(onBus: 0)
-        }
+        if engine.isRunning { engine.stop() }
+        // Remove the tap UNCONDITIONALLY: if engine.start() threw after the tap
+        // was installed (mic contended / route race), the engine isn't running but
+        // the tap is still attached — leaving it makes the NEXT installTap a fatal
+        // AVAudioEngine precondition crash. removeTap is a safe no-op when none.
+        engine.inputNode.removeTap(onBus: 0)
         request?.endAudio()
         task?.cancel()
         request = nil

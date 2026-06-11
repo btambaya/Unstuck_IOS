@@ -111,7 +111,7 @@ struct TodayView: View {
         }
         .background(theme.palette.bg.ignoresSafeArea())
         .sheet(isPresented: $showSettings) { SettingsView() }
-        .sheet(isPresented: $showNotifCenter) { NotificationCenterView() }
+        .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .feedbackBubble()
         .task {

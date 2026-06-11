@@ -81,12 +81,16 @@ struct NotificationCenterView: View {
             let id = String(dl.dropFirst("unstuck://task/".count))
             return { openTask(id) }
         }
-        return { dismiss(); model.routeDeepLink(dl) }
+        // Defer routing until this sheet finishes dismissing — the host (Today)
+        // flushes on the sheet's onDismiss. Routing here (which may present the
+        // task editor / focus, a second presentation from the same host) while
+        // we dismiss would silently no-op in SwiftUI.
+        return { model.routeDeepLinkAfterDismiss(dl); dismiss() }
     }
 
     private func openTask(_ id: String) {
+        model.routeDeepLinkAfterDismiss("unstuck://task/\(id)")
         dismiss()
-        model.routeDeepLink("unstuck://task/\(id)")
     }
 
     private func accentColor(_ kind: String) -> Color {

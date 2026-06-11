@@ -45,12 +45,36 @@ public actor OutboxFlusher {
         }
     }
 
+    // The in-flight drain. Swift actors are REENTRANT across `await`, so without
+    // chaining, two of the four overlapping flush triggers (debounced post-write
+    // kick / scenePhase syncNow / auth event / sign-out task group) interleave:
+    // while one is suspended in `await apply(op)` before markDone, another re-reads
+    // pending() and re-applies the same op + races failCounts (the per-pass
+    // blockedRows set is task-local, defeating last-writer-wins). Android serializes
+    // with a Mutex; we chain through this Task. Chaining (not bail-if-busy) so the
+    // bounded sign-out drain actually completes a pass before clearAll() wipes the
+    // outbox, instead of early-returning.
+    private var draining: Task<Void, Never>?
+
     public func flush(userId: String) async {
         await flush(userId: userId, currentUserId: { userId })
     }
 
-    public func flush(userId: String, currentUserId: @Sendable () -> String?) async {
+    public func flush(userId: String, currentUserId: @escaping @Sendable () -> String?) async {
+        let prev = draining
+        let work = Task { [weak self] in
+            await prev?.value
+            await self?.drainLoop(userId: userId, currentUserId: currentUserId)
+        }
+        draining = work
+        await work.value
+    }
+
+    private func drainLoop(userId: String, currentUserId: @Sendable () -> String?) async {
         while true {
+            // A cancelled drain (sign-out's 5s timeout, BG-task stop) is normal
+            // control flow, not a failure — abort without burning the poison cap.
+            if Task.isCancelled { return }
             // Bail if the signed-in user changed mid-drain (sign-out + sign-in
             // to a different account). RLS already blocks a cross-account
             // write, but this avoids confusing FK/RLS errors + a stuck op.
@@ -94,6 +118,14 @@ public actor OutboxFlusher {
                     failCounts[seq] = nil
                     progressed = true
                 } catch {
+                    // Cancellation (sign-out timeout / BG-task stop / URLSession
+                    // cancelled) is NOT a server rejection — abort the drain
+                    // without touching failCounts/blockedRows, or a repeated
+                    // sign-out on a slow link would poison-drop a valid op + its
+                    // FK dependents. Mirrors Android's `catch CancellationException`.
+                    if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                        return
+                    }
                     print("[outbox] \(rowKey) failed: \(error)")
                     blockedRows.insert(rowKey)
                     try? box.bumpAttempts(seq)   // persisted for field debugging only

@@ -25,6 +25,23 @@ extension AppModel {
 
     // MARK: deep-link routing (Android MainScaffold LaunchedEffect(deepLink))
 
+    /// Route a deep link triggered from INSIDE a sheet — defer it until that
+    /// sheet finishes dismissing (the host flushes via `flushPendingDeepLink` on
+    /// its sheet's onDismiss). Avoids the SwiftUI present-while-dismissing race
+    /// where the second sheet silently no-ops.
+    func routeDeepLinkAfterDismiss(_ link: String) {
+        router.pendingDeepLink = link
+    }
+
+    /// Flush a deep link captured inside a now-dismissed sheet. Called from the
+    /// host sheet's onDismiss so the target presents cleanly after the first
+    /// sheet is fully gone.
+    func flushPendingDeepLink() {
+        guard let link = router.pendingDeepLink else { return }
+        router.pendingDeepLink = nil
+        routeDeepLink(link)
+    }
+
     /// Route an `unstuck://` link (push tap, notification-center row, or
     /// notification action) to the right surface.
     func routeDeepLink(_ link: String) {

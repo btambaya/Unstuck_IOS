@@ -28,6 +28,11 @@ final class AppRouter {
     /// When set, the task editor is presented for this task (notification
     /// deep links: unstuck://task/<id> — Android Route.Detail).
     var detailTask: TaskItem?
+    /// A deep link captured INSIDE a presented sheet (Inbox "Open", Notification
+    /// Center tap) to route AFTER that sheet finishes dismissing. SwiftUI can't
+    /// present a second sheet from the same host while the first is still
+    /// dismissing, so the host flushes this on its sheet's `onDismiss`.
+    var pendingDeepLink: String?
 
     func select(_ tab: Tab) { self.tab = tab }
     func present(_ sheet: Sheet) { activeSheet = sheet }

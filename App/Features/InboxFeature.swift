@@ -197,8 +197,12 @@ struct InboxView: View {
 
     private func openTask(_ id: String?) {
         guard let id else { return }
+        // Defer the present until THIS sheet finishes dismissing — the host
+        // (MainTabScaffold) flushes it on the inbox sheet's onDismiss. Presenting
+        // the task editor here (a second sheet on the same host) while we dismiss
+        // would silently no-op in SwiftUI.
+        model.routeDeepLinkAfterDismiss("unstuck://task/\(id)")
         dismiss()
-        model.routeDeepLink("unstuck://task/\(id)")
     }
 
     // MARK: tag color (Android tagColor parity)
