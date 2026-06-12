@@ -432,6 +432,11 @@ struct TodayView: View {
     }
 
     private func refreshNotifStatus() async {
+        #if DEBUG
+        // Demo boot (UITEST_SEED): the banner only reflects the simulator's
+        // permission state — hide it so screenshots show the product.
+        if ProcessInfo.processInfo.environment["UITEST_SEED"] == "1" { notifsEnabled = true; return }
+        #endif
         let s = await UNUserNotificationCenter.current().notificationSettings()
         notifsEnabled = s.authorizationStatus == .authorized || s.authorizationStatus == .provisional || s.authorizationStatus == .ephemeral
     }
