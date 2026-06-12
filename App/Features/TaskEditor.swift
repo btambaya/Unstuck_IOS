@@ -9,6 +9,7 @@ import UnstuckDesign
 struct TaskEditor: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.uTheme) private var theme
 
     let task: TaskItem?
     let existingBlocks: [CalBlock]
@@ -29,6 +30,21 @@ struct TaskEditor: View {
     @State private var untilOn: Bool
     @State private var until: Date
     @State private var reminderOverride: Int?
+
+    // Captures attached to this task (existing-task editor) — live from GRDB,
+    // so adds/discards and remote sync refresh the list (Android
+    // TaskDetailSheet "Captures" section parity).
+    @State private var captures: [Capture] = []
+    @State private var captureBody = ""
+    @State private var captureTag: CaptureTag = .followUp
+    /// Draft captures composed on a brand-new task; they auto-save against the
+    /// task when it's created (Android NewTaskSheet capture-drafts parity).
+    private struct CaptureDraft: Identifiable {
+        let id = UUID()
+        var body = ""
+        var tag: CaptureTag = .followUp
+    }
+    @State private var drafts: [CaptureDraft] = []
 
     init(task: TaskItem?, existingBlocks: [CalBlock], defaultEstimate: Int = 25) {
         self.task = task
@@ -95,6 +111,21 @@ struct TaskEditor: View {
                         }
                     }
                 }
+                if task != nil {
+                    Section("Captures") {
+                        ForEach(captures) { cap in captureRow(cap) }
+                        captureComposer
+                    }
+                } else {
+                    Section("Capture a thought") {
+                        ForEach($drafts) { $draft in draftRow($draft) }
+                        Button {
+                            drafts.append(CaptureDraft())
+                        } label: {
+                            Label("Capture", systemImage: "plus").font(UFont.sans(13, .medium))
+                        }
+                    }
+                }
                 if let task {
                     Section {
                         Button("Schedule for today") {
@@ -115,7 +146,81 @@ struct TaskEditor: View {
                     Button("Save") { save() }.disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
             }
+            .task { await observeCaptures() }
         }
+    }
+
+    // MARK: captures (Android TaskDetailSheet section parity)
+
+    private func captureRow(_ cap: Capture) -> some View {
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let age = relPast(max(0, nowMs - (Time.parseMillis(cap.at) ?? nowMs)))
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Circle().fill(captureTagColor(cap.tag, theme)).frame(width: 7, height: 7)
+                Text(cap.tag.rawValue.uppercased()).font(UFont.mono(10, .bold))
+                    .foregroundStyle(captureTagColor(cap.tag, theme))
+                Text(age).font(UFont.mono(10)).foregroundStyle(.secondary)
+            }
+            Text(cap.body).font(UFont.sans(14))
+            HStack(spacing: 18) {
+                Button("Promote to task →") { model.promoteCapture(cap) }
+                    .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                Button("Discard") { model.discardCapture(cap.id) }
+                    .font(UFont.sans(12)).foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var captureComposer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("Capture a thought…", text: $captureBody)
+                if !captureBody.trimmingCharacters(in: .whitespaces).isEmpty {
+                    Button("Add") { addCapture() }
+                        .font(UFont.sans(12, .semibold))
+                        .buttonStyle(.borderedProminent).controlSize(.small)
+                }
+            }
+            CaptureTagPicker(selection: $captureTag)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func draftRow(_ draft: Binding<CaptureDraft>) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                TextField("Something on your mind…", text: draft.body)
+                Button {
+                    drafts.removeAll { $0.id == draft.wrappedValue.id }
+                } label: {
+                    Image(systemName: "xmark").font(.system(size: 12)).foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+            CaptureTagPicker(selection: draft.tag)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func addCapture() {
+        guard let task else { return }
+        let text = captureBody.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        model.saveCapture(Capture(id: newUUID(), taskId: task.id, tag: captureTag,
+                                  body: text, at: AppModel.isoNow()))
+        captureBody = ""
+    }
+
+    private func observeCaptures() async {
+        guard let task, let repo = model.taskRepo else { return }
+        do {
+            for try await snap in repo.observeCaptures() {
+                captures = snap.filter { $0.taskId == task.id }
+            }
+        } catch {}
     }
 
     private var weekdayToggles: some View {
@@ -164,6 +269,15 @@ struct TaskEditor: View {
             model.saveTaskWithRecurrence(t, existingBlocks: existingBlocks)
         } else {
             model.saveTask(t)
+        }
+        // Capture drafts ride along with a brand-new task (Android NewTaskSheet:
+        // drafts auto-save against the task on "Add task").
+        if task == nil {
+            for d in drafts {
+                let body = d.body.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !body.isEmpty else { continue }
+                model.saveCapture(Capture(id: newUUID(), taskId: t.id, tag: d.tag, body: body, at: now))
+            }
         }
         dismiss()
     }

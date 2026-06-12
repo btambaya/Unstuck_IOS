@@ -116,6 +116,7 @@ struct FocusView: View {
     @State private var fm: FocusModel?
     @State private var showReasons = false
     @State private var showCapture = false
+    @State private var captureTag: CaptureTag = .followUp
     @State private var showFinish = false
     @State private var captureText = ""
     /// Header mute toggle. Seeded from the Settings ambient choice in .task so
@@ -405,6 +406,9 @@ struct FocusView: View {
                 .padding(12).background(theme.palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).stroke(theme.palette.line))
+            // Tag chips — Android CaptureSheet has the same five-tag row; we
+            // were silently saving everything as `idea` before.
+            CaptureTagPicker(selection: $captureTag)
             UButton("Save") { saveCapture() }
             Spacer()
         }
@@ -436,7 +440,8 @@ struct FocusView: View {
         // Attach captures to the TEMPLATE for an occurrence focus (task.id is the
         // block id there) so they show on the series' detail, not a phantom row.
         let captureTaskId = fm?.occurrence?.templateId ?? task.id
-        model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId, sessionId: fm?.sessionId, tag: .idea, body: text, at: AppModel.isoNow()))
+        model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId, sessionId: fm?.sessionId, tag: captureTag, body: text, at: AppModel.isoNow()))
+        captureTag = .followUp
     }
 }
 

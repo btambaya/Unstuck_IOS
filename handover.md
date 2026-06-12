@@ -3,6 +3,24 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
+## Where things stand (2026-06-12) — TestFlight LIVE + captures-in-editor parity fix
+
+- **TestFlight is live** under Ahmad's own team `M9ULD6M5Z3`: app record
+  "UnstuckNow" (`io.unstucknow.app`), build 0.1.0 (1) uploaded + in Beta App
+  Review for the external group; internal testing active. Upload recipe in
+  `HANDOFF-TESTFLIGHT.md` (use the signed-in Xcode session, NOT the ASC API
+  key — App Manager keys can't mint the cloud distribution cert).
+- **Tester-reported parity gap FIXED — captures outside Focus.** Android's
+  TaskDetailSheet has a "Captures" section (list + promote/discard +
+  AddCaptureRow) and NewTaskSheet has capture-a-thought drafts; the iOS
+  TaskEditor had NEITHER, so captures looked "missing" to testers who never
+  ran a focus session. Added: `Captures` section on the edit form (live GRDB
+  observation filtered to the task), capture drafts on the new-task form
+  (saved against the task on Save), shared `CaptureTagPicker` chips
+  (App/Features/CaptureTagPicker.swift), and the Focus capture sheet now has
+  the five-tag row instead of silently saving everything as `idea`
+  (Android CaptureSheet parity). Build 0.1.0 (2).
+
 **Parity frame (don't lose this):** the ANDROID app
 (`../unstuck_android`) is the reference client — NOT the web app. The
 authoritative spec is
