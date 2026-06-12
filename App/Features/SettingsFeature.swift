@@ -96,12 +96,20 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             aboutLine("Theme", themeLabel(model.settings.theme))
             divider
-            aboutLine("Version", "0.1.0")
+            aboutLine("Version", Self.appVersion)
             divider
             aboutLine("Backend", "Supabase")
         }
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+    }
+
+    /// "1.0 (5)" from the bundle — never hardcode (it drifted to 0.1.0 once).
+    private static var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
     }
 
     private func themeLabel(_ t: ThemePref) -> String {
