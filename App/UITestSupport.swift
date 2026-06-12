@@ -45,9 +45,23 @@ enum DemoSeed {
         ]
         tasks.forEach { try? db.save($0) }
 
-        // One scheduled block today (Today + Calendar surfaces).
-        try? db.save(CalBlock(id: "blk-proposal", taskId: "t-proposal", taskName: "Draft the Q3 proposal",
-                              startTime: "09:00", durationMinutes: 45, date: today, kind: .task))
+        // Scheduled blocks placed RELATIVE to the current hour — the calendar
+        // day view auto-scrolls to NOW, so screenshots always show a populated
+        // schedule regardless of when the tour runs. Clamped to the 6–21h grid.
+        let h = Calendar.current.component(.hour, from: Date())
+        func hm(_ hour: Int) -> String { String(format: "%02d:00", min(max(hour, 6), 21)) }
+        let blocks: [(id: String, taskId: String, name: String, start: String, mins: Int)] = [
+            ("blk-sarah", "t-sarah", "Reply to Sarah", hm(h - 1), 15),
+            ("blk-proposal", "t-proposal", "Draft the Q3 proposal", hm(h + 1), 45),
+            ("blk-walk", "t-walk", "30-minute walk", hm(h + 2), 30),
+            ("blk-review", "t-review", "Review the launch checklist", hm(h + 3), 30),
+        ]
+        for b in blocks {
+            try? db.save(CalBlock(id: b.id, taskId: b.taskId, taskName: b.name,
+                                  startTime: b.start, durationMinutes: b.mins, date: today, kind: .task))
+        }
+        try? db.save(TaskItem(id: "t-review", name: "Review the launch checklist", estimateMin: 30,
+                              tags: ["deep-work"], lifeArea: "Work", createdAt: now, updatedAt: now))
 
         // Six recent sessions (linked to tasks, spread across this week's
         // weekdays) so Insights clears the real-data threshold (≥5) and the

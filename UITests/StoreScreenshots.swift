@@ -1,7 +1,8 @@
 // App Store screenshot tour — runs against the network-free demo boot
 // (UITEST_SEED) on a 6.9" simulator and writes full-resolution PNGs to
-// /tmp/unstuck-shots/ for upload to App Store Connect. Not a test of
-// behavior; failures only matter insofar as a screen didn't render.
+// /tmp/unstuck-shots/ for the caption compositor + upload to App Store
+// Connect. Not a behavior test; failures only matter if a screen didn't
+// render.
 
 import XCTest
 
@@ -39,28 +40,40 @@ final class StoreScreenshots: XCTestCase {
         usleep(1_200_000)
         save("01-today")
 
-        // Focus session (the product's core moment), then end it via the
-        // soft-exit "End for now" — landing back on Today with the recap card.
+        // Focus session, then end it via soft-exit "End for now" (a Button,
+        // not a staticText) — the recap card's "JUST NOW" label confirms we
+        // landed back on Today before shooting.
         if app.staticTexts["Focus"].firstMatch.waitForExistence(timeout: 4) {
             app.staticTexts["Focus"].firstMatch.tap()
             usleep(1_500_000)
             save("02-focus")
-            let end = app.staticTexts["End for now"].firstMatch
-            if end.waitForExistence(timeout: 3) { end.tap(); usleep(1_200_000) }
-            if app.buttons["Today"].firstMatch.waitForExistence(timeout: 6) {
-                usleep(600_000)
-                save("03-recap")
+            let end = app.buttons["End for now"].exists
+                ? app.buttons["End for now"].firstMatch
+                : app.staticTexts["End for now"].firstMatch
+            if end.waitForExistence(timeout: 3) {
+                end.tap()
+                if app.staticTexts["JUST NOW"].firstMatch.waitForExistence(timeout: 8) {
+                    usleep(800_000)
+                    save("03-recap")
+                }
             }
         }
 
         tapNav("Tasks")
-        save("04-tasks")
+        // "Upcoming" filter pill only exists on the Tasks screen — proves the
+        // tab actually switched before shooting.
+        if app.staticTexts["Upcoming"].firstMatch.waitForExistence(timeout: 4) {
+            usleep(400_000)
+            save("04-tasks")
+        } else {
+            tapNav("Tasks")
+            _ = app.staticTexts["Upcoming"].firstMatch.waitForExistence(timeout: 4)
+            usleep(400_000)
+            save("04-tasks")
+        }
 
         tapNav("Calendar")
-        usleep(600_000)
-        if app.staticTexts["Week"].firstMatch.waitForExistence(timeout: 3) {
-            app.staticTexts["Week"].firstMatch.tap(); usleep(900_000)
-        }
+        usleep(900_000)
         save("05-calendar")
 
         tapNav("Collections")
@@ -70,12 +83,21 @@ final class StoreScreenshots: XCTestCase {
         }
         save("06-collections")
 
-        // Insights via the Today header "This week" pill
+        // Capture Inbox (tray icon on the Today header)
         tapNav("Today")
-        let pill = app.staticTexts.matching(NSPredicate(format: "label CONTAINS[c] 'this week'")).firstMatch
+        let inbox = app.buttons["Inbox"].firstMatch
+        if inbox.waitForExistence(timeout: 4) {
+            inbox.tap(); usleep(1_000_000)
+            save("07-inbox")
+            let done = app.buttons["Done"].firstMatch
+            if done.waitForExistence(timeout: 3) { done.tap(); usleep(700_000) }
+        }
+
+        // Insights via the Today header "This week" pill (week-pill id)
+        let pill = app.buttons["week-pill"].firstMatch
         if pill.waitForExistence(timeout: 4) {
-            pill.tap(); usleep(1_200_000)
-            save("07-insights")
+            pill.tap(); usleep(1_500_000)
+            save("08-insights")
         }
     }
 }

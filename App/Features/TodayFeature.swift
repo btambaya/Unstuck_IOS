@@ -113,6 +113,7 @@ struct TodayView: View {
     @State private var showSettings = false
     @State private var showNotifCenter = false
     @State private var showPalette = false
+    @State private var showInsights = false
     @State private var notifsEnabled = true
     @State private var areaFilter: String?
     @State private var backlogActive = false
@@ -143,6 +144,7 @@ struct TodayView: View {
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
+        .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
         .feedbackBubble()
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }
@@ -172,7 +174,7 @@ struct TodayView: View {
                                     .offset(x: -8, y: 8)
                             }
                         }
-                }.buttonStyle(.plain)
+                }.buttonStyle(.plain).accessibilityLabel("Inbox")
                 // Bell → in-app Notification Center; the dot is the unread
                 // badge (newest log entry vs lastSeen — spec 10 §1.9).
                 Button { showNotifCenter = true } label: {
@@ -205,7 +207,8 @@ struct TodayView: View {
     private var weekPill: some View {
         let min = vm?.weekFocusMin ?? 0
         let label = min >= 60 ? "\(min / 60)h\(min % 60 != 0 ? " \(min % 60)m" : "") focused" : "\(min)m focused"
-        return Button { showSettings = true } label: {
+        // Opens INSIGHTS, not Settings — Android parity (TodayScreen pill → Route.Insights).
+        return Button { showInsights = true } label: {
             HStack(spacing: 8) {
                 Circle().fill(theme.palette.coral).frame(width: 6, height: 6)
                 Text("This week · ").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
@@ -215,6 +218,7 @@ struct TodayView: View {
             .padding(.horizontal, 12).padding(.vertical, 7)
             .background(theme.palette.bg2, in: Capsule())
         }.buttonStyle(.plain).padding(.top, 2)
+            .accessibilityIdentifier("week-pill")
     }
 
     // MARK: Start-Next hero
