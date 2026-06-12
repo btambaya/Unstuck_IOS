@@ -58,6 +58,17 @@ final class AppModel {
     /// extensions can't add stored properties — observing this drives the Inbox.
     var archivedCaptureIdsBacking: Set<String> = []
 
+    /// Last finished focus session, backing the Today "Just now" recap card
+    /// (Android RecapState parity). In-memory only — set by finishFocus,
+    /// shown for 6 hours, ✕ on the card clears it.
+    struct RecapState {
+        let taskName: String
+        let focusedSec: Int
+        /// Epoch ms of the session end.
+        let at: Double
+    }
+    var lastRecap: RecapState?
+
     /// Backing for the lazily-built assistant. Observation-ignored: AppModel
     /// holds the reference but never needs to observe the swap (AssistantModel
     /// is itself @Observable and drives the chat UI). A lazy stored var conflicts

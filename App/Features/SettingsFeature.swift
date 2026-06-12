@@ -348,6 +348,10 @@ private struct AccessibilitySettingsView: View {
         SettingsScaffold(eyebrow: "Settings · Accessibility", title: "Adjust to your brain.") {
             SettingsCard {
                 ToggleRow(label: "Reduce motion", isOn: $settings.reduceMotion)
+                CardDivider()
+                // +2 DynamicTypeSize steps on top of Density — Android's
+                // largerType 1.15× fontScale analogue.
+                ToggleRow(label: "Larger type", isOn: $settings.largerType)
             }
         }
     }
@@ -365,6 +369,18 @@ private struct InterfaceSettingsView: View {
                        options: [("system", "System"), ("light", "Light"), ("dark", "Dark")],
                        selected: settings.theme.rawValue) { v in
                     settings.theme = ThemePref(rawValue: v) ?? .system
+                }
+                CardDivider()
+                SegRow(label: "Accent",
+                       options: [("indigo", "Indigo"), ("rose", "Rose"), ("forest", "Forest")],
+                       selected: settings.accent.rawValue) { v in
+                    settings.accent = Accent(rawValue: v) ?? .indigo
+                }
+                CardDivider()
+                SegRow(label: "Density",
+                       options: [("compact", "Compact"), ("regular", "Regular"), ("comfy", "Comfy")],
+                       selected: settings.density.rawValue) { v in
+                    settings.density = DensityPref(rawValue: v) ?? .regular
                 }
             }
         }

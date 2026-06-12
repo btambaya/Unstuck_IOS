@@ -34,7 +34,7 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
 	<!-- Only standard HTTPS/TLS — exempt; skips the TestFlight compliance prompt. -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>

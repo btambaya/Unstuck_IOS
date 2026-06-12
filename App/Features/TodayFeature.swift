@@ -123,6 +123,13 @@ struct TodayView: View {
                 header
                 if let vm {
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
+                    // "Just now" session recap — shows for 6h after a finished
+                    // focus session, between the notif banner and the hero
+                    // (Android TodayScreen recap parity).
+                    if let recap = model.lastRecap,
+                       Date().timeIntervalSince1970 * 1000 - recap.at < 6 * 3_600_000 {
+                        recapCard(recap).padding(.horizontal, 18).padding(.top, 8)
+                    }
                     heroOrEmpty(vm).padding(.horizontal, 18).padding(.top, 14)
                     filterBar(vm)
                     list(vm)
@@ -380,6 +387,27 @@ struct TodayView: View {
                 }
             }
         }
+    }
+
+    // MARK: recap card (Android "Just now" parity)
+
+    private func recapCard(_ recap: AppModel.RecapState) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("JUST NOW").font(UFont.mono(11, .medium)).tracking(0.8)
+                    .foregroundStyle(theme.palette.coralDeep)
+                Spacer()
+                Button { model.lastRecap = nil } label: {
+                    Text("✕").font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+                }.buttonStyle(.plain)
+            }
+            Text("You did the thing.").font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
+            Text("\(max(1, recap.focusedSec / 60)) MIN FOCUSED · \(recap.taskName)")
+                .font(UFont.mono(11)).foregroundStyle(theme.palette.ink2)
+                .lineLimit(1).truncationMode(.tail)
+        }
+        .padding(16).frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.coralSoft, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
     // MARK: notifications banner + helpers

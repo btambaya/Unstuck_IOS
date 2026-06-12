@@ -3,6 +3,25 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
+## Where things stand (2026-06-12, later) — remaining parity gaps closed (build 3)
+
+- **Recap card NOW RENDERS** — `AppModel.RecapState` set in `finishFocus`,
+  coral "Just now / You did the thing." card on Today between the notif
+  banner and the hero, 6h window, ✕ dismisses (Android TodayScreen parity).
+- **Voice proxy configured** — `VOICE_PROXY_URL` set in `Secrets.xcconfig`
+  (same CF Worker as Android: `wss://unstuck-voice-proxy.justtesting6363.workers.dev`,
+  written with the `$()` xcconfig comment-escape). Talk button should now be
+  un-gated; on-device audio validation still pending (needs a real device).
+- **Accent + Density + Larger type implemented** (the functional Android
+  controls; high-contrast/keyboard-hints/chime/bell/completion stay omitted —
+  dead on Android too): `Accent` enum + `Palette.withAccent` in UnstuckDesign
+  (oklch values copied from Android Theme.kt), applied via
+  `unstuckTheme(accent:)`; density (compact/regular/comfy) + largerType fold
+  into a DynamicTypeSize step shift (`TypeScale` in UnstuckApp.swift) — all
+  app fonts are `Font.custom`, which scales with it. New Settings rows:
+  Interface → Accent + Density, Accessibility → Larger type.
+- swift test 263/0; sim build green. CFBundleVersion 3.
+
 ## Where things stand (2026-06-12) — TestFlight LIVE + captures-in-editor parity fix
 
 - **TestFlight is live** under Ahmad's own team `M9ULD6M5Z3`: app record

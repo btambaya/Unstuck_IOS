@@ -8,8 +8,9 @@ public struct Palette: Sendable {
     public let bg, bg2, surface: Color
     public let ink, ink2, ink3, ink4: Color
     public let line, line2: Color
-    public let primary, primarySoft, primaryDeep: Color
-    public let coral, coralSoft, coralDeep: Color
+    // `var` (not `let`): the accent remap (`withAccent`) rewrites these ramps.
+    public var primary, primarySoft, primaryDeep: Color
+    public var coral, coralSoft, coralDeep: Color
     public let violet, blue, green, amber, red: Color
     /// Soft fills + readable "ink" shades for status chips / rollups (Android parity).
     public let greenInk, greenSoft, blueSoft, blueInk, amberSoft, amberInk: Color
@@ -73,6 +74,39 @@ public enum Radius {
     public static let lg: CGFloat = 22
 }
 
+/// Accent palettes — mirror the Android/web ACCENT_PALETTES. Indigo+coral is
+/// the brand default (no remap).
+public enum Accent: String, CaseIterable, Sendable {
+    case indigo, rose, forest
+}
+
+public extension Palette {
+    /// Override the primary/coral ramps for the chosen accent. Same override
+    /// values for light + dark, matching Android's `withAccent`.
+    func withAccent(_ accent: Accent) -> Palette {
+        var p = self
+        switch accent {
+        case .indigo:
+            return self
+        case .rose:
+            p.primary = OKLCH(0.62, 0.14, 265).color
+            p.primaryDeep = OKLCH(0.42, 0.16, 265).color
+            p.primarySoft = OKLCH(0.94, 0.04, 265).color
+            p.coral = OKLCH(0.74, 0.14, 15).color
+            p.coralSoft = OKLCH(0.95, 0.05, 15).color
+            p.coralDeep = OKLCH(0.50, 0.16, 15).color
+        case .forest:
+            p.primary = OKLCH(0.55, 0.10, 170).color
+            p.primaryDeep = OKLCH(0.38, 0.10, 170).color
+            p.primarySoft = OKLCH(0.94, 0.04, 170).color
+            p.coral = OKLCH(0.74, 0.14, 65).color
+            p.coralSoft = OKLCH(0.95, 0.05, 65).color
+            p.coralDeep = OKLCH(0.48, 0.13, 65).color
+        }
+        return p
+    }
+}
+
 public struct UTheme: Sendable {
     public var palette: Palette
     public init(palette: Palette) { self.palette = palette }
@@ -92,15 +126,18 @@ public extension EnvironmentValues {
 }
 
 public extension View {
-    /// Inject the brand palette resolved from the current color scheme.
-    func unstuckTheme() -> some View {
-        modifier(UThemeResolver())
+    /// Inject the brand palette resolved from the current color scheme,
+    /// remapped for the chosen accent (Settings · Interface).
+    func unstuckTheme(accent: Accent = .indigo) -> some View {
+        modifier(UThemeResolver(accent: accent))
     }
 }
 
 private struct UThemeResolver: ViewModifier {
     @Environment(\.colorScheme) private var scheme
+    let accent: Accent
     func body(content: Content) -> some View {
-        content.environment(\.uTheme, scheme == .dark ? .dark : .light)
+        content.environment(\.uTheme,
+                            UTheme(palette: (scheme == .dark ? Palette.dark : Palette.light).withAccent(accent)))
     }
 }

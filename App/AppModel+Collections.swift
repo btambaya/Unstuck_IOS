@@ -391,6 +391,9 @@ extension AppModel {
             saveTask(focused)
         }
         sendSessionRecap(taskName: task.name, away: false)
+        // Today's "Just now" recap card (Android: _lastRecap.value = RecapState(...)).
+        lastRecap = RecapState(taskName: task.name, focusedSec: elapsedSec,
+                               at: Date().timeIntervalSince1970 * 1000)
     }
 
     // MARK: - sharing (edge-function backed)

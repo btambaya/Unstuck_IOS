@@ -55,6 +55,29 @@ enum BackgroundSync {
     }
 }
 
+/// Shifts the system DynamicTypeSize by N steps (density: ±1, larger type:
+/// +2). Every app font is `Font.custom(_:size:)`, which scales relative to
+/// body, so the shift rescales all text. Positive shifts cap at xxxLarge —
+/// the accessibility sizes stay reserved for the SYSTEM setting (which we
+/// never reduce).
+private struct TypeScale: ViewModifier {
+    @Environment(\.dynamicTypeSize) private var system
+    let steps: Int
+
+    func body(content: Content) -> some View {
+        content.dynamicTypeSize(shifted)
+    }
+
+    private var shifted: DynamicTypeSize {
+        guard steps != 0 else { return system }
+        let all = Array(DynamicTypeSize.allCases)
+        guard let i = all.firstIndex(of: system) else { return system }
+        let cap = all.firstIndex(of: .xxxLarge) ?? all.count - 1
+        let j = steps > 0 ? min(i + steps, max(cap, i)) : max(i + steps, 0)
+        return all[j]
+    }
+}
+
 @main
 struct UnstuckApp: App {
     @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var pushDelegate
@@ -69,7 +92,11 @@ struct UnstuckApp: App {
                 // OS, light/dark force the scheme. This flows into colorScheme
                 // and thus unstuckTheme()'s palette resolution below.
                 .preferredColorScheme(model.settings.theme.colorScheme)
-                .unstuckTheme()
+                .unstuckTheme(accent: model.settings.accent)
+                // Density + larger-type (Settings · Interface/Accessibility):
+                // shift DynamicTypeSize relative to the system size, the iOS
+                // analogue of Android's fontScale multiplier.
+                .modifier(TypeScale(steps: model.settings.typeStepShift))
                 .onOpenURL { model.handleDeepLink($0) }
                 .task {
                     #if DEBUG

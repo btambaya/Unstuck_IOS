@@ -11,6 +11,7 @@
 
 import SwiftUI
 import UnstuckCore
+import UnstuckDesign
 
 // `ThemePref` (system/light/dark) is the UnstuckCore enum (mirrors Android's
 // ThemePref); we only add the SwiftUI override seam here.
@@ -30,6 +31,13 @@ extension ThemePref {
 /// the choice for Android parity, but both map to the one available loop).
 enum AmbientSound: String, CaseIterable, Sendable {
     case off, brown, pink
+}
+
+/// Text density (Settings · Interface). Android folds this into one font
+/// scale (compact 0.94× / regular 1.0× / comfy 1.08×); iOS maps the same
+/// intent onto DynamicTypeSize steps (see `typeStepShift`).
+enum DensityPref: String, CaseIterable, Sendable {
+    case compact, regular, comfy
 }
 
 @MainActor
@@ -52,10 +60,42 @@ final class SettingsState {
         didSet { if !loading { d.set(theme.rawValue, forKey: "unstuck.theme") } }
     }
 
+    /// Accent palette (indigo+coral default / periwinkle+rose / forest+amber).
+    /// Applied at the app root via `unstuckTheme(accent:)`.
+    var accent: Accent = .indigo {
+        didSet { if !loading { d.set(accent.rawValue, forKey: "unstuck.accent") } }
+    }
+
+    /// Text density. Android: 0.94× / 1.0× / 1.08× font scale.
+    var density: DensityPref = .regular {
+        didSet { if !loading { d.set(density.rawValue, forKey: "unstuck.density") } }
+    }
+
     // MARK: Accessibility
 
     var reduceMotion: Bool = false {
         didSet { if !loading { d.set(reduceMotion, forKey: "unstuck.reduceMotion") } }
+    }
+
+    /// Larger type: Android applies +1.15× on top of density. iOS expresses
+    /// the same intent as +2 DynamicTypeSize steps (see `typeStepShift`).
+    var largerType: Bool = false {
+        didSet { if !loading { d.set(largerType, forKey: "unstuck.largerType") } }
+    }
+
+    /// Density + larger-type folded into one DynamicTypeSize step shift,
+    /// applied at the app root. All app fonts are `Font.custom(_:size:)`,
+    /// which scales relative to body — so shifting the type size scales
+    /// every text, like Android's LocalDensity fontScale multiplier.
+    var typeStepShift: Int {
+        var steps = 0
+        switch density {
+        case .compact: steps -= 1
+        case .comfy: steps += 1
+        case .regular: break
+        }
+        if largerType { steps += 2 }
+        return steps
     }
 
     // MARK: Focus
@@ -110,7 +150,10 @@ final class SettingsState {
         loading = true
         defer { loading = false }
         theme = ThemePref(rawValue: d.string(forKey: "unstuck.theme") ?? "") ?? .system
+        accent = Accent(rawValue: d.string(forKey: "unstuck.accent") ?? "") ?? .indigo
+        density = DensityPref(rawValue: d.string(forKey: "unstuck.density") ?? "") ?? .regular
         reduceMotion = d.bool(forKey: "unstuck.reduceMotion")   // default false
+        largerType = d.bool(forKey: "unstuck.largerType")       // default false
         focusDefaultMin = d.object(forKey: "unstuck.focusDefaultMin") == nil ? 25 : d.integer(forKey: "unstuck.focusDefaultMin")
         focusOverrunMin = d.object(forKey: "unstuck.focusOverrunMin") == nil ? 5 : d.integer(forKey: "unstuck.focusOverrunMin")
         focusSoftExit = d.object(forKey: "unstuck.focusSoftExit") == nil ? true : d.bool(forKey: "unstuck.focusSoftExit")
