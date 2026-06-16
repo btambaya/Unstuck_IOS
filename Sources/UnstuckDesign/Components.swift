@@ -57,7 +57,7 @@ public struct AreaDot: View {
     }
 }
 
-public enum ButtonKind: Sendable { case primary, ghost, danger }
+public enum ButtonKind: Sendable { case primary, ghost, danger, dark }
 
 /// Brand button. Primary uses the AA-contrast coralDeep CTA.
 public struct UButton: View {
@@ -84,6 +84,7 @@ public struct UButton: View {
         switch kind {
         case .primary, .danger: return .white
         case .ghost: return theme.palette.ink
+        case .dark: return theme.palette.bg   // ink button, cream text (Android ButtonKind.DARK)
         }
     }
     private var background: Color {
@@ -91,6 +92,7 @@ public struct UButton: View {
         case .primary: return theme.palette.coralDeep
         case .danger: return theme.palette.red
         case .ghost: return theme.palette.bg2
+        case .dark: return theme.palette.ink
         }
     }
 }

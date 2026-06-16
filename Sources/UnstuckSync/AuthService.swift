@@ -52,6 +52,18 @@ public struct AuthService: Sendable {
         catch { return .error(friendly(error)) }
     }
 
+    /// Sign in with Apple via a native ID token (ASAuthorization → Supabase
+    /// signInWithIdToken). Required by App Store Guideline 4.8 because we also
+    /// offer Google sign-in. `nonce` is the RAW nonce; Apple's request carried
+    /// its SHA-256, and Supabase/GoTrue compares the hash against the token.
+    public func signInWithApple(idToken: String, nonce: String) async -> AuthOutcome {
+        do {
+            _ = try await client.auth.signInWithIdToken(
+                credentials: OpenIDConnectCredentials(provider: .apple, idToken: idToken, nonce: nonce))
+            return .ok
+        } catch { return .error(friendly(error)) }
+    }
+
     public func resetPassword(email: String) async -> AuthOutcome {
         do { try await client.auth.resetPasswordForEmail(email); return .ok }
         catch { return .error(friendly(error)) }
