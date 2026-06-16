@@ -53,7 +53,7 @@ struct OnboardingView: View {
         HStack(spacing: 6) {
             ForEach(0...lastStep, id: \.self) { i in
                 Capsule()
-                    .fill(i <= step ? theme.palette.ink : theme.palette.line)
+                    .fill(i <= step ? theme.palette.ink : theme.palette.line2)
                     .frame(width: i == step ? 16 : 6, height: 6)
             }
         }
@@ -132,9 +132,9 @@ struct OnboardingView: View {
                 Button { tap(opt) } label: {
                     Text(opt)
                         .font(UFont.sans(14, .medium))
-                        .foregroundStyle(on ? .white : theme.palette.ink)
+                        .foregroundStyle(on ? theme.palette.bg : theme.palette.ink)
                         .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(on ? theme.palette.primary : theme.palette.surface, in: Capsule())
+                        .background(on ? theme.palette.ink : theme.palette.bg2, in: Capsule())
                         .overlay(Capsule().stroke(theme.palette.line))
                 }.buttonStyle(.plain)
             }

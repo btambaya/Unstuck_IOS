@@ -19,7 +19,9 @@ public struct Palette: Sendable {
 
     public static let light = Palette(
         bg: Color(hex: "#FAFAF7"), bg2: Color(hex: "#F4F2EC"), surface: Color(hex: "#FFFFFF"),
-        ink: OKLCH(0.22, 0.02, 280).color, ink2: OKLCH(0.40, 0.02, 280).color,
+        // Exact hex (matches Android's literal ink/ink2) so primary + secondary
+        // text render identically across platforms, not via an OKLCH approximation.
+        ink: Color(hex: "#1A1C26"), ink2: Color(hex: "#414252"),
         ink3: OKLCH(0.58, 0.02, 280).color, ink4: OKLCH(0.78, 0.01, 280).color,
         line: OKLCH(0.92, 0.005, 280).color, line2: OKLCH(0.88, 0.008, 280).color,
         primary: OKLCH(0.58, 0.13, 280).color, primarySoft: OKLCH(0.93, 0.04, 280).color,
