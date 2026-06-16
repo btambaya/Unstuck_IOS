@@ -99,7 +99,8 @@ final class AnalyticsModel {
     var enoughData: Bool { !wSessions.isEmpty }
     /// Estimate-hit % only means something once there's at least one calibration
     /// dot (an estimated, completed task) — otherwise the card reads "—".
-    var hasDots: Bool { !calibrationDots(wSessions, tasks).isEmpty }
+    var dots: [CalibrationDot] { calibrationDots(wSessions, tasks) }
+    var hasDots: Bool { !dots.isEmpty }
     var interruptions: [Int] { interruptionBins(wCaptures, wSessions) }
     var reEntry: [Int] { reEntryDistribution(wSessions) }
     var heatmap: Heatmap { timeOfDayHeatmap(wSessions) }
@@ -211,6 +212,9 @@ struct AnalyticsView: View {
 
         if vm.enoughData {
             stackedBars("When focus happens", vm).padding(.top, 12)
+            if vm.hasDots {
+                CalibrationScatter(dots: vm.dots, hitPct: vm.hitPct).padding(.top, 12)
+            }
             histogram("When interruptions happen", vm.interruptions, theme.palette.coral).padding(.top, 12)
             if !vm.insights.isEmpty {
                 SectionLabel("Worth noticing").padding(.top, 18).padding(.bottom, 6)
@@ -516,6 +520,58 @@ private struct FlowLegend: View {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Estimate-vs-actual scatter: square axes off a shared max so the y=x
+/// reference reads as a true 45° "perfect estimate" line (web/Android parity).
+/// Dots are green within 5 min of estimate, coral when off.
+private struct CalibrationScatter: View {
+    @Environment(\.uTheme) private var theme
+    let dots: [CalibrationDot]
+    let hitPct: Int
+
+    var body: some View {
+        let maxVal = ([70] + dots.flatMap { [$0.e, $0.a] }).max() ?? 70
+        Card {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Estimate calibration").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                Text("\(hitPct)% of recent sessions landed within 5 min of estimate.")
+                    .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                Canvas { ctx, size in
+                    let pad: CGFloat = 8
+                    let w = size.width - 2 * pad
+                    let h = size.height - 2 * pad
+                    func px(_ v: Int) -> CGFloat { pad + (CGFloat(v) / CGFloat(maxVal)) * w }
+                    func py(_ v: Int) -> CGFloat { (size.height - pad) - (CGFloat(v) / CGFloat(maxVal)) * h }
+                    // Axes.
+                    var axes = Path()
+                    axes.move(to: CGPoint(x: pad, y: size.height - pad))
+                    axes.addLine(to: CGPoint(x: size.width - pad, y: size.height - pad))
+                    axes.move(to: CGPoint(x: pad, y: pad))
+                    axes.addLine(to: CGPoint(x: pad, y: size.height - pad))
+                    // y = x reference (estimate == actual).
+                    axes.move(to: CGPoint(x: px(0), y: py(0)))
+                    axes.addLine(to: CGPoint(x: px(maxVal), y: py(maxVal)))
+                    ctx.stroke(axes, with: .color(theme.palette.line2), lineWidth: 1)
+                    // Dots: green within 5 min of estimate, coral when off.
+                    for d in dots {
+                        let within = abs(d.e - d.a) <= 5
+                        let cx = px(min(d.e, maxVal)), cy = py(min(d.a, maxVal))
+                        let r: CGFloat = 4
+                        let rect = CGRect(x: cx - r, y: cy - r, width: 2 * r, height: 2 * r)
+                        ctx.fill(Path(ellipseIn: rect), with: .color(within ? theme.palette.green : theme.palette.coral))
+                    }
+                }
+                .frame(height: 180)
+                .padding(.top, 8)
+                HStack(spacing: 14) {
+                    Text("→ estimate").font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
+                    Text("↑ actual").font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 }

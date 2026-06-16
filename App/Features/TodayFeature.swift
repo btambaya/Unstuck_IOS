@@ -163,40 +163,42 @@ struct TodayView: View {
             HStack {
                 Mark(size: 24)
                 Spacer()
-                // Inbox (MoveToInbox) → the capture triage tray; the coral dot
-                // marks open (untriaged) captures (Android Today header parity).
-                Button { model.router.present(.inbox) } label: {
-                    Image(systemName: "tray.and.arrow.down").font(.system(size: 18))
-                        .foregroundStyle(theme.palette.ink2).frame(width: 40, height: 40)
-                        .overlay(alignment: .topTrailing) {
-                            if (vm?.openCaptureCount(archivedIds: model.archivedCaptureIds) ?? 0) > 0 {
-                                Circle().fill(theme.palette.coral).frame(width: 8, height: 8)
-                                    .offset(x: -8, y: 8)
+                HStack(spacing: 2) {
+                    // Inbox (MoveToInbox) → the capture triage tray; the coral dot
+                    // marks open (untriaged) captures (Android Today header parity).
+                    Button { model.router.present(.inbox) } label: {
+                        Image(systemName: "tray.and.arrow.down").font(.system(size: 20))
+                            .foregroundStyle(theme.palette.ink2).frame(width: 40, height: 40)
+                            .overlay(alignment: .topTrailing) {
+                                if (vm?.openCaptureCount(archivedIds: model.archivedCaptureIds) ?? 0) > 0 {
+                                    Circle().fill(theme.palette.coral).frame(width: 7, height: 7)
+                                        .offset(x: -9, y: 9)
+                                }
                             }
-                        }
-                }.buttonStyle(.plain).accessibilityLabel("Inbox")
-                // Bell → in-app Notification Center; the dot is the unread
-                // badge (newest log entry vs lastSeen — spec 10 §1.9).
-                Button { showNotifCenter = true } label: {
-                    Image(systemName: "bell").font(.system(size: 18)).foregroundStyle(theme.palette.ink2).frame(width: 40, height: 40)
-                        .overlay(alignment: .topTrailing) {
-                            if NotificationLog.shared.hasUnread {
-                                Circle().fill(theme.palette.coral).frame(width: 8, height: 8)
-                                    .offset(x: -8, y: 8)
+                    }.buttonStyle(.plain).accessibilityLabel("Inbox")
+                    // Bell → in-app Notification Center; the dot is the unread
+                    // badge (newest log entry vs lastSeen — spec 10 §1.9).
+                    Button { showNotifCenter = true } label: {
+                        Image(systemName: "bell").font(.system(size: 20)).foregroundStyle(theme.palette.ink2).frame(width: 40, height: 40)
+                            .overlay(alignment: .topTrailing) {
+                                if NotificationLog.shared.hasUnread {
+                                    Circle().fill(theme.palette.coral).frame(width: 7, height: 7)
+                                        .offset(x: -9, y: 9)
+                                }
                             }
-                        }
-                }.buttonStyle(.plain)
-                Button { showSettings = true } label: {
-                    Text(model.avatarInitials)
-                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.greenInk)
-                        .frame(width: 32, height: 32).background(theme.palette.greenSoft, in: Circle())
-                }.buttonStyle(.plain)
+                    }.buttonStyle(.plain)
+                    Button { showSettings = true } label: {
+                        Text(model.avatarInitials)
+                            .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.greenInk)
+                            .frame(width: 32, height: 32).background(theme.palette.greenSoft, in: Circle())
+                    }.buttonStyle(.plain)
+                }
             }
-            .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 4)
+            .padding(.leading, 18).padding(.trailing, 12).padding(.top, 8).padding(.bottom, 4)
 
             VStack(alignment: .leading, spacing: 6) {
                 SectionLabel(dateEyebrow).foregroundStyle(theme.palette.primaryDeep)
-                Text("\(greeting),\nUnstuck.")
+                Text("\(greeting)\nUnstuck.")
                     .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
                 weekPill
             }
@@ -231,6 +233,8 @@ struct TodayView: View {
                     Image(systemName: "bolt.fill").font(.system(size: 11)).foregroundStyle(theme.palette.primaryDeep)
                     SectionLabel("Start next").foregroundStyle(theme.palette.primaryDeep)
                 }
+                .padding(.horizontal, 9).padding(.vertical, 3)
+                .background(Color.white.opacity(scheme == .dark ? 0.12 : 0.7), in: Capsule())
                 HStack(spacing: 6) {
                     Circle().fill(theme.palette.coral).frame(width: 6, height: 6)
                     Text("\(t.lifeArea ?? "Focus") · \(t.name)")
@@ -239,14 +243,21 @@ struct TodayView: View {
                 Text(firstStepHeadline(t))
                     .font(UFont.sans(21, .bold)).foregroundStyle(theme.palette.ink).lineLimit(2).padding(.top, 6)
                 Text("\(t.estimateMin) min").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2).padding(.top, 6)
-                Button { model.router.beginFocus(t) } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "play.fill").font(.system(size: 13))
-                        Text("Focus").font(UFont.sans(15, .semibold))
-                    }
-                    .foregroundStyle(.white).frame(maxWidth: .infinity).padding(.vertical, 13)
-                    .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                }.buttonStyle(.plain).padding(.top, 14)
+                HStack(spacing: 10) {
+                    Button { model.router.beginFocus(t) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "play.fill").font(.system(size: 13))
+                            Text("Focus").font(UFont.sans(15, .semibold))
+                        }
+                        .foregroundStyle(.white).padding(.horizontal, 18).padding(.vertical, 13)
+                        .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }.buttonStyle(.plain)
+                    Button { showPalette = true } label: {
+                        Text("Pick another").font(UFont.sans(13, .medium))
+                            .foregroundStyle(theme.palette.primaryDeep)
+                            .padding(.horizontal, 10).padding(.vertical, 8)
+                    }.buttonStyle(.plain)
+                }.padding(.top, 14)
             }
             .padding(18)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -256,15 +267,14 @@ struct TodayView: View {
             // Nothing scheduled today — point to the Backlog (don't pull a backlog
             // task into the hero). Tapping flips the list below to the Backlog.
             Button { backlogActive = true } label: {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 0) {
                     SectionLabel("Nothing scheduled today").foregroundStyle(theme.palette.primaryDeep)
                     Text("Pick something to start.")
-                        .font(UFont.sans(21, .bold)).foregroundStyle(theme.palette.ink)
+                        .font(UFont.sans(21, .bold)).foregroundStyle(theme.palette.ink).padding(.top, 6)
                     HStack(spacing: 6) {
                         Text("\(vm.backlogCount) in your backlog")
                             .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.primaryDeep)
-                        Image(systemName: "arrow.right").font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(theme.palette.primaryDeep)
+                        Text("→").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.primaryDeep)
                     }.padding(.top, 4)
                 }
                 .padding(18)
@@ -273,9 +283,18 @@ struct TodayView: View {
                             in: RoundedRectangle(cornerRadius: 24, style: .continuous))
             }.buttonStyle(.plain)
         } else {
-            VStack(spacing: 8) {
-                Text("All clear.").font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
-                Text("Add a task to get going.").font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+            VStack(spacing: 10) {
+                Mark(size: 48)
+                SectionLabel("Nothing to start").foregroundStyle(theme.palette.primaryDeep)
+                Text("You're all clear.").font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
+                Text("Nothing's missing. When something's on your mind, drop it in.")
+                    .font(UFont.sans(14)).foregroundStyle(theme.palette.ink2)
+                    .multilineTextAlignment(.center).padding(.horizontal, 8)
+                Button { showPalette = true } label: {
+                    Text("Add one thing").font(UFont.sans(15, .semibold))
+                        .foregroundStyle(.white).padding(.horizontal, 18).padding(.vertical, 13)
+                        .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+                }.buttonStyle(.plain).padding(.top, 6)
             }
             .frame(maxWidth: .infinity).padding(.vertical, 32).padding(.horizontal, 22)
             .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
@@ -322,10 +341,10 @@ struct TodayView: View {
             HStack(spacing: 5) {
                 if let dot { Circle().fill(dot).frame(width: 6, height: 6) }
                 Text(title).font(UFont.sans(12, .medium))
-                    .foregroundStyle(selected ? .white : theme.palette.ink2)
+                    .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
-            .background(selected ? theme.palette.primary : theme.palette.bg2, in: Capsule())
+            .background(selected ? theme.palette.ink : theme.palette.bg2, in: Capsule())
         }.buttonStyle(.plain)
     }
 
@@ -342,7 +361,7 @@ struct TodayView: View {
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                 .padding(.horizontal, 18).padding(.vertical, 28)
         } else {
-            VStack(spacing: 8) {
+            VStack(spacing: 6) {
                 ForEach(rows) { t in taskRow(t) }
             }
             .padding(.horizontal, 18)
@@ -358,26 +377,32 @@ struct TodayView: View {
                 // (mirrors Android TodayScreen + the Tasks list).
                 if t.done {
                     Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 16)).foregroundStyle(theme.palette.greenInk)
+                        .font(.system(size: 18)).foregroundStyle(theme.palette.green)
                 }
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 5) {
-                        Text(t.name).font(UFont.sans(16, .medium))
+                        Text(t.name).font(UFont.sans(14, .medium))
                             .strikethrough(t.done)
                             .foregroundStyle(t.done ? theme.palette.ink3 : theme.palette.ink).lineLimit(1)
                         if isOccurrence { Text("↻").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3) }
                     }
-                    HStack(spacing: 6) {
-                        Circle().fill(theme.palette.areaColor(t.lifeArea)).frame(width: 6, height: 6)
+                    HStack(spacing: 5) {
+                        Circle().fill(theme.palette.areaColor(t.lifeArea)).frame(width: 5, height: 5)
                         Text(t.lifeArea ?? "—").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        // Tags inline on the same line as the area (matches Android + the Tasks list).
+                        ForEach(Array((t.tags ?? []).prefix(3)), id: \.self) { tn in
+                            Text("#\(tn)").font(UFont.sans(10, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                                .padding(.horizontal, 7).padding(.vertical, 2)
+                                .background(theme.palette.primarySoft, in: Capsule())
+                        }
                     }
                 }
                 Spacer()
-                Text("\(t.estimateMin)m").font(UFont.mono(12)).foregroundStyle(theme.palette.ink3)
+                Text("\(t.estimateMin)m").font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
             }
-            .padding(.horizontal, 16).padding(.vertical, 14)
-            .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(theme.palette.line))
+            .padding(.horizontal, 12).padding(.vertical, 11)
+            .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.palette.line))
         }.buttonStyle(.plain)
         .contextMenu {
             Button { model.toggleDone(t) } label: {
@@ -396,19 +421,19 @@ struct TodayView: View {
     // MARK: recap card (Android "Just now" parity)
 
     private func recapCard(_ recap: AppModel.RecapState) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("JUST NOW").font(UFont.mono(11, .medium)).tracking(0.8)
-                    .foregroundStyle(theme.palette.coralDeep)
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top) {
+                SectionLabel("Just now").foregroundStyle(theme.palette.coralDeep)
                 Spacer()
                 Button { model.lastRecap = nil } label: {
-                    Text("✕").font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+                    Text("✕").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                 }.buttonStyle(.plain)
             }
             Text("You did the thing.").font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
+                .padding(.top, 4)
             Text("\(max(1, recap.focusedSec / 60)) MIN FOCUSED · \(recap.taskName)")
                 .font(UFont.mono(11)).foregroundStyle(theme.palette.ink2)
-                .lineLimit(1).truncationMode(.tail)
+                .lineLimit(1).truncationMode(.tail).padding(.top, 6)
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.palette.coralSoft, in: RoundedRectangle(cornerRadius: 18, style: .continuous))

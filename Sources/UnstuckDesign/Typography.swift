@@ -1,10 +1,10 @@
-// Brand fonts. The .ttf files are bundled in the app target (added with
-// the Xcode project); these helpers reference them by PostScript name and
-// fall back to the system font if absent, so UnstuckDesign builds + previews
-// without the font files present.
-//   sans  — Geist (UI text)
-//   serif — Instrument Serif (italic display headers)
-//   mono  — IBM Plex Mono (eyebrows / labels)
+// Brand fonts (bundled in App/Fonts/, registered via Info.plist UIAppFonts).
+// Referenced by their real PostScript names so they actually load (and match
+// Android, which bundles the same families); fall back to the system font if
+// absent so UnstuckDesign still builds/previews without them.
+//   sans  — Geist (UI text)          PS: Geist[-Regular] (variable)
+//   serif — Instrument Serif italic  PS: InstrumentSerif-Italic
+//   mono  — IBM Plex Mono            PS: IBMPlexMono-Regular / -Medium
 
 import SwiftUI
 
@@ -16,6 +16,7 @@ public enum UFont {
         .custom("InstrumentSerif-Italic", size: size)
     }
     public static func mono(_ size: CGFloat, _ weight: Font.Weight = .medium) -> Font {
-        .custom("IBMPlexMono", size: size).weight(weight)
+        // Two real cuts are bundled; pick Medium for any non-regular weight.
+        .custom(weight == .regular ? "IBMPlexMono-Regular" : "IBMPlexMono-Medium", size: size)
     }
 }

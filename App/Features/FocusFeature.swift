@@ -239,7 +239,7 @@ struct FocusView: View {
 
     private func phaseLabel(_ text: String) -> some View {
         Text(text)
-            .font(UFont.mono(11, .medium)).tracking(0.8)
+            .font(UFont.mono(11, .medium)).tracking(0.9)
             .foregroundStyle(.white.opacity(0.55))
     }
 
@@ -247,7 +247,7 @@ struct FocusView: View {
         Button(action: action) {
             Text(treatmentName(t))
                 .font(UFont.sans(12, .medium))
-                .foregroundStyle(selected ? OKLCH(0.18, 0.05, 280).color : .white.opacity(0.7))
+                .foregroundStyle(selected ? Color(hex: "#14122A") : .white.opacity(0.7))
                 .padding(.horizontal, 13).padding(.vertical, 6)
                 .background(selected ? AnyShapeStyle(Color.white.opacity(0.92)) : AnyShapeStyle(Color.white.opacity(0.08)),
                             in: Capsule())
@@ -487,8 +487,10 @@ private struct WhiteOrbit: View {
         let anchor = size * 6.8 / 32
         let dot = size * 4.2 / 32
         ZStack {
+            // ~304° arc with a 56° gap centered at 3 o'clock (where the coral
+            // satellite sits) — mirrors Android's Orbit (startAngle 28°, sweep 304°).
             Circle()
-                .trim(from: 0.125, to: 0.875)
+                .trim(from: 28.0 / 360.0, to: 332.0 / 360.0)
                 .stroke(.white, style: StrokeStyle(lineWidth: stroke, lineCap: .round))
                 .frame(width: ring, height: ring)
             Circle().fill(.white).frame(width: anchor, height: anchor)

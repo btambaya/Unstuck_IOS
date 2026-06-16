@@ -124,28 +124,23 @@ struct CalendarView: View {
     // MARK: segmented control (MdSegment)
 
     private var segment: some View {
-        HStack(spacing: 0) {
+        HStack(spacing: 2) {
             ForEach(CalMode.allCases, id: \.self) { m in
                 let on = mode == m
                 Button { mode = m } label: {
                     Text(m.rawValue)
-                        .font(UFont.sans(14, on ? .semibold : .medium))
-                        .foregroundStyle(on ? theme.palette.ink : theme.palette.ink2)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(on ? theme.palette.surface : .clear,
-                                    in: RoundedRectangle(cornerRadius: 999, style: .continuous))
-                        .overlay {
-                            if on {
-                                RoundedRectangle(cornerRadius: 999, style: .continuous)
-                                    .stroke(theme.palette.line, lineWidth: 1)
-                            }
-                        }
+                        // ink2 (not ink3) for inactive labels: 11pt on bg2 needs ≥4.5:1 AA contrast.
+                        .font(UFont.sans(11, .semibold))
+                        .foregroundStyle(on ? theme.palette.bg : theme.palette.ink2)
+                        .frame(maxWidth: .infinity, minHeight: 40)
+                        .padding(.horizontal, 10).padding(.vertical, 4)
+                        .background(on ? theme.palette.ink : .clear,
+                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 }.buttonStyle(.plain)
             }
         }
-        .padding(4)
-        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 999, style: .continuous))
+        .padding(2)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     // MARK: Google connect / sync bar (CalendarSyncBar)
@@ -686,7 +681,7 @@ struct DayGridView: View {
             VStack(spacing: 0) {
                 ForEach(firstHour..<lastHour, id: \.self) { hour in
                     HStack(alignment: .top, spacing: 0) {
-                        Text(hourLabel(hour)).font(UFont.mono(10)).foregroundStyle(theme.palette.ink4)
+                        Text(formatTime(String(format: "%02d:00", hour))).font(UFont.mono(10)).foregroundStyle(theme.palette.ink4)
                             .frame(width: 64, alignment: .leading)
                             .padding(.leading, 12).padding(.top, 2)
                         Rectangle().fill(.clear).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -802,9 +797,6 @@ struct DayGridView: View {
     private var dayLabel: String {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEE, MMM d"
         return f.string(from: date)
-    }
-    private func hourLabel(_ hour: Int) -> String {
-        "\(((hour + 11) % 12) + 1) \(hour >= 12 ? "PM" : "AM")"
     }
     private func minutesOf(_ hhmm: String) -> Int {
         let p = hhmm.split(separator: ":").compactMap { Int($0) }

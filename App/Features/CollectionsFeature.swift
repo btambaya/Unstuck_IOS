@@ -39,7 +39,7 @@ private struct ColorChip: View {
     var dot: CGFloat = 8
     var body: some View {
         let color = theme.palette.areaColor(token)
-        RoundedRectangle(cornerRadius: box * 0.32, style: .continuous)
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
             .fill(color.opacity(0.22))
             .frame(width: box, height: box)
             .overlay(Circle().fill(color).frame(width: dot, height: dot))
@@ -278,13 +278,13 @@ struct CollectionDetailView: View {
                             HStack(spacing: 4) {
                                 Button { model.archiveCollection(col.id, archived: !archived); dismiss() } label: {
                                     Image(systemName: archived ? "tray.and.arrow.up" : "archivebox")
-                                        .font(.system(size: 19)).foregroundStyle(theme.palette.ink3).padding(1)
+                                        .font(.system(size: 21)).foregroundStyle(theme.palette.ink3).padding(1)
                                 }.buttonStyle(.plain)
                                 Button { confirmDelete = true } label: {
-                                    Image(systemName: "trash").font(.system(size: 19)).foregroundStyle(theme.palette.ink3).padding(1)
+                                    Image(systemName: "trash").font(.system(size: 21)).foregroundStyle(theme.palette.ink3).padding(1)
                                 }.buttonStyle(.plain)
                                 Button { showShare = true } label: {
-                                    Image(systemName: "square.and.arrow.up").font(.system(size: 20)).foregroundStyle(theme.palette.ink2)
+                                    Image(systemName: "square.and.arrow.up").font(.system(size: 22)).foregroundStyle(theme.palette.ink2)
                                 }.buttonStyle(.plain)
                             }
                         } else {
@@ -443,17 +443,17 @@ private struct CollItemRow: View {
                 HStack(spacing: 8) {
                     Button { model.toggleCollectionItemPin(col, itemId: item.id) } label: {
                         Image(systemName: "pin\(item.pinned == true ? ".fill" : "")")
-                            .font(.system(size: 17))
+                            .font(.system(size: 19))
                             .foregroundStyle(item.pinned == true ? theme.palette.coral : theme.palette.ink4)
                     }.buttonStyle(.plain)
                     // Hide Move-to-task while a promotion is in flight (avoids a duplicate task).
                     if !(item.promoted == true) || item.promotedDone == true {
                         Button { onMoveToTask() } label: {
-                            Image(systemName: "arrow.up.forward.app").font(.system(size: 17)).foregroundStyle(theme.palette.ink4)
+                            Image(systemName: "arrow.up.forward.app").font(.system(size: 19)).foregroundStyle(theme.palette.ink4)
                         }.buttonStyle(.plain)
                     }
                     Button { model.removeCollectionItem(col, itemId: item.id) } label: {
-                        Image(systemName: "xmark").font(.system(size: 16)).foregroundStyle(theme.palette.ink4)
+                        Image(systemName: "xmark").font(.system(size: 19)).foregroundStyle(theme.palette.ink4)
                     }.buttonStyle(.plain)
                 }
             }

@@ -34,7 +34,15 @@
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
+	<key>UIAppFonts</key>
+	<array>
+		<string>geist_variable.ttf</string>
+		<string>instrument_serif_regular.ttf</string>
+		<string>instrument_serif_italic.ttf</string>
+		<string>ibm_plex_mono_regular.ttf</string>
+		<string>ibm_plex_mono_medium.ttf</string>
+	</array>
 	<!-- Only standard HTTPS/TLS — exempt; skips the TestFlight compliance prompt. -->
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
