@@ -61,7 +61,7 @@ struct AuthView: View {
 
                 socialButton("Continue with Google", systemIcon: nil) { Task { await google() } }
                     .padding(.top, 10)
-                socialButton("Continue with Apple", systemIcon: "applelogo") { Task { await apple() } }
+                socialButton("Continue with Apple", systemIcon: "apple.logo") { Task { await apple() } }
                     .padding(.top, 10)
 
                 Button(signUp ? "Already have an account? Sign in" : "New here? Create an account") {
@@ -230,15 +230,11 @@ struct AuthView: View {
     }
 }
 
-/// The multicolor Google "G", drawn with CoreGraphics-free SwiftUI so we don't
-/// need a bundled asset. Approximates the brand mark for the outlined button.
+/// The official multicolor Google "G" (bundled asset, rendered from the same
+/// brand paths Android uses).
 private struct GoogleG: View {
     var body: some View {
-        ZStack {
-            Text("G")
-                .font(.system(size: 16, weight: .bold, design: .default))
-                .foregroundStyle(Color(red: 0.26, green: 0.52, blue: 0.96))
-        }
+        Image("GoogleG").resizable().scaledToFit()
     }
 }
 
