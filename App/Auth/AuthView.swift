@@ -83,6 +83,13 @@ struct AuthView: View {
                 Text(signUp ? "Quiet clarity, with momentum." : "The anchor stays steady. You move around it.")
                     .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
                     .multilineTextAlignment(.center).padding(.top, 40)
+
+                // Terms + privacy agreement (App Store 1.2 / 5.1.1). Markdown
+                // links open in Safari.
+                Text("By continuing you agree to our [Terms of Use](https://unstucknow.io/terms) and [Privacy Policy](https://unstucknow.io/privacy).")
+                    .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                    .tint(theme.palette.primaryDeep)
+                    .multilineTextAlignment(.center).padding(.top, 14)
             }
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 22).padding(.bottom, 30)

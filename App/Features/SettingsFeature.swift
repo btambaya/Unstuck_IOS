@@ -85,6 +85,16 @@ struct SettingsView: View {
 
             divider
             navRow("Areas & tags") { TagsAreasView() }
+
+            divider
+            // Legal (App Store 1.2 / 5.1.1 — terms + privacy reachable in-app).
+            actionRow("Terms of Use", sub: "unstucknow.io/terms") {
+                if let u = URL(string: "https://unstucknow.io/terms") { UIApplication.shared.open(u) }
+            }
+            divider
+            actionRow("Privacy Policy", sub: "unstucknow.io/privacy") {
+                if let u = URL(string: "https://unstucknow.io/privacy") { UIApplication.shared.open(u) }
+            }
         }
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))

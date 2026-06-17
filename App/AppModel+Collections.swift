@@ -434,6 +434,41 @@ extension AppModel {
                                appVersion: Self.appVersion, platform: "ios", device: device, screen: screen)
     }
 
+    // MARK: - Safety (App Store Guideline 1.2 — user-generated/shared content)
+
+    /// Device-local set of blocked collaborator emails (lowercased). A blocked
+    /// person is removed from your shared lists and can't be re-invited. Cleared
+    /// on sign-out alongside the other device-local state.
+    private static let blockedEmailsKey = "unstuck.blockedEmails"
+
+    var blockedEmails: Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: Self.blockedEmailsKey) ?? [])
+    }
+
+    func isBlocked(_ email: String) -> Bool {
+        blockedEmails.contains(email.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Block an abusive collaborator: add to the blocklist + remove them from
+    /// this shared collection (so they lose access immediately).
+    func blockUser(email: String, inCollection collectionId: String, userId: String?) {
+        var s = blockedEmails
+        s.insert(email.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
+        UserDefaults.standard.set(Array(s), forKey: Self.blockedEmailsKey)
+        Task {
+            if let userId { await unshareCollection(collectionId, userId: userId) }
+            else { await cancelCollectionInvite(collectionId, email: email) }
+        }
+    }
+
+    /// Report objectionable content / a collaborator. Routes through the
+    /// feedback channel (triaged in the Supabase dashboard) so we can act.
+    func reportConcern(collectionId: String, about email: String, reason: String) async {
+        _ = await sendFeedback(
+            body: "⚠️ REPORT — shared collection \(collectionId), member \(email): \(reason)",
+            category: "report", screen: "shared-collection")
+    }
+
     /// e.g. "iPhone17,3". (Marketing names need a lookup table; the identifier is
     /// stable + sufficient for triage.)
     static var deviceModelName: String {

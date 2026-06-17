@@ -575,6 +575,7 @@ struct CollectionShareView: View {
     @State private var message: (ok: Bool, text: String)?
     @State private var members: [CollectionMemberInfo] = []
     @State private var loading = true
+    @State private var reportTarget: CollectionMemberInfo?
 
     var body: some View {
         NavigationStack {
@@ -627,6 +628,19 @@ struct CollectionShareView: View {
         }
         .presentationDetents([.medium, .large])
         .task { await refresh() }
+        .confirmationDialog("Report this person?", isPresented: Binding(
+            get: { reportTarget != nil }, set: { if !$0 { reportTarget = nil } }),
+            titleVisibility: .visible, presenting: reportTarget) { m in
+            ForEach(["Objectionable content", "Spam", "Harassment", "Other"], id: \.self) { reason in
+                Button(reason) {
+                    Task { await model.reportConcern(collectionId: collectionId, about: m.email, reason: reason) }
+                    reportTarget = nil
+                }
+            }
+            Button("Cancel", role: .cancel) { reportTarget = nil }
+        } message: { m in
+            Text("Send a report about \(m.email) to the Unstuck team. We review reports and take action.")
+        }
     }
 
     private var memberSummary: String {
@@ -643,8 +657,19 @@ struct CollectionShareView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             if m.pending { Text("PENDING").font(UFont.sans(9, .bold)).foregroundStyle(theme.palette.amberInk) }
             Text(m.role == "viewer" ? "VIEW" : "EDIT").font(UFont.sans(10, .bold)).foregroundStyle(theme.palette.ink3)
-            Button { remove(m) } label: { Image(systemName: "xmark").foregroundStyle(theme.palette.ink3).padding(2) }
-                .buttonStyle(.plain)
+            // Safety actions (App Store 1.2): report or block a collaborator,
+            // plus remove them from this list.
+            Menu {
+                Button { remove(m) } label: { Label("Remove from list", systemImage: "xmark") }
+                Button { reportTarget = m } label: { Label("Report…", systemImage: "flag") }
+                Button(role: .destructive) {
+                    model.blockUser(email: m.email, inCollection: collectionId, userId: m.userId)
+                    members.removeAll { $0.id == m.id }
+                } label: { Label("Block \(m.email)", systemImage: "hand.raised") }
+            } label: {
+                Image(systemName: "ellipsis").foregroundStyle(theme.palette.ink3).padding(4)
+            }
+            .buttonStyle(.plain)
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
         .background(theme.palette.bg2).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -658,6 +683,9 @@ struct CollectionShareView: View {
     private func submit() {
         let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !e.isEmpty, !busy else { return }
+        guard !model.isBlocked(e) else {
+            message = (false, "You've blocked that person."); return
+        }
         busy = true; message = nil
         Task {
             let outcome = await model.shareCollection(collectionId, email: e, role: role)
