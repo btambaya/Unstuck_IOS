@@ -274,8 +274,13 @@ struct NewTaskSheet: View {
             if repeatKind == .weekly { weekdayToggles }
             if repeatKind != .none {
                 Toggle("Ends on a date", isOn: $untilOn).font(UFont.sans(14))
-                if untilOn { DatePicker("Until", selection: $until, displayedComponents: .date).font(UFont.sans(14)) }
+                if untilOn { DatePicker("Until", selection: $until, in: Date()..., displayedComponents: .date).font(UFont.sans(14)) }
             }
+        }
+        // Weekly always keeps at least one day (Android seeds Monday) — a
+        // weekly rule with no days would materialize nothing.
+        .onChange(of: repeatKind) { _, kind in
+            if kind == .weekly && days.isEmpty { days = [1] }
         }
     }
 
@@ -400,7 +405,8 @@ struct NewTaskSheet: View {
             ForEach(Array(["S", "M", "T", "W", "T", "F", "S"].enumerated()), id: \.offset) { idx, label in
                 let on = days.contains(idx)
                 Button {
-                    if on { days.remove(idx) } else { days.insert(idx) }
+                    // Never empty the set (Android re-seeds the removed day).
+                    if on { if days.count > 1 { days.remove(idx) } } else { days.insert(idx) }
                 } label: {
                     Text(label)
                         .font(.system(size: 13, weight: .medium))
