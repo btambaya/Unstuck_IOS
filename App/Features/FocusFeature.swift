@@ -125,6 +125,11 @@ struct FocusView: View {
     /// Soft-exit confirm ("Leave focus?") — Android parity: the timer keeps
     /// running and stays resumable from Today; we just stop showing it.
     @State private var showLeaveConfirm = false
+    // End-of-session reflection (Android ReflectSheet) — shown after Done /
+    // End for now; momentary, nothing is stored.
+    @State private var showReflect = false
+    @State private var reflectMin = 0
+    @State private var reflectSel: String?
 
     private let reasons = ["Bathroom", "Drink", "Quick question", "Stuck — need a moment", "Other"]
 
@@ -168,6 +173,7 @@ struct FocusView: View {
             Text("Your timer keeps running — you can pick it back up from Today.")
         }
         .sheet(isPresented: $showCapture) { captureSheet }
+        .sheet(isPresented: $showReflect, onDismiss: { dismiss() }) { reflectSheet }
         .onDisappear { AmbientAudio.shared.stop() }
     }
 
@@ -391,7 +397,54 @@ struct FocusView: View {
         } ?? task
         model.finishFocus(task: focusTask, session: result.session, elapsedSec: result.elapsedSec,
                           markDone: markDone, occurrenceBlockId: fm.occurrence?.blockId)
-        dismiss()
+        // Show the momentary reflection (Android parity); its onDismiss closes Focus.
+        reflectMin = max(1, Int((Double(result.elapsedSec) / 60.0).rounded()))
+        showReflect = true
+    }
+
+    // End-of-session reflection (Android ReflectSheet) — momentary; nothing is
+    // stored. Both Skip and Done close it; its onDismiss closes the Focus screen.
+    private var reflectSheet: some View {
+        let opts: [(key: String, label: String, color: Color)] = [
+            ("flow", "It flowed.", theme.palette.greenSoft),
+            ("okay", "It was OK.", theme.palette.blueSoft),
+            ("sticky", "It was sticky.", theme.palette.amberSoft),
+            ("stopped", "I had to stop.", theme.palette.coralSoft),
+        ]
+        return VStack(alignment: .leading, spacing: 12) {
+            Text("SESSION COMPLETE · \(reflectMin)M").font(UFont.mono(11, .medium)).tracking(0.8)
+                .foregroundStyle(theme.palette.primaryDeep)
+            Text("How did that land?").font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
+            ForEach(opts, id: \.key) { o in
+                Button { reflectSel = o.key } label: {
+                    HStack(spacing: 12) {
+                        Circle().stroke(theme.palette.line2, lineWidth: 2).frame(width: 20, height: 20)
+                            .overlay(Circle().fill(theme.palette.ink).frame(width: 10, height: 10)
+                                .opacity(reflectSel == o.key ? 1 : 0))
+                        Text(o.label).font(UFont.sans(15)).foregroundStyle(theme.palette.ink)
+                        Spacer()
+                    }
+                    .padding(12)
+                    .background(reflectSel == o.key ? o.color : theme.palette.bg2,
+                                in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }.buttonStyle(.plain)
+            }
+            HStack {
+                Button("Skip") { showReflect = false }
+                    .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3).buttonStyle(.plain)
+                Spacer()
+                Button { showReflect = false } label: {
+                    Text("Done").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
+                        .padding(.horizontal, 18).padding(.vertical, 9)
+                        .background(theme.palette.ink, in: Capsule())
+                }.buttonStyle(.plain)
+            }
+            .padding(.top, 4)
+            Spacer()
+        }
+        .padding(22).frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.bg.ignoresSafeArea())
+        .presentationDetents([.height(420)])
     }
 
     private var captureSheet: some View {

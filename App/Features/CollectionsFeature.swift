@@ -51,6 +51,7 @@ struct ListsView: View {
     @Environment(\.uTheme) private var theme
     @State private var vm: CollectionsModel?
     @State private var newName = ""
+    @State private var newColor = "indigo"
     @State private var showNew = false
     @State private var query = ""
     @State private var showArchived = false
@@ -67,11 +68,7 @@ struct ListsView: View {
             .navigationBarHidden(true)
             .sheet(isPresented: $showSettings) { SettingsView() }
             .sheet(isPresented: $showPalette) { CommandPalette() }
-            .alert("New collection", isPresented: $showNew) {
-                TextField("Name", text: $newName)
-                Button("Add") { addCollection() }
-                Button("Cancel", role: .cancel) { newName = "" }
-            }
+            .sheet(isPresented: $showNew) { newCollectionSheet }
             .feedbackBubble()
         }
         .task {
@@ -186,11 +183,47 @@ struct ListsView: View {
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line))
     }
 
-    private func addCollection() {
+    // New-collection bottom sheet — name + color swatch + dark Create button
+    // (Android NewCollectionSheet parity; was a bare system alert with no color).
+    private var newCollectionSheet: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("NEW COLLECTION").font(UFont.mono(11, .medium)).tracking(0.8)
+                    .foregroundStyle(theme.palette.ink3)
+                TextField("What would you like to remember?", text: $newName)
+                    .textFieldStyle(.plain).font(UFont.sans(15))
+                    .padding(12)
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(theme.palette.line2))
+                    .submitLabel(.done).onSubmit { createCollection() }
+                Text("COLOR").font(UFont.mono(11, .medium)).tracking(0.8)
+                    .foregroundStyle(theme.palette.ink3)
+                HStack(spacing: 10) {
+                    ForEach(["indigo", "coral", "green", "amber", "blue", "violet"], id: \.self) { col in
+                        Circle().fill(theme.palette.areaColor(col)).frame(width: 30, height: 30)
+                            .overlay(Circle().stroke(theme.palette.ink, lineWidth: newColor == col ? 2 : 0))
+                            .onTapGesture { newColor = col }
+                    }
+                }
+                UButton("Create", kind: .dark) { createCollection() }
+                    .opacity(newName.trimmingCharacters(in: .whitespaces).isEmpty ? 0.5 : 1)
+                Spacer()
+            }
+            .padding(20).frame(maxWidth: .infinity, alignment: .leading)
+            .background(theme.palette.bg.ignoresSafeArea())
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showNew = false; newName = ""; newColor = "indigo" }
+                }
+            }
+        }
+        .presentationDetents([.height(380)])
+    }
+
+    private func createCollection() {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        newName = ""
         guard !trimmed.isEmpty, let vm else { return }
-        _ = model.addCollection(name: trimmed, existing: vm.collections)
+        _ = model.addCollection(name: trimmed, color: newColor, existing: vm.collections)
+        newName = ""; newColor = "indigo"; showNew = false
     }
 }
 
