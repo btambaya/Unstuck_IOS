@@ -107,8 +107,8 @@ public struct Chip: View {
         Text(title)
             .font(UFont.sans(13, .medium))
             .padding(.vertical, 5).padding(.horizontal, 11)
-            .foregroundStyle(selected ? Color.white : theme.palette.ink2)
-            .background(selected ? theme.palette.primary : theme.palette.bg2)
+            .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
+            .background(selected ? theme.palette.ink : theme.palette.bg2)
             .clipShape(Capsule())
     }
 }

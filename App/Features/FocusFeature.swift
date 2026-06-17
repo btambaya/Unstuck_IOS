@@ -117,7 +117,6 @@ struct FocusView: View {
     @State private var showReasons = false
     @State private var showCapture = false
     @State private var captureTag: CaptureTag = .followUp
-    @State private var showFinish = false
     @State private var captureText = ""
     /// Header mute toggle. Seeded from the Settings ambient choice in .task so
     /// the speaker starts in the state the user picked (off → muted).
@@ -161,11 +160,6 @@ struct FocusView: View {
                 Button(reason) { pauseWith(reason) }
             }
             Button("Just pause", role: .cancel) { fm?.pause(); coordinateCheckin() }
-        }
-        .confirmationDialog("Wrap up this session?", isPresented: $showFinish, titleVisibility: .visible) {
-            Button("Mark task complete") { finishSession(markDone: true) }
-            Button("Just finish") { finishSession(markDone: false) }
-            Button("Keep going", role: .cancel) {}
         }
         .confirmationDialog("Leave focus?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
             Button("Leave") { dismiss() }
@@ -340,7 +334,10 @@ struct FocusView: View {
                     else if model.settings.focusPauseReasons { fm.pause(); showReasons = true }
                     else { fm.pause(); coordinateCheckin() }
                 }
-                focusBtn("Done", soft: false) { showFinish = true }
+                // "Done" marks the task complete immediately (records the session
+                // + flips done), 1:1 with Android — no extra "complete vs finish"
+                // prompt; "End for now" below covers finishing without completing.
+                focusBtn("Done", soft: false) { finishSession(markDone: true) }
             }
             // Secondary actions: "Save for later" pauses (resumable from Today);
             // "End for now" records the session without completing the task.

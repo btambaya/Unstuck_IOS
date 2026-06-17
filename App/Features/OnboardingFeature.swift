@@ -163,7 +163,7 @@ struct OnboardingView: View {
                 if on { Image(systemName: "checkmark").foregroundStyle(.white) }
             }
             .padding(14)
-            .background(on ? theme.palette.primary : theme.palette.surface)
+            .background(on ? theme.palette.ink : theme.palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).stroke(theme.palette.line))
         }.buttonStyle(.plain)

@@ -128,6 +128,12 @@ struct TaskEditor: View {
                 }
                 if let task {
                     Section {
+                        // Mark done / un-complete from the editor (Android
+                        // TaskDetailSheet's "Mark done" / "✓ Done" toggle).
+                        Button(task.done ? "✓ Done — mark not done" : "Mark done") {
+                            model.toggleDone(task)
+                            dismiss()
+                        }
                         Button("Schedule for today") {
                             model.scheduleTask(task)
                             dismiss()
