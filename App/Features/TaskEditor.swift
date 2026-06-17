@@ -1,5 +1,8 @@
-// Create / edit a task, including the recurrence editor. Saving with a
-// recurrence materializes future cal_blocks via the tested
+// Create / edit a task. Mirrors the Android NewTaskSheet / TaskDetailSheet:
+// estimate CHIPS + area PILLS (not a stepper / free-text field), recurrence,
+// per-task reminder, and the Captures section. NO priority field — priority
+// is a mockup-only idea that isn't in the web app or Android, so it's not here.
+// Saving with a recurrence materializes future cal_blocks via the tested
 // regenerateForTask (AppModel.saveTaskWithRecurrence).
 
 import SwiftUI
@@ -20,9 +23,10 @@ struct TaskEditor: View {
 
     enum RepeatKind: String, CaseIterable { case none = "None", daily = "Daily", weekly = "Weekly", monthly = "Monthly" }
 
+    private static let estimatePresets = [15, 25, 45, 60, 90]
+
     @State private var name: String
     @State private var estimate: Int
-    @State private var priority: Priority
     @State private var lifeArea: String
     @State private var later: Bool
     @State private var repeatKind: RepeatKind
@@ -30,6 +34,7 @@ struct TaskEditor: View {
     @State private var untilOn: Bool
     @State private var until: Date
     @State private var reminderOverride: Int?
+    @State private var areas: [LifeArea] = []
 
     // Captures attached to this task (existing-task editor) — live from GRDB,
     // so adds/discards and remote sync refresh the list (Android
@@ -53,7 +58,6 @@ struct TaskEditor: View {
         _reminderOverride = State(initialValue: task.flatMap { NotificationPrefs.reminderOverride(taskId: $0.id) })
         _name = State(initialValue: task?.name ?? "")
         _estimate = State(initialValue: task?.estimateMin ?? defaultEstimate)
-        _priority = State(initialValue: task?.priority ?? .medium)
         _lifeArea = State(initialValue: task?.lifeArea ?? "")
         _later = State(initialValue: task?.later ?? false)
         switch task?.recurrence {
@@ -72,11 +76,8 @@ struct TaskEditor: View {
             Form {
                 Section("Task") {
                     TextField("What needs doing?", text: $name)
-                    Stepper("Estimate \(estimate)m", value: $estimate, in: 5...240, step: 5)
-                    Picker("Priority", selection: $priority) {
-                        ForEach(Priority.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) }
-                    }
-                    TextField("Life area (optional)", text: $lifeArea)
+                    chipRow(label: "Estimate") { estimateChips }
+                    chipRow(label: "Area") { areaPills }
                     Toggle("Save for later", isOn: $later)
                 }
                 Section("Repeat") {
@@ -92,8 +93,7 @@ struct TaskEditor: View {
                 }
                 // Per-task reminder override (spec 10 §1.11): Default uses
                 // the global lead; Off / 5 / 10 / 15 min before. Scheduled,
-                // non-Later tasks only (a Later task has no block to fire
-                // on). Device-local; cleared on sign-out.
+                // non-Later tasks only (a Later task has no block to fire on).
                 if let task, !later, !existingBlocks.isEmpty {
                     Section("Remind me") {
                         Picker("Remind me", selection: $reminderOverride) {
@@ -147,7 +147,57 @@ struct TaskEditor: View {
                 }
             }
             .task { await observeCaptures() }
+            .task { await observeAreas() }
         }
+    }
+
+    // MARK: estimate chips + area pills (Android NewTaskSheet/TaskDetailSheet)
+
+    private func chipRow<Content: View>(label: String, @ViewBuilder _ content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(label).font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) { content() }
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var estimateChips: some View {
+        let presets = Self.estimatePresets
+        return Group {
+            ForEach(presets, id: \.self) { m in
+                pill("\(m)m", selected: estimate == m) { estimate = m }
+            }
+            if !presets.contains(estimate) { pill("\(estimate)m", selected: true) {} }
+            // simple bump for an arbitrary estimate (Android has a Custom… dialog)
+            pill("+15", selected: false) { estimate = min(estimate + 15, 240) }
+        }
+    }
+
+    private var areaPills: some View {
+        Group {
+            pill("Unassigned", selected: lifeArea.isEmpty, dot: nil) { lifeArea = "" }
+            ForEach(areas) { a in
+                pill(a.name, selected: lifeArea == a.name, dot: theme.palette.areaColor(a.color)) {
+                    lifeArea = (lifeArea == a.name) ? "" : a.name
+                }
+            }
+        }
+    }
+
+    private func pill(_ label: String, selected: Bool, dot: Color? = nil, _ tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            HStack(spacing: 6) {
+                if let dot { Circle().fill(dot).frame(width: 6, height: 6) }
+                Text(label).font(UFont.sans(13, selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            .background(selected ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+            .overlay(Capsule().stroke(theme.palette.line2))
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: captures (Android TaskDetailSheet section parity)
@@ -223,6 +273,13 @@ struct TaskEditor: View {
         } catch {}
     }
 
+    private func observeAreas() async {
+        guard let repo = model.taskRepo else { return }
+        do {
+            for try await snap in repo.observeTasksAndBlocks() { areas = snap.areas }
+        } catch {}
+    }
+
     private var weekdayToggles: some View {
         HStack(spacing: 6) {
             ForEach(Array(["S", "M", "T", "W", "T", "F", "S"].enumerated()), id: \.offset) { idx, label in
@@ -233,8 +290,8 @@ struct TaskEditor: View {
                     Text(label)
                         .font(.system(size: 13, weight: .medium))
                         .frame(width: 30, height: 30)
-                        .background(on ? Color.accentColor : Color.secondary.opacity(0.15))
-                        .foregroundStyle(on ? .white : .primary)
+                        .background(on ? theme.palette.ink : theme.palette.bg2)
+                        .foregroundStyle(on ? theme.palette.bg : theme.palette.ink)
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
@@ -260,7 +317,6 @@ struct TaskEditor: View {
         var t = task ?? TaskItem(id: newUUID(), name: trimmed, estimateMin: estimate, createdAt: now, updatedAt: now)
         t.name = trimmed
         t.estimateMin = estimate
-        t.priority = priority
         t.lifeArea = lifeArea.trimmingCharacters(in: .whitespaces).isEmpty ? nil : lifeArea
         t.later = later
         t.recurrence = recurrence
