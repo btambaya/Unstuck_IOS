@@ -67,6 +67,10 @@ struct TaskEditor: View {
         return tasks.first(where: { $0.id == initialTask.id }) ?? initialTask
     }
     private var isDone: Bool { occBlock?.done ?? editTarget.done }
+    /// For a recurring occurrence the row's estimate is its block duration
+    /// (Android projects `estimateMin = block.durationMinutes`); the template's
+    /// estimate can differ. Show the occurrence's own duration.
+    private var displayEstimate: Int { occBlock?.durationMinutes ?? editTarget.estimateMin }
     private var myBlocks: [CalBlock] {
         blocks.filter { $0.taskId == editTarget.id && isTaskBlock($0) }
             .sorted { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
@@ -230,10 +234,10 @@ struct TaskEditor: View {
                     SectionLabel("Estimate")
                     chipScroll {
                         ForEach(Self.estimatePresets, id: \.self) { m in
-                            chip("\(m)m", selected: editTarget.estimateMin == m) { update { $0.estimateMin = m } }
+                            chip("\(m)m", selected: displayEstimate == m) { update { $0.estimateMin = m } }
                         }
-                        if !Self.estimatePresets.contains(editTarget.estimateMin) {
-                            chip("\(editTarget.estimateMin)m", selected: true) { openEstimate() }
+                        if !Self.estimatePresets.contains(displayEstimate) {
+                            chip("\(displayEstimate)m", selected: true) { openEstimate() }
                         }
                         chip("Custom…", selected: false) { openEstimate() }
                     }
@@ -575,7 +579,7 @@ struct TaskEditor: View {
         Task { try? await Task.sleep(nanoseconds: 350_000_000); model.router.beginFocus(t) }
     }
 
-    private func openEstimate() { estimateText = String(editTarget.estimateMin); showEstimate = true }
+    private func openEstimate() { estimateText = String(displayEstimate); showEstimate = true }
 
     private func openSchedule() {
         datePick = myBlocks.first.flatMap { Self.parseIso($0.date) } ?? Date()

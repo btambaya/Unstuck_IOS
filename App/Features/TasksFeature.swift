@@ -251,9 +251,12 @@ struct TasksView: View {
                             areaColor: areaColor(task.lifeArea, vm.areas),
                             ageDays: vm.view == .backlog ? vm.ageDays(task) : nil,
                             isRecurring: task.recurrence != nil || isOccurrence,
-                            // Opening an occurrence edits its TEMPLATE (the series),
-                            // never a phantom task keyed by the block id.
-                            onOpen: { editing = model.editableTask(for: task) },
+                            // Open the row as-is (incl. a projected occurrence,
+                            // id = block id). TaskEditor resolves the template for
+                            // field edits and routes done/skip to the occurrence —
+                            // so this must NOT pre-resolve to the template (that
+                            // would drop occurrence mode: Skip-today, per-day done).
+                            onOpen: { editing = task },
                             // Tag chips set the active tag filter (Android parity)
                             // instead of opening the row.
                             onTagTap: { vm.activeTag = $0 }
@@ -282,7 +285,7 @@ struct TasksView: View {
                                     Label("Skip this day", systemImage: "calendar.badge.minus")
                                 }
                             }
-                            Button { editing = model.editableTask(for: task) } label: {
+                            Button { editing = task } label: {
                                 Label(task.recurrence != nil ? "Edit series" : "Edit", systemImage: "pencil")
                             }
                         }
