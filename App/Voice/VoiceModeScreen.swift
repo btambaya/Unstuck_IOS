@@ -25,6 +25,7 @@ final class VoiceSessionModel {
     private let audio = VoiceAudioEngine()
     private var client: VoiceRealtimeClient?
     private var interruption: (any NSObjectProtocol)?
+    private var routeChange: (any NSObjectProtocol)?
 
     init(model: AppModel) { self.model = model }
 
@@ -53,6 +54,17 @@ final class VoiceSessionModel {
         let modelId = model.voiceModel
         let instructions = assistant.voiceInstructions()
         let tools = assistant.voiceTools()
+        // Mic acquisition failed (session activate / engine.start() — typically
+        // the mic held by another app). Stop the client + surface a note instead
+        // of leaving the UI stuck on "Listening…". 1:1 with Android.
+        audio.onCaptureError = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.client?.stop()
+                self.note = "Couldn't access the microphone — it may be in use by another app."
+                self.state = .error
+            }
+        }
         let rc = VoiceRealtimeClient(
             proxyURL: proxyURL, token: token, model: modelId,
             instructions: instructions, tools: tools, audio: audio,
@@ -75,19 +87,32 @@ final class VoiceSessionModel {
 
     func end() {
         if let interruption { NotificationCenter.default.removeObserver(interruption) }
+        if let routeChange { NotificationCenter.default.removeObserver(routeChange) }
         interruption = nil
+        routeChange = nil
         if let client { client.stop() } else { audio.shutdown() }
         client = nil
     }
 
     /// End the session if another app (e.g. an incoming call) interrupts audio —
-    /// the iOS analog of Android's audio-focus loss.
+    /// the iOS analog of Android's audio-focus loss — or if the active input
+    /// route disappears (e.g. headset unplugged), matching Android's
+    /// headset-removal teardown.
     private func observeInterruptions() {
         interruption = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
             guard let info = n.userInfo,
                   let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
                   AVAudioSession.InterruptionType(rawValue: raw) == .began else { return }
+            MainActor.assumeIsolated { self?.end() }
+        }
+        // Headset removal: the OS pulls the old input device. End rather than
+        // silently fall back to the built-in mic/speaker mid-call.
+        routeChange = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] n in
+            guard let info = n.userInfo,
+                  let raw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
+                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
             MainActor.assumeIsolated { self?.end() }
         }
     }
@@ -97,6 +122,7 @@ struct VoiceModeScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @State private var session: VoiceSessionModel?
 
     var body: some View {
@@ -136,6 +162,14 @@ struct VoiceModeScreen: View {
         .onDisappear { session?.end(); UIApplication.shared.isIdleTimerDisabled = false }
         .onChange(of: session?.isLive ?? false) { _, live in
             UIApplication.shared.isIdleTimerDisabled = live   // keep the screen awake mid-call
+        }
+        // Backgrounding/locking the app under a fullScreenCover does NOT fire
+        // .onDisappear, so without this a backgrounded session is a zombie call
+        // (mic + WebSocket + voiceChat audio session left alive). End it the
+        // moment we leave .active — the iOS analog of Android's ON_STOP teardown.
+        // end() is idempotent (client.stop() guards _stopped; end() nils client).
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { session?.end() }
         }
     }
 

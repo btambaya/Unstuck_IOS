@@ -324,6 +324,8 @@ private struct FocusSettingsView: View {
                     settings.focusOverrunMin = Int(v) ?? 0
                 }
                 CardDivider()
+                ToggleRow(label: "Hide right rail while focusing", isOn: $settings.focusCollapseRail)
+                CardDivider()
                 ToggleRow(label: "Soft exit", isOn: $settings.focusSoftExit)
                 CardDivider()
                 ToggleRow(label: "Pause reasons", isOn: $settings.focusPauseReasons)
@@ -344,6 +346,12 @@ private struct SoundSettingsView: View {
         @Bindable var settings = model.settings
         SettingsScaffold(eyebrow: "Settings · Sound", title: "Quiet by default.") {
             SettingsCard {
+                ToggleRow(label: "Start chime", isOn: $settings.soundStartChime)
+                CardDivider()
+                ToggleRow(label: "Overrun bell", isOn: $settings.soundOverrunBell)
+                CardDivider()
+                ToggleRow(label: "Completion sound", isOn: $settings.soundCompletion)
+                CardDivider()
                 SegRow(label: "Ambient",
                        options: [("off", "Off"), ("brown", "Brown"), ("pink", "Pink")],
                        selected: settings.ambient.rawValue) { v in
@@ -370,6 +378,10 @@ private struct AccessibilitySettingsView: View {
                 // +2 DynamicTypeSize steps on top of Density — Android's
                 // largerType 1.15× fontScale analogue.
                 ToggleRow(label: "Larger type", isOn: $settings.largerType)
+                CardDivider()
+                // Android `highContrast`. Stored for parity (SettingsState); the
+                // palette can stiffen hairlines/contrast off this flag.
+                ToggleRow(label: "High contrast", isOn: $settings.highContrast)
             }
         }
     }

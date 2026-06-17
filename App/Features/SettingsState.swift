@@ -83,6 +83,12 @@ final class SettingsState {
         didSet { if !loading { d.set(largerType, forKey: "unstuck.largerType") } }
     }
 
+    /// High contrast (Android `highContrast`). Stored for parity; consumers can
+    /// stiffen hairlines / text contrast off this flag.
+    var highContrast: Bool = false {
+        didSet { if !loading { d.set(highContrast, forKey: "unstuck.highContrast") } }
+    }
+
     /// Density + larger-type folded into one DynamicTypeSize step shift,
     /// applied at the app root. All app fonts are `Font.custom(_:size:)`,
     /// which scales relative to body — so shifting the type size scales
@@ -121,6 +127,13 @@ final class SettingsState {
         didSet { if !loading { d.set(focusPauseReasons, forKey: "unstuck.focusPauseReasons") } }
     }
 
+    /// Hide the right rail while focusing (Android `focusCollapseRail`). iOS has
+    /// no right rail in the focus surface today, so this is stored for parity;
+    /// the focus screen can honor it once a rail/side-panel exists. Android: true.
+    var focusCollapseRail: Bool = true {
+        didSet { if !loading { d.set(focusCollapseRail, forKey: "unstuck.focusCollapseRail") } }
+    }
+
     /// Treatment a fresh focus session starts in. Android: AMBIENT.
     var defaultTreatment: FocusTreatment = .ambient {
         didSet { if !loading { d.set(defaultTreatment.rawValue, forKey: "unstuck.defaultTreatment") } }
@@ -154,10 +167,12 @@ final class SettingsState {
         density = DensityPref(rawValue: d.string(forKey: "unstuck.density") ?? "") ?? .regular
         reduceMotion = d.bool(forKey: "unstuck.reduceMotion")   // default false
         largerType = d.bool(forKey: "unstuck.largerType")       // default false
+        highContrast = d.bool(forKey: "unstuck.highContrast")   // default false
         focusDefaultMin = d.object(forKey: "unstuck.focusDefaultMin") == nil ? 25 : d.integer(forKey: "unstuck.focusDefaultMin")
         focusOverrunMin = d.object(forKey: "unstuck.focusOverrunMin") == nil ? 5 : d.integer(forKey: "unstuck.focusOverrunMin")
         focusSoftExit = d.object(forKey: "unstuck.focusSoftExit") == nil ? true : d.bool(forKey: "unstuck.focusSoftExit")
         focusPauseReasons = d.object(forKey: "unstuck.focusPauseReasons") == nil ? true : d.bool(forKey: "unstuck.focusPauseReasons")
+        focusCollapseRail = d.object(forKey: "unstuck.focusCollapseRail") == nil ? true : d.bool(forKey: "unstuck.focusCollapseRail")
         defaultTreatment = FocusTreatment(rawValue: d.string(forKey: "unstuck.defaultTreatment") ?? "") ?? .ambient
         soundStartChime = d.object(forKey: "unstuck.soundStartChime") == nil ? true : d.bool(forKey: "unstuck.soundStartChime")
         soundOverrunBell = d.object(forKey: "unstuck.soundOverrunBell") == nil ? true : d.bool(forKey: "unstuck.soundOverrunBell")

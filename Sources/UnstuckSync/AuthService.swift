@@ -35,8 +35,21 @@ public struct AuthService: Sendable {
                 let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? nil : ["full_name": .string(trimmed), "display_name": .string(trimmed)]
             }
-            _ = try await client.auth.signUp(email: email, password: password, data: data)
-            return .ok
+            let response = try await client.auth.signUp(email: email, password: password, data: data)
+            let user = response.user
+            let hasSession = client.auth.currentSession != nil
+            // Supabase's anti-enumeration returns a "successful" obfuscated user for an
+            // already-registered email (no session, empty identities). Surface it instead
+            // of the misleading "check your email" — otherwise a returning user is stuck.
+            let exists = detectSignupAlreadyExists(
+                identitiesCount: user.identities?.count,
+                emailConfirmedAt: user.emailConfirmedAt.map { "\($0)" },
+                lastSignInAt: user.lastSignInAt.map { "\($0)" },
+                hasSession: hasSession)
+            if exists { return .alreadyExists }
+            // A genuine new sign-up with no session yet needs email confirmation; with a
+            // session (instant confirm) the auth-state stream navigates into the app.
+            return hasSession ? .ok : .needsConfirmation
         } catch { return .error(friendly(error)) }
     }
 

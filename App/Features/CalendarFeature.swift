@@ -54,14 +54,19 @@ final class CalendarModel {
             .sorted { $0.date < $1.date }
     }
     func blocks(on iso: String) -> [CalBlock] {
-        blocks.filter { $0.date == iso }.sorted { $0.startTime < $1.startTime }
+        // Skipped recurring occurrences are cancelled for that day — drop them
+        // (matches Android `blocksRaw.filter { !it.skipped }`).
+        blocks.filter { $0.date == iso && !$0.skipped }.sorted { $0.startTime < $1.startTime }
     }
     /// Open tasks with no block anywhere — the day grid's drag tray (matches
     /// Android: scheduled-anywhere tasks drop out of the tray so dragging one
     /// MOVES its block rather than re-adding it).
     func unscheduled() -> [TaskItem] {
         let scheduledIds = Set(blocks.filter { isTaskBlock($0) }.compactMap { $0.taskId })
-        return tasks.filter { !$0.done && !($0.later ?? false) && !scheduledIds.contains($0.id) }
+        // recurrence == nil: never offer a recurring TEMPLATE in the schedule tray
+        // — it's a hidden definition that generates occurrences, not a schedulable
+        // task. Mirrors the Android DayGrid `it.recurrence == null` filter.
+        return tasks.filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && !scheduledIds.contains($0.id) }
     }
 
     /// Focused seconds per ISO date, for the Month heatmap.
@@ -80,12 +85,21 @@ struct CalendarView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @State private var vm: CalendarModel?
-    @State private var showBlock = false
     @State private var showSettings = false
     @State private var showPalette = false
     @State private var mode: CalMode = .day
+    /// Tap-to-create prefill: the day + snapped time of an empty grid slot. A
+    /// local sheet (the AppRouter's Sheet enum can't carry a prefill payload).
+    @State private var createAt: CreateAt?
 
     enum CalMode: String, Hashable, CaseIterable { case day = "Day", week = "Week", month = "Month" }
+
+    /// One tap-to-create intent: the date (YYYY-MM-DD) + snapped time (HH:mm).
+    struct CreateAt: Identifiable, Equatable {
+        let date: String
+        let time: String
+        var id: String { "\(date)T\(time)" }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -96,11 +110,11 @@ struct CalendarView: View {
                 .padding(.horizontal, 18).padding(.vertical, 4)
 
             if let vm {
-                syncBar(vm)
+                CalendarSyncBar(vm: vm)
                 Group {
                     switch mode {
-                    case .day: DayGridView(vm: vm)
-                    case .week: WeekView(vm: vm)
+                    case .day: DayGridView(vm: vm, onCreateAt: presentCreate)
+                    case .week: WeekView(vm: vm, onCreateAt: presentCreate)
                     case .month: MonthView(vm: vm)
                     }
                 }
@@ -109,9 +123,14 @@ struct CalendarView: View {
             }
         }
         .background(theme.palette.bg.ignoresSafeArea())
-        .sheet(isPresented: $showBlock) { BlockTimeSheet() }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
+        // Tap an empty grid slot → create a task prefilled at that day + time.
+        // Mirrors the Android onCreateAt(date, time) → NewTaskSheet prefill.
+        .sheet(item: $createAt) { at in
+            NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin,
+                         prefillDate: at.date, prefillTime: at.time)
+        }
         // No bubble on Calendar (Android gates it off `tab == "calendar"`): it
         // sits bottom-trailing over the drag-to-schedule gesture area.
         .task {
@@ -119,6 +138,10 @@ struct CalendarView: View {
             let m = CalendarModel(taskRepo, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))
             vm = m; await m.observe()
         }
+    }
+
+    private func presentCreate(_ date: String, _ time: String) {
+        createAt = CreateAt(date: date, time: time)
     }
 
     // MARK: segmented control (MdSegment)
@@ -142,26 +165,20 @@ struct CalendarView: View {
         .padding(2)
         .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
-
-    // MARK: Google connect / sync bar (CalendarSyncBar)
-
-    @ViewBuilder
-    private func syncBar(_ vm: CalendarModel) -> some View {
-        CalendarSyncBar(vm: vm, onBlock: { showBlock = true })
-    }
 }
 
-/// Connect / sync Google Calendar — mirrors the Android CalendarSyncBar.
-/// Not connected: a "＋ Connect Google Calendar" pill. Connected: the synced
-/// account(s) + a "Sync now" action (pulls via AppModel.pullGoogleCalendar).
-/// A trailing "＋ Block" enters the block-time sheet (preserved iOS behavior).
+/// Connect / sync / disconnect Google Calendar — mirrors the Android
+/// CalendarSyncBar. Not connected: a "＋ Connect Google Calendar" pill.
+/// Connected: the synced account(s) + a "Sync now" action (pulls via
+/// AppModel.pullGoogleCalendar) + a destructive "Disconnect" behind a confirm
+/// alert (drops all synced events — AppModel.disconnectCalendar).
 private struct CalendarSyncBar: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     let vm: CalendarModel
-    let onBlock: () -> Void
     @State private var busy = false
     @State private var error: String?
+    @State private var confirmDisconnect = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -183,19 +200,25 @@ private struct CalendarSyncBar: View {
                             .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
                             .padding(.horizontal, 8).padding(.vertical, 4)
                     }.buttonStyle(.plain).disabled(busy)
+                    // Destructive — confirm first (it drops all synced events).
+                    Button { confirmDisconnect = true } label: {
+                        Text("Disconnect")
+                            .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                            .padding(.horizontal, 8).padding(.vertical, 4)
+                    }.buttonStyle(.plain).disabled(busy)
                 }
-                Spacer(minLength: 0)
-                Button(action: onBlock) {
-                    Text("＋ Block")
-                        .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                }.buttonStyle(.plain)
             }
             .padding(.horizontal, 18).padding(.vertical, 4)
             if let error {
                 Text(error).font(UFont.sans(11)).foregroundStyle(theme.palette.red)
                     .padding(.horizontal, 18).padding(.bottom, 6)
             }
+        }
+        .alert("Disconnect Google Calendar?", isPresented: $confirmDisconnect) {
+            Button("Disconnect", role: .destructive) { model.disconnectCalendar() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Synced events are removed from your calendar. Your tasks are unaffected.")
         }
     }
 
@@ -224,7 +247,11 @@ private struct CalendarSyncBar: View {
 private struct WeekView: View {
     @Environment(\.uTheme) private var theme
     let vm: CalendarModel
+    /// Tap an empty slot → create a task prefilled at that day + snapped time.
+    let onCreateAt: (String, String) -> Void
     @State private var weekOffset = 0
+    /// Tap a task block → reschedule/resize/unschedule (same sheet as the Day grid).
+    @State private var editingBlock: CalBlock?
 
     private let wStart = 0
     private let wEnd = 24
@@ -315,6 +342,10 @@ private struct WeekView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 96)
         }
+        // Tap a task block → reschedule / resize / unschedule.
+        .sheet(item: $editingBlock) { block in
+            CalBlockEditSheet(vm: vm, block: block)
+        }
     }
 
     private func dayColumn(_ iso: String) -> some View {
@@ -327,6 +358,13 @@ private struct WeekView: View {
                             .overlay(Rectangle().stroke(theme.palette.line.opacity(0.6), lineWidth: 0.5))
                     }
                 }
+                // Tap an empty slot → create a task prefilled at this day + snapped
+                // time. Blocks layer on top below, so a tap on a block doesn't fall
+                // through to create. Mirrors the Android WeekView detectTapGestures.
+                .contentShape(Rectangle())
+                .onTapGesture { location in
+                    onCreateAt(iso, snappedTime(location.y))
+                }
                 let laid = layoutLanes(vm.blocks(on: iso))
                 ForEach(laid, id: \.block.id) { item in
                     let b = item.block
@@ -336,6 +374,10 @@ private struct WeekView: View {
                         weekBlock(b)
                             .frame(width: max(5, laneW - 1),
                                    height: max(13, CGFloat(b.durationMinutes) / 60 * wHour))
+                            // Task blocks open the edit sheet; external/placeholder
+                            // blocks just swallow the tap so it doesn't fall through
+                            // to the create-task gesture underneath.
+                            .onTapGesture { if isTaskBlock(b) { editingBlock = b } }
                             .offset(x: laneW * CGFloat(item.lane), y: wHour * CGFloat(top) / 60)
                     }
                 }
@@ -344,9 +386,18 @@ private struct WeekView: View {
         .frame(maxWidth: .infinity)
     }
 
+    /// Map a y-offset in the day column to a snapped HH:mm, 15-min steps,
+    /// clamped 00:00–23:45. Mirrors the Android snap math.
+    private func snappedTime(_ y: CGFloat) -> String {
+        let totalMin = wStart * 60 + Int((Double(y) / Double(wHour) * 60).rounded())
+        let snapped = min(wEnd * 60 - 15, max(wStart * 60, (totalMin / 15) * 15))
+        return String(format: "%02d:%02d", snapped / 60, snapped % 60)
+    }
+
     private func weekBlock(_ b: CalBlock) -> some View {
         let bt = isTaskBlock(b) ? vm.tasks.first(where: { $0.id == b.taskId }) : nil
-        let done = bt?.done == true
+        // For a recurring occurrence the completion lives on the block.
+        let done = b.done || bt?.done == true
         let fill = isTaskBlock(b) ? theme.palette.areaColor(bt?.lifeArea) : theme.palette.blueSoft
         return Text(b.taskName)
             .font(UFont.sans(8, .medium))
@@ -547,45 +598,6 @@ func layoutLanes(_ blocks: [CalBlock]) -> [LaidBlock] {
     return laid
 }
 
-// MARK: - Block time sheet (create a label block, no task)
-
-/// Create a time block (no task). Pushes to Google when connected.
-struct BlockTimeSheet: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.dismiss) private var dismiss
-    @State private var label = ""
-    @State private var day = Date()
-    @State private var start = Date()
-    @State private var duration = 60
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                TextField("Label (e.g. Lunch, Gym)", text: $label)
-                DatePicker("Day", selection: $day, displayedComponents: .date)
-                DatePicker("Start", selection: $start, displayedComponents: .hourAndMinute)
-                Stepper("Duration \(duration)m", value: $duration, in: 15...480, step: 15)
-            }
-            .navigationTitle("Block time")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Add") { save() } }
-            }
-        }
-    }
-
-    private func save() {
-        let iso = Clock.dateISO(day)
-        let c = Calendar.current.dateComponents([.hour, .minute], from: start)
-        let hhmm = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
-        let block = CalBlock(id: newUUID(), taskId: nil,
-                             taskName: label.trimmingCharacters(in: .whitespaces).isEmpty ? "Busy" : label,
-                             startTime: hhmm, durationMinutes: duration, date: iso, kind: .task)
-        model.saveBlock(block)
-        dismiss()
-    }
-}
-
 // MARK: - Day grid (draggable hour grid + NOW line + unscheduled tray)
 
 /// Day view with a draggable unscheduled-task tray + a time grid + a NOW line.
@@ -596,8 +608,12 @@ struct DayGridView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     let vm: CalendarModel
+    /// Tap an empty slot → create a task prefilled at the viewed day + snapped time.
+    let onCreateAt: (String, String) -> Void
     @State private var date = Date()
     @State private var now = Date()
+    /// Tap a task block → the reschedule/resize/unschedule sheet.
+    @State private var editingBlock: CalBlock?
 
     private let firstHour = 0
     private let lastHour = 24
@@ -630,6 +646,18 @@ struct DayGridView: View {
                 date = Date()
             }
         }
+        // Tap a task block → reschedule / resize / unschedule.
+        .sheet(item: $editingBlock) { block in
+            CalBlockEditSheet(vm: vm, block: block)
+        }
+    }
+
+    /// Map a y-offset on the grid to a snapped HH:mm, 15-min steps, clamped
+    /// 00:00–23:45. Mirrors the Android DayGrid snap math.
+    private func snappedTime(_ y: CGFloat) -> String {
+        let totalMin = firstHour * 60 + Int((Double(y) / Double(pxPerHour) * 60).rounded())
+        let snapped = min(lastHour * 60 - 15, max(firstHour * 60, (totalMin / 15) * 15))
+        return String(format: "%02d:%02d", snapped / 60, snapped % 60)
     }
 
     private var dateHeader: some View {
@@ -691,6 +719,15 @@ struct DayGridView: View {
                     .id("hour-\(hour)")
                 }
             }
+            // Tap an empty grid area → create a task prefilled at the snapped time.
+            // Ignore the hour-label gutter (x < 64). Blocks layer on top below with
+            // their own taps, so a tap on a block opens its edit sheet instead of
+            // creating. Mirrors the Android DayGrid detectTapGestures.
+            .contentShape(Rectangle())
+            .onTapGesture { location in
+                guard location.x >= 64 else { return }
+                onCreateAt(iso, snappedTime(location.y))
+            }
             // Blocks for the day, positioned by start time, lane-split on overlap.
             // Only TASK blocks are draggable — external/Google + placeholder
             // blocks are display-only (they mirror the remote calendar; moving
@@ -703,9 +740,14 @@ struct DayGridView: View {
                 let card = blockCard(b, width: max(20, laneW - 3))
                     .offset(x: 70 + laneW * CGFloat(item.lane), y: yFor(b))
                 if isTaskBlock(b) {
-                    card.draggable("block:\(b.id)")
-                } else {
+                    // Tap to edit (reschedule/resize/unschedule) + drag to move.
                     card
+                        .onTapGesture { editingBlock = b }
+                        .draggable("block:\(b.id)")
+                } else {
+                    // External/placeholder blocks are display-only — swallow the tap
+                    // so it doesn't fall through to the grid's create handler.
+                    card.onTapGesture { }
                 }
             }
             // NOW line on today's grid.
@@ -733,7 +775,8 @@ struct DayGridView: View {
     private func blockCard(_ block: CalBlock, width: CGFloat) -> some View {
         let h = max(24, CGFloat(block.durationMinutes) / 60 * pxPerHour)
         let bt = isTaskBlock(block) ? vm.tasks.first(where: { $0.id == block.taskId }) : nil
-        let done = bt?.done == true
+        // For a recurring occurrence the completion lives on the block.
+        let done = block.done || bt?.done == true
         let fill: Color = isExternalBlock(block) ? theme.palette.blueSoft
             : (isTaskBlock(block) ? theme.palette.areaColor(bt?.lifeArea).opacity(0.5) : theme.palette.bg2)
         return VStack(alignment: .leading, spacing: 1) {
@@ -801,5 +844,95 @@ struct DayGridView: View {
     private func minutesOf(_ hhmm: String) -> Int {
         let p = hhmm.split(separator: ":").compactMap { Int($0) }
         return (p.first ?? 0) * 60 + (p.count > 1 ? p[1] : 0)
+    }
+}
+
+// MARK: - Block edit sheet (reschedule / resize / unschedule)
+
+/// Tap a scheduled task block → reschedule (free-slot chips), resize (duration
+/// chips), or unschedule. Mirrors the Android CalBlockEditSheet (and the web
+/// cal-block-edit-modal). External/Google blocks never reach here — the day
+/// grid only opens this for task blocks. The model is @Observable, so the live
+/// block follows sequential edits without manual refresh.
+struct CalBlockEditSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+    let vm: CalendarModel
+    let block: CalBlock
+
+    private static let durations = [15, 25, 45, 60, 90]
+
+    var body: some View {
+        // Track the live block so sequential edits compose + the selection
+        // follows (resize then reschedule re-reads the new duration).
+        let live = vm.blocks.first { $0.id == block.id } ?? block
+        // Full-day window (not the default 08:00–18:00) so an early-morning /
+        // evening block can be rescheduled within its own time band.
+        let slots = findFreeSlotsForDate(vm.blocks, durationMin: live.durationMinutes,
+                                         isoDate: live.date, now: Date(), limit: 5,
+                                         dayStartMin: 0, dayEndMin: 24 * 60)
+        // Keep the current start at the head so it always shows as selected.
+        var times = [live.startTime]
+        for s in slots where !times.contains(s.startTime) { times.append(s.startTime) }
+
+        return NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    SectionLabel("Edit block")
+                    Text(live.taskName).font(UFont.sans(18, .semibold)).foregroundStyle(theme.palette.ink)
+
+                    VStack(alignment: .leading, spacing: 7) {
+                        SectionLabel("Start time")
+                        chipRow {
+                            ForEach(times, id: \.self) { t in
+                                chip(formatTime(t), selected: live.startTime == t) {
+                                    model.moveBlock(live, toDate: live.date, startTime: t)
+                                }
+                            }
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 7) {
+                        SectionLabel("Duration")
+                        chipRow {
+                            ForEach(Self.durations, id: \.self) { m in
+                                chip("\(m)m", selected: live.durationMinutes == m) {
+                                    model.resizeBlock(live, durationMinutes: m)
+                                }
+                            }
+                        }
+                    }
+
+                    UButton("Unschedule", kind: .danger) {
+                        model.unschedule(live.id); dismiss()
+                    }
+                    .padding(.top, 4)
+                }
+                .padding(.horizontal, 22).padding(.vertical, 16)
+            }
+            .background(theme.palette.bg.ignoresSafeArea())
+            .navigationTitle("Edit block")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func chipRow<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) { content() }
+        }
+    }
+
+    private func chip(_ label: String, selected: Bool, _ tap: @escaping () -> Void) -> some View {
+        Button(action: tap) {
+            Text(label).font(UFont.sans(13, selected ? .semibold : .regular))
+                .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(selected ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+                .overlay(Capsule().stroke(theme.palette.line2))
+        }
+        .buttonStyle(.plain)
     }
 }

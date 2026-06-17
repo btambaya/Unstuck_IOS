@@ -198,7 +198,7 @@ struct AuthView: View {
     private func forgotPassword() async {
         let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !e.isEmpty else {
-            statusIsError = true; status = "Enter your email first, then tap “Forgot your password?”."
+            statusIsError = true; status = "Enter your email first."
             return
         }
         guard let auth = model.coordinator?.auth else { return }

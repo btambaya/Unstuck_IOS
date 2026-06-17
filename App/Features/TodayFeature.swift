@@ -103,6 +103,43 @@ final class TodayModel {
         return sessions.filter { (Time.parseMillis($0.completedAt) ?? 0) >= cutoff }
             .reduce(0) { $0 + $1.actualSec } / 60
     }
+
+    // MARK: nudges (quiet, in-app — Android AppViewModel.nudges parity)
+
+    /// Device-local dismissed-nudge ids (so a dismissed nudge stays dismissed
+    /// across relaunch). Android persists these in SettingsStore; we use the
+    /// same shape in UserDefaults. Held in an observed set (seeded from
+    /// UserDefaults in init) so a dismissal drops the card immediately.
+    private static let dismissedNudgesKey = "unstuck.dismissedNudges"
+    private var dismissedNudgeIds: Set<String> =
+        Set(UserDefaults.standard.stringArray(forKey: TodayModel.dismissedNudgesKey) ?? [])
+
+    /// The quiet Today nudges (things slipping / follow-ups). Off entirely at the
+    /// Calm level (NotificationLevel.nudges == false) and with dismissed ids
+    /// filtered out — 1:1 with Android `nudges`.
+    var nudges: [Nudge] {
+        guard NotificationPrefs.level.nudges else { return [] }
+        let now = Date().timeIntervalSince1970 * 1000
+        return computeNudges(tasks: all, captures: captures, now: now)
+            .filter { !dismissedNudgeIds.contains($0.id) }
+    }
+
+    /// Persist a nudge dismissal (Android `dismissNudge`) — drops the card now
+    /// and keeps it dismissed across relaunch.
+    func dismissNudge(_ id: String) {
+        dismissedNudgeIds.insert(id)
+        UserDefaults.standard.set(Array(dismissedNudgeIds), forKey: Self.dismissedNudgesKey)
+    }
+
+    /// Whole CALENDAR days since a task was created (0 = today), coerced ≥ 1 for
+    /// the Backlog "Nd" badge — mirrors Android `ageDays` (calendar-day diff so a
+    /// task made late yesterday reads "1d", not "today").
+    func ageDays(_ t: TaskItem) -> Int {
+        guard let created = Time.parseMillis(t.createdAt) else { return 1 }
+        let now = Date().timeIntervalSince1970 * 1000
+        let days = Int((Time.startOfDayMillis(now) - Time.startOfDayMillis(created)) / DAY_MS)
+        return max(1, days)
+    }
 }
 
 struct TodayView: View {
@@ -130,6 +167,11 @@ struct TodayView: View {
                     if let recap = model.lastRecap,
                        Date().timeIntervalSince1970 * 1000 - recap.at < 6 * 3_600_000 {
                         recapCard(recap).padding(.horizontal, 18).padding(.top, 8)
+                    }
+                    // Quiet in-app nudge — the FIRST of "things slipping" surfaced
+                    // between the recap and the hero (Android TodayScreen parity).
+                    if let nudge = vm.nudges.first {
+                        nudgeCard(vm, nudge).padding(.horizontal, 18).padding(.top, 6)
                     }
                     heroOrEmpty(vm).padding(.horizontal, 18).padding(.top, 14)
                     filterBar(vm)
@@ -352,33 +394,114 @@ struct TodayView: View {
 
     @ViewBuilder
     private func list(_ vm: TodayModel) -> some View {
-        let live = model.liveTaskId
-        let startNextId = vm.startNext(liveTaskId: live, area: areaFilter)?.id
-        let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: live)
-        if rows.isEmpty {
+        let liveId = model.liveTaskId
+        let startNextId = vm.startNext(liveTaskId: liveId, area: areaFilter)?.id
+        let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: liveId)
+        // The in-progress focus session, surfaced at the top of the list (Android
+        // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed tasks.
+        let liveTask = liveId.flatMap { id in vm.all.first { $0.id == id } }
+        VStack(spacing: 6) {
+            if let liveTask, let live = model.liveSession {
+                liveSessionCard(liveTask, live)
+            }
+            ForEach(rows) { t in taskRow(t) }
+        }
+        .padding(.horizontal, 18)
+        // Per-view empty note — only when nothing else is on screen (the live
+        // card counts as content), and only inside Backlog or an area filter
+        // (matches Android's displayRows.isEmpty && liveTask == null gate).
+        if rows.isEmpty && liveTask == nil && (backlogActive || areaFilter != nil) {
             Text(backlogActive ? "Backlog's clear — nothing waiting."
-                 : (areaFilter != nil ? "Nothing in \(areaFilter!) right now." : "Nothing scheduled. Tap + to add."))
+                 : "Nothing in \(areaFilter ?? "") right now.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                 .padding(.horizontal, 18).padding(.vertical, 28)
-        } else {
-            VStack(spacing: 6) {
-                ForEach(rows) { t in taskRow(t) }
+        } else if rows.isEmpty && liveTask == nil {
+            // Plain Today with nothing scheduled (no live card) — keep the
+            // existing prompt rather than a silent blank.
+            Text("Nothing scheduled. Tap + to add.")
+                .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+                .padding(.horizontal, 18).padding(.vertical, 28)
+        }
+    }
+
+    // MARK: live focus-session card (Android TodayScreen LiveSessionCard)
+
+    /// Surfaces the in-progress focus session on Today: a progress ring + live
+    /// elapsed timer (1s TimelineView tick), an "In focus · {task}" /
+    /// "Paused · {task}" label, tap-to-return to Focus, and an inline
+    /// Pause/Resume. Running → coral ring + border; paused → amber ring.
+    ///
+    /// The dynamic bits re-read `model.liveSession` on each 1s tick (not a
+    /// captured snapshot) so pausing/resuming from this card — which mutates the
+    /// device-local live store, outside SwiftUI's observation — reflects within a
+    /// second without an explicit observable trigger. `initial` is the parent's
+    /// snapshot, used as the fallback if a tick can't read the store.
+    private func liveSessionCard(_ task: TaskItem, _ initial: LiveSession) -> some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let live = model.liveSession ?? initial
+            let now = ctx.date.timeIntervalSince1970 * 1000
+            let paused = live.paused
+            let estimateSec = max(1, (live.sessionEstimateMin > 0 ? live.sessionEstimateMin : task.estimateMin)) * 60
+            let elapsed = FocusTimer.displayedElapsedSec(live, now: now)
+            let progress = min(1, max(0, Double(elapsed) / Double(estimateSec)))
+            let accent = paused ? theme.palette.amber : theme.palette.coral
+            HStack(spacing: 11) {
+                // Tapping the card body returns to the Focus screen for this task.
+                Button { model.router.beginFocus(task) } label: {
+                    HStack(spacing: 11) {
+                        ZStack {
+                            Circle().stroke(theme.palette.line, lineWidth: 3)
+                            Circle().trim(from: 0, to: progress)
+                                .stroke(accent, style: StrokeStyle(lineWidth: 3, lineCap: .round))
+                                .rotationEffect(.degrees(-90))
+                            Text(elapsed >= 3600
+                                 ? "\(elapsed / 3600)h\(String(format: "%02d", (elapsed % 3600) / 60))"
+                                 : formatMMSS(elapsed))
+                                .font(UFont.mono(7, .bold)).foregroundStyle(theme.palette.ink2)
+                        }
+                        .frame(width: 30, height: 30)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(paused ? "Paused · \(task.name)" : "In focus · \(task.name)")
+                                .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink).lineLimit(1)
+                            Text(paused ? "\(task.estimateMin)m · paused" : "running for \(formatMMSS(elapsed))")
+                                .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }.buttonStyle(.plain)
+                // Inline Pause/Resume — running → "Pause" (bg2), paused → "Resume" (ink).
+                Button { if paused { model.resumeFocus() } else { model.pauseFocus() } } label: {
+                    Text(paused ? "Resume" : "Pause")
+                        .font(UFont.sans(12, .semibold))
+                        .foregroundStyle(paused ? theme.palette.bg : theme.palette.ink)
+                        .padding(.horizontal, 14).padding(.vertical, 6)
+                        .background(paused ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+                }.buttonStyle(.plain)
             }
-            .padding(.horizontal, 18)
+            .padding(12)
+            .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(paused ? theme.palette.line2 : theme.palette.coral.opacity(0.55)))
         }
     }
 
     private func taskRow(_ t: TaskItem) -> some View {
         let isOccurrence = model.occurrenceBlockForId(t.id) != nil
-        return Button { model.toggleDone(t) } label: {
+        // PRIMARY tap opens the task detail (router.detailTask → TaskEditor),
+        // matching Android's onOpen → Route.Detail; toggle-done moved to the
+        // leading circle affordance (+ kept in the context menu).
+        return Button { model.router.detailTask = t } label: {
             HStack(spacing: 12) {
-                // Completed-today rows stay visible as wins — a green check +
-                // struck-through/greyed name distinguishes them from open work
-                // (mirrors Android TodayScreen + the Tasks list).
-                if t.done {
-                    Image(systemName: "checkmark.circle.fill")
-                        .font(.system(size: 18)).foregroundStyle(theme.palette.green)
-                }
+                // Leading checkbox/circle — the done-toggle affordance. Done rows
+                // stay visible as wins (green check + struck-through name); open
+                // rows show an empty circle. Tapping it toggles without opening
+                // the detail (its own Button intercepts the tap).
+                Button { model.toggleDone(t) } label: {
+                    Image(systemName: t.done ? "checkmark.circle.fill" : "circle")
+                        .font(.system(size: 18))
+                        .foregroundStyle(t.done ? theme.palette.green : theme.palette.ink3)
+                }.buttonStyle(.plain)
+                    .accessibilityLabel(t.done ? "Mark not done" : "Mark done")
                 VStack(alignment: .leading, spacing: 3) {
                     HStack(spacing: 5) {
                         Text(t.name).font(UFont.sans(14, .medium))
@@ -398,6 +521,14 @@ struct TodayView: View {
                     }
                 }
                 Spacer()
+                // Backlog rows carry an amber "Nd" age badge before the estimate
+                // (Android TaskRow ageDays badge) — how long the task has sat.
+                if backlogActive, let vm {
+                    Text("\(vm.ageDays(t))d").font(UFont.sans(10, .medium))
+                        .foregroundStyle(theme.palette.amberInk)
+                        .padding(.horizontal, 7).padding(.vertical, 2)
+                        .background(theme.palette.amberSoft, in: Capsule())
+                }
                 Text("\(t.estimateMin)m").font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
             }
             .padding(.horizontal, 12).padding(.vertical, 11)
@@ -405,6 +536,7 @@ struct TodayView: View {
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.palette.line))
         }.buttonStyle(.plain)
         .contextMenu {
+            Button { model.router.detailTask = t } label: { Label("Open", systemImage: "square.and.pencil") }
             Button { model.toggleDone(t) } label: {
                 Label(t.done ? "Mark not done" : "Mark done",
                       systemImage: t.done ? "circle" : "checkmark.circle")
@@ -437,6 +569,35 @@ struct TodayView: View {
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.palette.coralSoft, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+    }
+
+    // MARK: quiet nudge card (Android TodayScreen nudge row parity)
+
+    /// A bordered card: the nudge title, an action (SLIPPING → open the task's
+    /// detail; CAPTURE → promote the capture), and an ✕ that persists a
+    /// device-local dismissal. Both action + ✕ dismiss the nudge (Android parity).
+    private func nudgeCard(_ vm: TodayModel, _ n: Nudge) -> some View {
+        HStack(spacing: 10) {
+            Text(n.title).font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                .lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
+            Button {
+                switch n.kind {
+                case .slipping:
+                    if let t = vm.all.first(where: { $0.id == n.taskId }) { model.router.detailTask = t }
+                case .capture:
+                    if let c = vm.captures.first(where: { $0.id == n.captureId }) { model.promoteCapture(c) }
+                }
+                vm.dismissNudge(n.id)
+            } label: {
+                Text(n.action).font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+            }.buttonStyle(.plain)
+            Button { vm.dismissNudge(n.id) } label: {
+                Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            }.buttonStyle(.plain)
+        }
+        .padding(14)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(theme.palette.line))
     }
 
     // MARK: notifications banner + helpers

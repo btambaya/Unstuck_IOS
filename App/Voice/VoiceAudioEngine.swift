@@ -34,6 +34,13 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private var captureConverter: AVAudioConverter?
     private var started = false
     private let lock = NSLock()
+
+    /// Mic capture couldn't start (audio-session activation or engine.start()
+    /// failed — typically the mic is held by another app). The owner (the voice
+    /// session) wires this to surface a note + end the session, instead of
+    /// leaving the UI stuck on "Listening…" with a dead mic. Mirrors the Android
+    /// engine's `onCaptureError`. Fires off the main thread; hop as needed.
+    var onCaptureError: (@Sendable () -> Void)?
     /// Accumulates converted Int16 bytes until ~100ms (3200 bytes) is ready.
     private var pending = Data()
     private static let frameBytes = Int(inRate / 10) * 2   // 100ms mono pcm16 = 3200 bytes
@@ -89,7 +96,11 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     }
 
     func startCapture(_ onFrame: @escaping @Sendable (Data) -> Void) {
-        guard ensureStarted() else { return }
+        // ensureStarted() returns false when the audio session can't be
+        // activated or the engine won't start — almost always the mic being
+        // held by another app. Report it (Android bails the same way in
+        // startCapture) instead of returning silently into a dead "Listening…".
+        guard ensureStarted() else { onCaptureError?(); return }
         let input = engine.inputNode
         let hwFormat = input.inputFormat(forBus: 0)
         captureConverter = AVAudioConverter(from: hwFormat, to: captureFormat)
