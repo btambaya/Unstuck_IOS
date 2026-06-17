@@ -16,6 +16,12 @@ settings:
     CODE_SIGN_STYLE: Automatic
     # Ahmad's own paid Apple Developer team (active 2026-06-11).
     DEVELOPMENT_TEAM: M9ULD6M5Z3
+    # Single source of truth for the version + build, shared by the app AND the
+    # widget extension (their Info.plists reference these) so they never drift
+    # apart — a mismatch trips App Store warning 90473. Bump CURRENT_PROJECT_VERSION
+    # here for each new build.
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "14"
   configs:
     # Simulator/dev builds skip signing; Release (archive) signs automatically.
     Debug:
