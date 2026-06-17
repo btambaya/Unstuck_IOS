@@ -74,6 +74,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     // After a manual interrupt we drop still-in-flight audio from the cancelled
     // response until the next turn begins (user speaks / a new response starts).
     private var _muted = false
+    // Whether a model response is currently being generated. Guards
+    // response.cancel so we never cancel when nothing is active — DashScope
+    // rejects that with "Conversation has no active response" (the error the
+    // user hit). Set on response.created, cleared on response.done.
+    private var _responseActive = false
     // Guards against double error-reporting from the receive loop AND the
     // didCompleteWithError delegate for the same failed connection.
     private var _reportedError = false
@@ -156,9 +161,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// until the next turn begins.
     func interrupt() {
         guard get({ _open }) else { return }
-        lock.lock(); _muted = true; lock.unlock()
+        lock.lock(); _muted = true; let active = _responseActive; lock.unlock()
         audio.flushPlayback()
-        send(["type": "response.cancel"])
+        // Only cancel when a response is actually generating — cancelling with
+        // nothing active makes DashScope error "Conversation has no active response".
+        if active { send(["type": "response.cancel"]) }
         onState(.listening)
     }
 
@@ -205,7 +212,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             lock.lock(); _muted = false; lock.unlock()
             audio.flushPlayback(); onState(.listening)
         case "response.created":
-            lock.lock(); _muted = false; lock.unlock()
+            lock.lock(); _muted = false; _responseActive = true; lock.unlock()
         case "response.audio.delta":
             if get({ _muted }) { return }   // stale audio from a cancelled response
             if let b64 = ev["delta"] as? String, let pcm = Data(base64Encoded: b64) {
@@ -218,11 +225,20 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case "conversation.item.input_audio_transcription.completed":
             if let t = ev["transcript"] as? String { onCaption("user", t, true) }
         case "response.audio.done", "response.done":
+            lock.lock(); _responseActive = false; lock.unlock()
             onState(.listening)
         case "response.function_call_arguments.done":
             handleToolCall(ev)
         case "error":
             let m = (ev["error"] as? [String: Any])?["message"] as? String ?? (ev["error"] as? String)
+            // Benign realtime-protocol hiccups — cancelling/creating a response
+            // that is (or isn't) active — are NON-fatal; Android tolerates them.
+            // Stay in the call (listening) instead of tearing it down with an
+            // error screen (which is the bug the user hit).
+            if let m, m.lowercased().contains("active response") {
+                lock.lock(); _responseActive = false; lock.unlock()
+                onState(.listening); return
+            }
             if let m, !m.isEmpty { onError(String(m.prefix(160))) }
             onState(.error)
         default:
