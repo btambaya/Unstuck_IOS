@@ -23,8 +23,8 @@ struct MainTabScaffold: View {
             .background(theme.palette.bg.ignoresSafeArea())
             .sheet(item: $router.activeSheet, onDismiss: { model.flushPendingDeepLink() }) { sheet in
                 switch sheet {
-                case .newTask: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
-                case .quickCapture: TaskEditor(task: nil, existingBlocks: [], defaultEstimate: model.settings.focusDefaultMin)
+                case .newTask: NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin)
+                case .quickCapture: NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin)
                 case .inbox: InboxView()
                 }
             }

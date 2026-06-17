@@ -117,12 +117,13 @@ public struct Chip: View {
 public struct SectionLabel: View {
     @Environment(\.uTheme) private var theme
     let text: String
-    public init(_ text: String) { self.text = text }
+    let color: Color?
+    public init(_ text: String, color: Color? = nil) { self.text = text; self.color = color }
     public var body: some View {
         Text(text.uppercased())
             .font(UFont.mono(11, .medium))
             .tracking(0.8)
-            .foregroundStyle(theme.palette.ink3)
+            .foregroundStyle(color ?? theme.palette.ink3)
     }
 }
 
