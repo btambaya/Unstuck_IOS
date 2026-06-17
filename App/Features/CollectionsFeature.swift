@@ -242,6 +242,7 @@ struct CollectionDetailView: View {
     @State private var showShare = false
     @State private var promoteTarget: CollectionItem?
     @State private var byTimeTarget: CollectionItem?
+    @SwiftUI.FocusState private var addFocused: Bool
 
     private var collection: ItemCollection? { vm.collections.first { $0.id == id } }
 
@@ -378,6 +379,7 @@ struct CollectionDetailView: View {
                             Image(systemName: "plus").foregroundStyle(theme.palette.ink3)
                             TextField("Add to this collection…", text: $draft)
                                 .textFieldStyle(.plain).font(UFont.sans(15))
+                                .focused($addFocused)
                                 .onSubmit(add)
                         }
                         .padding(.horizontal, 16).padding(.vertical, 12)
@@ -385,6 +387,9 @@ struct CollectionDetailView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
                         .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(theme.palette.line2))
                         .padding(.top, 18)
+                        // Autofocus on open so the keyboard is already up for rapid entry
+                        // (Android requestFocus on collectionId). add() re-focuses after each item.
+                        .onAppear { addFocused = true }
                     }
                 }
                 .padding(.horizontal, 18).padding(.bottom, 96)
@@ -412,6 +417,7 @@ struct CollectionDetailView: View {
         guard !body.isEmpty, let col = collection else { return }
         model.addCollectionItem(col, body: body)
         draft = ""
+        addFocused = true   // keep the keyboard up for rapid entry (Android requestFocus)
     }
 }
 
@@ -458,6 +464,9 @@ private struct CollItemRow: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         .onTapGesture { if !readOnly { if revealed { onReveal() } else { draft = item.body; editing = true } } }
+                        // Hold to reveal the action bar (Android onLongClick = onReveal) —
+                        // an extra trigger alongside the trailing ellipsis below.
+                        .onLongPressGesture { if !readOnly { onReveal() } }
                 }
                 if promoted, let label = promotedLabel() {
                     Text(label).font(UFont.sans(11, .medium)).foregroundStyle(promotedColor())

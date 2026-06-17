@@ -128,7 +128,7 @@ struct FeedbackForm: View {
             .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).stroke(theme.palette.line))
 
             // Transparency context line
-            Text("Sent with v\(AppModel.appVersion) · \(screen)")
+            Text("Sent with v\(AppModel.appVersion) · \(screen) · \(AppModel.deviceModelName)")
                 .font(UFont.mono(11)).foregroundStyle(theme.palette.ink4)
 
             if failed {

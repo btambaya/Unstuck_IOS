@@ -33,14 +33,23 @@ struct OnboardingView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             progressDots
-            SectionLabel("STEP \(step + 1) OF \(Self.steps)")
-                .foregroundStyle(theme.palette.primaryDeep)
-                .padding(.top, 18)
 
-            ScrollView { stepBody.padding(.top, 14) }
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // Step content lives in a rounded surface card (progress dots stay
+            // above it) — mirrors Android's RoundedCornerShape(24) surface card.
+            VStack(alignment: .leading, spacing: 0) {
+                SectionLabel("STEP \(step + 1) OF \(Self.steps)")
+                    .foregroundStyle(theme.palette.primaryDeep)
 
-            footer
+                ScrollView { stepBody.padding(.top, 14) }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                footer
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: Radius.lg, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: Radius.lg, style: .continuous).stroke(theme.palette.line))
+            .padding(.top, 22)
         }
         .padding(28)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -74,8 +83,11 @@ struct OnboardingView: View {
     }
 
     private func finish() {
+        // Emit struggles in the canonical struggleOptions order so the saved
+        // payload is deterministic (Set iteration order is not).
+        let ordered = struggleOptions.filter { struggles.contains($0) }
         model.completeOnboarding(
-            struggles: Array(struggles), areas: areas,
+            struggles: ordered, areas: areas,
             firstTask: firstTask, firstAction: firstAction, treatment: treatment)
     }
 
@@ -86,10 +98,13 @@ struct OnboardingView: View {
         switch step {
         case 0:
             VStack(alignment: .leading, spacing: 12) {
-                Wordmark(size: 28)
                 Text("Welcome.").font(UFont.serifItalic(32)).foregroundStyle(theme.palette.ink)
                 Text("Unstuck is built for minds that struggle to start. Three minutes to set up.")
                     .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+                // The Orbit mark (iOS `Mark`), centered — mirrors Android's `Orbit(size = 88)`.
+                Mark(size: 88)
+                    .frame(maxWidth: .infinity, alignment: .center)
+                    .padding(.vertical, 24)
             }
         case 1:
             stepHeader("What parts of life share your attention?", "Pick a few. You can change these any time.")
@@ -156,11 +171,13 @@ struct OnboardingView: View {
         return Button { treatment = t } label: {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(name).font(UFont.sans(16, .medium)).foregroundStyle(on ? .white : theme.palette.ink)
-                    Text(blurb).font(UFont.sans(13)).foregroundStyle(on ? .white.opacity(0.85) : theme.palette.ink3)
+                    // Selected = ink fill, so the text must be the bg (cream / dark)
+                    // for contrast in BOTH themes — matches Android's `c.bg`.
+                    Text(name).font(UFont.sans(16, .medium)).foregroundStyle(on ? theme.palette.bg : theme.palette.ink)
+                    Text(blurb).font(UFont.sans(13)).foregroundStyle(on ? theme.palette.bg.opacity(0.85) : theme.palette.ink3)
                 }
                 Spacer()
-                if on { Image(systemName: "checkmark").foregroundStyle(.white) }
+                if on { Image(systemName: "checkmark").foregroundStyle(theme.palette.bg) }
             }
             .padding(14)
             .background(on ? theme.palette.ink : theme.palette.surface)

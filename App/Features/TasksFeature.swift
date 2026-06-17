@@ -21,6 +21,7 @@ final class TasksModel {
     var areas: [LifeArea] = []
     var view: TaskListView = .all
     var activeArea: String?
+    var activeTag: String?
     var slipMode = false
     private let repo: TaskRepository
 
@@ -40,10 +41,12 @@ final class TasksModel {
 
     var visible: [TaskItem] {
         // Today is area-agnostic on purpose (web/Android parity) — the area
-        // filter only bites on the other tabs. The slip filter still applies.
+        // filter only bites on the other tabs. The tag filter applies to
+        // every view. The slip filter still applies.
         visibleTasks(view: view, tasks: all, blocks: blocks,
                      now: Date().timeIntervalSince1970 * 1000,
                      activeArea: view == .today ? nil : activeArea,
+                     activeTag: activeTag,
                      slipMode: slipMode)
     }
 
@@ -61,6 +64,7 @@ struct TasksView: View {
     @State private var editing: TaskItem?
     @State private var showSettings = false
     @State private var showPalette = false
+    @State private var showNotifCenter = false
 
     // Tab order mirrors the web TaskListPane / Android: Backlog first (the
     // triage stack), then All / Today / Upcoming / Later / Recurring / Completed.
@@ -78,6 +82,7 @@ struct TasksView: View {
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
+        .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .feedbackBubble()
         .task {
             guard vm == nil, let repo = model.taskRepo else { return }
@@ -100,7 +105,8 @@ struct TasksView: View {
     private func content(_ vm: TasksModel) -> some View {
         @Bindable var vm = vm
         VStack(alignment: .leading, spacing: 0) {
-            AppBar(title: "Tasks", onSearch: { showPalette = true }, onAvatar: { showSettings = true })
+            AppBar(title: "Tasks", onSearch: { showPalette = true }, onAvatar: { showSettings = true },
+                   onNotifications: { showNotifCenter = true }, notifUnread: NotificationLog.shared.hasUnread)
 
             VStack(alignment: .leading, spacing: 0) {
                 // Long-press the title to toggle slip mode (the "tasks that are
@@ -114,6 +120,7 @@ struct TasksView: View {
 
                 bucketPills(vm)
                 areaPills(vm)
+                tagFilterBanner(vm)
             }
             .padding(.horizontal, 18)
 
@@ -201,6 +208,29 @@ struct TasksView: View {
         }.buttonStyle(.plain)
     }
 
+    // MARK: dismissible tag-filter banner (Android parity)
+
+    /// "Filtering by tag #x ✕" — shown in the pinned header when a tag chip is
+    /// tapped; tapping the banner clears the filter. Matches TasksScreen.kt.
+    @ViewBuilder
+    private func tagFilterBanner(_ vm: TasksModel) -> some View {
+        @Bindable var vm = vm
+        if let tag = vm.activeTag {
+            Button { vm.activeTag = nil } label: {
+                HStack(spacing: 6) {
+                    Text("Filtering by tag ")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.primaryDeep)
+                        + Text("#\(tag)")
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
+                    Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.primaryDeep)
+                }
+                .padding(.horizontal, 11).padding(.vertical, 6)
+                .background(theme.palette.primarySoft, in: Capsule())
+            }.buttonStyle(.plain)
+                .padding(.bottom, 12)
+        }
+    }
+
     // MARK: task list
 
     @ViewBuilder
@@ -223,7 +253,10 @@ struct TasksView: View {
                             isRecurring: task.recurrence != nil || isOccurrence,
                             // Opening an occurrence edits its TEMPLATE (the series),
                             // never a phantom task keyed by the block id.
-                            onOpen: { editing = model.editableTask(for: task) }
+                            onOpen: { editing = model.editableTask(for: task) },
+                            // Tag chips set the active tag filter (Android parity)
+                            // instead of opening the row.
+                            onTagTap: { vm.activeTag = $0 }
                         )
                         // Android's row has no checkbox (completion lives in the
                         // detail sheet). Preserve the iOS toggleDone path via a
@@ -276,6 +309,9 @@ struct TaskRowView: View {
     let ageDays: Int?
     var isRecurring: Bool = false
     let onOpen: () -> Void
+    /// Tapping an inline #tag chip filters by that tag instead of opening
+    /// the row (Android TasksScreen parity).
+    var onTagTap: (String) -> Void = { _ in }
 
     var body: some View {
         Button(action: onOpen) {
@@ -295,11 +331,13 @@ struct TaskRowView: View {
                             Text("· ↻").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                         }
                         ForEach(Array((task.tags ?? []).prefix(3)), id: \.self) { tag in
-                            Text("#\(tag)")
-                                .font(UFont.sans(10, .medium))
-                                .foregroundStyle(theme.palette.primaryDeep)
-                                .padding(.horizontal, 7).padding(.vertical, 2)
-                                .background(theme.palette.primarySoft, in: Capsule())
+                            Button { onTagTap(tag) } label: {
+                                Text("#\(tag)")
+                                    .font(UFont.sans(10, .medium))
+                                    .foregroundStyle(theme.palette.primaryDeep)
+                                    .padding(.horizontal, 7).padding(.vertical, 2)
+                                    .background(theme.palette.primarySoft, in: Capsule())
+                            }.buttonStyle(.plain)
                         }
                     }
                 }

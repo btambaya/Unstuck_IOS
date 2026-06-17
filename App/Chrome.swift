@@ -99,6 +99,12 @@ struct AppBar: View {
     var title: String = ""
     var onSearch: () -> Void = {}
     var onAvatar: () -> Void = {}
+    /// Optional notifications bell (Android AppBar parity). Defaults keep
+    /// existing call sites (Calendar/Collections) bell-free: only callers
+    /// that pass `onNotifications` get the bell, and `notifUnread > 0`
+    /// lights the coral dot.
+    var onNotifications: (() -> Void)? = nil
+    var notifUnread: Bool = false
 
     var body: some View {
         HStack(spacing: 2) {
@@ -110,6 +116,18 @@ struct AppBar: View {
                 Image(systemName: "magnifyingglass").font(.system(size: 18)).foregroundStyle(theme.palette.ink2)
                     .frame(width: 40, height: 40)
             }.buttonStyle(.plain)
+            if let onNotifications {
+                Button(action: onNotifications) {
+                    Image(systemName: "bell").font(.system(size: 18)).foregroundStyle(theme.palette.ink2)
+                        .frame(width: 40, height: 40)
+                        .overlay(alignment: .topTrailing) {
+                            if notifUnread {
+                                Circle().fill(theme.palette.coral).frame(width: 7, height: 7)
+                                    .offset(x: -9, y: 9)
+                            }
+                        }
+                }.buttonStyle(.plain).accessibilityLabel("Notifications")
+            }
             Button(action: onAvatar) {
                 Text(model.avatarInitials)
                     .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.greenInk)

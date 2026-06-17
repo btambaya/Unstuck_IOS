@@ -115,7 +115,14 @@ struct FocusView: View {
     let task: TaskItem
     @State private var fm: FocusModel?
     @State private var showReasons = false
+    /// "Save for later" exits AFTER the pause reason is logged (Android's
+    /// `exitAfterReason`). When set, picking a reason (or dismissing the sheet)
+    /// dismisses the focus screen; otherwise the reason sheet just records why.
+    @State private var exitAfterReason = false
     @State private var showCapture = false
+    /// Captures parked during focus, observed live so the Cockpit rail reflects
+    /// new captures as they're saved. Ordered newest-first (matches the repo).
+    @State private var captures: [Capture] = []
     @State private var captureTag: CaptureTag = .followUp
     @State private var captureText = ""
     /// Header mute toggle. Seeded from the Settings ambient choice in .task so
@@ -160,11 +167,28 @@ struct FocusView: View {
                                 occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) })
             }
         }
+        // Live captures for the Cockpit rail. Observe regardless of treatment so
+        // switching into Cockpit mid-session already has the list (Android's
+        // CapturesRail collects vm.captures the same way).
+        .task {
+            guard let repo = model.taskRepo else { return }
+            do { for try await snap in repo.observeCaptures() { captures = snap } } catch {}
+        }
         .confirmationDialog("Why are you pausing?", isPresented: $showReasons, titleVisibility: .visible) {
             ForEach(reasons, id: \.self) { reason in
-                Button(reason) { pauseWith(reason) }
+                // For the "Save for later" flow the session is already paused; we
+                // just record the reason and then exit after it lands.
+                Button(reason) {
+                    if exitAfterReason { model.saveReasonLog(ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow())); exitAfterReason = false; dismiss() }
+                    else { pauseWith(reason) }
+                }
             }
-            Button("Just pause", role: .cancel) { fm?.pause(); coordinateCheckin() }
+            Button("Just pause", role: .cancel) {
+                // Save-for-later already paused + coordinated the check-in, so here
+                // we only need to exit; the Pause-button flow still pauses now.
+                if exitAfterReason { exitAfterReason = false; dismiss() }
+                else { fm?.pause(); coordinateCheckin() }
+            }
         }
         .confirmationDialog("Leave focus?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
             Button("Leave") { dismiss() }
@@ -218,7 +242,12 @@ struct FocusView: View {
             // doesn't trap the user with no way back out.
             HStack(spacing: 8) {
                 ForEach([FocusTreatment.ambient, .cockpit, .monk], id: \.self) { t in
-                    treatmentChip(t, selected: fm.treatment == t) { fm.setTreatment(t) }
+                    // Android does both: mutate the live session AND persist the
+                    // pick as the default so future fresh sessions seed from it.
+                    treatmentChip(t, selected: fm.treatment == t) {
+                        fm.setTreatment(t)
+                        model.settings.defaultTreatment = t
+                    }
                 }
             }
             .padding(.top, 8)
@@ -321,7 +350,36 @@ struct FocusView: View {
                     }
                     .padding(.top, 8)
                 }
+
+                // Cockpit rail: the last 3 captures parked on this task, so
+                // recent thoughts stay glanceable while focusing (Android parity).
+                if fm.treatment == .cockpit { capturesRail(fm) }
             }
+        }
+    }
+
+    /// The Cockpit captures rail — last 3 captures for the focus task, listed as
+    /// "• <body>". For a recurring occurrence the captures live on the TEMPLATE,
+    /// so we match against the template id (mirrors saveCapture's attribution).
+    @ViewBuilder
+    private func capturesRail(_ fm: FocusModel) -> some View {
+        let railTaskId = fm.occurrence?.templateId ?? task.id
+        // observeCaptures() is newest-first; take the 3 newest, then reverse to
+        // chronological order to match Android's takeLast(3) on its oldest-first
+        // stream.
+        let recent = Array(captures.filter { $0.taskId == railTaskId }.prefix(3).reversed())
+        if !recent.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                SectionLabel("Captures", color: .white.opacity(0.45))
+                ForEach(recent) { cap in
+                    Text("• \(cap.body)")
+                        .font(UFont.sans(12)).foregroundStyle(.white.opacity(0.7))
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.top, 18)
         }
     }
 
@@ -348,7 +406,14 @@ struct FocusView: View {
             // Secondary actions: "Save for later" pauses (resumable from Today);
             // "End for now" records the session without completing the task.
             HStack(spacing: 14) {
-                secondaryBtn("Save for later") { fm.pause(); coordinateCheckin(); dismiss() }
+                // "Save for later" pauses + exits (resumable from Today). When
+                // Pause-reasons is on, prompt for an interruption reason first and
+                // exit AFTER it's logged (exitAfterReason); off → exit immediately.
+                secondaryBtn("Save for later") {
+                    fm.pause(); coordinateCheckin()
+                    if model.settings.focusPauseReasons { exitAfterReason = true; showReasons = true }
+                    else { dismiss() }
+                }
                 secondaryBtn("End for now") { finishSession(markDone: false) }
             }
             .padding(.top, 12).padding(.bottom, 6)

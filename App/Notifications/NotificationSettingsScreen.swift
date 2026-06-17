@@ -16,7 +16,7 @@ struct NotificationSettingsView: View {
     @State private var level = NotificationPrefs.level
     @State private var leadMin = NotificationPrefs.reminderLeadMin
 
-    private let leadOptions = [0, 5, 10, 15, 30]   // 0 = Off
+    private let leadOptions = [0, 5, 10, 15]   // 0 = Off (Android parity)
 
     var body: some View {
         ScrollView {

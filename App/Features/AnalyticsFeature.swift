@@ -7,6 +7,7 @@
 // threshold. Live store via GRDB; derivations from the tested UnstuckCore.
 
 import SwiftUI
+import UIKit
 import UnstuckCore
 import UnstuckData
 import UnstuckDesign
@@ -19,19 +20,15 @@ final class AnalyticsModel {
     var captures: [Capture] = []
     var reasonLogs: [ReasonLog] = []
     var lifeAreas: [LifeArea] = []
-    private let sessionRepo: Repository<Session>
     private let captureRepo: Repository<Capture>
     private let reasonRepo: Repository<ReasonLog>
     private let taskRepo: TaskRepository
-    private let db: AppDatabase
 
-    init(sessionRepo: Repository<Session>, captureRepo: Repository<Capture>,
-         reasonRepo: Repository<ReasonLog>, taskRepo: TaskRepository, db: AppDatabase) {
-        self.sessionRepo = sessionRepo
+    init(captureRepo: Repository<Capture>, reasonRepo: Repository<ReasonLog>,
+         taskRepo: TaskRepository) {
         self.captureRepo = captureRepo
         self.reasonRepo = reasonRepo
         self.taskRepo = taskRepo
-        self.db = db
     }
 
     /// Reflection time window (Android parity). Derivations read the windowed
@@ -39,12 +36,36 @@ final class AnalyticsModel {
     enum Window: Hashable { case week, month, all }
     var window: Window = .week
 
+    /// Observe every input live (Android parity) — sessions alone were tracked
+    /// before, so interruption bins, pause anatomy, captures-by-kind, the slip
+    /// detector, the calibration scatter, and the stacked bars all stayed frozen
+    /// on their first snapshot. `observeTasksAndBlocks` carries tasks + life
+    /// areas + sessions in one tracked snapshot (so an area rename or a session
+    /// arriving via realtime refreshes the legend + every session-derived chart);
+    /// captures and reason logs get their own trackers.
     func load() async {
-        tasks = (try? taskRepo.all()) ?? []
-        captures = (try? captureRepo.all()) ?? []
-        reasonLogs = (try? reasonRepo.all()) ?? []
-        lifeAreas = (try? Repository<LifeArea>(db, orderColumn: "sortOrder").all()) ?? []
-        do { for try await rows in sessionRepo.observeValues() { sessions = rows } } catch {}
+        async let tb: Void = observeTasksAndBlocks()
+        async let cap: Void = observeCaptures()
+        async let rea: Void = observeReasons()
+        _ = await (tb, cap, rea)
+    }
+
+    private func observeTasksAndBlocks() async {
+        do {
+            for try await snap in taskRepo.observeTasksAndBlocks() {
+                tasks = snap.tasks
+                lifeAreas = snap.areas
+                sessions = snap.sessions
+            }
+        } catch {}
+    }
+
+    private func observeCaptures() async {
+        do { for try await rows in captureRepo.observeValues() { captures = rows } } catch {}
+    }
+
+    private func observeReasons() async {
+        do { for try await rows in reasonRepo.observeValues() { reasonLogs = rows } } catch {}
     }
 
     /// Cutoff (epoch ms) for the window — Monday 00:00 (week), 1st 00:00 (month),
@@ -126,7 +147,9 @@ struct AnalyticsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @State private var vm: AnalyticsModel?
-    @State private var deep = false
+    // Report/Deep-dive is persisted (not local @State) so it survives leaving
+    // and re-entering Insights — Android route-persists this flag.
+    @AppStorage("insights.deepDive") private var deep = false
 
     var body: some View {
         ScrollView {
@@ -146,10 +169,9 @@ struct AnalyticsView: View {
         .task {
             guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }
             let m = AnalyticsModel(
-                sessionRepo: Repository<Session>(db, orderColumn: "completedAt"),
                 captureRepo: Repository<Capture>(db, orderColumn: "at"),
                 reasonRepo: Repository<ReasonLog>(db, orderColumn: "at"),
-                taskRepo: taskRepo, db: db)
+                taskRepo: taskRepo)
             vm = m; await m.load()
         }
     }
@@ -178,6 +200,26 @@ struct AnalyticsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
 
         if !deep { reportBody(vm) } else { deepBody(vm) }
+    }
+
+    /// Resolve a stacked-bar / legend area NAME to its color — matches Android's
+    /// `areaColorFor`: a matched area uses its token color; an UNMATCHED name
+    /// falls back to ink4 (not ink3, which is `palette.areaColor`'s nil default).
+    private func areaColor(forName name: String?, _ vm: AnalyticsModel) -> Color {
+        guard let token = name.flatMap({ vm.areaToken($0) }) else { return theme.palette.ink4 }
+        return theme.palette.areaColor(token)
+    }
+
+    /// Component-wise color interpolation (mirrors Compose `lerp`), so the
+    /// heatmap blends bg2 → green instead of layering translucent green.
+    private func lerpColor(_ a: Color, _ b: Color, _ t: Double) -> Color {
+        let ca = UIColor(a); let cb = UIColor(b)
+        var ar: CGFloat = 0, ag: CGFloat = 0, ab: CGFloat = 0, aa: CGFloat = 0
+        var br: CGFloat = 0, bg: CGFloat = 0, bb: CGFloat = 0, ba: CGFloat = 0
+        ca.getRed(&ar, green: &ag, blue: &ab, alpha: &aa)
+        cb.getRed(&br, green: &bg, blue: &bb, alpha: &ba)
+        let f = CGFloat(min(max(t, 0), 1))
+        return Color(red: Double(ar + (br - ar) * f), green: Double(ag + (bg - ag) * f), blue: Double(ab + (bb - ab) * f))
     }
 
     private func windowLabel(_ w: AnalyticsModel.Window) -> String {
@@ -327,7 +369,7 @@ struct AnalyticsView: View {
                                     let frac = min(max(v / maxV, 0), 1)
                                     if frac > 0 {
                                         Rectangle()
-                                            .fill(theme.palette.areaColor(areas.indices.contains(i) ? vm.areaToken(areas[i]) : nil))
+                                            .fill(areaColor(forName: areas.indices.contains(i) ? areas[i] : nil, vm))
                                             .frame(width: geo.size.width * frac)
                                     }
                                 }
@@ -339,7 +381,7 @@ struct AnalyticsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                     }
                 }
-                FlowLegend(areas: areas, token: { vm.areaToken($0) }).padding(.top, 4)
+                FlowLegend(areas: areas, color: { areaColor(forName: $0, vm) }).padding(.top, 4)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -383,8 +425,11 @@ struct AnalyticsView: View {
                         Text(d < days.count ? days[d] : "").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3).frame(width: 30, alignment: .leading)
                         ForEach(Array(row.enumerated()), id: \.offset) { _, v in
                             let t = min(max(v / maxV, 0), 1)
+                            // Interpolate bg2 → green (Android's lerp) so low-intensity
+                            // cells read as a tinted surface, not translucent green over
+                            // the card — `.opacity` let the card bleed through.
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                                .fill(v <= 0 ? theme.palette.bg2 : theme.palette.green.opacity(0.2 + 0.7 * t))
+                                .fill(v <= 0 ? theme.palette.bg2 : lerpColor(theme.palette.bg2, theme.palette.green, 0.2 + 0.7 * t))
                                 .aspectRatio(1, contentMode: .fit)
                                 .frame(maxWidth: .infinity)
                         }
@@ -506,7 +551,9 @@ private struct ThresholdNote: View {
 private struct FlowLegend: View {
     @Environment(\.uTheme) private var theme
     let areas: [String]
-    let token: (String) -> String?
+    // Resolved per name so an unmatched area falls back to ink4 (Android parity),
+    // matching the swatch color used in the stacked bars above.
+    let color: (String) -> Color
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -514,7 +561,7 @@ private struct FlowLegend: View {
                 ForEach(areas, id: \.self) { a in
                     HStack(spacing: 3) {
                         RoundedRectangle(cornerRadius: 2, style: .continuous)
-                            .fill(theme.palette.areaColor(token(a)))
+                            .fill(color(a))
                             .frame(width: 8, height: 8)
                         Text(a).font(UFont.sans(9)).foregroundStyle(theme.palette.ink3)
                     }

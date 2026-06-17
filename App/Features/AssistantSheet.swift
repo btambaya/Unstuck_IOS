@@ -83,6 +83,8 @@ private struct AssistantChat: View {
     @State private var input = ""
     @State private var showVoice = false        // realtime "Talk" mode
     @State private var speakReplies = false      // TTS read-aloud toggle
+    @State private var note: String?             // local notice (mic permission / STT unavailable)
+    @State private var userStoppedMic = false    // distinguishes a tap-to-stop from an auto-end (denial)
     @State private var voice = VoiceController()
     @SwiftUI.FocusState private var fieldFocused: Bool
 
@@ -124,9 +126,11 @@ private struct AssistantChat: View {
                 transcript(shown)
             }
 
-            // The last turn's error (survives close/reopen).
-            if let code = assistant.error {
-                Text(assistantFriendlyError(code))
+            // Local notice (mic permission / STT unavailable) or the last turn's
+            // error off the model (which survives close/reopen). A live region so
+            // VoiceOver announces failures. 1:1 with Android `note ?: errorCode`.
+            if let message = note ?? assistant.error.map(assistantFriendlyError) {
+                Text(message)
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 20).padding(.vertical, 4)
@@ -150,7 +154,7 @@ private struct AssistantChat: View {
             Text("Brain-dump it.")
                 .font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
             Text("Tell me what's on your plate and I'll sort it — \"add a dentist appt next Tue 3pm\", "
-                + "\"move my report to tomorrow morning\", \"what should I start?\".")
+                + "\"move my report to tomorrow morning\", \"what should I start?\". Type or tap the mic.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
@@ -189,7 +193,7 @@ private struct AssistantChat: View {
             .buttonStyle(.plain)
             .accessibilityLabel(speakReplies ? "Stop reading replies aloud" : "Read replies aloud")
 
-            TextField("Message…", text: $input, axis: .vertical)
+            TextField(assistant.dictating ? "Listening…" : "Message…", text: $input, axis: .vertical)
                 .font(UFont.sans(15))
                 .textFieldStyle(.plain)
                 .lineLimit(1...5)
@@ -228,17 +232,47 @@ private struct AssistantChat: View {
         .padding(.horizontal, 16).padding(.vertical, 10)
     }
 
+    private static let micDeniedNote = "Mic permission is needed to talk to the assistant."
+
     /// Toggle on-device dictation: stream the transcript into the input field
     /// (via the AssistantModel bridge), stop on the next tap or when it ends.
+    /// On end, auto-send the dictated draft if it's non-blank — hands-free
+    /// voice-to-action, 1:1 with Android's `if (input.isNotBlank()) send(input)`.
     private func toggleMic() {
         let assistant = self.assistant
-        if assistant.dictating { voice.stopListening(); assistant.dictating = false; return }
-        guard voice.sttAvailable else { return }
+        // User-initiated stop: end dictation quietly (don't surface a permission
+        // notice for an empty draft the user chose to abandon).
+        if assistant.dictating { userStoppedMic = true; voice.stopListening(); assistant.dictating = false; return }
+        guard voice.sttAvailable else { note = Self.micDeniedNote; return }
+        note = nil
+        userStoppedMic = false
+        assistant.setVoiceDraft("")   // clear any prior draft so the empty check below is meaningful
         assistant.dictating = true
         voice.startListening(
             onPartial: { p in Task { @MainActor in assistant.setVoiceDraft(p) } },
             onFinal: { f in Task { @MainActor in assistant.setVoiceDraft(f) } },
-            onDone: { Task { @MainActor in assistant.dictating = false } })
+            onDone: {
+                Task { @MainActor in
+                    assistant.dictating = false
+                    // Read the model's draft (the source the @Sendable callbacks
+                    // write) — `input` mirrors it via .onChange, which can lag.
+                    let draft = assistant.voiceDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !draft.isEmpty {
+                        // Auto-send the dictated draft (hands-free voice-to-action).
+                        // Clear the model draft so the .onChange mirror doesn't
+                        // re-populate `input` after send() empties it.
+                        assistant.setVoiceDraft("")
+                        input = draft
+                        send()
+                    } else if !userStoppedMic {
+                        // Ended with nothing captured AND the user didn't tap to
+                        // stop — on iOS the mic/speech permission is requested
+                        // lazily inside startListening, so an empty auto-ended
+                        // result is almost always a denial. Surface it.
+                        note = Self.micDeniedNote
+                    }
+                }
+            })
     }
 
     private var canSend: Bool {
@@ -249,6 +283,7 @@ private struct AssistantChat: View {
         let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty, !assistant.sending else { return }
         input = ""
+        note = nil   // 1:1 with Android send(): clear any local notice on send
         assistant.send(t)
     }
 }

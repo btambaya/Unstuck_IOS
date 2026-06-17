@@ -139,8 +139,9 @@ final class AppModel {
         (Bundle.main.infoDictionary?["VOICE_PROXY_URL"] as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
-    /// Gate the Talk button: a non-blank proxy URL + a signed-in session.
-    var voiceConfigured: Bool { !voiceProxyURL.isEmpty && coordinator?.auth.accessToken != nil }
+    /// Gate the Talk button: a non-blank proxy URL (matches Android — no token
+    /// check, so Talk stays visible during token-refresh / cold-start).
+    var voiceConfigured: Bool { !voiceProxyURL.isEmpty }
     /// The realtime model id (DashScope Qwen-Omni).
     var voiceModel: String { "qwen3.5-omni-flash-realtime" }
     /// The Supabase access token the proxy validates.
