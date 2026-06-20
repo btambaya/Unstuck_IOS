@@ -30,6 +30,15 @@ public struct SupabaseClientProvider: Sendable {
                 auth: SupabaseClientOptions.AuthOptions(
                     redirectToURL: config.authRedirectURL,
                     flowType: .pkce,
-                    autoRefreshToken: true)))
+                    autoRefreshToken: true,
+                    // Emit the locally-stored session as the initial session so an
+                    // OFFLINE launch with an expired access token stays signed in.
+                    // The SDK's legacy default (false) runs `try? await session` at
+                    // launch, which auto-refreshes the expired token and yields nil
+                    // when offline → `.initialSession(nil)` → the app wrongly logged
+                    // the user out (and scrubbed device-local data). With true, the
+                    // stored session is emitted immediately and the refresh retries
+                    // in the background once connectivity returns.
+                    emitLocalSessionAsInitialSession: true)))
     }
 }

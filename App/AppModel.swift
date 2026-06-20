@@ -291,12 +291,17 @@ final class AppModel {
                 let isRecoveryEvent: Bool = { if case .passwordRecovery = event { return true }; return false }()
                 let token = session?.accessToken
                 let isAuthed = session != nil
+                // Only an explicit .signedOut (the button OR a server session
+                // revocation) is a real logout. A transient/offline
+                // .initialSession with no session must NOT scrub — that wrongly
+                // wiped device-local data on a flaky connection.
+                let isSignOut: Bool = { if case .signedOut = event { return true }; return false }()
                 await MainActor.run {
                     guard let self else { return }
-                    // Any session→nil transition (button OR server revocation /
-                    // refresh failure) scrubs device-local personal content so the
-                    // next account on this device starts clean. Idempotent.
-                    if self.signedIn && !isAuthed { self.scrubDeviceLocalUserContent() }
+                    // Scrub device-local personal content only on a genuine
+                    // sign-out, so the next account on this device starts clean.
+                    // Idempotent.
+                    if self.signedIn && isSignOut { self.scrubDeviceLocalUserContent() }
                     self.signedIn = isAuthed
                     // PKCE: classify the just-exchanged session via `amr` once.
                     var isRecovery = isRecoveryEvent

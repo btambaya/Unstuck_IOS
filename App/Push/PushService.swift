@@ -65,9 +65,13 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
     }
 
     // Notification taps + action buttons (spec 10 §1.3/§1.5). The async
-    // variant holds the system completion until the GRDB write finishes
-    // (the iOS analog of Android's goAsync()); a background-task assertion
-    // keeps the process alive for the no-UI Reschedule path.
+    // variant already holds the system completion until this method returns
+    // (the iOS analog of Android's goAsync()), which covers the GRDB write +
+    // routing — so NO manual begin/endBackgroundTask is needed. Wrapping it in
+    // one made UIApplication snapshot for state restoration
+    // (_updateSnapshotAndStateRestoration → _performBlockAfterCATransactionCommit),
+    // which aborted with an NSAssertion when a notification was tapped
+    // (crash on build 14, iOS 26.5; reported via TestFlight).
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                             didReceive response: UNNotificationResponse) async {
         let content = response.notification.request.content
@@ -99,11 +103,7 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         guard let action else { return }
 
         let posted = PostedNotification(response.notification)
-        let bgTask = await MainActor.run {
-            UIApplication.shared.beginBackgroundTask(withName: "unstuck.notif.action", expirationHandler: nil)
-        }
         await MainActor.run { NotificationLog.shared.add(posted) }
         await PushActionHub.shared.post(action)
-        await MainActor.run { UIApplication.shared.endBackgroundTask(bgTask) }
     }
 }
