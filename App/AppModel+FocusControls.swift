@@ -14,10 +14,12 @@ import UnstuckCore
 import UnstuckData
 
 extension AppModel {
-    /// The persisted live focus session, or nil when idle. Lets Today render the
+    /// The live focus session, or nil when idle. Lets Today render the
     /// LiveSessionCard (progress ring + elapsed + Pause/Resume) without owning a
-    /// FocusModel. Mirrors Android `vm.liveSession`.
-    var liveSession: LiveSession? { (try? liveStore?.get()) ?? nil }
+    /// FocusModel. Mirrors Android `vm.liveSession`. Reads the in-memory cache
+    /// (kept current by `refreshLiveSession`) so the 1s LiveSessionCard tick
+    /// doesn't hit the GRDB store + a fresh JSONDecoder every second.
+    var liveSession: LiveSession? { cachedLiveSession }
 
     /// Pause the running live session from Today (Android `pauseFocus`). Persists
     /// the paused state, freezes the Live Activity, and pre-schedules the
@@ -28,6 +30,7 @@ extension AppModel {
               cur.sessionStart != nil, !cur.paused else { return }
         let paused = FocusTimer.pause(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(paused)
+        refreshLiveSession()
         LiveActivityController.shared.update(
             sessionStartMs: paused.sessionStart ?? 0, paused: true,
             estimateMin: paused.sessionEstimateMin)
@@ -54,6 +57,7 @@ extension AppModel {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.paused else { return }
         let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(resumed)
+        refreshLiveSession()
         LiveActivityController.shared.update(
             sessionStartMs: resumed.sessionStart ?? 0, paused: false,
             estimateMin: resumed.sessionEstimateMin)

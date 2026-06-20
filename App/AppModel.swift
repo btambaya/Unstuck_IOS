@@ -69,6 +69,21 @@ final class AppModel {
     }
     var lastRecap: RecapState?
 
+    /// In-memory cache of the persisted live focus session. The Today
+    /// LiveSessionCard ticks once per second while a session is live + Today is
+    /// on screen; reading the GRDB-backed liveStore (a blocking read + fresh
+    /// JSONDecoder) on every tick was wasteful. Every mutator that writes the
+    /// store (start/pause/resume/end/cancel) calls `refreshLiveSession()` to keep
+    /// this current; the 1s tick recomputes elapsed/progress from this cached
+    /// value with no per-tick disk read. Seeded once on launch (reapStaleLiveActivities).
+    private(set) var cachedLiveSession: LiveSession?
+
+    /// Re-read the persisted live session into the in-memory cache. Called by
+    /// every mutator that touches `liveStore` so the cache never goes stale.
+    func refreshLiveSession() {
+        cachedLiveSession = (try? liveStore?.get()) ?? nil
+    }
+
     /// Backing for the lazily-built assistant. Observation-ignored: AppModel
     /// holds the reference but never needs to observe the swap (AssistantModel
     /// is itself @Observable and drives the chat UI). A lazy stored var conflicts
@@ -171,6 +186,7 @@ final class AppModel {
         db = database
         taskRepo = TaskRepository(database)
         liveStore = LiveSessionStore(database)
+        refreshLiveSession()
         uiTestWrite = WriteThrough(db: database)
         DemoSeed.seed(database)
         configured = true
@@ -225,8 +241,11 @@ final class AppModel {
         // notification tap can resolve its task.
         startNotifications()
 
-        // Reap any focus Live Activity orphaned by a prior kill/crash: rebind
-        // to a still-live session, else end the ghost timer (liveStore exists).
+        // Seed the live-session cache from the persisted store (a relaunch
+        // mid-session must surface the LiveSessionCard without waiting for a
+        // mutator), then reap any focus Live Activity orphaned by a prior
+        // kill/crash: rebind to a still-live session, else end the ghost timer.
+        refreshLiveSession()
         reapStaleLiveActivities()
     }
 
@@ -374,8 +393,10 @@ final class AppModel {
 
     /// The task id of the active live focus session (nil when idle). Today uses
     /// it to exclude the in-progress task from the Start-Next suggestion + list.
+    /// Reads the in-memory cache (kept current by `refreshLiveSession`) so the
+    /// per-render access doesn't hit the GRDB store.
     var liveTaskId: String? {
-        guard let live = (try? liveStore?.get()) ?? nil, live.sessionStart != nil else { return nil }
+        guard let live = cachedLiveSession, live.sessionStart != nil else { return nil }
         return live.taskId
     }
 

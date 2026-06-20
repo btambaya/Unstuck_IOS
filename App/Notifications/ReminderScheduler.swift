@@ -23,12 +23,25 @@ final class ReminderScheduler {
     static let idPrefix = "unstuck.rem."
 
     private var observeTask: Task<Void, Never>?
+    private var debounceTask: Task<Void, Never>?
     private var repo: TaskRepository?
+    /// Debounce window for the GRDB observe stream: a burst of writes (e.g. a
+    /// recurrence regen upserting N blocks) emits many snapshots in quick
+    /// succession — collapse them into one sync. Mirrors the Android
+    /// ReminderScheduler debounce.
+    private static let debounceNanos: UInt64 = 400_000_000   // 400ms
+
+    /// Signature of the last sync's planned reminders (id + fire time per plan).
+    /// When a fresh observe emission computes the same signature, the sync is a
+    /// no-op (no pending-fetch + no awaited add() churn) — Android's signature
+    /// short-circuit.
+    private var lastSignature: Set<String>?
 
     private init() {}
 
     /// Re-sync reminders whenever blocks, tasks, or the live session change
-    /// while the app is alive (Android ReminderScheduler.observe).
+    /// while the app is alive (Android ReminderScheduler.observe). Debounced so a
+    /// burst of writes triggers a single sync.
     func start(repo: TaskRepository) {
         self.repo = repo
         guard observeTask == nil else { return }
@@ -36,9 +49,20 @@ final class ReminderScheduler {
             guard let stream = self?.repo?.observeReminderInputs() else { return }
             do {
                 for try await snap in stream {
-                    await self?.sync(blocks: snap.blocks, tasks: snap.tasks, liveTaskId: snap.liveTaskId)
+                    self?.scheduleDebouncedSync(blocks: snap.blocks, tasks: snap.tasks, liveTaskId: snap.liveTaskId)
                 }
             } catch {}
+        }
+    }
+
+    /// Restart the debounce timer with the latest snapshot; the sync runs once
+    /// the stream goes quiet for `debounceNanos`.
+    private func scheduleDebouncedSync(blocks: [CalBlock], tasks: [TaskItem], liveTaskId: String?) {
+        debounceTask?.cancel()
+        debounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.debounceNanos)
+            guard !Task.isCancelled else { return }
+            await self?.sync(blocks: blocks, tasks: tasks, liveTaskId: liveTaskId)
         }
     }
 
@@ -46,6 +70,10 @@ final class ReminderScheduler {
     /// (the 48h horizon must re-extend) and after a settings change.
     func resync() {
         guard let repo else { return }
+        // A settings change (lead time / level / overrides) can change reminder
+        // CONTENT without changing the plan ids/fire-times — clear the signature
+        // so resync always rebuilds. Also covers the 48h-horizon re-extend.
+        lastSignature = nil
         Task {
             // One snapshot only (first emission); `first(where:)` trips
             // Swift 6 sending checks from a @MainActor context, so loop+break.
@@ -61,6 +89,9 @@ final class ReminderScheduler {
     /// Cancel every scheduled reminder (sign-out: the next account on this
     /// device must not inherit the previous user's task reminders).
     func cancelAll() async {
+        // We're wiping every pending reminder — drop the signature so the next
+        // sync rebuilds from scratch rather than assuming they're still armed.
+        lastSignature = nil
         let pending = await UNUserNotificationCenter.current().pendingNotificationRequests()
         let ours = pending.map(\.identifier).filter { $0.hasPrefix(Self.idPrefix) }
         UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ours)
@@ -74,6 +105,13 @@ final class ReminderScheduler {
             overrides: NotificationPrefs.overridesByTask(),
             liveTaskId: liveTaskId,
             now: Date().timeIntervalSince1970 * 1000)
+
+        // Early-out when the plan is unchanged: same ids AND same fire times. A
+        // burst that nets out to the same reminders (an unrelated task edit, a
+        // session insert) does no pending-fetch + no awaited add() churn.
+        let signature = Set(plans.map { "\($0.key)@\($0.fireAt)" })
+        if signature == lastSignature { return }
+        lastSignature = signature
 
         let pending = await UNUserNotificationCenter.current().pendingNotificationRequests()
         let prev = Set(pending.map(\.identifier).filter { $0.hasPrefix(Self.idPrefix) })

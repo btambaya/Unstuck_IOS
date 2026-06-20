@@ -25,6 +25,10 @@ final class FocusModel {
     /// id). The session runs on the TEMPLATE; completion marks the block.
     let occurrence: (templateId: String, templateName: String, blockId: String)?
     private let store: LiveSessionStore?
+    /// Notified after every persist so AppModel can refresh its in-memory
+    /// live-session cache (the Today LiveSessionCard reads that cache, not the
+    /// store, on each 1s tick). Set by FocusView, which holds the AppModel.
+    var onPersist: (@MainActor () -> Void)?
 
     init(task: TaskItem, store: LiveSessionStore?,
          defaultTreatment: FocusTreatment = .ambient,
@@ -103,6 +107,7 @@ final class FocusModel {
 
     private func persist() {
         try? store?.set(live.sessionStart == nil ? nil : live)
+        onPersist?()
     }
 
     static func now() -> Double { Date().timeIntervalSince1970 * 1000 }
@@ -163,9 +168,16 @@ struct FocusView: View {
                 // displaced-session check compares against the TEMPLATE id.
                 let occ = model.occurrenceFocusTarget(task.id)
                 model.finalizeDisplacedFocus(forNewTaskId: occ?.template.id ?? task.id)
-                fm = FocusModel(task: task, store: model.liveStore,
+                let newFM = FocusModel(task: task, store: model.liveStore,
                                 defaultTreatment: model.settings.defaultTreatment,
                                 occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) })
+                // Keep AppModel's live-session cache in sync with every FocusModel
+                // transition (start/pause/resume/finish/cancel) so Today's
+                // LiveSessionCard reflects it without re-reading the store.
+                newFM.onPersist = { [weak model] in model?.refreshLiveSession() }
+                fm = newFM
+                // The init's persist() ran before onPersist was wired — seed once.
+                model.refreshLiveSession()
             }
         }
         // Live captures for the Cockpit rail. Observe regardless of treatment so

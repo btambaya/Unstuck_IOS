@@ -175,6 +175,7 @@ extension AppModel {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.paused else { return }
         let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(resumed)
+        refreshLiveSession()
         LiveActivityController.shared.update(
             sessionStartMs: resumed.sessionStart ?? 0, paused: false,
             estimateMin: resumed.sessionEstimateMin)
@@ -187,6 +188,7 @@ extension AppModel {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.sessionStart != nil else { return }
         let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(nil)
+        refreshLiveSession()
         LiveActivityController.shared.end()
         if let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil {
             let session = Session(id: cur.id ?? newUUID(), taskId: task.id, taskName: task.name,

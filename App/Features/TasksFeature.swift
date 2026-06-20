@@ -16,14 +16,26 @@ import UnstuckShared
 @MainActor
 @Observable
 final class TasksModel {
-    var all: [TaskItem] = []
-    var blocks: [CalBlock] = []
+    var all: [TaskItem] = [] { didSet { recomputeSnapshot() } }
+    var blocks: [CalBlock] = [] { didSet { recomputeSnapshot() } }
     var areas: [LifeArea] = []
-    var view: TaskListView = .all
-    var activeArea: String?
-    var activeTag: String?
-    var slipMode = false
+    var view: TaskListView = .all { didSet { recomputeVisible() } }
+    var activeArea: String? { didSet { recomputeVisible() } }
+    var activeTag: String? { didSet { recomputeVisible() } }
+    var slipMode = false { didSet { recomputeVisible() } }
     private let repo: TaskRepository
+
+    /// The visible task rows for the current view + filters. Derived state,
+    /// recomputed ONLY when an input (all/blocks/view/filters) changes — not on
+    /// every access. Previously `visible` re-ran a full visibleTasks pass
+    /// (Sets + projectOccurrences, O(tasks+blocks)) on every read.
+    private(set) var visible: [TaskItem] = []
+
+    /// Ids of the rows that are recurring OCCURRENCES (id = cal_block id),
+    /// precomputed once per snapshot from the pure `occurrenceBlockFor` over the
+    /// already-observed tasks+blocks. Rows look this up with `.contains` instead
+    /// of each row running two full-table DB reads + a JSON decode in `body`.
+    private(set) var occurrenceIds: Set<String> = []
 
     init(_ repo: TaskRepository) { self.repo = repo }
 
@@ -32,22 +44,36 @@ final class TasksModel {
             // areas come from the same tracked snapshot, so an area rename
             // refreshes the filter pills without waiting for a task edit.
             for try await snap in repo.observeTasksAndBlocks() {
+                areas = snap.areas
+                // Assigning all/blocks triggers recomputeSnapshot via didSet;
+                // set blocks last so the recompute sees both (each didSet rebuilds
+                // from the current stored values, so the final assignment wins).
                 all = snap.tasks
                 blocks = snap.blocks
-                areas = snap.areas
             }
         } catch { /* observation ended */ }
     }
 
-    var visible: [TaskItem] {
+    /// Snapshot inputs (tasks/blocks) changed: rebuild the occurrence-id set
+    /// (same rule as the pure `occurrenceBlockFor`: a task-block whose task is a
+    /// recurring template), then the visible rows. O(tasks+blocks).
+    private func recomputeSnapshot() {
+        let templateIds = Set(all.filter { $0.recurrence != nil }.map { $0.id })
+        occurrenceIds = Set(
+            blocks.filter { isTaskBlock($0) && templateIds.contains($0.taskId ?? "") }.map { $0.id })
+        recomputeVisible()
+    }
+
+    /// View/filter (or snapshot) changed: rebuild the visible rows.
+    private func recomputeVisible() {
         // Today is area-agnostic on purpose (web/Android parity) — the area
         // filter only bites on the other tabs. The tag filter applies to
         // every view. The slip filter still applies.
-        visibleTasks(view: view, tasks: all, blocks: blocks,
-                     now: Date().timeIntervalSince1970 * 1000,
-                     activeArea: view == .today ? nil : activeArea,
-                     activeTag: activeTag,
-                     slipMode: slipMode)
+        visible = visibleTasks(view: view, tasks: all, blocks: blocks,
+                               now: Date().timeIntervalSince1970 * 1000,
+                               activeArea: view == .today ? nil : activeArea,
+                               activeTag: activeTag,
+                               slipMode: slipMode)
     }
 
     func blocks(forTask id: String) -> [CalBlock] { blocks.filter { $0.taskId == id } }
@@ -245,7 +271,9 @@ struct TasksView: View {
                         .padding(.vertical, 32)
                 } else {
                     ForEach(rows) { task in
-                        let isOccurrence = model.occurrenceBlockForId(task.id) != nil
+                        // Precomputed once per snapshot (vm.occurrenceIds) — was
+                        // two full-table DB reads + a JSON decode PER ROW in body.
+                        let isOccurrence = vm.occurrenceIds.contains(task.id)
                         TaskRowView(
                             task: task,
                             areaColor: areaColor(task.lifeArea, vm.areas),

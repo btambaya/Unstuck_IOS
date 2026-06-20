@@ -12,16 +12,46 @@ import UnstuckData
 import UnstuckDesign
 import UnstuckShared
 
+/// Shared, configured-once DateFormatter for the Today date eyebrow — hoisted to
+/// file scope so the header doesn't allocate a fresh DateFormatter on every
+/// render. Read-only after the fixed config; `nonisolated(unsafe)` documents
+/// that to the Swift 6 concurrency checker.
+private enum TodayFmt {
+    nonisolated(unsafe) static let eyebrow: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEEE · h:mm a"; return f
+    }()
+}
+
 @MainActor
 @Observable
 final class TodayModel {
-    var all: [TaskItem] = []
-    var blocks: [CalBlock] = []
+    var all: [TaskItem] = [] { didSet { recomputeSnapshot() } }
+    var blocks: [CalBlock] = [] { didSet { recomputeSnapshot() } }
     var areas: [LifeArea] = []
     var sessions: [Session] = []
     var captures: [Capture] = []
     private let repo: TaskRepository
     init(_ repo: TaskRepository) { self.repo = repo }
+
+    // MARK: - snapshot-derived caches (recomputed only when tasks/blocks change)
+
+    /// Ids of rows that are recurring OCCURRENCES (id = cal_block id),
+    /// precomputed once per snapshot. taskRow looks this up with `.contains`
+    /// instead of running two full-table DB reads + a JSON decode PER ROW in body.
+    private(set) var occurrenceIds: Set<String> = []
+
+    /// The Today bucket (area-agnostic open rows) — the base for the hero, the
+    /// list, and the Start-Next subtraction. Cached per snapshot so the four
+    /// per-render passes (hero ×2, list, etc.) don't each rebuild it.
+    private var todayBase: [TaskItem] = []
+    /// Today's completions kept as struck-through wins (sorted last), cached.
+    private var doneTodayBase: [TaskItem] = []
+    /// The Backlog bucket, cached per snapshot (drives backlogCount + the
+    /// Backlog list).
+    private var backlogBase: [TaskItem] = []
+
+    /// How many tasks sit in the Backlog (for the empty-hero pointer).
+    private(set) var backlogCount: Int = 0
 
     func observe() async {
         async let tb: Void = observeTasksAndBlocks()
@@ -35,13 +65,36 @@ final class TodayModel {
             // rename or a realtime session arrival refreshes the pills and
             // the week-focused stat without waiting for a task edit.
             for try await snap in repo.observeTasksAndBlocks() {
-                all = snap.tasks
-                blocks = snap.blocks
                 areas = snap.areas
                 sessions = snap.sessions
+                // all/blocks assignment triggers recomputeSnapshot via didSet;
+                // set blocks last so the final recompute sees both.
+                all = snap.tasks
+                blocks = snap.blocks
                 writeWidgetSnapshot()
             }
         } catch {}
+    }
+
+    /// Rebuild every snapshot-derived cache (occurrence ids + the Today/Backlog
+    /// base buckets + backlogCount). Runs once per tasks/blocks change instead of
+    /// re-running the O(tasks+blocks) passes on every render access.
+    private func recomputeSnapshot() {
+        let now = Date().timeIntervalSince1970 * 1000
+        // Same rule as the pure `occurrenceBlockFor`: a task-block whose task is a
+        // recurring template. Computed in O(tasks+blocks), not O(blocks²).
+        let templateIds = Set(all.filter { $0.recurrence != nil }.map { $0.id })
+        occurrenceIds = Set(
+            blocks.filter { isTaskBlock($0) && templateIds.contains($0.taskId ?? "") }.map { $0.id })
+        todayBase = visibleTasks(view: .today, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
+        backlogBase = visibleTasks(view: .backlog, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
+        backlogCount = backlogBase.count
+        // Today's completions kept as struck-through wins until tomorrow, minus
+        // anything still open — 1:1 with Android TodayScreen.kt:127-136.
+        let today = Clock.todayISO()
+        let openIds = Set(todayBase.map { $0.id })
+        doneTodayBase = (all.filter { !isTemplate($0) } + projectOccurrences(all, blocks, fromISO: today))
+            .filter { isCompletedToday($0, now: now) && !openIds.contains($0.id) }
     }
 
     private func observeCaptures() async {
@@ -56,9 +109,23 @@ final class TodayModel {
         captures.filter { !archivedIds.contains($0.id) }.count
     }
 
+    /// The content of the last widget snapshot we wrote (everything but
+    /// updatedAt). The observed stream carries areas + sessions too, so an area
+    /// rename / session insert re-emits a snapshot whose Start-Next content is
+    /// unchanged — debounce those: only write + reload WidgetKit when the
+    /// content actually differs.
+    private var lastWidgetContent: StartNextSnapshot?
+
     private func writeWidgetSnapshot() {
         let next = startNext(liveTaskId: nil, area: nil)
         let openCount = all.filter { !$0.done && !($0.later ?? false) }.count
+        // Compare on a fixed updatedAt so only the meaningful fields drive the
+        // Equatable check (the real write stamps the current time).
+        let content = StartNextSnapshot(
+            taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
+            openCount: openCount, updatedAt: Date(timeIntervalSince1970: 0))
+        guard content != lastWidgetContent else { return }
+        lastWidgetContent = content
         AppGroup.writeStartNext(StartNextSnapshot(
             taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
             openCount: openCount, updatedAt: Date()))
@@ -68,31 +135,24 @@ final class TodayModel {
     /// The Start-Next hero — scoped to TODAY (next-scheduled by time → else
     /// shortest-estimate → else nil so the hero points to the Backlog instead of
     /// pulling a backlog task). Excludes the live-focused task + honours the area.
+    /// pickTodayHero is cheap relative to the list passes and depends on view
+    /// state (liveTaskId/area), so the view computes it ONCE per render and
+    /// threads the result into both the hero and the list (no duplicate passes).
     func startNext(liveTaskId: String?, area: String?) -> TaskItem? {
         pickTodayHero(tasks: all, blocks: blocks, now: Date().timeIntervalSince1970 * 1000,
                       liveTaskId: liveTaskId, areaFilter: area)
     }
 
-    /// How many tasks sit in the Backlog (for the empty-hero pointer).
-    var backlogCount: Int {
-        visibleTasks(view: .backlog, tasks: all, blocks: blocks,
-                     now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false).count
-    }
-
     func rows(backlog: Bool, area: String?, startNextId: String?, liveTaskId: String?) -> [TaskItem] {
-        let now = Date().timeIntervalSince1970 * 1000
         if backlog {
-            return visibleTasks(view: .backlog, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
-                .filter { $0.id != startNextId && $0.id != liveTaskId }
+            // backlogBase is cached per snapshot — just subtract the hero/live task.
+            return backlogBase.filter { $0.id != startNextId && $0.id != liveTaskId }
         }
-        // Today: open rows (area-agnostic bucket) PLUS today's completions kept as
-        // struck-through wins (sorted last) until tomorrow, then area-filtered and
-        // with the hero/live task subtracted — 1:1 with Android TodayScreen.kt:127-136.
-        let open = visibleTasks(view: .today, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
-        let today = Clock.todayISO()
-        let doneToday = (all.filter { !isTemplate($0) } + projectOccurrences(all, blocks, fromISO: today))
-            .filter { t in isCompletedToday(t, now: now) && !open.contains { $0.id == t.id } }
-        return (open + doneToday).filter {
+        // Today: cached open rows (area-agnostic bucket) PLUS cached today's
+        // completions kept as struck-through wins (sorted last) until tomorrow,
+        // then area-filtered and with the hero/live task subtracted — 1:1 with
+        // Android TodayScreen.kt:127-136.
+        return (todayBase + doneTodayBase).filter {
             (area == nil || $0.lifeArea == area) && $0.id != startNextId && $0.id != liveTaskId
         }
     }
@@ -160,6 +220,11 @@ struct TodayView: View {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 if let vm {
+                    // The Start-Next hero is computed ONCE per render here and
+                    // threaded into both the hero card and the list (which only
+                    // needs its id to subtract it) — previously each ran its own
+                    // pickTodayHero pass.
+                    let hero = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter)
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
                     // "Just now" session recap — shows for 6h after a finished
                     // focus session, between the notif banner and the hero
@@ -173,9 +238,9 @@ struct TodayView: View {
                     if let nudge = vm.nudges.first {
                         nudgeCard(vm, nudge).padding(.horizontal, 18).padding(.top, 6)
                     }
-                    heroOrEmpty(vm).padding(.horizontal, 18).padding(.top, 14)
+                    heroOrEmpty(vm, hero: hero).padding(.horizontal, 18).padding(.top, 14)
                     filterBar(vm)
-                    list(vm)
+                    list(vm, hero: hero)
                 } else {
                     ProgressView().frame(maxWidth: .infinity).padding(.top, 60)
                 }
@@ -268,8 +333,8 @@ struct TodayView: View {
     // MARK: Start-Next hero
 
     @ViewBuilder
-    private func heroOrEmpty(_ vm: TodayModel) -> some View {
-        if let t = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter) {
+    private func heroOrEmpty(_ vm: TodayModel, hero: TaskItem?) -> some View {
+        if let t = hero {
             VStack(alignment: .leading, spacing: 0) {
                 HStack(spacing: 6) {
                     Image(systemName: "bolt.fill").font(.system(size: 11)).foregroundStyle(theme.palette.primaryDeep)
@@ -393,9 +458,9 @@ struct TodayView: View {
     // MARK: today list
 
     @ViewBuilder
-    private func list(_ vm: TodayModel) -> some View {
+    private func list(_ vm: TodayModel, hero: TaskItem?) -> some View {
         let liveId = model.liveTaskId
-        let startNextId = vm.startNext(liveTaskId: liveId, area: areaFilter)?.id
+        let startNextId = hero?.id
         let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: liveId)
         // The in-progress focus session, surfaced at the top of the list (Android
         // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed tasks.
@@ -432,10 +497,11 @@ struct TodayView: View {
     /// Pause/Resume. Running → coral ring + border; paused → amber ring.
     ///
     /// The dynamic bits re-read `model.liveSession` on each 1s tick (not a
-    /// captured snapshot) so pausing/resuming from this card — which mutates the
-    /// device-local live store, outside SwiftUI's observation — reflects within a
-    /// second without an explicit observable trigger. `initial` is the parent's
-    /// snapshot, used as the fallback if a tick can't read the store.
+    /// captured snapshot) so pausing/resuming from this card reflects within a
+    /// second. `model.liveSession` is now an in-memory cache (kept current by
+    /// every live-session mutator via refreshLiveSession), so the tick no longer
+    /// hits the GRDB store + a fresh JSONDecoder every second. `initial` is the
+    /// parent's snapshot, used as the fallback if the cache is momentarily nil.
     private func liveSessionCard(_ task: TaskItem, _ initial: LiveSession) -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { ctx in
             let live = model.liveSession ?? initial
@@ -486,7 +552,9 @@ struct TodayView: View {
     }
 
     private func taskRow(_ t: TaskItem) -> some View {
-        let isOccurrence = model.occurrenceBlockForId(t.id) != nil
+        // Precomputed once per snapshot (vm.occurrenceIds) — was two full-table
+        // DB reads + a JSON decode PER ROW in body.
+        let isOccurrence = vm?.occurrenceIds.contains(t.id) ?? false
         // PRIMARY tap opens the task detail (router.detailTask → TaskEditor),
         // matching Android's onOpen → Route.Detail; toggle-done moved to the
         // leading circle affordance (+ kept in the context menu).
@@ -641,7 +709,6 @@ struct TodayView: View {
         }
     }
     private var dateEyebrow: String {
-        let df = DateFormatter(); df.locale = Locale(identifier: "en_US"); df.dateFormat = "EEEE · h:mm a"
-        return df.string(from: Date())
+        TodayFmt.eyebrow.string(from: Date())
     }
 }

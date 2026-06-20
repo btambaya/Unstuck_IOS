@@ -10,13 +10,30 @@ import UnstuckCore
 import UnstuckData
 import UnstuckDesign
 
+/// Shared, configured-once DateFormatters for the calendar labels. Hoisted to
+/// file scope so view bodies (week range / month title / day header) don't
+/// allocate + configure a fresh DateFormatter on every render. DateFormatter is
+/// thread-safe for reading once configured; `nonisolated(unsafe)` documents the
+/// fixed-config, read-only use to the Swift 6 concurrency checker.
+private enum CalFmt {
+    nonisolated(unsafe) static let monthDay: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "MMM d"; return f
+    }()
+    nonisolated(unsafe) static let monthYear: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "MMMM yyyy"; return f
+    }()
+    nonisolated(unsafe) static let weekdayMonthDay: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEE, MMM d"; return f
+    }()
+}
+
 @MainActor
 @Observable
 final class CalendarModel {
-    var tasks: [TaskItem] = []
-    var blocks: [CalBlock] = []
+    var tasks: [TaskItem] = [] { didSet { recomputeTaskDerived() } }
+    var blocks: [CalBlock] = [] { didSet { recomputeBlockDerived() } }
     var areas: [LifeArea] = []
-    var sessions: [Session] = []
+    var sessions: [Session] = [] { didSet { recomputeFocusByDay() } }
     var connections: [CalendarConnection] = []
     private let repo: TaskRepository
     private let connRepo: Repository<CalendarConnection>
@@ -35,9 +52,9 @@ final class CalendarModel {
             // rename or a realtime session arrival refreshes the pills and
             // the Month heatmap without waiting for a task edit.
             for try await snap in repo.observeTasksAndBlocks() {
+                areas = snap.areas
                 tasks = snap.tasks
                 blocks = snap.blocks
-                areas = snap.areas
                 sessions = snap.sessions
             }
         } catch {}
@@ -47,38 +64,72 @@ final class CalendarModel {
     }
     var connected: Bool { !connections.isEmpty }
 
-    /// Blocks grouped by date (ascending), each day's blocks sorted by start.
-    var byDate: [(date: String, blocks: [CalBlock])] {
-        Dictionary(grouping: blocks, by: { $0.date })
+    // MARK: - snapshot-derived caches (recomputed only when the inputs change)
+
+    /// Per-day blocks with skipped occurrences dropped + sorted by start —
+    /// the `blocks(on:)` semantics, precomputed once per snapshot. WeekView calls
+    /// blocks(on:) 7× per render (one per column); this turns each into an O(1)
+    /// dictionary lookup instead of a full filter+sort over all blocks.
+    private(set) var blocksByDate: [String: [CalBlock]] = [:]
+    /// Per-day lane layout (greedy interval colouring), precomputed once per
+    /// snapshot. WeekView ran layoutLanes 7× per render; this caches it so each
+    /// column is an O(1) lookup.
+    private(set) var laidByDate: [String: [LaidBlock]] = [:]
+    /// Blocks grouped by date (ascending, NOT skipped-filtered), each day's
+    /// blocks sorted by start — cached per snapshot.
+    private(set) var byDate: [(date: String, blocks: [CalBlock])] = []
+    /// Open tasks with no block anywhere — the day grid's drag tray. Cached;
+    /// depends on both tasks + blocks (recomputed by recomputeTaskDerived, which
+    /// recomputeBlockDerived also calls so the scheduled-id set stays fresh).
+    private(set) var unscheduledTasks: [TaskItem] = []
+    /// Focused seconds per ISO date, for the Month heatmap — cached per snapshot.
+    private(set) var focusByDay: [String: Int] = [:]
+
+    private func recomputeBlockDerived() {
+        var byDay: [String: [CalBlock]] = [:]
+        var byDayRaw: [String: [CalBlock]] = [:]
+        for b in blocks {
+            byDayRaw[b.date, default: []].append(b)
+            if !b.skipped { byDay[b.date, default: []].append(b) }
+        }
+        blocksByDate = byDay.mapValues { $0.sorted { $0.startTime < $1.startTime } }
+        laidByDate = blocksByDate.mapValues { layoutLanes($0) }
+        byDate = byDayRaw
             .map { ($0.key, $0.value.sorted { $0.startTime < $1.startTime }) }
             .sorted { $0.date < $1.date }
+        // unscheduled depends on the block set (scheduled ids), so refresh it too.
+        recomputeTaskDerived()
     }
-    func blocks(on iso: String) -> [CalBlock] {
-        // Skipped recurring occurrences are cancelled for that day — drop them
-        // (matches Android `blocksRaw.filter { !it.skipped }`).
-        blocks.filter { $0.date == iso && !$0.skipped }.sorted { $0.startTime < $1.startTime }
-    }
-    /// Open tasks with no block anywhere — the day grid's drag tray (matches
-    /// Android: scheduled-anywhere tasks drop out of the tray so dragging one
-    /// MOVES its block rather than re-adding it).
-    func unscheduled() -> [TaskItem] {
+
+    private func recomputeTaskDerived() {
         let scheduledIds = Set(blocks.filter { isTaskBlock($0) }.compactMap { $0.taskId })
         // recurrence == nil: never offer a recurring TEMPLATE in the schedule tray
         // — it's a hidden definition that generates occurrences, not a schedulable
         // task. Mirrors the Android DayGrid `it.recurrence == null` filter.
-        return tasks.filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && !scheduledIds.contains($0.id) }
+        unscheduledTasks = tasks.filter {
+            !$0.done && !($0.later ?? false) && $0.recurrence == nil && !scheduledIds.contains($0.id)
+        }
     }
 
-    /// Focused seconds per ISO date, for the Month heatmap.
-    var focusByDay: [String: Int] {
+    private func recomputeFocusByDay() {
         var out: [String: Int] = [:]
         for s in sessions {
             guard let ms = Time.parseMillis(s.completedAt) else { continue }
             let k = Clock.dateISO(millis: ms)
             out[k, default: 0] += s.actualSec
         }
-        return out
+        focusByDay = out
     }
+
+    /// Blocks for a day (skipped dropped, sorted by start) — O(1) cache lookup.
+    func blocks(on iso: String) -> [CalBlock] { blocksByDate[iso] ?? [] }
+    /// Lane-laid blocks for a day — O(1) cache lookup (was layoutLanes per call).
+    func laidBlocks(on iso: String) -> [LaidBlock] { laidByDate[iso] ?? [] }
+
+    /// Open tasks with no block anywhere — the day grid's drag tray (matches
+    /// Android: scheduled-anywhere tasks drop out of the tray so dragging one
+    /// MOVES its block rather than re-adding it).
+    func unscheduled() -> [TaskItem] { unscheduledTasks }
 }
 
 struct CalendarView: View {
@@ -365,7 +416,7 @@ private struct WeekView: View {
                 .onTapGesture { location in
                     onCreateAt(iso, snappedTime(location.y))
                 }
-                let laid = layoutLanes(vm.blocks(on: iso))
+                let laid = vm.laidBlocks(on: iso)
                 ForEach(laid, id: \.block.id) { item in
                     let b = item.block
                     let top = minutesOf(b.startTime) - wStart * 60
@@ -424,7 +475,7 @@ private struct WeekView: View {
     private let dayLabels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
     private func weekRangeLabel(_ start: Date, _ end: Date) -> String {
-        let df = DateFormatter(); df.locale = Locale(identifier: "en_US"); df.dateFormat = "MMM d"
+        let df = CalFmt.monthDay
         let cal = Calendar.current
         if cal.component(.month, from: start) == cal.component(.month, from: end) {
             return "\(df.string(from: start))–\(cal.component(.day, from: end))"
@@ -540,8 +591,7 @@ private struct MonthView: View {
     }
 
     private func monthLabel(_ d: Date) -> String {
-        let df = DateFormatter(); df.locale = Locale(identifier: "en_US"); df.dateFormat = "MMMM yyyy"
-        return df.string(from: d)
+        CalFmt.monthYear.string(from: d)
     }
 
     private func lerpColor(_ a: Color, _ b: Color, _ t: Double) -> Color {
@@ -734,7 +784,7 @@ struct DayGridView: View {
             // one would enqueue a non-UUID g_ row Postgres rejects forever, and
             // only changes local state that reverts on the next sync). Mirrors
             // the Android DayGrid gating.
-            ForEach(layoutLanes(vm.blocks(on: iso)), id: \.block.id) { item in
+            ForEach(vm.laidBlocks(on: iso), id: \.block.id) { item in
                 let b = item.block
                 let laneW = item.lanes > 1 ? (width - 82) / CGFloat(item.lanes) : (width - 82)
                 let card = blockCard(b, width: max(20, laneW - 3))
@@ -838,8 +888,7 @@ struct DayGridView: View {
         date = Calendar.current.date(byAdding: .day, value: days, to: date) ?? date
     }
     private var dayLabel: String {
-        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEE, MMM d"
-        return f.string(from: date)
+        CalFmt.weekdayMonthDay.string(from: date)
     }
     private func minutesOf(_ hhmm: String) -> Int {
         let p = hhmm.split(separator: ":").compactMap { Int($0) }

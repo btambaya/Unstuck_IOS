@@ -14,18 +14,31 @@ public typealias EpochMillis = Double
 public let DAY_MS: Double = 24 * 60 * 60 * 1000
 
 public enum Time {
+    /// Shared ISO-8601 parsers, hoisted to `static let` so the hot path
+    /// (realtime mirror / outbox prune / analytics / list rebuild) doesn't
+    /// allocate two formatters on every `parseMillis` call. `ISO8601DateFormatter`
+    /// is thread-safe for `date(from:)` (we only ever read with these — the
+    /// `formatOptions` are set once here and never mutated), so a single shared
+    /// instance is safe; `nonisolated(unsafe)` documents that to the compiler.
+    nonisolated(unsafe) private static let isoWithFractional: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) private static let isoPlain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+
     /// Parse an ISO-8601 timestamp to epoch milliseconds, or `nil` if it
     /// can't be parsed — mirrors `Date.parse` returning `NaN`. Accepts
     /// both fractional-second and whole-second forms.
     public static func parseMillis(_ iso: String) -> EpochMillis? {
-        let withFrac = ISO8601DateFormatter()
-        withFrac.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = withFrac.date(from: iso) {
+        if let d = isoWithFractional.date(from: iso) {
             return d.timeIntervalSince1970 * 1000
         }
-        let plain = ISO8601DateFormatter()
-        plain.formatOptions = [.withInternetDateTime]
-        if let d = plain.date(from: iso) {
+        if let d = isoPlain.date(from: iso) {
             return d.timeIntervalSince1970 * 1000
         }
         return nil
