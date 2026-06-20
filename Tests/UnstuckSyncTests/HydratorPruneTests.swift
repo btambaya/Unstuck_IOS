@@ -23,6 +23,11 @@ private actor FakeReadGateway: SyncReadGatewayProtocol {
         if table == "tasks", let rows = taskRows as? [Row] { return rows }
         return []
     }
+    func fetchAllRaw(table: String) async throws -> [Data] {
+        guard table == "tasks" else { return [] }
+        let encoder = JSONEncoder()
+        return try taskRows.map { try encoder.encode($0) }
+    }
 }
 
 /// Write-side fake (mirrors OutboxFlusherTests): records successful upserts.

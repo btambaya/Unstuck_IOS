@@ -34,7 +34,9 @@ public actor Hydrator {
         let ops = (try? box.pending()) ?? []
         let taskOps = ops.filter { $0.tableName == "tasks" && $0.kind == .upsert }
         guard !taskOps.isEmpty else { return }
-        guard let serverRows = try? await gateway.fetchAll(TaskRow.self, table: "tasks") else { return }
+        // Per-row tolerant: one un-decodable server task must not make the whole
+        // prune a no-op (which would let stale local ops re-push and clobber).
+        guard let serverRows = try? await gateway.fetchAllTolerant(TaskRow.self, table: "tasks") else { return }
         var serverUpdatedAt: [String: String] = [:]
         for r in serverRows { serverUpdatedAt[r.id] = r.updatedAt }
         for op in taskOps {
@@ -67,8 +69,10 @@ public actor Hydrator {
     /// event fires.
     public func hydrateCollections(userId: String) async {
         do {
-            let base = try await gateway.fetchAll(CollectionRow.self, table: "collections").map { $0.model() }
-            let memberRows = (try? await gateway.fetchAll(MemberRow.self, table: "collection_members")) ?? []
+            // Per-row tolerant decode (see replace()): a single bad collection
+            // row mustn't drop the user's entire list of collections.
+            let base = try await gateway.fetchAllTolerant(CollectionRow.self, table: "collections").map { $0.model() }
+            let memberRows = (try? await gateway.fetchAllTolerant(MemberRow.self, table: "collection_members")) ?? []
             var byColl: [String: [(String, String)]] = [:]   // collectionId -> [(userId, role)]
             for m in memberRows {
                 byColl[m.collectionId, default: []].append((m.userId, m.role ?? "editor"))
@@ -111,7 +115,12 @@ public actor Hydrator {
 
     private func replace<Row: Decodable & Sendable>(_ table: String, _ rowType: Row.Type, save: ([Row]) throws -> Void) async {
         do {
-            let rows = try await gateway.fetchAll(Row.self, table: table)
+            // Per-ROW tolerant decode: one un-decodable row (e.g. a forward-compat
+            // shape this build can't parse — an unknown recurrence kind already
+            // degrades, but any other new enum value could still throw) must not
+            // abort the whole table and wipe every good row off the UI. Drop only
+            // the bad row. Mirrors the Android Hydrator.
+            let rows = try await gateway.fetchAllTolerant(Row.self, table: table)
             try save(rows)
         } catch {
             print("[hydrate] \(table) failed, leaving local intact: \(error)")
@@ -120,7 +129,9 @@ public actor Hydrator {
 
     private func hydrateCalBlocks() async {
         do {
-            let remote = try await gateway.fetchAll(CalBlockRow.self, table: "cal_blocks").map { $0.model() }
+            // Per-row tolerant decode (see replace()): a single bad cal_block row
+            // mustn't wipe the whole schedule.
+            let remote = try await gateway.fetchAllTolerant(CalBlockRow.self, table: "cal_blocks").map { $0.model() }
             let local = (try? db.fetchAllCalBlocks()) ?? []
             let localExternal = local.filter { isExternalBlock($0) }
             let merged = SyncDecision.mergeHydratedCalBlocks(remote: remote, localExternal: localExternal)

@@ -41,6 +41,19 @@ public enum Recurrence: Codable, Equatable, Sendable {
         case kind, daysOfWeek, until
     }
 
+    /// `until` sentinel for an unrecognised recurrence kind (see `init(from:)`).
+    /// A date far enough in the past that the until-guard in
+    /// `materializeOccurrences` trips before any occurrence is materialised, so
+    /// the task repeats zero times on this build. `isUnknown` detects it.
+    public static let UNKNOWN_UNTIL = "0001-01-01"
+
+    /// True for the `init(from:)` degrade-sentinel — a daily whose until is in
+    /// the distant past. Callers (recurrenceLabel) treat it as "no recurrence".
+    public static func isUnknown(_ r: Recurrence?) -> Bool {
+        if case .daily(let until) = r, until == UNKNOWN_UNTIL { return true }
+        return false
+    }
+
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let kind = try c.decode(String.self, forKey: .kind)
@@ -54,9 +67,14 @@ public enum Recurrence: Codable, Equatable, Sendable {
         case "monthly":
             self = .monthly(until: until)
         default:
-            throw DecodingError.dataCorruptedError(
-                forKey: .kind, in: c,
-                debugDescription: "Unknown recurrence kind \"\(kind)\"")
+            // Forward-compat: an UNKNOWN kind (a newer web/iOS release added a
+            // recurrence type this build can't model). A bare throw would abort
+            // the WHOLE TaskRow decode, so the task would VANISH from the list.
+            // Degrade to a no-op daily that already ENDED (UNKNOWN_UNTIL): zero
+            // occurrences materialise and recurrenceLabel renders nothing, so
+            // the task stays usable (it just doesn't repeat here) instead of
+            // disappearing. Mirrors the Android RecurrenceSerializer fix.
+            self = .daily(until: Self.UNKNOWN_UNTIL)
         }
     }
 

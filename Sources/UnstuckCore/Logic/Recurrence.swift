@@ -129,6 +129,9 @@ private func formatDays(_ days: [Int]) -> String {
 /// Short human label for the detail pane / row chips.
 public func recurrenceLabel(_ r: Recurrence?) -> String {
     guard let r else { return "" }
+    // An unrecognised recurrence kind degraded to the inert sentinel on decode —
+    // render nothing (it doesn't repeat on this build). Matches Android.
+    if Recurrence.isUnknown(r) { return "" }
     let base: String
     switch r {
     case .daily:

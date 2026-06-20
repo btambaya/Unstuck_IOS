@@ -1,7 +1,48 @@
 // Ported 1:1 from lib/recurrence.test.ts.
 
 import XCTest
+import Foundation
 @testable import UnstuckCore
+
+// Forward-compat: an UNKNOWN recurrence kind (a newer release added a type this
+// build can't model) must NOT throw on decode — a throw would abort the whole
+// TaskRow decode and the task would VANISH from the list. It degrades to an inert
+// no-op daily (Recurrence.isUnknown) that materialises zero occurrences and
+// renders a blank label. Mirrors the Android RecurrenceSerializer fix.
+final class RecurrenceUnknownKindTests: XCTestCase {
+    private func decode(_ json: String) throws -> Recurrence {
+        try JSONDecoder().decode(Recurrence.self, from: json.data(using: .utf8)!)
+    }
+
+    func testUnknownKindDecodesToInertSentinelWithoutThrowing() throws {
+        let r = try decode(#"{"kind":"yearly"}"#)
+        XCTAssertTrue(Recurrence.isUnknown(r))
+        if case .daily(let until) = r {
+            XCTAssertEqual(until, Recurrence.UNKNOWN_UNTIL)
+        } else {
+            XCTFail("unknown kind should degrade to a daily sentinel")
+        }
+    }
+
+    func testUnknownKindMaterializesZeroOccurrences() throws {
+        let r = try decode(#"{"kind":"quarterly","until":null}"#)
+        let occ = materializeOccurrences(r, startDate: Time.civil(2026, 5, 21), startTime: "09:00", horizonDays: 56)
+        XCTAssertTrue(occ.isEmpty, "an unknown recurrence must not schedule any occurrence")
+    }
+
+    func testUnknownKindRendersBlankLabel() throws {
+        let r = try decode(#"{"kind":"fortnightly"}"#)
+        XCTAssertEqual(recurrenceLabel(r), "")
+    }
+
+    func testKnownKindsAreNotFlaggedUnknown() {
+        XCTAssertFalse(Recurrence.isUnknown(.daily(until: nil)))
+        XCTAssertFalse(Recurrence.isUnknown(.daily(until: "2026-09-01")))
+        XCTAssertFalse(Recurrence.isUnknown(.weekly(daysOfWeek: [1], until: nil)))
+        XCTAssertFalse(Recurrence.isUnknown(.monthly(until: nil)))
+        XCTAssertFalse(Recurrence.isUnknown(nil))
+    }
+}
 
 final class MaterializeOccurrencesTests: XCTestCase {
     // Thu May 21 2026

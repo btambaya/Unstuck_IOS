@@ -88,9 +88,15 @@ final class RecurrenceCodableTests: XCTestCase {
         XCTAssertEqual(r, .weekly(daysOfWeek: [0, 6], until: nil))
     }
 
-    func testUnknownKindThrows() {
+    // Forward-compat: an UNKNOWN kind must NOT throw — a throw would abort the
+    // whole TaskRow decode and the task would VANISH. It degrades to an inert
+    // no-op daily (Recurrence.isUnknown) instead. (Was testUnknownKindThrows,
+    // which asserted the old buggy behavior; mirrors Android's degrade fix.)
+    func testUnknownKindDegradesToInertSentinel() throws {
         let json = #"{"kind":"yearly"}"#.data(using: .utf8)!
-        XCTAssertThrowsError(try JSONDecoder().decode(Recurrence.self, from: json))
+        let r = try JSONDecoder().decode(Recurrence.self, from: json)
+        XCTAssertTrue(Recurrence.isUnknown(r))
+        XCTAssertEqual(r, .daily(until: Recurrence.UNKNOWN_UNTIL))
     }
 }
 

@@ -120,6 +120,24 @@ final class DbRowCodecTests: XCTestCase {
         XCTAssertEqual(model.recurrence, .weekly(daysOfWeek: [1, 3], until: nil))
     }
 
+    // An unknown recurrence kind (a newer release's shape) decodes inside a whole
+    // TaskRow to a USABLE task — recurrence present but inert — rather than throwing
+    // and dropping the row entirely (which would make the task VANISH). Mirrors
+    // Android's CoreModelsTest.unknownKindKeepsTaskDecodable.
+    func testTaskWithUnknownRecurrenceKindStillDecodes() throws {
+        let json = """
+        {"id":"t1","name":"Ship","estimate_min":25,"total_focused":0,"done":false,
+         "priority":null,"tags":[],"objectives":[],"comments":[],
+         "intent_when":null,"intent_then":null,"life_area":null,
+         "first_physical_action":null,"move_count":0,"completed_at":null,"later":false,
+         "recurrence":{"kind":"yearly"},
+         "created_at":"2026-05-21T10:00:00.000Z","updated_at":"2026-05-21T10:00:00.000Z"}
+        """.data(using: .utf8)!
+        let model = try JSONDecoder().decode(TaskRow.self, from: json).model()
+        XCTAssertEqual(model.name, "Ship")            // the task survived
+        XCTAssertTrue(Recurrence.isUnknown(model.recurrence))   // recurrence is inert
+    }
+
     func testForeignKeysDroppedWhenNotUUID() throws {
         let valid = "22222222-2222-4222-8222-222222222222"
         let bad = CalBlock(id: "b", taskId: "not-a-uuid", taskName: "B", startTime: "09:00",

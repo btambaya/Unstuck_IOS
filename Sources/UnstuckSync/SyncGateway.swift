@@ -22,6 +22,24 @@ public protocol SyncGatewayProtocol: Sendable {
 /// client) to exercise prune/hydrate ordering without a server.
 public protocol SyncReadGatewayProtocol: Sendable {
     func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row]
+    /// Fetch every row as a standalone JSON object (`Data` per row), so the
+    /// caller can decode PER-ROW and tolerate a single un-decodable row
+    /// (e.g. a forward-compat shape this build can't parse) instead of having
+    /// the whole-array decode of `fetchAll` throw and abort the table refresh.
+    func fetchAllRaw(table: String) async throws -> [Data]
+}
+
+public extension SyncReadGatewayProtocol {
+    /// Per-row tolerant decode over `fetchAllRaw`: drops only the rows that
+    /// fail to decode, keeping every good row. The load-bearing replacement
+    /// for an eager `fetchAll` in the hydrate path — one bad row (an unknown
+    /// recurrence kind already degrades, but any other forward-compat field
+    /// could still throw) must not wipe the whole table off the UI.
+    func fetchAllTolerant<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] {
+        let raw = try await fetchAllRaw(table: table)
+        let decoder = JSONDecoder()
+        return raw.compactMap { try? decoder.decode(Row.self, from: $0) }
+    }
 }
 
 public struct SyncGateway: Sendable, SyncGatewayProtocol, SyncReadGatewayProtocol {
@@ -31,6 +49,16 @@ public struct SyncGateway: Sendable, SyncGatewayProtocol, SyncReadGatewayProtoco
 
     public func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] {
         try await client.from(table).select().execute().value
+    }
+
+    /// Fetch the table as a list of per-row JSON objects re-encoded to `Data`.
+    /// PostgREST's whole-array decode is all-or-nothing, so we decode the
+    /// response into `[AnyJSON]` (which never fails on a forward-compat shape)
+    /// and re-encode each element — the caller then decodes per-row tolerantly.
+    public func fetchAllRaw(table: String) async throws -> [Data] {
+        let rows: [AnyJSON] = try await client.from(table).select().execute().value
+        let encoder = JSONEncoder()
+        return try rows.map { try encoder.encode($0) }
     }
 
     public func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {
