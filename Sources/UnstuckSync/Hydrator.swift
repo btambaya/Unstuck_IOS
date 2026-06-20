@@ -43,7 +43,17 @@ public actor Hydrator {
             guard let seq = op.opSeq, let data = op.payload?.data(using: .utf8),
                   let row = try? decoder.decode(TaskRow.self, from: data),
                   let serverTime = serverUpdatedAt[op.rowId] else { continue }
-            if serverTime > row.updatedAt {
+            // Compare INSTANTS, not ISO strings: PostgREST emits microseconds +
+            // "+00:00" while local ops use millis + "Z", which don't sort
+            // lexicographically as they sort chronologically — a raw `>` could
+            // keep a stale op and let it clobber a newer server row (the
+            // "completed on web didn't reflect on phone" regression). Mirrors
+            // RealtimeMirror.incomingTaskWins. If either side won't parse, fall
+            // back conservatively and DON'T prune (keep the op — it flushes and
+            // the server's own conflict resolution decides).
+            guard let serverMs = Time.parseMillis(serverTime),
+                  let localMs = Time.parseMillis(row.updatedAt) else { continue }
+            if serverMs > localMs {
                 print("[outbox] pruning stale tasks op \(op.rowId) — server is newer")
                 try? box.markDone(seq)
             }

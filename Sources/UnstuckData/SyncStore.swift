@@ -17,7 +17,12 @@ public extension AppDatabase {
     func replaceAll<T: PersistableRecord & FetchableRecord & Sendable>(_ type: T.Type, with rows: [T]) throws {
         try writer.write { db in
             try type.deleteAll(db)
-            for r in rows { try r.insert(db) }
+            // upsert (not insert): a duplicate id in `rows` — e.g. the server
+            // briefly returns two rows with the same id during a merge — would
+            // make `insert` throw and, because the Hydrator catch swallows it
+            // and "leaves local intact", abort the WHOLE table's hydrate. upsert
+            // resolves the duplicate to last-write-wins instead of failing.
+            for r in rows { try r.upsert(db) }
         }
     }
 

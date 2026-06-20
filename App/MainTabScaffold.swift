@@ -28,15 +28,17 @@ struct MainTabScaffold: View {
                 case .inbox: InboxView()
                 }
             }
-            .sheet(isPresented: $router.showBubble) {
+            .sheet(isPresented: $router.showBubble, onDismiss: { model.flushPendingDeepLink() }) {
                 BubbleSheet(screen: screenLabel(router.tab), startTab: router.bubbleStartTab)
             }
             // Notification deep links (unstuck://task/<id>) open the task
-            // editor from anywhere — Android's Route.Detail push.
-            .sheet(item: $router.detailTask) { task in
+            // editor from anywhere — Android's Route.Detail push. onDismiss
+            // flushes a deferred deep-link so a push tap arriving while THIS
+            // sheet was open presents cleanly once it's gone (bug-8 guard).
+            .sheet(item: $router.detailTask, onDismiss: { model.flushPendingDeepLink() }) { task in
                 TaskEditor(task: task, existingBlocks: ((try? model.db?.blocks(forTask: task.id)) ?? nil) ?? [])
             }
-            .fullScreenCover(item: $router.focusTask) { task in
+            .fullScreenCover(item: $router.focusTask, onDismiss: { model.flushPendingDeepLink() }) { task in
                 FocusView(task: task)
             }
     }

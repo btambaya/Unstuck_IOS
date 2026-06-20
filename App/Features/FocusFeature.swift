@@ -112,6 +112,7 @@ struct FocusView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
+    @Environment(\.scenePhase) private var scenePhase
     let task: TaskItem
     @State private var fm: FocusModel?
     @State private var showReasons = false
@@ -199,6 +200,15 @@ struct FocusView: View {
         .sheet(isPresented: $showCapture) { captureSheet }
         .sheet(isPresented: $showReflect, onDismiss: { dismiss() }) { reflectSheet }
         .onDisappear { AmbientAudio.shared.stop() }
+        // .onDisappear does NOT fire when the phone locks/backgrounds while the
+        // Focus screen stays "appeared" — the .playback engine would keep
+        // rendering (and draining battery) in the background. Stop on leaving
+        // .active; restart on return if the user still wants the bed playing.
+        // (VoiceModeScreen tears down on scenePhase the same way.)
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { AmbientAudio.shared.stop() }
+            else if let fm { updateAudio(fm) }
+        }
     }
 
     /// Ambient loop plays while focusing when the Settings ambient bed is on
@@ -394,8 +404,11 @@ struct FocusView: View {
                 focusBtn(isPaused ? "Resume" : "Pause", soft: true) {
                     if isPaused { fm.resume() }
                     // Pause-reasons setting off → pause silently (no "Why are you
-                    // pausing?" sheet), but still coordinate the paused check-in.
-                    else if model.settings.focusPauseReasons { fm.pause(); showReasons = true }
+                    // pausing?" sheet). Either way coordinate the paused check-in
+                    // NOW: pause() pre-schedules the local notif, so the cap/mute
+                    // gate must run whether or not a reason is later picked (an
+                    // ignored/dismissed reasons sheet must not bypass the cap).
+                    else if model.settings.focusPauseReasons { fm.pause(); coordinateCheckin(); showReasons = true }
                     else { fm.pause(); coordinateCheckin() }
                 }
                 // "Done" marks the task complete immediately (records the session

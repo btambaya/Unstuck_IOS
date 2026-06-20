@@ -16,6 +16,26 @@ final class SyncStoreClearAllTests: XCTestCase {
         db = try AppDatabase.makeInMemory()
     }
 
+    // Bug-9 regression: replaceAll upserts (not inserts) each row, so a
+    // duplicate id in the hydrated set resolves last-write-wins instead of
+    // throwing — a throw here was swallowed by the Hydrator's catch and aborted
+    // the WHOLE table's hydrate, blanking every good row on the UI.
+    func testReplaceAllToleratesDuplicateIds() throws {
+        try db.save(TaskItem(id: "old", name: "Old", estimateMin: 25, createdAt: now, updatedAt: now))
+        let dupes = [
+            TaskItem(id: "x", name: "First", estimateMin: 25, createdAt: now, updatedAt: now),
+            TaskItem(id: "x", name: "Second", estimateMin: 30, createdAt: now, updatedAt: now),  // same id
+            TaskItem(id: "y", name: "Other", estimateMin: 15, createdAt: now, updatedAt: now),
+        ]
+
+        XCTAssertNoThrow(try db.replaceAll(TaskItem.self, with: dupes))
+
+        // The prior row is replaced; the duplicate id collapses to the last write.
+        XCTAssertNil(try db.fetchById(TaskItem.self, id: "old"))
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "x")?.name, "Second")
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "y")?.name, "Other")
+    }
+
     func testClearAllWipesRecordsOutboxAndLiveSession() throws {
         let box = OutboxStore(db)
         let live = LiveSessionStore(db)

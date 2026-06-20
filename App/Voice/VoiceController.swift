@@ -130,8 +130,18 @@ final class VoiceController: @unchecked Sendable {
         if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
     }
 
+    /// Release the shared audio session. speak()/begin() activate it with the
+    /// playback/record category; without deactivating, that category leaks into
+    /// whatever plays next. .notifyOthersOnDeactivation lets other apps resume.
+    private func deactivateSession() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    }
+
     func shutdown() {
         stopListening()
         stopSpeaking()
+        // STT/TTS each set the session active but never released it; do so on
+        // teardown so the category doesn't bleed into the next session.
+        deactivateSession()
     }
 }

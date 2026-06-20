@@ -37,4 +37,21 @@ final class AppRouter {
     func select(_ tab: Tab) { self.tab = tab }
     func present(_ sheet: Sheet) { activeSheet = sheet }
     func beginFocus(_ task: TaskItem) { focusTask = task }
+
+    /// Any modal currently up on the single MainTabScaffold host. SwiftUI can't
+    /// present a second sheet/cover from one host while another is up (the new
+    /// one silently no-ops), so a push deep-link arriving now must dismiss first
+    /// and present after (see AppModel.routeDeepLink).
+    var hasActivePresentation: Bool {
+        activeSheet != nil || showBubble || detailTask != nil || focusTask != nil
+    }
+
+    /// Tear down every active modal so a deferred deep-link can present cleanly
+    /// once they finish dismissing (each host's onDismiss flushes the pending link).
+    func dismissAllPresentations() {
+        activeSheet = nil
+        showBubble = false
+        detailTask = nil
+        focusTask = nil
+    }
 }

@@ -74,6 +74,13 @@ final class AmbientAudio {
         if let node = sourceNode { engine.detach(node) }
         sourceNode = nil
         running = false
+        // configureSession() left the shared session active; release it so the
+        // .playback category doesn't leak into whatever plays next (and so the
+        // system can power down audio). .notifyOthersOnDeactivation lets other
+        // apps resume. Matches VoiceAudioEngine.deactivateSession().
+        #if os(iOS)
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        #endif
     }
 
     private func configureSession() {

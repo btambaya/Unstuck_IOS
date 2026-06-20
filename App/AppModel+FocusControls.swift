@@ -38,6 +38,15 @@ extension AppModel {
         }
     }
 
+    /// Reap focus Live Activities left dangling by a kill/crash mid-session.
+    /// If the persisted live session is still active, the controller rebinds to
+    /// its activity (so updates keep flowing); otherwise it ends every orphan so
+    /// no ghost lock-screen timer survives. Called on launch + foreground.
+    func reapStaleLiveActivities() {
+        let active = ((try? liveStore?.get()) ?? nil)?.sessionStart != nil
+        LiveActivityController.shared.reapOrphans(hasActiveSession: active)
+    }
+
     /// Resume the paused live session from Today (Android `resumeFocus`). Shifts
     /// sessionStart by the pause gap (so elapsed continues, not double-counts),
     /// un-freezes the Live Activity, and cancels the pending paused check-in.

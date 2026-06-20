@@ -224,6 +224,10 @@ final class AppModel {
         // (spec 10): must come after repos exist so a cold launch from a
         // notification tap can resolve its task.
         startNotifications()
+
+        // Reap any focus Live Activity orphaned by a prior kill/crash: rebind
+        // to a still-live session, else end the ghost timer (liveStore exists).
+        reapStaleLiveActivities()
     }
 
     /// Foreground/manual sync trigger (scenePhase .active, BG refresh):

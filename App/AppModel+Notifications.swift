@@ -45,6 +45,17 @@ extension AppModel {
     /// Route an `unstuck://` link (push tap, notification-center row, or
     /// notification action) to the right surface.
     func routeDeepLink(_ link: String) {
+        // Dismiss-before-present guard: if a sheet/cover is already up on the
+        // MainTabScaffold host, presenting another silently no-ops. Defer the
+        // link, dismiss the active modal(s), and let the host's onDismiss flush
+        // it. Only the modal-presenting links (focus/task/capture/collections)
+        // need this; a tab-switch link can apply under an open sheet, and the
+        // flush path itself re-enters with nothing presented (so no loop).
+        if presentsModal(link), router.hasActivePresentation {
+            routeDeepLinkAfterDismiss(link)
+            router.dismissAllPresentations()
+            return
+        }
         if link == "capture" || link == "unstuck://capture" {
             router.present(.quickCapture)
             return
@@ -72,6 +83,15 @@ extension AppModel {
             return
         }
         router.select(.today)           // unstuck://today, /recap, /brief
+    }
+
+    /// True when a link opens a modal (sheet/cover) — those collide with an
+    /// already-presented modal and so go through the dismiss-then-present guard.
+    /// A bare tab-switch (today/recap/brief/collections-tab) doesn't.
+    private func presentsModal(_ link: String) -> Bool {
+        link == "capture" || link == "unstuck://capture"
+            || link.hasPrefix("unstuck://focus/")
+            || link.hasPrefix("unstuck://task/")
     }
 
     // MARK: notification gestures (PushAppDelegate → PushActionHub)

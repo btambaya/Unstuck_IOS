@@ -111,7 +111,13 @@ struct UnstuckApp: App {
                     // Foreground sync (spec 02-sync-engine §5): flush queued
                     // offline edits + hydrate whenever the app returns to the
                     // foreground; queue the next BG refresh on exit.
-                    if phase == .active { model.syncNow() }
+                    if phase == .active {
+                        model.syncNow()
+                        // Reap any focus Live Activity orphaned by a kill/crash
+                        // mid-session (rebinds to a still-live session, else
+                        // ends the ghost timer).
+                        model.reapStaleLiveActivities()
+                    }
                     if phase == .background { BackgroundSync.schedule() }
                 }
         }
