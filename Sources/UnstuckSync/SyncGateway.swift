@@ -17,7 +17,14 @@ public protocol SyncGatewayProtocol: Sendable {
     func delete(table: String, id: String) async throws
 }
 
-public struct SyncGateway: Sendable, SyncGatewayProtocol {
+/// The server-read seam the Hydrator builds on — SyncGateway in production;
+/// tests inject a scripted fake (the real gateway needs a network + Supabase
+/// client) to exercise prune/hydrate ordering without a server.
+public protocol SyncReadGatewayProtocol: Sendable {
+    func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row]
+}
+
+public struct SyncGateway: Sendable, SyncGatewayProtocol, SyncReadGatewayProtocol {
     let client: SupabaseClient
 
     public init(_ client: SupabaseClient) { self.client = client }

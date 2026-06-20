@@ -156,4 +156,63 @@ final class OutboxFlusherTests: XCTestCase {
         let upserts = await gateway.upserts
         XCTAssertEqual(upserts.map { $0.id }, ["t2"])
     }
+
+    // MARK: - Malformed-op quarantine (dead-letter, not silent drop)
+
+    func testUnknownTableOpIsQuarantinedNotDropped() async throws {
+        // The user's local row is real; only the queued op names a table the
+        // flusher can't route. The old `default: break` markDone'd it as
+        // success, permanently dropping the edit. It must be kept + skipped.
+        try db.save(TaskItem(id: "x1", name: "kept", estimateMin: 25,
+                             createdAt: now, updatedAt: now))
+        _ = try box.enqueue(table: "unknown_table", rowId: "x1", kind: .upsert,
+                            payload: try taskPayload(id: "x1"), nowISO: now)
+
+        await flusher.flush(userId: "u1")
+        // Op survives in the outbox (not silently dropped) ...
+        XCTAssertEqual(try box.count(), 1)
+        // ... was never sent to the server ...
+        let upserts = await gateway.upserts
+        XCTAssertTrue(upserts.isEmpty)
+        // ... and the user's local row is untouched.
+        let kept = try db.fetchById(TaskItem.self, id: "x1")
+        XCTAssertEqual(kept?.name, "kept")
+    }
+
+    func testNilPayloadUpsertOpIsQuarantinedNotDropped() async throws {
+        // An upsert op whose payload is nil can never be sent. It must be
+        // quarantined (kept, not markDone'd) rather than treated as success.
+        try db.save(TaskItem(id: "x1", name: "kept", estimateMin: 25,
+                             createdAt: now, updatedAt: now))
+        _ = try box.enqueue(table: "tasks", rowId: "x1", kind: .upsert,
+                            payload: nil, nowISO: now)
+
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 1)
+        let upserts = await gateway.upserts
+        XCTAssertTrue(upserts.isEmpty)
+        let kept = try db.fetchById(TaskItem.self, id: "x1")
+        XCTAssertEqual(kept?.name, "kept")
+    }
+
+    func testQuarantinedOpDoesNotBlockHealthyOpsOrSpinAcrossDrains() async throws {
+        // A malformed op for one row must not stall a valid op for another, and
+        // re-draining must not re-send it (it's filtered out every pass).
+        _ = try box.enqueue(table: "unknown_table", rowId: "bad", kind: .upsert,
+                            payload: try taskPayload(id: "bad"), nowISO: now)
+        _ = try box.enqueue(table: "tasks", rowId: "good", kind: .upsert,
+                            payload: try taskPayload(id: "good"), nowISO: now)
+
+        await flusher.flush(userId: "u1")
+        // Valid op flushed + dropped; malformed op remains quarantined.
+        XCTAssertEqual(try box.pending().map(\.rowId), ["bad"])
+        var upserts = await gateway.upserts
+        XCTAssertEqual(upserts.map(\.id), ["good"])
+
+        // A second drain doesn't re-send the quarantined op.
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 1)
+        upserts = await gateway.upserts
+        XCTAssertEqual(upserts.map(\.id), ["good"])
+    }
 }

@@ -25,9 +25,18 @@ public actor RealtimeMirror {
 
     public func subscribeAll(userId: String, onMembersChanged: @escaping @Sendable () async -> Void = {}) async {
         await unsubscribeAll()
+        // tasks carries `updated_at`, so guard incoming UPDATEs with last-write-
+        // wins: an out-of-order remote echo (the server re-broadcasting an edit
+        // we already superseded locally) must NOT clobber a newer local edit.
+        // INSERTs always apply (creating a row we don't have); only UPDATEs are
+        // gated. Other tables have no `updated_at` column, so they can't be
+        // timestamp-guarded and keep the prior unconditional apply.
         await subscribe("tasks", TaskRow.self, userId: userId,
                         onUpsert: { try? self.db.save($0.model()) },
-                        onDelete: { try? self.db.deleteById(TaskItem.self, id: $0) })
+                        onDelete: { try? self.db.deleteById(TaskItem.self, id: $0) },
+                        shouldApplyUpdate: { [db] incoming in
+                            Self.incomingTaskWins(incoming, db: db)
+                        })
         await subscribe("sessions", SessionRow.self, userId: userId,
                         onUpsert: { try? self.db.save($0.model()) },
                         onDelete: { try? self.db.deleteById(Session.self, id: $0) })
@@ -66,13 +75,27 @@ public actor RealtimeMirror {
         await subscribeMembers(userId: userId, onChanged: onMembersChanged)
     }
 
+    /// Last-write-wins guard for an incoming `tasks` UPDATE. Skip (return
+    /// false) when the local row's `updated_at` parses to a STRICTLY newer
+    /// instant than the incoming row's — i.e. a newer local edit would be
+    /// clobbered by a stale remote echo. Compares parsed dates, not strings.
+    /// Applies (returns true) when there's no local row, the local row has no
+    /// usable timestamp, or the incoming is at-or-after the local one.
+    static func incomingTaskWins(_ incoming: TaskRow, db: AppDatabase) -> Bool {
+        guard let local = try? db.fetchById(TaskItem.self, id: incoming.id),
+              let localMs = Time.parseMillis(local.updatedAt),
+              let incomingMs = Time.parseMillis(incoming.updatedAt) else { return true }
+        return incomingMs >= localMs
+    }
+
     private func subscribe<Row: Decodable & Sendable>(
         _ table: String,
         _ rowType: Row.Type,
         userId: String,
         onUpsert: @escaping @Sendable (Row) -> Void,
         onDelete: @escaping @Sendable (String) -> Void,
-        noUserFilter: Bool = false
+        noUserFilter: Bool = false,
+        shouldApplyUpdate: @escaping @Sendable (Row) -> Bool = { _ in true }
     ) async {
         let channel = client.channel("unstuck_\(table)_\(userId)")
         let filter: RealtimePostgresFilter? = noUserFilter ? nil : .eq("user_id", value: userId)
@@ -96,7 +119,8 @@ public actor RealtimeMirror {
         streamTasks.append(Task {
             let dec = JSONDecoder()
             for await change in updates {
-                if let row = try? change.decodeRecord(as: Row.self, decoder: dec) { onUpsert(row) }
+                if let row = try? change.decodeRecord(as: Row.self, decoder: dec),
+                   shouldApplyUpdate(row) { onUpsert(row) }
             }
         })
         streamTasks.append(Task {

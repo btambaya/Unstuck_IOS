@@ -29,6 +29,18 @@ public actor OutboxFlusher {
     private var failCounts: [Int64: Int] = [:]
     private static let failCap = 5
 
+    // Quarantined (dead-lettered) op seqs: malformed ops we can't even build a
+    // request for — an unknown tableName or a nil/undecodable upsert payload.
+    // These can never succeed by retrying, but they must NOT be markDone'd
+    // (that silently drops the user's local row) and must NOT be retried as if
+    // transiently failing (that would poison-cap a healthy app or spin the
+    // drain). We keep the outbox row, stop sending it, and skip it every pass —
+    // the local row stays put, and hydrate's pending-row preservation still
+    // protects it from a blanking replace. In-memory (resets on relaunch) so a
+    // future build that learns the table/payload can flush it. Mirrors the
+    // idea of a dead-letter queue without a schema change.
+    private var quarantined: Set<Int64> = []
+
     public init(gateway: any SyncGatewayProtocol, db: AppDatabase) {
         self.gateway = gateway
         self.box = OutboxStore(db)
@@ -97,6 +109,9 @@ public actor OutboxFlusher {
             // at session end). A parent present locally with no pending op has been
             // flushed/hydrated, so the FK is satisfied server-side.
             let flushable = all.filter { op in
+                // Skip dead-lettered ops: kept in the outbox (the local row
+                // survives) but never re-sent, so they don't spin the loop.
+                if let seq = op.opSeq, quarantined.contains(seq) { return false }
                 guard let dep = op.dependsOn else { return true }
                 if pendingRowIds.contains(dep) { return false }
                 guard let parent = Self.dependsOnParentTable(op.tableName) else { return true }
@@ -117,6 +132,17 @@ public actor OutboxFlusher {
                     try box.markDone(seq)
                     failCounts[seq] = nil
                     progressed = true
+                } catch let malformed as MalformedOpError {
+                    // Structurally-invalid op (nil payload / unknown table): it
+                    // can never become a request, so dead-letter it — keep the
+                    // outbox row (the user's local row is untouched and stays on
+                    // the UI via hydrate's pending-row preservation), stop
+                    // re-sending it, and don't markDone (the old code's silent
+                    // drop) or burn the poison cap (it isn't a server rejection).
+                    // Block this row's later ops too, preserving per-row order.
+                    print("[outbox] quarantining malformed op \(rowKey): \(malformed.reason)")
+                    quarantined.insert(seq)
+                    blockedRows.insert(rowKey)
                 } catch {
                     // Cancellation (sign-out timeout / BG-task stop / URLSession
                     // cancelled) is NOT a server rejection — abort the drain
@@ -152,12 +178,27 @@ public actor OutboxFlusher {
         }
     }
 
+    /// A structurally-invalid op the flusher can never turn into a request:
+    /// an upsert with a nil payload, or a tableName the apply switch doesn't
+    /// know. NOT a server rejection (so it must not feed the poison cap) and
+    /// NOT success (so the op must not be markDone'd) — it's dead-lettered.
+    struct MalformedOpError: Error {
+        enum Reason { case missingPayload, unknownTable(String) }
+        let reason: Reason
+    }
+
     private func apply(_ op: OutboxOp, userId: String) async throws {
         if op.kind == .delete {
             try await gateway.delete(table: op.tableName, id: op.rowId)
             return
         }
-        guard let data = op.payload?.data(using: .utf8) else { return }
+        // A nil/empty upsert payload can never be sent. Surface it so the drain
+        // quarantines the op instead of silently markDone'ing (= dropping the
+        // user's local row) — the old `guard … else { return }` looked like
+        // success to the caller.
+        guard let data = op.payload?.data(using: .utf8) else {
+            throw MalformedOpError(reason: .missingPayload)
+        }
         switch op.tableName {
         case "tasks":        try await gateway.upsert(decoder.decode(TaskRow.self, from: data), table: op.tableName, userId: userId)
         case "cal_blocks":   try await gateway.upsert(decoder.decode(CalBlockRow.self, from: data), table: op.tableName, userId: userId)
@@ -167,7 +208,9 @@ public actor OutboxFlusher {
         case "collections":  try await gateway.upsert(decoder.decode(CollectionRow.self, from: data), table: op.tableName, userId: userId)
         case "tags":         try await gateway.upsert(decoder.decode(TagDbRow.self, from: data), table: op.tableName, userId: userId)
         case "life_areas":   try await gateway.upsert(decoder.decode(LifeAreaDbRow.self, from: data), table: op.tableName, userId: userId)
-        default: break
+        // An unknown table can never be routed. Quarantine rather than the old
+        // `default: break` (which fell through to markDone, dropping the row).
+        default: throw MalformedOpError(reason: .unknownTable(op.tableName))
         }
     }
 }

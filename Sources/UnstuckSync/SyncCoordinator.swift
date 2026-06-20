@@ -125,12 +125,19 @@ public actor SyncCoordinator {
         return f.string(from: Date())
     }
 
-    /// Drain the outbox for the current user now. Flush-only (no hydrate):
-    /// a hydrate racing a transiently-failed flush would revert the
-    /// optimistic local edit off the UI until the op retries.
+    /// Drain the outbox for the current user now. No hydrate (a hydrate
+    /// racing a transiently-failed flush would revert the optimistic local
+    /// edit off the UI until the op retries), but it DOES prune stale task
+    /// ops first — exactly like syncNow()/the auth-event path, and like
+    /// Android which pairs every flush with a prune. Without the prune, a
+    /// queued op the server already superseded (e.g. a completion made on
+    /// the web) would re-push and clobber the newer server state before the
+    /// next prune+hydrate. The prune only touches the server when task ops
+    /// are actually queued, so it's free in the common empty-outbox case.
     public func flushNow() async {
         guard let uid = auth.currentUserId else { return }
         let auth = self.auth
+        await hydrator.pruneStaleTaskOps()
         await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
     }
 

@@ -10,12 +10,12 @@ import UnstuckCore
 import UnstuckData
 
 public actor Hydrator {
-    private let gateway: SyncGateway
+    private let gateway: any SyncReadGatewayProtocol
     private let db: AppDatabase
     private let box: OutboxStore
     private let decoder = JSONDecoder()
 
-    public init(gateway: SyncGateway, db: AppDatabase) {
+    public init(gateway: any SyncReadGatewayProtocol, db: AppDatabase) {
         self.gateway = gateway
         self.db = db
         self.box = OutboxStore(db)
