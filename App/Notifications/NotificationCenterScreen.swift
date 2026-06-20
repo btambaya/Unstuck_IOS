@@ -45,7 +45,8 @@ struct NotificationCenterView: View {
                         ForEach(log.items) { n in
                             card(dot: accentColor(n.kind), title: n.title,
                                  meta: "\(n.body)  ·  \(relPast(now - n.at))",
-                                 action: tapAction(for: n))
+                                 action: tapAction(for: n),
+                                 kindLabel: kindLabel(n.kind))
                         }
                     }
                 }
@@ -93,6 +94,21 @@ struct NotificationCenterView: View {
         dismiss()
     }
 
+    /// Human-readable name for the dot's color-coded kind, so VoiceOver conveys
+    /// the meaning that's otherwise only in the accent color.
+    private func kindLabel(_ kind: String) -> String {
+        switch kind {
+        case "paused_checkin": return "Paused check-in"
+        case "atstart": return "Starting now"
+        case "drifted": return "Drifted"
+        case "session_recap": return "Session recap"
+        case "morning_brief": return "Morning brief"
+        case "evening_preview": return "Evening preview"
+        case "daily_nudge": return "Daily nudge"
+        default: return "Notification"
+        }
+    }
+
     private func accentColor(_ kind: String) -> Color {
         switch notificationAccent(kind: kind) {
         case .amber: return theme.palette.amber
@@ -102,7 +118,8 @@ struct NotificationCenterView: View {
         }
     }
 
-    private func card(dot: Color, title: String, meta: String, action: (() -> Void)?) -> some View {
+    private func card(dot: Color, title: String, meta: String, action: (() -> Void)?,
+                      kindLabel: String = "Reminder") -> some View {
         let row = HStack(alignment: .center, spacing: 11) {
             Circle().fill(dot).frame(width: 7, height: 7)
             VStack(alignment: .leading, spacing: 2) {
@@ -118,6 +135,11 @@ struct NotificationCenterView: View {
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.palette.line))
         .padding(.vertical, 3)
+        // The dot's color is the ONLY signal of the notification kind — surface
+        // it as a label so it isn't color-only for VoiceOver.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(kindLabel): \(title)")
+        .accessibilityValue(meta)
 
         return Group {
             if let action {

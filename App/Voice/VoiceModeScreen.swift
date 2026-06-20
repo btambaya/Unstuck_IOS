@@ -235,7 +235,11 @@ private struct PulsingOrb: View {
             .overlay(Image(systemName: "waveform").font(.system(size: 34)).foregroundStyle(.white.opacity(0.9)))
             .animation(active ? .easeInOut(duration: 0.9).repeatForever(autoreverses: true) : .default, value: pulse)
             .onAppear { pulse = true }
+            // Reliable circular hit shape (the scaleEffect/overlay otherwise leave
+            // hit-test gaps), and announce it as a button to VoiceOver.
+            .contentShape(Circle())
             .onTapGesture { onTap?() }
-            .accessibilityLabel(onTap != nil ? "Interrupt assistant" : "Assistant")
+            .accessibilityLabel(onTap != nil ? "Tap to interrupt" : "Assistant")
+            .accessibilityAddTraits(onTap != nil ? .isButton : [])
     }
 }

@@ -210,7 +210,10 @@ struct CalendarView: View {
                         .padding(.horizontal, 10).padding(.vertical, 4)
                         .background(on ? theme.palette.ink : .clear,
                                     in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .contentShape(Rectangle())
                 }.buttonStyle(.plain)
+                    .accessibilityLabel(m.rawValue)
+                    .accessibilityAddTraits(on ? [.isButton, .isSelected] : .isButton)
             }
         }
         .padding(2)
@@ -336,17 +339,23 @@ private struct WeekView: View {
                     Button { weekOffset -= 1 } label: {
                         Text("‹").font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink2)
                             .padding(.horizontal, 12).padding(.vertical, 2)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).padding(.vertical, -6)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("Previous week")
                     if weekOffset != 0 {
                         Button { weekOffset = 0 } label: {
                             Text("Today").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
                                 .padding(.horizontal, 8).padding(.vertical, 4)
+                                .frame(minHeight: 44).contentShape(Rectangle()).padding(.vertical, -10)
                         }.buttonStyle(.plain)
+                            .accessibilityLabel("This week")
                     }
                     Button { weekOffset += 1 } label: {
                         Text("›").font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink2)
                             .padding(.horizontal, 12).padding(.vertical, 2)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).padding(.vertical, -6)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("Next week")
                 }
                 .padding(.top, 8)
 
@@ -524,15 +533,21 @@ private struct MonthView: View {
                     Button { ym = cal.date(byAdding: .month, value: -1, to: ym)! } label: {
                         Text("‹").font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink2)
                             .padding(.horizontal, 10).padding(.vertical, 2)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).padding(.vertical, -8)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("Previous month")
                     Button { ym = Date() } label: {
                         Text("Today").font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.primaryDeep)
                             .padding(.horizontal, 8).padding(.vertical, 4)
+                            .frame(minHeight: 44).contentShape(Rectangle()).padding(.vertical, -10)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("This month")
                     Button { ym = cal.date(byAdding: .month, value: 1, to: ym)! } label: {
                         Text("›").font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink2)
                             .padding(.horizontal, 10).padding(.vertical, 2)
+                            .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).padding(.vertical, -8)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("Next month")
                 }
                 .padding(.top, 8)
 
@@ -715,14 +730,18 @@ struct DayGridView: View {
             Button { shift(-1) } label: {
                 Text("‹").font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink2)
                     .padding(.horizontal, 12).padding(.vertical, 4)
+                    .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).padding(.vertical, -6)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Previous day")
             Spacer()
             Text(iso == Clock.todayISO() ? "Today" : dayLabel).font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink)
             Spacer()
             Button { shift(1) } label: {
                 Text("›").font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink2)
                     .padding(.horizontal, 12).padding(.vertical, 4)
+                    .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle()).padding(.vertical, -6)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Next day")
         }
         .padding(.horizontal, 20).padding(.vertical, 10)
     }
@@ -981,7 +1000,11 @@ struct CalBlockEditSheet: View {
                 .padding(.horizontal, 12).padding(.vertical, 6)
                 .background(selected ? theme.palette.ink : theme.palette.bg2, in: Capsule())
                 .overlay(Capsule().stroke(theme.palette.line2))
+                // 44pt hit area without growing the drawn capsule row.
+                .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 }

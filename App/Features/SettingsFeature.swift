@@ -249,7 +249,11 @@ private struct SegRow: View {
                             .padding(.horizontal, 11).padding(.vertical, 6)
                             .background(isOn ? AnyShapeStyle(theme.palette.primary) : AnyShapeStyle(theme.palette.bg2),
                                         in: Capsule())
+                            // 44pt hit area; negative padding keeps the row's drawn height.
+                            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
                     }.buttonStyle(.plain)
+                        .accessibilityLabel(opt.label)
+                        .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
                 }
             }
         }

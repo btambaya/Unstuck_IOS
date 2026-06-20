@@ -385,6 +385,22 @@ struct AnalyticsView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // The bars are area-colored only — give VoiceOver the numbers instead of
+        // silence: total focus hours per weekday + the busiest day.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(stackedBarsSummary(title, bars))
+    }
+
+    private func stackedBarsSummary(_ title: String, _ bars: [StackedBar]) -> String {
+        let totals = bars.map { ($0.d, $0.data.reduce(0, +)) }
+        let grand = totals.reduce(0.0) { $0 + $1.1 }
+        guard grand > 0 else { return "\(title). No focus hours recorded yet." }
+        let parts = totals.filter { $0.1 > 0 }
+            .map { "\($0.0) \(String(format: "%.1f", $0.1)) hours" }
+            .joined(separator: ", ")
+        let busiest = totals.max { $0.1 < $1.1 }
+        let lead = busiest.map { "Busiest \($0.0)." } ?? ""
+        return "\(title). \(lead) \(parts)."
     }
 
     // MARK: histogram (interruptions / re-entry)
@@ -408,6 +424,16 @@ struct AnalyticsView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // Bars are height + color only — summarize the distribution for VoiceOver.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(histogramSummary(title, bins))
+    }
+
+    private func histogramSummary(_ title: String, _ bins: [Int]) -> String {
+        let total = bins.reduce(0, +)
+        guard total > 0 else { return "\(title). No data yet." }
+        let peakIdx = bins.indices.max { bins[$0] < bins[$1] } ?? 0
+        return "\(title). \(total) total, peak in bin \(peakIdx + 1) of \(bins.count)."
     }
 
     // MARK: hour × day heatmap
@@ -439,6 +465,19 @@ struct AnalyticsView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        // Cells encode intensity by color only — call out the busiest day for
+        // VoiceOver instead of leaving the grid silent.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(heatmapSummary(grid, days))
+    }
+
+    private func heatmapSummary(_ grid: Heatmap, _ days: [String]) -> String {
+        let totals = grid.map { $0.reduce(0, +) }
+        let grand = totals.reduce(0, +)
+        guard grand > 0 else { return "Hour by day focus heatmap. No focus recorded yet." }
+        let busiestDay = totals.indices.max { totals[$0] < totals[$1] }
+            .flatMap { $0 < days.count ? days[$0] : nil } ?? "—"
+        return "Hour by day focus heatmap. Busiest day \(busiestDay)."
     }
 }
 
@@ -462,8 +501,12 @@ private struct MdSegment: View {
                         .padding(.horizontal, 10).padding(.vertical, 4)
                         .background(active ? theme.palette.ink : .clear,
                                     in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        // 44pt hit area; negative padding keeps the track's drawn height.
+                        .frame(minHeight: 44).contentShape(Rectangle()).padding(.vertical, -11)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(opt)
+                .accessibilityAddTraits(active ? [.isButton, .isSelected] : .isButton)
             }
         }
         .padding(2)
@@ -613,6 +656,10 @@ private struct CalibrationScatter: View {
                 }
                 .frame(height: 180)
                 .padding(.top, 8)
+                // The Canvas scatter is purely visual (green = on estimate, coral =
+                // off) — describe it for VoiceOver.
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(scatterSummary)
                 HStack(spacing: 14) {
                     Text("→ estimate").font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
                     Text("↑ actual").font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
@@ -620,5 +667,11 @@ private struct CalibrationScatter: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    private var scatterSummary: String {
+        guard !dots.isEmpty else { return "Estimate calibration scatter. No estimated sessions yet." }
+        let within = dots.filter { abs($0.e - $0.a) <= 5 }.count
+        return "Estimate calibration scatter. \(dots.count) sessions, \(within) within 5 minutes of estimate, \(hitPct)% on estimate."
     }
 }

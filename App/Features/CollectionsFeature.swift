@@ -201,7 +201,14 @@ struct ListsView: View {
                     ForEach(["indigo", "coral", "green", "amber", "blue", "violet"], id: \.self) { col in
                         Circle().fill(theme.palette.areaColor(col)).frame(width: 30, height: 30)
                             .overlay(Circle().stroke(theme.palette.ink, lineWidth: newColor == col ? 2 : 0))
+                            // 44pt hit target; negative padding keeps the swatch row's
+                            // drawn size (the 30pt circle is unchanged).
+                            .frame(width: 44, height: 44).contentShape(Circle())
                             .onTapGesture { newColor = col }
+                            .padding(-7)
+                            .accessibilityElement()
+                            .accessibilityLabel(col.capitalized)
+                            .accessibilityAddTraits(newColor == col ? [.isButton, .isSelected] : .isButton)
                     }
                 }
                 UButton("Create", kind: .dark) { createCollection() }
@@ -360,7 +367,14 @@ struct CollectionDetailView: View {
                             ForEach(COLLECTION_PALETTE, id: \.self) { token in
                                 Circle().fill(theme.palette.areaColor(token)).frame(width: 26, height: 26)
                                     .overlay(Circle().stroke(theme.palette.ink, lineWidth: col.color == token ? 2 : 0))
+                                    // 44pt hit target; negative padding preserves the
+                                    // drawn 26pt swatch + row spacing.
+                                    .frame(width: 44, height: 44).contentShape(Circle())
                                     .onTapGesture { model.recolorCollection(col, color: token) }
+                                    .padding(-9)
+                                    .accessibilityElement()
+                                    .accessibilityLabel(token.capitalized)
+                                    .accessibilityAddTraits(col.color == token ? [.isButton, .isSelected] : .isButton)
                             }
                         }.padding(.top, 12)
                     }

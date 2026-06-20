@@ -232,7 +232,12 @@ struct TasksView: View {
             }
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(selected ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+            // 44pt hit area; the negative padding keeps the filter bar's drawn
+            // height (the pill capsule is unchanged).
+            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
         }.buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 
     // MARK: dismissible tag-filter banner (Android parity)
@@ -253,7 +258,11 @@ struct TasksView: View {
                 }
                 .padding(.horizontal, 11).padding(.vertical, 6)
                 .background(theme.palette.primarySoft, in: Capsule())
+                // 44pt hit area on the pill without growing the drawn capsule —
+                // negative padding cancels the extra height so layout is unchanged.
+                .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Filtering by tag number \(tag). Tap to clear.")
                 .padding(.bottom, 12)
         }
     }
@@ -275,7 +284,9 @@ struct TasksView: View {
                 }
                 .padding(.horizontal, 11).padding(.vertical, 6)
                 .background(theme.palette.amberSoft, in: Capsule())
+                .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Showing slipping tasks. Tap to clear.")
                 .padding(.bottom, 12)
         }
     }

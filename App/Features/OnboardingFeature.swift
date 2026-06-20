@@ -159,7 +159,11 @@ struct OnboardingView: View {
                         .padding(.horizontal, 14).padding(.vertical, 9)
                         .background(on ? theme.palette.ink : theme.palette.bg2, in: Capsule())
                         .overlay(Capsule().stroke(theme.palette.line))
+                        // 44pt hit area without enlarging the drawn pill.
+                        .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -5)
                 }.buttonStyle(.plain)
+                    .accessibilityLabel(opt)
+                    .accessibilityAddTraits(on ? [.isButton, .isSelected] : .isButton)
             }
         }
         .padding(.top, 14)

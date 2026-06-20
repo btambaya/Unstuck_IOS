@@ -294,11 +294,14 @@ struct TodayView: View {
                                 }
                             }
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("Notifications")
+                        .accessibilityValue(NotificationLog.shared.hasUnread ? "Unread" : "")
                     Button { showSettings = true } label: {
                         Text(model.avatarInitials)
                             .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.greenInk)
                             .frame(width: 32, height: 32).background(theme.palette.greenSoft, in: Circle())
                     }.buttonStyle(.plain)
+                        .accessibilityLabel("Account and settings")
                 }
             }
             .padding(.leading, 18).padding(.trailing, 12).padding(.top, 8).padding(.bottom, 4)
@@ -627,7 +630,14 @@ struct TodayView: View {
                 Spacer()
                 Button { model.lastRecap = nil } label: {
                     Text("✕").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+                        // Grow the hit area to 44pt without shifting the card body:
+                        // the ✕ stays drawn at 13pt; the larger frame is centered &
+                        // transparent, and the negative top padding keeps the HStack
+                        // (and the text below it) at its original height.
+                        .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                        .padding(.vertical, -14)
                 }.buttonStyle(.plain)
+                    .accessibilityLabel("Dismiss")
             }
             Text("You did the thing.").font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
                 .padding(.top, 4)
@@ -661,7 +671,12 @@ struct TodayView: View {
             }.buttonStyle(.plain)
             Button { vm.dismissNudge(n.id) } label: {
                 Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    // 44pt hit area; negative padding keeps the nudge-card row height
+                    // unchanged so the drawn layout is identical.
+                    .frame(minWidth: 44, minHeight: 44).contentShape(Rectangle())
+                    .padding(.vertical, -14)
             }.buttonStyle(.plain)
+                .accessibilityLabel("Dismiss")
         }
         .padding(14)
         .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 16, style: .continuous))

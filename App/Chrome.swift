@@ -115,7 +115,7 @@ struct AppBar: View {
             Button(action: onSearch) {
                 Image(systemName: "magnifyingglass").font(.system(size: 18)).foregroundStyle(theme.palette.ink2)
                     .frame(width: 40, height: 40)
-            }.buttonStyle(.plain)
+            }.buttonStyle(.plain).accessibilityLabel("Search")
             if let onNotifications {
                 Button(action: onNotifications) {
                     Image(systemName: "bell").font(.system(size: 18)).foregroundStyle(theme.palette.ink2)
@@ -127,13 +127,14 @@ struct AppBar: View {
                             }
                         }
                 }.buttonStyle(.plain).accessibilityLabel("Notifications")
+                    .accessibilityValue(notifUnread ? "Unread" : "")
             }
             Button(action: onAvatar) {
                 Text(model.avatarInitials)
                     .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.greenInk)
                     .frame(width: 32, height: 32)
                     .background(theme.palette.greenSoft, in: Circle())
-            }.buttonStyle(.plain)
+            }.buttonStyle(.plain).accessibilityLabel("Account and settings")
         }
         .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 4)
     }

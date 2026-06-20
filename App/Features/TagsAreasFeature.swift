@@ -159,6 +159,8 @@ private struct AreaRow: View {
                 ColorChip(token: area.color, box: 30, dot: 9)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Color")
+            .accessibilityValue(area.color.capitalized)
             .popover(isPresented: $showPalette) {
                 PalettePicker { tok in
                     // Recolor = re-upsert preserving id + sortOrder + name.
@@ -280,6 +282,8 @@ private struct TagRowView: View {
                 ColorChip(token: tag.color, box: 26, dot: 8)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Color")
+            .accessibilityValue((tag.color ?? "default").capitalized)
             .popover(isPresented: $showPalette) {
                 PalettePicker { tok in
                     model.saveTag(TagRow(id: tag.id, name: tag.name, color: tok, sortOrder: tag.sortOrder))
@@ -369,6 +373,8 @@ private struct PalettePicker: View {
                 Button { onPick(tok) } label: {
                     ColorChip(token: tok, box: 30, dot: 11)
                 }.buttonStyle(.plain)
+                    .accessibilityLabel(tok.capitalized)
+                    .accessibilityAddTraits(.isButton)
             }
         }
         .padding(14)
