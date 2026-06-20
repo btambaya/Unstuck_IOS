@@ -10,7 +10,12 @@ import Foundation
 import Supabase
 
 /// One message in the OpenAI-style conversation (user | assistant | tool).
-public struct ChatMessage: Codable, Equatable, Sendable {
+public struct ChatMessage: Codable, Equatable, Sendable, Identifiable {
+    /// Stable identity for SwiftUI list diffing — NOT part of the wire shape
+    /// (omitted from CodingKeys and from ==, so equality + the JSON sent to the
+    /// edge fn are unchanged). Keying transcript bubbles on this instead of the
+    /// array index fixes recycling/stale-text glitches as a turn streams.
+    public let id = UUID()
     public var role: String
     public var content: String?
     public var toolCalls: [ToolCall]?
@@ -30,6 +35,14 @@ public struct ChatMessage: Codable, Equatable, Sendable {
         self.toolCalls = toolCalls
         self.toolCallId = toolCallId
         self.name = name
+    }
+
+    // Identity is view-only — exclude `id` from equality so persisted/decoded
+    // histories still compare by content (each decode mints a fresh id).
+    public static func == (lhs: ChatMessage, rhs: ChatMessage) -> Bool {
+        lhs.role == rhs.role && lhs.content == rhs.content
+            && lhs.toolCalls == rhs.toolCalls && lhs.toolCallId == rhs.toolCallId
+            && lhs.name == rhs.name
     }
 }
 

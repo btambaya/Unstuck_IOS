@@ -37,7 +37,7 @@ protocol VoiceAudioIO: AnyObject {
     func shutdown()
 }
 
-enum VoiceState: Sendable { case connecting, listening, speaking, error, closed }
+enum VoiceState: Sendable { case connecting, listening, thinking, speaking, error, closed }
 
 /// `@unchecked Sendable`: the socket (URLSessionWebSocketTask) is thread-safe to
 /// send on from any thread, and the few mutable flags are guarded by `lock`.
@@ -213,6 +213,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             audio.flushPlayback(); onState(.listening)
         case "response.created":
             lock.lock(); _muted = false; _responseActive = true; lock.unlock()
+            // The model heard the user and is reasoning — surface a distinct
+            // "Thinking" state until the first audio delta, so the user isn't
+            // left looking at "Listening…" (and tap-to-interrupt stays live).
+            onState(.thinking)
         case "response.audio.delta":
             if get({ _muted }) { return }   // stale audio from a cancelled response
             if let b64 = ev["delta"] as? String, let pcm = Data(base64Encoded: b64) {

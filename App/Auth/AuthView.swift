@@ -22,7 +22,9 @@ struct AuthView: View {
     @State private var status: String?
     @State private var statusIsError = true
     @State private var busy = false
+    @SwiftUI.FocusState private var focus: Field?
 
+    enum Field: Hashable { case name, email, password }
     enum Mode { case signIn, signUp }
     private var signUp: Bool { mode == .signUp }
 
@@ -46,9 +48,16 @@ struct AuthView: View {
                     .multilineTextAlignment(.center).padding(.top, 10)
 
                 VStack(spacing: 14) {
-                    if signUp { field("Name (optional)", text: $name) }
-                    field("Email", text: $email, keyboard: .emailAddress)
-                    field("Password", text: $password, secure: true)
+                    if signUp {
+                        field("Name (optional)", text: $name, field: .name,
+                              contentType: .name, submit: .next) { focus = .email }
+                    }
+                    field("Email", text: $email, field: .email, keyboard: .emailAddress,
+                          contentType: .emailAddress, submit: .next) { focus = .password }
+                    field("Password", text: $password, field: .password, secure: true,
+                          contentType: signUp ? .newPassword : .password, submit: .go) {
+                        Task { await submit() }
+                    }
                 }
                 .padding(.top, 22)
 
@@ -94,13 +103,16 @@ struct AuthView: View {
             .frame(maxWidth: .infinity)
             .padding(.horizontal, 22).padding(.bottom, 30)
         }
+        .scrollDismissesKeyboard(.interactively)
         .background(theme.palette.bg.ignoresSafeArea())
         .disabled(busy)
     }
 
     // MARK: field (Material-style outlined, matches Android MdField)
 
-    private func field(_ label: String, text: Binding<String>, secure: Bool = false, keyboard: UIKeyboardType = .default) -> some View {
+    private func field(_ label: String, text: Binding<String>, field: Field, secure: Bool = false,
+                       keyboard: UIKeyboardType = .default, contentType: UITextContentType? = nil,
+                       submit: SubmitLabel = .next, onSubmit: @escaping () -> Void = {}) -> some View {
         Group {
             if secure { SecureField(label, text: text) } else { TextField(label, text: text) }
         }
@@ -110,8 +122,12 @@ struct AuthView: View {
         .frame(maxWidth: .infinity)
         .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(theme.palette.line2))
         .keyboardType(keyboard)
+        .textContentType(contentType)
         .textInputAutocapitalization(.never)
         .autocorrectionDisabled()
+        .focused($focus, equals: field)
+        .submitLabel(submit)
+        .onSubmit(onSubmit)
     }
 
     // MARK: banner (rounded, soft fill + icon — matches Android message banner)

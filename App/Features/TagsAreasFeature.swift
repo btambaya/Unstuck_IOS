@@ -150,6 +150,7 @@ private struct AreaRow: View {
     @State private var nameDraft = ""
     @State private var showPalette = false
     @State private var showDelete = false
+    @SwiftUI.FocusState private var nameFocused: Bool
 
     var body: some View {
         HStack(spacing: 11) {
@@ -170,11 +171,19 @@ private struct AreaRow: View {
                 TextField("Area name", text: $nameDraft)
                     .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
                     .textFieldStyle(.plain)
+                    .focused($nameFocused)
                     .submitLabel(.done)
                     .onSubmit(commitRename)
+                    // Re-sync from the live name when not focused so a concurrent
+                    // rename isn't clobbered by a stale once-seeded draft.
+                    .onChange(of: area.name) { _, new in if !nameFocused { nameDraft = new } }
                 Button(action: commitRename) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.green)
+                }.buttonStyle(.plain)
+                Button { nameDraft = area.name; editing = false; nameFocused = false } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.ink3)
                 }.buttonStyle(.plain)
             } else {
                 VStack(alignment: .leading, spacing: 2) {
@@ -183,7 +192,7 @@ private struct AreaRow: View {
                 }
                 Spacer()
                 Menu {
-                    Button("Rename") { nameDraft = area.name; editing = true }
+                    Button("Rename") { nameDraft = area.name; editing = true; nameFocused = true }
                     Button("Delete area", role: .destructive) { showDelete = true }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -206,8 +215,8 @@ private struct AreaRow: View {
 
     private func commitRename() {
         let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        editing = false
-        guard !name.isEmpty else { return }
+        editing = false; nameFocused = false
+        guard !name.isEmpty else { nameDraft = area.name; return }
         // Rename = re-upsert preserving id + sortOrder + color.
         model.saveLifeArea(LifeArea(id: area.id, name: name, color: area.color, sortOrder: area.sortOrder))
     }
@@ -263,6 +272,7 @@ private struct TagRowView: View {
     @State private var nameDraft = ""
     @State private var showPalette = false
     @State private var showDelete = false
+    @SwiftUI.FocusState private var nameFocused: Bool
 
     var body: some View {
         HStack(spacing: 11) {
@@ -281,20 +291,28 @@ private struct TagRowView: View {
                 TextField("Tag name", text: $nameDraft)
                     .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
                     .textFieldStyle(.plain)
+                    .focused($nameFocused)
                     .submitLabel(.done)
                     .onSubmit(commitRename)
+                    // Re-sync from the live name when not focused so a concurrent
+                    // rename isn't clobbered by a stale once-seeded draft.
+                    .onChange(of: tag.name) { _, new in if !nameFocused { nameDraft = new } }
                 Button(action: commitRename) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.green)
                 }.buttonStyle(.plain)
+                Button { nameDraft = tag.name; editing = false; nameFocused = false } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.ink3)
+                }.buttonStyle(.plain)
             } else {
                 Text("#\(tag.name)")
                     .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                    .onTapGesture { nameDraft = tag.name; editing = true }
+                    .onTapGesture { nameDraft = tag.name; editing = true; nameFocused = true }
                 Spacer()
                 Text("\(uses)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 Menu {
-                    Button("Rename") { nameDraft = tag.name; editing = true }
+                    Button("Rename") { nameDraft = tag.name; editing = true; nameFocused = true }
                     Button("Delete", role: .destructive) { showDelete = true }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -317,8 +335,8 @@ private struct TagRowView: View {
 
     private func commitRename() {
         let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        editing = false
-        guard !name.isEmpty else { return }
+        editing = false; nameFocused = false
+        guard !name.isEmpty else { nameDraft = tag.name; return }
         model.saveTag(TagRow(id: tag.id, name: name, color: tag.color, sortOrder: tag.sortOrder))
     }
 }

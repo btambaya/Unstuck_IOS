@@ -58,6 +58,12 @@ final class FocusModel {
         live = session
         persist()
         LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: task.estimateMin)
+        // start() hardcodes paused:false. Reopening a PAUSED session (resumed via
+        // start()) would otherwise show a running Dynamic Island timer until the
+        // next transition — immediately reflect the paused state.
+        if live.paused {
+            LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? Self.now(), paused: true, estimateMin: task.estimateMin)
+        }
     }
 
     func pause() {

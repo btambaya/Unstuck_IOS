@@ -30,7 +30,7 @@ final class VoiceSessionModel {
     init(model: AppModel) { self.model = model }
 
     /// Live = a session is connecting or active (keeps the screen awake).
-    var isLive: Bool { state == .connecting || state == .listening || state == .speaking }
+    var isLive: Bool { state == .connecting || state == .listening || state == .thinking || state == .speaking }
 
     func start() {
         guard let token = model.voiceAccessToken, !token.isEmpty else {
@@ -173,12 +173,19 @@ struct VoiceModeScreen: View {
         }
     }
 
-    @ViewBuilder
     private func center(_ session: VoiceSessionModel) -> some View {
-        let live = session.state == .speaking || session.state == .listening
-        VStack(spacing: 24) {
+        // "Thinking" is interruptible too — the model is generating a response,
+        // so a tap should barge in / cancel just like during speech.
+        let live = session.state == .speaking || session.state == .listening || session.state == .thinking
+        let orbColor: Color
+        switch session.state {
+        case .speaking: orbColor = theme.palette.coral
+        case .thinking: orbColor = theme.palette.amber
+        default: orbColor = theme.palette.primary
+        }
+        return VStack(spacing: 24) {
             PulsingOrb(active: live,
-                       color: session.state == .speaking ? theme.palette.coral : theme.palette.primary,
+                       color: orbColor,
                        onTap: live ? { session.interrupt() } : nil)
             Text(stateLabel(session))
                 .font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink2)
@@ -205,6 +212,7 @@ struct VoiceModeScreen: View {
         switch s.state {
         case .connecting: return "Connecting…"
         case .listening: return "Listening…"
+        case .thinking: return "Thinking…"
         case .speaking: return "Speaking…"
         case .error: return s.note ?? "Something went wrong."
         case .closed: return "Ended"

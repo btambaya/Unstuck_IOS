@@ -165,7 +165,7 @@ private struct AssistantChat: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 8) {
-                    ForEach(Array(shown.enumerated()), id: \.offset) { _, m in
+                    ForEach(shown) { m in
                         MessageBubble(text: m.content ?? "", fromUser: m.role == "user")
                     }
                     if assistant.sending { ThinkingRow().id("thinking") }

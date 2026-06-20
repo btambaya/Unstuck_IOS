@@ -147,6 +147,7 @@ struct TasksView: View {
                 bucketPills(vm)
                 areaPills(vm)
                 tagFilterBanner(vm)
+                slipModeBanner(vm)
             }
             .padding(.horizontal, 18)
 
@@ -257,6 +258,28 @@ struct TasksView: View {
         }
     }
 
+    // MARK: dismissible slip-mode banner
+
+    /// "Showing slipping tasks ✕" — surfaces the otherwise-hidden long-press
+    /// slip filter so it has a visible indicator and an escape (tap to clear).
+    /// Mirrors the tag-filter banner above.
+    @ViewBuilder
+    private func slipModeBanner(_ vm: TasksModel) -> some View {
+        @Bindable var vm = vm
+        if vm.slipMode {
+            Button { vm.slipMode = false } label: {
+                HStack(spacing: 6) {
+                    Text("Showing slipping tasks")
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.amberInk)
+                    Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.amberInk)
+                }
+                .padding(.horizontal, 11).padding(.vertical, 6)
+                .background(theme.palette.amberSoft, in: Capsule())
+            }.buttonStyle(.plain)
+                .padding(.bottom, 12)
+        }
+    }
+
     // MARK: task list
 
     @ViewBuilder
@@ -279,12 +302,19 @@ struct TasksView: View {
                             areaColor: areaColor(task.lifeArea, vm.areas),
                             ageDays: vm.view == .backlog ? vm.ageDays(task) : nil,
                             isRecurring: task.recurrence != nil || isOccurrence,
+                            // A repeating TEMPLATE row (Recurring tab) has no per-day
+                            // done — hide the circle and open it to edit the series.
+                            // Occurrence + plain rows get the leading done-circle.
+                            canToggleDone: task.recurrence == nil,
                             // Open the row as-is (incl. a projected occurrence,
                             // id = block id). TaskEditor resolves the template for
                             // field edits and routes done/skip to the occurrence —
                             // so this must NOT pre-resolve to the template (that
                             // would drop occurrence mode: Skip-today, per-day done).
                             onOpen: { editing = task },
+                            // Leading done-circle (matches Today) — toggles without
+                            // opening the row; for an occurrence it marks that day.
+                            onToggleDone: { model.toggleDone(task) },
                             // Tag chips set the active tag filter (Android parity)
                             // instead of opening the row.
                             onTagTap: { vm.activeTag = $0 }
@@ -339,7 +369,12 @@ struct TaskRowView: View {
     let areaColor: Color
     let ageDays: Int?
     var isRecurring: Bool = false
+    /// Whether to show the leading done-circle (false for repeating templates,
+    /// which have no per-day done — those open to edit the series instead).
+    var canToggleDone: Bool = true
     let onOpen: () -> Void
+    /// Toggle the row's done state (for an occurrence, marks that day's block).
+    var onToggleDone: () -> Void = {}
     /// Tapping an inline #tag chip filters by that tag instead of opening
     /// the row (Android TasksScreen parity).
     var onTagTap: (String) -> Void = { _ in }
@@ -347,6 +382,17 @@ struct TaskRowView: View {
     var body: some View {
         Button(action: onOpen) {
             HStack(spacing: 12) {
+                // Leading done-circle — the visible completion affordance, 1:1
+                // with Today's task row (its own Button intercepts the tap so it
+                // toggles without opening the detail). Hidden for template rows.
+                if canToggleDone {
+                    Button(action: onToggleDone) {
+                        Image(systemName: task.done ? "checkmark.circle.fill" : "circle")
+                            .font(.system(size: 18))
+                            .foregroundStyle(task.done ? theme.palette.green : theme.palette.ink3)
+                    }.buttonStyle(.plain)
+                        .accessibilityLabel(task.done ? "Mark not done" : "Mark done")
+                }
                 VStack(alignment: .leading, spacing: 3) {
                     Text(task.name)
                         .font(UFont.sans(14, .medium))

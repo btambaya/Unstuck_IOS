@@ -69,6 +69,9 @@ struct InboxView: View {
 
     @State private var vm: CapturesModel?
     @State private var showArchived = false
+    // The capture pending a Discard confirm — gates the irreversible delete
+    // behind a destructive dialog (consistent with confirmed deletes elsewhere).
+    @State private var discardTarget: Capture?
     // Re-tick ~every 30s so the "Xm ago" ages don't freeze at screen-open time
     // (Android refreshes `now` on a 30s loop). `Date()` is read per render.
     @State private var now = Date()
@@ -105,6 +108,17 @@ struct InboxView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+            }
+            .confirmationDialog(
+                "Discard this capture?",
+                isPresented: Binding(get: { discardTarget != nil }, set: { if !$0 { discardTarget = nil } }),
+                titleVisibility: .visible,
+                presenting: discardTarget
+            ) { cap in
+                Button("Discard", role: .destructive) { model.discardCapture(cap.id); discardTarget = nil }
+                Button("Cancel", role: .cancel) { discardTarget = nil }
+            } message: { _ in
+                Text("This removes it for good. Use “Done” to archive without deleting.")
             }
         }
         .task {
@@ -184,7 +198,7 @@ struct InboxView: View {
                 if showArchived { model.unarchiveCapture(cap.id) } else { model.archiveCapture(cap.id) }
             }
             Spacer().frame(width: 16)
-            action("Discard", color: theme.palette.ink3, weight: .regular) { model.discardCapture(cap.id) }
+            action("Discard", color: theme.palette.ink3, weight: .regular) { discardTarget = cap }
         }
     }
 

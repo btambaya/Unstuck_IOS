@@ -71,7 +71,15 @@ struct OnboardingView: View {
 
     private var footer: some View {
         HStack {
-            Button("Skip") { model.completeOnboarding(struggles: []) }
+            // Back (only past the welcome step) lets a mis-pick be corrected.
+            if step > 0 {
+                Button("Back") { withAnimation(.easeInOut(duration: 0.2)) { step -= 1 } }
+                    .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+                    .buttonStyle(.plain)
+            }
+            // Skip keeps whatever's been entered so far (never silently discards
+            // areas / first task / treatment) — same payload as Begin.
+            Button("Skip") { finish() }
                 .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
                 .buttonStyle(.plain)
             Spacer()

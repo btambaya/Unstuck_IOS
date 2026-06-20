@@ -243,6 +243,7 @@ struct CollectionDetailView: View {
     @State private var promoteTarget: CollectionItem?
     @State private var byTimeTarget: CollectionItem?
     @SwiftUI.FocusState private var addFocused: Bool
+    @SwiftUI.FocusState private var titleFocused: Bool
 
     private var collection: ItemCollection? { vm.collections.first { $0.id == id } }
 
@@ -301,13 +302,25 @@ struct CollectionDetailView: View {
                         TextField("Name", text: $titleDraft)
                             .font(UFont.serifItalic(26)).textFieldStyle(.plain)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        Button { model.renameCollection(col, name: titleDraft); editingTitle = false } label: {
+                            .focused($titleFocused)
+                            .submitLabel(.done)
+                            .onSubmit { commitTitleRename(col) }
+                            // Re-sync the draft from the live name whenever the
+                            // field isn't focused — so a concurrent rename (sync)
+                            // isn't silently clobbered by a stale once-seeded draft.
+                            .onChange(of: col.name) { _, new in if !titleFocused { titleDraft = new } }
+                        Button { commitTitleRename(col) } label: {
                             Image(systemName: "checkmark").font(.system(size: 18)).foregroundStyle(theme.palette.green).padding(4)
+                        }.buttonStyle(.plain)
+                        // Cancel — discard the draft, keep the live name (mirrors
+                        // TaskEditor.cancelButton).
+                        Button { titleDraft = col.name; editingTitle = false; titleFocused = false } label: {
+                            Image(systemName: "xmark").font(.system(size: 18)).foregroundStyle(theme.palette.ink3).padding(4)
                         }.buttonStyle(.plain)
                     } else {
                         Text(col.name).font(UFont.serifItalic(26)).foregroundStyle(theme.palette.ink)
                             .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                            .onTapGesture { if owner { titleDraft = col.name; editingTitle = true } }
+                            .onTapGesture { if owner { titleDraft = col.name; editingTitle = true; titleFocused = true } }
                         if owner {
                             HStack(spacing: 4) {
                                 Button { model.archiveCollection(col.id, archived: !archived); dismiss() } label: {
@@ -404,6 +417,10 @@ struct CollectionDetailView: View {
             revealed: revealedId == item.id,
             onReveal: { revealedId = revealedId == item.id ? nil : item.id },
             onMoveToTask: { startPromote(col, item) })
+            // Key the row to item identity: pinning moves an item between the
+            // Pinned/All sections, and without a stable id an in-progress edit's
+            // @State could re-attach to a different recycled item.
+            .id(item.id)
     }
 
     private func startPromote(_ col: ItemCollection, _ item: CollectionItem) {
@@ -419,6 +436,15 @@ struct CollectionDetailView: View {
         draft = ""
         addFocused = true   // keep the keyboard up for rapid entry (Android requestFocus)
     }
+
+    /// Commit the inline title rename. An empty/blank draft would silently wipe
+    /// the name, so treat it as a cancel (revert to the live name) instead.
+    private func commitTitleRename(_ col: ItemCollection) {
+        let trimmed = titleDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { titleDraft = col.name }
+        else { model.renameCollection(col, name: trimmed) }
+        editingTitle = false; titleFocused = false
+    }
 }
 
 private struct CollItemRow: View {
@@ -433,6 +459,15 @@ private struct CollItemRow: View {
 
     @State private var editing = false
     @State private var draft = ""
+    @SwiftUI.FocusState private var editFocused: Bool
+
+    /// Commit the inline body edit. Blank draft → cancel (revert), never wipe
+    /// the item body silently.
+    private func commitEdit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { model.updateCollectionItemBody(col, itemId: item.id, body: trimmed) }
+        editing = false; editFocused = false
+    }
 
     var body: some View {
         let done = item.done == true
@@ -453,8 +488,18 @@ private struct CollItemRow: View {
                 if editing && !readOnly {
                     HStack {
                         TextField("Item", text: $draft).textFieldStyle(.plain).font(UFont.sans(14))
-                        Button { model.updateCollectionItemBody(col, itemId: item.id, body: draft); editing = false } label: {
+                            .focused($editFocused)
+                            .submitLabel(.done)
+                            .onSubmit(commitEdit)
+                            // Re-sync from the live body when not focused so a
+                            // concurrent edit isn't clobbered by a stale draft.
+                            .onChange(of: item.body) { _, new in if !editFocused { draft = new } }
+                        Button(action: commitEdit) {
                             Image(systemName: "checkmark").font(.system(size: 16)).foregroundStyle(theme.palette.green).padding(2)
+                        }.buttonStyle(.plain)
+                        // Cancel — discard the draft, keep the live body.
+                        Button { draft = item.body; editing = false; editFocused = false } label: {
+                            Image(systemName: "xmark").font(.system(size: 16)).foregroundStyle(theme.palette.ink3).padding(2)
                         }.buttonStyle(.plain)
                     }
                 } else {
@@ -463,7 +508,7 @@ private struct CollItemRow: View {
                         .foregroundStyle(struck ? theme.palette.ink3 : theme.palette.ink)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
-                        .onTapGesture { if !readOnly { if revealed { onReveal() } else { draft = item.body; editing = true } } }
+                        .onTapGesture { if !readOnly { if revealed { onReveal() } else { draft = item.body; editing = true; editFocused = true } } }
                         // Hold to reveal the action bar (Android onLongClick = onReveal) —
                         // an extra trigger alongside the trailing ellipsis below.
                         .onLongPressGesture { if !readOnly { onReveal() } }
