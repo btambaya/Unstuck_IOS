@@ -51,6 +51,18 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         ENABLE_USER_SCRIPT_SANDBOXING: "YES"
         CODE_SIGN_STYLE: Automatic
+      # aps-environment is substituted into Unstuck.entitlements from this
+      # per-config build setting. Debug (Xcode/device) → sandbox APNs; Release
+      # (archive/TestFlight/App Store) → production APNs. Previously hardcoded
+      # `development` for ALL configs, so TestFlight builds registered a SANDBOX
+      # token while PushClient reported "production" → the production gateway
+      # rejected it → push silently failed for testers. PushClient's #if DEBUG
+      # sandbox/production reporting already matches these per-config values.
+      configs:
+        Debug:
+          APS_ENVIRONMENT: development
+        Release:
+          APS_ENVIRONMENT: production
     dependencies:
       - package: UnstuckKit
         product: UnstuckCore
