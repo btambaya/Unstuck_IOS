@@ -268,7 +268,21 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private func send(_ obj: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: obj),
               let str = String(data: data, encoding: .utf8) else { return }
-        task?.send(.string(str)) { _ in }   // best-effort; failures surface via receiveLoop
+        task?.send(.string(str)) { [weak self] err in
+            guard let self, let err else { return }
+            // A send failure means the socket is gone — but the mic keeps encoding
+            // and queuing appends, so without this the session would silently
+            // wedge ("Listening…" with a dead socket). Tear down once: flip _open
+            // false, shut the audio engine, surface the error. Guard against
+            // double-reporting from the receive loop / didCompleteWithError.
+            self.lock.lock()
+            guard self._open, !self._reportedError, !self._stopped else { self.lock.unlock(); return }
+            self._open = false; self._reportedError = true
+            self.lock.unlock()
+            self.audio.shutdown()
+            self.onError(String(err.localizedDescription.prefix(160)))
+            self.onState(.error)
+        }
     }
 
     private func sessionUpdate() -> [String: Any] {

@@ -98,6 +98,49 @@ final class ReEntryDistributionTests: XCTestCase {
     }
 }
 
+// Degenerate-bin guards: a 0-wide bin would divide-by-zero in the index math
+// (trapping), and a 0-count bin array would index bins[-1]. Both interruption
+// + re-entry histograms coerce binMin→max(1, …) and return [] when binCount<1.
+final class HistogramDegenerateBinTests: XCTestCase {
+    private func cap(_ id: String, sessionId: String, at: String) -> Capture {
+        Capture(id: id, sessionId: sessionId, tag: .followUp, body: "x", at: at)
+    }
+
+    func testInterruptionBinsZeroBinMinDoesNotTrap() {
+        let completedMs = Time.parseMillis("2026-01-01T10:30:00.000Z")!
+        let startMs = completedMs - 30 * 60 * 1000
+        let s = Session(id: "sess", taskId: "t", taskName: "task", actualSec: 30 * 60,
+                        completedAt: "2026-01-01T10:30:00.000Z")
+        let c = cap("c", sessionId: "sess", at: iso(startMs + 10 * 60_000))
+        // binMin == 0 would crash on the original `/ Double(binMin)` path.
+        let bins = interruptionBins([c], [s], binMin: 0, binCount: 10)
+        XCTAssertEqual(bins.count, 10)
+        XCTAssertEqual(bins.reduce(0, +), 1, "the one capture still lands in a bin")
+    }
+
+    func testInterruptionBinsZeroBinCountReturnsEmpty() {
+        let s = Session(id: "sess", taskId: "t", taskName: "task", actualSec: 1800,
+                        completedAt: "2026-01-01T10:30:00.000Z")
+        let c = cap("c", sessionId: "sess", at: "2026-01-01T10:05:00.000Z")
+        XCTAssertEqual(interruptionBins([c], [s], binMin: 3, binCount: 0), [])
+    }
+
+    func testReEntryZeroBinMinDoesNotTrap() {
+        let startMs = Time.parseMillis("2026-01-01T10:00:00.000Z")!
+        let sessions = [
+            Session(id: "s1", taskId: "t", taskName: "x", actualSec: 25 * 60, completedAt: iso(startMs + 25 * 60_000)),
+            Session(id: "s2", taskId: "t", taskName: "x", actualSec: 25 * 60, completedAt: iso(startMs + (25 + 35) * 60_000)),
+        ]
+        let bins = reEntryDistribution(sessions, binMin: 0, binCount: 12)
+        XCTAssertEqual(bins.count, 12)
+        XCTAssertEqual(bins.reduce(0, +), 1)
+    }
+
+    func testReEntryZeroBinCountReturnsEmpty() {
+        XCTAssertEqual(reEntryDistribution([], binMin: 5, binCount: 0), [])
+    }
+}
+
 final class SlippingTests: XCTestCase {
     func testFlagsOlderThan21Days() {
         let now = Date().timeIntervalSince1970 * 1000

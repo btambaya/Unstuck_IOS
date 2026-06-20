@@ -18,6 +18,9 @@ final class VoiceSessionModel {
     var state: VoiceState = .connecting
     /// The streaming assistant caption (cleared at the start of each user turn).
     var caption = ""
+    /// The user's last transcribed turn, shown briefly until the assistant's
+    /// reply starts streaming — so a spoken request isn't silently discarded.
+    var userTranscript = ""
     /// A local note (permission / config / mic error) shown in the ERROR state.
     var note: String?
 
@@ -73,8 +76,17 @@ final class VoiceSessionModel {
             onCaption: { [weak self] role, text, done in
                 Task { @MainActor in
                     guard let self else { return }
-                    if role == "user" { self.caption = "" }            // new user turn → clear the reply line
-                    else if role == "assistant", !done { self.caption += text }
+                    if role == "user" {
+                        // New user turn: surface what they said + clear the reply.
+                        self.caption = ""
+                        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !t.isEmpty { self.userTranscript = t }
+                    } else if role == "assistant", !done {
+                        // The reply is streaming in — drop the user echo so the
+                        // single caption line reads the assistant's words.
+                        self.userTranscript = ""
+                        self.caption += text
+                    }
                 }
             },
             onError: { [weak self] msg in Task { @MainActor in self?.note = msg } })
@@ -83,7 +95,11 @@ final class VoiceSessionModel {
         rc.start()
     }
 
-    func interrupt() { client?.interrupt() }
+    func interrupt() {
+        // Barge-in starts a fresh turn — drop the stale caption + user echo.
+        caption = ""; userTranscript = ""
+        client?.interrupt()
+    }
 
     func end() {
         if let interruption { NotificationCenter.default.removeObserver(interruption) }
@@ -191,6 +207,14 @@ struct VoiceModeScreen: View {
                 .font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink2)
                 .multilineTextAlignment(.center)
                 .accessibilityAddTraits(.updatesFrequently)
+            // The user's just-spoken turn, shown until the reply starts streaming
+            // (so a request isn't silently discarded). Dimmer + quote-marked to
+            // distinguish it from the assistant's reply below.
+            if session.caption.isEmpty, !session.userTranscript.isEmpty {
+                Text("“\(session.userTranscript)”")
+                    .font(UFont.sans(15)).foregroundStyle(theme.palette.ink3)
+                    .multilineTextAlignment(.center)
+            }
             if !session.caption.isEmpty {
                 Text(session.caption)
                     .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)

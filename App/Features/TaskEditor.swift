@@ -17,11 +17,9 @@ struct TaskEditor: View {
     @Environment(\.uTheme) private var theme
 
     let initialTask: TaskItem
-    let existingBlocks: [CalBlock]
 
-    init(task: TaskItem, existingBlocks: [CalBlock]) {
+    init(task: TaskItem) {
         self.initialTask = task
-        self.existingBlocks = existingBlocks
     }
 
     private static let estimatePresets = [15, 25, 45, 60, 90]
@@ -582,7 +580,13 @@ struct TaskEditor: View {
     private func openEstimate() { estimateText = String(displayEstimate); showEstimate = true }
 
     private func openSchedule() {
-        datePick = myBlocks.first.flatMap { Self.parseIso($0.date) } ?? Date()
+        // Clamp the seed to today: the DatePicker range starts at startOfDay(now),
+        // so seeding a past block's date would leave the bound value below the
+        // range (the picker shows today but the stale past date persists until the
+        // user scrolls). max(parsed, today) keeps the binding in range.
+        let today = Calendar.current.startOfDay(for: Date())
+        let parsed = myBlocks.first.flatMap { Self.parseIso($0.date) } ?? Date()
+        datePick = max(parsed, today)
         timePick = myBlocks.first.flatMap { Self.parseHHmm($0.startTime) } ?? Date()
         showSchedule = true
     }

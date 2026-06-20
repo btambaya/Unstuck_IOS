@@ -487,9 +487,11 @@ struct FocusView: View {
         let result = fm.finish()
         // For an occurrence focus the Session is attributed to the template; pass
         // its id as the focus `task` so totalFocused accrues there, and the block
-        // id so a "Mark complete" marks just this day done.
+        // id so a "Mark complete" marks just this day done. Resolve the template
+        // by primary key (a keyed fetchOne) rather than decoding the whole task
+        // table on the main actor.
         let focusTask = fm.occurrence.flatMap { occ in
-            (try? model.taskRepo?.all())?.first(where: { $0.id == occ.templateId })
+            (try? model.taskRepo?.fetch(id: occ.templateId)) ?? nil
         } ?? task
         model.finishFocus(task: focusTask, session: result.session, elapsedSec: result.elapsedSec,
                           markDone: markDone, occurrenceBlockId: fm.occurrence?.blockId)

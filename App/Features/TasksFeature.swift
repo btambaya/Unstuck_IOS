@@ -104,7 +104,7 @@ struct TasksView: View {
         }
         .background(theme.palette.bg.ignoresSafeArea())
         .sheet(item: $editing) { task in
-            TaskEditor(task: task, existingBlocks: vm?.blocks(forTask: task.id) ?? [])
+            TaskEditor(task: task)
         }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }

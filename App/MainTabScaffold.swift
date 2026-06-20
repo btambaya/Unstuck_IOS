@@ -36,7 +36,7 @@ struct MainTabScaffold: View {
             // flushes a deferred deep-link so a push tap arriving while THIS
             // sheet was open presents cleanly once it's gone (bug-8 guard).
             .sheet(item: $router.detailTask, onDismiss: { model.flushPendingDeepLink() }) { task in
-                TaskEditor(task: task, existingBlocks: ((try? model.db?.blocks(forTask: task.id)) ?? nil) ?? [])
+                TaskEditor(task: task)
             }
             .fullScreenCover(item: $router.focusTask, onDismiss: { model.flushPendingDeepLink() }) { task in
                 FocusView(task: task)

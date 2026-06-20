@@ -103,6 +103,58 @@ final class MaterializeOccurrencesTests: XCTestCase {
     }
 }
 
+// A daily series spanning a DST transition must produce exactly one occurrence
+// per consecutive civil day — never dropping or doubling the transition day.
+// We re-floor each step (startOfDay(addDays(startOfDay(start), i))) so a
+// startDate carrying a time-of-day can't drift across the spring-forward gap.
+// Pin the process timezone to a DST-observing zone (CI runs TZ=UTC, which has
+// no DST), and exercise the spring-forward day (Sun Mar 8, 2026 in US Eastern).
+final class MaterializeOccurrencesDSTTests: XCTestCase {
+    private var savedTimeZone: TimeZone!
+
+    override func setUp() {
+        super.setUp()
+        savedTimeZone = NSTimeZone.default
+        NSTimeZone.default = TimeZone(identifier: "America/New_York")!
+    }
+    override func tearDown() {
+        NSTimeZone.default = savedTimeZone
+        super.tearDown()
+    }
+
+    func testDailyAcrossSpringForwardNoDropOrDouble() {
+        // Start Fri Mar 6 — series crosses the spring-forward boundary (Mar 8).
+        let occ = materializeOccurrences(.daily(until: nil),
+                                         startDate: Time.civil(2026, 3, 6), startTime: "09:00", horizonDays: 6)
+        XCTAssertEqual(occ.map(\.date),
+                       ["2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11"])
+        // No civil day repeated, none skipped.
+        XCTAssertEqual(Set(occ.map(\.date)).count, occ.count)
+    }
+
+    func testDailyAcrossFallBackNoDropOrDouble() {
+        // Fall-back boundary: Sun Nov 1, 2026 in US Eastern.
+        let occ = materializeOccurrences(.daily(until: nil),
+                                         startDate: Time.civil(2026, 10, 30), startTime: "09:00", horizonDays: 5)
+        XCTAssertEqual(occ.map(\.date),
+                       ["2026-10-30", "2026-10-31", "2026-11-01", "2026-11-02", "2026-11-03"])
+        XCTAssertEqual(Set(occ.map(\.date)).count, occ.count)
+    }
+
+    func testNonMidnightStartDateStillLandsOnCivilDays() {
+        // A startDate carrying a wall-clock time (not local midnight) must still
+        // materialize one occurrence per civil day across the DST gap — the
+        // pre-fix code (addDays preserving time-of-day, no re-floor) is what
+        // risked a drift on the transition day.
+        let noon = Calendar.current.date(bySettingHour: 13, minute: 30, second: 0,
+                                         of: Time.civil(2026, 3, 6))!
+        let occ = materializeOccurrences(.daily(until: nil),
+                                         startDate: noon, startTime: "09:00", horizonDays: 6)
+        XCTAssertEqual(occ.map(\.date),
+                       ["2026-03-06", "2026-03-07", "2026-03-08", "2026-03-09", "2026-03-10", "2026-03-11"])
+    }
+}
+
 final class RegenerateForTaskTests: XCTestCase {
     private let t = mkTask(id: "task-1", name: "A")
     private let startDate = Time.civil(2026, 5, 21)
@@ -138,6 +190,45 @@ final class RegenerateForTaskTests: XCTestCase {
                                      startTime: "09:00", startDate: startDate, horizonDays: 14)
         XCTAssertEqual(plan.toDelete, [])
         XCTAssertEqual(plan.toUpsert.map(\.date), ["2026-06-01"])
+    }
+}
+
+// The post-plan coverage decision behind scheduleTaskAt's guarantee-upsert,
+// extracted as a pure helper. A block the plan is about to DELETE must NOT count
+// as coverage (else the day silently ends up empty); a planned upsert DOES.
+final class RecurrenceCoversChosenDateTests: XCTestCase {
+    private let iso = "2026-05-25"
+
+    func testCoveredByPlannedUpsert() {
+        let plan = RegenPlan(toUpsert: [mkBlock(id: "u1", taskId: "t", date: iso)], toDelete: [])
+        XCTAssertTrue(recurrenceCoversChosenDate(existing: [], plan: plan, iso: iso))
+    }
+
+    func testCoveredByExistingBlockNotBeingDeleted() {
+        let existing = [mkBlock(id: "e1", taskId: "t", date: iso)]
+        let plan = RegenPlan(toUpsert: [], toDelete: [])
+        XCTAssertTrue(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+    }
+
+    func testExistingBlockBeingDeletedDoesNotCount() {
+        // The only block on the chosen date is queued for deletion → NOT covered,
+        // so the caller must mint a guarantee block (the bug this guards).
+        let existing = [mkBlock(id: "e1", taskId: "t", date: iso)]
+        let plan = RegenPlan(toUpsert: [], toDelete: ["e1"])
+        XCTAssertFalse(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+    }
+
+    func testDeletedExistingButPlannedUpsertOnSameDateIsCovered() {
+        // The old block is deleted but the plan re-adds one on the same date.
+        let existing = [mkBlock(id: "e1", taskId: "t", date: iso)]
+        let plan = RegenPlan(toUpsert: [mkBlock(id: "u1", taskId: "t", date: iso)], toDelete: ["e1"])
+        XCTAssertTrue(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+    }
+
+    func testNothingOnChosenDateIsNotCovered() {
+        let existing = [mkBlock(id: "e1", taskId: "t", date: "2026-05-26")]
+        let plan = RegenPlan(toUpsert: [mkBlock(id: "u1", taskId: "t", date: "2026-06-01")], toDelete: [])
+        XCTAssertFalse(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
     }
 }
 

@@ -352,7 +352,11 @@ final class AppModel {
     /// claim contains a `recovery` entry — i.e. this session came from a
     /// password-reset link. Best-effort decode of the unsigned middle segment
     /// (base64url). Mirrors the Android isRecoverySession amr probe.
-    static func isRecoverySession(_ jwt: String) -> Bool {
+    ///
+    /// `nonisolated`: a pure static over its `jwt` argument with no actor state,
+    /// so it's correct to call off the main actor (and lets it be unit-tested
+    /// from a non-isolated context).
+    nonisolated static func isRecoverySession(_ jwt: String) -> Bool {
         let parts = jwt.split(separator: ".")
         guard parts.count >= 2 else { return false }
         var b64 = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
@@ -606,14 +610,11 @@ final class AppModel {
                 for b in plan.toUpsert { try? await write.upsertCalBlock(b, nowISO: now) }
             }
             // Guarantee the chosen slot is materialized (the horizon regen skips
-            // today / off-pattern picks). Only when nothing already covers it.
-            // Coverage must be computed POST-plan: an existing block on the chosen
-            // date that the regen is about to DELETE doesn't count, or we'd skip
-            // the guarantee-upsert, run the delete, and leave the date with no
-            // block — the task silently vanishes from the day just scheduled.
-            let deleting = Set(plan.toDelete)
-            let coversChosen = existing.contains { $0.date == iso && !deleting.contains($0.id) }
-                || plan.toUpsert.contains { $0.date == iso }
+            // today / off-pattern picks). Only when nothing already covers it —
+            // computed POST-plan by the pure helper (an existing block the regen
+            // is about to DELETE doesn't count, or the task would vanish from the
+            // day just scheduled).
+            let coversChosen = recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso)
             if !coversChosen {
                 saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
                                    startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))

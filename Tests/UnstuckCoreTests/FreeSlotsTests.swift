@@ -36,6 +36,21 @@ final class FindFreeSlotsTests: XCTestCase {
         let slots = findFreeSlots([], durationMin: 15, now: lateNow, startDate: lateNow, daysToScan: 1, limit: 1)
         XCTAssertEqual(slots[0].startTime, "08:15")
     }
+
+    // A non-positive duration would make `cursor + durationMin <= gapEnd`
+    // perpetually true → an unbounded run of zero/negative-length garbage slots.
+    // Coerced to >= 1 (Android parity), so the count is bounded by the limit and
+    // each slot is a real, advancing time.
+    func testNonPositiveDurationCoercedToOne() {
+        let zero = findFreeSlots([], durationMin: 0, now: now, startDate: now, daysToScan: 1, limit: 3)
+        XCTAssertEqual(zero.count, 3, "limit still bounds the output; no infinite garbage run")
+        XCTAssertEqual(zero[0].startTime, "08:00")
+        // Slots must advance by the 30-min step (max(durationMin, 30)).
+        XCTAssertEqual(zero[1].startTime, "08:30")
+        let negative = findFreeSlots([], durationMin: -10, now: now, startDate: now, daysToScan: 1, limit: 2)
+        XCTAssertEqual(negative.count, 2)
+        XCTAssertEqual(negative[0].startTime, "08:00")
+    }
 }
 
 final class FindFreeSlotsForDateTests: XCTestCase {

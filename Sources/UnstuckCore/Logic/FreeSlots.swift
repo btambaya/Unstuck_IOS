@@ -79,6 +79,10 @@ public func findFreeSlots(
 ) -> [Slot] {
     let start = startDate ?? now
     var out: [Slot] = []
+    // A non-positive duration makes `cursor + durationMin <= gapEnd` perpetually
+    // true → garbage zero/negative-length slots. A slot must span real time.
+    // Mirrors the Android coerceAtLeast(1).
+    let durationMin = max(1, durationMin)
     let nowMin = Calendar.current.component(.hour, from: now) * 60 + Calendar.current.component(.minute, from: now)
 
     var d = 0

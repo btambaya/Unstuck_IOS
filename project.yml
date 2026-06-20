@@ -78,7 +78,28 @@ targets:
         embed: true
     scheme:
       testTargets:
+        - UnstuckAppTests
         - UnstuckUITests
+
+  # App-layer UNIT tests (host: Unstuck). The SPM package modules are tested
+  # via `swift test`; this target covers the pure logic that lives in App/
+  # (lane layout, settings hydration, the recovery-session JWT probe) which
+  # `swift test` can't reach. Hosted by the app so `@testable import Unstuck`
+  # sees its internal symbols.
+  UnstuckAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests/UnstuckAppTests
+    dependencies:
+      - target: Unstuck
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.unstucknow.app.apptests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Unstuck.app/Unstuck"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TARGETED_DEVICE_FAMILY: "1"
 
   UnstuckUITests:
     type: bundle.ui-testing

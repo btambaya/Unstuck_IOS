@@ -139,8 +139,12 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     }
 
     func enqueue(_ pcm: Data) {
-        guard started, !pcm.isEmpty else { return }
-        guard let buffer = Self.pcm16ToBuffer(pcm, format: playFormat) else { return }
+        guard !pcm.isEmpty, let buffer = Self.pcm16ToBuffer(pcm, format: playFormat) else { return }
+        // Check `started` AND schedule under the same lock shutdown() holds, so a
+        // concurrent teardown can't stop/detach the player between the guard and
+        // the scheduleBuffer (the prior TOCTOU could schedule onto a dead engine).
+        lock.lock(); defer { lock.unlock() }
+        guard started else { return }
         if !player.isPlaying { player.play() }
         player.scheduleBuffer(buffer, completionHandler: nil)
     }
@@ -173,6 +177,12 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     }
 
     func shutdown() {
+        // Flip `started` under the lock so any concurrent enqueue() — which now
+        // checks `started` AND schedules under this same lock — is serialized
+        // against this teardown: it either schedules fully before we flip, or
+        // sees started == false and bails. The AVAudioEngine teardown stays
+        // OUTSIDE the lock: removeTap waits for an executing render callback, and
+        // that callback also takes `lock`, so holding it here would deadlock.
         lock.lock()
         let wasStarted = started
         started = false

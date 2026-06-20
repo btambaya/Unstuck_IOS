@@ -56,8 +56,15 @@ public func materializeOccurrences(
 ) -> [MaterializedOccurrence] {
     var out: [MaterializedOccurrence] = []
     let untilIso = recurrence.untilDate
+    // Anchor on local midnight and re-floor each step. `Calendar.addDays`
+    // preserves wall-clock time, so a `startDate` carrying a time-of-day could,
+    // across a DST transition, land an occurrence in the wrong civil day (drop /
+    // double the transition day). Flooring before AND after addDays makes the
+    // series land on exact civil days regardless. Byte-identical for a midnight
+    // startDate (the documented contract — web/Android pass local midnight).
+    let base = Time.startOfDay(startDate)
     for i in 0..<horizonDays {
-        let day = Time.addDays(startDate, i)
+        let day = Time.startOfDay(Time.addDays(base, i))
         let iso = Clock.dateISO(day)
         if let untilIso, iso > untilIso { break }
         if matchesRecurrence(recurrence, startDate: startDate, candidate: day) {
@@ -115,6 +122,19 @@ public func regenerateForTask(
     }
 
     return RegenPlan(toUpsert: toUpsert, toDelete: toDelete)
+}
+
+/// Does anything already cover the chosen `iso` date AFTER a `RegenPlan` is
+/// applied? Pure decision behind `scheduleTaskAt`'s guarantee-upsert: an
+/// existing block on the date that the plan is about to DELETE does NOT count
+/// (or we'd skip minting a block, run the delete, and leave the day empty — the
+/// task would silently vanish from the day just scheduled), while a planned
+/// upsert on the date DOES count. Extracted so the post-plan boundary is unit-
+/// testable; the caller mints a guarantee block only when this returns false.
+public func recurrenceCoversChosenDate(existing: [CalBlock], plan: RegenPlan, iso: String) -> Bool {
+    let deleting = Set(plan.toDelete)
+    return existing.contains { $0.date == iso && !deleting.contains($0.id) }
+        || plan.toUpsert.contains { $0.date == iso }
 }
 
 private let DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]

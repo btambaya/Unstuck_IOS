@@ -73,6 +73,10 @@ public func calibrationHitRate(_ dots: [CalibrationDot], slackMin: Int = 5) -> D
 // MARK: H3 — interruption histogram (captures as the proxy)
 
 public func interruptionBins(_ captures: [Capture], _ sessions: [Session], binMin: Int = 3, binCount: Int = 10) -> [Int] {
+    // Degenerate-arg guards: a 0-wide bin divides-by-zero in the index math, and
+    // a 0-count bin array would index bins[-1]. Coerce to safe minimums.
+    let binMin = max(1, binMin)
+    guard binCount >= 1 else { return [] }
     var bins = Array(repeating: 0, count: binCount)
     var sessionStart: [String: Double] = [:]
     for s in sessions {
@@ -137,6 +141,10 @@ public func pauseAnatomy(_ reasonLogs: [ReasonLog]) -> [PauseBar] {
 // MARK: H6 — re-entry distribution
 
 public func reEntryDistribution(_ sessions: [Session], binMin: Int = 5, binCount: Int = 12) -> [Int] {
+    // Degenerate-arg guards (see interruptionBins): avoid divide-by-zero on a
+    // 0-wide bin and a bins[-1] index when no bins were requested.
+    let binMin = max(1, binMin)
+    guard binCount >= 1 else { return [] }
     var bins = Array(repeating: 0, count: binCount)
     var byTask: [String: [Session]] = [:]
     for s in sessions {

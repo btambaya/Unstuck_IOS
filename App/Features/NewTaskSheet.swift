@@ -86,6 +86,21 @@ struct NewTaskSheet: View {
         }
     }
 
+    /// Effective date resolved against a FRESH clock — used at submit time. The
+    /// session's `now` is frozen at init so free-slot math doesn't drift mid-edit,
+    /// but a sheet left open across midnight would otherwise schedule "Today"
+    /// onto yesterday. Re-derive Today/Tomorrow from the real date on submit.
+    private func effectiveDateNow() -> String? {
+        let fresh = Date()
+        let today = Clock.dateISO(fresh)
+        switch whenSel {
+        case "Later": return nil
+        case "Today": return today
+        case "Tomorrow": return Clock.dateISO(Time.addDays(Time.startOfDay(fresh), 1))
+        default: return pickedDate.isEmpty ? Clock.dateISO(Time.addDays(Time.startOfDay(fresh), 1)) : pickedDate
+        }
+    }
+
     private var slots: [Slot] {
         guard let date = effectiveDate else { return [] }
         return findFreeSlotsForDate(blocks, durationMin: estimate, isoDate: date, now: now, limit: 4)
@@ -163,7 +178,11 @@ struct NewTaskSheet: View {
                     let label = (w == "Pick date" && whenSel == "Pick date" && !pickedDate.isEmpty)
                         ? String(pickedDate.suffix(5)) : w
                     chip(label, selected: whenSel == w) {
-                        autoTime = true
+                        // Preserve a manually-chosen time across a WHEN-bucket
+                        // switch — silently wiping the user's typed/picked time
+                        // (forcing autoTime back on) was the surprising behavior.
+                        // Only re-arm auto-pick when no explicit time was set.
+                        if pickedTime == nil { autoTime = true }
                         if w == "Pick date" {
                             datePick = Self.parseIso(pickedDate.isEmpty ? tmrwIso : pickedDate) ?? now
                             showDatePicker = true
@@ -586,7 +605,9 @@ struct NewTaskSheet: View {
 
         if !later {
             if let lead = reminderLead { NotificationPrefs.setReminderOverride(taskId: t.id, leadMin: lead) }
-            if let date = effectiveDate, let time = pickedTime {
+            // Re-resolve Today/Tomorrow against a fresh clock so a sheet left open
+            // across midnight doesn't schedule onto yesterday.
+            if let date = effectiveDateNow(), let time = pickedTime {
                 model.scheduleTaskAt(t, date: date, startTime: time)
             }
             ReminderScheduler.shared.resync()

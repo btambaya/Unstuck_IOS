@@ -286,15 +286,6 @@ extension AppModel {
         return occurrenceBlockFor(rowId, tasks: tasks, blocks: blocks)
     }
 
-    /// The task to OPEN in the editor for a list row: an occurrence row (id =
-    /// block id) resolves to its TEMPLATE so edits apply to the series and never
-    /// mint a phantom task; a normal row returns itself.
-    func editableTask(for row: TaskItem) -> TaskItem {
-        guard let block = occurrenceBlockForId(row.id),
-              let tpl = (try? taskRepo?.all())?.first(where: { $0.id == block.taskId }) else { return row }
-        return tpl
-    }
-
     /// Skip ("cancel today") one recurring occurrence — hides just this day; the
     /// series keeps generating tomorrow. `blockId` is the occurrence row's id.
     func skipOccurrence(_ blockId: String) {
