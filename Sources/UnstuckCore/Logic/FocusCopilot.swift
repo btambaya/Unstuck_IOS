@@ -151,6 +151,19 @@ public enum FocusCopilot {
             return "You're \(overMin) minutes over. Stop here, or keep going?"
         }
     }
+
+    // MARK: - Push-to-talk capture (Phase 1.5)
+
+    /// Normalize a dictated transcript into a verbatim capture body, or nil if
+    /// there's nothing to save. PURE: trims surrounding whitespace/newlines and
+    /// returns nil for a blank/empty transcript; otherwise returns the trimmed
+    /// text UNCHANGED — it is NEVER parsed as a command (so "I should stop
+    /// procrastinating" is saved verbatim, never read as a stop). This is the
+    /// whole contract of push-to-talk capture: dictation, not commands.
+    public static func captureFromTranscript(_ transcript: String) -> String? {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
 
 // MARK: - Voice command parsing (keyword match, NO LLM)

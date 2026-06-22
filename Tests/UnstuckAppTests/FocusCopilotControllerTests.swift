@@ -263,6 +263,129 @@ final class FocusCopilotControllerTests: XCTestCase {
         XCTAssertEqual(speaker.spoken.count, 1, "resume keeps the fired cadence")
     }
 
+    // ── Phase 1.5: push-to-talk capture ──────────────────────────────────
+
+    func testCaptureNowSavesTranscriptVerbatim() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = "  Ping Zubair re TestFlight  "
+        c.captureNow()
+        // Saved verbatim (trimmed only) with the live session's body — NOT parsed.
+        XCTAssertEqual(spy.captured, ["Ping Zubair re TestFlight"])
+        XCTAssertEqual(c.lastCaptureOutcome, .saved)
+        XCTAssertFalse(c.capturing, "window closed after the result")
+        XCTAssertEqual(restores, 1, "ducked audio restored")
+        XCTAssertEqual(listener.startCount, 1)
+    }
+
+    func testCaptureNeverParsesCommandPhrases() {
+        // The crux: a command-like utterance must be SAVED, never interpreted.
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = "I should stop procrastinating"
+        c.captureNow()
+        XCTAssertEqual(spy.captured, ["I should stop procrastinating"])
+        // None of the command effects ran — no parse on the capture path.
+        XCTAssertEqual(spy.stopped, 0)
+        XCTAssertTrue(spy.extended.isEmpty)
+        XCTAssertEqual(spy.keptGoing, 0)
+
+        // Even a bare "stop" is captured, not treated as a stop command.
+        let c2 = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = "stop"
+        c2.captureNow()
+        XCTAssertEqual(spy.captured, ["stop"])
+        XCTAssertEqual(spy.stopped, 0)
+    }
+
+    func testBlankCaptureSavesNothing_reportsMissed() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = "   "   // heard only whitespace
+        c.captureNow()
+        XCTAssertTrue(spy.captured.isEmpty, "blank transcript saves nothing")
+        XCTAssertEqual(c.lastCaptureOutcome, .missed)
+        XCTAssertFalse(c.capturing)
+        XCTAssertEqual(restores, 1)
+    }
+
+    func testEmptyCaptureSavesNothing() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = ""
+        c.captureNow()
+        XCTAssertTrue(spy.captured.isEmpty)
+        XCTAssertEqual(c.lastCaptureOutcome, .missed)
+    }
+
+    func testSecondTapCancelsInFlightCapture() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = nil   // hold the window open
+        c.captureNow()
+        XCTAssertTrue(c.capturing)
+        let stopsBefore = listener.stopCount
+        c.captureNow()              // second tap = cancel
+        XCTAssertFalse(c.capturing, "cancelled")
+        XCTAssertGreaterThan(listener.stopCount, stopsBefore, "mic closed on cancel")
+        XCTAssertTrue(spy.captured.isEmpty, "cancel saves nothing")
+        XCTAssertNil(c.lastCaptureOutcome, "no confirm on a cancel")
+    }
+
+    func testCaptureWhenRecognitionUnavailableNoOps() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.canListen = false   // permission denied / no recognizer
+        XCTAssertFalse(c.canCapture)
+        c.captureNow()
+        XCTAssertEqual(listener.startCount, 0, "no mic when recognition unavailable")
+        XCTAssertFalse(c.capturing)
+        XCTAssertTrue(spy.captured.isEmpty)
+    }
+
+    func testThrowingListenerDuringCaptureDoesNotBreakTimer() {
+        // FAIL-SAFE: a throwing STT layer on the capture path must never stop or
+        // corrupt the focus timer. Here we prove the controller recovers (not
+        // stuck "capturing", audio restored, no crash) AND the milestone clock
+        // keeps working afterwards — a subsequent tick still fires AT_TIME.
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: false)
+        listener.shouldThrow = true
+        c.captureNow()              // throws inside start → swallowed
+        XCTAssertFalse(c.capturing, "recovered, not stuck capturing")
+        XCTAssertTrue(spy.captured.isEmpty)
+        XCTAssertEqual(restores, 1, "ducked audio restored after the throw")
+
+        // The timer/cadence is unaffected: AT_TIME still fires on the next tick.
+        listener.shouldThrow = false
+        tickThrough(c, to: 1500)
+        XCTAssertTrue(speaker.spoken.contains("That's your block. Add five, stop, or keep going?"))
+    }
+
+    func testCaptureIgnoredWhenInactive() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        c.endSession()              // inactive
+        c.captureNow()
+        XCTAssertEqual(listener.startCount, 0, "no capture when not active")
+        XCTAssertTrue(spy.captured.isEmpty)
+    }
+
+    func testCaptureDoesNotStartWhileAQuestionWindowIsOpen() {
+        // Don't double-open the mic: if a question reply window is live, a
+        // capture tap is a no-op (the prompt window owns the mic).
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = nil   // hold the question window open
+        tickThrough(c, to: 1500)
+        XCTAssertTrue(c.listening)
+        let startsBefore = listener.startCount
+        c.captureNow()
+        XCTAssertEqual(listener.startCount, startsBefore, "capture ignored mid-prompt")
+        XCTAssertFalse(c.capturing)
+    }
+
+    func testEndSessionStopsAnInFlightCapture() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        listener.autoResult = nil   // hold the capture window open
+        c.captureNow()
+        XCTAssertTrue(c.capturing)
+        c.endSession()
+        XCTAssertFalse(c.capturing)
+        XCTAssertGreaterThanOrEqual(listener.stopCount, 1)
+    }
+
     // ── GUARDRAIL: zero LLM / network in the copilot path ────────────────
 
     func testNoNetworkOrAssistantSymbolsReachableFromCopilotPath() {
@@ -271,6 +394,10 @@ final class FocusCopilotControllerTests: XCTestCase {
         // import UnstuckSync (the AssistantClient lives there) or reference
         // URLSession / the assistant edge function. Verified by scanning the
         // sources so a future edit that wires in a network call fails CI.
+        //
+        // This also covers the Phase-1.5 push-to-talk CAPTURE path: captureNow()
+        // + captureFromTranscript live in these same two files, so the scan
+        // proves the capture transcript is never streamed off-device.
         let root = URL(fileURLWithPath: #filePath)        // …/Tests/UnstuckAppTests/this.swift
             .deletingLastPathComponent()                   // UnstuckAppTests
             .deletingLastPathComponent()                   // Tests

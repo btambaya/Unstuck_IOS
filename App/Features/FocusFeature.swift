@@ -307,6 +307,23 @@ struct FocusView: View {
         .transition(.opacity)
     }
 
+    /// Momentary push-to-talk capture confirm ("Captured." on save, "Didn't
+    /// catch that." on a blank/empty transcript). Visual ack; the controller
+    /// also speaks the same words.
+    private func captureConfirm(_ outcome: FocusCopilotController.CaptureOutcome) -> some View {
+        let saved = outcome == .saved
+        return HStack(spacing: 7) {
+            Image(systemName: saved ? "checkmark.circle.fill" : "mic.slash").font(.system(size: 11))
+            Text(saved ? "Captured." : "Didn't catch that.").font(UFont.mono(11, .medium)).tracking(0.4)
+        }
+        .foregroundStyle(.white.opacity(0.9))
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(.white.opacity(0.16), in: Capsule())
+        .padding(.bottom, 12)
+        .accessibilityLabel(saved ? "Captured" : "Didn't catch that")
+        .transition(.opacity)
+    }
+
     @ViewBuilder
     private func content(_ fm: FocusModel) -> some View {
         @Bindable var fm = fm
@@ -416,9 +433,20 @@ struct FocusView: View {
                         copilot?.tick(focusedSec: sec)
                     }
 
-                // "listening…" indicator while the post-prompt mic window is live.
-                if let copilot, copilot.listening {
+                // "listening…" indicator while the post-prompt mic window OR a
+                // push-to-talk capture window is live.
+                if let copilot, copilot.listening || copilot.capturing {
                     listeningIndicator
+                }
+                // Brief push-to-talk capture confirm ("Captured." / missed).
+                if let copilot, let outcome = copilot.lastCaptureOutcome {
+                    captureConfirm(outcome)
+                        .task(id: outcome) {
+                            // Show for ~1.6s, then clear (best-effort; cancelled
+                            // if the outcome changes or the view goes away).
+                            try? await Task.sleep(nanoseconds: 1_600_000_000)
+                            copilot.clearCaptureOutcome()
+                        }
                 }
 
                 if fm.treatment == .ambient {
@@ -504,6 +532,13 @@ struct FocusView: View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 focusBtn("Capture", soft: true) { showCapture = true }
+                // Push-to-talk capture (Phase 1.5): tap → speak → the transcript
+                // is saved VERBATIM as a capture (on-device STT, ZERO LLM/network).
+                // Shown only when the focus coach is on AND recognition is usable;
+                // the first tap requests mic/speech permission. Tap again = cancel.
+                if let copilot, copilot.canCapture {
+                    talkCaptureBtn(copilot)
+                }
                 focusBtn(isPaused ? "Resume" : "Pause", soft: true) {
                     if isPaused { fm.resume(); copilot?.resumeSession() }
                     // Pause-reasons setting off → pause silently (no "Why are you
@@ -536,6 +571,24 @@ struct FocusView: View {
             }
             .padding(.top, 12).padding(.bottom, 6)
         }
+    }
+
+    /// Push-to-talk capture button (Phase 1.5). A circular mic that toggles the
+    /// on-device capture window; tinted coral while capturing so a second tap to
+    /// cancel is obvious. Wrapped so a throwing STT layer can never reach the
+    /// timer (captureNow() itself is fail-safe).
+    private func talkCaptureBtn(_ copilot: FocusCopilotController) -> some View {
+        Button { copilot.captureNow() } label: {
+            Image(systemName: copilot.capturing ? "mic.fill" : "mic")
+                .font(.system(size: 16))
+                .foregroundStyle(.white)
+                .frame(width: 44, height: 44)
+                .background(copilot.capturing ? AnyShapeStyle(theme.palette.coral)
+                                              : AnyShapeStyle(Color.white.opacity(0.10)),
+                            in: Circle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(copilot.capturing ? "Cancel voice capture" : "Capture by voice")
     }
 
     private func focusBtn(_ title: String, soft: Bool, action: @escaping () -> Void) -> some View {

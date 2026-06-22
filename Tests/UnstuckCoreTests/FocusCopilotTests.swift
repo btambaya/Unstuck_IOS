@@ -333,6 +333,43 @@ final class FocusCommandParserTests: XCTestCase {
     }
 }
 
+// MARK: - Push-to-talk capture helper (Phase 1.5)
+
+final class FocusCaptureFromTranscriptTests: XCTestCase {
+
+    func testNormalTranscriptReturnedVerbatim() {
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("call the dentist"), "call the dentist")
+        // Casing + punctuation preserved exactly (it is NOT parsed/normalized).
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("Ping Zubair re TestFlight!"),
+                       "Ping Zubair re TestFlight!")
+    }
+
+    func testLeadingTrailingWhitespaceTrimmed() {
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("  buy milk  "), "buy milk")
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("\n\tremember the key\n"), "remember the key")
+        // Interior whitespace is left alone — only the ends are trimmed.
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("  two  words  "), "two  words")
+    }
+
+    func testBlankAndEmptyReturnNil() {
+        XCTAssertNil(FocusCopilot.captureFromTranscript(""))
+        XCTAssertNil(FocusCopilot.captureFromTranscript("   "))
+        XCTAssertNil(FocusCopilot.captureFromTranscript("\n\t  \n"))
+    }
+
+    func testCommandLikePhrasesAreSavedVerbatim_neverParsed() {
+        // The whole point of push-to-talk capture: dictation, NOT commands.
+        // "stop" / "add ten" / "note …" must be saved as-is, never interpreted.
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("I should stop procrastinating"),
+                       "I should stop procrastinating")
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("stop"), "stop")
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("add ten things to the list"),
+                       "add ten things to the list")
+        XCTAssertEqual(FocusCopilot.captureFromTranscript("note to self: relax"),
+                       "note to self: relax")
+    }
+}
+
 // MARK: - Effect mapping + acks
 
 final class FocusEffectTests: XCTestCase {

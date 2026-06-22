@@ -15,12 +15,21 @@
 // AmbientAudio is ducked while speaking/listening and restored after. Teardown
 // on pause / end / background.
 //
+// PHASE 1.5 — push-to-talk CAPTURE. A deliberate tap (the focus screen's mic
+// button) calls `captureNow()`, which opens the SAME on-device CopilotListener
+// window and, on a non-blank result, saves the transcript VERBATIM as a capture
+// (effects.capture) — it is NEVER routed through FocusCommandParser.parse, so
+// "I should stop procrastinating" is saved, never read as a stop command. A
+// second tap while capturing cancels; a blank transcript saves nothing.
+//
 // GUARDRAILS:
 //   • ZERO LLM / network: this file imports nothing that can reach the assistant
 //     client or Supabase. It only touches UnstuckCore (pure) + the injected
 //     Speaker/Listener (on-device speech) + AmbientAudio + the effect closures.
 //   • The mic opens ONLY during a session, ONLY in the short window after a
-//     question prompt; the transcript is parsed then DISCARDED (never stored/sent).
+//     question prompt OR on an explicit capture tap; the reply transcript is
+//     parsed then DISCARDED, and the capture transcript is used ONLY to create
+//     the verbatim capture (never streamed off-device).
 //   • FAIL-SAFE: every Speaker/Listener call is wrapped so a throw / permission
 //     denial / unavailable engine can NEVER stop or corrupt the focus timer — it
 //     degrades to silence + the existing visual overrun buttons.
@@ -78,8 +87,17 @@ final class FocusCopilotController {
 
     /// True while the mic is live — drives the "listening…" indicator.
     private(set) var listening = false
+    /// True while a push-to-talk CAPTURE window is open (Phase 1.5). Distinct
+    /// from `listening` (the question-reply window) so the capture button can
+    /// show its own state + a second tap cancels only an in-flight capture.
+    private(set) var capturing = false
     /// The last line spoken (for an optional on-screen caption / debugging).
     private(set) var lastSpokenLine: String?
+
+    /// Momentary outcome of the last push-to-talk capture, for a brief on-screen
+    /// confirm. Cleared by the view after it's shown.
+    enum CaptureOutcome: Equatable { case saved, missed }
+    private(set) var lastCaptureOutcome: CaptureOutcome?
 
     // Dependencies (injected; all on-device / pure).
     @ObservationIgnored private let speaker: CopilotSpeaker
@@ -159,6 +177,7 @@ final class FocusCopilotController {
     private func haltSpeechAndMic() {
         busy = false
         if listening { listening = false }
+        if capturing { capturing = false }
         safe { speaker.stop() }
         safe { listener.stop() }
         restore()
@@ -182,6 +201,75 @@ final class FocusCopilotController {
         let line = FocusCopilot.line(for: milestone, estimateMin: E, focusedSec: focusedSec)
         deliver(milestone, line: line)
     }
+
+    // MARK: - push-to-talk capture (Phase 1.5)
+
+    /// True if a capture can be started right now (recognition usable + a live
+    /// session). Drives whether the capture button is enabled / shows a hint.
+    var canCapture: Bool { listener.canListen }
+
+    /// Deliberate-tap push-to-talk capture. Opens the SAME on-device STT window
+    /// as a question reply, but the transcript is saved VERBATIM as a capture —
+    /// it is NEVER parsed (no FocusCommandParser.parse on this path). A second
+    /// tap while capturing CANCELS (no save). A blank/empty transcript saves
+    /// nothing and reports `.missed`. Fully fail-safe: any STT/permission throw
+    /// is swallowed so the focus timer can never be stopped or corrupted.
+    func captureNow() {
+        // Second tap while a capture is open = cancel (no save, no confirm).
+        if capturing { cancelCapture(); return }
+        // Don't collide with an in-flight question prompt or an inactive session.
+        guard active, !busy, !listening else { return }
+        guard listener.canListen else { return }
+
+        lastCaptureOutcome = nil
+        busy = true
+        capturing = true
+        duck()
+
+        let opened = safe {
+            try listener.start(maxSeconds: listenWindowSec) { [weak self] heard in
+                self?.handleCaptured(heard)
+            }
+        } != nil
+        if !opened {
+            // Couldn't open the mic — degrade gracefully (no save, timer intact).
+            capturing = false
+            finishCapture()
+        }
+    }
+
+    /// Cancel an in-flight capture (second tap / teardown). No save, no confirm.
+    private func cancelCapture() {
+        capturing = false
+        safe { listener.stop() }
+        finishCapture()
+    }
+
+    /// A transcript came back from the capture window (possibly ""). Save it
+    /// VERBATIM — `captureFromTranscript` only trims + rejects blanks, it does
+    /// NOT parse. The transcript is used ONLY to build the capture, then goes
+    /// out of scope (never stored elsewhere, never sent).
+    private func handleCaptured(_ heard: String) {
+        capturing = false
+        if let body = FocusCopilot.captureFromTranscript(heard) {
+            effects.capture(body)
+            lastCaptureOutcome = .saved
+            _ = safe { try speaker.speak("Captured.") }
+        } else {
+            lastCaptureOutcome = .missed
+            _ = safe { try speaker.speak("Didn't catch that.") }
+        }
+        finishCapture()
+    }
+
+    private func finishCapture() {
+        if capturing { capturing = false }
+        restore()
+        busy = false
+    }
+
+    /// Clear the momentary capture confirm after the view has shown it.
+    func clearCaptureOutcome() { lastCaptureOutcome = nil }
 
     // MARK: - delivery
 
