@@ -333,8 +333,20 @@ private struct FocusSettingsView: View {
                 ToggleRow(label: "Soft exit", isOn: $settings.focusSoftExit)
                 CardDivider()
                 ToggleRow(label: "Pause reasons", isOn: $settings.focusPauseReasons)
+                CardDivider()
+                // Hands-Free Focus Copilot (Phase 1): on-device spoken progress
+                // alerts during a block; Voice replies adds a short mic window
+                // after a prompt. Coach off disables Voice replies.
+                ToggleRow(label: "Spoken focus coach", isOn: $settings.focusSpokenCoach)
+                CardDivider()
+                ToggleRow(label: "Voice replies", isOn: $settings.focusVoiceReplies)
+                    .opacity(settings.focusSpokenCoach ? 1 : 0.4)
+                    .disabled(!settings.focusSpokenCoach)
             }
             Text("Default focus length sets the estimate on a new task. Soft overrun decides how long past the estimate before the check-in appears.")
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                .padding(.top, 10)
+            Text("Spoken focus coach reads gentle progress alerts aloud while you focus — how often follows your Notifications level (Calm / Balanced / Coach). Voice replies opens a brief on-device mic after a prompt so you can say \u{201C}add ten\u{201D}, \u{201C}stop\u{201D}, or \u{201C}keep going\u{201D} hands-free. Both stay on your device — no recording is ever stored or sent.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
                 .padding(.top, 10)
         }

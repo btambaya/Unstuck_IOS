@@ -69,11 +69,35 @@ final class AmbientAudio {
         teardown()
     }
 
+    /// True while the bed is paused specifically for the Focus Copilot (so a
+    /// restore() only resumes a bed the copilot itself ducked, never one the
+    /// user muted). Best-effort.
+    private var duckedForCopilot = false
+
+    /// Pause the ambient bed while the copilot speaks / listens, so the spoken
+    /// line is clear and the mic isn't fed the noise loop. No-op if the bed
+    /// isn't running. Pairs with `restore()`. Best-effort — never throws.
+    func duck() {
+        guard running, !duckedForCopilot else { return }
+        engine.pause()
+        duckedForCopilot = true
+    }
+
+    /// Resume a bed that `duck()` paused. No-op if we didn't duck it (e.g. the
+    /// user muted, or it was never playing). Best-effort.
+    func restore() {
+        guard duckedForCopilot else { return }
+        duckedForCopilot = false
+        guard running else { return }
+        try? engine.start()
+    }
+
     private func teardown() {
         engine.stop()
         if let node = sourceNode { engine.detach(node) }
         sourceNode = nil
         running = false
+        duckedForCopilot = false
         // configureSession() left the shared session active; release it so the
         // .playback category doesn't leak into whatever plays next (and so the
         // system can power down audio). .notifyOthersOnDeactivation lets other

@@ -139,6 +139,21 @@ final class SettingsState {
         didSet { if !loading { d.set(defaultTreatment.rawValue, forKey: "unstuck.defaultTreatment") } }
     }
 
+    /// Hands-Free Focus Copilot — spoken progress alerts during a focus block
+    /// (HALFWAY / T-5 / AT_TIME / OVERRUN, gated by the notification level).
+    /// 100% on-device TTS, zero LLM. Default ON (speak-only). Settings · Focus.
+    var focusSpokenCoach: Bool = true {
+        didSet { if !loading { d.set(focusSpokenCoach, forKey: "unstuck.focusSpokenCoach") } }
+    }
+
+    /// Hands-free VOICE replies — after a question prompt, open a short
+    /// on-device mic window so you can say "add ten" / "stop" / "keep going"
+    /// without touching the screen. Requires the spoken coach. Default OFF
+    /// (the mic is opt-in). Settings · Focus.
+    var focusVoiceReplies: Bool = false {
+        didSet { if !loading { d.set(focusVoiceReplies, forKey: "unstuck.focusVoiceReplies") } }
+    }
+
     // MARK: Sound
 
     var soundStartChime: Bool = true {
@@ -174,6 +189,8 @@ final class SettingsState {
         focusPauseReasons = d.object(forKey: "unstuck.focusPauseReasons") == nil ? true : d.bool(forKey: "unstuck.focusPauseReasons")
         focusCollapseRail = d.object(forKey: "unstuck.focusCollapseRail") == nil ? true : d.bool(forKey: "unstuck.focusCollapseRail")
         defaultTreatment = FocusTreatment(rawValue: d.string(forKey: "unstuck.defaultTreatment") ?? "") ?? .ambient
+        focusSpokenCoach = d.object(forKey: "unstuck.focusSpokenCoach") == nil ? true : d.bool(forKey: "unstuck.focusSpokenCoach")
+        focusVoiceReplies = d.object(forKey: "unstuck.focusVoiceReplies") == nil ? false : d.bool(forKey: "unstuck.focusVoiceReplies")
         soundStartChime = d.object(forKey: "unstuck.soundStartChime") == nil ? true : d.bool(forKey: "unstuck.soundStartChime")
         soundOverrunBell = d.object(forKey: "unstuck.soundOverrunBell") == nil ? true : d.bool(forKey: "unstuck.soundOverrunBell")
         soundCompletion = d.bool(forKey: "unstuck.soundCompletion")   // default false

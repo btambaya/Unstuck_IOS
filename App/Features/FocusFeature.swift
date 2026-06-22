@@ -150,6 +150,14 @@ struct FocusView: View {
     @State private var reflectMin = 0
     @State private var reflectSel: String?
 
+    // Hands-Free Focus Copilot (Phase 1). The VoiceController is the same
+    // on-device $0 STT/TTS layer the assistant uses (no LLM/network here). The
+    // controller is created on first session start when "Spoken focus coach" is
+    // on; `lastTickSec` de-dupes the per-second tick.
+    @State private var copilotVoice = VoiceController()
+    @State private var copilot: FocusCopilotController?
+    @State private var lastTickSec = -1
+
     private let reasons = ["Bathroom", "Drink", "Quick question", "Stuck — need a moment", "Other"]
 
     // The Android focus screen is dark for every treatment: a deep indigo
@@ -184,6 +192,7 @@ struct FocusView: View {
                 fm = newFM
                 // The init's persist() ran before onPersist was wired — seed once.
                 model.refreshLiveSession()
+                startCopilotIfEnabled(newFM)
             }
         }
         // Live captures for the Cockpit rail. Observe regardless of treatment so
@@ -217,14 +226,16 @@ struct FocusView: View {
         }
         .sheet(isPresented: $showCapture) { captureSheet }
         .sheet(isPresented: $showReflect, onDismiss: { dismiss() }) { reflectSheet }
-        .onDisappear { AmbientAudio.shared.stop() }
+        .onDisappear { teardownCopilot(); AmbientAudio.shared.stop() }
         // .onDisappear does NOT fire when the phone locks/backgrounds while the
         // Focus screen stays "appeared" — the .playback engine would keep
         // rendering (and draining battery) in the background. Stop on leaving
         // .active; restart on return if the user still wants the bed playing.
         // (VoiceModeScreen tears down on scenePhase the same way.)
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { AmbientAudio.shared.stop() }
+            // Background / inactive: tear the copilot down (mic must never run
+            // off-screen) alongside the existing ambient-audio teardown.
+            if phase != .active { teardownCopilot(); AmbientAudio.shared.stop() }
             else if let fm { updateAudio(fm) }
         }
     }
@@ -236,6 +247,64 @@ struct FocusView: View {
     private func updateAudio(_ fm: FocusModel) {
         if soundOn && model.settings.ambient != .off { AmbientAudio.shared.start() }
         else { AmbientAudio.shared.stop() }
+    }
+
+    // MARK: - Hands-Free Focus Copilot wiring
+
+    /// Build + start the copilot when "Spoken focus coach" is on. The effects
+    /// run the SAME paths the on-screen buttons use (extend / finish / capture)
+    /// — no voice command deletes data. Re-created per session.
+    private func startCopilotIfEnabled(_ fm: FocusModel) {
+        guard model.settings.focusSpokenCoach else { copilot = nil; return }
+        let speaker = VoiceControllerSpeaker(copilotVoice)
+        let listener = VoiceControllerListener(copilotVoice)
+        let effects = CopilotEffects(
+            extend: { [weak fm] n in fm?.extendFocus(n) },
+            keepGoing: { [weak fm] in
+                // Mirror the visual "In the zone": set the no-re-nag flag on the
+                // live session so the overrun check-in won't re-escalate.
+                guard let fm else { return }
+                fm.live.overrunPromptFired = true
+            },
+            stop: { finishSession(markDone: false) },
+            capture: { [weak fm] text in
+                let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !body.isEmpty, let fm else { return }
+                let captureTaskId = fm.occurrence?.templateId ?? task.id
+                model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId,
+                                          sessionId: fm.sessionId, tag: .followUp,
+                                          body: body, at: AppModel.isoNow()))
+            }
+        )
+        let c = FocusCopilotController(
+            speaker: speaker,
+            listener: listener,
+            effects: effects,
+            estimateMin: { [weak fm] in fm?.live.sessionEstimateMin ?? task.estimateMin },
+            level: { NotificationPrefs.level },
+            voiceRepliesEnabled: { model.settings.focusVoiceReplies }
+        )
+        c.startSession()
+        copilot = c
+    }
+
+    /// Tear the copilot down (stops any speech/mic, restores ducked audio).
+    private func teardownCopilot() {
+        copilot?.endSession()
+        lastTickSec = -1
+    }
+
+    private var listeningIndicator: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "mic.fill").font(.system(size: 11))
+            Text("listening…").font(UFont.mono(11, .medium)).tracking(0.6)
+        }
+        .foregroundStyle(.white.opacity(0.9))
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(theme.palette.coral.opacity(0.35), in: Capsule())
+        .padding(.bottom, 12)
+        .accessibilityLabel("Listening for a voice command")
+        .transition(.opacity)
     }
 
     @ViewBuilder
@@ -336,6 +405,22 @@ struct FocusView: View {
             let isPaused = fm.live.paused
 
             VStack(spacing: 0) {
+                // Drive the copilot once per accumulated-focus second (paused
+                // EXCLUDED — `elapsed` here is FocusTimer.displayedElapsedSec,
+                // which freezes while paused). Wrapped so it can never affect the
+                // timer; de-duped on the whole-second value.
+                Color.clear.frame(height: 0)
+                    .onChange(of: elapsed) { _, sec in
+                        guard !isPaused, sec != lastTickSec else { return }
+                        lastTickSec = sec
+                        copilot?.tick(focusedSec: sec)
+                    }
+
+                // "listening…" indicator while the post-prompt mic window is live.
+                if let copilot, copilot.listening {
+                    listeningIndicator
+                }
+
                 if fm.treatment == .ambient {
                     ProgressRing(progress: progress, paused: isPaused, animated: !model.settings.reduceMotion)
                         .frame(width: 220, height: 220)
@@ -420,14 +505,16 @@ struct FocusView: View {
             HStack(spacing: 10) {
                 focusBtn("Capture", soft: true) { showCapture = true }
                 focusBtn(isPaused ? "Resume" : "Pause", soft: true) {
-                    if isPaused { fm.resume() }
+                    if isPaused { fm.resume(); copilot?.resumeSession() }
                     // Pause-reasons setting off → pause silently (no "Why are you
                     // pausing?" sheet). Either way coordinate the paused check-in
                     // NOW: pause() pre-schedules the local notif, so the cap/mute
                     // gate must run whether or not a reason is later picked (an
                     // ignored/dismissed reasons sheet must not bypass the cap).
-                    else if model.settings.focusPauseReasons { fm.pause(); coordinateCheckin(); showReasons = true }
-                    else { fm.pause(); coordinateCheckin() }
+                    // Pausing also stops any copilot mic/speech (it re-arms on
+                    // Resume, keeping its already-fired cadence).
+                    else if model.settings.focusPauseReasons { fm.pause(); copilot?.pauseSession(); coordinateCheckin(); showReasons = true }
+                    else { fm.pause(); copilot?.pauseSession(); coordinateCheckin() }
                 }
                 // "Done" marks the task complete immediately (records the session
                 // + flips done), 1:1 with Android — no extra "complete vs finish"
@@ -441,7 +528,7 @@ struct FocusView: View {
                 // Pause-reasons is on, prompt for an interruption reason first and
                 // exit AFTER it's logged (exitAfterReason); off → exit immediately.
                 secondaryBtn("Save for later") {
-                    fm.pause(); coordinateCheckin()
+                    fm.pause(); copilot?.pauseSession(); coordinateCheckin()
                     if model.settings.focusPauseReasons { exitAfterReason = true; showReasons = true }
                     else { dismiss() }
                 }
@@ -484,6 +571,7 @@ struct FocusView: View {
     /// the task (fires the shared-collection done notification for promoted tasks).
     private func finishSession(markDone: Bool) {
         guard let fm else { return }
+        teardownCopilot()
         let result = fm.finish()
         // For an occurrence focus the Session is attributed to the template; pass
         // its id as the focus `task` so totalFocused accrues there, and the block
@@ -569,6 +657,7 @@ struct FocusView: View {
     private func pauseWith(_ reason: String) {
         model.saveReasonLog(ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow()))
         fm?.pause()
+        copilot?.pauseSession()
         coordinateCheckin()
     }
 
