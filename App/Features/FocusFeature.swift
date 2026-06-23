@@ -339,6 +339,24 @@ struct FocusView: View {
                         .background(.white.opacity(0.10), in: Capsule())
                 }.buttonStyle(.plain)
                 Spacer()
+                // Typed capture (sheet) — header pill matching "← Out" (web parity:
+                // the focus top bar reads Capture · mic · exit). Moved here from the
+                // bottom action row so the typed Capture and the voice mic sit
+                // together, mirroring the web top bar and the Android header.
+                Button { showCapture = true } label: {
+                    Text("Capture")
+                        .font(UFont.sans(12))
+                        .foregroundStyle(.white.opacity(0.7))
+                        .padding(.horizontal, 12).padding(.vertical, 6)
+                        .background(.white.opacity(0.10), in: Capsule())
+                }.buttonStyle(.plain)
+                // Push-to-talk voice capture (Phase 1.5) — INLINE beside the typed
+                // Capture (web parity). Tap → on-device STT → the transcript is
+                // saved VERBATIM as a session capture (ZERO LLM/network); a second
+                // tap cancels. Shown only when the coach is on AND STT is usable.
+                if let copilot, copilot.canCapture {
+                    talkCaptureBtn(copilot)
+                }
                 // Sound toggle (ambient loop) lives where Android's mute-less
                 // header has space; keeps the existing soundOn behavior.
                 Button { soundOn.toggle(); updateAudio(fm) } label: {
@@ -531,14 +549,8 @@ struct FocusView: View {
         let isPaused = fm.live.paused
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                focusBtn("Capture", soft: true) { showCapture = true }
-                // Push-to-talk capture (Phase 1.5): tap → speak → the transcript
-                // is saved VERBATIM as a capture (on-device STT, ZERO LLM/network).
-                // Shown only when the focus coach is on AND recognition is usable;
-                // the first tap requests mic/speech permission. Tap again = cancel.
-                if let copilot, copilot.canCapture {
-                    talkCaptureBtn(copilot)
-                }
+                // Capture (typed + voice mic) now lives in the focus header (web
+                // parity); the action row keeps only the session controls.
                 focusBtn(isPaused ? "Resume" : "Pause", soft: true) {
                     if isPaused { fm.resume(); copilot?.resumeSession() }
                     // Pause-reasons setting off → pause silently (no "Why are you
@@ -573,22 +585,36 @@ struct FocusView: View {
         }
     }
 
-    /// Push-to-talk capture button (Phase 1.5). A circular mic that toggles the
-    /// on-device capture window; tinted coral while capturing so a second tap to
+    /// Push-to-talk voice-capture button (Phase 1.5), INLINE in the focus header
+    /// next to the exit/sound controls (web parity: the focus top bar's mic sits
+    /// beside "Capture"/"Soft exit"). Compact to match the neighboring header
+    /// controls' weight: an idle mic glyph that, while capturing, swaps to a
+    /// "waveform" glyph + a "Listening…" label and tints coral so a second tap to
     /// cancel is obvious. Wrapped so a throwing STT layer can never reach the
     /// timer (captureNow() itself is fail-safe).
     private func talkCaptureBtn(_ copilot: FocusCopilotController) -> some View {
         Button { copilot.captureNow() } label: {
-            Image(systemName: copilot.capturing ? "mic.fill" : "mic")
-                .font(.system(size: 16))
-                .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
-                .background(copilot.capturing ? AnyShapeStyle(theme.palette.coral)
-                                              : AnyShapeStyle(Color.white.opacity(0.10)),
-                            in: Circle())
+            HStack(spacing: 6) {
+                Image(systemName: copilot.capturing ? "waveform" : "mic.fill")
+                    .font(.system(size: 13, weight: .medium))
+                    .symbolEffect(.variableColor.iterative, isActive: copilot.capturing)
+                if copilot.capturing {
+                    Text("Listening…")
+                        .font(UFont.mono(11, .medium)).tracking(0.4)
+                        .transition(.opacity)
+                }
+            }
+            .foregroundStyle(copilot.capturing ? .white : .white.opacity(0.6))
+            .frame(height: 32)
+            .padding(.horizontal, copilot.capturing ? 12 : 0)
+            .frame(minWidth: 32)
+            .background(copilot.capturing ? AnyShapeStyle(theme.palette.coral)
+                                          : AnyShapeStyle(Color.white.opacity(0.10)),
+                        in: Capsule())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(copilot.capturing ? "Cancel voice capture" : "Capture by voice")
+        .animation(.easeInOut(duration: 0.18), value: copilot.capturing)
+        .accessibilityLabel(copilot.capturing ? "Listening — tap to cancel voice capture" : "Capture by voice")
     }
 
     private func focusBtn(_ title: String, soft: Bool, action: @escaping () -> Void) -> some View {
