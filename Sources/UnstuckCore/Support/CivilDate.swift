@@ -52,4 +52,17 @@ public extension Time {
         let secs = startOfDay(a).timeIntervalSince(startOfDay(b))
         return Int((secs / 86_400).rounded())
     }
+
+    /// Short weekday ("Mon"…"Sun") for a `YYYY-MM-DD` date, in the local
+    /// calendar. Mirrors the web's `weekdayShort` (task-row.tsx) used to label
+    /// a missed recurring occurrence in Backlog ("Overdue · Fri"). Returns ""
+    /// for an unparseable date.
+    static func weekdayShort(_ iso: String) -> String {
+        let parts = iso.split(separator: "-").map { Int($0) }
+        guard parts.count == 3, let y = parts[0], let m = parts[1], let d = parts[2] else { return "" }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "EEE"
+        return f.string(from: Time.civil(y, m, d))
+    }
 }

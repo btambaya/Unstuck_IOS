@@ -468,7 +468,12 @@ struct TodayView: View {
         // The in-progress focus session, surfaced at the top of the list (Android
         // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed tasks.
         let liveTask = liveId.flatMap { id in vm.all.first { $0.id == id } }
-        VStack(spacing: 6) {
+        // LazyVStack (not VStack): the whole Today/dashboard screen — header,
+        // hero, filter bar, AND these rows — lives in ONE outer ScrollView
+        // (body), so the entire screen scrolls as a single unit. Lazy keeps a
+        // long Today/Backlog list from rendering every row eagerly inside that
+        // single scroll container. Matches the Tasks list.
+        LazyVStack(spacing: 6) {
             if let liveTask, let live = model.liveSession {
                 liveSessionCard(liveTask, live)
             }

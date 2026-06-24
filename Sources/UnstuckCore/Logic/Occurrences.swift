@@ -41,6 +41,68 @@ public func projectOccurrences(_ tasks: [TaskItem], _ blocks: [CalBlock], fromIS
     return out
 }
 
+/// One synthetic "overdue" occurrence row per recurring template whose most-
+/// recent PAST occurrence was missed — i.e. that latest past occurrence is still
+/// incomplete (NOT done AND NOT skipped) AND today is not itself a recurrence day
+/// for it (a today occurrence supersedes the stale miss — it shows in Today). This
+/// is what surfaces a missed "Call mom every Friday" in Backlog the day after,
+/// instead of it vanishing until next Friday. Port of lib/occurrences.ts
+/// `projectOverdueOccurrences`.
+///
+/// Keyed to the most-recent past occurrence on purpose, so the behaviour is:
+///   • At most ONE overdue row per template — missing several weeks never stacks.
+///   • Completing it marks that occurrence done → the most-recent past is now
+///     complete → the row clears. Older incomplete misses are intentionally
+///     ignored ("you don't owe 3 calls").
+///   • The next live occurrence (today) takes over: no overdue while today is a
+///     recurrence day.
+/// Pure read — never mutates blocks. Each row's id IS the cal_block id, so the
+/// usual `occurrenceBlockFor` routing resolves it for complete/skip/focus.
+public func projectOverdueOccurrences(_ tasks: [TaskItem], _ blocks: [CalBlock], todayISO: String) -> [TaskItem] {
+    var templates: [String: TaskItem] = [:]
+    for t in tasks where t.recurrence != nil { templates[t.id] = t }
+    if templates.isEmpty { return [] }
+
+    var latestPast: [String: CalBlock] = [:]   // template id -> most-recent PAST occurrence block
+    var hasToday = Set<String>()                // template ids with an occurrence dated today
+    for b in blocks {
+        guard isTaskBlock(b), let tid = b.taskId, templates[tid] != nil else { continue }
+        if b.date == todayISO { hasToday.insert(tid); continue }
+        if b.date > todayISO { continue }
+        if let cur = latestPast[tid], cur.date >= b.date { continue }
+        latestPast[tid] = b
+    }
+
+    var out: [TaskItem] = []
+    for (tid, b) in latestPast {
+        if hasToday.contains(tid) { continue }   // today's occurrence takes over
+        if b.done || b.skipped { continue }      // most-recent past already handled
+        guard let tpl = templates[tid] else { continue }
+        var occ = tpl
+        occ.id = b.id                            // id = cal_block id
+        occ.done = false
+        occ.completedAt = nil
+        occ.estimateMin = b.durationMinutes
+        occ.recurrence = nil
+        occ.later = false
+        out.append(occ)
+    }
+    return out
+}
+
+/// Map of overdue-occurrence row id → its missed occurrence date (YYYY-MM-DD).
+/// The Backlog UI uses this to label a missed recurring row ("Overdue · Fri")
+/// without re-deriving the rule per row. Same selection as
+/// `projectOverdueOccurrences`, so the keys match exactly the overdue rows it
+/// surfaces. Pure / read-only.
+public func overdueOccurrenceDates(_ tasks: [TaskItem], _ blocks: [CalBlock], todayISO: String) -> [String: String] {
+    var out: [String: String] = [:]
+    for occ in projectOverdueOccurrences(tasks, blocks, todayISO: todayISO) {
+        if let b = blocks.first(where: { $0.id == occ.id }) { out[occ.id] = b.date }
+    }
+    return out
+}
+
 /// The occurrence cal_block behind a projected row id, or nil if the row is a
 /// normal task. Routing (complete/skip/focus) uses this to target the block.
 public func occurrenceBlockFor(_ rowId: String, tasks: [TaskItem], blocks: [CalBlock]) -> CalBlock? {

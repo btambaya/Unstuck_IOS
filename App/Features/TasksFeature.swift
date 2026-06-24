@@ -37,6 +37,11 @@ final class TasksModel {
     /// of each row running two full-table DB reads + a JSON decode in `body`.
     private(set) var occurrenceIds: Set<String> = []
 
+    /// Row id → "Overdue · Fri" label for missed recurring occurrences surfaced
+    /// in Backlog. Same selection as `projectOverdueOccurrences`; computed once
+    /// per snapshot so the row just reads the chip text.
+    private(set) var overdueLabels: [String: String] = [:]
+
     init(_ repo: TaskRepository) { self.repo = repo }
 
     func observe() async {
@@ -61,6 +66,9 @@ final class TasksModel {
         let templateIds = Set(all.filter { $0.recurrence != nil }.map { $0.id })
         occurrenceIds = Set(
             blocks.filter { isTaskBlock($0) && templateIds.contains($0.taskId ?? "") }.map { $0.id })
+        // "Overdue · Fri" labels for missed recurring occurrences (Backlog only).
+        overdueLabels = overdueOccurrenceDates(all, blocks, todayISO: Clock.todayISO())
+            .mapValues { "Overdue · \(Time.weekdayShort($0))" }
         recomputeVisible()
     }
 
@@ -308,10 +316,15 @@ struct TasksView: View {
                         // Precomputed once per snapshot (vm.occurrenceIds) — was
                         // two full-table DB reads + a JSON decode PER ROW in body.
                         let isOccurrence = vm.occurrenceIds.contains(task.id)
+                        // A missed recurring occurrence surfaced in Backlog: show
+                        // why it's here ("Overdue · Fri") instead of the misleading
+                        // template-age chip.
+                        let overdueLabel = vm.overdueLabels[task.id]
                         TaskRowView(
                             task: task,
                             areaColor: areaColor(task.lifeArea, vm.areas),
-                            ageDays: vm.view == .backlog ? vm.ageDays(task) : nil,
+                            ageDays: (vm.view == .backlog && overdueLabel == nil) ? vm.ageDays(task) : nil,
+                            overdueLabel: overdueLabel,
                             isRecurring: task.recurrence != nil || isOccurrence,
                             // A repeating TEMPLATE row (Recurring tab) has no per-day
                             // done — hide the circle and open it to edit the series.
@@ -379,6 +392,10 @@ struct TaskRowView: View {
     let task: TaskItem
     let areaColor: Color
     let ageDays: Int?
+    /// "Overdue · Fri" for a missed recurring occurrence surfaced in Backlog —
+    /// shown as a coral chip in place of the age badge so it's obvious why the
+    /// row is here and that it's a missed recurring task.
+    var overdueLabel: String? = nil
     var isRecurring: Bool = false
     /// Whether to show the leading done-circle (false for repeating templates,
     /// which have no per-day done — those open to edit the series instead).
@@ -429,7 +446,14 @@ struct TaskRowView: View {
                         }
                     }
                 }
-                if let ageDays {
+                if let overdueLabel {
+                    Text(overdueLabel)
+                        .font(UFont.sans(10, .bold))
+                        .foregroundStyle(theme.palette.coralDeep)
+                        .padding(.horizontal, 8).padding(.vertical, 2)
+                        .background(theme.palette.coralSoft, in: Capsule())
+                        .accessibilityLabel("Missed recurring task. \(overdueLabel)")
+                } else if let ageDays {
                     Text("\(max(ageDays, 1))d")
                         .font(UFont.sans(10, .medium))
                         .foregroundStyle(theme.palette.amberInk)

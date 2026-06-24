@@ -86,6 +86,10 @@ public func visibleTasks(
     let projected = projectOccurrences(tasks, blocks, fromISO: today)
     let todayOccurrences = projected.filter { todayOccIds.contains($0.id) }
     let upcomingOccurrences = projected.filter { nextUpcomingOccIds.contains($0.id) }
+    // Missed recurring occurrences: one overdue row per template whose most-
+    // recent past occurrence went undone — surfaced in Backlog so a skipped
+    // "every Friday" task doesn't silently vanish until next Friday.
+    let overdueOccurrences = projectOverdueOccurrences(tasks, blocks, todayISO: today)
 
     // Non-template task bucketing — over NON-recurring task blocks only (an
     // occurrence block's taskId is its template, never a row in these buckets).
@@ -117,12 +121,14 @@ public func visibleTasks(
         byView = nt + todayOccurrences.filter { !$0.done }
     case .backlog:
         // Open work not actively planned AND sitting ≥ a day: never scheduled, or
-        // only ever scheduled in the past (overdue). No recurring occurrences.
-        byView = nonTemplates.filter { t in
+        // only ever scheduled in the past (overdue). PLUS one overdue row per
+        // recurring template whose most-recent occurrence was missed.
+        let nt = nonTemplates.filter { t in
             !t.done && !(t.later ?? false) && !isCreatedToday(t, now: now) && (
                 !scheduledTaskIds.contains(t.id) || pastOnlyTaskIds.contains(t.id)
             )
         }
+        byView = nt + overdueOccurrences
     case .upcoming:
         // Future-scheduled tasks + the single NEXT occurrence per recurring series.
         let nt = nonTemplates.filter { t in

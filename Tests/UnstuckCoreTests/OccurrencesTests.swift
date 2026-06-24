@@ -47,6 +47,110 @@ final class OccurrencesTests: XCTestCase {
         XCTAssertEqual(projectOccurrences([template()], blocks, fromISO: "2026-06-10").map(\.id), ["ok"])
     }
 
+    // MARK: projectOverdueOccurrences — missed recurring surfaces once
+    // Parity with lib/occurrences.test.ts "projectOverdueOccurrences" block.
+
+    /// A weekly (Fri) recurring template — matches the web's `tmpl`.
+    private func weeklyTemplate() -> TaskItem {
+        var t = mkTask(id: "t1", name: "Call mom", lifeArea: "Personal")
+        t.recurrence = .weekly(daysOfWeek: [5], until: nil)
+        return t
+    }
+    private let TODAY = "2026-06-12"
+
+    func testOverdueSurfacesOneRowForMostRecentMiss() {
+        let blocks = [
+            block("b1", "2026-06-05"),   // older miss
+            block("b2", "2026-06-11"),   // most-recent miss
+        ]
+        let out = projectOverdueOccurrences([weeklyTemplate()], blocks, todayISO: TODAY)
+        XCTAssertEqual(out.count, 1)
+        XCTAssertEqual(out[0].id, "b2")
+        XCTAssertFalse(out[0].done)
+        XCTAssertNil(out[0].recurrence)
+        XCTAssertEqual(out[0].name, "Call mom")
+        XCTAssertEqual(out[0].lifeArea, "Personal")
+    }
+
+    func testOverdueDoesNotStackAcrossMultipleMisses() {
+        let blocks = [
+            block("b1", "2026-05-29"),
+            block("b2", "2026-06-05"),
+            block("b3", "2026-06-11"),
+        ]
+        XCTAssertEqual(projectOverdueOccurrences([weeklyTemplate()], blocks, todayISO: TODAY).count, 1)
+    }
+
+    func testOverdueSupersededByTodayOccurrence() {
+        let blocks = [
+            block("b1", "2026-06-11"),    // missed
+            block("b2", TODAY),           // today's occurrence takes over
+        ]
+        XCTAssertEqual(projectOverdueOccurrences([weeklyTemplate()], blocks, todayISO: TODAY).count, 0)
+    }
+
+    func testOverdueClearsWhenMostRecentPastIsDone() {
+        let blocks = [
+            block("b1", "2026-06-05"),                  // older, still undone
+            block("b2", "2026-06-11", done: true),      // most-recent, done
+        ]
+        XCTAssertEqual(projectOverdueOccurrences([weeklyTemplate()], blocks, todayISO: TODAY).count, 0)
+    }
+
+    func testOverdueClearsWhenMostRecentPastSkipped() {
+        let blocks = [block("b2", "2026-06-11", skipped: true)]
+        XCTAssertEqual(projectOverdueOccurrences([weeklyTemplate()], blocks, todayISO: TODAY).count, 0)
+    }
+
+    func testOverdueNoneForFutureOnlyOccurrences() {
+        let blocks = [block("b1", "2026-06-19")]
+        XCTAssertEqual(projectOverdueOccurrences([weeklyTemplate()], blocks, todayISO: TODAY).count, 0)
+    }
+
+    func testOverdueIgnoresNonRecurringTasks() {
+        let normal = mkTask(id: "t1")   // no recurrence
+        let blocks = [block("b1", "2026-06-11")]
+        XCTAssertEqual(projectOverdueOccurrences([normal], blocks, todayISO: TODAY).count, 0)
+    }
+
+    func testOverdueDatesMapsRowIdToOccurrenceDate() {
+        let blocks = [
+            block("b1", "2026-06-05"),
+            block("b2", "2026-06-11"),
+        ]
+        let dates = overdueOccurrenceDates([weeklyTemplate()], blocks, todayISO: TODAY)
+        XCTAssertEqual(dates, ["b2": "2026-06-11"])
+    }
+
+    // Backlog wiring: a missed recurring occurrence surfaces in Backlog (and
+    // nowhere else), and is cleared by a today occurrence.
+    func testBacklogSurfacesMissedRecurringOccurrence() {
+        let tpl = weeklyTemplate()
+        // most-recent past occurrence (yesterday) is undone → one overdue row.
+        let blocks = [mkBlock(id: "occ", taskId: "t1", date: todayPlus(-1), kind: .task)]
+        let backlog = visibleTasks(view: .backlog, tasks: [tpl], blocks: blocks,
+                                   now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false)
+        XCTAssertEqual(backlog.map(\.id), ["occ"])
+        // Not in Today (no today occurrence) and never in All.
+        let today = visibleTasks(view: .today, tasks: [tpl], blocks: blocks,
+                                 now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false)
+        XCTAssertFalse(today.contains { $0.id == "occ" })
+        let all = visibleTasks(view: .all, tasks: [tpl], blocks: blocks,
+                               now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false)
+        XCTAssertTrue(all.isEmpty)
+    }
+
+    func testBacklogOverdueClearedByTodayOccurrence() {
+        let tpl = weeklyTemplate()
+        let blocks = [
+            mkBlock(id: "missed", taskId: "t1", date: todayPlus(-1), kind: .task),
+            mkBlock(id: "live", taskId: "t1", date: todayPlus(0), kind: .task),
+        ]
+        let backlog = visibleTasks(view: .backlog, tasks: [tpl], blocks: blocks,
+                                   now: Date().timeIntervalSince1970 * 1000, activeArea: nil, slipMode: false)
+        XCTAssertFalse(backlog.contains { $0.id == "missed" }, "today's occurrence supersedes the stale miss")
+    }
+
     func testOccurrenceBlockForResolvesOnlyTemplateBlocks() {
         let tplBlock = block("b1", "2026-06-10")
         let normal = mkTask(id: "t2")
