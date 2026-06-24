@@ -216,7 +216,11 @@ struct TodayView: View {
     @State private var backlogActive = false
 
     var body: some View {
-        ScrollView {
+        VStack(alignment: .leading, spacing: 0) {
+            // Pinned top bar — the logo, inbox/notifications, and avatar stay
+            // fixed; only the greeting + hero + filters + task list scroll.
+            topBar
+            ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 if let vm {
@@ -246,6 +250,7 @@ struct TodayView: View {
                 }
             }
             .padding(.bottom, 96)   // clear the floating bottom nav
+            }
         }
         .background(theme.palette.bg.ignoresSafeArea())
         .sheet(isPresented: $showSettings) { SettingsView() }
@@ -265,9 +270,10 @@ struct TodayView: View {
 
     // MARK: header
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack {
+    // Pinned top bar — logo + inbox/notifications/avatar. Lives OUTSIDE the
+    // Today ScrollView so it stays fixed while the content scrolls beneath it.
+    private var topBar: some View {
+        HStack {
                 Mark(size: 24)
                 Spacer()
                 HStack(spacing: 2) {
@@ -305,15 +311,17 @@ struct TodayView: View {
                 }
             }
             .padding(.leading, 18).padding(.trailing, 12).padding(.top, 8).padding(.bottom, 4)
+    }
 
-            VStack(alignment: .leading, spacing: 6) {
-                SectionLabel(dateEyebrow).foregroundStyle(theme.palette.primaryDeep)
-                Text("\(greeting)\nUnstuck.")
-                    .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
-                weekPill
-            }
-            .padding(.horizontal, 18).padding(.bottom, 4)
+    // Greeting block — scrolls with the content (only topBar is pinned).
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            SectionLabel(dateEyebrow).foregroundStyle(theme.palette.primaryDeep)
+            Text("\(greeting)\nUnstuck.")
+                .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
+            weekPill
         }
+        .padding(.horizontal, 18).padding(.bottom, 4)
     }
 
     private var weekPill: some View {
