@@ -21,7 +21,7 @@ settings:
     # apart — a mismatch trips App Store warning 90473. Bump CURRENT_PROJECT_VERSION
     # here for each new build.
     MARKETING_VERSION: "1.0.2"
-    CURRENT_PROJECT_VERSION: "17"
+    CURRENT_PROJECT_VERSION: "18"
   configs:
     # Simulator/dev builds skip signing; Release (archive) signs automatically.
     Debug:
