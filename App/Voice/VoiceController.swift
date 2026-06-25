@@ -20,6 +20,8 @@ final class VoiceController: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
+    /// Guards `onDone` to fire at most once per dictation (see begin()).
+    private var doneFired = false
     private let synth = AVSpeechSynthesizer()
     private let lock = NSLock()
 
@@ -52,11 +54,24 @@ final class VoiceController: @unchecked Sendable {
                        onPartial: @escaping @Sendable (String) -> Void,
                        onFinal: @escaping @Sendable (String) -> Void,
                        onDone: @escaping @Sendable () -> Void) {
+        // onDone must fire EXACTLY ONCE per dictation. The recognition handler is
+        // re-invoked with an error when the task is cancelled right after a final
+        // result, which fired onDone a SECOND time. Because onFinal (writes the
+        // draft) and onDone (reads it → send) are separate main-actor Tasks with
+        // no ordering guarantee, onFinal could repopulate the draft BETWEEN the
+        // two onDone fires — so the chat auto-sent the same dictated prompt twice.
+        // Gate completion so a session reports done a single time.
+        lock.lock(); doneFired = false; lock.unlock()
+        let done: @Sendable () -> Void = { [weak self] in
+            guard let self else { onDone(); return }
+            self.lock.lock(); let first = !self.doneFired; self.doneFired = true; self.lock.unlock()
+            if first { onDone() }
+        }
         let session = AVAudioSession.sharedInstance()
         do {
             try session.setCategory(.record, mode: .measurement, options: .duckOthers)
             try session.setActive(true, options: [])
-        } catch { onDone(); return }
+        } catch { done(); return }
 
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
@@ -70,20 +85,20 @@ final class VoiceController: @unchecked Sendable {
             req.append(buffer)
         }
         engine.prepare()
-        do { try engine.start() } catch { stopListening(); onDone(); return }
+        do { try engine.start() } catch { stopListening(); done(); return }
 
         let recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             if let result {
                 let text = result.bestTranscription.formattedString
                 if result.isFinal {
                     if !text.isEmpty { onFinal(text) }
-                    self?.stopListening(); onDone()
+                    self?.stopListening(); done()
                 } else if !text.isEmpty {
                     onPartial(text)
                 }
             }
             if error != nil {
-                self?.stopListening(); onDone()
+                self?.stopListening(); done()
             }
         }
         lock.lock(); task = recognitionTask; lock.unlock()   // guarded
