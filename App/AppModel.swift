@@ -232,7 +232,8 @@ final class AppModel {
         // rebuild the Start-Next widget snapshot (the in-app updater only
         // runs while TodayModel is alive — mirrors Android's SyncWorker).
         BackgroundSync.perform = { [weak coord, weak self] in
-            await coord?.syncNow()
+            await self?.drainSiriWriteQueue()   // apply Siri-queued writes first
+            await coord?.syncNow()              // flush the outbox (incl. those)
             await self?.refreshWidgetSnapshot()
         }
 
@@ -248,12 +249,15 @@ final class AppModel {
         refreshLiveSession()
         reapStaleLiveActivities()
 
-        // Refresh the App-Group snapshot (Siri reads "how many left / what's
-        // next" from it) now that repos are ready, then consume any route a
-        // Siri "open the app" intent stashed before launch (cold-launch path —
-        // the scenePhase=.active hook no-ops until db exists).
+        // Apply any hands-free writes a Siri intent queued while the app was
+        // closed, refresh the App-Group snapshot (Siri reads "how many left /
+        // what's next" from it), then consume any "open the app" route stashed
+        // before launch (cold-launch path — the scenePhase=.active hook no-ops
+        // until db exists). Flush the drained ops to the server when present.
+        let drained = drainSiriWriteQueue()
         refreshWidgetSnapshot()
         consumePendingSiriRoute()
+        if drained { syncNow() }
     }
 
     /// Foreground/manual sync trigger (scenePhase .active, BG refresh):

@@ -1,4 +1,4 @@
-// Siri "do" intents — Phase 1: open the app to the right surface.
+// Siri "do" intents that OPEN the app to the right surface.
 //
 // Each intent sets a pending route in the App Group and opens the app
 // (openAppWhenRun); the app consumes the route on scenePhase=.active and drives
@@ -7,16 +7,17 @@
 // touch the @MainActor AppModel/router reliably, and the reconcile-on-active
 // hand-off is the same pattern WorkFocusFilter already trusts.
 //
-// Phase 3 adds truly hands-free variants (create/complete without opening the
-// app) via a shared write-queue; these open-app intents remain the explicit
-// "take me there" path.
+// Hands-free create/complete/add/capture (no app launch) live in WriteIntents;
+// these open-app intents are the explicit "take me there" path. AddTaskIntent
+// stays available in the Shortcuts app as an open-app alternative to the
+// hands-free CreateTaskIntent.
 
 import AppIntents
 import UnstuckShared
 
-/// "Add a task in UnstuckNow" → opens the New Task sheet.
+/// "Add a task in UnstuckNow" (open-app variant) → opens the New Task sheet.
 struct AddTaskIntent: AppIntent {
-    static let title: LocalizedStringResource = "Add a Task"
+    static let title: LocalizedStringResource = "Add a Task (Open App)"
     static let description = IntentDescription(
         "Open UnstuckNow to add a new task.",
         categoryName: "Doing")
@@ -24,20 +25,6 @@ struct AddTaskIntent: AppIntent {
 
     func perform() async throws -> some IntentResult {
         AppGroup.setPendingRoute("unstuck://new-task")
-        return .result()
-    }
-}
-
-/// "Capture a thought in UnstuckNow" → opens the quick-capture inbox sheet.
-struct CaptureThoughtIntent: AppIntent {
-    static let title: LocalizedStringResource = "Capture a Thought"
-    static let description = IntentDescription(
-        "Open UnstuckNow to jot something into your inbox.",
-        categoryName: "Doing")
-    static let openAppWhenRun = true
-
-    func perform() async throws -> some IntentResult {
-        AppGroup.setPendingRoute("unstuck://capture")
         return .result()
     }
 }

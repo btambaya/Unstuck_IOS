@@ -78,6 +78,39 @@ public struct UnstuckSnapshot: Codable, Sendable, Equatable {
         updatedAt: Date(timeIntervalSince1970: 0))
 }
 
+/// A hands-free write a Siri intent queued while the app was closed. The app
+/// drains these into its REAL outbox (via the validated AppModel mutators) on
+/// next launch / foreground / background-entry / BG-refresh — one write
+/// authority, so no row/sync logic is duplicated in the intent process. Eventual
+/// consistency: the op lands when the app next runs. Foundation-only; fields are
+/// interpreted per `kind`.
+public struct PendingWrite: Codable, Sendable, Equatable {
+    public enum Kind: String, Codable, Sendable {
+        case createTask     // text = name, estimateMin?
+        case completeTask   // taskId
+        case addToList      // collectionId, text = item body
+        case capture        // text = body
+    }
+    public var id: String          // client op id (idempotent drain)
+    public var kind: Kind
+    public var text: String?
+    public var taskId: String?
+    public var collectionId: String?
+    public var estimateMin: Int?
+    public var createdAt: Date
+
+    public init(id: String, kind: Kind, text: String? = nil, taskId: String? = nil,
+                collectionId: String? = nil, estimateMin: Int? = nil, createdAt: Date) {
+        self.id = id
+        self.kind = kind
+        self.text = text
+        self.taskId = taskId
+        self.collectionId = collectionId
+        self.estimateMin = estimateMin
+        self.createdAt = createdAt
+    }
+}
+
 public enum AppGroup {
     public static let id = "group.io.unstucknow.app"
     private static let startNextKey = "startNextSnapshot"
@@ -148,5 +181,36 @@ public enum AppGroup {
               let snapshot = try? JSONDecoder().decode(UnstuckSnapshot.self, from: data)
         else { return .empty }
         return snapshot
+    }
+
+    // MARK: hands-free write queue (Siri → app handoff)
+    private static let writeQueueKey = "siri.writeQueue"
+
+    /// Append a Siri-queued write. Re-reads the current queue so a concurrent
+    /// append by the app's drain isn't clobbered.
+    public static func enqueueWrite(_ op: PendingWrite) {
+        guard let defaults else { return }
+        var queue = readWriteQueue()
+        queue.append(op)
+        if let data = try? JSONEncoder().encode(queue) { defaults.set(data, forKey: writeQueueKey) }
+    }
+
+    public static func readWriteQueue() -> [PendingWrite] {
+        guard let defaults,
+              let data = defaults.data(forKey: writeQueueKey),
+              let queue = try? JSONDecoder().decode([PendingWrite].self, from: data)
+        else { return [] }
+        return queue
+    }
+
+    /// Remove the ops the app has applied — re-reads first so an op the intent
+    /// appended between the drain's read and this call survives.
+    public static func removeWrites(ids: Set<String>) {
+        guard let defaults else { return }
+        let remaining = readWriteQueue().filter { !ids.contains($0.id) }
+        if remaining.isEmpty { defaults.removeObject(forKey: writeQueueKey) }
+        else if let data = try? JSONEncoder().encode(remaining) {
+            defaults.set(data, forKey: writeQueueKey)
+        }
     }
 }

@@ -54,6 +54,48 @@ extension AppModel {
         routeDeepLink(route)
     }
 
+    /// Apply any hands-free writes a Siri intent queued while the app was closed
+    /// (create task / complete / add-to-list / capture). Runs through the SAME
+    /// validated mutators the UI uses — addTask/toggleDone/addCollectionItem/
+    /// saveCapture — so each op flows into the normal outbox (no duplicated row
+    /// logic). Called on launch / scenePhase=.active / background-entry /
+    /// BG-refresh. Every op is marked processed (best-effort: a vanished target
+    /// is dropped, never retried forever). Returns true if anything was applied.
+    @discardableResult
+    func drainSiriWriteQueue() -> Bool {
+        guard write != nil else { return false }   // need an authed writer
+        let ops = AppGroup.readWriteQueue()
+        guard !ops.isEmpty else { return false }
+        let tasks = (try? taskRepo?.all()) ?? []
+        let collections = (try? db?.fetchAllCollections()) ?? []
+        var processed = Set<String>()
+        for op in ops {
+            switch op.kind {
+            case .createTask:
+                if let name = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+                    addTask(name: name, estimateMin: op.estimateMin ?? 25)
+                }
+            case .completeTask:
+                if let tid = op.taskId, let t = tasks.first(where: { $0.id == tid }), !t.done {
+                    toggleDone(t)
+                }
+            case .addToList:
+                if let cid = op.collectionId,
+                   let body = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty,
+                   let col = collections.first(where: { $0.id == cid }) {
+                    addCollectionItem(col, body: body)
+                }
+            case .capture:
+                if let body = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty {
+                    saveCapture(Capture(id: newUUID(), tag: .idea, body: body, at: Self.isoNow()))
+                }
+            }
+            processed.insert(op.id)
+        }
+        AppGroup.removeWrites(ids: processed)
+        return !processed.isEmpty
+    }
+
     /// Route an `unstuck://` link (push tap, notification-center row, or
     /// notification action) to the right surface.
     func routeDeepLink(_ link: String) {

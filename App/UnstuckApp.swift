@@ -112,6 +112,9 @@ struct UnstuckApp: App {
                     // offline edits + hydrate whenever the app returns to the
                     // foreground; queue the next BG refresh on exit.
                     if phase == .active {
+                        // Merge any Siri-queued hands-free writes into the outbox
+                        // BEFORE syncNow so they flush on this same foreground.
+                        model.drainSiriWriteQueue()
                         model.syncNow()
                         // Reap any focus Live Activity orphaned by a kill/crash
                         // mid-session (rebinds to a still-live session, else

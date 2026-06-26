@@ -92,4 +92,42 @@ final class AppGroupTests: XCTestCase {
         XCTAssertNil(UnstuckSnapshot.empty.nextTaskName)
         XCTAssertTrue(UnstuckSnapshot.empty.tasks.isEmpty)
     }
+
+    // MARK: hands-free write queue (Siri → app drain)
+
+    override func tearDown() {
+        AppGroup.removeWrites(ids: Set(AppGroup.readWriteQueue().map { $0.id }))
+        super.tearDown()
+    }
+
+    func testEnqueueAndReadWritePreservesOrderAndFields() {
+        AppGroup.removeWrites(ids: Set(AppGroup.readWriteQueue().map { $0.id }))
+        AppGroup.enqueueWrite(PendingWrite(id: "a", kind: .createTask, text: "Call bank", createdAt: Date()))
+        AppGroup.enqueueWrite(PendingWrite(id: "b", kind: .addToList, text: "Milk",
+                                           collectionId: "c1", createdAt: Date()))
+        let q = AppGroup.readWriteQueue()
+        XCTAssertEqual(q.map { $0.id }, ["a", "b"])
+        XCTAssertEqual(q[0].kind, .createTask)
+        XCTAssertEqual(q[0].text, "Call bank")
+        XCTAssertEqual(q[1].kind, .addToList)
+        XCTAssertEqual(q[1].collectionId, "c1")
+    }
+
+    func testRemoveWritesDropsOnlyProcessedIds() {
+        AppGroup.removeWrites(ids: Set(AppGroup.readWriteQueue().map { $0.id }))
+        AppGroup.enqueueWrite(PendingWrite(id: "x", kind: .capture, text: "idea", createdAt: Date()))
+        AppGroup.enqueueWrite(PendingWrite(id: "y", kind: .completeTask, taskId: "t9", createdAt: Date()))
+        // App applied only "x"; "y" (e.g. enqueued meanwhile) must survive.
+        AppGroup.removeWrites(ids: ["x"])
+        let q = AppGroup.readWriteQueue()
+        XCTAssertEqual(q.map { $0.id }, ["y"])
+        XCTAssertEqual(q.first?.taskId, "t9")
+    }
+
+    func testRemoveAllClearsTheQueue() {
+        AppGroup.removeWrites(ids: Set(AppGroup.readWriteQueue().map { $0.id }))
+        AppGroup.enqueueWrite(PendingWrite(id: "z", kind: .createTask, text: "Solo", createdAt: Date()))
+        AppGroup.removeWrites(ids: ["z"])
+        XCTAssertTrue(AppGroup.readWriteQueue().isEmpty)
+    }
 }

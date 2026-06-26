@@ -41,7 +41,7 @@ struct UnstuckShortcuts: AppShortcutsProvider {
             systemImageName: "sun.max.fill")
 
         AppShortcut(
-            intent: AddTaskIntent(),
+            intent: CreateTaskIntent(),
             phrases: [
                 "Add a task in \(.applicationName)",
                 "Create a task in \(.applicationName)",
@@ -58,6 +58,25 @@ struct UnstuckShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Capture",
             systemImageName: "tray.and.arrow.down")
+
+        AppShortcut(
+            intent: CompleteTaskIntent(),
+            phrases: [
+                "Complete \(\.$task) in \(.applicationName)",
+                "Mark \(\.$task) done in \(.applicationName)",
+                "Finish \(\.$task) in \(.applicationName)",
+            ],
+            shortTitle: "Complete task",
+            systemImageName: "checkmark.circle")
+
+        AppShortcut(
+            intent: AddToListIntent(),
+            phrases: [
+                "Add to my \(\.$list) in \(.applicationName)",
+                "Add an item to my \(\.$list) in \(.applicationName)",
+            ],
+            shortTitle: "Add to list",
+            systemImageName: "text.badge.plus")
 
         AppShortcut(
             intent: StartFocusIntent(),
