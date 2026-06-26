@@ -8,6 +8,7 @@
 import Foundation
 import UnstuckCore
 import UnstuckData
+import UnstuckShared
 import UserNotifications
 
 extension AppModel {
@@ -42,6 +43,17 @@ extension AppModel {
         routeDeepLink(link)
     }
 
+    /// Consume a route a Siri "open the app" App Intent stashed in the App Group
+    /// (Add task, Capture, Start focus, Open today). Called on scenePhase=.active
+    /// AND at the end of start(). Guarded on repos being ready so a cold-launch
+    /// .active that fires before start() finishes leaves the route for start() to
+    /// pick up — consumePendingRoute() clears it, so it routes exactly once.
+    func consumePendingSiriRoute() {
+        guard db != nil, AppGroup.hasPendingRoute() else { return }
+        guard let route = AppGroup.consumePendingRoute() else { return }
+        routeDeepLink(route)
+    }
+
     /// Route an `unstuck://` link (push tap, notification-center row, or
     /// notification action) to the right surface.
     func routeDeepLink(_ link: String) {
@@ -58,6 +70,22 @@ extension AppModel {
         }
         if link == "capture" || link == "unstuck://capture" {
             router.present(.quickCapture)
+            return
+        }
+        if link == "unstuck://new-task" {
+            // Siri "Add a task" — open the New Task sheet.
+            router.present(.newTask)
+            return
+        }
+        if link == "unstuck://focus-next" {
+            // Siri "Start a focus session" — begin Focus on the Start-Next pick.
+            let tasks = (try? taskRepo?.all()) ?? []
+            let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+            if let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: liveTaskId) {
+                router.beginFocus(next)
+            } else {
+                router.select(.today)   // nothing to focus — land on Today
+            }
             return
         }
         if link.hasPrefix("unstuck://focus/") {
@@ -90,6 +118,8 @@ extension AppModel {
     /// A bare tab-switch (today/recap/brief/collections-tab) doesn't.
     private func presentsModal(_ link: String) -> Bool {
         link == "capture" || link == "unstuck://capture"
+            || link == "unstuck://new-task"
+            || link == "unstuck://focus-next"
             || link.hasPrefix("unstuck://focus/")
             || link.hasPrefix("unstuck://task/")
     }

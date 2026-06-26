@@ -60,5 +60,6 @@ let package = Package(
         // App-Group snapshot + Live Activity attributes — linked by BOTH
         // the app and the widget/Live-Activity extension. Foundation-only.
         .target(name: "UnstuckShared"),
+        .testTarget(name: "UnstuckSharedTests", dependencies: ["UnstuckShared"]),
     ]
 )

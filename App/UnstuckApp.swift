@@ -117,6 +117,10 @@ struct UnstuckApp: App {
                         // mid-session (rebinds to a still-live session, else
                         // ends the ghost timer).
                         model.reapStaleLiveActivities()
+                        // Consume any route a Siri "open the app" intent stashed
+                        // (Add task / Capture / Start focus / Open today). No-ops
+                        // until repos exist — start() consumes it on cold launch.
+                        model.consumePendingSiriRoute()
                     }
                     if phase == .background { BackgroundSync.schedule() }
                 }

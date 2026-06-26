@@ -30,8 +30,34 @@ public enum AppGroup {
     public static let id = "group.io.unstucknow.app"
     private static let startNextKey = "startNextSnapshot"
     private static let focusFilterKey = "focusFilter.hideNonToday"
+    private static let pendingRouteKey = "siri.pendingRoute"
 
     private static var defaults: UserDefaults? { UserDefaults(suiteName: id) }
+
+    // MARK: Siri / App-Intent → app hand-off.
+    //
+    // An "open the app" App Intent (Add task, Start focus, …) runs in a
+    // separate process and cannot drive SwiftUI navigation — and a background
+    // `perform()` is documented-flaky (see WorkFocusFilter). So the intent
+    // writes a deep-link-style route here and returns; the app consumes it on
+    // the next launch / scenePhase=.active, the SAME reconcile-on-active pattern
+    // the Work Focus Filter already relies on. One-shot: read clears it.
+    public static func setPendingRoute(_ route: String?) {
+        guard let defaults else { return }
+        if let route { defaults.set(route, forKey: pendingRouteKey) }
+        else { defaults.removeObject(forKey: pendingRouteKey) }
+    }
+    /// Read AND clear the pending route (so it routes exactly once).
+    public static func consumePendingRoute() -> String? {
+        guard let defaults, let route = defaults.string(forKey: pendingRouteKey) else { return nil }
+        defaults.removeObject(forKey: pendingRouteKey)
+        return route
+    }
+    /// Peek without clearing — used to decide whether the app is ready to route
+    /// (so a cold-launch race doesn't drop the route before repos exist).
+    public static func hasPendingRoute() -> Bool {
+        defaults?.string(forKey: pendingRouteKey) != nil
+    }
 
     // MARK: Focus Filter state (set by the Work Focus Filter intent; the
     // app reads it to pare the UI down while a Work Focus is on).

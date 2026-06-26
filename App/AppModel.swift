@@ -247,6 +247,13 @@ final class AppModel {
         // kill/crash: rebind to a still-live session, else end the ghost timer.
         refreshLiveSession()
         reapStaleLiveActivities()
+
+        // Refresh the App-Group snapshot (Siri reads "how many left / what's
+        // next" from it) now that repos are ready, then consume any route a
+        // Siri "open the app" intent stashed before launch (cold-launch path —
+        // the scenePhase=.active hook no-ops until db exists).
+        refreshWidgetSnapshot()
+        consumePendingSiriRoute()
     }
 
     /// Foreground/manual sync trigger (scenePhase .active, BG refresh):
@@ -256,6 +263,9 @@ final class AppModel {
     func syncNow() {
         ReminderScheduler.shared.resync()
         NotificationLog.shared.sweepDelivered()
+        // Keep the App-Group snapshot current on every foreground so Siri's
+        // "how many left / what's next" answers don't lag.
+        refreshWidgetSnapshot()
         guard let coord = coordinator else { return }
         Task { await coord.syncNow() }
     }
