@@ -275,11 +275,38 @@ final class AppModel {
     func refreshWidgetSnapshot() {
         guard let repo = taskRepo else { return }
         let tasks = (try? repo.all()) ?? []
-        let next = pickStartNext(tasks: tasks, blocks: [], liveTaskId: nil)
+        let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+        let collections = (try? db?.fetchAllCollections()) ?? []
+        let now = Date().timeIntervalSince1970 * 1000
+        let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: liveTaskId)
+
+        // Widget snapshot (unchanged payload) — the home/lock "Start Next" tile.
         let openCount = tasks.filter { !$0.done && !($0.later ?? false) }.count
         AppGroup.writeStartNext(StartNextSnapshot(
             taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
             openCount: openCount, updatedAt: Date()))
+
+        // Enriched snapshot the Siri "ask" intents read + the App Intent entities
+        // resolve against. Counts use the SAME bucketing the UI shows.
+        let nonTemplates = tasks.filter { !isTemplate($0) }
+        let todayList = visibleTasks(view: .today, tasks: tasks, blocks: blocks,
+                                     now: now, activeArea: nil, slipMode: false).filter { !$0.done }
+        let todayIds = Set(todayList.map { $0.id })
+        let pending = nonTemplates.filter { !$0.done && !($0.later ?? false) }
+        let overdue = visibleTasks(view: .backlog, tasks: tasks, blocks: blocks,
+                                   now: now, activeArea: nil, slipMode: true).filter { !$0.done }
+        let taskRefs = pending.prefix(50).map {
+            UnstuckSnapshot.TaskRef(id: $0.id, name: $0.name, today: todayIds.contains($0.id))
+        }
+        let colRefs = collections.filter { $0.archived != true }.map {
+            UnstuckSnapshot.CollectionRef(id: $0.id, name: $0.name,
+                                          openCount: $0.items.filter { $0.done != true }.count)
+        }
+        AppGroup.writeSnapshot(UnstuckSnapshot(
+            pendingCount: pending.count, todayCount: todayList.count, overdueCount: overdue.count,
+            nextTaskName: next?.name, nextEstimateMin: next?.estimateMin,
+            tasks: Array(taskRefs), collections: colRefs, updatedAt: Date()))
+
         WidgetCenter.shared.reloadAllTimelines()
     }
 

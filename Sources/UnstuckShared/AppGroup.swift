@@ -26,6 +26,58 @@ public struct StartNextSnapshot: Codable, Sendable, Equatable {
         updatedAt: Date(timeIntervalSince1970: 0))
 }
 
+/// Richer snapshot the Siri layer reads — counts + the open-task and list names
+/// the "ask" intents speak and the App Intent entities resolve against. Written
+/// by the app (AppModel.refreshWidgetSnapshot) on launch, every foreground sync,
+/// background-entry, and the BG-refresh task. Distinct from StartNextSnapshot so
+/// the widget's small payload stays unchanged. Foundation-only.
+public struct UnstuckSnapshot: Codable, Sendable, Equatable {
+    /// An open task — id lets a write intent (complete) target it later.
+    public struct TaskRef: Codable, Sendable, Equatable {
+        public var id: String
+        public var name: String
+        public var today: Bool
+        public init(id: String, name: String, today: Bool) {
+            self.id = id; self.name = name; self.today = today
+        }
+    }
+    /// A non-archived list/collection + its count of un-handled items.
+    public struct CollectionRef: Codable, Sendable, Equatable {
+        public var id: String
+        public var name: String
+        public var openCount: Int
+        public init(id: String, name: String, openCount: Int) {
+            self.id = id; self.name = name; self.openCount = openCount
+        }
+    }
+    public var pendingCount: Int          // open, actionable, non-template tasks
+    public var todayCount: Int            // Today bucket (incl. today's occurrences)
+    public var overdueCount: Int          // slipping backlog items
+    public var nextTaskName: String?
+    public var nextEstimateMin: Int?
+    public var tasks: [TaskRef]           // open tasks (capped), for entity resolution
+    public var collections: [CollectionRef]
+    public var updatedAt: Date
+
+    public init(pendingCount: Int, todayCount: Int, overdueCount: Int,
+                nextTaskName: String?, nextEstimateMin: Int?,
+                tasks: [TaskRef], collections: [CollectionRef], updatedAt: Date) {
+        self.pendingCount = pendingCount
+        self.todayCount = todayCount
+        self.overdueCount = overdueCount
+        self.nextTaskName = nextTaskName
+        self.nextEstimateMin = nextEstimateMin
+        self.tasks = tasks
+        self.collections = collections
+        self.updatedAt = updatedAt
+    }
+
+    public static let empty = UnstuckSnapshot(
+        pendingCount: 0, todayCount: 0, overdueCount: 0,
+        nextTaskName: nil, nextEstimateMin: nil, tasks: [], collections: [],
+        updatedAt: Date(timeIntervalSince1970: 0))
+}
+
 public enum AppGroup {
     public static let id = "group.io.unstucknow.app"
     private static let startNextKey = "startNextSnapshot"
@@ -78,6 +130,22 @@ public enum AppGroup {
         guard let defaults,
               let data = defaults.data(forKey: startNextKey),
               let snapshot = try? JSONDecoder().decode(StartNextSnapshot.self, from: data)
+        else { return .empty }
+        return snapshot
+    }
+
+    // MARK: enriched Siri snapshot
+    private static let snapshotKey = "unstuckSnapshot"
+
+    public static func writeSnapshot(_ snapshot: UnstuckSnapshot) {
+        guard let defaults, let data = try? JSONEncoder().encode(snapshot) else { return }
+        defaults.set(data, forKey: snapshotKey)
+    }
+
+    public static func readSnapshot() -> UnstuckSnapshot {
+        guard let defaults,
+              let data = defaults.data(forKey: snapshotKey),
+              let snapshot = try? JSONDecoder().decode(UnstuckSnapshot.self, from: data)
         else { return .empty }
         return snapshot
     }

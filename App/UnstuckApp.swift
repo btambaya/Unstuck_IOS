@@ -122,7 +122,13 @@ struct UnstuckApp: App {
                         // until repos exist — start() consumes it on cold launch.
                         model.consumePendingSiriRoute()
                     }
-                    if phase == .background { BackgroundSync.schedule() }
+                    if phase == .background {
+                        BackgroundSync.schedule()
+                        // Capture the latest in-session state into the App-Group
+                        // snapshot NOW, so a hands-free Siri query right after
+                        // backgrounding reflects what the user just did.
+                        model.refreshWidgetSnapshot()
+                    }
                 }
         }
     }

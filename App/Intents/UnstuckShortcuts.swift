@@ -31,6 +31,16 @@ struct UnstuckShortcuts: AppShortcutsProvider {
             systemImageName: "arrow.right.circle")
 
         AppShortcut(
+            intent: TodayPlanIntent(),
+            phrases: [
+                "What's on my \(.applicationName) today",
+                "What's on today in \(.applicationName)",
+                "What's my \(.applicationName) plan",
+            ],
+            shortTitle: "Today's plan",
+            systemImageName: "sun.max.fill")
+
+        AppShortcut(
             intent: AddTaskIntent(),
             phrases: [
                 "Add a task in \(.applicationName)",

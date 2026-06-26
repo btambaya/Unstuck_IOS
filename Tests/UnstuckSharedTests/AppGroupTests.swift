@@ -53,4 +53,43 @@ final class AppGroupTests: XCTestCase {
         XCTAssertNil(StartNextSnapshot.empty.taskName)
         XCTAssertEqual(StartNextSnapshot.empty.openCount, 0)
     }
+
+    // MARK: enriched snapshot (what the Siri reads + entities use)
+
+    func testEnrichedSnapshotRoundTrips() throws {
+        let snap = UnstuckSnapshot(
+            pendingCount: 5, todayCount: 2, overdueCount: 1,
+            nextTaskName: "Call the bank", nextEstimateMin: 15,
+            tasks: [
+                .init(id: "t1", name: "Call the bank", today: true),
+                .init(id: "t2", name: "Email Sam", today: false),
+            ],
+            collections: [.init(id: "c1", name: "Groceries", openCount: 3)],
+            updatedAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let back = try JSONDecoder().decode(
+            UnstuckSnapshot.self, from: try JSONEncoder().encode(snap))
+        XCTAssertEqual(back, snap)
+        XCTAssertEqual(back.tasks.filter { $0.today }.count, 1)
+        XCTAssertEqual(back.collections.first?.name, "Groceries")
+        XCTAssertEqual(back.collections.first?.openCount, 3)
+    }
+
+    func testEnrichedSnapshotPersistsViaAppGroup() {
+        let snap = UnstuckSnapshot(
+            pendingCount: 4, todayCount: 1, overdueCount: 0,
+            nextTaskName: "Write report", nextEstimateMin: 25,
+            tasks: [.init(id: "t9", name: "Write report", today: true)],
+            collections: [], updatedAt: Date(timeIntervalSince1970: 1_700_000_000))
+        AppGroup.writeSnapshot(snap)
+        let back = AppGroup.readSnapshot()
+        XCTAssertEqual(back.pendingCount, 4)
+        XCTAssertEqual(back.nextTaskName, "Write report")
+        XCTAssertEqual(back.tasks.first?.id, "t9")
+    }
+
+    func testEmptyEnrichedSnapshotIsAllClear() {
+        XCTAssertEqual(UnstuckSnapshot.empty.pendingCount, 0)
+        XCTAssertNil(UnstuckSnapshot.empty.nextTaskName)
+        XCTAssertTrue(UnstuckSnapshot.empty.tasks.isEmpty)
+    }
 }
