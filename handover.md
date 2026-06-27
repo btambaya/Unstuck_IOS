@@ -3,6 +3,47 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
+## Where things stand (2026-06-27, latest) — Siri / App Intents (4 phases)
+
+OS-level Siri control + voice queries, built in `App/Intents/` (the `App/` glob
+picks them up; **no Siri entitlement needed** for App-Shortcut intents — the
+existing `WorkFocusFilter` already proved App Intents compile). 10 App Shortcuts
+(`UnstuckShortcuts`), phrases use `\(.applicationName)` = "UnstuckNow"; they also
+surface in Spotlight, Shortcuts, Apple Watch, CarPlay for free.
+
+- **Reads (hands-free, no app launch):** PendingTaskCount, NextTask, TodayPlan —
+  speak from the App-Group `UnstuckSnapshot` (counts + task/list names, computed
+  with the SAME `visibleTasks` bucketing the UI shows). Written by
+  `AppModel.refreshWidgetSnapshot()` on launch / every foreground `syncNow` /
+  scenePhase `.background` / BG-refresh.
+- **Writes (hands-free):** CreateTask, CaptureThought, CompleteTask (TaskEntity),
+  AddToList (item + CollectionEntity). Each enqueues a `PendingWrite` to the
+  App-Group queue; `AppModel.drainSiriWriteQueue()` applies them via the existing
+  validated mutators → the normal outbox (one write authority). Drained on
+  launch / `.active` / BG-refresh. Trade-off chosen by the user: lands in
+  seconds, else on next launch (NOT instant-to-backend — that "Mode D" shared-
+  keychain path is deferred).
+- **Open-app actions:** StartFocus (→ `unstuck://focus-next`, Focus on the
+  Start-Next pick), OpenToday, AddTask (open-app fallback). They stash a route in
+  the App Group; the app consumes it on `.active` (the `WorkFocusFilter`
+  reconcile pattern — a background `perform()` can't drive SwiftUI nav).
+- **Ask Unstuck:** freeform → opens the app + sends the prompt to the Qwen
+  assistant (`routeDeepLink "unstuck://assistant"` → `assistant.send`). Apple's
+  Siri has no third-party tasks domain, so this is the real agent bridge.
+- **Entities:** CollectionEntity + TaskEntity (`EntityStringQuery`) backed by the
+  snapshot — resolve a spoken "Groceries"/"the taxes task" to an id, with Siri
+  disambiguation.
+- **Widget buttons (iOS 17):** Start-Next tile gets Done (queues a hands-free
+  completion + `AppGroup.optimisticComplete` advances the tile at once) and Start
+  (opens Focus). Widget intents live in `Widgets/` (App-Group only).
+  `StartNextSnapshot` gained `taskId` (optional, backward-compatible).
+- **Tests:** `TZ=UTC swift test` → **378/0** (new `UnstuckSharedTests`: route +
+  snapshot + write-queue + optimistic-complete). `UnstuckAppTests` 53/0. App +
+  widget sim build green. Pushed to `main` (Phases 1–4: 268aa5f, d2d242a,
+  cc4bdb2, a72bb7c).
+- **Not yet:** archived/uploaded to TestFlight for real-Siri device validation;
+  no version bump yet.
+
 ## Where things stand (2026-06-12, latest) — App Store 1.0 submission prepped
 
 - Build **1.0 (4)** uploaded + attached to the App Store version record;

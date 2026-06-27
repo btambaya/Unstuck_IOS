@@ -109,6 +109,30 @@ xcrun llvm-cov report \
 
 CI (`.github/workflows/ci.yml`) runs the same on every push/PR.
 
+## Siri / App Intents
+
+OS-level voice control + queries live in [`App/Intents/`](App/Intents) (plus the
+widget-button intents in [`Widgets/WidgetIntents.swift`](Widgets/WidgetIntents.swift)).
+`UnstuckShortcuts` (`AppShortcutsProvider`) declares ~10 zero-setup Siri phrases;
+no Siri entitlement is required for App-Shortcut intents.
+
+- **Reads** (hands-free, no app launch) speak from the App-Group `UnstuckSnapshot`
+  the app writes on launch / foreground / background / BG-refresh: "how many
+  tasks left", "what's next", "what's on today".
+- **Writes** (hands-free) enqueue a `PendingWrite` to the App Group; the app
+  applies them via its normal mutators in `AppModel.drainSiriWriteQueue()` on next
+  run (eventual consistency — lands in seconds, else on next launch). Covers
+  create task, capture, complete (TaskEntity), add-to-list (CollectionEntity).
+- **Open-app** intents (Start focus, Open today, Ask Unstuck) stash a route in the
+  App Group consumed on `scenePhase=.active` — the same hand-off `WorkFocusFilter`
+  uses, since a background `perform()` can't drive SwiftUI navigation.
+- **Ask Unstuck** bridges freeform requests to the in-app Qwen assistant (Apple's
+  Siri has no third-party task domain).
+
+The bridge is the App Group (`UnstuckShared/AppGroup.swift`): App Intents run in a
+separate process and can't touch the app-private GRDB store or Keychain session,
+so all read/write goes through the shared snapshot + write-queue.
+
 ## Backend & spec
 
 The shared Supabase backend lives in the **web** repo under
