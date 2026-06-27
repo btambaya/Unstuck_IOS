@@ -41,8 +41,18 @@ surface in Spotlight, Shortcuts, Apple Watch, CarPlay for free.
   snapshot + write-queue + optimistic-complete). `UnstuckAppTests` 53/0. App +
   widget sim build green. Pushed to `main` (Phases 1–4: 268aa5f, d2d242a,
   cc4bdb2, a72bb7c).
-- **Not yet:** archived/uploaded to TestFlight for real-Siri device validation;
-  no version bump yet.
+- **Shipped to TestFlight:** **1.0.3 (19)** archived + uploaded via the scripted
+  pipeline (altool UPLOAD SUCCEEDED, delivery 26b84df4…) for real-device Siri
+  validation. Recipe: rebuild a signing keychain from `build/signing/dist.{key,cer}`
+  (import separately; `set-key-partition-list`; add to search list) → `xcodebuild
+  archive` with `-allowProvisioningUpdates` + the ASC key (D9Z2MUP6J9) for
+  automatic profiles → `-exportArchive` with `build/signing/ExportOptions-manual.plist`
+  (MANUAL signing + installed store profiles — the App-Manager ASC key CAN'T cloud-sign)
+  → `altool --upload-app`. App Store 1.0.2 (18) remains in review separately.
+- **Real-Siri testing (device):** install the TestFlight build, then "Hey Siri,
+  how many tasks do I have left in UnstuckNow / what's next / add a task / start a
+  focus session / ask Unstuck …"; verify the widget Done/Start buttons. App
+  Shortcuts register on first launch; phrases say "UnstuckNow".
 
 ## Where things stand (2026-06-12, latest) — App Store 1.0 submission prepped
 
