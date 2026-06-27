@@ -288,7 +288,7 @@ final class AppModel {
         let openCount = tasks.filter { !$0.done && !($0.later ?? false) }.count
         AppGroup.writeStartNext(StartNextSnapshot(
             taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
-            openCount: openCount, updatedAt: Date()))
+            openCount: openCount, taskId: next?.id, updatedAt: Date()))
 
         // Enriched snapshot the Siri "ask" intents read + the App Intent entities
         // resolve against. Counts use the SAME bucketing the UI shows.

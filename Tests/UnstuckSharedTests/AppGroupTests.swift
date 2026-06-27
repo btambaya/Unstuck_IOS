@@ -130,4 +130,48 @@ final class AppGroupTests: XCTestCase {
         AppGroup.removeWrites(ids: ["z"])
         XCTAssertTrue(AppGroup.readWriteQueue().isEmpty)
     }
+
+    // MARK: Ask Unstuck prompt hand-off
+
+    func testAssistantPromptRoundTripsAndClears() {
+        AppGroup.setPendingAssistantPrompt("what's my afternoon like")
+        XCTAssertEqual(AppGroup.consumePendingAssistantPrompt(), "what's my afternoon like")
+        XCTAssertNil(AppGroup.consumePendingAssistantPrompt())
+    }
+
+    // MARK: widget Complete optimistic patch
+
+    func testOptimisticCompleteDropsTaskAndAdvancesStartNext() {
+        AppGroup.writeSnapshot(UnstuckSnapshot(
+            pendingCount: 2, todayCount: 1, overdueCount: 0,
+            nextTaskName: "Call bank", nextEstimateMin: 15,
+            tasks: [
+                .init(id: "t1", name: "Call bank", today: true),
+                .init(id: "t2", name: "Email Sam", today: false),
+            ],
+            collections: [], updatedAt: Date(timeIntervalSince1970: 1)))
+        AppGroup.writeStartNext(StartNextSnapshot(
+            taskName: "Call bank", estimateMin: 15, lifeArea: nil, openCount: 2,
+            taskId: "t1", updatedAt: Date(timeIntervalSince1970: 1)))
+
+        AppGroup.optimisticComplete(taskId: "t1")
+
+        let snap = AppGroup.readSnapshot()
+        XCTAssertEqual(snap.pendingCount, 1)
+        XCTAssertEqual(snap.todayCount, 0)
+        XCTAssertEqual(snap.tasks.map { $0.id }, ["t2"])
+        XCTAssertEqual(snap.nextTaskName, "Email Sam")
+
+        let widget = AppGroup.readStartNext()
+        XCTAssertEqual(widget.taskId, "t2")
+        XCTAssertEqual(widget.taskName, "Email Sam")
+        XCTAssertEqual(widget.openCount, 1)
+    }
+
+    func testStartNextSnapshotCarriesTaskId() throws {
+        let s = StartNextSnapshot(taskName: "X", estimateMin: 10, lifeArea: nil,
+                                  openCount: 1, taskId: "abc", updatedAt: Date(timeIntervalSince1970: 1))
+        let back = try JSONDecoder().decode(StartNextSnapshot.self, from: try JSONEncoder().encode(s))
+        XCTAssertEqual(back.taskId, "abc")
+    }
 }

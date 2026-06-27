@@ -123,12 +123,12 @@ final class TodayModel {
         // Equatable check (the real write stamps the current time).
         let content = StartNextSnapshot(
             taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
-            openCount: openCount, updatedAt: Date(timeIntervalSince1970: 0))
+            openCount: openCount, taskId: next?.id, updatedAt: Date(timeIntervalSince1970: 0))
         guard content != lastWidgetContent else { return }
         lastWidgetContent = content
         AppGroup.writeStartNext(StartNextSnapshot(
             taskName: next?.name, estimateMin: next?.estimateMin, lifeArea: next?.lifeArea,
-            openCount: openCount, updatedAt: Date()))
+            openCount: openCount, taskId: next?.id, updatedAt: Date()))
         WidgetCenter.shared.reloadAllTimelines()
     }
 

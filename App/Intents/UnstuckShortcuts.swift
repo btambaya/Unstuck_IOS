@@ -96,5 +96,14 @@ struct UnstuckShortcuts: AppShortcutsProvider {
             ],
             shortTitle: "Open today",
             systemImageName: "sun.max")
+
+        AppShortcut(
+            intent: AskUnstuckIntent(),
+            phrases: [
+                "Ask \(.applicationName)",
+                "Ask \(.applicationName) about my schedule",
+            ],
+            shortTitle: "Ask Unstuck",
+            systemImageName: "sparkles")
     }
 }

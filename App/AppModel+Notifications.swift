@@ -119,6 +119,15 @@ extension AppModel {
             router.present(.newTask)
             return
         }
+        if link == "unstuck://assistant" {
+            // Siri "Ask Unstuck …" — open the assistant bubble and send the
+            // stashed prompt through the Qwen agent (client-side tool execution).
+            let prompt = AppGroup.consumePendingAssistantPrompt()
+            router.bubbleStartTab = .assistant
+            router.showBubble = true
+            if let prompt, !prompt.isEmpty { assistant.send(prompt) }
+            return
+        }
         if link == "unstuck://focus-next" {
             // Siri "Start a focus session" — begin Focus on the Start-Next pick.
             let tasks = (try? taskRepo?.all()) ?? []
@@ -162,6 +171,7 @@ extension AppModel {
         link == "capture" || link == "unstuck://capture"
             || link == "unstuck://new-task"
             || link == "unstuck://focus-next"
+            || link == "unstuck://assistant"
             || link.hasPrefix("unstuck://focus/")
             || link.hasPrefix("unstuck://task/")
     }

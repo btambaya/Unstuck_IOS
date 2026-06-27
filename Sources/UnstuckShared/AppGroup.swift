@@ -11,19 +11,24 @@ public struct StartNextSnapshot: Codable, Sendable, Equatable {
     public var estimateMin: Int?
     public var lifeArea: String?
     public var openCount: Int
+    /// Id of the shown task — lets the widget's Complete button target it.
+    /// Optional (older payloads decode with nil) so it's backward-compatible.
+    public var taskId: String?
     public var updatedAt: Date
 
-    public init(taskName: String?, estimateMin: Int?, lifeArea: String?, openCount: Int, updatedAt: Date) {
+    public init(taskName: String?, estimateMin: Int?, lifeArea: String?, openCount: Int,
+                taskId: String? = nil, updatedAt: Date) {
         self.taskName = taskName
         self.estimateMin = estimateMin
         self.lifeArea = lifeArea
         self.openCount = openCount
+        self.taskId = taskId
         self.updatedAt = updatedAt
     }
 
     public static let empty = StartNextSnapshot(
         taskName: nil, estimateMin: nil, lifeArea: nil, openCount: 0,
-        updatedAt: Date(timeIntervalSince1970: 0))
+        taskId: nil, updatedAt: Date(timeIntervalSince1970: 0))
 }
 
 /// Richer snapshot the Siri layer reads — counts + the open-task and list names
@@ -138,6 +143,19 @@ public enum AppGroup {
         defaults.removeObject(forKey: pendingRouteKey)
         return route
     }
+
+    // The freeform "Ask Unstuck …" prompt the assistant route carries.
+    private static let assistantPromptKey = "siri.assistantPrompt"
+    public static func setPendingAssistantPrompt(_ prompt: String?) {
+        guard let defaults else { return }
+        if let prompt { defaults.set(prompt, forKey: assistantPromptKey) }
+        else { defaults.removeObject(forKey: assistantPromptKey) }
+    }
+    public static func consumePendingAssistantPrompt() -> String? {
+        guard let defaults, let p = defaults.string(forKey: assistantPromptKey) else { return nil }
+        defaults.removeObject(forKey: assistantPromptKey)
+        return p
+    }
     /// Peek without clearing — used to decide whether the app is ready to route
     /// (so a cold-launch race doesn't drop the route before repos exist).
     public static func hasPendingRoute() -> Bool {
@@ -212,5 +230,30 @@ public enum AppGroup {
         else if let data = try? JSONEncoder().encode(remaining) {
             defaults.set(data, forKey: writeQueueKey)
         }
+    }
+
+    /// Optimistically reflect a widget "Complete" tap in BOTH snapshots so the
+    /// tile updates immediately (the queued op + the app's drain are the source
+    /// of truth; this just avoids a stale "still there" flash until the app
+    /// reconciles). Drops the task, decrements counts, advances Start-Next.
+    public static func optimisticComplete(taskId: String) {
+        var snap = readSnapshot()
+        let wasToday = snap.tasks.first { $0.id == taskId }?.today ?? false
+        snap.tasks.removeAll { $0.id == taskId }
+        snap.pendingCount = max(0, snap.pendingCount - 1)
+        if wasToday { snap.todayCount = max(0, snap.todayCount - 1) }
+        snap.nextTaskName = snap.tasks.first?.name
+        snap.nextEstimateMin = nil
+        writeSnapshot(snap)
+
+        var widget = readStartNext()
+        if widget.taskId == taskId {
+            widget.taskName = snap.tasks.first?.name
+            widget.taskId = snap.tasks.first?.id
+            widget.estimateMin = nil
+            widget.lifeArea = nil
+        }
+        widget.openCount = max(0, widget.openCount - 1)
+        writeStartNext(widget)
     }
 }

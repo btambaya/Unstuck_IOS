@@ -52,11 +52,26 @@ struct StartNextWidgetView: View {
                         Text("+\(entry.snapshot.openCount - 1) more").font(.system(size: 11)).foregroundStyle(.secondary)
                     }
                 }
+                Spacer(minLength: 4)
+                // Interactive buttons (iOS 17): Done queues a hands-free
+                // completion + advances the tile; Start opens Focus.
+                HStack(spacing: 6) {
+                    Button(intent: CompleteStartNextIntent()) {
+                        Label("Done", systemImage: "checkmark")
+                    }
+                    .buttonStyle(.bordered)
+                    Button(intent: StartFocusWidgetIntent()) {
+                        Label("Start", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(1)
             } else {
                 Text("All clear").font(.system(size: 15, weight: .medium))
                 Text("Add a task to get going.").font(.system(size: 11)).foregroundStyle(.secondary)
+                Spacer()
             }
-            Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .containerBackground(.fill.tertiary, for: .widget)
