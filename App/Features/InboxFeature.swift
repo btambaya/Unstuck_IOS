@@ -89,7 +89,7 @@ struct InboxView: View {
                         if visible.isEmpty {
                             Text(showArchived
                                  ? "No archived captures."
-                                 : "Inbox zero. Capture a thought with the capture action during a focus session.")
+                                 : "All clear. Capture a thought during a focus session — it keeps the task it came from.")
                                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                                 .padding(.vertical, 24)
                         } else {
@@ -104,7 +104,7 @@ struct InboxView: View {
                 }
             }
             .background(theme.palette.bg.ignoresSafeArea())
-            .navigationTitle("Inbox")
+            .navigationTitle("Captures")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
@@ -136,7 +136,7 @@ struct InboxView: View {
             Spacer()
             if showArchived || archivedCount > 0 {
                 Button { showArchived.toggle() } label: {
-                    Text(showArchived ? "← Back to inbox" : "Archived (\(archivedCount))")
+                    Text(showArchived ? "← Back to captures" : "Archived (\(archivedCount))")
                         .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink3)
                         .padding(4)
                 }.buttonStyle(.plain)

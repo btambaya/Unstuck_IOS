@@ -83,9 +83,9 @@ final class StoreScreenshots: XCTestCase {
         }
         save("06-collections")
 
-        // Capture Inbox (tray icon on the Today header)
+        // Captures (tray icon on the Today header)
         tapNav("Today")
-        let inbox = app.buttons["Inbox"].firstMatch
+        let inbox = app.buttons["Captures"].firstMatch
         if inbox.waitForExistence(timeout: 4) {
             inbox.tap(); usleep(1_000_000)
             save("07-inbox")

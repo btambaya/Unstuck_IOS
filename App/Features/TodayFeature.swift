@@ -288,7 +288,7 @@ struct TodayView: View {
                                         .offset(x: -9, y: 9)
                                 }
                             }
-                    }.buttonStyle(.plain).accessibilityLabel("Inbox")
+                    }.buttonStyle(.plain).accessibilityLabel("Captures")
                     // Bell → in-app Notification Center; the dot is the unread
                     // badge (newest log entry vs lastSeen — spec 10 §1.9).
                     Button { showNotifCenter = true } label: {
