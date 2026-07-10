@@ -34,7 +34,9 @@ enum NotificationCategories {
             case "paused_checkin": return paused
             case "morning_brief", "evening_preview", "daily_nudge": return daily
             case "reminder", "event_soon": return reminders
-            case "collection_share": return collab
+            case "collection_share",
+                 "task_share", "shared_session_start", "shared_session_end", "shared_task_done":
+                return collab
             default: return recap
             }
         }

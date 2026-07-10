@@ -413,6 +413,29 @@ extension AppModel {
         await coordinator?.share.listMembers(collectionId: collectionId) ?? []
     }
 
+    // MARK: - trusted circle (People / Connections)
+
+    /// Build a live circle roster view-model bound to the shared CircleClient.
+    /// Nil client (unconfigured / demo boot) degrades to an empty, read-only
+    /// roster — mirrors the web `useCircle` no-`sb` guard.
+    func makeCircleModel() -> CircleModel {
+        CircleModel(client: coordinator?.circle)
+    }
+
+    // MARK: - co-focus presence (M5)
+
+    /// The name we broadcast to co-focus peers (so the other side sees who's
+    /// with them) — display name → email local-part → "Someone".
+    var selfDisplayName: String { currentUserName ?? currentEmail ?? "Someone" }
+
+    /// Build a co-focus presence model for a task id, bound to the shared
+    /// realtime client. Nil client / signed-out (no user id) degrades to an inert
+    /// model that never joins — the presence UI simply shows nothing.
+    func makeCoFocusModel(taskId: String) -> CoFocusModel {
+        CoFocusModel(client: coordinator?.coFocus, taskId: taskId,
+                     selfId: coordinator?.auth.currentUserId, selfName: selfDisplayName)
+    }
+
     // MARK: - feedback
 
     /// One-way beta feedback with auto-attached context. False on failure

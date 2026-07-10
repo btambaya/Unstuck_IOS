@@ -32,13 +32,16 @@ public func pickStartNext(
     tasks: [TaskItem],
     blocks: [CalBlock],
     liveTaskId: String?,
-    areaFilter: String? = nil
+    areaFilter: String? = nil,
+    excludeIds: Set<String>? = nil
 ) -> TaskItem? {
     let candidates = tasks
         // !later: a deferred task must never be the top "Start now"
         // suggestion. recurrence == nil: skip hidden recurring TEMPLATES —
         // their per-day occurrences surface in Today on their own.
-        .filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && $0.id != liveTaskId }
+        // excludeIds: tasks you've assigned away — they're someone else's now.
+        .filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && $0.id != liveTaskId
+            && !(excludeIds?.contains($0.id) ?? false) }
         .filter { matchesArea($0.lifeArea, areaFilter) }
     return candidates.sorted(by: ranksBefore).first
 }
@@ -48,12 +51,15 @@ public func pickUpNext(
     blocks: [CalBlock],
     liveTaskId: String?,
     startNextId: String?,
-    limit: Int = 3
+    limit: Int = 3,
+    excludeIds: Set<String>? = nil
 ) -> [TaskItem] {
     var skip = Set<String>()
     if let liveTaskId { skip.insert(liveTaskId) }
     if let startNextId { skip.insert(startNextId) }
-    let open = tasks.filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && !skip.contains($0.id) }
+    // excludeIds: tasks you've assigned away — no longer your work to queue up.
+    let open = tasks.filter { !$0.done && !($0.later ?? false) && $0.recurrence == nil && !skip.contains($0.id)
+        && !(excludeIds?.contains($0.id) ?? false) }
     return Array(open.sorted(by: ranksBefore).prefix(limit))
 }
 
@@ -70,13 +76,15 @@ public func pickTodayHero(
     blocks: [CalBlock],
     now: EpochMillis,
     liveTaskId: String? = nil,
-    areaFilter: String? = nil
+    areaFilter: String? = nil,
+    excludeIds: Set<String>? = nil
 ) -> TaskItem? {
     // Today's open rows (non-template today tasks + today's occurrences), minus
-    // the live-focused task, narrowed by the active area.
+    // the live-focused task and anything assigned away, narrowed by the active area.
     let rows = visibleTasks(view: .today, tasks: tasks, blocks: blocks, now: now,
                             activeArea: nil, slipMode: false)
-        .filter { $0.id != liveTaskId && matchesArea($0.lifeArea, areaFilter) }
+        .filter { $0.id != liveTaskId && !(excludeIds?.contains($0.id) ?? false)
+            && matchesArea($0.lifeArea, areaFilter) }
     if rows.isEmpty { return nil }
 
     let today = Clock.todayISO()

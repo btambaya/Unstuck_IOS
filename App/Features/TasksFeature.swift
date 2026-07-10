@@ -119,6 +119,7 @@ struct TasksView: View {
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .feedbackBubble()
         .task {
+            model.shareState.start()   // live "shared with you" + delegation state
             guard vm == nil, let repo = model.taskRepo else { return }
             let m = TasksModel(repo)
             // Honor an active iOS Focus Filter (reconcile on appear — iOS 18
@@ -303,9 +304,24 @@ struct TasksView: View {
 
     @ViewBuilder
     private func list(_ vm: TasksModel) -> some View {
-        let rows = vm.visible
+        // Tasks I've assigned away leave every active bucket (they surface in the
+        // Delegated group instead); Completed still shows everything — 1:1 with
+        // the web task-list-pane filter.
+        let assignedOut = model.shareState.assignedOut
+        let rows = vm.view == .completed ? vm.visible : vm.visible.filter { assignedOut[$0.id] == nil }
+        // The two collaboration groups sit atop the main "All"/"Today" lists.
+        let showGroups = vm.view == .all || vm.view == .today
         ScrollView {
             LazyVStack(spacing: 6) {
+                if showGroups {
+                    SharedWithYouGroup(items: model.shareState.sharedWithMe,
+                                       makeCoFocus: { model.makeCoFocusModel(taskId: $0) }) { taskId, done in
+                        Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
+                    }
+                    DelegatedGroup(tasks: vm.all, assignedOut: assignedOut,
+                                   activeArea: vm.view == .today ? nil : vm.activeArea,
+                                   now: Date().timeIntervalSince1970 * 1000) { t in editing = t }
+                }
                 if rows.isEmpty {
                     Text("No \(vm.view.rawValue.lowercased()) tasks.")
                         .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
@@ -326,6 +342,8 @@ struct TasksView: View {
                             ageDays: (vm.view == .backlog && overdueLabel == nil) ? vm.ageDays(task) : nil,
                             overdueLabel: overdueLabel,
                             isRecurring: task.recurrence != nil || isOccurrence,
+                            // My outgoing view/partner shares on this row.
+                            shareWith: (model.shareState.badges[task.id] ?? []).map(\.recipientName),
                             // A repeating TEMPLATE row (Recurring tab) has no per-day
                             // done — hide the circle and open it to edit the series.
                             // Occurrence + plain rows get the leading done-circle.
@@ -397,6 +415,8 @@ struct TaskRowView: View {
     /// row is here and that it's a missed recurring task.
     var overdueLabel: String? = nil
     var isRecurring: Bool = false
+    /// Recipients I've shared this task with (view/partner) — a quiet row pill.
+    var shareWith: [String] = []
     /// Whether to show the leading done-circle (false for repeating templates,
     /// which have no per-day done — those open to edit the series instead).
     var canToggleDone: Bool = true
@@ -444,6 +464,7 @@ struct TaskRowView: View {
                                     .background(theme.palette.primarySoft, in: Capsule())
                             }.buttonStyle(.plain)
                         }
+                        ShareWithPill(names: shareWith)
                     }
                 }
                 if let overdueLabel {

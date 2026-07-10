@@ -130,12 +130,30 @@ extension AppModel {
         }
         if link == "unstuck://focus-next" {
             // Siri "Start a focus session" — begin Focus on the Start-Next pick.
-            let tasks = (try? taskRepo?.all()) ?? []
-            let blocks = (try? db?.fetchAllCalBlocks()) ?? []
-            if let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: liveTaskId) {
-                router.beginFocus(next)
-            } else {
-                router.select(.today)   // nothing to focus — land on Today
+            // On a COLD Siri launch `_shareState` is still nil, so the exclude
+            // set would be empty and Siri could start focus on a task I've
+            // assigned away. Build the ShareModel + best-effort refresh it so
+            // `assignedOutIds` is current before the pick — bounded, so a slow /
+            // failed network never hangs the focus start (mirrors how
+            // BackgroundSync.perform refreshes shareState before the widget snapshot).
+            let share = shareState   // build the lazy model so it can populate
+            Task {
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await share.refresh() }
+                    group.addTask { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+                    _ = await group.next()   // whichever finishes first: refresh or timeout
+                    group.cancelAll()
+                }
+                let tasks = (try? taskRepo?.all()) ?? []
+                let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+                // Never surface a task I've assigned away as the background "start
+                // next" pick — it's someone else's now (parity with the widget).
+                if let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: liveTaskId,
+                                            excludeIds: share.assignedOutIds) {
+                    router.beginFocus(next)
+                } else {
+                    router.select(.today)   // nothing to focus — land on Today
+                }
             }
             return
         }
@@ -159,6 +177,14 @@ extension AppModel {
         }
         if link == "unstuck://collections" || link.hasPrefix("unstuck://collections") {
             router.select(.lists)       // a shared collection
+            return
+        }
+        if link == "unstuck://tasks" || link.hasPrefix("unstuck://tasks") {
+            // Shared-task pushes (task_share / shared_session_start / _end /
+            // shared_task_done) deep-link here. Recipients can't open the raw
+            // task detail (RLS), so Today — where "Shared with you" + Delegated
+            // surface these — is the calm landing.
+            router.select(.today)
             return
         }
         router.select(.today)           // unstuck://today, /recap, /brief

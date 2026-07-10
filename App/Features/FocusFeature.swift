@@ -158,6 +158,11 @@ struct FocusView: View {
     @State private var copilot: FocusCopilotController?
     @State private var lastTickSec = -1
 
+    // Co-focus presence (M5). When the focused task is PARTNER-shared, we join
+    // `cofocus:<taskId>` as 'focusing' and surface a calm "X is here with you"
+    // pill whenever a partner is present. Joined on start, left on disappear.
+    @State private var coFocus: CoFocusModel?
+
     private let reasons = ["Bathroom", "Drink", "Quick question", "Stuck — need a moment", "Other"]
 
     // The Android focus screen is dark for every treatment: a deep indigo
@@ -171,7 +176,18 @@ struct FocusView: View {
             RadialGradient(colors: [bgTop, bgBottom], center: .top, startRadius: 0, endRadius: 900)
                 .ignoresSafeArea()
             if let fm { content(fm) } else { ProgressView().tint(.white) }
+            // OWNER co-focus pill — floats at the top when a partner is present.
+            // Non-interactive so it never blocks the header controls beneath it.
+            if let coFocus, !coFocus.peers.isEmpty {
+                VStack {
+                    CoFocusBar(peers: coFocus.peers).padding(.top, 10)
+                    Spacer()
+                }
+                .transition(.opacity)
+                .allowsHitTesting(false)
+            }
         }
+        .animation(.easeInOut(duration: 0.25), value: coFocus?.peers.count)
         .task {
             // Seed the mute toggle from the Settings ambient choice (off →
             // start muted) once, before the first audio update.
@@ -193,6 +209,7 @@ struct FocusView: View {
                 // The init's persist() ran before onPersist was wired — seed once.
                 model.refreshLiveSession()
                 startCopilotIfEnabled(newFM)
+                startCoFocusIfNeeded()
             }
         }
         // Live captures for the Cockpit rail. Observe regardless of treatment so
@@ -226,7 +243,13 @@ struct FocusView: View {
         }
         .sheet(isPresented: $showCapture) { captureSheet }
         .sheet(isPresented: $showReflect, onDismiss: { dismiss() }) { reflectSheet }
-        .onDisappear { teardownCopilot(); AmbientAudio.shared.stop() }
+        // Join/leave co-focus reactively: badges may resolve after Focus opens
+        // (a partner share made moments earlier), and revoking mid-session leaves.
+        .onChange(of: coFocusPartnerShared) { _, shared in
+            if shared { startCoFocusIfNeeded() }
+            else { coFocus?.stop(); coFocus = nil }
+        }
+        .onDisappear { teardownCopilot(); AmbientAudio.shared.stop(); coFocus?.stop(); coFocus = nil }
         // .onDisappear does NOT fire when the phone locks/backgrounds while the
         // Focus screen stays "appeared" — the .playback engine would keep
         // rendering (and draining battery) in the background. Stop on leaving
@@ -292,6 +315,26 @@ struct FocusView: View {
     private func teardownCopilot() {
         copilot?.endSession()
         lastTickSec = -1
+    }
+
+    // MARK: - Co-focus presence wiring (owner side)
+
+    /// The task id we key co-focus on — the TEMPLATE for a recurring occurrence
+    /// (where the shares live), else the focus task. Matches where badges attach.
+    private var coFocusTaskId: String { fm?.occurrence?.templateId ?? task.id }
+
+    /// True when the focused task has an outgoing PARTNER share (co-focus is a
+    /// partner-level capability; view/assign don't join the live channel).
+    private var coFocusPartnerShared: Bool {
+        model.shareState.badges[coFocusTaskId]?.contains { $0.level == .partner } ?? false
+    }
+
+    /// Join `cofocus:<taskId>` as 'focusing' once, when the task is partner-shared.
+    private func startCoFocusIfNeeded() {
+        guard coFocus == nil, fm != nil, coFocusPartnerShared else { return }
+        let cf = model.makeCoFocusModel(taskId: coFocusTaskId)
+        cf.start(track: .focusing)
+        coFocus = cf
     }
 
     private var listeningIndicator: some View {
@@ -651,6 +694,7 @@ struct FocusView: View {
     private func finishSession(markDone: Bool) {
         guard let fm else { return }
         teardownCopilot()
+        coFocus?.stop(); coFocus = nil   // leave the co-focus channel on finish
         let result = fm.finish()
         // For an occurrence focus the Session is attributed to the template; pass
         // its id as the focus `task` so totalFocused accrues there, and the block

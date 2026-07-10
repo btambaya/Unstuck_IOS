@@ -138,9 +138,9 @@ final class TodayModel {
     /// pickTodayHero is cheap relative to the list passes and depends on view
     /// state (liveTaskId/area), so the view computes it ONCE per render and
     /// threads the result into both the hero and the list (no duplicate passes).
-    func startNext(liveTaskId: String?, area: String?) -> TaskItem? {
+    func startNext(liveTaskId: String?, area: String?, excludeIds: Set<String> = []) -> TaskItem? {
         pickTodayHero(tasks: all, blocks: blocks, now: Date().timeIntervalSince1970 * 1000,
-                      liveTaskId: liveTaskId, areaFilter: area)
+                      liveTaskId: liveTaskId, areaFilter: area, excludeIds: excludeIds)
     }
 
     func rows(backlog: Bool, area: String?, startNextId: String?, liveTaskId: String?) -> [TaskItem] {
@@ -228,7 +228,8 @@ struct TodayView: View {
                     // threaded into both the hero card and the list (which only
                     // needs its id to subtract it) — previously each ran its own
                     // pickTodayHero pass.
-                    let hero = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter)
+                    let hero = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter,
+                                            excludeIds: model.shareState.assignedOutIds)
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
                     // "Just now" session recap — shows for 6h after a finished
                     // focus session, between the notif banner and the hero
@@ -259,6 +260,7 @@ struct TodayView: View {
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
         .feedbackBubble()
         .task {
+            model.shareState.start()   // live "shared with you" + delegation state
             guard vm == nil, let repo = model.taskRepo else { return }
             let m = TodayModel(repo); vm = m; await m.observe()
         }
@@ -472,7 +474,11 @@ struct TodayView: View {
     private func list(_ vm: TodayModel, hero: TaskItem?) -> some View {
         let liveId = model.liveTaskId
         let startNextId = hero?.id
+        // Tasks I've assigned away leave the active buckets (they show in the
+        // Delegated group instead) — mirrors the web today-list filter.
+        let assignedOut = model.shareState.assignedOut
         let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: liveId)
+            .filter { assignedOut[$0.id] == nil }
         // The in-progress focus session, surfaced at the top of the list (Android
         // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed tasks.
         let liveTask = liveId.flatMap { id in vm.all.first { $0.id == id } }
@@ -484,6 +490,18 @@ struct TodayView: View {
         LazyVStack(spacing: 6) {
             if let liveTask, let live = model.liveSession {
                 liveSessionCard(liveTask, live)
+            }
+            // Company + delegation sit atop the Today list (not the Backlog view),
+            // 1:1 with the web today-list. Each renders nothing when empty.
+            if !backlogActive {
+                SharedWithYouGroup(items: model.shareState.sharedWithMe,
+                                   makeCoFocus: { model.makeCoFocusModel(taskId: $0) }) { taskId, done in
+                    Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
+                }
+                DelegatedGroup(tasks: vm.all, assignedOut: assignedOut, activeArea: areaFilter,
+                               now: Date().timeIntervalSince1970 * 1000) { t in
+                    model.router.detailTask = t
+                }
             }
             ForEach(rows) { t in taskRow(t) }
         }
@@ -602,6 +620,8 @@ struct TodayView: View {
                                 .padding(.horizontal, 7).padding(.vertical, 2)
                                 .background(theme.palette.primarySoft, in: Capsule())
                         }
+                        // "Shared with N" — my outgoing view/partner shares on this row.
+                        ShareWithPill(names: (model.shareState.badges[t.id] ?? []).map(\.recipientName))
                     }
                 }
                 Spacer()

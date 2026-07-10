@@ -69,4 +69,24 @@ final class PickStartNextTests: XCTestCase {
         let out = pickUpNext(tasks: [done, later, open], blocks: [], liveTaskId: nil, startNextId: nil)
         XCTAssertEqual(out.map(\.id), ["open"])
     }
+
+    // MARK: excludeIds — tasks assigned away are never recommended (web parity:
+    // pick-start-next.ts excludeIds; delegated tasks show in Delegated instead).
+
+    func testStartNextSkipsAssignedAwayId() {
+        let assigned = mkTask(id: "assigned", priority: .urgent)   // would win…
+        let open = mkTask(id: "open", priority: .low)
+        let pick = pickStartNext(tasks: [assigned, open], blocks: [], liveTaskId: nil,
+                                 areaFilter: nil, excludeIds: ["assigned"])
+        XCTAssertEqual(pick?.id, "open")                            // …but it's excluded
+    }
+
+    func testUpNextSkipsAssignedAwayIds() {
+        let a = mkTask(id: "a", priority: .urgent)
+        let b = mkTask(id: "b", priority: .high)
+        let c = mkTask(id: "c", priority: .medium)
+        let out = pickUpNext(tasks: [a, b, c], blocks: [], liveTaskId: nil, startNextId: nil,
+                             limit: 3, excludeIds: ["a"])
+        XCTAssertEqual(out.map(\.id), ["b", "c"])
+    }
 }

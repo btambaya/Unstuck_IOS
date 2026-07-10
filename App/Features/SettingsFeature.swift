@@ -75,6 +75,10 @@ struct SettingsView: View {
             navRow("Notifications") { NotificationSettingsView() }
 
             divider
+            // Trusted circle — the people you share tasks + lists with.
+            navRow("People") { ConnectionsView() }
+
+            divider
             navRow("Insights") { AnalyticsView() }
 
             divider
@@ -186,7 +190,9 @@ struct SettingsView: View {
 
 /// A settings sub-screen: the dark-bg scroll, the eyebrow + serif title, and a
 /// single surface card. Mirrors the Android SettingsSubScreen layout.
-private struct SettingsScaffold<Content: View>: View {
+/// Internal (not private) so sibling settings screens (e.g. ConnectionsView)
+/// reuse the exact same chrome.
+struct SettingsScaffold<Content: View>: View {
     @Environment(\.uTheme) private var theme
     let eyebrow: String
     let title: String
@@ -211,7 +217,7 @@ private struct SettingsScaffold<Content: View>: View {
 }
 
 /// One grouped surface card for a settings section.
-private struct SettingsCard<Content: View>: View {
+struct SettingsCard<Content: View>: View {
     @Environment(\.uTheme) private var theme
     @ViewBuilder var content: () -> Content
     var body: some View {
@@ -221,7 +227,7 @@ private struct SettingsCard<Content: View>: View {
     }
 }
 
-private struct CardDivider: View {
+struct CardDivider: View {
     @Environment(\.uTheme) private var theme
     var body: some View { Rectangle().fill(theme.palette.line).frame(height: 1) }
 }

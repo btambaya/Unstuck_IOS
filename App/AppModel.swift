@@ -80,8 +80,12 @@ final class AppModel {
 
     /// Re-read the persisted live session into the in-memory cache. Called by
     /// every mutator that touches `liveStore` so the cache never goes stale.
+    /// This is also the single choke point every focus transition (start / pause
+    /// / resume / finish / cancel) flows through, so it drives the share-session
+    /// signal reducer — a start/finish on a shared task pings its recipients.
     func refreshLiveSession() {
         cachedLiveSession = (try? liveStore?.get()) ?? nil
+        pumpShareSessionSignals()
     }
 
     /// Backing for the lazily-built assistant. Observation-ignored: AppModel
@@ -98,6 +102,58 @@ final class AppModel {
         let a = AssistantModel(model: self, client: coordinator?.assistant)
         _assistant = a
         return a
+    }
+
+    /// Backing for the app-wide per-task sharing state (tasks shared WITH me +
+    /// my outgoing badges / delegation map). Single shared instance so Today,
+    /// Tasks, the share sheet, and the Start-Next picker all read one source of
+    /// truth; it refetches on the live `unstuckCollabSharesChanged` signal.
+    @ObservationIgnored private(set) var _shareState: ShareModel?
+
+    /// Live per-task sharing state (the iOS analogue of the web `useSharedWithMe`
+    /// + `useShareBadges` hooks). Built lazily on first access, bound to the
+    /// shared CircleClient (nil client on the demo/UITest boot → empty + inert).
+    var shareState: ShareModel {
+        if let s = _shareState { return s }
+        let s = ShareModel(client: coordinator?.circle)
+        // Re-run the share-session signal reducer whenever the outgoing badges
+        // refresh, so a session_start that was waiting on late-resolving badges
+        // (RPC still in flight when the session began) fires once they land.
+        s.onChange = { [weak self] in self?.pumpShareSessionSignals() }
+        _shareState = s
+        return s
+    }
+
+    /// Prior state of the pure share-session signal reducer (UnstuckCore
+    /// `sessionSignalStep`). Driven off the live focus session + outgoing badges.
+    @ObservationIgnored private var shareSig = initSigState()
+
+    /// Feed the current (session id, shared taskId) into the pure reducer and
+    /// fire any session_start / session_end pings it returns. Called on every
+    /// live-session transition (via refreshLiveSession) AND on every badge
+    /// refresh (via ShareModel.onChange). Reads `_shareState` (never builds it)
+    /// so an idle/signed-out app never announces anything. Mirrors the web
+    /// useShareSessionSignals effect.
+    func pumpShareSessionSignals() {
+        let live = cachedLiveSession
+        let active = live?.sessionStart != nil
+        let sid: String? = active ? (live?.id ?? live?.taskId) : nil
+        let taskId: String? = active ? live?.taskId : nil
+        let badges = _shareState?.badges ?? [:]
+        // shared == the taskId iff it has ≥1 outgoing share (any level) — the
+        // whole point of the start/finish heads-up ("quiet company").
+        let shared: String? = {
+            guard let taskId, !(badges[taskId]?.isEmpty ?? true) else { return nil }
+            return taskId
+        }()
+        let (state, fires) = sessionSignalStep(shareSig, sid: sid, shared: shared)
+        shareSig = state
+        guard !fires.isEmpty, let share = _shareState else { return }
+        for f in fires {
+            let kind = f.kind.rawValue
+            let tid = f.taskId
+            Task { await share.notifySession(kind: kind, taskId: tid) }
+        }
     }
 
     /// Finish onboarding. Mirrors the Android completeOnboarding: seed the
@@ -234,6 +290,7 @@ final class AppModel {
         BackgroundSync.perform = { [weak coord, weak self] in
             await self?.drainSiriWriteQueue()   // apply Siri-queued writes first
             await coord?.syncNow()              // flush the outbox (incl. those)
+            await self?.shareState.refresh()    // current delegation before the pick
             await self?.refreshWidgetSnapshot()
         }
 
@@ -282,7 +339,12 @@ final class AppModel {
         let blocks = (try? db?.fetchAllCalBlocks()) ?? []
         let collections = (try? db?.fetchAllCollections()) ?? []
         let now = Date().timeIntervalSince1970 * 1000
-        let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: liveTaskId)
+        // Tasks I've assigned away are someone else's now — never surface them in
+        // the widget / Siri "Start Next" pick or the App-Intent task list. (The
+        // ShareModel is only refreshed while the app is used; in a pure background
+        // pass BackgroundSync.perform refreshes it first so this set is current.)
+        let excludeIds = _shareState?.assignedOutIds ?? []
+        let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: liveTaskId, excludeIds: excludeIds)
 
         // Widget snapshot (unchanged payload) — the home/lock "Start Next" tile.
         let openCount = tasks.filter { !$0.done && !($0.later ?? false) }.count
@@ -296,7 +358,9 @@ final class AppModel {
         let todayList = visibleTasks(view: .today, tasks: tasks, blocks: blocks,
                                      now: now, activeArea: nil, slipMode: false).filter { !$0.done }
         let todayIds = Set(todayList.map { $0.id })
-        let pending = nonTemplates.filter { !$0.done && !($0.later ?? false) }
+        // Assigned-away tasks are excluded from the pending list Siri can start
+        // focusing on (parity with the Start-Next pick + the today-list filter).
+        let pending = nonTemplates.filter { !$0.done && !($0.later ?? false) && !excludeIds.contains($0.id) }
         let overdue = visibleTasks(view: .backlog, tasks: tasks, blocks: blocks,
                                    now: now, activeArea: nil, slipMode: true).filter { !$0.done }
         let taskRefs = pending.prefix(50).map {

@@ -55,6 +55,9 @@ struct TaskEditor: View {
     @State private var tagPanelOpen = false
     @State private var tagQuery = ""
 
+    // Per-task share sheet (M2).
+    @State private var showShare = false
+
     // MARK: derived (occurrence resolution + live task)
 
     private var occBlock: CalBlock? { occurrenceBlockFor(initialTask.id, tasks: tasks, blocks: blocks) }
@@ -118,7 +121,16 @@ struct TaskEditor: View {
             }
             .background(theme.palette.bg.ignoresSafeArea())
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                // Share this task with a circle member at a graded level (M2).
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showShare = true } label: {
+                        Image(systemName: "person.crop.circle.badge.plus")
+                    }.accessibilityLabel("Share task")
+                }
+            }
+            .sheet(isPresented: $showShare) { ShareSheet(task: editTarget) }
             .task { await observe() }
             .alert("Estimate (minutes)", isPresented: $showEstimate) {
                 TextField("Minutes", text: $estimateText).keyboardType(.numberPad)

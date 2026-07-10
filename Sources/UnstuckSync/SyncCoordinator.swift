@@ -25,11 +25,20 @@ public actor SyncCoordinator {
     public nonisolated let notifications: NotificationsClient
     public nonisolated let preferences: PreferencesClient
     public nonisolated let share: CollectionShareClient
+    /// Trusted-circle + per-task sharing transport (RPCs + circle-invite /
+    /// share-notify edge fns). Reachable from the app via `coordinator.circle`.
+    public nonisolated let circle: CircleClient
+    /// Co-focus presence factory (Supabase Realtime Presence, `cofocus:<taskId>`)
+    /// for the owner CoFocusBar + recipient PartnerPresence surfaces (M5).
+    public nonisolated let coFocus: CoFocusPresenceClient
     public nonisolated let feedback: FeedbackClient
     public nonisolated let loginTracker: LoginTrackerClient
     public nonisolated let assistant: AssistantClient
     private let hydrator: Hydrator
     private let realtime: RealtimeMirror
+    /// Live change-signal for sharing (posts NotificationCenter; the UI refetches
+    /// the RPC-backed projections). Recipients can't mirror shared task rows (RLS).
+    private let collab: CollabRealtime
     private let flusher: OutboxFlusher
     private let db: AppDatabase
     private let prevUserKey = "unstuck.prevUserId"
@@ -45,11 +54,14 @@ public actor SyncCoordinator {
         self.notifications = NotificationsClient(provider.client)
         self.preferences = PreferencesClient(provider.client)
         self.share = CollectionShareClient(provider.client)
+        self.circle = CircleClient(provider.client)
+        self.coFocus = CoFocusPresenceClient(provider.client)
         self.feedback = FeedbackClient(provider.client)
         self.loginTracker = LoginTrackerClient(provider.client)
         self.assistant = AssistantClient(provider.client)
         self.hydrator = Hydrator(gateway: gateway, db: db)
         self.realtime = RealtimeMirror(client: provider.client, db: db)
+        self.collab = CollabRealtime(client: provider.client)
         self.flusher = OutboxFlusher(gateway: gateway, db: db)
         self.db = db
     }
@@ -205,10 +217,13 @@ public actor SyncCoordinator {
             await realtime.subscribeAll(userId: uid, onMembersChanged: {
                 await hydrator.hydrateCollections(userId: uid)
             })
+            // Live sharing signal (RPC-backed projections refetch on the post).
+            await collab.start(userId: uid)
             await pullCalendar()   // ingest Google events if connected (spec §1.7 step 4, best-effort)
 
         case .signedOut:
             await realtime.unsubscribeAll()
+            await collab.stop()
             try? db.clearAll()
             UserDefaults.standard.removeObject(forKey: prevUserKey)
 
