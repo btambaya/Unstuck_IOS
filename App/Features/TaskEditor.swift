@@ -1,8 +1,9 @@
 // Full task detail / edit screen — a 1:1 port of the Android TaskDetailSheet.
 // Editable in place (no Save button): every field commits immediately, like
 // Android's `vm.updateTask(...)`. Inline-edit name + first action, estimate +
-// area chips, Focus / Schedule / Mark-done / Skip actions, a Status + Schedule
-// meta row, recurrence, tags, a sessions list, and capture management.
+// area chips, a per-task reminder override (scheduled tasks), Focus / Schedule /
+// Mark-done / Skip actions, a Status + Schedule meta row, recurrence, tags, a
+// sessions list, and capture management.
 // Recurring OCCURRENCES (row id = cal_block id) edit the TEMPLATE for field
 // changes and route Mark-done / Skip to the occurrence block.
 
@@ -57,6 +58,10 @@ struct TaskEditor: View {
 
     // Per-task share sheet (M2).
     @State private var showShare = false
+
+    // Bumped after each reminder-override write so the device-local (UserDefaults,
+    // non-observable) value re-reads — `reminderLead` depends on it.
+    @State private var reminderTick = 0
 
     // MARK: derived (occurrence resolution + live task)
 
@@ -259,6 +264,22 @@ struct TaskEditor: View {
                         ForEach(areas) { a in
                             pill(a.name, selected: editTarget.lifeArea == a.name, dot: theme.palette.areaColor(a.color)) {
                                 update { $0.lifeArea = (editTarget.lifeArea == a.name) ? nil : a.name }
+                            }
+                        }
+                    }
+                }
+                // Pre-task reminder override — the create sheet no longer sets one
+                // (new tasks use the global default), so the editor owns it. Only
+                // meaningful for a scheduled, non-Later task (reminders fire off
+                // scheduled blocks). "Default" clears the override.
+                if editTarget.later != true && !myBlocks.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        SectionLabel("Remind me")
+                        chipScroll {
+                            chip("Default", selected: reminderLead == nil) { setReminder(nil) }
+                            chip("Off", selected: reminderLead == 0) { setReminder(0) }
+                            ForEach([5, 10, 15], id: \.self) { m in
+                                chip("\(m)m before", selected: reminderLead == m) { setReminder(m) }
                             }
                         }
                     }
@@ -590,6 +611,21 @@ struct TaskEditor: View {
     }
 
     private func openEstimate() { estimateText = String(displayEstimate); showEstimate = true }
+
+    /// Per-task reminder lead (minutes before the block; 0 = Off), or nil for the
+    /// global default. Read live from NotificationPrefs so an occurrence resolves
+    /// to its TEMPLATE's override (editTarget) — the id the create/schedule flow
+    /// keys on. `reminderTick` forces the re-read after a write.
+    private var reminderLead: Int? {
+        _ = reminderTick
+        return NotificationPrefs.reminderOverride(taskId: editTarget.id)
+    }
+
+    private func setReminder(_ lead: Int?) {
+        NotificationPrefs.setReminderOverride(taskId: editTarget.id, leadMin: lead)
+        ReminderScheduler.shared.resync()
+        reminderTick += 1
+    }
 
     private func openSchedule() {
         // Clamp the seed to today: the DatePicker range starts at startOfDay(now),

@@ -1,16 +1,20 @@
-// Create-task sheet — a 1:1 port of the Android NewTaskSheet (scheduler-first,
-// mirroring the web task-create-modal). Section order is identical:
-//   name → When (Today/Tomorrow/Pick date/Later) → Time (free-slot chips +
-//   custom + conflict warning) → Estimate chips → Remind me → Area pills →
-//   First step → Tags → Repeat → Capture-a-thought drafts → "Add task".
-// WHEN is mandatory; the time auto-picks the first free slot for the date
-// unless the user chooses one. No priority picker (the web + DB don't surface
-// one). Editing an existing task still goes through TaskEditor.
+// Create-task sheet — the "conversational" redesign (mirrors the Android
+// NewTaskSheet + web task-create-modal). Four serif questions instead of ten
+// stacked sections:
+//   What's on your mind? → When? (+ Time sub-row) → How long? → Which area?
+// then a collapsed "More options" disclosure holding Share/assign (per-task
+// circle sharing, applied on submit), Tags and Repeat. WHEN is mandatory; the
+// time auto-picks the first free slot for the date unless the user chooses
+// one. First step / reminder / capture drafts moved to TaskEditor — new tasks
+// use the global default reminder. No priority picker (the web + DB don't
+// surface one). Editing an existing task still goes through TaskEditor.
 
 import SwiftUI
+import UIKit
 import UnstuckCore
 import UnstuckData
 import UnstuckDesign
+import UnstuckSync
 
 struct NewTaskSheet: View {
     @Environment(AppModel.self) private var model
@@ -29,14 +33,7 @@ struct NewTaskSheet: View {
         self.prefillTime = prefillTime
     }
 
-    private static let estimatePresets = [15, 25, 45, 60, 90]
-    private static let captureTags: [CaptureTag] = [.followUp, .idea, .edit, .question, .distraction]
-
-    private struct CaptureDraft: Identifiable {
-        let id = UUID()
-        var body = ""
-        var tag: CaptureTag = .followUp
-    }
+    private static let estimatePresets = [15, 25, 45, 90]
 
     // Stable "now" for the session so free-slot math doesn't drift mid-edit.
     private let now = Date()
@@ -50,10 +47,7 @@ struct NewTaskSheet: View {
     @State private var autoTime = true            // false once a time is explicitly chosen
     @State private var estimate = 25
     @State private var area: String?
-    @State private var firstMove = ""
-    @State private var reminderLead: Int?         // nil = global default
     @State private var tags: [String] = []
-    @State private var drafts: [CaptureDraft] = []
 
     // Recurrence (inline editor, same controls as TaskEditor).
     enum RepeatKind: String, CaseIterable { case none = "None", daily = "Daily", weekly = "Weekly", monthly = "Monthly" }
@@ -61,6 +55,29 @@ struct NewTaskSheet: View {
     @State private var days: Set<Int> = []
     @State private var untilOn = false
     @State private var until = Date()
+
+    // "More options" disclosure — collapsed by default so the sheet reads as
+    // four questions; Share · Tags · Repeat live behind it.
+    @State private var moreOpen = false
+
+    // Per-task sharing (picked levels are LOCAL create-state — the share RPCs
+    // fire on submit, after the task row exists). userId → level; absent = Off.
+    @State private var shareLevels: [String: ShareLevel] = [:]
+    @State private var circle: CircleModel?
+
+    // Inline invite-a-new-person state (same flow as ShareSheet).
+    @State private var inviting = false
+    @State private var inviteEmail = ""
+    @State private var inviteResult: InviteOutcome?
+    @State private var inviteErr: String?
+    @State private var copied = false
+
+    private struct InviteOutcome { let added: Bool; let emailed: Bool; let link: String?; let email: String }
+
+    /// nil == "Off"; else the granted level. Mirrors ShareSheet's OPTIONS list.
+    private let shareOptions: [(value: ShareLevel?, label: String)] = [
+        (nil, "Off"), (.view, "View"), (.partner, "Partner"), (.assign, "Assign"),
+    ]
 
     // Live data.
     @State private var blocks: [CalBlock] = []
@@ -113,20 +130,19 @@ struct NewTaskSheet: View {
 
     private var canSubmit: Bool { !name.trimmingCharacters(in: .whitespaces).isEmpty }
 
+    private var activeMembers: [CircleMember] {
+        (circle?.members ?? []).filter { $0.status == "active" && $0.memberUserId != nil }
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 22) {
                     nameSection
                     whenSection
-                    if whenSel != "Later" { timeSection }
                     estimateSection
-                    if whenSel != "Later" { remindSection }
                     if !areas.isEmpty { areaSection }
-                    firstStepSection
-                    tagsSection
-                    repeatSection
-                    captureSection
+                    moreOptionsSection
                     UButton("Add task", kind: canSubmit ? .primary : .dark) { submit() }
                         .disabled(!canSubmit)
                         .padding(.top, 4)
@@ -135,11 +151,23 @@ struct NewTaskSheet: View {
                 .padding(.vertical, 16)
             }
             .background(theme.palette.bg.ignoresSafeArea())
-            .navigationTitle("New task")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
+                ToolbarItem(placement: .principal) {
+                    Text("New task")
+                        .font(UFont.serif(22, italic: true))
+                        .foregroundStyle(theme.palette.ink)
+                }
+            }
             .task { await observe() }
+            .task {
+                let c = circle ?? model.makeCircleModel()
+                circle = c
+                c.start()
+            }
             .onAppear(perform: seedPrefill)
+            .onDisappear { circle?.stop() }
             .onChange(of: effectiveDate) { _, _ in autoPick() }
             .onChange(of: estimate) { _, _ in autoPick() }
             // Re-pick the first free slot once blocks arrive (and on every
@@ -158,9 +186,14 @@ struct NewTaskSheet: View {
 
     // MARK: sections
 
+    /// Serif "conversational" question header (the redesign's signature type).
+    private func question(_ text: String) -> some View {
+        Text(text).font(UFont.serif(22)).foregroundStyle(theme.palette.ink)
+    }
+
     private var nameSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("New task")
+        VStack(alignment: .leading, spacing: 10) {
+            question("What's on your mind?")
             TextField("What's the next thing on your mind?", text: $name, axis: .vertical)
                 .font(UFont.sans(15))
                 .textFieldStyle(.plain)
@@ -171,8 +204,8 @@ struct NewTaskSheet: View {
     }
 
     private var whenSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("When")
+        VStack(alignment: .leading, spacing: 10) {
+            question("When?")
             chipScroll {
                 ForEach(["Today", "Tomorrow", "Pick date", "Later"], id: \.self) { w in
                     let label = (w == "Pick date" && whenSel == "Pick date" && !pickedDate.isEmpty)
@@ -192,13 +225,15 @@ struct NewTaskSheet: View {
                     }
                 }
             }
+            if whenSel != "Later" { timeSubsection }
         }
     }
 
-    private var timeSection: some View {
+    private var timeSubsection: some View {
         VStack(alignment: .leading, spacing: 7) {
             SectionLabel("Time")
             chipScroll {
+                chip("Custom…", selected: false) { openTimePicker() }
                 if let pt = pickedTime, !slots.contains(where: { $0.startTime == pt }) {
                     chip(formatTime(pt), selected: true) { openTimePicker() }
                 }
@@ -207,7 +242,6 @@ struct NewTaskSheet: View {
                         pickedTime = s.startTime; autoTime = false
                     }
                 }
-                chip("Custom…", selected: false) { openTimePicker() }
             }
             if slots.isEmpty && pickedTime == nil {
                 Text("No free slots that day — pick a custom time, or it'll be added without one.")
@@ -220,39 +254,27 @@ struct NewTaskSheet: View {
                     .background(theme.palette.amberSoft, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
         }
+        .padding(.top, 4)
     }
 
     private var estimateSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("Estimate")
+        VStack(alignment: .leading, spacing: 10) {
+            question("How long?")
             chipScroll {
-                ForEach(Self.estimatePresets, id: \.self) { m in
-                    chip("\(m)m", selected: estimate == m) { estimate = m }
-                }
+                chip("Custom…", selected: false) { openEstimate() }
                 if !Self.estimatePresets.contains(estimate) {
                     chip("\(estimate)m", selected: true) { openEstimate() }
                 }
-                chip("Custom…", selected: false) { openEstimate() }
-            }
-        }
-    }
-
-    private var remindSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("Remind me")
-            chipScroll {
-                chip("Default", selected: reminderLead == nil) { reminderLead = nil }
-                chip("Off", selected: reminderLead == 0) { reminderLead = 0 }
-                ForEach([5, 10, 15], id: \.self) { m in
-                    chip("\(m)m before", selected: reminderLead == m) { reminderLead = m }
+                ForEach(Self.estimatePresets, id: \.self) { m in
+                    chip("\(m)m", selected: estimate == m) { estimate = m }
                 }
             }
         }
     }
 
     private var areaSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("Area")
+        VStack(alignment: .leading, spacing: 10) {
+            question("Which area?")
             chipScroll {
                 pill("Unassigned", selected: area == nil, dot: nil) { area = nil }
                 ForEach(areas) { a in
@@ -264,16 +286,203 @@ struct NewTaskSheet: View {
         }
     }
 
-    private var firstStepSection: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            SectionLabel("First step", color: theme.palette.coral)
-            TextField("The smallest concrete step…", text: $firstMove, axis: .vertical)
-                .font(UFont.sans(15))
-                .textFieldStyle(.plain)
-                .padding(.horizontal, 12).padding(.vertical, 10)
-                .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(theme.palette.line2))
+    // MARK: more options (Share · Tags · Repeat)
+
+    private var moreOptionsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Rectangle().fill(theme.palette.line).frame(height: 1)
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { moreOpen.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Text("More options").font(UFont.sans(14, .semibold))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 11, weight: .semibold))
+                        .rotationEffect(.degrees(moreOpen ? 180 : 0))
+                    Spacer()
+                    Text("Share · Tags · Repeat").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                }
+                .foregroundStyle(theme.palette.ink2)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if moreOpen {
+                shareSection
+                tagsSection
+                repeatSection
+            }
         }
+    }
+
+    private var shareSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            SectionLabel("Share or assign")
+            if !activeMembers.isEmpty {
+                VStack(spacing: 10) {
+                    ForEach(activeMembers) { m in shareMemberRow(m) }
+                }
+            }
+            if inviting { invitePanel } else { addSomeoneButton }
+            if activeMembers.isEmpty && !inviting {
+                Text("Share this task with someone in your circle.")
+                    .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+            } else if !activeMembers.isEmpty {
+                shareExplainer
+            }
+        }
+    }
+
+    /// One circle member: initial avatar + name/relationship, and a full-width
+    /// Off/View/Partner/Assign segmented row. Selection is LOCAL — the share
+    /// RPCs fire on submit (a failed share must never block creation).
+    private func shareMemberRow(_ m: CircleMember) -> some View {
+        let userId = m.memberUserId ?? ""
+        let current = shareLevels[userId]
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text(String((m.memberName ?? "?").prefix(1)).uppercased())
+                    .font(UFont.sans(13, .semibold)).foregroundStyle(.white)
+                    .frame(width: 30, height: 30)
+                    .background(theme.palette.primary, in: Circle())
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(m.memberName ?? "Member").font(UFont.sans(14, .semibold))
+                        .foregroundStyle(theme.palette.ink).lineLimit(1)
+                    if let label = m.relationshipLabel {
+                        Text(label).font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 2) {
+                ForEach(shareOptions, id: \.label) { opt in
+                    let selected = current == opt.value
+                    Button {
+                        if let level = opt.value { shareLevels[userId] = level }
+                        else { shareLevels.removeValue(forKey: userId) }
+                    } label: {
+                        Text(opt.label)
+                            .font(UFont.sans(11, .semibold))
+                            .foregroundStyle(selected ? .white : theme.palette.ink2)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(selected ? theme.palette.coralDeep : Color.clear, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(2)
+            .background(theme.palette.bg, in: Capsule())
+            .overlay(Capsule().stroke(theme.palette.line2))
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    // MARK: inline invite (same flow as ShareSheet)
+
+    private var addSomeoneButton: some View {
+        Button { inviting = true; inviteResult = nil; inviteErr = nil } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "plus").font(.system(size: 12, weight: .semibold))
+                Text("Add someone").font(UFont.sans(13, .semibold))
+            }.foregroundStyle(theme.palette.primaryDeep)
+        }.buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var invitePanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let r = inviteResult {
+                if r.added {
+                    Text("✓ Added — pick their level above.")
+                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.greenInk)
+                } else if r.emailed {
+                    Text("✓ Invite sent to \(r.email). Pick their level once they accept.")
+                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.greenInk)
+                } else if let link = r.link {
+                    Text("Invite link ready\(copied ? " · copied!" : "")")
+                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                    Text(link).font(UFont.mono(12)).foregroundStyle(theme.palette.ink2)
+                        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
+                        .background(theme.palette.bg, in: RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
+                        .textSelection(.enabled)
+                    Text(r.email.isEmpty ? "Send it to them — it's the only way in."
+                         : "We couldn't email them — send this link instead.")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                }
+                HStack(spacing: 8) {
+                    if let link = r.link {
+                        Button { copy(link) } label: {
+                            Text("Copy link").font(UFont.sans(13, .semibold)).foregroundStyle(.white)
+                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                .background(theme.palette.ink, in: Capsule())
+                        }.buttonStyle(.plain)
+                    }
+                    Button { inviting = false; inviteResult = nil } label: {
+                        Text("Done").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink2)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(theme.palette.bg, in: Capsule())
+                    }.buttonStyle(.plain)
+                }
+            } else {
+                Text("Their email (optional)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                TextField("name@example.com", text: $inviteEmail)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
+                Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                if let inviteErr {
+                    Text(inviteErr).font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                }
+                HStack(spacing: 8) {
+                    Button { generateInvite() } label: {
+                        Text(inviteEmail.trimmingCharacters(in: .whitespaces).isEmpty ? "Generate link" : "Send invite")
+                            .font(UFont.sans(13, .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(theme.palette.ink, in: Capsule())
+                    }.buttonStyle(.plain)
+                    Button { inviting = false; inviteErr = nil } label: {
+                        Text("Cancel").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink2)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(theme.palette.bg, in: Capsule())
+                    }.buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func generateInvite() {
+        let email = inviteEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        inviteErr = nil
+        Task {
+            guard let circle else { inviteErr = "Sign in to invite people."; return }
+            let r = await circle.invite(email: email.isEmpty ? nil : email)
+            if r.ok == false, r.added != true, r.emailed != true, r.link == nil {
+                inviteErr = r.error == "circle_full" ? "Your circle is full." : "Could not create invite."
+                return
+            }
+            inviteResult = InviteOutcome(added: r.added == true, emailed: r.emailed == true, link: r.link, email: email)
+            inviteEmail = ""
+            if let link = r.link { copy(link) }
+        }
+    }
+
+    private func copy(_ s: String) {
+        UIPasteboard.general.string = s
+        copied = true
+        Task { try? await Task.sleep(nanoseconds: 1_800_000_000); copied = false }
+    }
+
+    private var shareExplainer: some View {
+        (Text("View").font(UFont.sans(12, .semibold)) + Text(" — they see it + get pinged when you start & finish. ").font(UFont.sans(12))
+         + Text("Partner").font(UFont.sans(12, .semibold)) + Text(" — either of you can start/complete & focus together. ").font(UFont.sans(12))
+         + Text("Assign").font(UFont.sans(12, .semibold)) + Text(" — it becomes their task; you keep view.").font(UFont.sans(12)))
+            .foregroundStyle(theme.palette.ink3)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var tagsSection: some View {
@@ -300,20 +509,6 @@ struct NewTaskSheet: View {
         // weekly rule with no days would materialize nothing.
         .onChange(of: repeatKind) { _, kind in
             if kind == .weekly && days.isEmpty { days = [1] }
-        }
-    }
-
-    private var captureSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Capture a thought", color: theme.palette.primaryDeep)
-            ForEach($drafts) { $draft in draftCard($draft) }
-            Button { drafts.append(CaptureDraft()) } label: {
-                Text("+ Capture")
-                    .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
-                    .padding(.horizontal, 12).padding(.vertical, 7)
-                    .overlay(Capsule().stroke(theme.palette.line2))
-            }
-            .buttonStyle(.plain)
         }
     }
 
@@ -384,39 +579,6 @@ struct NewTaskSheet: View {
         }
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(theme.palette.line2))
-    }
-
-    private func draftCard(_ draft: Binding<CaptureDraft>) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                TextField("Something on your mind…", text: draft.body)
-                    .font(UFont.sans(13)).textFieldStyle(.plain)
-                Button {
-                    drafts.removeAll { $0.id == draft.wrappedValue.id }
-                } label: {
-                    Image(systemName: "xmark").font(.system(size: 12)).foregroundStyle(theme.palette.ink3)
-                }
-                .buttonStyle(.plain)
-            }
-            chipScroll {
-                ForEach(Self.captureTags, id: \.self) { tag in
-                    let on = draft.wrappedValue.tag == tag
-                    Button { draft.tag.wrappedValue = tag } label: {
-                        HStack(spacing: 5) {
-                            Circle().fill(captureTagColor(tag, theme)).frame(width: 6, height: 6)
-                            Text(tag.rawValue).font(UFont.sans(12, on ? .semibold : .regular))
-                                .foregroundStyle(on ? theme.palette.ink : theme.palette.ink2)
-                        }
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(on ? theme.palette.ink.opacity(0.08) : .clear, in: Capsule())
-                        .overlay(Capsule().stroke(theme.palette.line))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(10)
-        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private var weekdayToggles: some View {
@@ -592,7 +754,7 @@ struct NewTaskSheet: View {
             name: trimmed, estimateMin: estimate,
             tags: tags.isEmpty ? nil : tags,
             lifeArea: area,
-            firstPhysicalAction: firstMove.trimmingCharacters(in: .whitespaces).isEmpty ? nil : firstMove.trimmingCharacters(in: .whitespaces),
+            firstPhysicalAction: nil,
             later: later)
 
         // addTask persists the task without recurrence; attach it so the row
@@ -604,7 +766,6 @@ struct NewTaskSheet: View {
         }
 
         if !later {
-            if let lead = reminderLead { NotificationPrefs.setReminderOverride(taskId: t.id, leadMin: lead) }
             // Re-resolve Today/Tomorrow against a fresh clock so a sheet left open
             // across midnight doesn't schedule onto yesterday.
             if let date = effectiveDateNow(), let time = pickedTime {
@@ -613,10 +774,21 @@ struct NewTaskSheet: View {
             ReminderScheduler.shared.resync()
         }
 
-        for d in drafts {
-            let body = d.body.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !body.isEmpty else { continue }
-            model.saveCapture(Capture(id: newUUID(), taskId: t.id, tag: d.tag, body: body, at: now))
+        // Apply the picked share levels now the row exists — fire-and-forget,
+        // exactly how ShareSheet calls the RPCs (a failed share, e.g. offline,
+        // must never block creation).
+        let shares = shareLevels
+        if !shares.isEmpty {
+            let share = model.shareState
+            let taskId = t.id
+            Task {
+                for (userId, level) in shares {
+                    do {
+                        try await share.shareTask(taskId: taskId, user: userId, level: level)
+                        await share.notifyShare(taskId: taskId, recipientId: userId)
+                    } catch {}
+                }
+            }
         }
         dismiss()
     }
