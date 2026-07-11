@@ -63,4 +63,29 @@ final class RealtimeMirrorTests: XCTestCase {
         let echo = incoming(id: "t1", name: "remote-old", updatedAt: "2026-05-21T10:00:00.500Z")
         XCTAssertFalse(RealtimeMirror.incomingTaskWins(echo, db: db))
     }
+
+    // MARK: - subscribe retry backoff (pure)
+
+    func testRetryBackoffDoublesFromHalfSecond() {
+        // 1-based attempt → delay before the next try: 0.5s, 1s, 2s, 4s.
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 1), 500_000_000)
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 2), 1_000_000_000)
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 3), 2_000_000_000)
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 4), 4_000_000_000)
+    }
+
+    func testRetryBackoffCapsAtEightSeconds() {
+        // 5th try wants 8s; anything beyond stays capped (no runaway growth /
+        // UInt64 overflow from an unbounded shift).
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 5), 8_000_000_000)
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 6), 8_000_000_000)
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 50), 8_000_000_000)
+    }
+
+    func testRetryBackoffClampsNonPositiveAttempt() {
+        // Defensive: a 0 / negative attempt clamps to the base delay, never a
+        // negative shift (which would trap).
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 0), 500_000_000)
+        XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: -3), 500_000_000)
+    }
 }

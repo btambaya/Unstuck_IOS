@@ -216,6 +216,12 @@ public actor SyncCoordinator {
             let hydrator = self.hydrator
             await realtime.subscribeAll(userId: uid, onMembersChanged: {
                 await hydrator.hydrateCollections(userId: uid)
+            }, onResync: {
+                // Realtime self-heal backfill (socket reconnect / channel
+                // rebuild): a full server-canonical pull catches anything the
+                // dropped connection missed. The REST hydrate is the reliable
+                // source of truth around which realtime self-heals.
+                await hydrator.hydrate(userId: uid)
             })
             // Live sharing signal (RPC-backed projections refetch on the post).
             await collab.start(userId: uid)

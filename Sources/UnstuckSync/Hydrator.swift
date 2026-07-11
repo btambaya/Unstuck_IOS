@@ -60,7 +60,32 @@ public actor Hydrator {
         }
     }
 
+    // Coalesce overlapping full hydrates. The socket-reconnect resync, the 60s
+    // foreground safety-net (syncNow), and the auth-event hydrate all funnel
+    // into hydrate() and can interleave at await points (actor isolation gates
+    // each step, not the whole run). Gate so at most ONE full hydrate runs at a
+    // time; any request that arrives while one is in flight collapses into a
+    // SINGLE trailing run afterwards (in-flight → remember latest → run once
+    // more). BUG 2.
+    private var hydrateInFlight = false
+    private var hydratePendingUserId: String?
+
     public func hydrate(userId: String) async {
+        guard !hydrateInFlight else {
+            hydratePendingUserId = userId   // coalesce concurrent requests → one trailing run
+            return
+        }
+        hydrateInFlight = true
+        defer { hydrateInFlight = false }
+        var next: String? = userId
+        while let uid = next {
+            hydratePendingUserId = nil
+            await performHydrate(userId: uid)
+            next = hydratePendingUserId     // a request arrived mid-run → run once more, for it
+        }
+    }
+
+    private func performHydrate(userId: String) async {
         await replace("tasks", TaskRow.self) { try self.db.replaceAll(TaskItem.self, with: $0.map { $0.model() }) }
         await replace("sessions", SessionRow.self) { try self.db.replaceAll(Session.self, with: $0.map { $0.model() }) }
         await replace("captures", CaptureRow.self) { try self.db.replaceAll(Capture.self, with: $0.map { $0.model() }) }

@@ -116,6 +116,10 @@ struct UnstuckApp: App {
                         // BEFORE syncNow so they flush on this same foreground.
                         model.drainSiriWriteQueue()
                         model.syncNow()
+                        // Start the ~60s foreground safety-net pull: realtime can
+                        // silently drop while the app stays continuously
+                        // foregrounded — the periodic hydrate is the backstop.
+                        model.startForegroundSafetyNet()
                         // Reap any focus Live Activity orphaned by a kill/crash
                         // mid-session (rebinds to a still-live session, else
                         // ends the ghost timer).
@@ -124,6 +128,11 @@ struct UnstuckApp: App {
                         // (Add task / Capture / Start focus / Open today). No-ops
                         // until repos exist — start() consumes it on cold launch.
                         model.consumePendingSiriRoute()
+                    }
+                    // Stop the safety-net pull whenever we leave the foreground
+                    // (it restarts on the next .active).
+                    if phase == .inactive || phase == .background {
+                        model.stopForegroundSafetyNet()
                     }
                     if phase == .background {
                         BackgroundSync.schedule()

@@ -101,3 +101,46 @@ final class HydratorTolerantTests: XCTestCase {
         XCTAssertTrue(Recurrence.isUnknown(future?.recurrence), "its recurrence is the inert sentinel")
     }
 }
+
+/// Gauges hydrate concurrency: records the max number of simultaneous
+/// `fetchAllRaw` calls and how many full passes touched `tasks`. A small sleep
+/// per fetch widens the interleave window so an UN-coalesced overlap is visible.
+private actor GaugedGateway: SyncReadGatewayProtocol {
+    private(set) var maxConcurrent = 0
+    private(set) var tasksPasses = 0
+    private var current = 0
+    private let sleepNs: UInt64
+    init(sleepNs: UInt64) { self.sleepNs = sleepNs }
+
+    func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] { [] }
+
+    func fetchAllRaw(table: String) async throws -> [Data] {
+        current += 1
+        maxConcurrent = max(maxConcurrent, current)
+        if table == "tasks" { tasksPasses += 1 }   // one fetch per full hydrate pass
+        try? await Task.sleep(nanoseconds: sleepNs)
+        current -= 1
+        return []
+    }
+}
+
+// BUG 2: the socket-reconnect resync, the 60s safety-net, and the auth hydrate
+// all call hydrate() and can interleave at await points. The coalescer must
+// serialize them — never two full hydrates overlapping — and collapse extra
+// concurrent requests into a single trailing run.
+final class HydratorCoalesceTests: XCTestCase {
+    func testConcurrentHydratesAreSerializedAndCoalesced() async throws {
+        let db = try AppDatabase.makeInMemory()
+        let gateway = GaugedGateway(sleepNs: 15_000_000)   // 15ms per fetch widens the race window
+        let hydrator = Hydrator(gateway: gateway, db: db)
+        // Fire several hydrates at once.
+        await withTaskGroup(of: Void.self) { group in
+            for _ in 0..<6 { group.addTask { await hydrator.hydrate(userId: "u1") } }
+        }
+        let maxC = await gateway.maxConcurrent
+        let passes = await gateway.tasksPasses
+        XCTAssertEqual(maxC, 1, "at most one full hydrate runs at a time")
+        XCTAssertGreaterThanOrEqual(passes, 1, "at least one hydrate ran")
+        XCTAssertLessThanOrEqual(passes, 2, "extra concurrent requests coalesce to one trailing run")
+    }
+}

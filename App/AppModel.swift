@@ -331,6 +331,34 @@ final class AppModel {
         Task { await coord.syncNow() }
     }
 
+    /// Backing task for the foreground safety-net pull. Observation-ignored:
+    /// it's plumbing, not observable UI state.
+    @ObservationIgnored private var foregroundPullTask: Task<Void, Never>?
+
+    /// Foreground safety-net (spec 02-sync-engine §5): while the app stays
+    /// continuously foregrounded (the user watching this device while editing
+    /// on another), realtime is the only path for remote edits — and realtime
+    /// can silently drop. So run a lightweight ~60s hydrate as a backstop. It's
+    /// the same full REST pull scenePhase .active already does, just repeated.
+    /// Started on .active, cancelled on .inactive/.background. No-op signed out
+    /// or in the UITest boot (no coordinator).
+    func startForegroundSafetyNet() {
+        guard coordinator != nil, foregroundPullTask == nil else { return }
+        foregroundPullTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)   // 60s
+                if Task.isCancelled { return }
+                guard let coord = self?.coordinator else { return }
+                await coord.syncNow()
+            }
+        }
+    }
+
+    func stopForegroundSafetyNet() {
+        foregroundPullTask?.cancel()
+        foregroundPullTask = nil
+    }
+
     /// Recompute + write the Start-Next widget snapshot from the local
     /// store, then poke WidgetKit (used by the BG refresh task).
     func refreshWidgetSnapshot() {
