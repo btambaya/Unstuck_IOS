@@ -46,8 +46,27 @@ extension AppModel {
     /// its activity (so updates keep flowing); otherwise it ends every orphan so
     /// no ghost lock-screen timer survives. Called on launch + foreground.
     func reapStaleLiveActivities() {
-        let active = ((try? liveStore?.get()) ?? nil)?.sessionStart != nil
-        LiveActivityController.shared.reapOrphans(hasActiveSession: active)
+        let cur = (try? liveStore?.get()) ?? nil
+        // A SHARED live session with NO Focus screen currently up is an ORPHAN:
+        // it's a recipient's focus on a task they don't own, so Today can't
+        // resolve/resume it (no local row) — leaving it live would let a later
+        // focus dump the whole app-closed time onto the OWNER (T2). Finalize it
+        // here — accrue the CAPPED elapsed onto the owner (idempotent per session
+        // id, migration 046) — and end its Live Activity rather than rebind a
+        // timer nobody can return to. When the shared Focus screen IS up
+        // (router.focusTask set), it still owns the session; leave it running.
+        if let cur, cur.sessionStart != nil, let level = cur.sharedFocusLevel,
+           levelCanComplete(level), router.focusTask == nil {
+            let raw = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+            let capped = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: cur.sessionEstimateMin)
+            let (taskId, sessionId) = (cur.taskId, cur.id ?? newUUID())
+            try? liveStore?.set(nil)
+            refreshLiveSession()
+            Task { await shareState.logSharedFocus(taskId: taskId, actualSec: capped, sessionId: sessionId) }
+            LiveActivityController.shared.reapOrphans(hasActiveSession: false)
+            return
+        }
+        LiveActivityController.shared.reapOrphans(hasActiveSession: cur?.sessionStart != nil)
     }
 
     /// Resume the paused live session from Today (Android `resumeFocus`). Shifts

@@ -93,6 +93,50 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// The read-only detail of a task shared WITH me — the ONLY window a recipient
+/// has into a shared task's contents (RLS blocks the raw `tasks` row). Built from
+/// the `shared_task_detail(p_task_id)` RPC (migration 045), which returns the
+/// detail for a share the caller holds at ANY level (view/partner/assign). Every
+/// field is display-only: the recipient never edits the owner's task.
+public struct SharedTaskDetail: Equatable, Sendable, Identifiable {
+    public var taskId: String
+    public var ownerName: String
+    public var level: ShareLevel
+    public var name: String
+    public var done: Bool
+    public var estimateMin: Int
+    /// The OWNER's cumulative focus on the task (incl. any partner/assign minutes
+    /// a recipient contributed via log_shared_focus).
+    public var totalFocused: Int
+    public var lifeArea: String?
+    public var priority: Priority?
+    public var tags: [String]
+    /// The task's steps / subtasks (the `objectives` jsonb).
+    public var objectives: [Objective]
+    public var dueAt: String?
+    public var createdAt: String?
+
+    public var id: String { taskId }
+
+    public init(taskId: String, ownerName: String, level: ShareLevel, name: String, done: Bool,
+                estimateMin: Int, totalFocused: Int, lifeArea: String?, priority: Priority?,
+                tags: [String], objectives: [Objective], dueAt: String?, createdAt: String?) {
+        self.taskId = taskId
+        self.ownerName = ownerName
+        self.level = level
+        self.name = name
+        self.done = done
+        self.estimateMin = estimateMin
+        self.totalFocused = totalFocused
+        self.lifeArea = lifeArea
+        self.priority = priority
+        self.tags = tags
+        self.objectives = objectives
+        self.dueAt = dueAt
+        self.createdAt = createdAt
+    }
+}
+
 /// One outgoing share for the row badges on my own task list. Mirrors web
 /// `ShareBadge`, plus `taskId` so a flat list can be grouped by task.
 public struct ShareBadge: Codable, Equatable, Sendable {
@@ -130,6 +174,13 @@ public func shareStatusLabel(_ level: ShareLevel, done: Bool) -> String {
     case .assign: return "yours"
     case .partner: return "partner"
     }
+}
+
+/// The focus-action label inside a shared-task detail — partner "focus together,
+/// live"; assign is theirs to do. Only shown for focus-capable levels (the
+/// log_shared_focus gate is the same partner+assign rule as levelCanComplete).
+public func sharedFocusActionLabel(_ level: ShareLevel) -> String {
+    level == .partner ? "Focus with them" : "Focus"
 }
 
 /// The chip on the OWNER's own task row / "shared with" line — the level granted.

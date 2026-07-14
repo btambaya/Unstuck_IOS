@@ -24,6 +24,11 @@ final class FocusModel {
     /// When focusing a recurring occurrence: the (template id/name, day's block
     /// id). The session runs on the TEMPLATE; completion marks the block.
     let occurrence: (templateId: String, templateName: String, blockId: String)?
+    /// Non-nil when this is a focus on a task shared WITH me (partner/assign):
+    /// finalize accrues onto the OWNER's task via log_shared_focus (T3), never an
+    /// own Session/totalFocused. Carried into the live session so all exit paths
+    /// (incl. displaced/relaunch) detect it from the stored session.
+    let sharedLevel: ShareLevel?
     private let store: LiveSessionStore?
     /// Notified after every persist so AppModel can refresh its in-memory
     /// live-session cache (the Today LiveSessionCard reads that cache, not the
@@ -32,10 +37,12 @@ final class FocusModel {
 
     init(task: TaskItem, store: LiveSessionStore?,
          defaultTreatment: FocusTreatment = .ambient,
-         occurrence: (templateId: String, templateName: String, blockId: String, priorFocused: Int)? = nil) {
+         occurrence: (templateId: String, templateName: String, blockId: String, priorFocused: Int)? = nil,
+         sharedLevel: ShareLevel? = nil) {
         self.task = task
         self.store = store
         self.occurrence = occurrence.map { ($0.templateId, $0.templateName, $0.blockId) }
+        self.sharedLevel = sharedLevel
         let existing: LiveSession? = (try? store?.get()) ?? nil
         // The live session is keyed to the TEMPLATE when focusing an occurrence
         // (so totalFocused accrues on the series), and carries the block id so
@@ -55,6 +62,9 @@ final class FocusModel {
         // live session for this task).
         let isFresh = (existing?.sessionStart == nil) || (existing?.taskId != focusId)
         if isFresh { session = FocusTimer.setTreatment(session, defaultTreatment) }
+        // Stamp the shared marker so every finalize path (finish / displaced /
+        // relaunch) knows to log onto the OWNER's task instead of an own row.
+        session.sharedFocusLevel = sharedLevel
         live = session
         persist()
         LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: task.estimateMin)
@@ -125,6 +135,10 @@ struct FocusView: View {
     @Environment(\.uTheme) private var theme
     @Environment(\.scenePhase) private var scenePhase
     let task: TaskItem
+    /// Non-nil when this Focus is on a task shared WITH me (partner/assign). The
+    /// live session logs onto the OWNER's task via log_shared_focus (T3) rather
+    /// than writing my own Session/totalFocused. Set by the shared detail sheet.
+    var shared: SharedFocusContext?
     @State private var fm: FocusModel?
     @State private var showReasons = false
     /// "Save for later" exits AFTER the pause reason is logged (Android's
@@ -200,7 +214,8 @@ struct FocusView: View {
                 model.finalizeDisplacedFocus(forNewTaskId: occ?.template.id ?? task.id)
                 let newFM = FocusModel(task: task, store: model.liveStore,
                                 defaultTreatment: model.settings.defaultTreatment,
-                                occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) })
+                                occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) },
+                                sharedLevel: shared?.level)
                 // Keep AppModel's live-session cache in sync with every FocusModel
                 // transition (start/pause/resume/finish/cancel) so Today's
                 // LiveSessionCard reflects it without re-reading the store.
@@ -249,7 +264,7 @@ struct FocusView: View {
             if shared { startCoFocusIfNeeded() }
             else { coFocus?.stop(); coFocus = nil }
         }
-        .onDisappear { teardownCopilot(); AmbientAudio.shared.stop(); coFocus?.stop(); coFocus = nil }
+        .onDisappear { teardownCopilot(); AmbientAudio.shared.stop(); coFocus?.stop(); coFocus = nil; finalizeSharedOnLeave() }
         // .onDisappear does NOT fire when the phone locks/backgrounds while the
         // Focus screen stays "appeared" — the .playback engine would keep
         // rendering (and draining battery) in the background. Stop on leaving
@@ -323,10 +338,14 @@ struct FocusView: View {
     /// (where the shares live), else the focus task. Matches where badges attach.
     private var coFocusTaskId: String { fm?.occurrence?.templateId ?? task.id }
 
-    /// True when the focused task has an outgoing PARTNER share (co-focus is a
-    /// partner-level capability; view/assign don't join the live channel).
+    /// True when co-focus should join `cofocus:<taskId>` as 'focusing' — a
+    /// partner-level capability. Either the OWNER focusing a task they shared at
+    /// partner (an outgoing partner badge), OR the RECIPIENT focusing a task
+    /// shared WITH them at partner (T3 — so the owner's CoFocusBar sees them).
+    /// view/assign never join the live channel.
     private var coFocusPartnerShared: Bool {
-        model.shareState.badges[coFocusTaskId]?.contains { $0.level == .partner } ?? false
+        if shared?.level == .partner { return true }
+        return model.shareState.badges[coFocusTaskId]?.contains { $0.level == .partner } ?? false
     }
 
     /// Join `cofocus:<taskId>` as 'focusing' once, when the task is partner-shared.
@@ -696,19 +715,42 @@ struct FocusView: View {
         teardownCopilot()
         coFocus?.stop(); coFocus = nil   // leave the co-focus channel on finish
         let result = fm.finish()
-        // For an occurrence focus the Session is attributed to the template; pass
-        // its id as the focus `task` so totalFocused accrues there, and the block
-        // id so a "Mark complete" marks just this day done. Resolve the template
-        // by primary key (a keyed fetchOne) rather than decoding the whole task
-        // table on the main actor.
-        let focusTask = fm.occurrence.flatMap { occ in
-            (try? model.taskRepo?.fetch(id: occ.templateId)) ?? nil
-        } ?? task
-        model.finishFocus(task: focusTask, session: result.session, elapsedSec: result.elapsedSec,
-                          markDone: markDone, occurrenceBlockId: fm.occurrence?.blockId)
+        if fm.sharedLevel != nil {
+            // Shared focus (T3, Option B): reflect the elapsed onto the OWNER's
+            // task via log_shared_focus and (partner/assign) optionally complete
+            // it — NEVER an own Session/totalFocused (the task isn't mine).
+            model.finalizeSharedFocus(taskId: fm.task.id, taskName: fm.task.name,
+                                      sessionId: result.session.id,
+                                      elapsedSec: result.elapsedSec, markDone: markDone, showRecap: true)
+        } else {
+            // For an occurrence focus the Session is attributed to the template;
+            // pass its id as the focus `task` so totalFocused accrues there, and
+            // the block id so a "Mark complete" marks just this day done. Resolve
+            // the template by primary key (a keyed fetchOne) rather than decoding
+            // the whole task table on the main actor.
+            let focusTask = fm.occurrence.flatMap { occ in
+                (try? model.taskRepo?.fetch(id: occ.templateId)) ?? nil
+            } ?? task
+            model.finishFocus(task: focusTask, session: result.session, elapsedSec: result.elapsedSec,
+                              markDone: markDone, occurrenceBlockId: fm.occurrence?.blockId)
+        }
         // Show the momentary reflection (Android parity); its onDismiss closes Focus.
         reflectMin = max(1, Int((Double(result.elapsedSec) / 60.0).rounded()))
         showReflect = true
+    }
+
+    /// Leaving a SHARED focus (← Out / Save for later) without an explicit
+    /// Done/End: the recipient can't resume it from Today (no own row for a
+    /// foreign task), so finalize it here — log the accrued time onto the owner's
+    /// task (no recap; they only stepped away) — rather than orphan a live session
+    /// pinned to a task that isn't theirs. Own-task sessions keep running (Android
+    /// parity), so this is gated on the shared marker.
+    private func finalizeSharedOnLeave() {
+        guard let fm, fm.sharedLevel != nil, fm.live.sessionStart != nil else { return }
+        let result = fm.finish()   // clears the live session + ends the LiveActivity
+        model.finalizeSharedFocus(taskId: fm.task.id, taskName: fm.task.name,
+                                  sessionId: result.session.id,
+                                  elapsedSec: result.elapsedSec, markDone: false, showRecap: false)
     }
 
     // End-of-session reflection (Android ReflectSheet) — momentary; nothing is

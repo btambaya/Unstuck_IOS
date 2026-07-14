@@ -96,6 +96,67 @@ final class CircleClientTests: XCTestCase {
         XCTAssertEqual(b.recipientName, "Jo")
     }
 
+    func testSharedTaskDetailRowMapping() throws {
+        // Full row (migration 045): snake_case columns; objectives jsonb keeps
+        // camelCase keys; tags is a text[] → string array; timestamptz → ISO.
+        let json = """
+        {"task_id":"t7","owner_name":"Pat","level":"partner","name":"Ship the deck",
+         "done":false,"estimate_min":45,"total_focused":600,"life_area":"Work",
+         "priority":"high","tags":["deck","q3"],
+         "objectives":[{"text":"Outline","done":true},{"text":"Draft","done":false}],
+         "due_at":"2026-06-20T17:00:00.000Z","created_at":"2026-06-11T09:00:00.000Z"}
+        """
+        let d = try decode(SharedTaskDetailRow.self, json).model()
+        XCTAssertEqual(d.taskId, "t7")
+        XCTAssertEqual(d.ownerName, "Pat")
+        XCTAssertEqual(d.level, .partner)
+        XCTAssertEqual(d.name, "Ship the deck")
+        XCTAssertFalse(d.done)
+        XCTAssertEqual(d.estimateMin, 45)
+        XCTAssertEqual(d.totalFocused, 600)
+        XCTAssertEqual(d.lifeArea, "Work")
+        XCTAssertEqual(d.priority, .high)
+        XCTAssertEqual(d.tags, ["deck", "q3"])
+        XCTAssertEqual(d.objectives.count, 2)
+        XCTAssertEqual(d.objectives.first?.text, "Outline")
+        XCTAssertEqual(d.objectives.first?.done, true)
+        XCTAssertEqual(d.dueAt, "2026-06-20T17:00:00.000Z")
+        XCTAssertEqual(d.createdAt, "2026-06-11T09:00:00.000Z")
+    }
+
+    func testSharedTaskDetailRowTolerantDefaults() throws {
+        // Sparse row (nulls / missing optionals) must decode to calm defaults,
+        // never crash — the recipient still gets a usable detail.
+        let json = """
+        {"task_id":"t8","owner_name":null,"level":"future_tier","name":null,"done":null,
+         "estimate_min":null,"total_focused":null,"life_area":null,"priority":null,
+         "tags":null,"objectives":null,"due_at":null,"created_at":null}
+        """
+        let d = try decode(SharedTaskDetailRow.self, json).model()
+        XCTAssertEqual(d.ownerName, "Someone")
+        XCTAssertEqual(d.level, .view)              // unknown level → least-privilege
+        XCTAssertEqual(d.name, "Untitled task")
+        XCTAssertFalse(d.done)
+        XCTAssertEqual(d.estimateMin, 25)
+        XCTAssertEqual(d.totalFocused, 0)
+        XCTAssertNil(d.lifeArea)
+        XCTAssertNil(d.priority)
+        XCTAssertTrue(d.tags.isEmpty)
+        XCTAssertTrue(d.objectives.isEmpty)
+        XCTAssertNil(d.dueAt)
+    }
+
+    func testLogSharedFocusParamKeysAndValues() throws {
+        // 3-arg RPC (migration 046): p_session_id makes the accrue idempotent.
+        let obj = try encodedObject(LogSharedFocusParams(p_task_id: "t7", p_actual_sec: 1500,
+                                                         p_session_id: "sess-1"))
+        XCTAssertEqual(Set(obj.keys), ["p_task_id", "p_actual_sec", "p_session_id"])
+        XCTAssertEqual(obj["p_task_id"]?.stringValue, "t7")
+        XCTAssertEqual(obj["p_session_id"]?.stringValue, "sess-1")
+        if case let .number(n) = obj["p_actual_sec"] { XCTAssertEqual(n, 1500) }
+        else { XCTFail("p_actual_sec should be a number") }
+    }
+
     func testUnknownLevelFallsBackToView() throws {
         // A forward-compat level this build doesn't know must not crash the
         // decode — it degrades to `.view` (least-privilege).

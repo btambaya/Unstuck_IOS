@@ -774,21 +774,19 @@ struct NewTaskSheet: View {
             ReminderScheduler.shared.resync()
         }
 
-        // Apply the picked share levels now the row exists — fire-and-forget,
-        // exactly how ShareSheet calls the RPCs (a failed share, e.g. offline,
-        // must never block creation).
-        let shares = shareLevels
+        // Apply the picked share levels AFTER the created row lands server-side.
+        // task_share validates ownership server-side, so firing it in a bare Task
+        // (as before) races the still-uncommitted insert → `not_your_task` → the
+        // share silently drops (T2). applyCreateShares flushes the tasks upsert to
+        // the server first, mirroring the web awaitPendingUpsert('tasks', id).
+        // Fire-and-forget by design: creation must never block on a share, so a
+        // failed share (e.g. offline) is INTENTIONALLY non-blocking here — the
+        // returned failures are discarded rather than surfaced, matching the web's
+        // create flow. A dropped share is re-addable from the task's Share sheet.
+        let shares = shareLevels.map { (user: $0.key, level: $0.value) }
         if !shares.isEmpty {
-            let share = model.shareState
-            let taskId = t.id
-            Task {
-                for (userId, level) in shares {
-                    do {
-                        try await share.shareTask(taskId: taskId, user: userId, level: level)
-                        await share.notifyShare(taskId: taskId, recipientId: userId)
-                    } catch {}
-                }
-            }
+            let task = t
+            Task { await model.applyCreateShares(task: task, shares: shares) }
         }
         dismiss()
     }

@@ -331,9 +331,24 @@ extension AppModel {
     /// Android startFocus finalize.
     func finalizeDisplacedFocus(forNewTaskId newTaskId: String) {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
-              cur.sessionStart != nil, cur.taskId != newTaskId,
-              let prev = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else { return }
+              cur.sessionStart != nil, cur.taskId != newTaskId else { return }
         let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        // A displaced SHARED focus (partner/assign) belongs to someone else — its
+        // time accrues onto the OWNER's task via log_shared_focus, never an own
+        // Session/totalFocused (there is no local row for it, so the old
+        // taskRepo.fetch guard silently discarded it — the T3 no-op bug). CAP the
+        // elapsed: this session may have been resurrected from the store after a
+        // process-kill, so `now - sessionStart` is wall-clock — an uncapped value
+        // would dump the whole app-closed time onto the owner (T2). Idempotent per
+        // session id (migration 046).
+        if let level = cur.sharedFocusLevel, levelCanComplete(level) {
+            let taskId = cur.taskId
+            let sessionId = cur.id ?? newUUID()
+            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
+            Task { await shareState.logSharedFocus(taskId: taskId, actualSec: capped, sessionId: sessionId) }
+            return
+        }
+        guard let prev = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else { return }
         saveSession(Session(id: cur.id ?? newUUID(), taskId: prev.id, taskName: prev.name,
                             estimateMin: prev.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
         var bumped = prev
@@ -385,6 +400,94 @@ extension AppModel {
         // Today's "Just now" recap card (Android: _lastRecap.value = RecapState(...)).
         lastRecap = RecapState(taskName: task.name, focusedSec: elapsedSec,
                                at: Date().timeIntervalSince1970 * 1000)
+    }
+
+    // MARK: - shared focus (T3, Option B — recipient side)
+
+    /// The grace window added to a shared session's estimate when capping the
+    /// elapsed accrued onto the OWNER. Generous enough to credit a genuine
+    /// overrun, tight enough that an orphan resurrected from the store after a
+    /// process-kill (whose `now - sessionStart` is wall-clock) can't dump hours.
+    static let sharedFocusCapGraceSec = 30 * 60
+
+    /// Seconds to accrue onto an OWNER's shared task from a session RESURRECTED
+    /// from the store (displaced / notification-end / relaunch reap), capped to
+    /// the session estimate + a grace window so a stale orphan measuring
+    /// wall-clock time can never over-credit the owner (T2). In-app finishes (a
+    /// live foreground timer) are already bounded and pass their real elapsed.
+    static func cappedSharedElapsedSec(rawSec: Int, estimateMin: Int) -> Int {
+        let cap = max(1, estimateMin) * 60 + sharedFocusCapGraceSec
+        return min(max(0, rawSec), cap)
+    }
+
+    /// Open a REAL Focus session on a task shared WITH me (partner/assign). The
+    /// recipient doesn't own the task (no local row), so we synthesize a display
+    /// TaskItem from the read-only detail and carry the shared level via the
+    /// router — FocusView seeds the live session from it and finalize accrues onto
+    /// the OWNER's task (finalizeSharedFocus), never an own Session/totalFocused.
+    func beginSharedFocus(_ detail: SharedTaskDetail) {
+        guard levelCanComplete(detail.level) else { return }   // partner/assign only
+        let now = Self.isoNow()
+        // totalFocused stays 0 so the recipient's timer starts fresh at their own
+        // contribution this session; log_shared_focus reflects it onto the owner.
+        let synthesized = TaskItem(id: detail.taskId, name: detail.name,
+                                   estimateMin: detail.estimateMin, totalFocused: 0,
+                                   objectives: detail.objectives, lifeArea: detail.lifeArea,
+                                   createdAt: detail.createdAt ?? now, updatedAt: now,
+                                   dueAt: detail.dueAt)
+        router.sharedFocus = SharedFocusContext(taskId: detail.taskId, title: detail.name,
+                                                estimateMin: detail.estimateMin, level: detail.level)
+        router.focusTask = synthesized
+    }
+
+    /// Finalize a shared Focus session: accrue the recipient's focus onto the
+    /// OWNER's task via log_shared_focus (partner/assign only, gated server-side),
+    /// optionally mark it done, and — when the recipient explicitly ended it —
+    /// show them a normal local recap. Never writes an own Session/totalFocused
+    /// (the task isn't theirs). `elapsedSec ≤ 0` still shows the recap but the RPC
+    /// no-ops server-side.
+    func finalizeSharedFocus(taskId: String, taskName: String, sessionId: String,
+                             elapsedSec: Int, markDone: Bool, showRecap: Bool) {
+        Task { await shareState.logSharedFocus(taskId: taskId, actualSec: elapsedSec, sessionId: sessionId) }
+        if markDone {
+            Task { try? await shareState.completeSharedTask(taskId: taskId, done: true) }
+        }
+        if showRecap {
+            sendSessionRecap(taskName: taskName, away: false)
+            lastRecap = RecapState(taskName: taskName, focusedSec: elapsedSec,
+                                   at: Date().timeIntervalSince1970 * 1000)
+        }
+    }
+
+    /// Apply opt-in shares AFTER the just-created task row is guaranteed to exist
+    /// SERVER-side (T2). task_share validates ownership server-side, so it must not
+    /// race the task insert — that raises `not_your_task` and the share is silently
+    /// dropped. The web awaits `awaitPendingUpsert('tasks', id)`; the iOS write
+    /// path is the offline outbox, so we re-issue the (idempotent, whole-row)
+    /// upsert to guarantee it's enqueued, then flush the outbox to land it on the
+    /// server before sharing. Per-recipient failures are RETURNED for a caller
+    /// that wants to surface them; the create flow deliberately discards them to
+    /// stay non-blocking (a dropped share is re-addable from the Share sheet).
+    @discardableResult
+    func applyCreateShares(task: TaskItem, shares: [(user: String, level: ShareLevel)]) async -> [String] {
+        guard !shares.isEmpty else { return [] }
+        // Deterministically enqueue the tasks upsert (addTask already did this
+        // fire-and-forget; re-issuing is idempotent and removes the timing race),
+        // then drain the outbox so the row is server-side before task_share.
+        if let write = coordinator?.write {
+            try? await write.upsertTask(task, nowISO: Self.isoNow())
+        }
+        await coordinator?.flushNow()
+        var failed: [String] = []
+        for (user, level) in shares {
+            do {
+                try await shareState.shareTask(taskId: task.id, user: user, level: level)
+                await shareState.notifyShare(taskId: task.id, recipientId: user)
+            } catch {
+                failed.append(user)   // surfaced to the caller, not swallowed
+            }
+        }
+        return failed
     }
 
     // MARK: - sharing (edge-function backed)

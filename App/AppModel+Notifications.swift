@@ -298,6 +298,19 @@ extension AppModel {
         try? liveStore.set(nil)
         refreshLiveSession()
         LiveActivityController.shared.end()
+        // A SHARED session (a recipient's focus on someone else's task) has no
+        // local row — taskRepo.fetch(cur.taskId) misses, so the own-Session
+        // fallback below would mint a phantom "Focus session" row polluting the
+        // recipient's analytics while the OWNER is credited ZERO. Mirror
+        // finalizeDisplacedFocus: accrue the CAPPED elapsed onto the OWNER via
+        // log_shared_focus and RETURN before the fallback. The cap guards a
+        // session resurrected across a background/kill (wall-clock elapsed);
+        // idempotent per session id (migration 046).
+        if let level = cur.sharedFocusLevel, levelCanComplete(level) {
+            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
+            await shareState.logSharedFocus(taskId: cur.taskId, actualSec: capped, sessionId: cur.id ?? newUUID())
+            return
+        }
         if let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil {
             let session = Session(id: cur.id ?? newUUID(), taskId: task.id, taskName: task.name,
                                   estimateMin: task.estimateMin, actualSec: elapsed, completedAt: Self.isoNow())

@@ -25,6 +25,12 @@ final class AppRouter {
     enum BubbleTab { case assistant, feedback }
     /// When set, the Focus surface is presented full-screen for this task.
     var focusTask: TaskItem?
+    /// Set ALONGSIDE `focusTask` when the presented Focus session is on a task
+    /// shared WITH me (partner/assign). Carries the shared identity into the live
+    /// session so finalize accrues onto the OWNER's task via log_shared_focus
+    /// (Option B) instead of writing my own Session/totalFocused. nil for a
+    /// normal own-task focus.
+    var sharedFocus: SharedFocusContext?
     /// When set, the task editor is presented for this task (notification
     /// deep links: unstuck://task/<id> — Android Route.Detail).
     var detailTask: TaskItem?
@@ -36,7 +42,9 @@ final class AppRouter {
 
     func select(_ tab: Tab) { self.tab = tab }
     func present(_ sheet: Sheet) { activeSheet = sheet }
-    func beginFocus(_ task: TaskItem) { focusTask = task }
+    /// Start a normal own-task focus (clears any stale shared marker so this
+    /// session never inherits a prior shared context).
+    func beginFocus(_ task: TaskItem) { sharedFocus = nil; focusTask = task }
 
     /// Any modal currently up on the single MainTabScaffold host. SwiftUI can't
     /// present a second sheet/cover from one host while another is up (the new
@@ -53,5 +61,17 @@ final class AppRouter {
         showBubble = false
         detailTask = nil
         focusTask = nil
+        sharedFocus = nil
     }
+}
+
+/// The shared identity carried into a Focus session on a task shared WITH me
+/// (partner/assign). The recipient doesn't own the task (no local row), so the
+/// live session is seeded from this instead of the own store, and finalize logs
+/// the elapsed onto the OWNER's task via log_shared_focus (T3, Option B).
+struct SharedFocusContext: Equatable {
+    let taskId: String
+    let title: String
+    let estimateMin: Int
+    let level: ShareLevel
 }

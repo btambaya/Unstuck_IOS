@@ -97,6 +97,9 @@ public enum FocusTimer {
         next.overrunPromptFired = false
         next.priorAccumulatedSec = priorAccumulatedSec ?? 0
         next.occurrenceBlockId = occurrenceBlockId
+        // A fresh session for a different task must not inherit a prior session's
+        // shared marker; the caller (FocusModel) re-sets it for a shared focus.
+        next.sharedFocusLevel = nil
         return next
     }
 

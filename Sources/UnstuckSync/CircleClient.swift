@@ -143,6 +143,33 @@ public struct CircleClient: Sendable {
             params: SetDoneParams(p_task_id: taskId, p_done: done)).execute()
     }
 
+    /// The read-only detail of a task shared WITH me, at ANY level (the recipient
+    /// can't read the raw `tasks` row — RLS — so this SECURITY DEFINER window is
+    /// the only path). RPC: shared_task_detail(p_task_id) → a single-row table.
+    /// Tolerant → nil on any failure / no matching share.
+    public func sharedTaskDetail(taskId: String) async -> SharedTaskDetail? {
+        do {
+            let rows: [SharedTaskDetailRow] = try await client.rpc(
+                "shared_task_detail", params: TaskIdParams(p_task_id: taskId)).execute().value
+            return rows.first?.model()
+        } catch { return nil }
+    }
+
+    /// Accrue a recipient's focus seconds onto the OWNER's shared task
+    /// (Option B — the recipient's minutes reflect onto the one shared task).
+    /// RPC: log_shared_focus(p_task_id, p_actual_sec, p_session_id) (migration
+    /// 046). Allowed only for a partner/assign share (the server raises
+    /// `not_allowed` for view) and no-ops for actualSec ≤ 0. IDEMPOTENT per
+    /// `sessionId` — a re-fire with the same live-session id no-ops server-side,
+    /// so a retry / double finalize can never double-count. Best-effort — the
+    /// local recap stands regardless.
+    public func logSharedFocus(taskId: String, actualSec: Int, sessionId: String) async {
+        guard actualSec > 0 else { return }
+        _ = try? await client.rpc("log_shared_focus",
+            params: LogSharedFocusParams(p_task_id: taskId, p_actual_sec: actualSec,
+                                         p_session_id: sessionId)).execute()
+    }
+
     /// All of my outgoing shares, for the task-row badges. RPC:
     /// my_task_share_badges(). Tolerant → []. Flat list; group with
     /// `shareBadgesByTask(_:)` for the per-row map the web builds.
@@ -182,6 +209,7 @@ struct IdParams: Encodable { let p_id: String }
 struct TaskIdParams: Encodable { let p_task_id: String }
 struct TaskShareParams: Encodable { let p_task_id: String; let p_user: String; let p_level: String }
 struct SetDoneParams: Encodable { let p_task_id: String; let p_done: Bool }
+struct LogSharedFocusParams: Encodable { let p_task_id: String; let p_actual_sec: Int; let p_session_id: String }
 
 // Edge-fn bodies: camelCase, matching what the web sends + the functions read.
 struct InviteBody: Encodable { let email: String? }
@@ -238,5 +266,42 @@ struct ShareBadgeRow: Decodable {
 
     func model() -> ShareBadge {
         ShareBadge(taskId: task_id, level: ShareLevel(rawValue: level) ?? .view, recipientName: recipient_name)
+    }
+}
+
+/// One row of shared_task_detail (migration 045). Top-level columns are
+/// snake_case; `objectives` is a jsonb blob whose keys stay camelCase (like the
+/// tasks TaskRow), and `tags` is a Postgres text[] → JSON array of strings.
+/// timestamptz columns arrive as ISO strings. All nullable → tolerant defaults.
+struct SharedTaskDetailRow: Decodable {
+    let task_id: String
+    let owner_name: String?
+    let level: String
+    let name: String?
+    let done: Bool?
+    let estimate_min: Int?
+    let total_focused: Int?
+    let life_area: String?
+    let priority: String?
+    let tags: [String]?
+    let objectives: [Objective]?
+    let due_at: String?
+    let created_at: String?
+
+    func model() -> SharedTaskDetail {
+        SharedTaskDetail(
+            taskId: task_id,
+            ownerName: owner_name ?? "Someone",
+            level: ShareLevel(rawValue: level) ?? .view,
+            name: name ?? "Untitled task",
+            done: done == true,
+            estimateMin: estimate_min ?? 25,
+            totalFocused: total_focused ?? 0,
+            lifeArea: life_area,
+            priority: priority.flatMap { Priority(rawValue: $0) },
+            tags: tags ?? [],
+            objectives: objectives ?? [],
+            dueAt: due_at,
+            createdAt: created_at)
     }
 }

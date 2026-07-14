@@ -38,8 +38,10 @@ struct MainTabScaffold: View {
             .sheet(item: $router.detailTask, onDismiss: { model.flushPendingDeepLink() }) { task in
                 TaskEditor(task: task)
             }
-            .fullScreenCover(item: $router.focusTask, onDismiss: { model.flushPendingDeepLink() }) { task in
-                FocusView(task: task)
+            .fullScreenCover(item: $router.focusTask, onDismiss: { router.sharedFocus = nil; model.flushPendingDeepLink() }) { task in
+                // `sharedFocus` (set alongside focusTask by beginSharedFocus) makes
+                // this a recipient's shared focus (T3); nil = a normal own-task focus.
+                FocusView(task: task, shared: router.sharedFocus)
             }
     }
 

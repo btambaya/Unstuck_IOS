@@ -115,6 +115,20 @@ final class ShareModel {
         await client?.shareNotify(kind: "task_share", taskId: taskId, recipientId: recipientId)
     }
 
+    /// The read-only detail of a task shared WITH me (T1) — the only window a
+    /// recipient has into the task's contents. nil client / failure → nil.
+    func sharedTaskDetail(taskId: String) async -> SharedTaskDetail? {
+        await client?.sharedTaskDetail(taskId: taskId)
+    }
+
+    /// Accrue a recipient's focus seconds onto the OWNER's shared task (T3,
+    /// Option B). partner/assign only (gated server-side); no-ops for ≤ 0.
+    /// `sessionId` = the live focus session's id; the RPC is idempotent per that
+    /// id (migration 046), so a re-fire from any finalize path never double-counts.
+    func logSharedFocus(taskId: String, actualSec: Int, sessionId: String) async {
+        await client?.logSharedFocus(taskId: taskId, actualSec: actualSec, sessionId: sessionId)
+    }
+
     /// Best-effort start/finish ping to everyone a task is shared with (the
     /// View-level promise). Called by AppModel's session-signal observer with
     /// kind session_start / session_end. Fire-and-forget, like the web.
@@ -367,6 +381,9 @@ struct SharedWithYouGroup: View {
     var makeCoFocus: ((String) -> CoFocusModel)? = nil
     let onToggle: (String, Bool) -> Void   // (taskId, nextDone)
 
+    /// The row the recipient tapped to OPEN the read-only detail (T1).
+    @State private var detailTarget: SharedDetailTarget?
+
     var body: some View {
         if items.isEmpty {
             EmptyView()
@@ -376,6 +393,11 @@ struct SharedWithYouGroup: View {
                 ForEach(items) { s in row(s) }
             }
             .padding(.bottom, 8)
+            // Read-only detail — the only window a recipient has into the task
+            // (steps, area, estimate, due) + level-appropriate actions (T1/T3).
+            .sheet(item: $detailTarget) { target in
+                SharedTaskDetailSheet(taskId: target.id)
+            }
         }
     }
 
@@ -407,11 +429,204 @@ struct SharedWithYouGroup: View {
             }
             Spacer(minLength: 8)
             StatusChip(shareStatusLabel(s.level, done: s.done))
+            // Affordance: the row opens the read-only detail (the checkbox +
+            // "Sit with them" stay independent tap targets beneath the row tap).
+            Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(theme.palette.ink3)
         }
         .padding(.horizontal, 13).padding(.vertical, 11)
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .strokeBorder(theme.palette.primarySoft, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+        .contentShape(Rectangle())
+        .onTapGesture { detailTarget = SharedDetailTarget(id: s.taskId) }
+        .accessibilityHint("Opens the shared task")
+    }
+}
+
+/// Identifiable wrapper so a tapped shared-task id can drive `.sheet(item:)`.
+private struct SharedDetailTarget: Identifiable, Equatable { let id: String }
+
+// MARK: - Shared task read-only detail (T1) + shared focus entry (T3)
+
+/// The read-only detail of a task shared WITH me, built from shared_task_detail
+/// (migration 045) — the ONLY window a recipient has into the task's contents
+/// (RLS blocks the raw row). Shows the title, "from <owner>", life area, estimate,
+/// due, steps/subtasks, and tags, plus a level chip. Level-appropriate actions:
+/// partner/assign can Complete + start a real focus session that reflects onto the
+/// owner's task (T3); VIEW is strictly read-only. Never edits the owner's task.
+struct SharedTaskDetailSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+    let taskId: String
+
+    @State private var detail: SharedTaskDetail?
+    @State private var loaded = false
+    /// Set when the recipient taps Focus: we dismiss THIS sheet first, then start
+    /// the shared focus on `onDisappear` (the focus cover lives on another host, so
+    /// it can't present while this sheet is still dismissing).
+    @State private var pendingFocus: SharedTaskDetail?
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                if let d = detail {
+                    content(d)
+                } else if !loaded {
+                    ProgressView().padding(.top, 60)
+                } else {
+                    Text("Couldn't load this shared task.")
+                        .font(UFont.sans(14)).foregroundStyle(theme.palette.ink2)
+                        .padding(24)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            .background(theme.palette.bg.ignoresSafeArea())
+            .navigationTitle("Shared task").navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+        .presentationDetents([.medium, .large])
+        .task {
+            if detail == nil { detail = await model.shareState.sharedTaskDetail(taskId: taskId) }
+            loaded = true
+        }
+        // Start the shared focus AFTER this sheet is gone (cover on another host).
+        .onDisappear { if let d = pendingFocus { model.beginSharedFocus(d) } }
+    }
+
+    @ViewBuilder
+    private func content(_ d: SharedTaskDetail) -> some View {
+        VStack(alignment: .leading, spacing: 16) {
+            // Title + the level chip.
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text(d.name.isEmpty ? "Untitled task" : d.name)
+                    .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                StatusChip(shareStatusLabel(d.level, done: d.done))
+            }
+            Text("from \(shortName(d.ownerName))")
+                .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+
+            // Meta chips: life area · estimate · due (a short, fixed set).
+            HStack(spacing: 6) {
+                ForEach(Array(metaChips(d).enumerated()), id: \.offset) { _, m in QuietChip(m) }
+            }
+
+            // Steps / subtasks (objectives).
+            if !d.objectives.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    SectionLabel("Steps")
+                    ForEach(Array(d.objectives.enumerated()), id: \.offset) { _, o in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: o.done == true ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 14))
+                                .foregroundStyle(o.done == true ? theme.palette.green : theme.palette.ink3)
+                            Text(o.text).font(UFont.sans(14))
+                                .strikethrough(o.done == true)
+                                .foregroundStyle(o.done == true ? theme.palette.ink3 : theme.palette.ink)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                }
+            }
+
+            // Tags — horizontal scroll so a long set never breaks the layout.
+            if !d.tags.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) { ForEach(d.tags, id: \.self) { QuietChip("#\($0)") } }
+                }
+            }
+
+            // Level-appropriate actions — partner/assign can act; view is read-only.
+            if levelCanComplete(d.level) {
+                actions(d)
+            } else {
+                Text("You're following this task. You'll see when \(shortName(d.ownerName)) starts and finishes it.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(20)
+    }
+
+    private func metaChips(_ d: SharedTaskDetail) -> [String] {
+        var out: [String] = []
+        if let area = d.lifeArea, !area.isEmpty { out.append(area) }
+        out.append("\(d.estimateMin)m")
+        if let due = d.dueAt, let label = Self.dueLabel(due) { out.append("due \(label)") }
+        return out
+    }
+
+    @ViewBuilder
+    private func actions(_ d: SharedTaskDetail) -> some View {
+        HStack(spacing: 10) {
+            // Complete / reopen (shared_task_set_done, partner/assign only).
+            // Optimistic, with a ROLLBACK: shared_task_set_done can reject
+            // (e.g. the owner revoked the share, or offline) — reverting the flip
+            // keeps the chip honest instead of showing a "done" that never landed.
+            Button {
+                let next = !d.done
+                detail?.done = next          // optimistic
+                Task {
+                    do { try await model.shareState.completeSharedTask(taskId: d.taskId, done: next) }
+                    catch { detail?.done = !next }   // revert on RPC failure
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: d.done ? "arrow.uturn.left" : "checkmark")
+                        .font(.system(size: 12, weight: .semibold))
+                    Text(d.done ? "Reopen" : "Complete").font(UFont.sans(13, .semibold))
+                }
+                .foregroundStyle(d.done ? theme.palette.ink2 : .white)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .background(d.done ? AnyShapeStyle(theme.palette.bg2) : AnyShapeStyle(theme.palette.primary), in: Capsule())
+            }.buttonStyle(.plain)
+
+            // Focus with them (partner) / Focus (assign) — a real session whose
+            // time reflects onto the owner's task via log_shared_focus (T3).
+            Button {
+                pendingFocus = d
+                dismiss()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "timer").font(.system(size: 12, weight: .semibold))
+                    Text(sharedFocusActionLabel(d.level)).font(UFont.sans(13, .semibold))
+                }
+                .foregroundStyle(theme.palette.primaryDeep)
+                .padding(.horizontal, 16).padding(.vertical, 10)
+                .background(theme.palette.primarySoft, in: Capsule())
+            }.buttonStyle(.plain)
+        }
+        .padding(.top, 2)
+    }
+
+    /// "Jun 14" from an ISO due timestamp (best-effort; drops on a bad parse).
+    private static func dueLabel(_ iso: String) -> String? {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let date = f.date(from: iso) ?? {
+            f.formatOptions = [.withInternetDateTime]; return f.date(from: iso)
+        }()
+        guard let date else { return nil }
+        let out = DateFormatter()
+        out.dateFormat = "MMM d"
+        return out.string(from: date)
+    }
+}
+
+/// A small quiet capsule chip (life area / estimate / due / tag) in the detail.
+private struct QuietChip: View {
+    @Environment(\.uTheme) private var theme
+    let text: String
+    init(_ text: String) { self.text = text }
+    var body: some View {
+        Text(text)
+            .font(UFont.sans(11.5, .medium)).foregroundStyle(theme.palette.ink2)
+            .lineLimit(1)
+            .padding(.horizontal, 9).padding(.vertical, 4)
+            .background(theme.palette.bg2, in: Capsule())
     }
 }
 

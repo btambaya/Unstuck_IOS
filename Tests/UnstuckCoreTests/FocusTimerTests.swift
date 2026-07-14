@@ -19,6 +19,42 @@ final class FormatMMSSTests: XCTestCase {
     }
 }
 
+final class SharedFocusMarkerTests: XCTestCase {
+    // A fresh session for a DIFFERENT task must not inherit a prior session's
+    // shared marker (else a following own-task focus would wrongly log onto an
+    // owner). start() resets it; the caller re-stamps for a shared focus.
+    func testFreshStartClearsSharedMarker() {
+        var live = FocusTimer.start(.empty, taskId: "shared-1", estimateMin: 25, now: T0)
+        live.sharedFocusLevel = .partner
+        let next = FocusTimer.start(live, taskId: "own-2", estimateMin: 25, now: T0 + 60_000)
+        XCTAssertNil(next.sharedFocusLevel)
+        XCTAssertEqual(next.taskId, "own-2")
+    }
+
+    // Resuming the SAME paused task preserves its shared marker (the session is
+    // continued, not recreated).
+    func testResumePreservesSharedMarker() {
+        var live = FocusTimer.start(.empty, taskId: "shared-1", estimateMin: 25, now: T0)
+        live.sharedFocusLevel = .assign
+        live = FocusTimer.pause(live, now: T0 + 30_000)
+        let resumed = FocusTimer.start(live, taskId: "shared-1", estimateMin: 25, now: T0 + 60_000)
+        XCTAssertEqual(resumed.sharedFocusLevel, .assign)
+        XCTAssertFalse(resumed.paused)
+    }
+
+    // Old persisted live_session JSON (pre-045, no key) decodes to nil, not a crash.
+    func testLiveSessionDecodesWithoutSharedMarker() throws {
+        let json = """
+        {"id":"s1","taskId":"t1","sessionStart":1000,"paused":false,
+         "sessionEstimateMin":25,"nudge80Fired":false,"overrunPromptFired":false,
+         "treatment":"ambient"}
+        """
+        let live = try JSONDecoder().decode(LiveSession.self, from: Data(json.utf8))
+        XCTAssertNil(live.sharedFocusLevel)
+        XCTAssertEqual(live.taskId, "t1")
+    }
+}
+
 final class FocusTimerBasicTests: XCTestCase {
 
     func testIdleByDefault() {

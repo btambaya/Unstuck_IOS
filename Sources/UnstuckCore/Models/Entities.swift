@@ -162,8 +162,15 @@ public struct LiveSession: Codable, Equatable, Sendable {
     /// is ticked off without ending the series. nil for a normal task focus.
     /// Device-local (not synced; lives only in the live_session JSON).
     public var occurrenceBlockId: String?
+    /// Set when this session is a focus on a task shared WITH me (partner/assign):
+    /// the share level. Finalize accrues the elapsed onto the OWNER's task via
+    /// log_shared_focus instead of writing my own Session/totalFocused — the task
+    /// isn't mine. Persisted in the live_session JSON so EVERY finalize path
+    /// (done / end / cancel / displaced / relaunch) can detect it from the stored
+    /// session alone. nil for a normal own-task focus. Device-local (not synced).
+    public var sharedFocusLevel: ShareLevel?
 
-    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil) {
+    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil) {
         self.id = id
         self.taskId = taskId
         self.sessionStart = sessionStart
@@ -175,5 +182,6 @@ public struct LiveSession: Codable, Equatable, Sendable {
         self.treatment = treatment
         self.priorAccumulatedSec = priorAccumulatedSec
         self.occurrenceBlockId = occurrenceBlockId
+        self.sharedFocusLevel = sharedFocusLevel
     }
 }

@@ -58,4 +58,26 @@ final class SharingModelsTests: XCTestCase {
         let b = ShareBadge(taskId: "t1", level: .view, recipientName: "Jo")
         XCTAssertEqual(try roundTrip(b), b)
     }
+
+    // T1/T3: the read-only shared-task detail model + its focus-action label.
+    func testSharedTaskDetailIdentityAndEquality() {
+        let d = SharedTaskDetail(taskId: "t7", ownerName: "Pat", level: .partner,
+                                 name: "Ship the deck", done: false, estimateMin: 45,
+                                 totalFocused: 600, lifeArea: "Work", priority: .high,
+                                 tags: ["deck"], objectives: [Objective(text: "Outline", done: true)],
+                                 dueAt: nil, createdAt: nil)
+        XCTAssertEqual(d.id, "t7")            // Identifiable id == taskId
+        XCTAssertEqual(d, d)
+        XCTAssertEqual(d.objectives.first?.text, "Outline")
+    }
+
+    // The focus action is offered only for the focus-capable levels — the same
+    // partner+assign rule log_shared_focus enforces server-side.
+    func testSharedFocusActionLabelMatchesGate() {
+        XCTAssertEqual(sharedFocusActionLabel(.partner), "Focus with them")
+        XCTAssertEqual(sharedFocusActionLabel(.assign), "Focus")
+        XCTAssertTrue(levelCanComplete(.partner))
+        XCTAssertTrue(levelCanComplete(.assign))
+        XCTAssertFalse(levelCanComplete(.view))   // view = read-only, no focus/complete
+    }
 }
