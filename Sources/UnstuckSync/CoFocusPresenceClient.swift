@@ -47,6 +47,11 @@ public actor CoFocusChannel {
     /// Stable session-join timestamp so a track state-flip (observe → here)
     /// doesn't reset "since".
     private let sinceMs: Double
+    /// The latest track state + focus-timer we broadcast, retained so a re-track
+    /// (state flip / timer change) rebuilds the full payload. `timer` is only
+    /// carried into the wire payload while `track == .focusing` (T1b).
+    private var track: CoFocusState?
+    private var timer: CoFocusTimerState?
 
     public init(client: SupabaseClient, taskId: String, selfId: String, selfName: String) {
         self.client = client
@@ -60,9 +65,12 @@ public actor CoFocusChannel {
     /// (presence callbacks must be registered pre-subscribe), subscribe, then
     /// track our own state (if any). Idempotent — re-joining tears the old
     /// channel down first.
-    public func start(track: CoFocusState?, onPeers: @escaping @Sendable ([CoFocusPeer]) -> Void) async {
+    public func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
+                      onPeers: @escaping @Sendable ([CoFocusPeer]) -> Void) async {
         await stop()
         self.onPeers = onPeers
+        self.track = track
+        self.timer = timer
         // Presence key = our user id, so both sides self-exclude consistently.
         let ch = client.channel("cofocus:\(taskId)") { config in config.presence.key = selfId }
         let (stream, continuation) = AsyncStream<PresenceDiff>.makeStream()
@@ -90,15 +98,27 @@ public actor CoFocusChannel {
         pumpTask = Task { [weak self] in
             for await diff in stream { await self?.apply(diff) }
         }
-        if let track { await trackState(track) }
+        if track != nil { await applyTrack() }
     }
 
     /// Flip our presence state in place (observe → here → focusing) without
-    /// tearing down the channel — the recipient "Sit with them" toggle.
-    public func setTrack(_ track: CoFocusState?) async {
+    /// tearing down the channel — the recipient "Sit with them" toggle. Carries
+    /// the focus timer through when flipping to `.focusing`.
+    public func setTrack(_ track: CoFocusState?, timer: CoFocusTimerState? = nil) async {
         guard let ch = channel else { return }
-        if let track { await trackState(track) }
+        self.track = track
+        self.timer = timer
+        if track != nil { await applyTrack() }
         else { await ch.untrack() }
+    }
+
+    /// Re-track with an updated focus timer (pause / resume / extend / start), so
+    /// a focusing peer's shared timer updates live on the other side (T1b). A
+    /// no-op unless we're currently tracking as `.focusing`.
+    public func updateTimer(_ timer: CoFocusTimerState?) async {
+        self.timer = timer
+        guard channel != nil, track == .focusing else { return }
+        await applyTrack()
     }
 
     /// Leave + tear down (untrack, cancel the stream, remove the channel).
@@ -107,6 +127,8 @@ public actor CoFocusChannel {
         subscription?.cancel(); subscription = nil
         presences = [:]
         onPeers = nil
+        track = nil
+        timer = nil
         if let ch = channel {
             await ch.untrack()
             await client.removeChannel(ch)
@@ -114,9 +136,16 @@ public actor CoFocusChannel {
         channel = nil
     }
 
-    private func trackState(_ track: CoFocusState) async {
-        guard let ch = channel else { return }
-        try? await ch.track(TrackPayload(userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs))
+    /// Track the current state + (for a focuser) the live timer. Timer fields are
+    /// only attached while `.focusing`; a `.here`/observe peer omits them, so the
+    /// wire payload matches web + Android field-for-field.
+    private func applyTrack() async {
+        guard let ch = channel, let track else { return }
+        let t = track == .focusing ? timer : nil
+        try? await ch.track(TrackPayload(
+            userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs,
+            sessionStartMs: t?.sessionStartMs, paused: t?.paused,
+            pausedAtMs: t?.pausedAtMs, estimateMin: t?.estimateMin))
     }
 
     private func apply(_ diff: PresenceDiff) {
@@ -150,7 +179,11 @@ public actor CoFocusChannel {
             userId: wire?.userId ?? fallbackKey,
             name: wire?.name,
             state: wire?.state.flatMap(CoFocusState.init(rawValue:)),
-            sinceMs: wire?.sinceMs)
+            sinceMs: wire?.sinceMs,
+            sessionStartMs: wire?.sessionStartMs,
+            paused: wire?.paused,
+            pausedAtMs: wire?.pausedAtMs,
+            estimateMin: wire?.estimateMin)
     }
 
     private struct PresenceDiff: Sendable {
@@ -165,11 +198,21 @@ public actor CoFocusChannel {
         let name: String
         let state: String
         let sinceMs: Double
+        // Focus-timer fields (T1b) — nil for a non-focuser, so Codable's
+        // `encodeIfPresent` omits them (matching the web/Android payload shape).
+        let sessionStartMs: Double?
+        let paused: Bool?
+        let pausedAtMs: Double?
+        let estimateMin: Int?
     }
     private struct MetaWire: Decodable {
         var userId: String?
         var name: String?
         var state: String?
         var sinceMs: Double?
+        var sessionStartMs: Double?
+        var paused: Bool?
+        var pausedAtMs: Double?
+        var estimateMin: Int?
     }
 }

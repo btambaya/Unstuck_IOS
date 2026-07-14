@@ -18,7 +18,10 @@ struct CommandPalette: View {
             List {
                 Section("Actions") {
                     Button { dismiss(); model.router.present(.newTask) } label: { Label("New task", systemImage: "plus") }
-                    if let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: model.liveSession?.taskId) {
+                    // Exclude tasks the owner assigned out — they're someone else's
+                    // now, so never surfaced as a "Focus" pick (T3 secondary path).
+                    if let next = pickStartNext(tasks: tasks, blocks: blocks, liveTaskId: model.liveSession?.taskId,
+                                                excludeIds: model.shareState.assignedOutIds) {
                         Button { dismiss(); model.router.beginFocus(next) } label: { Label("Focus: \(next.name)", systemImage: "timer") }
                     }
                     Button { dismiss(); model.router.select(.today) } label: { Label("Go to Today", systemImage: "sun.max") }
@@ -58,7 +61,9 @@ struct CommandPalette: View {
     }
 
     private var filtered: [TaskItem] {
-        let open = tasks.filter { !$0.done }
+        // Drop tasks the owner assigned out — they can't be focus-started (T3).
+        let assignedOut = model.shareState.assignedOutIds
+        let open = tasks.filter { !$0.done && !assignedOut.contains($0.id) }
         guard !query.isEmpty else { return Array(open.prefix(8)) }
         return open.filter { $0.name.localizedCaseInsensitiveContains(query) }
     }

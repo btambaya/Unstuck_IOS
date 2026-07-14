@@ -769,12 +769,13 @@ final class CoFocusModel {
     }
 
     /// Join the channel (idempotent). `track` = how you appear: .focusing (owner),
-    /// .here (recipient sitting in), or nil (observe only).
-    func start(track: CoFocusState?) {
+    /// .here (recipient sitting in), or nil (observe only). `timer` carries the
+    /// live focus-session state so focusing peers can render the shared timer (T1b).
+    func start(track: CoFocusState?, timer: CoFocusTimerState? = nil) {
         guard !running, let channel else { return }
         running = true
         Task { [weak self] in
-            await channel.start(track: track) { peers in
+            await channel.start(track: track, timer: timer) { peers in
                 Task { @MainActor in self?.peers = peers }
             }
         }
@@ -782,9 +783,16 @@ final class CoFocusModel {
 
     /// Flip your presence in place (recipient "Sit with them" on/off) — no
     /// channel teardown.
-    func setTrack(_ track: CoFocusState?) {
+    func setTrack(_ track: CoFocusState?, timer: CoFocusTimerState? = nil) {
         guard running, let channel else { return }
-        Task { await channel.setTrack(track) }
+        Task { await channel.setTrack(track, timer: timer) }
+    }
+
+    /// Re-broadcast the focus timer (pause / resume / extend / start) so peers'
+    /// shared timers update live (T1b). No-op unless tracking as `.focusing`.
+    func updateTimer(_ timer: CoFocusTimerState?) {
+        guard running, let channel else { return }
+        Task { await channel.updateTimer(timer) }
     }
 
     /// Leave + tear down (call on disappear/finish — no leaks).
@@ -808,10 +816,16 @@ struct CoFocusBar: View {
             EmptyView()
         } else {
             let anyFocusing = peers.contains { $0.state == .focusing }
-            HStack(spacing: 9) {
-                CoFocusPulseDot()
-                Text("\(coFocusPeopleLabel(peers)) \(coFocusPresenceVerb(peers, anyFocusing: anyFocusing))")
-                    .font(UFont.sans(12.5, .semibold)).foregroundStyle(theme.palette.ink)
+            // Shared view (T1b): if a focusing peer carries a live session, show
+            // their running/paused timer so both sides see the same clock.
+            let timed = peers.first { $0.state == .focusing && $0.sessionStartMs != nil }
+            VStack(spacing: 4) {
+                HStack(spacing: 9) {
+                    CoFocusPulseDot()
+                    Text("\(coFocusPeopleLabel(peers)) \(coFocusPresenceVerb(peers, anyFocusing: anyFocusing))")
+                        .font(UFont.sans(12.5, .semibold)).foregroundStyle(theme.palette.ink)
+                }
+                if let timed { CoFocusPeerTimerView(peer: timed) }
             }
             .padding(.horizontal, 14).padding(.vertical, 8)
             .background(theme.palette.surface, in: Capsule())
@@ -819,6 +833,42 @@ struct CoFocusBar: View {
             .shadow(color: .black.opacity(0.14), radius: 12, y: 6)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("\(coFocusPeopleLabel(peers)) \(coFocusPresenceVerb(peers, anyFocusing: anyFocusing))")
+        }
+    }
+}
+
+/// The live shared timer for a FOCUSING peer (T1b) — a calm mm:ss + "N left"
+/// that ticks locally (TimelineView) and shows a "Paused" badge when the peer
+/// paused. Elapsed/remaining come from the pure `coFocusPeerTimer`, so all
+/// platforms compute them identically. Renders nothing if the peer isn't
+/// focusing / carries no session (the callers already gate on that).
+struct CoFocusPeerTimerView: View {
+    @Environment(\.uTheme) private var theme
+    let peer: CoFocusPeer
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            let now = ctx.date.timeIntervalSince1970 * 1000
+            if let t = coFocusPeerTimer(peer, now: now) {
+                HStack(spacing: 6) {
+                    Text(formatMMSS(t.elapsedSec))
+                        .font(UFont.mono(12, .medium)).monospacedDigit()
+                        .foregroundStyle(t.paused ? theme.palette.ink3 : theme.palette.ink)
+                    Text("\(formatMMSS(t.remainingSec)) left")
+                        .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                    if t.paused {
+                        Text("Paused")
+                            .font(UFont.sans(9.5, .bold)).tracking(0.4)
+                            .foregroundStyle(theme.palette.amberInk)
+                            .padding(.horizontal, 6).padding(.vertical, 1.5)
+                            .background(theme.palette.amberSoft, in: Capsule())
+                    }
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel(t.paused
+                    ? "Paused at \(formatMMSS(t.elapsedSec))"
+                    : "\(formatMMSS(t.elapsedSec)) focused, \(formatMMSS(t.remainingSec)) left")
+            }
         }
     }
 }
@@ -835,31 +885,39 @@ struct PartnerPresence: View {
     @State private var sitting = false
 
     var body: some View {
-        let ownerFocusing = cf?.peers.contains { $0.state == .focusing } ?? false
+        // The owner's focusing presence (if any) — carries the shared timer (T1b).
+        let ownerPeer = cf?.peers.first { $0.state == .focusing }
+        let ownerFocusing = ownerPeer != nil
         Group {
             // Nothing to show until the owner is focusing or you've chosen to sit in.
             if ownerFocusing || sitting {
-                HStack(spacing: 8) {
-                    if ownerFocusing {
-                        HStack(spacing: 5) {
-                            CoFocusPulseDot()
-                            Text("focusing now").font(UFont.sans(11.5, .semibold))
-                                .foregroundStyle(theme.palette.greenInk)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 8) {
+                        if ownerFocusing {
+                            HStack(spacing: 5) {
+                                CoFocusPulseDot()
+                                Text("focusing now").font(UFont.sans(11.5, .semibold))
+                                    .foregroundStyle(theme.palette.greenInk)
+                            }
                         }
+                        Button {
+                            sitting.toggle()
+                            cf?.setTrack(sitting ? .here : nil)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "person.2.fill").font(.system(size: 10))
+                                Text(sitting ? "Sitting with them" : "Sit with them")
+                                    .font(UFont.sans(11, .bold))
+                            }
+                            .foregroundStyle(sitting ? .white : theme.palette.primaryDeep)
+                            .padding(.horizontal, 10).padding(.vertical, 3)
+                            .background(sitting ? theme.palette.primary : theme.palette.primarySoft, in: Capsule())
+                        }.buttonStyle(.plain)
                     }
-                    Button {
-                        sitting.toggle()
-                        cf?.setTrack(sitting ? .here : nil)
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "person.2.fill").font(.system(size: 10))
-                            Text(sitting ? "Sitting with them" : "Sit with them")
-                                .font(UFont.sans(11, .bold))
-                        }
-                        .foregroundStyle(sitting ? .white : theme.palette.primaryDeep)
-                        .padding(.horizontal, 10).padding(.vertical, 3)
-                        .background(sitting ? theme.palette.primary : theme.palette.primarySoft, in: Capsule())
-                    }.buttonStyle(.plain)
+                    // The same running/paused timer the owner sees — shared view.
+                    if let p = ownerPeer, p.sessionStartMs != nil {
+                        CoFocusPeerTimerView(peer: p)
+                    }
                 }
                 .padding(.top, 3)
             }

@@ -91,6 +91,16 @@ struct TaskEditor: View {
         if editTarget.totalFocused > 0 { return "In progress" }
         return "Not started"
     }
+    /// The task is handed to someone else (an outgoing 'assign' share): the
+    /// owner's view is read-only — no Focus / Mark-done — but the Share controls
+    /// stay live so they can take it back (downgrade / unshare), which re-enables
+    /// Focus + completion (T3). Occurrences are never assigned out, so only a real
+    /// task with an outgoing assign badge is gated.
+    private var isAssignedOut: Bool {
+        guard !isOcc else { return false }
+        return model.shareState.assignedOut[editTarget.id] != nil
+    }
+    private var assignedOutName: String { model.shareState.assignedOut[editTarget.id] ?? "" }
 
     var body: some View {
         NavigationStack {
@@ -136,6 +146,9 @@ struct TaskEditor: View {
                 }
             }
             .sheet(isPresented: $showShare) { ShareSheet(task: editTarget) }
+            // Live outgoing badges → the view-only (assigned-out) gate (T3).
+            // Idempotent; refetches so a directly-opened editor has current state.
+            .task { model.shareState.start() }
             .task { await observe() }
             .alert("Estimate (minutes)", isPresented: $showEstimate) {
                 TextField("Minutes", text: $estimateText).keyboardType(.numberPad)
@@ -208,33 +221,45 @@ struct TaskEditor: View {
     }
 
     private var actionRow: some View {
-        HStack(spacing: 8) {
-            Button { startFocus() } label: {
-                HStack(spacing: 6) { Image(systemName: "play.fill").font(.system(size: 13)); Text("Focus").font(UFont.sans(15, .medium)) }
-                    .foregroundStyle(.white)
-                    .padding(.vertical, 11).frame(maxWidth: .infinity)
-                    .background(theme.palette.coralDeep, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
-            }
-            .buttonStyle(.plain)
-            if !isOcc {
-                Button { openSchedule() } label: {
-                    Text("Schedule").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink)
-                        .padding(.horizontal, 14).padding(.vertical, 11)
-                        .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).stroke(theme.palette.line2))
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                // Assigned-out tasks are view-only for the owner — no Focus (T3).
+                if !isAssignedOut {
+                    Button { startFocus() } label: {
+                        HStack(spacing: 6) { Image(systemName: "play.fill").font(.system(size: 13)); Text("Focus").font(UFont.sans(15, .medium)) }
+                            .foregroundStyle(.white)
+                            .padding(.vertical, 11).frame(maxWidth: .infinity)
+                            .background(theme.palette.coralDeep, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
-            }
-            Button { model.toggleDone(initialTask) } label: {
-                Text(isDone ? "✓ Done" : "Mark done").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
-                    .padding(.horizontal, 10).padding(.vertical, 11)
-            }
-            .buttonStyle(.plain)
-            if isOcc {
-                Button { model.skipOccurrence(initialTask.id); dismiss() } label: {
-                    Text("Skip today").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
-                        .padding(.horizontal, 8).padding(.vertical, 11)
+                if !isOcc {
+                    Button { openSchedule() } label: {
+                        Text("Schedule").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink)
+                            .padding(.horizontal, 14).padding(.vertical, 11)
+                            .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous).stroke(theme.palette.line2))
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+                // …and no Mark-done (T3). The Share controls stay live to take it back.
+                if !isAssignedOut {
+                    Button { toggleDone() } label: {
+                        Text(isDone ? "✓ Done" : "Mark done").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
+                            .padding(.horizontal, 10).padding(.vertical, 11)
+                    }
+                    .buttonStyle(.plain)
+                }
+                if isOcc {
+                    Button { model.skipOccurrence(initialTask.id); dismiss() } label: {
+                        Text("Skip today").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
+                            .padding(.horizontal, 8).padding(.vertical, 11)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            if isAssignedOut {
+                Text("You assigned this to \(shortName(assignedOutName)) — view only")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
         }
         .padding(.top, 14)
@@ -605,9 +630,19 @@ struct TaskEditor: View {
     }
 
     private func startFocus() {
+        // Defense-in-depth: a deep-link / command-palette must not start focus on
+        // a task the owner has assigned out (the button is already hidden) (T3).
+        guard !isAssignedOut else { return }
         let t = editTarget
         dismiss()
         Task { try? await Task.sleep(nanoseconds: 350_000_000); model.router.beginFocus(t) }
+    }
+
+    /// Mark-done, guarded so a hidden-button bypass can't complete a task the
+    /// owner has assigned out (T3). Re-enabled by downgrading / unsharing.
+    private func toggleDone() {
+        guard !isAssignedOut else { return }
+        model.toggleDone(initialTask)
     }
 
     private func openEstimate() { estimateText = String(displayEstimate); showEstimate = true }

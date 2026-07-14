@@ -264,6 +264,11 @@ struct FocusView: View {
             if shared { startCoFocusIfNeeded() }
             else { coFocus?.stop(); coFocus = nil }
         }
+        // Re-broadcast the timer on every pause / resume / extend / start so a
+        // watching partner's shared timer updates live (T1b). No-op off-channel.
+        .onChange(of: coFocusTimerSignature) { _, _ in
+            coFocus?.updateTimer(coFocusTimerState)
+        }
         .onDisappear { teardownCopilot(); AmbientAudio.shared.stop(); coFocus?.stop(); coFocus = nil; finalizeSharedOnLeave() }
         // .onDisappear does NOT fire when the phone locks/backgrounds while the
         // Focus screen stays "appeared" — the .playback engine would keep
@@ -349,11 +354,28 @@ struct FocusView: View {
     }
 
     /// Join `cofocus:<taskId>` as 'focusing' once, when the task is partner-shared.
+    /// Broadcasts the live session's timer so peers render the shared view (T1b).
     private func startCoFocusIfNeeded() {
         guard coFocus == nil, fm != nil, coFocusPartnerShared else { return }
         let cf = model.makeCoFocusModel(taskId: coFocusTaskId)
-        cf.start(track: .focusing)
+        cf.start(track: .focusing, timer: coFocusTimerState)
         coFocus = cf
+    }
+
+    /// The broadcastable timer state of THIS focus session (T1b). Mirrors the
+    /// focuser's own FocusTimer.elapsedSec inputs: sessionStart (resume-adjusted),
+    /// paused, pausedAt, and the live (extend-aware) session estimate.
+    private var coFocusTimerState: CoFocusTimerState? {
+        guard let live = fm?.live, let start = live.sessionStart else { return nil }
+        return CoFocusTimerState(sessionStartMs: start, paused: live.paused,
+                                 pausedAtMs: live.pausedAt, estimateMin: live.sessionEstimateMin)
+    }
+
+    /// Changes whenever the broadcastable timer state changes (start / pause /
+    /// resume / extend), so `.onChange` re-tracks presence for peers.
+    private var coFocusTimerSignature: String {
+        guard let live = fm?.live else { return "" }
+        return "\(live.sessionStart ?? 0)|\(live.paused)|\(live.pausedAt ?? 0)|\(live.sessionEstimateMin)"
     }
 
     private var listeningIndicator: some View {
