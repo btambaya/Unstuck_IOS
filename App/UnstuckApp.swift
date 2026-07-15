@@ -98,6 +98,12 @@ struct UnstuckApp: App {
                 // analogue of Android's fontScale multiplier.
                 .modifier(TypeScale(steps: model.settings.typeStepShift))
                 .onOpenURL { model.handleDeepLink($0) }
+                // Universal Links (https invite link) arrive as a browsing-web
+                // user activity, NOT onOpenURL — route its URL through the same
+                // handler so unstucknow.io/circle/join opens + redeems in-app.
+                .onContinueUserActivity(NSUserActivityTypeBrowsingWeb) { activity in
+                    if let url = activity.webpageURL { model.handleDeepLink(url) }
+                }
                 .task {
                     #if DEBUG
                     if ProcessInfo.processInfo.environment["UITEST_SEED"] == "1" {

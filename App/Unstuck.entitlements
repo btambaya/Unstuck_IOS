@@ -10,6 +10,13 @@
     <array>
         <string>Default</string>
     </array>
+    <!-- Universal Links: an https invite link (unstucknow.io/circle/join?code=…)
+         opens the app instead of Safari. Backed by the AASA file at
+         unstucknow.io/.well-known/apple-app-site-association. -->
+    <key>com.apple.developer.associated-domains</key>
+    <array>
+        <string>applinks:unstucknow.io</string>
+    </array>
     <key>aps-environment</key>
     <string>$(APS_ENVIRONMENT)</string>
 </dict>

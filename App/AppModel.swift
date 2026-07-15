@@ -512,6 +512,9 @@ final class AppModel {
                     // Usage-analytics sign-in ping (not on recovery — that's a
                     // re-auth, not a real login). Throttled to once / 12h / user.
                     if isAuthed, !isRecovery { self.trackLogin() }
+                    // A circle invite link tapped while signed out stashed its
+                    // code — redeem it now that we're authenticated.
+                    if isAuthed { self.redeemPendingCircleCodeIfAny() }
                 }
             }
         }
@@ -544,7 +547,50 @@ final class AppModel {
     /// so RootView leaves the set-new-password screen for the app.
     func consumeRecovery() { pendingPasswordRecovery = false; pendingRecoveryProbe = false }
 
+    /// A pending trusted-circle invite code from a tapped invite LINK
+    /// (unstucknow.io/circle/join?code=…), held until we're signed in so the
+    /// redeem can run. Cleared once redeemed.
+    private var pendingCircleCode: String?
+
+    /// Extract the invite `code` from a circle-join UNIVERSAL LINK
+    /// (https://unstucknow.io/circle/join?code=…). Returns nil for anything else.
+    /// This is the https link the invite email/copy-link shares — Universal Links
+    /// route it here so the app opens instead of Safari (bug: it opened the site).
+    nonisolated static func circleJoinCode(from url: URL) -> String? {
+        guard let host = url.host, host.hasSuffix("unstucknow.io") else { return nil }
+        guard url.path.hasPrefix("/circle/join") else { return nil }
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+        let code = items?.first(where: { $0.name == "code" })?.value
+        return (code?.isEmpty == false) ? code : nil
+    }
+
+    /// Redeem the pending circle invite code if we have one AND are signed in.
+    /// Signed out → keep it pending; observeAuth calls this again once authed.
+    func redeemPendingCircleCodeIfAny() {
+        guard let code = pendingCircleCode, signedIn, let circle = coordinator?.circle else { return }
+        Task { [weak self] in
+            let res = await circle.redeem(code: code)
+            await MainActor.run {
+                guard let self else { return }
+                self.pendingCircleCode = nil
+                // Land on Today (the calm home); a redeemed connection surfaces in
+                // Settings → People, and any open roster refetches on the signal.
+                self.router.select(.today)
+                if res.ok {
+                    NotificationCenter.default.post(name: .unstuckCollabCircleChanged, object: nil)
+                }
+            }
+        }
+    }
+
     func handleDeepLink(_ url: URL) {
+        // A tapped invite LINK (https universal link) → redeem the circle code in
+        // the app (was opening the website). Signed out → stash until authed.
+        if let code = Self.circleJoinCode(from: url) {
+            pendingCircleCode = code
+            redeemPendingCircleCodeIfAny()
+            return
+        }
         // OAuth / magic-link PKCE callback → the auth client; everything
         // else (unstuck://task/…, /focus/…, /today, capture) routes to the
         // matching surface (spec 10 §1.7 push-tap deep links).
