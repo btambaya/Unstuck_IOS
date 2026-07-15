@@ -79,6 +79,13 @@ final class AppModel {
     /// Observed, so seeding/refresh re-renders the avatar reactively.
     private(set) var cachedUserName: String?
     private(set) var cachedEmail: String?
+    /// Cached user id + has-password, same rationale as cachedUserName: isShared/
+    /// isOwner (per collection card) and Settings' hasPassword read these instead
+    /// of `auth.currentSession` (a synchronous keychain read), so a notification
+    /// deep-linking to Collections/Settings can't reproduce the T4 render-snapshot
+    /// crash. Seeded on start(), refreshed from the authStateChanges session.
+    private(set) var cachedUserId: String?
+    private(set) var cachedHasPassword: Bool = true
 
     /// Overwrite the cached display name (used right after a successful name
     /// change so Settings/avatar reflect it before the auth `.userUpdated` event
@@ -293,6 +300,8 @@ final class AppModel {
         // authStateChanges session — see cachedUserName's note.
         cachedUserName = coord.auth.currentUserName
         cachedEmail = coord.auth.currentEmail
+        cachedUserId = coord.auth.currentUserId
+        cachedHasPassword = coord.auth.hasPassword
         await coord.start()
         await observeAuth(coord)
 
@@ -484,6 +493,8 @@ final class AppModel {
                     // keychain read). Sign-out passes nil → clears it.
                     self.cachedUserName = AuthService.displayName(from: session)
                     self.cachedEmail = AuthService.email(from: session)
+                    self.cachedUserId = AuthService.userId(from: session)
+                    self.cachedHasPassword = AuthService.hasPassword(from: session)
                     // PKCE: classify the just-exchanged session via `amr` once.
                     var isRecovery = isRecoveryEvent
                     if isAuthed, self.pendingRecoveryProbe {

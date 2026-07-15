@@ -183,6 +183,21 @@ public struct AuthService: Sendable {
     /// Email from a session (companion to `displayName(from:)` for cached identity).
     public static func email(from session: Supabase.Session?) -> String? { session?.user.email }
 
+    /// Lowercased user id from a session (server uuids are lowercase — see
+    /// `currentUserId`). For caching identity off the authStateChanges session so
+    /// render-path callers (isShared/isOwner) don't hit `currentSession` (a
+    /// synchronous keychain read) during a view body — the T4 crash class.
+    public static func userId(from session: Supabase.Session?) -> String? {
+        session?.user.id.uuidString.lowercased()
+    }
+
+    /// Whether the session's user has an email/password identity (vs Google-only).
+    /// Cached companion to `hasPassword` so Settings doesn't read `currentSession`
+    /// during render. Defaults true (matches the instance accessor).
+    public static func hasPassword(from session: Supabase.Session?) -> Bool {
+        session?.user.identities?.contains { $0.provider == "email" } ?? true
+    }
+
     public var authStateChanges: AsyncStream<(event: AuthChangeEvent, session: Supabase.Session?)> {
         client.auth.authStateChanges
     }

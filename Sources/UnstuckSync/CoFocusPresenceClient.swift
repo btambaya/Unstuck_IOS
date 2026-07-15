@@ -179,10 +179,17 @@ public actor CoFocusChannel {
     private func applyTrack() async {
         guard let ch = channel, let track else { return }
         let t = track == .focusing ? timer : nil
+        // Epoch-ms are ROUNDED to whole before hitting the wire: our source is
+        // Date().timeIntervalSince1970*1000, a FRACTIONAL Double, and supabase-swift
+        // serializes a fractional Double as a JSON decimal (e.g. 1784151661971.73).
+        // Android decodes these fields as Long (longOrNull), which REJECTS decimals →
+        // the whole timer payload is dropped and an Android partner sees no timer.
+        // An integral Double serializes as an integer literal, which every platform
+        // parses. (web accepts either; iOS accepts either on the way back in.)
         try? await ch.track(TrackPayload(
-            userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs,
-            sessionStartMs: t?.sessionStartMs, paused: t?.paused,
-            pausedAtMs: t?.pausedAtMs, estimateMin: t?.estimateMin))
+            userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs.rounded(),
+            sessionStartMs: (t?.sessionStartMs).map { $0.rounded() }, paused: t?.paused,
+            pausedAtMs: (t?.pausedAtMs).map { $0.rounded() }, estimateMin: t?.estimateMin))
         await broadcastTimer()
     }
 
@@ -191,8 +198,11 @@ public actor CoFocusChannel {
     /// would silently drop. No-op unless we're focusing with a timer.
     private func broadcastTimer() async {
         guard let ch = channel, track == .focusing, let t = timer else { return }
-        let msg = TimerBroadcast(userId: selfId, sessionStartMs: t.sessionStartMs,
-                                 paused: t.paused, pausedAtMs: t.pausedAtMs, estimateMin: t.estimateMin)
+        // Round epoch-ms to whole so they serialize as JSON integers, not decimals
+        // (see applyTrack) — a fractional Double breaks Android's Long decode.
+        let msg = TimerBroadcast(userId: selfId, sessionStartMs: t.sessionStartMs.rounded(),
+                                 paused: t.paused, pausedAtMs: t.pausedAtMs.map { $0.rounded() },
+                                 estimateMin: t.estimateMin)
         try? await ch.broadcast(event: "timer", message: msg)
     }
 

@@ -23,12 +23,15 @@ extension AppModel {
     /// list as shared (that would route edits down the RPC-only path with no
     /// outbox → silent loss).
     func isShared(_ c: ItemCollection) -> Bool {
-        let uid = coordinator?.auth.currentUserId
+        // cachedUserId (not auth.currentUserId) — this runs per collection card in a
+        // view body; auth.currentUserId hits the keychain synchronously, which during
+        // a notification-tap state-restoration snapshot trips the T4 crash. [[cached]]
+        let uid = cachedUserId
         return !(c.members ?? []).isEmpty || (c.ownerId != nil && uid != nil && c.ownerId != uid)
     }
     /// Owner (or a local/demo row with no ownerId). Gates rename/recolor/delete/share.
     func isOwner(_ c: ItemCollection) -> Bool {
-        let uid = coordinator?.auth.currentUserId
+        let uid = cachedUserId
         return c.ownerId == nil || c.ownerId == uid
     }
     /// A view-only member can't edit items; owner + editor + local can.
@@ -45,7 +48,7 @@ extension AppModel {
 
     /// True for an email/password account (vs Google-only) — gates "Change
     /// password" vs "Add a password" copy in Settings.
-    var hasPassword: Bool { coordinator?.auth.hasPassword ?? true }
+    var hasPassword: Bool { cachedHasPassword }   // cached — Settings body reads it; avoids a keychain read during render (T4)
 
     func updateDisplayName(_ name: String) async -> AuthOutcome {
         guard let auth = coordinator?.auth else { return .error("Not signed in.") }
