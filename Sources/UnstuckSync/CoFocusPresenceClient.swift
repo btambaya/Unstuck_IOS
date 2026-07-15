@@ -10,6 +10,15 @@
 //   .here     — you're sitting with them / body-doubling (recipient side).
 //   nil       — observe only: you see who's present but don't broadcast.
 //
+// PRESENCE carries WHO's here + their identity + the INITIAL focus timer. The
+// MUTABLE focus timer (pause / resume / extend) travels by BROADCAST, not a
+// presence re-track: Supabase Realtime presence does NOT propagate a metadata
+// update to an already-present key — a repeat `track()` sticks at the first
+// payload on every observer (verified against prod), so a partner never saw a
+// pause. Broadcast is fire-and-forget + reliable per event; the observer
+// overlays the latest broadcast timer onto the peer's presence session, and the
+// focuser re-announces on a new peer join so late joiners converge.
+//
 // The pure "who's here" reduction (exclude self, sort focusing-first) lives in
 // UnstuckCore's `coFocusPeers`; this layer only wires the channel + decodes the
 // raw presences into `CoFocusMeta`. Idempotent + self-cleaning: `stop()`
@@ -32,8 +41,9 @@ public struct CoFocusPresenceClient: Sendable {
 }
 
 /// One live presence channel (`cofocus:<taskId>`). Accumulates join/leave diffs
-/// into a presence map, recomputes the OTHER peers via the pure `coFocusPeers`,
-/// and pushes them to `onPeers`.
+/// into a presence map, overlays each focusing peer's latest broadcast timer,
+/// recomputes the OTHER peers via the pure `coFocusPeers`, and pushes them to
+/// `onPeers`.
 public actor CoFocusChannel {
     private let client: SupabaseClient
     private let taskId: String
@@ -41,8 +51,14 @@ public actor CoFocusChannel {
     private let selfName: String
     private var channel: RealtimeChannelV2?
     private var subscription: RealtimeSubscription?
+    private var broadcastSub: RealtimeSubscription?
+    private var helloSub: RealtimeSubscription?
     private var pumpTask: Task<Void, Never>?
     private var presences: [String: CoFocusMeta] = [:]
+    /// Latest live-timer BROADCAST per peer (userId → timer). Authoritative for
+    /// the mutable timer (pause/resume/extend); overlays the presence session.
+    /// See the file header for why presence re-track can't carry this.
+    private var broadcastTimers: [String: CoFocusTimerState] = [:]
     private var onPeers: (@Sendable ([CoFocusPeer]) -> Void)?
     /// Stable session-join timestamp so a track state-flip (observe → here)
     /// doesn't reset "since".
@@ -61,10 +77,9 @@ public actor CoFocusChannel {
         self.sinceMs = Date().timeIntervalSince1970 * 1000
     }
 
-    /// Join the channel: wire the presence diff stream BEFORE subscribing
-    /// (presence callbacks must be registered pre-subscribe), subscribe, then
-    /// track our own state (if any). Idempotent — re-joining tears the old
-    /// channel down first.
+    /// Join the channel: wire the presence + broadcast streams BEFORE subscribing
+    /// (both must be registered pre-subscribe), subscribe, then track our own
+    /// state (if any). Idempotent — re-joining tears the old channel down first.
     public func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
                       onPeers: @escaping @Sendable ([CoFocusPeer]) -> Void) async {
         await stop()
@@ -73,31 +88,48 @@ public actor CoFocusChannel {
         self.timer = timer
         // Presence key = our user id, so both sides self-exclude consistently.
         let ch = client.channel("cofocus:\(taskId)") { config in config.presence.key = selfId }
-        let (stream, continuation) = AsyncStream<PresenceDiff>.makeStream()
-        // The callback is @Sendable and captures only the continuation — the
-        // actor applies each diff off the stream.
+        let (stream, continuation) = AsyncStream<ChannelEvent>.makeStream()
+        // Both callbacks are @Sendable and capture only the continuation — the
+        // actor applies each event off the stream, serialized.
         let sub = ch.onPresenceChange { action in
             // A `presence_state` frame is the FULL authoritative snapshot (initial
             // join AND every post-reconnect resync); a `presence_diff` is an
-            // incremental change. Tag it so apply() can REPLACE on a snapshot (so a
+            // incremental change. Tag it so apply() REPLACES on a snapshot (so a
             // peer that left while we were disconnected doesn't linger) vs MERGE a diff.
-            continuation.yield(PresenceDiff(
+            continuation.yield(.presence(PresenceDiff(
                 joins: action.joins, leaves: action.leaves,
-                isSnapshot: action.rawMessage.event == "presence_state"))
+                isSnapshot: action.rawMessage.event == "presence_state")))
+        }
+        let bsub = ch.onBroadcast(event: "timer") { json in
+            continuation.yield(.timer(json))
+        }
+        // A joining peer announces itself with `hello`; a focuser replies with its
+        // current timer so a LATE joiner converges — including an observe-only
+        // peer that never tracks presence (so a presence-join re-announce can't
+        // see it). Payload is ignored beyond "someone joined".
+        let hsub = ch.onBroadcast(event: "hello") { _ in
+            continuation.yield(.hello)
         }
         do {
             try await ch.subscribeWithError()
         } catch {
             sub.cancel()
+            bsub.cancel()
+            hsub.cancel()
             continuation.finish()
             self.onPeers = nil
             return
         }
         channel = ch
         subscription = sub
+        broadcastSub = bsub
+        helloSub = hsub
         pumpTask = Task { [weak self] in
-            for await diff in stream { await self?.apply(diff) }
+            for await ev in stream { await self?.handle(ev) }
         }
+        // Announce ourselves so any focuser re-broadcasts its timer to us (works
+        // whether or not we track presence).
+        await sendHello()
         if track != nil { await applyTrack() }
     }
 
@@ -112,7 +144,7 @@ public actor CoFocusChannel {
         else { await ch.untrack() }
     }
 
-    /// Re-track with an updated focus timer (pause / resume / extend / start), so
+    /// Re-broadcast an updated focus timer (pause / resume / extend / start), so
     /// a focusing peer's shared timer updates live on the other side (T1b). A
     /// no-op unless we're currently tracking as `.focusing`.
     public func updateTimer(_ timer: CoFocusTimerState?) async {
@@ -121,11 +153,14 @@ public actor CoFocusChannel {
         await applyTrack()
     }
 
-    /// Leave + tear down (untrack, cancel the stream, remove the channel).
+    /// Leave + tear down (untrack, cancel the streams, remove the channel).
     public func stop() async {
         pumpTask?.cancel(); pumpTask = nil
         subscription?.cancel(); subscription = nil
+        broadcastSub?.cancel(); broadcastSub = nil
+        helloSub?.cancel(); helloSub = nil
         presences = [:]
+        broadcastTimers = [:]
         onPeers = nil
         track = nil
         timer = nil
@@ -136,9 +171,11 @@ public actor CoFocusChannel {
         channel = nil
     }
 
-    /// Track the current state + (for a focuser) the live timer. Timer fields are
-    /// only attached while `.focusing`; a `.here`/observe peer omits them, so the
-    /// wire payload matches web + Android field-for-field.
+    /// Track the current state + (for a focuser) the INITIAL live timer, then
+    /// broadcast the timer. Timer fields are only attached while `.focusing`; a
+    /// `.here`/observe peer omits them, so the wire payload matches web + Android
+    /// field-for-field. Presence gives a fresh joiner an instant value; the
+    /// broadcast is what reliably delivers subsequent pause/resume/extend.
     private func applyTrack() async {
         guard let ch = channel, let track else { return }
         let t = track == .focusing ? timer : nil
@@ -146,9 +183,34 @@ public actor CoFocusChannel {
             userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs,
             sessionStartMs: t?.sessionStartMs, paused: t?.paused,
             pausedAtMs: t?.pausedAtMs, estimateMin: t?.estimateMin))
+        await broadcastTimer()
     }
 
-    private func apply(_ diff: PresenceDiff) {
+    /// Broadcast the live focus timer (fire-and-forget, reliable per event) so an
+    /// ALREADY-present peer sees pause/resume/extend — which a presence re-track
+    /// would silently drop. No-op unless we're focusing with a timer.
+    private func broadcastTimer() async {
+        guard let ch = channel, track == .focusing, let t = timer else { return }
+        let msg = TimerBroadcast(userId: selfId, sessionStartMs: t.sessionStartMs,
+                                 paused: t.paused, pausedAtMs: t.pausedAtMs, estimateMin: t.estimateMin)
+        try? await ch.broadcast(event: "timer", message: msg)
+    }
+
+    /// Announce our arrival so focusers re-broadcast their current timer to us.
+    private func sendHello() async {
+        guard let ch = channel else { return }
+        try? await ch.broadcast(event: "hello", message: HelloBroadcast(userId: selfId))
+    }
+
+    private func handle(_ ev: ChannelEvent) async {
+        switch ev {
+        case .presence(let diff): applyPresence(diff)
+        case .timer(let json): applyTimerBroadcast(json)
+        case .hello: await broadcastTimer()   // a peer joined → re-announce our timer
+        }
+    }
+
+    private func applyPresence(_ diff: PresenceDiff) {
         if diff.isSnapshot {
             // Full (re)subscribe snapshot: rebuild from scratch so peers that
             // left during a socket drop (whose leave we never saw) don't linger.
@@ -157,18 +219,48 @@ public actor CoFocusChannel {
                 next[key] = Self.decodeMeta(presence, fallbackKey: key)
             }
             presences = next
+            // Drop cached broadcast timers for peers no longer present.
+            broadcastTimers = broadcastTimers.filter { presences.keys.contains($0.key) }
         } else {
             // Incremental diff: Phoenix-safe order — LEAVES before JOINS, so a key
             // present in both (a re-track / coalesced change) ends up present, not
             // removed by a stale leave.
             for key in diff.leaves.keys {
                 presences.removeValue(forKey: key)
+                broadcastTimers.removeValue(forKey: key)
             }
             for (key, presence) in diff.joins {
                 presences[key] = Self.decodeMeta(presence, fallbackKey: key)
             }
         }
-        onPeers?(coFocusPeers(from: presences, selfId: selfId))
+        emitPeers()
+    }
+
+    /// A peer broadcast an updated live timer — overlay it (authoritative over
+    /// the peer's presence session) and re-emit. The callback receives the
+    /// broadcast ENVELOPE `{event,type,payload}`; our fields live under `payload`.
+    private func applyTimerBroadcast(_ json: JSONObject) {
+        guard let wire = try? json["payload"]?.decode(as: TimerBroadcast.self),
+              let uid = wire.userId, uid != selfId, let start = wire.sessionStartMs else { return }
+        broadcastTimers[uid] = CoFocusTimerState(
+            sessionStartMs: start, paused: wire.paused ?? false,
+            pausedAtMs: wire.pausedAtMs, estimateMin: wire.estimateMin ?? 25)
+        emitPeers()
+    }
+
+    /// Emit the OTHER peers, overlaying each focusing peer's latest broadcast
+    /// timer (authoritative for pause/resume/extend) onto its presence session.
+    private func emitPeers() {
+        var peers = coFocusPeers(from: presences, selfId: selfId)
+        for i in peers.indices where peers[i].state == .focusing {
+            if let bt = broadcastTimers[peers[i].userId] {
+                peers[i].sessionStartMs = bt.sessionStartMs
+                peers[i].paused = bt.paused
+                peers[i].pausedAtMs = bt.pausedAtMs
+                peers[i].estimateMin = bt.estimateMin
+            }
+        }
+        onPeers?(peers)
     }
 
     /// Decode one raw presence into a CoFocusMeta (tolerant — your own presence
@@ -186,6 +278,11 @@ public actor CoFocusChannel {
             estimateMin: wire?.estimateMin)
     }
 
+    private enum ChannelEvent: Sendable {
+        case presence(PresenceDiff)
+        case timer(JSONObject)
+        case hello
+    }
     private struct PresenceDiff: Sendable {
         let joins: [String: PresenceV2]
         let leaves: [String: PresenceV2]
@@ -214,5 +311,20 @@ public actor CoFocusChannel {
         var paused: Bool?
         var pausedAtMs: Double?
         var estimateMin: Int?
+    }
+    /// The live-timer BROADCAST payload (event `timer`). Same fields as the
+    /// presence timer, plus `userId` so the observer keys it. Optionals so the
+    /// receiver is tolerant; the sender sets all but `pausedAtMs` (only paused).
+    private struct TimerBroadcast: Codable, Sendable {
+        let userId: String?
+        let sessionStartMs: Double?
+        let paused: Bool?
+        let pausedAtMs: Double?
+        let estimateMin: Int?
+    }
+    /// The `hello` join-announcement payload — just who joined (a focuser replies
+    /// with its `timer`, so late joiners converge without a presence re-track).
+    private struct HelloBroadcast: Codable, Sendable {
+        let userId: String
     }
 }

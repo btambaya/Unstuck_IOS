@@ -159,14 +159,29 @@ public struct AuthService: Sendable {
     /// Display name from auth metadata, falling back to the email's local-part.
     /// Mirrors the web `currentUserName` helper used for accountability chips.
     public var currentUserName: String? {
-        let meta = client.auth.currentSession?.user.userMetadata
+        Self.displayName(from: client.auth.currentSession)
+    }
+
+    /// Pure derivation of the display name from a session (full_name /
+    /// display_name metadata → email local-part → email). Kept `static` so the
+    /// app can cache identity from the `authStateChanges` session it ALREADY
+    /// holds, instead of calling `currentSession` — that accessor runs storage
+    /// migrations + a SYNCHRONOUS keychain read (SecItemCopyMatching) + a JSON
+    /// decode on EVERY call, and doing that on the main thread during a SwiftUI
+    /// view body (the avatar top-bar) stalled the CATransaction commit that a
+    /// notification-tap state-restoration snapshot asserts on → SIGABRT on
+    /// TestFlight (crash reported on build ≤22).
+    public static func displayName(from session: Supabase.Session?) -> String? {
+        let meta = session?.user.userMetadata
         if let v = meta?["full_name"], case let .string(s) = v, !s.isEmpty { return s }
         if let v = meta?["display_name"], case let .string(s) = v, !s.isEmpty { return s }
-        if let email = currentEmail, let at = email.firstIndex(of: "@") {
-            return String(email[..<at])
-        }
-        return currentEmail
+        let email = session?.user.email
+        if let email, let at = email.firstIndex(of: "@") { return String(email[..<at]) }
+        return email
     }
+
+    /// Email from a session (companion to `displayName(from:)` for cached identity).
+    public static func email(from session: Supabase.Session?) -> String? { session?.user.email }
 
     public var authStateChanges: AsyncStream<(event: AuthChangeEvent, session: Supabase.Session?)> {
         client.auth.authStateChanges

@@ -69,6 +69,22 @@ final class AppModel {
     }
     var lastRecap: RecapState?
 
+    /// Cached signed-in identity (display name + email), backing the top-bar
+    /// avatar initials, Settings, DataExport and Assistant context. Seeded once
+    /// on `start()` and refreshed from the `authStateChanges` session — NEVER
+    /// re-read from `auth.currentSession` during a view body, because that
+    /// accessor does a synchronous keychain read on every call and stalling the
+    /// main thread there during a notification-tap state-restoration snapshot
+    /// aborts with a UIKit CATransaction NSAssertion (TestFlight crash, T4).
+    /// Observed, so seeding/refresh re-renders the avatar reactively.
+    private(set) var cachedUserName: String?
+    private(set) var cachedEmail: String?
+
+    /// Overwrite the cached display name (used right after a successful name
+    /// change so Settings/avatar reflect it before the auth `.userUpdated` event
+    /// lands). Same file as the `private(set)` declaration so extensions can set it.
+    func setCachedUserName(_ name: String) { cachedUserName = name }
+
     /// In-memory cache of the persisted live focus session. The Today
     /// LiveSessionCard ticks once per second while a session is live + Today is
     /// on screen; reading the GRDB-backed liveStore (a blocking read + fresh
@@ -272,6 +288,11 @@ final class AppModel {
         let coord = SyncCoordinator(provider: provider, db: database)
         coordinator = coord
         signedIn = coord.auth.currentUserId != nil
+        // Seed the cached identity once at cold launch (one keychain read here,
+        // off the render/snapshot path). Thereafter it's refreshed from the
+        // authStateChanges session — see cachedUserName's note.
+        cachedUserName = coord.auth.currentUserName
+        cachedEmail = coord.auth.currentEmail
         await coord.start()
         await observeAuth(coord)
 
@@ -459,6 +480,10 @@ final class AppModel {
                     // Idempotent.
                     if self.signedIn && isSignOut { self.scrubDeviceLocalUserContent() }
                     self.signedIn = isAuthed
+                    // Refresh cached identity from the session in hand (no
+                    // keychain read). Sign-out passes nil → clears it.
+                    self.cachedUserName = AuthService.displayName(from: session)
+                    self.cachedEmail = AuthService.email(from: session)
                     // PKCE: classify the just-exchanged session via `amr` once.
                     var isRecovery = isRecoveryEvent
                     if isAuthed, self.pendingRecoveryProbe {

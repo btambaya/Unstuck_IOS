@@ -34,8 +34,12 @@ extension AppModel {
     /// A view-only member can't edit items; owner + editor + local can.
     func canEdit(_ c: ItemCollection) -> Bool { c.myRole != "viewer" }
 
-    var currentUserName: String? { coordinator?.auth.currentUserName }
-    var currentEmail: String? { coordinator?.auth.currentEmail }
+    // Read the CACHED identity (seeded on start(), refreshed from the auth
+    // stream), never `auth.currentSession` — that does a synchronous keychain
+    // read per call and reading it from a view body during a notification-tap
+    // state-restoration snapshot aborts with a CATransaction NSAssertion (T4).
+    var currentUserName: String? { cachedUserName }
+    var currentEmail: String? { cachedEmail }
 
     // MARK: - account management (Settings · Account)
 
@@ -45,7 +49,15 @@ extension AppModel {
 
     func updateDisplayName(_ name: String) async -> AuthOutcome {
         guard let auth = coordinator?.auth else { return .error("Not signed in.") }
-        return await auth.updateDisplayName(name)
+        let outcome = await auth.updateDisplayName(name)
+        // Reflect the new name in the cached identity immediately — the auth
+        // `.userUpdated` event also refreshes it, but updating here avoids a
+        // stale Settings row / avatar between the save and that async event.
+        if case .ok = outcome {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { setCachedUserName(trimmed) }
+        }
+        return outcome
     }
 
     /// Re-auth with the current password, then set the new one (Android parity:
