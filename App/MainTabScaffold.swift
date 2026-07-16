@@ -43,6 +43,52 @@ struct MainTabScaffold: View {
                 // this a recipient's shared focus (T3); nil = a normal own-task focus.
                 FocusView(task: task, shared: router.sharedFocus)
             }
+            // Invite-link flow (universal link → confirmed join → visible outcome).
+            // Alerts, not sheets, so they present over whatever is up. The tester's
+            // note on the old silent auto-redeem: "no way to accept or decline,
+            // when it auto accepts this isn't visible."
+            .alert("Join their circle?", isPresented: confirmInviteShown, presenting: confirmInviteCode) { code in
+                Button("Accept") { model.acceptCircleInvite(code: code) }
+                Button("Not now", role: .cancel) {}
+            } message: { _ in
+                Text("You opened an invite link. Accept to connect — you’ll see each other under Settings → People, and tasks they share with you appear in “Shared with you”.")
+            }
+            .alert(inviteResultOK ? "You’re in 🤝" : "Couldn’t join", isPresented: inviteResultShown, presenting: inviteResultMessage) { _ in
+                Button("OK") { model.circleInvitePrompt = nil }
+            } message: { msg in
+                Text(msg)
+            }
+    }
+
+    // MARK: - invite-prompt bindings (confirm + result over circleInvitePrompt)
+
+    private var confirmInviteCode: String? {
+        if case .confirm(let code) = model.circleInvitePrompt { return code }
+        return nil
+    }
+    private var confirmInviteShown: Binding<Bool> {
+        Binding(
+            get: { confirmInviteCode != nil },
+            // Only clear if still on the confirm case — Accept swaps the state to
+            // .result asynchronously and the dismissal must not clobber it.
+            set: { shown in
+                if !shown, case .confirm = model.circleInvitePrompt { model.circleInvitePrompt = nil }
+            })
+    }
+    private var inviteResultOK: Bool {
+        if case .result(let ok, _) = model.circleInvitePrompt { return ok }
+        return true
+    }
+    private var inviteResultMessage: String? {
+        if case .result(_, let message) = model.circleInvitePrompt { return message }
+        return nil
+    }
+    private var inviteResultShown: Binding<Bool> {
+        Binding(
+            get: { inviteResultMessage != nil },
+            set: { shown in
+                if !shown, case .result = model.circleInvitePrompt { model.circleInvitePrompt = nil }
+            })
     }
 
     @ViewBuilder

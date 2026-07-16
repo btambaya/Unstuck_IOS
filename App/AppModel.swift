@@ -513,8 +513,8 @@ final class AppModel {
                     // re-auth, not a real login). Throttled to once / 12h / user.
                     if isAuthed, !isRecovery { self.trackLogin() }
                     // A circle invite link tapped while signed out stashed its
-                    // code — redeem it now that we're authenticated.
-                    if isAuthed { self.redeemPendingCircleCodeIfAny() }
+                    // code — ask (Accept / Not now) now that we're authenticated.
+                    if isAuthed { self.promptPendingCircleInviteIfAny() }
                 }
             }
         }
@@ -549,8 +549,59 @@ final class AppModel {
 
     /// A pending trusted-circle invite code from a tapped invite LINK
     /// (unstucknow.io/circle/join?code=…), held until we're signed in so the
-    /// redeem can run. Cleared once redeemed.
+    /// confirm prompt can show. Cleared once prompted.
     private var pendingCircleCode: String?
+
+    /// Drives the invite-link UI (MainTabScaffold alerts): a tapped invite link
+    /// first asks Accept / Not now, then reports the outcome. The tester's
+    /// feedback on the silent auto-redeem: "there's no way to accept or decline,
+    /// when it auto accepts this isn't visible" — so nothing is redeemed until
+    /// the user accepts, and the result is always shown.
+    enum CircleInvitePrompt: Identifiable, Equatable {
+        case confirm(code: String)
+        case result(ok: Bool, message: String)
+        var id: String {
+            switch self {
+            case .confirm(let code): return "confirm:\(code)"
+            case .result(let ok, let message): return "result:\(ok):\(message)"
+            }
+        }
+    }
+    var circleInvitePrompt: CircleInvitePrompt?
+
+    /// Accept a circle invite (the confirm alert's Accept) → redeem on the
+    /// server → surface the outcome. Success also fires the circle-changed
+    /// signal so an open People roster refetches.
+    func acceptCircleInvite(code: String) {
+        guard let circle = coordinator?.circle else {
+            circleInvitePrompt = .result(ok: false, message: "Couldn’t join — you’re not signed in.")
+            return
+        }
+        Task { [weak self] in
+            let res = await circle.redeem(code: code)
+            await MainActor.run {
+                guard let self else { return }
+                if res.ok {
+                    let who = res.ownerName.flatMap { $0.isEmpty ? nil : $0 } ?? "them"
+                    self.circleInvitePrompt = .result(ok: true, message:
+                        "You’re now connected with \(who). You’ll find each other under Settings → People, and tasks they share appear in “Shared with you”.")
+                    NotificationCenter.default.post(name: .unstuckCollabCircleChanged, object: nil)
+                } else {
+                    self.circleInvitePrompt = .result(ok: false, message: Self.circleRedeemErrorText(res.error))
+                }
+            }
+        }
+    }
+
+    /// Human copy for a failed redeem — mirrors the web /circle/join page.
+    nonisolated static func circleRedeemErrorText(_ error: String?) -> String {
+        switch error {
+        case "invalid_or_expired": return "This invite has expired or already been used."
+        case "self": return "That’s your own invite link."
+        case "already_in_circle": return "You’re already in this circle."
+        default: return "Couldn’t join with this link. Check your connection and try again."
+        }
+    }
 
     /// Extract the invite `code` from a circle-join UNIVERSAL LINK
     /// (https://unstucknow.io/circle/join?code=…). Returns nil for anything else.
@@ -564,31 +615,24 @@ final class AppModel {
         return (code?.isEmpty == false) ? code : nil
     }
 
-    /// Redeem the pending circle invite code if we have one AND are signed in.
-    /// Signed out → keep it pending; observeAuth calls this again once authed.
-    func redeemPendingCircleCodeIfAny() {
-        guard let code = pendingCircleCode, signedIn, let circle = coordinator?.circle else { return }
-        Task { [weak self] in
-            let res = await circle.redeem(code: code)
-            await MainActor.run {
-                guard let self else { return }
-                self.pendingCircleCode = nil
-                // Land on Today (the calm home); a redeemed connection surfaces in
-                // Settings → People, and any open roster refetches on the signal.
-                self.router.select(.today)
-                if res.ok {
-                    NotificationCenter.default.post(name: .unstuckCollabCircleChanged, object: nil)
-                }
-            }
-        }
+    /// Surface the confirm prompt for a stashed invite code once signed in
+    /// (a link tapped while signed out waits for auth, then asks).
+    func promptPendingCircleInviteIfAny() {
+        guard let code = pendingCircleCode, signedIn else { return }
+        pendingCircleCode = nil
+        circleInvitePrompt = .confirm(code: code)
     }
 
     func handleDeepLink(_ url: URL) {
-        // A tapped invite LINK (https universal link) → redeem the circle code in
-        // the app (was opening the website). Signed out → stash until authed.
+        // A tapped invite LINK (https universal link) → ask Accept / Not now in
+        // the app (was opening the website; then auto-redeeming with no visible
+        // feedback). Signed out → stash and ask right after sign-in.
         if let code = Self.circleJoinCode(from: url) {
-            pendingCircleCode = code
-            redeemPendingCircleCodeIfAny()
+            if signedIn {
+                circleInvitePrompt = .confirm(code: code)
+            } else {
+                pendingCircleCode = code
+            }
             return
         }
         // OAuth / magic-link PKCE callback → the auth client; everything

@@ -55,25 +55,40 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
 
     // Show recap/check-in banners while the app is foregrounded, and append
     // them to the in-app Notification Log (spec 10 §1.7/§1.10).
-    // nonisolated: UNUserNotificationCenterDelegate isn't main-actor-bound,
-    // unlike UIApplicationDelegate, so this must opt out of the isolation.
+    //
+    // COMPLETION-HANDLER form, NOT the async variant, on BOTH delegate methods.
+    // The async variant resumes on a Swift-concurrency background thread, and
+    // UIKit's compiler-generated @objc completion then runs
+    // _updateStateRestorationArchive…updateSnapshot: on THAT thread — which
+    // asserts main-thread (_performBlockAfterCATransactionCommitSynchronizes
+    // NSAssertion → SIGABRT). That was the notification-tap crash on TestFlight
+    // builds 14–25 (crash log frame 6: "@objc closure #1 in
+    // PushAppDelegate.userNotificationCenter(_:didReceive:)" on Thread 13).
+    // With the handler form we do the work on the main actor and invoke the
+    // system completion FROM the main actor, so UIKit's snapshot work runs on
+    // the main thread. (The system still holds the completion until called —
+    // the iOS analog of Android's goAsync() — so no begin/endBackgroundTask.)
+    /// Carries a UN* completion block across the main-actor hop. The blocks
+    /// aren't imported `@Sendable`, but passing one to the main actor and
+    /// calling it exactly once THERE is the whole point of the crash fix.
+    private struct CompletionBox<T>: @unchecked Sendable { let call: T }
+
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+                                            willPresent notification: UNNotification,
+                                            withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void) {
         let posted = PostedNotification(notification)
-        await MainActor.run { NotificationLog.shared.add(posted) }
-        return [.banner, .sound]
+        let done = CompletionBox(call: completionHandler)
+        Task { @MainActor in
+            NotificationLog.shared.add(posted)
+            done.call([.banner, .sound])
+        }
     }
 
-    // Notification taps + action buttons (spec 10 §1.3/§1.5). The async
-    // variant already holds the system completion until this method returns
-    // (the iOS analog of Android's goAsync()), which covers the GRDB write +
-    // routing — so NO manual begin/endBackgroundTask is needed. Wrapping it in
-    // one made UIApplication snapshot for state restoration
-    // (_updateSnapshotAndStateRestoration → _performBlockAfterCATransactionCommit),
-    // which aborted with an NSAssertion when a notification was tapped
-    // (crash on build 14, iOS 26.5; reported via TestFlight).
+    // Notification taps + action buttons (spec 10 §1.3/§1.5). See the
+    // main-thread-completion note above — this is the crash-fix shape.
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
-                                            didReceive response: UNNotificationResponse) async {
+                                            didReceive response: UNNotificationResponse,
+                                            withCompletionHandler completionHandler: @escaping () -> Void) {
         let content = response.notification.request.content
         let info = content.userInfo
         let deepLink = info["deepLink"] as? String
@@ -100,10 +115,13 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         default:
             action = nil   // dismissed
         }
-        guard let action else { return }
 
-        let posted = PostedNotification(response.notification)
-        await MainActor.run { NotificationLog.shared.add(posted) }
-        await PushActionHub.shared.post(action)
+        let posted = action != nil ? PostedNotification(response.notification) : nil
+        let done = CompletionBox(call: completionHandler)
+        Task { @MainActor in
+            if let posted { NotificationLog.shared.add(posted) }
+            if let action { await PushActionHub.shared.post(action) }
+            done.call()
+        }
     }
 }
