@@ -291,6 +291,10 @@ extension AppModel {
 
     /// End the persisted live session from the shade: write the Session,
     /// accumulate focus time, send the recap — same path as the in-app Done.
+    /// For a partner-shared session, refreshLiveSession() (below) broadcasts
+    /// `ended: true` on the shared channel BEFORE teardown — best-effort: the
+    /// channel may be down while backgrounded, in which case the partner
+    /// converges via the ledger + stale-reap.
     private func endLiveSessionFromNotification() async {
         PausedCheckinScheduler.cancel()
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.sessionStart != nil else { return }
@@ -308,13 +312,24 @@ extension AppModel {
         // idempotent per session id (migration 046).
         if let level = cur.sharedFocusLevel, levelCanComplete(level) {
             let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
-            await shareState.logSharedFocus(taskId: cur.taskId, actualSec: capped, sessionId: cur.id ?? newUUID())
+            await logSharedFocusDurable(taskId: cur.taskId, actualSec: capped,
+                                        estimateMin: cur.sessionEstimateMin,
+                                        sessionId: cur.id ?? newUUID())
             return
         }
         if let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil {
             let session = Session(id: cur.id ?? newUUID(), taskId: task.id, taskName: task.name,
                                   estimateMin: task.estimateMin, actualSec: elapsed, completedAt: Self.isoNow())
-            finishFocus(task: task, session: session, elapsedSec: elapsed, markDone: false)
+            // One true shared session: an OWNER session on a partner-shared task
+            // accrues via the ledger only (same session id as the partner's
+            // finalize — exactly once). This path can resurrect a session across
+            // a background/kill, so the ledger amount is CAPPED like the shared
+            // paths (estimate + grace); the Session row keeps the raw elapsed,
+            // as today.
+            let sharedLedger = accruesViaSharedLedger(cur, taskId: task.id)
+            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
+            finishFocus(task: task, session: session, elapsedSec: elapsed, markDone: false,
+                        sharedLedger: sharedLedger, ledgerSec: sharedLedger ? capped : nil)
         } else {
             saveSession(Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: "Focus session",
                                 estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))

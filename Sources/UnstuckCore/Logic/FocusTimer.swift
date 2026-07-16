@@ -100,6 +100,52 @@ public enum FocusTimer {
         // A fresh session for a different task must not inherit a prior session's
         // shared marker; the caller (FocusModel) re-sets it for a shared focus.
         next.sharedFocusLevel = nil
+        // Nor the previous session's shared-control bookkeeping — a fresh MINT
+        // starts the rev chain over (one true shared session).
+        next.sharedSessionRev = nil
+        next.sharedSessionAtMs = nil
+        next.lastAppliedRev = nil
+        next.lastAppliedAtMs = nil
+        next.sharedSessionEndedBy = nil
+        return next
+    }
+
+    /// ADOPT an in-flight shared session from the co-focus channel — the JOIN
+    /// half of join-or-mint (one true shared session). Bypasses the mint: the
+    /// id / start / paused / pausedAt / estimate come from the broadcast state,
+    /// so the focus screen opens mid-clock on the same session the partner is
+    /// running. Keeps the current treatment; the caller re-stamps
+    /// sharedFocusLevel + priorAccumulatedSec (and occurrenceBlockId).
+    /// `lastAppliedRev/AtMs` are seeded from the adopted state so the LWW floor
+    /// starts where the wire left off, and the next local control broadcasts
+    /// `rev + 1`. A partner clock running AHEAD can post a start in our future
+    /// (adoptable within the 2-min skew window) — clamp it to `now` for local
+    /// display so elapsed never renders negative.
+    public static func adopt(
+        _ cur: LiveSession,
+        taskId: String,
+        state: SharedSessionState,
+        priorAccumulatedSec: Int? = nil,
+        now: EpochMillis,
+        occurrenceBlockId: String? = nil
+    ) -> LiveSession {
+        var next = cur
+        next.id = state.sessionId
+        next.taskId = taskId
+        next.sessionStart = min(state.sessionStartMs, now)
+        next.paused = state.paused
+        next.pausedAt = state.pausedAtMs
+        next.sessionEstimateMin = state.estimateMin
+        next.nudge80Fired = false
+        next.overrunPromptFired = false
+        next.priorAccumulatedSec = priorAccumulatedSec ?? 0
+        next.occurrenceBlockId = occurrenceBlockId
+        next.sharedFocusLevel = nil
+        next.sharedSessionRev = state.rev
+        next.sharedSessionAtMs = nil
+        next.lastAppliedRev = state.rev
+        next.lastAppliedAtMs = state.atMs
+        next.sharedSessionEndedBy = nil
         return next
     }
 

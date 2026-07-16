@@ -169,8 +169,26 @@ public struct LiveSession: Codable, Equatable, Sendable {
     /// (done / end / cancel / displaced / relaunch) can detect it from the stored
     /// session alone. nil for a normal own-task focus. Device-local (not synced).
     public var sharedFocusLevel: ShareLevel?
+    // --- One true shared session (partner co-focus v2). All optional so old
+    // persisted blobs (and other-platform stores) keep decoding.
+    /// The `rev` of the last shared state THIS device broadcast (nil until the
+    /// session is shared-broadcast at least once). The next local control sends
+    /// `max(sharedSessionRev, lastAppliedRev) + 1`.
+    public var sharedSessionRev: Int?
+    /// The `atMs` of the last LOCAL control this device broadcast — persisted
+    /// so the LWW floor survives a relaunch (a rebind seeds its broadcast
+    /// baseline from the stored session and must not fall behind its own last
+    /// control on the atMs tiebreak).
+    public var sharedSessionAtMs: Double?
+    /// The `(rev, atMs)` of the last REMOTE control applied to this session —
+    /// the LWW floor for incoming `timer` messages.
+    public var lastAppliedRev: Int?
+    public var lastAppliedAtMs: Double?
+    /// Display name of the participant whose remote `ended` finalized this
+    /// session ("<name> ended the session" on the recap). nil otherwise.
+    public var sharedSessionEndedBy: String?
 
-    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil) {
+    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil, sharedSessionRev: Int? = nil, sharedSessionAtMs: Double? = nil, lastAppliedRev: Int? = nil, lastAppliedAtMs: Double? = nil, sharedSessionEndedBy: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.sessionStart = sessionStart
@@ -183,5 +201,10 @@ public struct LiveSession: Codable, Equatable, Sendable {
         self.priorAccumulatedSec = priorAccumulatedSec
         self.occurrenceBlockId = occurrenceBlockId
         self.sharedFocusLevel = sharedFocusLevel
+        self.sharedSessionRev = sharedSessionRev
+        self.sharedSessionAtMs = sharedSessionAtMs
+        self.lastAppliedRev = lastAppliedRev
+        self.lastAppliedAtMs = lastAppliedAtMs
+        self.sharedSessionEndedBy = sharedSessionEndedBy
     }
 }

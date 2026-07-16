@@ -38,6 +38,58 @@ public struct CoFocusPresenceClient: Sendable {
     public func channel(taskId: String, selfId: String, selfName: String) -> CoFocusChannel {
         CoFocusChannel(client: client, taskId: taskId, selfId: selfId, selfName: selfName)
     }
+
+    /// One-shot adoption probe — the JOIN check of join-or-mint (one true
+    /// shared session): join `cofocus:<taskId>`, announce `hello` (any focuser
+    /// re-broadcasts its timer), and wait ≤ `timeoutMs` for an ADOPTABLE
+    /// session state (has a sessionId, not ended, started < 12h ago). Tears its
+    /// channel down before returning. nil ⇒ no live shared session → MINT.
+    ///
+    /// supabase-swift dedupes channels by topic, so if another surface already
+    /// holds this topic's channel (a PartnerPresence row observing it) we
+    /// piggyback on it — no re-subscribe, and crucially NO removeChannel on the
+    /// way out (that would kill the other surface's stream).
+    public func probe(taskId: String, selfId: String, timeoutMs: UInt64 = 1_500) async -> SharedSessionMsg? {
+        let ch = client.channel("cofocus:\(taskId)") { config in config.presence.key = selfId }
+        let preexisting = ch.status == .subscribed || ch.status == .subscribing
+        let (stream, continuation) = AsyncStream<SharedSessionMsg>.makeStream()
+        let sub = ch.onBroadcast(event: "timer") { json in
+            if let msg = CoFocusChannel.decodeControl(json) { continuation.yield(msg) }
+        }
+        if !preexisting {
+            do { try await ch.subscribeWithError() } catch {
+                sub.cancel()
+                continuation.finish()
+                await client.removeChannel(ch)
+                return nil
+            }
+        }
+        // RANDOM hello id (not selfId): a focuser that filters hellos by its
+        // own user id would ignore a same-user probe — but the same user
+        // focusing on ANOTHER device is exactly who must answer for
+        // multi-device adoption.
+        try? await ch.broadcast(event: "hello", message: HelloBroadcast(userId: UUID().uuidString.lowercased()))
+        // First adoptable message vs the timeout — whichever lands first.
+        let found: SharedSessionMsg? = await withTaskGroup(of: SharedSessionMsg?.self) { group in
+            group.addTask {
+                for await msg in stream {
+                    if sharedSessionAdoptable(msg, now: Date().timeIntervalSince1970 * 1000) { return msg }
+                }
+                return nil
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        sub.cancel()
+        continuation.finish()
+        if !preexisting { await client.removeChannel(ch) }
+        return found
+    }
 }
 
 /// One live presence channel (`cofocus:<taskId>`). Accumulates join/leave diffs
@@ -60,6 +112,11 @@ public actor CoFocusChannel {
     /// See the file header for why presence re-track can't carry this.
     private var broadcastTimers: [String: CoFocusTimerState] = [:]
     private var onPeers: (@Sendable ([CoFocusPeer]) -> Void)?
+    /// Control surface (one true shared session): EVERY received `timer`
+    /// message — including the new sessionId/rev/atMs/ended fields, including
+    /// old-build messages without them — is handed to the app layer, which runs
+    /// the pure LWW reducer + side effects. Display overlay stays internal.
+    private var onControl: (@Sendable (SharedSessionMsg) -> Void)?
     /// Stable session-join timestamp so a track state-flip (observe → here)
     /// doesn't reset "since".
     private let sinceMs: Double
@@ -68,6 +125,14 @@ public actor CoFocusChannel {
     /// carried into the wire payload while `track == .focusing` (T1b).
     private var track: CoFocusState?
     private var timer: CoFocusTimerState?
+    /// The full shared-session state (sessionId/rev/atMs — one true shared
+    /// session) that rides along with every timer track/broadcast. nil for a
+    /// display-only timer (never expected from this build's focusing path).
+    private var shared: SharedSessionState?
+    /// A final `ended` state that arrived while the channel was still
+    /// subscribing (`channel` nil) — queued and sent as soon as the subscribe
+    /// completes, so a finish racing the join is never silently dropped.
+    private var pendingEnded: SharedSessionState?
 
     public init(client: SupabaseClient, taskId: String, selfId: String, selfName: String) {
         self.client = client
@@ -80,12 +145,19 @@ public actor CoFocusChannel {
     /// Join the channel: wire the presence + broadcast streams BEFORE subscribing
     /// (both must be registered pre-subscribe), subscribe, then track our own
     /// state (if any). Idempotent — re-joining tears the old channel down first.
+    /// `shared` is the full shared-session snapshot (one true shared session)
+    /// carried on every timer track/broadcast; `onControl` receives every
+    /// incoming `timer` message for the app-layer reducer.
     public func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
-                      onPeers: @escaping @Sendable ([CoFocusPeer]) -> Void) async {
+                      shared: SharedSessionState? = nil,
+                      onPeers: @escaping @Sendable ([CoFocusPeer]) -> Void,
+                      onControl: (@Sendable (SharedSessionMsg) -> Void)? = nil) async {
         await stop()
         self.onPeers = onPeers
+        self.onControl = onControl
         self.track = track
         self.timer = timer
+        self.shared = shared
         // Presence key = our user id, so both sides self-exclude consistently.
         let ch = client.channel("cofocus:\(taskId)") { config in config.presence.key = selfId }
         let (stream, continuation) = AsyncStream<ChannelEvent>.makeStream()
@@ -127,6 +199,12 @@ public actor CoFocusChannel {
         pumpTask = Task { [weak self] in
             for await ev in stream { await self?.handle(ev) }
         }
+        // A finish raced the subscribe: send the queued FINAL state first —
+        // `ended` is terminal, nothing else this channel says matters more.
+        if let pending = pendingEnded {
+            pendingEnded = nil
+            try? await ch.broadcast(event: "timer", message: TimerBroadcast(state: pending, userId: selfId))
+        }
         // Announce ourselves so any focuser re-broadcasts its timer to us (works
         // whether or not we track presence).
         await sendHello()
@@ -136,25 +214,64 @@ public actor CoFocusChannel {
     /// Flip our presence state in place (observe → here → focusing) without
     /// tearing down the channel — the recipient "Sit with them" toggle. Carries
     /// the focus timer through when flipping to `.focusing`.
-    public func setTrack(_ track: CoFocusState?, timer: CoFocusTimerState? = nil) async {
+    public func setTrack(_ track: CoFocusState?, timer: CoFocusTimerState? = nil,
+                         shared: SharedSessionState? = nil) async {
         guard let ch = channel else { return }
         self.track = track
         self.timer = timer
+        self.shared = shared
         if track != nil { await applyTrack() }
         else { await ch.untrack() }
     }
 
     /// Re-broadcast an updated focus timer (pause / resume / extend / start), so
     /// a focusing peer's shared timer updates live on the other side (T1b). A
-    /// no-op unless we're currently tracking as `.focusing`.
-    public func updateTimer(_ timer: CoFocusTimerState?) async {
+    /// no-op unless we're currently tracking as `.focusing`. `shared` carries
+    /// the full control snapshot (rev+1 by the caller) alongside.
+    public func updateTimer(_ timer: CoFocusTimerState?, shared: SharedSessionState? = nil) async {
         self.timer = timer
+        self.shared = shared
         guard channel != nil, track == .focusing else { return }
         await applyTrack()
     }
 
+    /// Broadcast the session's FINAL state (`ended: true`) — finish/cancel ends
+    /// it for both sides. One-shot + best-effort (the caller tears down right
+    /// after); independent of the stored track/timer so it works mid-teardown.
+    /// If the channel is still subscribing (`channel` nil), the state is
+    /// QUEUED and sent the moment the subscribe completes — never dropped.
+    public func broadcastEnded(_ state: SharedSessionState) async {
+        guard let ch = channel else {
+            pendingEnded = state
+            return
+        }
+        try? await ch.broadcast(event: "timer", message: TimerBroadcast(state: state, userId: selfId))
+    }
+
     /// Leave + tear down (untrack, cancel the streams, remove the channel).
     public func stop() async {
+        releaseLocalState()
+        if let ch = channel {
+            await ch.untrack()
+            await client.removeChannel(ch)
+        }
+        channel = nil
+    }
+
+    /// Release this actor's hold on the channel WITHOUT unsubscribing it.
+    /// supabase-swift dedupes channels BY TOPIC (`client.channel(topic)`
+    /// returns the registered instance) and `removeChannel` unconditionally
+    /// unsubscribes it — so when ANOTHER surface still owns this topic (the
+    /// session-lifetime co-focus channel while a PartnerPresence row unmounts),
+    /// a full `stop()` would kill its live stream and an `untrack` would wipe
+    /// the presence it re-tracked under the same key. Detach only cancels OUR
+    /// callbacks + clears OUR state; the underlying channel stays subscribed.
+    public func detach() async {
+        releaseLocalState()
+        channel = nil
+    }
+
+    private func releaseLocalState() {
         pumpTask?.cancel(); pumpTask = nil
         subscription?.cancel(); subscription = nil
         broadcastSub?.cancel(); broadcastSub = nil
@@ -162,13 +279,11 @@ public actor CoFocusChannel {
         presences = [:]
         broadcastTimers = [:]
         onPeers = nil
+        onControl = nil
         track = nil
         timer = nil
-        if let ch = channel {
-            await ch.untrack()
-            await client.removeChannel(ch)
-        }
-        channel = nil
+        shared = nil
+        pendingEnded = nil
     }
 
     /// Track the current state + (for a focuser) the INITIAL live timer, then
@@ -186,23 +301,35 @@ public actor CoFocusChannel {
         // the whole timer payload is dropped and an Android partner sees no timer.
         // An integral Double serializes as an integer literal, which every platform
         // parses. (web accepts either; iOS accepts either on the way back in.)
+        // Shared-session fields ride on presence too (fresh joiners get an
+        // instant, adoptable-looking render); broadcast stays the authoritative
+        // control path (a presence re-track doesn't propagate — file header).
+        let s = track == .focusing ? shared : nil
         try? await ch.track(TrackPayload(
             userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs.rounded(),
             sessionStartMs: (t?.sessionStartMs).map { $0.rounded() }, paused: t?.paused,
-            pausedAtMs: (t?.pausedAtMs).map { $0.rounded() }, estimateMin: t?.estimateMin))
+            pausedAtMs: (t?.pausedAtMs).map { $0.rounded() }, estimateMin: t?.estimateMin,
+            sessionId: s?.sessionId, rev: s?.rev, atMs: (s?.atMs).map { $0.rounded() },
+            ended: s.map { $0.ended }))
         await broadcastTimer()
     }
 
     /// Broadcast the live focus timer (fire-and-forget, reliable per event) so an
     /// ALREADY-present peer sees pause/resume/extend — which a presence re-track
-    /// would silently drop. No-op unless we're focusing with a timer.
+    /// would silently drop. No-op unless we're focusing with a timer. Sends the
+    /// FULL shared-session state (sessionId/rev/atMs/ended) when available, so
+    /// receivers can adopt/apply it (one true shared session); old builds ignore
+    /// the extra fields and keep the read-only shared view.
     private func broadcastTimer() async {
         guard let ch = channel, track == .focusing, let t = timer else { return }
         // Round epoch-ms to whole so they serialize as JSON integers, not decimals
         // (see applyTrack) — a fractional Double breaks Android's Long decode.
         let msg = TimerBroadcast(userId: selfId, sessionStartMs: t.sessionStartMs.rounded(),
                                  paused: t.paused, pausedAtMs: t.pausedAtMs.map { $0.rounded() },
-                                 estimateMin: t.estimateMin)
+                                 estimateMin: t.estimateMin,
+                                 sessionId: shared?.sessionId, rev: shared?.rev,
+                                 atMs: (shared?.atMs).map { $0.rounded() },
+                                 ended: shared.map { $0.ended })
         try? await ch.broadcast(event: "timer", message: msg)
     }
 
@@ -246,16 +373,39 @@ public actor CoFocusChannel {
         emitPeers()
     }
 
-    /// A peer broadcast an updated live timer — overlay it (authoritative over
-    /// the peer's presence session) and re-emit. The callback receives the
-    /// broadcast ENVELOPE `{event,type,payload}`; our fields live under `payload`.
+    /// A peer broadcast an updated live timer — hand EVERY message to the
+    /// control surface (the app-layer LWW reducer decides; a message without a
+    /// sessionId is an old build's → display-only), then overlay it on the
+    /// peer's presence session (authoritative for the visible timer) and
+    /// re-emit. The callback receives the broadcast ENVELOPE
+    /// `{event,type,payload}`; our fields live under `payload`.
     private func applyTimerBroadcast(_ json: JSONObject) {
-        guard let wire = try? json["payload"]?.decode(as: TimerBroadcast.self),
-              let uid = wire.userId, uid != selfId, let start = wire.sessionStartMs else { return }
-        broadcastTimers[uid] = CoFocusTimerState(
-            sessionStartMs: start, paused: wire.paused ?? false,
-            pausedAtMs: wire.pausedAtMs, estimateMin: wire.estimateMin ?? 25)
+        guard let msg = Self.decodeControl(json) else { return }
+        // Control first — includes same-user-other-device messages (one user,
+        // two devices, one session) that the peers display excludes below.
+        onControl?(msg)
+        guard let uid = msg.userId, uid != selfId, let start = msg.sessionStartMs else { return }
+        if msg.ended == true {
+            // Final state: drop the overlay (the ender's presence leave follows,
+            // but don't show a stale running clock in the gap).
+            broadcastTimers.removeValue(forKey: uid)
+        } else {
+            broadcastTimers[uid] = CoFocusTimerState(
+                sessionStartMs: start, paused: msg.paused ?? false,
+                pausedAtMs: msg.pausedAtMs, estimateMin: msg.estimateMin ?? 25)
+        }
         emitPeers()
+    }
+
+    /// Decode a broadcast `timer` envelope into the platform-neutral control
+    /// message. Tolerant: every field optional (old builds omit the new ones).
+    static func decodeControl(_ json: JSONObject) -> SharedSessionMsg? {
+        guard let wire = try? json["payload"]?.decode(as: TimerBroadcast.self) else { return nil }
+        return SharedSessionMsg(
+            userId: wire.userId, sessionId: wire.sessionId,
+            sessionStartMs: wire.sessionStartMs, paused: wire.paused,
+            pausedAtMs: wire.pausedAtMs, estimateMin: wire.estimateMin,
+            rev: wire.rev, atMs: wire.atMs, ended: wire.ended)
     }
 
     /// Emit the OTHER peers, overlaying each focusing peer's latest broadcast
@@ -311,6 +461,12 @@ public actor CoFocusChannel {
         let paused: Bool?
         let pausedAtMs: Double?
         let estimateMin: Int?
+        // One-true-shared-session fields — the session identity + control rev
+        // ride on presence too, so fresh joiners see the full state instantly.
+        let sessionId: String?
+        let rev: Int?
+        let atMs: Double?
+        let ended: Bool?
     }
     private struct MetaWire: Decodable {
         var userId: String?
@@ -321,20 +477,55 @@ public actor CoFocusChannel {
         var paused: Bool?
         var pausedAtMs: Double?
         var estimateMin: Int?
+        // One-true-shared-session fields (tolerated, currently display-unused —
+        // the broadcast path is the authoritative control surface).
+        var sessionId: String?
+        var rev: Int?
+        var atMs: Double?
+        var ended: Bool?
     }
-    /// The live-timer BROADCAST payload (event `timer`). Same fields as the
-    /// presence timer, plus `userId` so the observer keys it. Optionals so the
-    /// receiver is tolerant; the sender sets all but `pausedAtMs` (only paused).
-    private struct TimerBroadcast: Codable, Sendable {
-        let userId: String?
-        let sessionStartMs: Double?
-        let paused: Bool?
-        let pausedAtMs: Double?
-        let estimateMin: Int?
+}
+
+/// The live-timer BROADCAST payload (event `timer`). Same fields as the
+/// presence timer, plus `userId` so the observer keys it, plus the one-true-
+/// shared-session control fields (sessionId/rev/atMs/ended). Optionals so the
+/// receiver is tolerant of old builds; new builds treat a message without a
+/// `sessionId` as view-only (never adopt/control it).
+struct TimerBroadcast: Codable, Sendable {
+    let userId: String?
+    let sessionStartMs: Double?
+    let paused: Bool?
+    let pausedAtMs: Double?
+    let estimateMin: Int?
+    let sessionId: String?
+    let rev: Int?
+    let atMs: Double?
+    let ended: Bool?
+
+    init(userId: String?, sessionStartMs: Double?, paused: Bool?, pausedAtMs: Double?,
+         estimateMin: Int?, sessionId: String?, rev: Int?, atMs: Double?, ended: Bool?) {
+        self.userId = userId
+        self.sessionStartMs = sessionStartMs
+        self.paused = paused
+        self.pausedAtMs = pausedAtMs
+        self.estimateMin = estimateMin
+        self.sessionId = sessionId
+        self.rev = rev
+        self.atMs = atMs
+        self.ended = ended
     }
-    /// The `hello` join-announcement payload — just who joined (a focuser replies
-    /// with its `timer`, so late joiners converge without a presence re-track).
-    private struct HelloBroadcast: Codable, Sendable {
-        let userId: String
+
+    /// The full-state snapshot form (all epoch-ms rounded — Android Long decode).
+    init(state: SharedSessionState, userId: String) {
+        self.init(userId: userId, sessionStartMs: state.sessionStartMs.rounded(),
+                  paused: state.paused, pausedAtMs: state.pausedAtMs.map { $0.rounded() },
+                  estimateMin: state.estimateMin, sessionId: state.sessionId,
+                  rev: state.rev, atMs: state.atMs.rounded(), ended: state.ended)
     }
+}
+
+/// The `hello` join-announcement payload — just who joined (a focuser replies
+/// with its `timer`, so late joiners converge without a presence re-track).
+struct HelloBroadcast: Codable, Sendable {
+    let userId: String
 }

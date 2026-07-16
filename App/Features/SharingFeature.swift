@@ -121,12 +121,16 @@ final class ShareModel {
         await client?.sharedTaskDetail(taskId: taskId)
     }
 
-    /// Accrue a recipient's focus seconds onto the OWNER's shared task (T3,
-    /// Option B). partner/assign only (gated server-side); no-ops for ≤ 0.
+    /// Accrue focus seconds onto the shared task's exactly-once ledger (T3 /
+    /// one true shared session — owner included, migration 047); no-ops for ≤ 0.
     /// `sessionId` = the live focus session's id; the RPC is idempotent per that
     /// id (migration 046), so a re-fire from any finalize path never double-counts.
-    func logSharedFocus(taskId: String, actualSec: Int, sessionId: String) async {
-        await client?.logSharedFocus(taskId: taskId, actualSec: actualSec, sessionId: sessionId)
+    /// SURFACES the outcome so AppModel.logSharedFocusDurable can queue a retry
+    /// on failure / fall back on not_allowed; a nil client (demo boot / signed
+    /// out) reports `.failure` — "can't run" is queued like any other failure.
+    @discardableResult
+    func logSharedFocus(taskId: String, actualSec: Int, sessionId: String) async -> SharedFocusLogResult {
+        await client?.logSharedFocus(taskId: taskId, actualSec: actualSec, sessionId: sessionId) ?? .failure
     }
 
     /// Best-effort start/finish ping to everyone a task is shared with (the
@@ -379,6 +383,12 @@ struct SharedWithYouGroup: View {
     /// Builds a co-focus presence model for a partner-row taskId (nil on the
     /// demo/UITest boot → the presence indicator is simply omitted).
     var makeCoFocus: ((String) -> CoFocusModel)? = nil
+    /// The LIVE session's task id: its row skips PartnerPresence entirely.
+    /// I'm IN that session (the live card shows it), and — because supabase-
+    /// swift dedupes channels by topic — an observe-join here would share the
+    /// underlying channel with AppModel's session-lifetime one, and its leave
+    /// would untrack/unsubscribe the live channel out from under it.
+    var suppressPresenceTaskId: String? = nil
     let onToggle: (String, Bool) -> Void   // (taskId, nextDone)
 
     /// The row the recipient tapped to OPEN the read-only detail (T1).
@@ -423,7 +433,7 @@ struct SharedWithYouGroup: View {
                 // Live co-focus: on a PARTNER row, show "focusing now" when the
                 // owner is present + a "Sit with them" toggle (mirrors web
                 // PartnerPresence). Only when a presence factory is available.
-                if s.level == .partner, let makeCoFocus {
+                if s.level == .partner, s.taskId != suppressPresenceTaskId, let makeCoFocus {
                     PartnerPresence(taskId: s.taskId, make: makeCoFocus)
                 }
             }
@@ -759,6 +769,20 @@ final class CoFocusModel {
     private(set) var peers: [CoFocusPeer] = []
     @ObservationIgnored private let channel: CoFocusChannel?
     @ObservationIgnored private var running = false
+    /// Serializes every channel op (start / stop / endSession) behind every
+    /// other co-focus op, app-wide — set by AppModel.makeCoFocusModel to
+    /// AppModel.chainCoFocusOp. supabase-swift dedupes channels BY TOPIC, so an
+    /// unordered stop() from one surface (e.g. a PartnerPresence row) could
+    /// otherwise unsubscribe another surface's fresh channel. The chain head
+    /// is read + re-registered at ENQUEUE time on the main actor — never a
+    /// stale task captured at some earlier call site.
+    @ObservationIgnored var chainOp: (@MainActor (@escaping @MainActor () async -> Void) -> Task<Void, Never>)?
+    /// Consulted at teardown EXECUTION time: true ⇒ the topic is currently
+    /// owned by AppModel's session-lifetime channel, so tear down with
+    /// `detach()` (release our callbacks, keep the deduped channel subscribed)
+    /// instead of `stop()` (untrack + removeChannel — which would kill the
+    /// live channel out from under it).
+    @ObservationIgnored var preserveTopicOnStop: (@MainActor () -> Bool)?
 
     init(client: CoFocusPresenceClient?, taskId: String, selfId: String?, selfName: String) {
         if let client, let selfId, !selfId.isEmpty {
@@ -768,39 +792,84 @@ final class CoFocusModel {
         }
     }
 
+    /// Enqueue an op on the app-wide co-focus chain (FIFO with every other
+    /// start/stop/probe); falls back to an unchained Task when no chain was
+    /// injected (demo/UITest boot).
+    @discardableResult
+    private func run(_ op: @escaping @MainActor () async -> Void) -> Task<Void, Never> {
+        chainOp?(op) ?? Task { @MainActor in await op() }
+    }
+
     /// Join the channel (idempotent). `track` = how you appear: .focusing (owner),
     /// .here (recipient sitting in), or nil (observe only). `timer` carries the
-    /// live focus-session state so focusing peers can render the shared timer (T1b).
-    func start(track: CoFocusState?, timer: CoFocusTimerState? = nil) {
+    /// live focus-session state so focusing peers can render the shared timer
+    /// (T1b); `shared` the one-true-shared-session control snapshot
+    /// (sessionId/rev/atMs) riding along it; `onControl` receives every incoming
+    /// timer message for the LWW reducer. The join runs on the co-focus chain,
+    /// so it lands strictly after any in-flight teardown of the same topic.
+    func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
+               shared: SharedSessionState? = nil,
+               onControl: (@Sendable (SharedSessionMsg) -> Void)? = nil) {
         guard !running, let channel else { return }
         running = true
-        Task { [weak self] in
-            await channel.start(track: track, timer: timer) { peers in
-                Task { @MainActor in self?.peers = peers }
-            }
+        run { [weak self] in
+            await channel.start(track: track, timer: timer, shared: shared,
+                                onPeers: { peers in
+                                    Task { @MainActor in self?.peers = peers }
+                                },
+                                onControl: onControl)
         }
     }
 
     /// Flip your presence in place (recipient "Sit with them" on/off) — no
-    /// channel teardown.
+    /// channel teardown. Chained so it can't race an in-flight join.
     func setTrack(_ track: CoFocusState?, timer: CoFocusTimerState? = nil) {
         guard running, let channel else { return }
-        Task { await channel.setTrack(track, timer: timer) }
+        run { await channel.setTrack(track, timer: timer) }
     }
 
     /// Re-broadcast the focus timer (pause / resume / extend / start) so peers'
-    /// shared timers update live (T1b). No-op unless tracking as `.focusing`.
-    func updateTimer(_ timer: CoFocusTimerState?) {
+    /// shared timers update live (T1b). `shared` carries the full control
+    /// snapshot (rev+1 by the caller). No-op unless tracking as `.focusing`.
+    func updateTimer(_ timer: CoFocusTimerState?, shared: SharedSessionState? = nil) {
         guard running, let channel else { return }
-        Task { await channel.updateTimer(timer) }
+        run { await channel.updateTimer(timer, shared: shared) }
+    }
+
+    /// End the shared session for everyone: broadcast the final state
+    /// (`ended: true`), THEN tear down — one chained op so the order holds.
+    /// Teardown preserves the topic (detach, not removeChannel) when the
+    /// session-lifetime channel owns it at execution time (same-task rebind).
+    @discardableResult
+    func endSession(_ finalState: SharedSessionState) -> Task<Void, Never>? {
+        peers = []
+        guard running, let channel else { running = false; return nil }
+        running = false
+        let preserve = preserveTopicOnStop
+        return run {
+            await channel.broadcastEnded(finalState)
+            if preserve?() == true { await channel.detach() } else { await channel.stop() }
+        }
     }
 
     /// Leave + tear down (call on disappear/finish — no leaks).
     func stop() {
+        stopTask()
+    }
+
+    /// `stop()` that hands back the teardown task. Decides detach-vs-stop at
+    /// EXECUTION time: a PartnerPresence row unmounting while AppModel's live
+    /// channel holds the same topic (the row got suppressed by the session it
+    /// just helped start) must NOT untrack/removeChannel the shared instance.
+    @discardableResult
+    func stopTask() -> Task<Void, Never>? {
         peers = []
-        guard running, let channel else { running = false; return }
+        guard running, let channel else { running = false; return nil }
         running = false
-        Task { await channel.stop() }
+        let preserve = preserveTopicOnStop
+        return run {
+            if preserve?() == true { await channel.detach() } else { await channel.stop() }
+        }
     }
 }
 

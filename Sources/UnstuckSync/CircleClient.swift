@@ -47,6 +47,18 @@ public struct CircleInviteResult: Decodable, Sendable, Equatable {
     }
 }
 
+/// Outcome of a `log_shared_focus` ledger write — surfaced (never swallowed)
+/// so the app layer can queue a durable retry or apply the owner fallback.
+public enum SharedFocusLogResult: Sendable, Equatable {
+    /// Landed (or no-op'd server-side — the ledger is idempotent per session).
+    case ok
+    /// The server rejected the caller (`not_allowed`): no share admits them
+    /// anymore (revoked mid-session). Retrying can never succeed.
+    case notAllowed
+    /// Transport / transient failure — retry later (idempotent per sessionId).
+    case failure
+}
+
 public struct CircleClient: Sendable {
     let client: SupabaseClient
 
@@ -155,19 +167,31 @@ public struct CircleClient: Sendable {
         } catch { return nil }
     }
 
-    /// Accrue a recipient's focus seconds onto the OWNER's shared task
-    /// (Option B — the recipient's minutes reflect onto the one shared task).
+    /// Accrue focus seconds onto the shared task's ledger (Option B / one true
+    /// shared session — owner included since migration 047).
     /// RPC: log_shared_focus(p_task_id, p_actual_sec, p_session_id) (migration
-    /// 046). Allowed only for a partner/assign share (the server raises
-    /// `not_allowed` for view) and no-ops for actualSec ≤ 0. IDEMPOTENT per
+    /// 046). The server raises `not_allowed` when no share admits the caller
+    /// (revoked mid-session); no-ops for actualSec ≤ 0. IDEMPOTENT per
     /// `sessionId` — a re-fire with the same live-session id no-ops server-side,
-    /// so a retry / double finalize can never double-count. Best-effort — the
-    /// local recap stands regardless.
-    public func logSharedFocus(taskId: String, actualSec: Int, sessionId: String) async {
-        guard actualSec > 0 else { return }
-        _ = try? await client.rpc("log_shared_focus",
-            params: LogSharedFocusParams(p_task_id: taskId, p_actual_sec: actualSec,
-                                         p_session_id: sessionId)).execute()
+    /// so a retry / double finalize can never double-count.
+    ///
+    /// SURFACES the outcome (not fire-and-forget): the app layer queues a
+    /// durable retry on `.failure` (offline finish must not lose the accrual)
+    /// and falls back to the owner's direct totalFocused bump on `.notAllowed`.
+    @discardableResult
+    public func logSharedFocus(taskId: String, actualSec: Int, sessionId: String) async -> SharedFocusLogResult {
+        guard actualSec > 0 else { return .ok }
+        do {
+            _ = try await client.rpc("log_shared_focus",
+                params: LogSharedFocusParams(p_task_id: taskId, p_actual_sec: actualSec,
+                                             p_session_id: sessionId)).execute()
+            return .ok
+        } catch {
+            if let pg = error as? PostgrestError {
+                return pg.message.contains("not_allowed") ? .notAllowed : .failure
+            }
+            return .failure
+        }
     }
 
     /// All of my outgoing shares, for the task-row badges. RPC:

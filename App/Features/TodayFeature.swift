@@ -480,8 +480,12 @@ struct TodayView: View {
         let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: liveId)
             .filter { assignedOut[$0.id] == nil }
         // The in-progress focus session, surfaced at the top of the list (Android
-        // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed tasks.
+        // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed
+        // tasks; a SHARED (recipient) session has no local row, so a display
+        // task is synthesized — one true shared session keeps it running +
+        // resumable after leaving the focus screen.
         let liveTask = liveId.flatMap { id in vm.all.first { $0.id == id } }
+            ?? model.sharedLiveTaskFallback()
         // LazyVStack (not VStack): the whole Today/dashboard screen — header,
         // hero, filter bar, AND these rows — lives in ONE outer ScrollView
         // (body), so the entire screen scrolls as a single unit. Lazy keeps a
@@ -495,7 +499,8 @@ struct TodayView: View {
             // 1:1 with the web today-list. Each renders nothing when empty.
             if !backlogActive {
                 SharedWithYouGroup(items: model.shareState.sharedWithMe,
-                                   makeCoFocus: { model.makeCoFocusModel(taskId: $0) }) { taskId, done in
+                                   makeCoFocus: { model.makeCoFocusModel(taskId: $0) },
+                                   suppressPresenceTaskId: liveId) { taskId, done in
                     Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
                 }
                 DelegatedGroup(tasks: vm.all, assignedOut: assignedOut, activeArea: areaFilter,
@@ -546,8 +551,10 @@ struct TodayView: View {
             let progress = min(1, max(0, Double(elapsed) / Double(estimateSec)))
             let accent = paused ? theme.palette.amber : theme.palette.coral
             HStack(spacing: 11) {
-                // Tapping the card body returns to the Focus screen for this task.
-                Button { model.router.beginFocus(task) } label: {
+                // Tapping the card body returns to the Focus screen for this
+                // task; a shared (recipient) session re-carries its level so
+                // finalize stays on the shared ledger.
+                Button { model.reopenLiveFocus(task) } label: {
                     HStack(spacing: 11) {
                         ZStack {
                             Circle().stroke(theme.palette.line, lineWidth: 3)
@@ -677,6 +684,13 @@ struct TodayView: View {
             Text("\(max(1, recap.focusedSec / 60)) MIN FOCUSED · \(recap.taskName)")
                 .font(UFont.mono(11)).foregroundStyle(theme.palette.ink2)
                 .lineLimit(1).truncationMode(.tail).padding(.top, 6)
+            // One true shared session: a partner finishing the session ends it
+            // for both — quietly attribute who did (never a modal).
+            if let by = recap.endedBy {
+                Text("\(by) ended the session")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .padding(.top, 4)
+            }
         }
         .padding(16).frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.palette.coralSoft, in: RoundedRectangle(cornerRadius: 18, style: .continuous))

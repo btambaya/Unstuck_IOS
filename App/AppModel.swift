@@ -66,8 +66,70 @@ final class AppModel {
         let focusedSec: Int
         /// Epoch ms of the session end.
         let at: Double
+        /// Set when a PARTNER ended the shared session remotely — the recap
+        /// shows "<name> ended the session" (one true shared session).
+        var endedBy: String? = nil
     }
     var lastRecap: RecapState?
+
+    // MARK: - one true shared session (partner co-focus v2)
+    // Stored state for AppModel+SharedSession (extensions can't add storage).
+
+    /// The session-lifetime co-focus channel for the LIVE partner-shared
+    /// session. Owned HERE — not by the focus screen — so remote pause/resume/
+    /// extend/end arrive while the user is on Today or the screen is closed.
+    /// Lifecycle + broadcasts run through `syncSharedSessionChannel()` (the
+    /// refreshLiveSession choke point). Observable: FocusView feeds its
+    /// CoFocusBar from this model's peers.
+    var liveCoFocus: CoFocusModel?
+    /// The task id `liveCoFocus` is bound to (the channel topic key).
+    @ObservationIgnored var liveCoFocusTaskId: String?
+    /// The last shared-session state this device broadcast, ADOPTED, or applied
+    /// from a remote control — the change/echo detector for the choke-point
+    /// broadcast and the `atMs` base for LWW ties. In-memory only (the rev also
+    /// persists on the live session, so a relaunch keeps the chain monotonic).
+    @ObservationIgnored var lastSharedBroadcast: SharedSessionState?
+    /// Bumped after every APPLIED remote control so an open FocusView re-syncs
+    /// its FocusModel from the store (remote pause/resume/extend) or leaves
+    /// (remote end).
+    var sharedSessionRemoteTick = 0
+    /// Calm attribution line for the focus screen ("Ann paused" / "Ann
+    /// resumed") — never a modal. Sticky for a remote pause; transient (a few
+    /// seconds) for resume/extend. Cleared on any local control.
+    var sharedSessionAttribution: String?
+    @ObservationIgnored var sharedAttributionClearTask: Task<Void, Never>?
+    /// A just-probed ADOPTED session state, consumed by the choke point when
+    /// the adopted live session lands in the store — it becomes the broadcast
+    /// baseline (no rev bump: adopting is not a control).
+    @ObservationIgnored var pendingAdoptionSeed: SharedSessionState?
+    /// The HEAD of the app-wide co-focus op chain: every channel start / stop /
+    /// endSession / adoption probe enqueues behind the current head and
+    /// registers itself as the new head (chainCoFocusOp) — a strict FIFO, so a
+    /// stop() can never race a start() on the same (topic-deduped) channel.
+    /// Read + re-registered at ENQUEUE time on the main actor, never captured
+    /// stale (supabase-swift dedupes channels by topic; removeChannel
+    /// unconditionally unsubscribes whichever instance holds the topic).
+    @ObservationIgnored var coFocusTeardown: Task<Void, Never>?
+    /// The in-flight pending-shared-focus-ledger drain (nil when idle) — a
+    /// foreground + relaunch retry loop for accruals that couldn't reach the
+    /// server (idempotent per sessionId, so re-fires are safe).
+    @ObservationIgnored var sharedLedgerDrainTask: Task<Void, Never>?
+
+    /// Register a channel-ADOPTED shared session with the share-session signal
+    /// reducer as already-started: only the MINTER fires the session_start
+    /// ping; joining an in-flight session announces nothing (its end, if ended
+    /// HERE, still fires — that's this device acting).
+    func markSessionSignalAdopted(sid: String) { shareSig.adoptedSid = sid }
+
+    /// Overwrite the in-memory live-session cache after a DIRECT store write
+    /// from the shared-session choke point (which runs INSIDE refreshLiveSession
+    /// and so must not recurse into it). Same-file setter for the private(set).
+    func setCachedLiveSession(_ live: LiveSession?) { cachedLiveSession = live }
+
+    /// Drop the started-task marker so the imminent transition to idle fires
+    /// NO session_end ping — a remote `ended` was applied and the ender's
+    /// device already announced it.
+    func suppressNextSessionEndSignal() { shareSig.startedTask = nil }
 
     /// Cached signed-in identity (display name + email), backing the top-bar
     /// avatar initials, Settings, DataExport and Assistant context. Seeded once
@@ -105,10 +167,14 @@ final class AppModel {
     /// every mutator that touches `liveStore` so the cache never goes stale.
     /// This is also the single choke point every focus transition (start / pause
     /// / resume / finish / cancel) flows through, so it drives the share-session
-    /// signal reducer — a start/finish on a shared task pings its recipients.
+    /// signal reducer — a start/finish on a shared task pings its recipients —
+    /// AND the one-true-shared-session channel: partner co-focus sessions
+    /// broadcast every local control (rev+1 full-state snapshot) from here,
+    /// and finished ones broadcast `ended` before teardown.
     func refreshLiveSession() {
         cachedLiveSession = (try? liveStore?.get()) ?? nil
         pumpShareSessionSignals()
+        syncSharedSessionChannel()
     }
 
     /// Backing for the lazily-built assistant. Observation-ignored: AppModel
@@ -142,7 +208,12 @@ final class AppModel {
         // Re-run the share-session signal reducer whenever the outgoing badges
         // refresh, so a session_start that was waiting on late-resolving badges
         // (RPC still in flight when the session began) fires once they land.
-        s.onChange = { [weak self] in self?.pumpShareSessionSignals() }
+        // Same for the shared-session channel: a partner badge resolving after
+        // the session began makes it a co-focus candidate now.
+        s.onChange = { [weak self] in
+            self?.pumpShareSessionSignals()
+            self?.syncSharedSessionChannel()
+        }
         _shareState = s
         return s
     }
@@ -335,6 +406,9 @@ final class AppModel {
         // kill/crash: rebind to a still-live session, else end the ghost timer.
         refreshLiveSession()
         reapStaleLiveActivities()
+        // Retry shared-focus accruals that couldn't reach the server before a
+        // kill (the offline-finish pending ledger — idempotent per sessionId).
+        drainPendingSharedFocusLedger()
 
         // Apply any hands-free writes a Siri intent queued while the app was
         // closed, refresh the App-Group snapshot (Siri reads "how many left /
@@ -357,6 +431,9 @@ final class AppModel {
         // Keep the App-Group snapshot current on every foreground so Siri's
         // "how many left / what's next" answers don't lag.
         refreshWidgetSnapshot()
+        // Retry any shared-focus accrual stranded by an offline finish
+        // (pending ledger — idempotent per sessionId).
+        drainPendingSharedFocusLedger()
         guard let coord = coordinator else { return }
         Task { await coord.syncNow() }
     }
@@ -700,6 +777,12 @@ final class AppModel {
         _assistant?.clear()
         AssistantModel.scrubPersisted()
         Task { await ReminderScheduler.shared.cancelAll() }
+        // One-true-shared-session: drop the signed-out account's pending ledger
+        // accruals and stop any in-flight drain — the NEXT account on this
+        // device must never post the previous account's shared-focus records.
+        sharedLedgerDrainTask?.cancel()
+        sharedLedgerDrainTask = nil
+        pendingSharedFocusLogs = []
     }
 
     func saveTask(_ task: TaskItem) {

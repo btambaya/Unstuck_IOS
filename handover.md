@@ -3,7 +3,107 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-06-27, latest) — Siri / App Intents (4 phases)
+## Where things stand (2026-07-16, latest) — one true shared session (partner co-focus v2)
+
+Spec: `../unstuck/docs/shared-session-spec.md` (migration 047 already applied:
+`log_shared_focus` now admits the task OWNER + 12h server clamp). A
+partner-shared task now has AT MOST ONE live session — same clock on every
+screen, pause/resume/extend/finish from either side applies to both.
+
+- **Pure reducer** `Sources/UnstuckCore/Logic/SharedSession.swift`:
+  `SharedSessionState` (the full `timer` wire snapshot), `SharedSessionMsg`
+  (all-optional receive shape), `sharedSessionStep` (apply-iff-newer LWW on
+  `(rev, atMs)`, same sessionId, not locally ended), `sharedSessionAdoptable`
+  (has id, !ended, 0 ≤ now−start < 12h), `canonicalElapsedSec`. 24 new tests in
+  `Tests/UnstuckCoreTests/SharedSessionTests.swift`.
+- **LiveSession** gained Codable-optional `sharedSessionRev` / `lastAppliedRev`
+  / `lastAppliedAtMs` / `sharedSessionEndedBy` (old blobs decode);
+  `FocusTimer.adopt(...)` joins an in-flight session (bypasses mint, keeps
+  treatment; caller re-stamps sharedFocusLevel/prior); `start()` clears the new
+  bookkeeping.
+- **Wire** (`CoFocusPresenceClient`): `timer` broadcast + presence track carry
+  `sessionId/rev/atMs/ended` (epoch-ms always `.rounded()` — Android Long);
+  `onControl` hands EVERY incoming timer msg to the app layer;
+  `broadcastEnded(_:)`; `probe(taskId:selfId:)` = one-shot join→hello→≤1.5s
+  wait for an adoptable state. supabase-swift DEDUPES channels by topic, so the
+  probe piggybacks on a pre-subscribed channel (never removeChannel on one it
+  didn't create), and every CoFocusModel teardown registers into
+  `AppModel.coFocusTeardown` so successors/probes on the same topic chain
+  behind it.
+- **Session-lifetime channel** (`App/AppModel+SharedSession.swift`): AppModel
+  owns the CoFocusModel keyed on `cachedLiveSession` being a partner candidate;
+  `refreshLiveSession()` (the existing choke point) broadcasts every local
+  control as a full-state snapshot with rev+1 (rev persisted), broadcasts
+  `ended:true` (rev+1) when the broadcast session disappears (finish / cancel /
+  shade-End / displaced), and applies incoming controls via the reducer —
+  REPLACE fields, persist WITHOUT rev bump, drive Live Activity + check-in
+  side effects, never the pause-reason sheet / pause nag for a REMOTE pause.
+  Calm attribution ("Ann paused" — sticky; "Ann resumed" — transient) under the
+  FOCUSING label; remote end → dismiss + recap "…ended the session"
+  (`RecapState.endedBy`).
+- **Join-or-mint:** FocusView `.task` probes before `FocusModel` mints (owner
+  partner-badge OR recipient partner level) and adopts mid-clock; adopted sids
+  are registered with the signal reducer so NO session_start ping fires (only
+  the minter announces); a remote `ended` fires no session_end ping.
+- **Accrual = ledger-only:** every partner-shared session accrues
+  `total_focused` EXCLUSIVELY via `log_shared_focus(taskId, sec, sessionId)` —
+  OWNER included (skips the direct bump in `finishFocus` / displaced path;
+  still writes the own Session row with id = the shared session id). Both
+  sides finalize the same id → exactly-once (046 PK + 047 owner guard).
+  Resurrected paths (shade-End / displaced / reap) cap at estimate+30min.
+- **Leave keeps it running:** `finalizeSharedOnLeave` REMOVED; the Today live
+  card now renders a row-less shared session (synthesized task, title from
+  sharedWithMe) and `reopenLiveFocus` re-carries the share level. Relaunch reap
+  only consumes a shared session when TRULY stale (elapsed > estimate + 30min).
+- **Compat:** a `timer` without `sessionId` (old builds) stays display-only.
+  Also fixed while there: extend (local AND remote) now updates the Live
+  Activity estimate; pause/resume/start use the extend-aware session estimate.
+- **Adversarial-review fix pass (same day, 8 findings):**
+  1. *Channel teardown safety:* ALL CoFocusModel ops (start/stop/endSession +
+     the adoption probe) now run on ONE app-wide FIFO chain
+     (`AppModel.chainCoFocusOp` — head read/re-registered at enqueue on the
+     main actor, never a stale captured task), and teardown decides at
+     EXECUTION time: when `liveCoFocusTaskId` owns the topic it `detach()`es
+     (new CoFocusChannel API — cancels own callbacks, keeps the topic-deduped
+     channel subscribed + tracked) instead of `stop()` (untrack+removeChannel).
+     So a PartnerPresence row unmounting (incl. via the live-session
+     suppression) can never kill the session-lifetime channel.
+  2. *Offline finish is durable:* `CircleClient.logSharedFocus` now returns
+     `.ok/.notAllowed/.failure`; `AppModel.logSharedFocusDurable` routes every
+     accrual — on failure it persists `{sessionId, taskId, sec, estimateMin}`
+     (UserDefaults `unstuck.pendingSharedFocusLedger`) drained on foreground
+     (`syncNow`) + relaunch (`start`), idempotent per sessionId; on
+     `not_allowed` (share revoked mid-session) an OWNER falls back to the
+     direct outbox-durable totalFocused bump.
+  3. *No spurious rev+1 on rebind:* relaunch/flap seeds `lastSharedBroadcast`
+     FROM the persisted session (same rev — idempotent re-broadcast); new
+     persisted `LiveSession.sharedSessionAtMs` keeps the LWW atMs floor across
+     relaunch (reducer floor = max(local, lastApplied)).
+  4. *Adoption clock-skew:* adoptable window is now `-2min ≤ age < 12h`
+     (`sharedSessionMaxSkewMs`); `FocusTimer.adopt` takes `now` and clamps the
+     start to `min(start, now)` for display (the clamp is mirrored into the
+     broadcast baseline so it's never mistaken for a local control).
+  5. *Adopt-over-existing:* `finalizeDisplacedForAdoption` finalizes a live
+     local session with a DIFFERENT id on the same task before adopting —
+     capped ledger write under the OLD sessionId (+ owner Session row).
+  6. *Ended never dropped:* `CoFocusChannel.broadcastEnded` queues the final
+     state when the channel is still subscribing and sends it on subscribe.
+  7. *finishFocus ordering:* the sharedLedger path now upserts the resolved
+     task row ITSELF inside the ordered Task (await enqueue → flushNow → RPC),
+     so land-row-then-RPC actually holds (no second racing saveTask op).
+  8. *Parity:* `ended` is TERMINAL in the reducer (bypasses the (rev, atMs)
+     LWW when sessionId matches + not locally ended); adoptable/state reject
+     an EMPTY sessionId + floor estimateMin to 25; the probe's hello uses a
+     RANDOM id (a same-user other-device focuser must answer — multi-device
+     adoption); partner-shared sessions (minted or adopted) run with
+     `priorAccumulatedSec = 0` so every device's ring shows the one session
+     clock.
+- **Verify:** `swift build` + `swift test` green (475 tests — reducer/adopt
+  suites extended for skew, terminal-ended, empty-sid, estimate floor, clamp),
+  `xcodegen generate` + simulator `xcodebuild build` green. NOT committed —
+  awaiting review. Live two-device validation still pending.
+
+## Where things stand (2026-06-27) — Siri / App Intents (4 phases)
 
 OS-level Siri control + voice queries, built in `App/Intents/` (the `App/` glob
 picks them up; **no Siri entitlement needed** for App-Shortcut intents — the

@@ -47,24 +47,32 @@ extension AppModel {
     /// no ghost lock-screen timer survives. Called on launch + foreground.
     func reapStaleLiveActivities() {
         let cur = (try? liveStore?.get()) ?? nil
-        // A SHARED live session with NO Focus screen currently up is an ORPHAN:
-        // it's a recipient's focus on a task they don't own, so Today can't
-        // resolve/resume it (no local row) — leaving it live would let a later
-        // focus dump the whole app-closed time onto the OWNER (T2). Finalize it
-        // here — accrue the CAPPED elapsed onto the owner (idempotent per session
-        // id, migration 046) — and end its Live Activity rather than rebind a
-        // timer nobody can return to. When the shared Focus screen IS up
-        // (router.focusTask set), it still owns the session; leave it running.
+        // A SHARED (recipient) live session is finalized here ONLY when it is
+        // TRULY stale — elapsed past the estimate + grace window. One true
+        // shared session: the session is task-scoped and may still be running
+        // on the partner's side; a fresh one is kept + rebound, resumable from
+        // the Today live card (which synthesizes the row-less shared task) and
+        // steerable by remote controls. A stale one is consumed: accrue the
+        // CAPPED elapsed onto the owner (idempotent per session id, migration
+        // 046 — the ledger id freezes on first write) and end its Live
+        // Activity. When the shared Focus screen IS up (router.focusTask set),
+        // it owns the session; leave it alone.
         if let cur, cur.sessionStart != nil, let level = cur.sharedFocusLevel,
            levelCanComplete(level), router.focusTask == nil {
             let raw = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
-            let capped = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: cur.sessionEstimateMin)
-            let (taskId, sessionId) = (cur.taskId, cur.id ?? newUUID())
-            try? liveStore?.set(nil)
-            refreshLiveSession()
-            Task { await shareState.logSharedFocus(taskId: taskId, actualSec: capped, sessionId: sessionId) }
-            LiveActivityController.shared.reapOrphans(hasActiveSession: false)
-            return
+            let staleAfterSec = max(1, cur.sessionEstimateMin) * 60 + AppModel.sharedFocusCapGraceSec
+            if raw > staleAfterSec {
+                let capped = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: cur.sessionEstimateMin)
+                let (taskId, sessionId) = (cur.taskId, cur.id ?? newUUID())
+                let estimate = cur.sessionEstimateMin
+                try? liveStore?.set(nil)
+                refreshLiveSession()
+                Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
+                                                        estimateMin: estimate, sessionId: sessionId) }
+                LiveActivityController.shared.reapOrphans(hasActiveSession: false)
+                return
+            }
+            // Still fresh — fall through: rebind + keep it resumable.
         }
         LiveActivityController.shared.reapOrphans(hasActiveSession: cur?.sessionStart != nil)
     }

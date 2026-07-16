@@ -359,13 +359,29 @@ extension AppModel {
         if let level = cur.sharedFocusLevel, levelCanComplete(level) {
             let taskId = cur.taskId
             let sessionId = cur.id ?? newUUID()
+            let estimate = cur.sessionEstimateMin
             let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
-            Task { await shareState.logSharedFocus(taskId: taskId, actualSec: capped, sessionId: sessionId) }
+            Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
+                                                    estimateMin: estimate, sessionId: sessionId) }
             return
         }
         guard let prev = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else { return }
         saveSession(Session(id: cur.id ?? newUUID(), taskId: prev.id, taskName: prev.name,
                             estimateMin: prev.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+        // One true shared session: an OWNER session on a partner-shared task
+        // accrues via the exactly-once ledger with the SHARED session id — the
+        // direct bump would double-count against the partner's finalize of the
+        // same session. Capped like the other resurrected paths; durable (the
+        // pending ledger retries a failed RPC on foreground/relaunch).
+        if accruesViaSharedLedger(cur, taskId: prev.id) {
+            let taskId = prev.id
+            let sessionId = cur.id ?? newUUID()
+            let estimate = cur.sessionEstimateMin
+            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
+            Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
+                                                    estimateMin: estimate, sessionId: sessionId) }
+            return
+        }
         var bumped = prev
         bumped.totalFocused += elapsed
         bumped.updatedAt = Self.isoNow()
@@ -388,14 +404,28 @@ extension AppModel {
     /// Android finishFocus. When `occurrenceBlockId` is set the session/focus
     /// time accrue on the TEMPLATE (`task`) but completion marks the BLOCK done,
     /// so just that day is ticked off without ending the series.
-    func finishFocus(task: TaskItem, session: Session, elapsedSec: Int, markDone: Bool, occurrenceBlockId: String? = nil) {
+    ///
+    /// `sharedLedger` (one true shared session): the task is partner-shared, so
+    /// its focus time accrues EXCLUSIVELY via log_shared_focus with the SHARED
+    /// session id (exactly-once per id — both participants finalize the same
+    /// session, one accrual lands; migrations 046/047 admit the owner). The
+    /// direct totalFocused bump is skipped (the server-side accrual comes back
+    /// via realtime/hydrate); the own Session row (insights) is still written
+    /// with id = the shared session id. `ledgerSec` overrides the accrued
+    /// seconds (resurrected sessions pass a capped value); nil → elapsedSec.
+    func finishFocus(task: TaskItem, session: Session, elapsedSec: Int, markDone: Bool,
+                     occurrenceBlockId: String? = nil,
+                     sharedLedger: Bool = false, ledgerSec: Int? = nil) {
         saveSession(session)
         var focused = task
-        focused.totalFocused += elapsedSec
+        if !sharedLedger { focused.totalFocused += elapsedSec }
         focused.updatedAt = Self.isoNow()
+        // Resolve the exact task row this finish lands (completion stamping /
+        // occurrence semantics), so the sharedLedger path below can write it
+        // ITSELF, ordered before the flush + RPC.
+        var landedRow = focused
         if let occurrenceBlockId, let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == occurrenceBlockId }) {
             // Always accrue focus on the template; mark the DAY's block done.
-            saveTask(focused)
             if markDone {
                 var doneBlock = block
                 doneBlock.done = true
@@ -406,10 +436,30 @@ extension AppModel {
         } else if markDone {
             var done = focused
             done.done = true
-            saveTask(applyCompletion(done, prior: task, nowISO: Self.isoNow()))
+            landedRow = applyCompletion(done, prior: task, nowISO: Self.isoNow())
             notifyTaskDoneIfShared(task)
+        }
+        if sharedLedger {
+            // Order matters: enqueue the (whole-row) task write DIRECTLY and
+            // await it, flush it to the server, THEN fire the RPC — so the
+            // upsert's stale totalFocused can't land after (and stomp) the
+            // fresh server-side accrual. Creating the flush Task before the
+            // row op was enqueued (the old shape) let the row flush late.
+            // Accrual is durable: a failed RPC lands in the pending ledger.
+            let write = self.write
+            let coord = coordinator
+            let row = landedRow
+            let taskId = task.id, sessionId = session.id
+            let sec = ledgerSec ?? elapsedSec
+            let estimate = session.estimateMin ?? task.estimateMin
+            Task {
+                try? await write?.upsertTask(row, nowISO: Self.isoNow())
+                await coord?.flushNow()
+                await self.logSharedFocusDurable(taskId: taskId, actualSec: sec,
+                                                 estimateMin: estimate, sessionId: sessionId)
+            }
         } else {
-            saveTask(focused)
+            saveTask(landedRow)
         }
         sendSessionRecap(taskName: task.name, away: false)
         // Today's "Just now" recap card (Android: _lastRecap.value = RecapState(...)).
@@ -460,10 +510,12 @@ extension AppModel {
     /// optionally mark it done, and — when the recipient explicitly ended it —
     /// show them a normal local recap. Never writes an own Session/totalFocused
     /// (the task isn't theirs). `elapsedSec ≤ 0` still shows the recap but the RPC
-    /// no-ops server-side.
+    /// no-ops server-side. Durable: a failed accrual lands in the pending
+    /// ledger and is retried on foreground/relaunch (idempotent per sessionId).
     func finalizeSharedFocus(taskId: String, taskName: String, sessionId: String,
-                             elapsedSec: Int, markDone: Bool, showRecap: Bool) {
-        Task { await shareState.logSharedFocus(taskId: taskId, actualSec: elapsedSec, sessionId: sessionId) }
+                             elapsedSec: Int, estimateMin: Int, markDone: Bool, showRecap: Bool) {
+        Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: elapsedSec,
+                                                estimateMin: estimateMin, sessionId: sessionId) }
         if markDone {
             Task { try? await shareState.completeSharedTask(taskId: taskId, done: true) }
         }
@@ -549,9 +601,20 @@ extension AppModel {
     /// Build a co-focus presence model for a task id, bound to the shared
     /// realtime client. Nil client / signed-out (no user id) degrades to an inert
     /// model that never joins — the presence UI simply shows nothing.
+    /// Every model's channel ops run on AppModel's ONE co-focus chain
+    /// (chainCoFocusOp — strict FIFO, head read at enqueue time, never a stale
+    /// captured task), and teardown consults `liveCoFocusTaskId` at EXECUTION
+    /// time: when the session-lifetime channel owns this topic, the model
+    /// detaches (keeps the topic-deduped channel subscribed) instead of
+    /// removeChannel-ing it out from under the live stream.
     func makeCoFocusModel(taskId: String) -> CoFocusModel {
-        CoFocusModel(client: coordinator?.coFocus, taskId: taskId,
-                     selfId: coordinator?.auth.currentUserId, selfName: selfDisplayName)
+        let m = CoFocusModel(client: coordinator?.coFocus, taskId: taskId,
+                             selfId: coordinator?.auth.currentUserId, selfName: selfDisplayName)
+        m.chainOp = { [weak self] op in
+            self?.chainCoFocusOp(op) ?? Task { @MainActor in await op() }
+        }
+        m.preserveTopicOnStop = { [weak self] in self?.liveCoFocusTaskId == taskId }
+        return m
     }
 
     // MARK: - feedback
