@@ -106,6 +106,7 @@ public enum FocusTimer {
         next.sharedSessionAtMs = nil
         next.lastAppliedRev = nil
         next.lastAppliedAtMs = nil
+        next.divergedOffline = nil
         next.sharedSessionEndedBy = nil
         return next
     }
@@ -145,6 +146,7 @@ public enum FocusTimer {
         next.sharedSessionAtMs = nil
         next.lastAppliedRev = state.rev
         next.lastAppliedAtMs = state.atMs
+        next.divergedOffline = nil
         next.sharedSessionEndedBy = nil
         return next
     }

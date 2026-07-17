@@ -137,7 +137,60 @@ public func sharedSessionStep(
 /// identical number (up to clock skew), so whichever finalize wins the
 /// exactly-once ledger writes ~the same accrual. For an `ended` state pass the
 /// sender's `atMs` as `now` so the number freezes at the ender's clock.
+/// A paused state MISSING its `pausedAtMs` falls back to `now` (web/Android
+/// parity): the pause instant is unknown, and freezing at the start would
+/// zero the elapsed — under-counting accrual and mis-ranking the most-ahead
+/// comparison.
 public func canonicalElapsedSec(_ s: SharedSessionState, now: EpochMillis) -> Int {
-    let ref = s.paused ? (s.pausedAtMs ?? s.sessionStartMs) : now
+    let ref = s.paused ? (s.pausedAtMs ?? now) : now
     return max(0, Int(((ref - s.sessionStartMs) / 1000).rounded(.down)))
+}
+
+// MARK: - Offline divergence (spec §Offline & reconnect convergence)
+
+/// Elapsed-comparison slack for the most-ahead convergence rule: two clocks
+/// within ~3s of each other are "the same clock up to skew/latency" — they
+/// fall back to plain (rev, atMs) LWW instead of the elapsed comparison.
+public let sharedSessionDivergenceSlackMs: Double = 3000
+
+/// The outcome of `resolveDivergence` — how a DIVERGED client reconciles its
+/// local session with a same-session state received after reconnecting.
+public enum SharedSessionDivergenceResolution: Equatable, Sendable {
+    /// The incoming clock is ahead: adopt the incoming state WHOLESALE and
+    /// clear the diverged flag.
+    case adopt
+    /// The local clock is ahead: keep it, clear the diverged flag, and
+    /// broadcast the local state as a GENUINE convergence control at `rev` —
+    /// `max(local.rev, incoming.rev) + 1` — which the partner applies via
+    /// normal LWW (no special logic needed on the online side).
+    case keepAndBroadcast(rev: Int)
+    /// Within slack — the clocks agree; fall back to plain (rev, atMs) LWW.
+    case lww
+}
+
+/// Most-ahead convergence for a DIVERGED client (one that made controls it
+/// couldn't deliver — offline pause/resume/extend). On receiving a state for
+/// the SAME session, compare `canonicalElapsedSec` of both sides at the
+/// RECEIVER's clock (`now`), with `sharedSessionDivergenceSlackMs` slack:
+/// whichever clock is further ahead wins (tester criteria 3–4: "on regaining
+/// internet I get the timer that's THE MOST AHEAD" — both sides converge on
+/// it). This comparison applies ONLY while diverged: non-diverged clients keep
+/// plain LWW, so a stale running re-announce can never un-pause a live pause.
+///
+/// `ended` stays terminal throughout — callers pre-filter an incoming `ended`
+/// into the normal terminal step; defensively, an ended incoming resolves to
+/// `.lww` here (web/Android parity — the STEP reducer owns ended-terminality
+/// and applies it bypassing the (rev, atMs) gate; the elapsed comparison never
+/// enters).
+public func resolveDivergence(
+    local: SharedSessionState, incoming: SharedSessionState, now: EpochMillis
+) -> SharedSessionDivergenceResolution {
+    if incoming.ended { return .lww }
+    let deltaMs = Double(canonicalElapsedSec(incoming, now: now)
+                         - canonicalElapsedSec(local, now: now)) * 1000
+    if deltaMs > sharedSessionDivergenceSlackMs { return .adopt }
+    if deltaMs < -sharedSessionDivergenceSlackMs {
+        return .keepAndBroadcast(rev: max(local.rev, incoming.rev) + 1)
+    }
+    return .lww
 }

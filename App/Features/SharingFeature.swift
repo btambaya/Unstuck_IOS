@@ -805,19 +805,33 @@ final class CoFocusModel {
     /// live focus-session state so focusing peers can render the shared timer
     /// (T1b); `shared` the one-true-shared-session control snapshot
     /// (sessionId/rev/atMs) riding along it; `onControl` receives every incoming
-    /// timer message for the LWW reducer. The join runs on the co-focus chain,
-    /// so it lands strictly after any in-flight teardown of the same topic.
+    /// timer message for the LWW reducer; `suppressControls` binds in the
+    /// DIVERGED state (offline & reconnect convergence); `onDeliveryFailure`
+    /// reports an undeliverable control broadcast; `onSocketDown` reports the
+    /// realtime socket dropping under a live shared session (socket-down alone
+    /// marks divergence); `onDivergedAlone` reports the diverged re-exchange
+    /// grace expiring with nobody to converge with (the app clears the flag +
+    /// re-announces). The join runs on the co-focus chain, so it lands
+    /// strictly after any in-flight teardown of the same topic.
     func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
                shared: SharedSessionState? = nil,
-               onControl: (@Sendable (SharedSessionMsg) -> Void)? = nil) {
+               suppressControls: Bool = false,
+               onControl: (@Sendable (SharedSessionMsg) -> Void)? = nil,
+               onDeliveryFailure: (@Sendable (String) -> Void)? = nil,
+               onSocketDown: (@Sendable (String) -> Void)? = nil,
+               onDivergedAlone: (@Sendable (String) -> Void)? = nil) {
         guard !running, let channel else { return }
         running = true
         run { [weak self] in
             await channel.start(track: track, timer: timer, shared: shared,
+                                suppressControls: suppressControls,
                                 onPeers: { peers in
                                     Task { @MainActor in self?.peers = peers }
                                 },
-                                onControl: onControl)
+                                onControl: onControl,
+                                onDeliveryFailure: onDeliveryFailure,
+                                onSocketDown: onSocketDown,
+                                onDivergedAlone: onDivergedAlone)
         }
     }
 
@@ -834,6 +848,33 @@ final class CoFocusModel {
     func updateTimer(_ timer: CoFocusTimerState?, shared: SharedSessionState? = nil) {
         guard running, let channel else { return }
         run { await channel.updateTimer(timer, shared: shared) }
+    }
+
+    /// Flip the transport side of the `divergedOffline` flag: while suppressed
+    /// the channel stops announcing timer state (hello replies, rejoin
+    /// re-announces, presence timer fields) — a diverged client doesn't fight
+    /// the channel with stale state.
+    func setControlsSuppressed(_ suppressed: Bool) {
+        guard running, let channel else { return }
+        run { await channel.setControlsSuppressed(suppressed) }
+    }
+
+    /// Refresh the channel's retained announce state WITHOUT any wire traffic:
+    /// the DIVERGED choke point keeps the (suppressed) channel current so a
+    /// forced diverged-hello reply carries the TRUE local state (an offline
+    /// pause included), not the pre-divergence snapshot.
+    func syncLocalState(timer: CoFocusTimerState?, shared: SharedSessionState? = nil) {
+        guard running, let channel else { return }
+        run { await channel.syncLocalState(timer: timer, shared: shared) }
+    }
+
+    /// Foreground / reconnect re-exchange: ensure the channel is genuinely
+    /// joined, re-assert presence, idempotently re-announce (unless diverged),
+    /// and `hello` so any focuser re-broadcasts its state to us (the diverged
+    /// side's convergence trigger). Chained like every other channel op.
+    func reexchange() {
+        guard running, let channel else { return }
+        run { await channel.reexchange() }
     }
 
     /// End the shared session for everyone: broadcast the final state

@@ -184,11 +184,19 @@ public struct LiveSession: Codable, Equatable, Sendable {
     /// the LWW floor for incoming `timer` messages.
     public var lastAppliedRev: Int?
     public var lastAppliedAtMs: Double?
+    /// Set when a LOCAL control's broadcast could not be delivered (offline /
+    /// socket not joined): the session has DIVERGED from the channel. While
+    /// set, choke-point re-broadcasts are suppressed (a diverged client doesn't
+    /// fight the channel with stale state) and the next same-session state
+    /// received runs most-ahead convergence (`resolveDivergence`) instead of
+    /// plain LWW. Cleared on convergence. Optional → old persisted blobs (and
+    /// other-platform stores) keep decoding. Device-local (not synced).
+    public var divergedOffline: Bool?
     /// Display name of the participant whose remote `ended` finalized this
     /// session ("<name> ended the session" on the recap). nil otherwise.
     public var sharedSessionEndedBy: String?
 
-    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil, sharedSessionRev: Int? = nil, sharedSessionAtMs: Double? = nil, lastAppliedRev: Int? = nil, lastAppliedAtMs: Double? = nil, sharedSessionEndedBy: String? = nil) {
+    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil, sharedSessionRev: Int? = nil, sharedSessionAtMs: Double? = nil, lastAppliedRev: Int? = nil, lastAppliedAtMs: Double? = nil, divergedOffline: Bool? = nil, sharedSessionEndedBy: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.sessionStart = sessionStart
@@ -205,6 +213,7 @@ public struct LiveSession: Codable, Equatable, Sendable {
         self.sharedSessionAtMs = sharedSessionAtMs
         self.lastAppliedRev = lastAppliedRev
         self.lastAppliedAtMs = lastAppliedAtMs
+        self.divergedOffline = divergedOffline
         self.sharedSessionEndedBy = sharedSessionEndedBy
     }
 }

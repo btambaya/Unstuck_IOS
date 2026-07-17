@@ -104,6 +104,12 @@ extension AppModel {
         // 3) Candidate: seed a pending ADOPTION (join-or-mint's join — the
         //    adopted wire state is our baseline, no rev bump), then detect a
         //    local control by signature.
+        // While DIVERGED (an offline control never delivered) the rev/baseline
+        // BOOKKEEPING keeps running — the chain must stay monotonic for the
+        // convergence rev = max(local, incoming) + 1 — but every SEND below is
+        // suppressed: a diverged client doesn't fight the channel with stale
+        // state (spec §Offline & reconnect convergence).
+        let diverged = live.divergedOffline == true
         if let pending = pendingAdoptionSeed {
             if pending.sessionId == id {
                 var seed = pending
@@ -183,17 +189,107 @@ extension AppModel {
             // app-wide co-focus chain (chainCoFocusOp), so this join lands
             // strictly after any in-flight teardown of the SAME topic
             // (supabase-swift dedupes channels by topic — a stop() racing a
-            // start() would otherwise unsubscribe the fresh channel).
+            // start() would otherwise unsubscribe the fresh channel). A
+            // diverged rebind (relaunch mid-divergence) joins RECEIVE-only.
             let cf = makeCoFocusModel(taskId: live.taskId)
             cf.start(track: .focusing, timer: timer, shared: lastSharedBroadcast,
+                     suppressControls: diverged,
                      onControl: { [weak self] msg in
                          Task { @MainActor in self?.handleSharedControl(msg) }
+                     },
+                     onDeliveryFailure: { [weak self] sid in
+                         Task { @MainActor in self?.handleSharedDeliveryFailure(sessionId: sid) }
+                     },
+                     // Socket-down ALONE marks divergence (same sessionId-guarded
+                     // handler): the offline RUNNER must not be rewound by the
+                     // partner's mid-outage pause on rejoin — even when no local
+                     // control happens while offline.
+                     onSocketDown: { [weak self] sid in
+                         Task { @MainActor in self?.handleSharedDeliveryFailure(sessionId: sid) }
+                     },
+                     onDivergedAlone: { [weak self] sid in
+                         Task { @MainActor in self?.handleSharedDivergedAlone(sessionId: sid) }
                      })
             liveCoFocus = cf
             liveCoFocusTaskId = live.taskId
         } else if changed {
-            liveCoFocus?.updateTimer(timer, shared: lastSharedBroadcast)
+            if diverged {
+                // Suppressed, but keep the channel's retained announce state
+                // CURRENT (no wire traffic): a forced diverged-hello reply must
+                // carry the TRUE local state (an offline pause included), not
+                // the pre-divergence snapshot.
+                liveCoFocus?.syncLocalState(timer: timer, shared: lastSharedBroadcast)
+            } else {
+                liveCoFocus?.updateTimer(timer, shared: lastSharedBroadcast)
+            }
         }
+    }
+
+    /// A control broadcast could not be delivered (socket down / channel not
+    /// joined / send error — reported by the channel's delivery gate), OR the
+    /// realtime socket dropped under the live shared session (`onSocketDown` —
+    /// divergence without any local control): mark the live session DIVERGED.
+    /// Guarded on the reported sessionId so a finish + new start racing the
+    /// async hop can't flag the wrong session. Direct store write + cache
+    /// overwrite via `setCachedLiveSession` — NOT refreshLiveSession, whose
+    /// choke point owns the broadcast that just failed (re-entering it would
+    /// re-send). While set, choke-point re-broadcasts are suppressed on both
+    /// the app side (no updateTimer) and the transport side
+    /// (controlsSuppressed), and the next same-session state received runs
+    /// most-ahead convergence.
+    ///
+    /// Echo-guard integrity (spec §Convergence amendments): the choke point
+    /// records `lastSharedBroadcast` BEFORE delivery is known — it is NOT
+    /// rolled back here, because every convergence exit re-announces PAST it
+    /// (keepAndBroadcast at max+1, within-slack local-win at the same rev,
+    /// diverged-alone at the already-monotonic rev, adopt replaces it), so a
+    /// failed send can never leave the catch-up broadcast suppressed. Rolling
+    /// it back would instead re-mint rev+1 for the SAME state on every
+    /// refresh while offline.
+    func handleSharedDeliveryFailure(sessionId: String) {
+        guard let liveStore, var cur = (try? liveStore.get()) ?? nil,
+              cur.sessionStart != nil, cur.id == sessionId,
+              cur.divergedOffline != true else { return }
+        cur.divergedOffline = true
+        try? liveStore.set(cur)
+        setCachedLiveSession(cur)
+        liveCoFocus?.setControlsSuppressed(true)
+    }
+
+    /// The diverged re-exchange grace expired with nobody (focusing) left in
+    /// presence — there is no state to converge with; ours IS the session
+    /// (spec §Convergence amendments: a solo channel blip must not mute the
+    /// client's broadcasts forever). Clear the flag, un-suppress the
+    /// transport, and re-announce the current state at its ALREADY-monotonic
+    /// rev (the offline bumps made it strictly newer than anything delivered
+    /// pre-outage — no extra bump; receivers already at it LWW-ignore).
+    func handleSharedDivergedAlone(sessionId: String) {
+        guard let liveStore, var cur = (try? liveStore.get()) ?? nil,
+              cur.sessionStart != nil, cur.id == sessionId,
+              cur.divergedOffline == true else { return }
+        cur.divergedOffline = nil
+        try? liveStore.set(cur)
+        setCachedLiveSession(cur)   // direct — don't re-enter the choke point
+        let timer = CoFocusTimerState(sessionStartMs: cur.sessionStart ?? 0,
+                                      paused: cur.paused, pausedAtMs: cur.pausedAt,
+                                      estimateMin: cur.sessionEstimateMin)
+        let snapshot: SharedSessionState
+        if let b = lastSharedBroadcast, b.sessionId == sessionId {
+            snapshot = b
+        } else {
+            // Baseline lost (relaunch mid-divergence before any control):
+            // rebuild from the persisted bookkeeping, same as the rebind seed.
+            snapshot = SharedSessionState(
+                sessionId: sessionId, sessionStartMs: (cur.sessionStart ?? 0).rounded(),
+                paused: cur.paused, pausedAtMs: cur.pausedAt.map { $0.rounded() },
+                estimateMin: cur.sessionEstimateMin,
+                rev: max(cur.sharedSessionRev ?? 0, cur.lastAppliedRev ?? 0),
+                atMs: max(cur.sharedSessionAtMs ?? 0, cur.lastAppliedAtMs ?? 0),
+                ended: false)
+            lastSharedBroadcast = snapshot
+        }
+        liveCoFocus?.setControlsSuppressed(false)
+        liveCoFocus?.updateTimer(timer, shared: snapshot)
     }
 
     // MARK: - incoming controls (the reducer + side effects)
@@ -215,6 +311,18 @@ extension AppModel {
             atMs: max(lastSharedBroadcast?.atMs ?? 0,
                       max(cur.sharedSessionAtMs ?? 0, cur.lastAppliedAtMs ?? 0)),
             ended: false)
+        // Offline divergence (spec §Offline & reconnect convergence): while
+        // DIVERGED, a live same-session state runs MOST-AHEAD convergence
+        // instead of plain LWW. `ended` stays terminal — it falls through to
+        // the normal step below. Non-diverged behavior is COMPLETELY
+        // unchanged: the elapsed comparison never applies to live controls (a
+        // stale running re-announce cannot un-pause an online pause).
+        if cur.divergedOffline == true, let inc = msg.state,
+           inc.sessionId == curId, !inc.ended {
+            resolveDivergedControl(cur: cur, local: local, inc: inc, msg: msg)
+            return
+        }
+
         let step = sharedSessionStep(local: local, incoming: msg)
         guard step.apply else { return }
         let inc = step.next
@@ -224,11 +332,24 @@ extension AppModel {
             applyRemoteEnded(cur: cur, state: inc, by: by)
             return
         }
+        applyRemoteSnapshot(cur: cur, inc: inc, by: by)
+    }
 
-        // REPLACE the shared fields (full-state snapshot — peers never
-        // recompute the resume shift); keep local-only fields (treatment,
-        // priorAccumulatedSec, shared markers, nudge flags); persist WITHOUT
-        // bumping rev; remember the applied (rev, atMs) as the new floor.
+    /// REPLACE the shared fields (full-state snapshot — peers never
+    /// recompute the resume shift); keep local-only fields (treatment,
+    /// priorAccumulatedSec, shared markers, nudge flags); persist WITHOUT
+    /// bumping rev; remember the applied (rev, atMs) as the new floor. Also
+    /// clears `divergedOffline` — applying a remote state IS convergence.
+    ///
+    /// `resetRevFloor` (the divergence ADOPT arm): also overwrite the LOCAL
+    /// control bookkeeping (`sharedSessionRev/AtMs`) with the incoming pair —
+    /// adopting is wholesale, cursors included. The offline-inflated local rev
+    /// must not keep out-flooring the partner's post-convergence controls
+    /// (they'd be rejected here and then reverted on their side by our next
+    /// re-announce). Web parity: the adopt arm writes `sharedSessionRev:
+    /// msg.rev` too.
+    private func applyRemoteSnapshot(cur: LiveSession, inc: SharedSessionState, by: String,
+                                     resetRevFloor: Bool = false) {
         let wasPaused = cur.paused
         let prevEstimate = cur.sessionEstimateMin
         var next = cur
@@ -238,10 +359,15 @@ extension AppModel {
         next.sessionEstimateMin = inc.estimateMin
         next.lastAppliedRev = inc.rev
         next.lastAppliedAtMs = inc.atMs
+        if resetRevFloor {
+            next.sharedSessionRev = inc.rev
+            next.sharedSessionAtMs = inc.atMs
+        }
+        next.divergedOffline = nil
         // Pre-seed the echo detector: the refresh below must see this state as
         // already-on-the-wire (we applied it; we don't own it).
         lastSharedBroadcast = inc
-        try? liveStore.set(next)
+        try? liveStore?.set(next)
         refreshLiveSession()
 
         // Remote-control side effects are first-class: the Live Activity
@@ -259,6 +385,82 @@ extension AppModel {
             setSharedAttribution("\(by) extended the session", transient: true)
         }
         sharedSessionRemoteTick &+= 1
+    }
+
+    /// Most-ahead convergence for a DIVERGED local session receiving a live
+    /// same-session state (pure `resolveDivergence`, ~3s slack, both elapsed
+    /// at OUR clock):
+    ///  • incoming ahead → adopt it wholesale + clear the flag;
+    ///  • local ahead → keep local, clear the flag, broadcast local as a
+    ///    GENUINE convergence control at rev = max(local, incoming) + 1 — the
+    ///    partner applies it via normal LWW (criterion 4: the online side
+    ///    needs no special logic);
+    ///  • within slack → the clocks agree: clear the flag, fall back to plain
+    ///    (rev, atMs) LWW; when LOCAL wins that LWW, idempotently re-announce
+    ///    it at the SAME rev so the partner's floor catches up to the rev
+    ///    bumps made offline (receivers already at it ignore non-newer).
+    private func resolveDivergedControl(cur: LiveSession, local: SharedSessionState,
+                                        inc: SharedSessionState, msg: SharedSessionMsg) {
+        let now = (Date().timeIntervalSince1970 * 1000).rounded()
+        let localShared = SharedSessionState(
+            sessionId: local.sessionId, sessionStartMs: cur.sessionStart ?? 0,
+            paused: cur.paused, pausedAtMs: cur.pausedAt,
+            estimateMin: cur.sessionEstimateMin, rev: local.rev, atMs: local.atMs,
+            ended: false)
+        let by = sharedAttributionName(for: msg.userId)
+        let timer = CoFocusTimerState(sessionStartMs: cur.sessionStart ?? 0,
+                                      paused: cur.paused, pausedAtMs: cur.pausedAt,
+                                      estimateMin: cur.sessionEstimateMin)
+
+        switch resolveDivergence(local: localShared, incoming: inc, now: now) {
+        case .adopt:
+            // The partner's clock is ahead — theirs is THE session now,
+            // cursors included (resetRevFloor: the offline-inflated local rev
+            // must not out-floor their post-convergence controls).
+            liveCoFocus?.setControlsSuppressed(false)
+            applyRemoteSnapshot(cur: cur, inc: inc, by: by, resetRevFloor: true)
+            // Sync the channel's announce state to the adopted snapshot (the
+            // suppressed actor still holds the stale pre-divergence timer, and
+            // a hello reply would otherwise re-display it). Same rev — a no-op
+            // for anyone who already has it.
+            liveCoFocus?.updateTimer(CoFocusTimerState(
+                sessionStartMs: inc.sessionStartMs, paused: inc.paused,
+                pausedAtMs: inc.pausedAtMs, estimateMin: inc.estimateMin), shared: inc)
+
+        case .keepAndBroadcast(let rev):
+            var next = cur
+            next.divergedOffline = nil
+            next.sharedSessionRev = rev
+            next.sharedSessionAtMs = now
+            let snapshot = SharedSessionState(
+                sessionId: local.sessionId, sessionStartMs: (cur.sessionStart ?? 0).rounded(),
+                paused: cur.paused, pausedAtMs: cur.pausedAt.map { $0.rounded() },
+                estimateMin: cur.sessionEstimateMin, rev: rev, atMs: now, ended: false)
+            lastSharedBroadcast = snapshot   // baseline = what we now announce
+            try? liveStore?.set(next)
+            setCachedLiveSession(next)       // direct — don't re-enter the choke point
+            liveCoFocus?.setControlsSuppressed(false)
+            liveCoFocus?.updateTimer(timer, shared: snapshot)
+
+        case .lww:
+            var next = cur
+            next.divergedOffline = nil
+            try? liveStore?.set(next)
+            setCachedLiveSession(next)
+            liveCoFocus?.setControlsSuppressed(false)
+            let step = sharedSessionStep(local: local, incoming: msg)
+            if step.apply {
+                applyRemoteSnapshot(cur: next, inc: step.next, by: by)
+            } else {
+                let snapshot = SharedSessionState(
+                    sessionId: local.sessionId, sessionStartMs: (cur.sessionStart ?? 0).rounded(),
+                    paused: cur.paused, pausedAtMs: cur.pausedAt.map { $0.rounded() },
+                    estimateMin: cur.sessionEstimateMin, rev: local.rev, atMs: local.atMs,
+                    ended: false)
+                lastSharedBroadcast = snapshot
+                liveCoFocus?.updateTimer(timer, shared: snapshot)
+            }
+        }
     }
 
     /// A partner finished/cancelled the shared session: finalize quietly with

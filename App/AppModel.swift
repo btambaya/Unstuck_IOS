@@ -434,6 +434,13 @@ final class AppModel {
         // Retry any shared-focus accrual stranded by an offline finish
         // (pending ledger — idempotent per sessionId).
         drainPendingSharedFocusLedger()
+        // Foreground re-exchange for a live partner-shared session (offline &
+        // reconnect convergence): re-join the co-focus channel if the socket
+        // outage killed it, re-send `hello` (any focuser re-broadcasts its
+        // state — the diverged side's convergence trigger) and idempotently
+        // re-announce ours (suppressed while diverged). Belt-and-braces beside
+        // the channel's own socket-status monitor.
+        if isPartnerCoFocusCandidate(cachedLiveSession) { liveCoFocus?.reexchange() }
         guard let coord = coordinator else { return }
         Task { await coord.syncNow() }
     }

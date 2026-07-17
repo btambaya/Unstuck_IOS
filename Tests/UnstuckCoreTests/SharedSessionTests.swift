@@ -215,9 +215,12 @@ final class CanonicalElapsedTests: XCTestCase {
         XCTAssertEqual(canonicalElapsedSec(s, now: T0 + 999_000), 90)
     }
 
-    func testPausedWithoutPausedAtFallsBackToZero() {
+    func testPausedWithoutPausedAtFallsBackToNow() {
+        // Web/Android parity: a paused state MISSING pausedAt uses `now` (the
+        // pause instant is unknown; freezing at the start would zero the
+        // elapsed — under-counting accrual and mis-ranking most-ahead).
         let s = state(start: T0, paused: true, pausedAt: nil)
-        XCTAssertEqual(canonicalElapsedSec(s, now: T0 + 999_000), 0)
+        XCTAssertEqual(canonicalElapsedSec(s, now: T0 + 999_000), 999)
     }
 
     func testNegativeClampsToZero() {
@@ -232,6 +235,206 @@ final class CanonicalElapsedTests: XCTestCase {
         // Both sides pass the ender's atMs as `now` → identical accrual numbers.
         let s = state(start: T0, rev: 4, at: T0 + 300_000, ended: true)
         XCTAssertEqual(canonicalElapsedSec(s, now: s.atMs), 300)
+    }
+}
+
+// MARK: - resolveDivergence (offline & reconnect convergence)
+
+final class ResolveDivergenceTests: XCTestCase {
+    // Tracker criterion 1 (+3): lose internet, DON'T pause → the local timer
+    // ran on wall clock; a stale (behind) partner re-announce on reconnect
+    // must NOT rewind it — keep local + broadcast the convergence control.
+    func testLocalRanAheadOfflineKeepsAndBroadcasts() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 7, at: T0 + 90_000)          // elapsed 100
+        let incoming = state(start: T0 + 10_000, rev: 4, at: T0)       // elapsed 90
+        XCTAssertEqual(resolveDivergence(local: local, incoming: incoming, now: now),
+                       .keepAndBroadcast(rev: 8))
+    }
+
+    // Tracker criterion 2 (+3): lose internet and PAUSE → it paused locally;
+    // on reconnect the partner's still-running clock is the most ahead → adopt
+    // it wholesale (un-pausing onto THE session clock).
+    func testPartnerRanAheadOfLocalOfflinePauseAdopts() {
+        let now = T0 + 100_000
+        let local = state(start: T0, paused: true, pausedAt: T0 + 50_000,
+                          rev: 6, at: T0 + 50_000)                     // frozen at 50
+        let incoming = state(start: T0, rev: 4, at: T0)                // elapsed 100
+        XCTAssertEqual(resolveDivergence(local: local, incoming: incoming, now: now), .adopt)
+    }
+
+    // Tracker criterion 3: on regaining internet the MOST-AHEAD clock wins —
+    // an incoming paused-but-ahead state also beats a behind local.
+    func testIncomingPausedButAheadAdopts() {
+        let now = T0 + 100_000
+        let local = state(start: T0 + 40_000, rev: 9, at: now)                       // elapsed 60
+        let incoming = state(start: T0, paused: true, pausedAt: T0 + 80_000,
+                             rev: 2, at: T0 + 80_000)                                // frozen at 80
+        XCTAssertEqual(resolveDivergence(local: local, incoming: incoming, now: now), .adopt)
+    }
+
+    // Tracker criterion 4: the online partner needs NO special logic — the
+    // convergence control broadcast at max(local, incoming)+1 applies through
+    // its plain LWW reducer.
+    func testConvergenceBroadcastAppliesOnThePartnerViaPlainLWW() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 7, at: T0 + 90_000)
+        let partnerView = state(start: T0 + 10_000, rev: 4, at: T0)
+        guard case .keepAndBroadcast(let rev) =
+                resolveDivergence(local: local, incoming: partnerView, now: now) else {
+            return XCTFail("expected keepAndBroadcast")
+        }
+        XCTAssertEqual(rev, 8)   // strictly newer than BOTH sides' floors
+        let convergence = msg(start: T0, rev: rev, at: now)
+        let (apply, next) = sharedSessionStep(local: partnerView, incoming: convergence)
+        XCTAssertTrue(apply)
+        XCTAssertEqual(next.sessionStartMs, T0)   // the most-ahead clock, both sides
+    }
+
+    func testRevIsMaxOfBothSidesPlusOne() {
+        let now = T0 + 100_000
+        // Incoming rev HIGHER than local: the convergence control must still
+        // beat it — max of both, plus one.
+        let local = state(start: T0, rev: 2, at: T0)                   // elapsed 100
+        let incoming = state(start: T0 + 20_000, rev: 9, at: now)      // elapsed 80
+        XCTAssertEqual(resolveDivergence(local: local, incoming: incoming, now: now),
+                       .keepAndBroadcast(rev: 10))
+    }
+
+    // Slack boundary (~3s = 3000 ms): a difference of EXACTLY the slack is
+    // "the same clock up to skew" → plain LWW; one second beyond converges.
+    func testSlackBoundary() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 5, at: T0)                   // elapsed 100
+        XCTAssertEqual(resolveDivergence(
+            local: local, incoming: state(start: T0 - 3000, rev: 4, at: T0), now: now), .lww)
+        XCTAssertEqual(resolveDivergence(
+            local: local, incoming: state(start: T0 - 4000, rev: 4, at: T0), now: now), .adopt)
+        XCTAssertEqual(resolveDivergence(
+            local: local, incoming: state(start: T0 + 3000, rev: 4, at: T0), now: now), .lww)
+        XCTAssertEqual(resolveDivergence(
+            local: local, incoming: state(start: T0 + 4000, rev: 4, at: T0), now: now),
+            .keepAndBroadcast(rev: 6))
+    }
+
+    func testIdenticalClocksFallBackToLWW() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 5, at: T0)
+        XCTAssertEqual(resolveDivergence(
+            local: local, incoming: state(start: T0, rev: 6, at: T0 + 1000), now: now), .lww)
+    }
+
+    func testEndedIncomingFallsBackToLWW() {
+        // Web/Android parity: callers pre-filter `ended` into the terminal
+        // step; the resolver returns .lww (the STEP reducer owns terminality
+        // and applies `ended` bypassing the (rev, atMs) gate — the elapsed
+        // comparison never enters).
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 9, at: now)                  // elapsed 100, way ahead
+        let incoming = state(start: T0 + 60_000, rev: 2, at: T0, ended: true)
+        XCTAssertEqual(resolveDivergence(local: local, incoming: incoming, now: now), .lww)
+        // ...and the step it falls back to DOES end the session (terminal
+        // bypasses the older (rev, atMs)):
+        let (apply, next) = sharedSessionStep(
+            local: local, incoming: msg(start: T0 + 60_000, rev: 2, at: T0, ended: true))
+        XCTAssertTrue(apply)
+        XCTAssertTrue(next.ended)
+    }
+
+    // Regression guard for the NON-diverged path: the elapsed comparison
+    // NEVER applies to live controls — a stale RUNNING re-announce (older
+    // rev, "ahead" clock) must not un-pause an online pause. Plain LWW only.
+    func testStaleRunningReannounceCannotUnpauseNonDivergedPause() {
+        let local = state(start: T0, paused: true, pausedAt: T0 + 30_000,
+                          rev: 5, at: T0 + 30_000)
+        let stale = msg(start: T0, paused: false, pausedAt: nil, rev: 4, at: T0 + 60_000)
+        let (apply, next) = sharedSessionStep(local: local, incoming: stale)
+        XCTAssertFalse(apply)
+        XCTAssertTrue(next.paused)
+    }
+
+    // Rev-floor integrity after ADOPT (spec §Convergence amendments): adopting
+    // is wholesale, CURSORS INCLUDED. An offline client whose rev inflated to
+    // 9 adopts the partner's rev-5 state → its floor becomes (5, inc.atMs), so
+    // the partner's next control (rev 6) applies. A floor left at the stale
+    // rev 9 would reject rev 6 — and our next re-announce would then revert
+    // the partner's control on their side.
+    func testAdoptResetsRevFloorSoPartnersNextControlApplies() {
+        let now = T0 + 100_000
+        // Diverged local: paused offline at 40s, rev inflated to 9.
+        let local = state(start: T0, paused: true, pausedAt: T0 + 40_000,
+                          rev: 9, at: T0 + 95_000)
+        // Partner kept running: elapsed 100 — most ahead → adopt.
+        let incoming = state(start: T0, rev: 5, at: T0 + 60_000)
+        XCTAssertEqual(resolveDivergence(local: local, incoming: incoming, now: now), .adopt)
+
+        // Wholesale adoption: the local floor IS the incoming (rev, atMs).
+        let adopted = incoming
+        XCTAssertEqual(adopted.rev, 5)
+
+        // The partner's post-convergence pause at rev 6 must apply.
+        let partnerPause = msg(start: T0, paused: true, pausedAt: now + 5000,
+                               rev: 6, at: now + 5000)
+        let (apply, next) = sharedSessionStep(local: adopted, incoming: partnerPause)
+        XCTAssertTrue(apply)
+        XCTAssertTrue(next.paused)
+
+        // Regression shape: the POISONED floor (stale local rev 9 retained
+        // after adopt) would have rejected exactly that control.
+        var poisoned = incoming
+        poisoned.rev = local.rev          // sharedSessionRev not reset
+        poisoned.atMs = local.atMs
+        XCTAssertFalse(sharedSessionStep(local: poisoned, incoming: partnerPause).apply)
+    }
+
+    // Both-diverged deadlock break (spec §Convergence amendments): each side's
+    // hello declares divergence, each side ANSWERS (the reply bypasses its own
+    // suppression) — safe because a diverged receiver resolves via MOST-AHEAD,
+    // not plain LWW. Both sides then converge on the same (most-ahead) clock.
+    func testBothDivergedConvergeOnTheMostAheadClock() {
+        let now = T0 + 100_000
+        let a = state(start: T0, rev: 9, at: T0 + 90_000)              // elapsed 100 (ahead)
+        let b = state(start: T0 + 20_000, rev: 7, at: T0 + 80_000)     // elapsed 80
+
+        // A (diverged) receives B's forced reply → keep + broadcast at
+        // max(9, 7) + 1 = 10.
+        XCTAssertEqual(resolveDivergence(local: a, incoming: b, now: now),
+                       .keepAndBroadcast(rev: 10))
+        // B (diverged) receives A's forced reply → adopt A wholesale.
+        XCTAssertEqual(resolveDivergence(local: b, incoming: a, now: now), .adopt)
+
+        // And A's convergence control then applies on B via plain LWW (B's
+        // adopted floor = A's state; rev 10 > 9) — one shared clock, both sides.
+        let convergence = msg(start: T0, rev: 10, at: now)
+        let (apply, next) = sharedSessionStep(local: a, incoming: convergence)
+        XCTAssertTrue(apply)
+        XCTAssertEqual(next.sessionStartMs, T0)
+    }
+
+    // Socket-down alone must mark divergence (spec §Convergence amendments):
+    // an offline RUNNER makes NO local control — its rev never inflates — so
+    // under plain LWW the partner's mid-outage pause (higher rev, frozen way
+    // back) would apply on rejoin and REWIND the runner. Diverged-marked, the
+    // most-ahead comparison keeps the runner's clock and re-broadcasts it.
+    func testOfflineRunnerMarkedDivergedIsNotRewoundByMidOutagePause() {
+        let now = T0 + 100_000
+        // The runner: no offline control, rev still 3, clock ran to 100s.
+        let runner = state(start: T0, rev: 3, at: T0)
+        // The partner paused mid-outage at 40s (rev 4 — strictly newer).
+        let partnerPause = msg(start: T0, paused: true, pausedAt: T0 + 40_000,
+                               rev: 4, at: T0 + 40_000)
+
+        // WITHOUT the socket-down divergence mark: plain LWW applies the
+        // pause and rewinds the runner to a 40s frozen clock. (This is why
+        // `.disconnected` alone must flag divergence.)
+        let lww = sharedSessionStep(local: runner, incoming: partnerPause)
+        XCTAssertTrue(lww.apply)
+        XCTAssertEqual(canonicalElapsedSec(lww.next, now: now), 40)
+
+        // WITH the mark: most-ahead keeps the runner (elapsed 100 vs 40) and
+        // broadcasts the genuine convergence control at max(3, 4) + 1.
+        XCTAssertEqual(resolveDivergence(local: runner, incoming: partnerPause.state!, now: now),
+                       .keepAndBroadcast(rev: 5))
     }
 }
 
@@ -288,12 +491,22 @@ final class FocusTimerAdoptTests: XCTestCase {
         var live = FocusTimer.adopt(.empty, taskId: "t1", state: state(rev: 7, at: T0), now: T0)
         live.sharedSessionEndedBy = "Ann"
         live.sharedSessionAtMs = T0
+        live.divergedOffline = true
         let next = FocusTimer.start(live, taskId: "t2", estimateMin: 25, now: T0 + 1000)
         XCTAssertNil(next.sharedSessionRev)
         XCTAssertNil(next.sharedSessionAtMs)
         XCTAssertNil(next.lastAppliedRev)
         XCTAssertNil(next.lastAppliedAtMs)
+        XCTAssertNil(next.divergedOffline)
         XCTAssertNil(next.sharedSessionEndedBy)
+    }
+
+    func testAdoptClearsDivergedFlag() {
+        // Adopting a fresh in-flight session starts CONVERGED by definition.
+        var cur = LiveSession.empty
+        cur.divergedOffline = true
+        let adopted = FocusTimer.adopt(cur, taskId: "t", state: state(rev: 3, at: T0), now: T0)
+        XCTAssertNil(adopted.divergedOffline)
     }
 
     func testOldLiveSessionBlobDecodesWithoutNewFields() throws {
@@ -308,6 +521,18 @@ final class FocusTimerAdoptTests: XCTestCase {
         XCTAssertNil(live.sharedSessionAtMs)
         XCTAssertNil(live.lastAppliedRev)
         XCTAssertNil(live.lastAppliedAtMs)
+        XCTAssertNil(live.divergedOffline)
         XCTAssertNil(live.sharedSessionEndedBy)
+    }
+
+    func testDivergedFlagRoundTripsThroughTheBlob() throws {
+        // The flag must survive a relaunch (a diverged rebind joins
+        // receive-only) and stay optional for other-platform stores.
+        var live = LiveSession.empty
+        live.sessionStart = 1000
+        live.divergedOffline = true
+        let data = try JSONEncoder().encode(live)
+        let back = try JSONDecoder().decode(LiveSession.self, from: data)
+        XCTAssertEqual(back.divergedOffline, true)
     }
 }
