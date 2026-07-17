@@ -116,7 +116,10 @@ public actor CoFocusChannel {
     /// message — including the new sessionId/rev/atMs/ended fields, including
     /// old-build messages without them — is handed to the app layer, which runs
     /// the pure LWW reducer + side effects. Display overlay stays internal.
-    private var onControl: (@Sendable (SharedSessionMsg) -> Void)?
+    /// The Bool rides `rejoinPending`-at-receipt (Rejoin reconciliation v2):
+    /// true ⇒ this is the FIRST same-session exchange after a rejoin — the app
+    /// layer widens its most-ahead gate to it (flag or no flag).
+    private var onControl: (@Sendable (SharedSessionMsg, Bool) -> Void)?
     /// Stable session-join timestamp so a track state-flip (observe → here)
     /// doesn't reset "since".
     private let sinceMs: Double
@@ -165,11 +168,36 @@ public actor CoFocusChannel {
     /// (or a foreground re-exchange) must not run two joinChannels at once.
     private var joining = false
     /// Post-re-exchange divergence grace (spec §Convergence amendments): after
-    /// a DIVERGED client sends hello, wait ~5s for a same-session answer. On
-    /// expiry: a focusing peer still in presence → re-hello + re-arm (≤3
-    /// tries); nobody focusing → report `onDivergedAlone`.
+    /// a DIVERGED (or rejoin-pending) client sends hello, wait ~5s for a
+    /// same-session answer. On expiry: a focusing peer still in presence →
+    /// re-hello + re-arm (≤3 tries); nobody focusing AND presence synced →
+    /// diverged reports `onDivergedAlone`, un-flagged pending self-clears.
     private var divergenceGraceTask: Task<Void, Never>?
     private var divergenceGraceTries = 0
+    /// Rejoin reconciliation v2 §2 — armed on EVERY rejoin (reconnect refire,
+    /// forced rejoin, phx_close rebuild, start-rebind of an existing session),
+    /// cleared by the first same-session exchange (a received same-session
+    /// state, or our own genuine rev+1 control send). While pending, the
+    /// idempotent state re-announces stay suppressed — a rejoin must never
+    /// impose local state by rev authority (the live-reproduced build-28
+    /// failure: an unflagged offline pause bumped rev, and the rejoin
+    /// re-announce bulldozed the healthy partner's clock).
+    private var rejoinPending = false
+    /// v2 §4 — true once a full `presence_state` snapshot landed AFTER the
+    /// last rejoin. The grace's "alone" conclusion requires it: an unsynced
+    /// presence map counts as a focusing peer present, never as empty (the
+    /// stale-presences race: concluding "alone" off a cleared/stale map
+    /// re-announced stale state over a live, not-yet-visible partner).
+    private var presenceSyncedSinceRejoin = false
+    /// v2 §5 — socket un-parking. supabase-swift's ConnectionManager only
+    /// auto-reconnects on the ws-error and heartbeat-timeout paths;
+    /// `handleClose` (a server/send-failure close) just flips state to
+    /// `.disconnected` and stops — the socket PARKS there forever (verified
+    /// against 2.46: no initiateReconnect in handleClose). While we observe
+    /// `.disconnected`, this task nudges `connect()` on a bounded backoff;
+    /// every successful connect lands in the monitor's `.connected` arm.
+    private var unparkTask: Task<Void, Never>?
+    private var unparkAttempt = 0
 
     public init(client: SupabaseClient, taskId: String, selfId: String, selfName: String) {
         self.client = client
@@ -188,11 +216,18 @@ public actor CoFocusChannel {
     /// binds in the DIVERGED state (a relaunch mid-divergence must not
     /// re-announce stale state); `onDeliveryFailure` reports an undeliverable
     /// control broadcast (the app layer flags `divergedOffline`).
+    /// `rejoin` (Rejoin reconciliation v2 §1) marks a REBIND of an EXISTING
+    /// session (relaunch / candidacy flap): the join tracks IDENTITY ONLY (no
+    /// timer/session fields) and sends `hello{diverged: flag}` — never a state
+    /// re-announce; `rejoinPending` arms and the first same-session exchange
+    /// (or the grace fallback) reconciles. The genuine FIRST subscribe of a
+    /// fresh session (mint/adopt) keeps the full announce.
     public func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
                       shared: SharedSessionState? = nil,
                       suppressControls: Bool = false,
+                      rejoin: Bool = false,
                       onPeers: @escaping @Sendable ([CoFocusPeer]) -> Void,
-                      onControl: (@Sendable (SharedSessionMsg) -> Void)? = nil,
+                      onControl: (@Sendable (SharedSessionMsg, Bool) -> Void)? = nil,
                       onDeliveryFailure: (@Sendable (String) -> Void)? = nil,
                       onSocketDown: (@Sendable (String) -> Void)? = nil,
                       onDivergedAlone: (@Sendable (String) -> Void)? = nil) async {
@@ -206,6 +241,7 @@ public actor CoFocusChannel {
         self.timer = timer
         self.shared = shared
         self.controlsSuppressed = suppressControls
+        if rejoin { armRejoin() }
         let joined = await joinChannel()
         // The socket-status monitors run REGARDLESS of the join outcome: a
         // bind that failed offline (an OFFLINE MINT included) must still see
@@ -219,10 +255,13 @@ public actor CoFocusChannel {
         // Announce ourselves so any focuser re-broadcasts its timer to us (works
         // whether or not we track presence).
         await sendHello()
-        if track != nil { await applyTrack() }
-        // A rebind mid-divergence (relaunch): the hello above is the diverged
-        // re-exchange — arm the grace so a lone client self-clears.
-        if controlsSuppressed { armDivergenceGrace(resetTries: true) }
+        if track != nil {
+            if rejoin { await trackIdentity() } else { await applyTrack() }
+        }
+        // A rebind mid-divergence (relaunch) or of an existing session: the
+        // hello above is the re-exchange — arm the grace so a lone client
+        // self-clears (the flag AND/OR the rejoin-pending gate).
+        if controlsSuppressed || rejoinPending { armDivergenceGrace(resetTries: true) }
     }
 
     /// Create (or re-acquire — supabase-swift dedupes by topic) the channel,
@@ -393,6 +432,10 @@ public actor CoFocusChannel {
         channelStatusTask?.cancel(); channelStatusTask = nil
         divergenceGraceTask?.cancel(); divergenceGraceTask = nil
         divergenceGraceTries = 0
+        unparkTask?.cancel(); unparkTask = nil
+        unparkAttempt = 0
+        rejoinPending = false
+        presenceSyncedSinceRejoin = false
         presences = [:]
         broadcastTimers = [:]
         onPeers = nil
@@ -445,17 +488,55 @@ public actor CoFocusChannel {
                         sawDrop = true
                         await self?.handleSocketDropped()
                     }
+                    // v2 §5: a parked socket never un-parks itself (SDK
+                    // handleClose does NOT reconnect) — nudge connect().
+                    await self?.startSocketUnpark()
                 case .connected:
                     let dropped = sawDrop
                     sawDrop = false
+                    await self?.cancelSocketUnpark(resetAttempts: true)
                     await self?.recoverAfterReconnect(afterDrop: dropped)
                 case .connecting:
-                    break
+                    // Someone (the SDK's own error/heartbeat reconnect, our
+                    // nudge, or a subscribe) is already driving a connect —
+                    // stand the nudger down; `.disconnected` re-arms it.
+                    await self?.cancelSocketUnpark(resetAttempts: false)
                 @unknown default:
                     break
                 }
             }
         }
+    }
+
+    /// v2 §5 — bounded-backoff `connect()` nudges while the socket sits
+    /// `.disconnected` (2s, 4s, 8s, 16s, then a 30s cap — persistent: an
+    /// airplane-mode outage keeps failing cheaply until connectivity returns).
+    /// Single-flight; cancelled on `.connecting`/`.connected` and at teardown.
+    private func startSocketUnpark() {
+        guard unparkTask == nil else { return }
+        let realtime = client.realtimeV2
+        unparkTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let attempt = await self?.bumpUnparkAttempt() else { return }
+                let delaySec = min(30.0, pow(2.0, Double(min(attempt, 6))))
+                try? await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
+                guard !Task.isCancelled, realtime.status == .disconnected else { return }
+                // Either succeeds (monitor's `.connected` arm cancels us and
+                // runs the rejoin cycle) or fails back to `.disconnected` —
+                // loop for the next, longer-spaced nudge.
+                await realtime.connect()
+            }
+        }
+    }
+
+    private func bumpUnparkAttempt() -> Int {
+        unparkAttempt += 1
+        return unparkAttempt
+    }
+
+    private func cancelSocketUnpark(resetAttempts: Bool) {
+        unparkTask?.cancel(); unparkTask = nil
+        if resetAttempts { unparkAttempt = 0 }
     }
 
     /// The socket dropped. Two jobs:
@@ -477,34 +558,72 @@ public actor CoFocusChannel {
     }
 
     /// The socket reconnected: make sure our channel genuinely re-joined,
-    /// then re-track + re-exchange. Handles ALL three shapes:
+    /// then run the v2 REJOIN cycle (hello-only). Handles ALL three shapes:
     ///  • `channel == nil` — the bind never succeeded (offline mint) or a
-    ///    failed rebuild: join from scratch (an offline mint must announce
-    ///    itself after reconnect);
+    ///    failed rebuild: join from scratch;
     ///  • after a drop — force an unsubscribe first if the stale
     ///    `.subscribed` survived (the drop can race the prearm), re-subscribe,
     ///    and RE-ARM the channel-close observer (its task consumed itself on
     ///    the prearm's expected unsubscribe);
     ///  • a healthy `.connected` replay (no drop, channel up) — no-op.
+    /// Rejoin reconciliation v2 §1: a rejoin NEVER re-announces state (the
+    /// build-28 re-announce imposed an unflagged offline pause on the healthy
+    /// partner by rev authority) — identity-only presence + `hello{diverged}`;
+    /// `rejoinPending` arms and the first same-session exchange (or the grace
+    /// fallback, which for a flagged offline mint delivers the delayed
+    /// announce via `onDivergedAlone`) reconciles.
     private func recoverAfterReconnect(afterDrop: Bool) async {
         if channel == nil {
+            armRejoin()
             guard await joinChannel() else { return }
         } else if afterDrop, let ch = channel {
-            // Our own (expected) unsubscribe below must not read as a
-            // server-side close — cancel the observer, re-arm after.
-            channelStatusTask?.cancel(); channelStatusTask = nil
-            if ch.status == .subscribed { await ch.unsubscribe() }
-            try? await ch.subscribeWithError()
-            guard ch.status == .subscribed else { return }
-            startChannelCloseObserver(ch)
+            armRejoin()
+            guard await forceRejoin(ch) else { return }
         } else {
             return
         }
-        if track != nil { await applyTrack() }
+        if track != nil { await trackIdentity() }
         await sendHello()
-        // The hello above is a diverged client's re-exchange: arm the grace
-        // fallback so a lone client (nobody left to converge with) self-clears.
-        if controlsSuppressed { armDivergenceGrace(resetTries: true) }
+        armDivergenceGrace(resetTries: true)
+    }
+
+    /// Force a genuine re-join of the EXISTING channel instance: unsubscribe a
+    /// stale `.subscribed` first (a plain drop leaves the state machine there,
+    /// where both the SDK's rejoin and `subscribe()` no-op), re-subscribe, and
+    /// re-arm the close observer around our own EXPECTED unsubscribe. Shares
+    /// the `joining` single-flight guard with joinChannel — a monitor replay
+    /// racing a foreground re-exchange must not run two rejoins at once.
+    private func forceRejoin(_ ch: RealtimeChannelV2) async -> Bool {
+        guard !joining else { return false }
+        joining = true
+        defer { joining = false }
+        channelStatusTask?.cancel(); channelStatusTask = nil
+        if ch.status == .subscribed { await ch.unsubscribe() }
+        try? await ch.subscribeWithError()
+        guard ch.status == .subscribed else { return false }
+        startChannelCloseObserver(ch)
+        return true
+    }
+
+    /// Arm the v2 rejoin gate: `rejoinPending` until the first same-session
+    /// exchange, and the presence map counts as UNSYNCED until the fresh
+    /// join's `presence_state` snapshot lands (v2 §4).
+    private func armRejoin() {
+        rejoinPending = true
+        presenceSyncedSinceRejoin = false
+    }
+
+    /// Re-assert presence IDENTITY after a rejoin — name/state/since only,
+    /// carrying NO timer or session fields (v2 §1: no state on the wire by
+    /// rev authority on any rejoin). Peers re-learn the live timer from the
+    /// first post-reconciliation broadcast (hello replies / controls / the
+    /// grace fallback's announce), which is the authoritative path anyway.
+    private func trackIdentity() async {
+        guard let ch = channel, let track else { return }
+        try? await ch.track(TrackPayload(
+            userId: selfId, name: selfName, state: track.rawValue, sinceMs: sinceMs.rounded(),
+            sessionStartMs: nil, paused: nil, pausedAtMs: nil, estimateMin: nil,
+            sessionId: nil, rev: nil, atMs: nil, ended: nil))
     }
 
     /// Watch OUR channel for a server-side close (`phx_close` → `.subscribed`
@@ -563,41 +682,57 @@ public actor CoFocusChannel {
         // No removeChannel: the server close already unregistered the topic.
         // joinChannel re-registers it (client.channel dedupes if it didn't)
         // and rebuilds presence from the fresh `presence_state` snapshot.
+        // v2 §1: the rebuild is a REJOIN — identity-only track + hello, never
+        // a state re-announce; rejoinPending + the grace reconcile.
+        armRejoin()
         guard await joinChannel() else { return }
-        if track != nil { await applyTrack() }
+        if track != nil { await trackIdentity() }
         await sendHello()
-        if controlsSuppressed { armDivergenceGrace(resetTries: true) }
+        armDivergenceGrace(resetTries: true)
     }
 
     /// Foreground / manual re-exchange (belt-and-braces beside the socket
     /// monitor — the scenePhase `.active` hook calls this through the app's
-    /// syncNow): ensure the channel is genuinely joined (driving the rejoin if
-    /// the SDK's lifecycle reconnect landed without one), re-assert presence,
-    /// re-announce our state idempotently (same rev — receivers' LWW ignores
-    /// non-newer; suppressed while diverged), and `hello` so any focuser
-    /// re-broadcasts its state — which is what lets a DIVERGED client converge.
+    /// syncNow): un-park a dead socket, ensure the channel is genuinely
+    /// joined (driving the forced rejoin if the SDK's lifecycle reconnect
+    /// landed without one), and `hello` so any focuser re-broadcasts its
+    /// state — which is what lets a rejoining/diverged client converge.
+    /// Rejoin reconciliation v2 §1/§5: NEVER a state re-announce here — a
+    /// "healthy" status read may be a lie (a dead socket goes unnoticed for
+    /// up to ~2 heartbeats), so the old idempotent applyTrack could impose
+    /// unflagged offline state by rev authority. Hello-only on EVERY branch.
     public func reexchange() async {
+        // v2 §5: supabase-swift's handleClose parks the socket at
+        // `.disconnected` (no auto-reconnect on that path) — foreground must
+        // drive connect() explicitly before any rejoin can succeed. A socket
+        // we just un-parked ALWAYS forces the rejoin below: the channel's
+        // `.subscribed` from before the park is dead server-side (no fresh
+        // phx_join happens on its own).
+        var unparked = false
+        if client.realtimeV2.status == .disconnected {
+            await client.realtimeV2.connect()
+            unparked = true
+        }
         if channel == nil {
             // The bind never succeeded (offline at start — an offline mint):
-            // the foreground re-exchange is the recovery trigger when the
-            // SDK's socket sits `.disconnected` without retrying (a failed
-            // FIRST connect never re-initiates; subscribe drives connect()).
+            // the foreground re-exchange is the recovery trigger.
+            armRejoin()
             guard await joinChannel() else { return }
+            if track != nil { await trackIdentity() }
         } else if let ch = channel,
-                  ch.status != .subscribed || client.realtimeV2.status != .connected {
-            // Our own (expected) unsubscribe must not read as a server-side
-            // close — cancel the observer, re-arm after the re-subscribe.
-            channelStatusTask?.cancel(); channelStatusTask = nil
-            if ch.status == .subscribed { await ch.unsubscribe() }   // stale-subscribed: force a real join
-            try? await ch.subscribeWithError()
-            guard ch.status == .subscribed else { return }
-            startChannelCloseObserver(ch)
+                  unparked || ch.status != .subscribed || client.realtimeV2.status != .connected {
+            // Not genuinely joined (incl. a socket that read `.disconnected`
+            // above and just reconnected): force a real re-join.
+            armRejoin()
+            guard await forceRejoin(ch) else { return }
+            if track != nil { await trackIdentity() }
         }
-        if track != nil { await applyTrack() }
+        // Always hello — even on a healthy-reading channel (the read may be
+        // stale; a hello is cheap and a focuser's reply is what reconciles).
         await sendHello()
-        // Diverged re-exchange: arm the alone-fallback grace (≤3 re-hellos
-        // toward a focusing peer, then clear-and-announce).
-        if controlsSuppressed { armDivergenceGrace(resetTries: true) }
+        // Rejoin/diverged re-exchange: arm the alone-fallback grace (≤3
+        // re-hellos toward a focusing peer, then clear-and-announce).
+        if controlsSuppressed || rejoinPending { armDivergenceGrace(resetTries: true) }
     }
 
     /// Track the current state + (for a focuser) the INITIAL live timer, then
@@ -656,6 +791,20 @@ public actor CoFocusChannel {
     private func broadcastTimer(control: Bool = false, bypassSuppression: Bool = false) async {
         guard let ch = channel, track == .focusing, let t = timer,
               !controlsSuppressed || bypassSuppression else { return }
+        // Rejoin reconciliation v2 §2: while `rejoinPending` the idempotent
+        // re-announces stay suppressed (no local state on the wire by rev
+        // authority until the first exchange reconciles). A genuine rev+1
+        // CONTROL still sends — fresh user intent, applied locally first,
+        // plain LWW on the receiver — and, as an outbound same-session
+        // exchange, completes the pending gate itself (also protecting the
+        // fresh control from being reverted by a most-ahead adopt of the
+        // partner's pre-control reply). The forced diverged-hello reply keeps
+        // bypassing WITHOUT clearing (we still owe the incoming state a
+        // reconciliation).
+        if rejoinPending {
+            guard control || bypassSuppression else { return }
+            if control { rejoinPending = false }
+        }
         // Round epoch-ms to whole so they serialize as JSON integers, not decimals
         // (see applyTrack) — a fractional Double breaks Android's Long decode.
         let msg = TimerBroadcast(userId: selfId, sessionStartMs: t.sessionStartMs.rounded(),
@@ -695,17 +844,16 @@ public actor CoFocusChannel {
         }
     }
 
-    // MARK: - divergence grace (spec §Convergence-protocol amendments)
+    // MARK: - divergence grace (spec §Convergence-protocol amendments + v2 §4)
 
-    /// After a diverged re-exchange hello, wait ~5s for a same-session answer.
+    /// After a diverged/rejoin re-exchange hello, wait ~5s for a same-session answer.
     private static let divergenceGraceNs: UInt64 = 5_000_000_000
-    private static let divergenceGraceMaxTries = 3
 
     /// Arm (or re-arm) the post-hello grace. `resetTries` on every FRESH
     /// re-exchange trigger (rejoin / foreground / rebuild); the expiry re-arms
     /// without a reset so the ≤3 bound holds within one convergence attempt.
     private func armDivergenceGrace(resetTries: Bool) {
-        guard controlsSuppressed else { return }
+        guard controlsSuppressed || rejoinPending else { return }
         if resetTries { divergenceGraceTries = 0 }
         divergenceGraceTask?.cancel()
         divergenceGraceTask = Task { [weak self] in
@@ -715,27 +863,46 @@ public actor CoFocusChannel {
         }
     }
 
-    /// The grace expired with the divergence still unresolved. A focusing peer
-    /// still in presence may just be slow (or mid-rejoin): re-hello and re-arm,
-    /// bounded to 3 tries. Nobody focusing — or the retries exhausted — means
-    /// there is no state to converge with: report `onDivergedAlone` so the app
-    /// clears the flag, un-suppresses, and re-announces (our state IS the
-    /// session; the offline rev bumps are already monotonic). Without this a
-    /// solo channel blip would mute the client's broadcasts forever.
+    /// The grace expired with the divergence / rejoin gate still unresolved.
+    /// The decision is the pure `divergenceGraceExpiry` (v2 §4):
+    ///  • a focusing peer in presence — or a presence map that hasn't SYNCED
+    ///    since the rejoin, which proves nothing and counts as one — may just
+    ///    be slow: re-hello and re-arm, bounded to 3 tries;
+    ///  • synced + nobody focusing (or retries exhausted): genuinely alone.
+    ///    DIVERGED → report `onDivergedAlone` (the app clears the flag and
+    ///    re-announces via the delivery-verified control path, re-flagging on
+    ///    failure). Un-flagged rejoin-pending → self-clear and resume
+    ///    announcing (idempotent same rev; safe — no focusing peer to fight).
+    ///  • retries exhausted with presence NEVER synced: the join is broken —
+    ///    stand down (conclude nothing off an unsynced map); the next rejoin
+    ///    cycle (socket monitor / foreground re-exchange) restarts the grace.
     private func divergenceGraceExpired() async {
-        guard controlsSuppressed else { return }
-        let peers = coFocusPeers(from: presences, selfId: selfId)
-        if peers.contains(where: { $0.state == .focusing }),
-           divergenceGraceTries < Self.divergenceGraceMaxTries {
+        guard controlsSuppressed || rejoinPending else { return }
+        let focusing = coFocusPeers(from: presences, selfId: selfId)
+            .contains { $0.state == .focusing }
+        switch divergenceGraceExpiry(focusingPeerPresent: focusing,
+                                     presenceSynced: presenceSyncedSinceRejoin,
+                                     tries: divergenceGraceTries) {
+        case .rehello:
             divergenceGraceTries += 1
             await sendHello()
             armDivergenceGrace(resetTries: false)
-        } else if let sid = shared?.sessionId {
-            onDivergedAlone?(sid)
+        case .standDown:
+            break
+        case .clearAndAnnounce:
+            if controlsSuppressed {
+                if let sid = shared?.sessionId { onDivergedAlone?(sid) }
+            } else {
+                rejoinPending = false
+                if track != nil { await applyTrack() }
+            }
         }
     }
 
     private func applyPresence(_ diff: PresenceDiff) {
+        // v2 §4: a full snapshot is the post-(re)join presence SYNC — only
+        // after one may the grace trust an empty map to mean "alone".
+        if diff.isSnapshot { presenceSyncedSinceRejoin = true }
         if diff.isSnapshot {
             // Full (re)subscribe snapshot: rebuild from scratch so peers that
             // left during a socket drop (whose leave we never saw) don't linger.
@@ -769,9 +936,24 @@ public actor CoFocusChannel {
     /// `{event,type,payload}`; our fields live under `payload`.
     private func applyTimerBroadcast(_ json: JSONObject) {
         guard let msg = Self.decodeControl(json) else { return }
+        // Rejoin reconciliation v2 §2: the FIRST same-session state received
+        // after a rejoin completes the exchange — clear the pending gate and
+        // surface its pre-clear value with the control, so the app layer runs
+        // most-ahead reconciliation on exactly this first exchange (flag or
+        // no flag). The grace has nothing left to decide unless the DIVERGED
+        // machinery still owns it.
+        let wasRejoinPending = rejoinPending
+        if rejoinPending, let sid = msg.sessionId,
+           shared == nil || sid == shared?.sessionId {
+            rejoinPending = false
+            if !controlsSuppressed {
+                divergenceGraceTask?.cancel(); divergenceGraceTask = nil
+                divergenceGraceTries = 0
+            }
+        }
         // Control first — includes same-user-other-device messages (one user,
         // two devices, one session) that the peers display excludes below.
-        onControl?(msg)
+        onControl?(msg, wasRejoinPending)
         guard let uid = msg.userId, uid != selfId, let start = msg.sessionStartMs else { return }
         if msg.ended == true {
             // Final state: drop the overlay (the ender's presence leave follows,

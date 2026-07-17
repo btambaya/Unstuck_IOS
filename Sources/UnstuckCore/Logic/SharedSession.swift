@@ -194,3 +194,68 @@ public func resolveDivergence(
     }
     return .lww
 }
+
+// MARK: - Rejoin reconciliation v2 (spec §Rejoin reconciliation v2)
+
+/// The reconciliation GATE (v2 §2): a live same-session state runs most-ahead
+/// reconciliation — instead of plain LWW — iff the receiver is genuinely
+/// flagged diverged OR its channel is rejoin-pending (armed on every rejoin,
+/// cleared by the first same-session exchange). The first exchange after ANY
+/// rejoin reconciles, flag or no flag: the flag-based design alone failed on
+/// real devices because a dead socket goes unnoticed for up to ~2 heartbeats
+/// and controls made in that window bump rev UNFLAGGED.
+public func sharedSessionReconcilesMostAhead(divergedOffline: Bool, rejoinPending: Bool) -> Bool {
+    divergedOffline || rejoinPending
+}
+
+/// ASYMMETRIC most-ahead for a rejoining client (v2 §3). `flaggedDiverged` is
+/// the genuine `divergedOffline` flag (a DETECTED outage / undelivered
+/// control), not the transient rejoin-pending gate:
+///  • `adopt` (incoming clock ahead) is always allowed — a rejoiner may take
+///    the partner's fresher clock whether or not its own outage was detected;
+///  • `keepAndBroadcast` (imposing the LOCAL clock by rev authority) requires
+///    the flag. Un-flagged + local-ahead falls back to plain (rev, atMs) LWW —
+///    a trivial connection blip can never bulldoze the partner's genuine
+///    online pause (the standing non-diverged guard), while a detected outage
+///    still wins tester criteria 3/4.
+public func resolveRejoin(
+    local: SharedSessionState, incoming: SharedSessionState,
+    now: EpochMillis, flaggedDiverged: Bool
+) -> SharedSessionDivergenceResolution {
+    let resolution = resolveDivergence(local: local, incoming: incoming, now: now)
+    if case .keepAndBroadcast = resolution, !flaggedDiverged { return .lww }
+    return resolution
+}
+
+/// Bounded re-hello attempts for the post-rejoin grace (matches web's
+/// DIVERGENCE_REEXCHANGE_MAX_TRIES).
+public let sharedSessionGraceMaxTries = 3
+
+/// What the post-rejoin grace does when it expires with no same-session
+/// answer (v2 §4 — pure so the presence race is encoded + tested once).
+public enum SharedSessionGraceOutcome: Equatable, Sendable {
+    /// A focusing peer may hold state (or presence is still unsynced —
+    /// unknowable): re-send `hello` and re-arm, bounded.
+    case rehello
+    /// Presence is SYNCED and shows nobody focusing (or the bounded retries
+    /// ran out with a synced map): genuinely alone — clear the gate/flag and
+    /// (re-)announce; ours IS the session.
+    case clearAndAnnounce
+    /// The retries ran out but presence NEVER synced since the rejoin: the
+    /// join is broken — conclude NOTHING off an unsynced map (announcing
+    /// stale state over an unseen live partner is the exact race this
+    /// prevents). The next rejoin cycle restarts the grace.
+    case standDown
+}
+
+/// Grace-expiry decision (v2 §4): the "alone" conclusion requires at least one
+/// presence sync AFTER the last rejoin — an unsynced presence map counts as a
+/// focusing peer present (retry), never as empty.
+public func divergenceGraceExpiry(
+    focusingPeerPresent: Bool, presenceSynced: Bool, tries: Int
+) -> SharedSessionGraceOutcome {
+    if (focusingPeerPresent || !presenceSynced), tries < sharedSessionGraceMaxTries {
+        return .rehello
+    }
+    return presenceSynced ? .clearAndAnnounce : .standDown
+}

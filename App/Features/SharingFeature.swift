@@ -811,12 +811,18 @@ final class CoFocusModel {
     /// realtime socket dropping under a live shared session (socket-down alone
     /// marks divergence); `onDivergedAlone` reports the diverged re-exchange
     /// grace expiring with nobody to converge with (the app clears the flag +
-    /// re-announces). The join runs on the co-focus chain, so it lands
-    /// strictly after any in-flight teardown of the same topic.
+    /// re-announces). `rejoin` marks a REBIND of an EXISTING session (Rejoin
+    /// reconciliation v2): the join is hello-only — identity presence, NO
+    /// state re-announce — and the channel arms `rejoinPending`, surfaced per
+    /// message through `onControl`'s Bool (true ⇒ the first same-session
+    /// exchange after a rejoin — the app widens its most-ahead gate to it).
+    /// The join runs on the co-focus chain, so it lands strictly after any
+    /// in-flight teardown of the same topic.
     func start(track: CoFocusState?, timer: CoFocusTimerState? = nil,
                shared: SharedSessionState? = nil,
                suppressControls: Bool = false,
-               onControl: (@Sendable (SharedSessionMsg) -> Void)? = nil,
+               rejoin: Bool = false,
+               onControl: (@Sendable (SharedSessionMsg, Bool) -> Void)? = nil,
                onDeliveryFailure: (@Sendable (String) -> Void)? = nil,
                onSocketDown: (@Sendable (String) -> Void)? = nil,
                onDivergedAlone: (@Sendable (String) -> Void)? = nil) {
@@ -825,6 +831,7 @@ final class CoFocusModel {
         run { [weak self] in
             await channel.start(track: track, timer: timer, shared: shared,
                                 suppressControls: suppressControls,
+                                rejoin: rejoin,
                                 onPeers: { peers in
                                     Task { @MainActor in self?.peers = peers }
                                 },

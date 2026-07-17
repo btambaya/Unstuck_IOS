@@ -128,9 +128,13 @@ extension AppModel {
         // seed the baseline FROM it (SAME rev + the persisted atMs floor)
         // instead of letting the change detector mint a spurious rev+1 with
         // atMs=now, which could beat a genuine partner control on the atMs
-        // tiebreak. The (re)bind below re-broadcasts this state idempotently:
-        // receivers' LWW ignores a non-newer (rev, atMs). Rev bumps are for
-        // genuine LOCAL user controls only.
+        // tiebreak. Rev bumps are for genuine LOCAL user controls only.
+        // Rejoin reconciliation v2: this seed marks the bind below as a
+        // REJOIN of an existing session — hello-only, NO state re-announce
+        // (the build-28 idempotent rebind announce imposed unflagged offline
+        // state on the healthy partner by rev authority); the channel arms
+        // `rejoinPending` and the first same-session exchange reconciles.
+        var rebindOfExisting = false
         if lastSharedBroadcast == nil,
            live.sharedSessionRev != nil || live.lastAppliedRev != nil {
             lastSharedBroadcast = SharedSessionState(
@@ -140,6 +144,7 @@ extension AppModel {
                 rev: max(live.sharedSessionRev ?? 0, live.lastAppliedRev ?? 0),
                 atMs: max(live.sharedSessionAtMs ?? 0, live.lastAppliedAtMs ?? 0),
                 ended: false)
+            rebindOfExisting = true
         }
 
         let changed: Bool = {
@@ -190,12 +195,18 @@ extension AppModel {
             // strictly after any in-flight teardown of the SAME topic
             // (supabase-swift dedupes channels by topic — a stop() racing a
             // start() would otherwise unsubscribe the fresh channel). A
-            // diverged rebind (relaunch mid-divergence) joins RECEIVE-only.
+            // diverged rebind (relaunch mid-divergence) joins RECEIVE-only;
+            // a rebind of an EXISTING session (the seed above) joins as a v2
+            // REJOIN (hello-only — a fresh mint/adopt keeps the full
+            // first-subscribe announce).
             let cf = makeCoFocusModel(taskId: live.taskId)
             cf.start(track: .focusing, timer: timer, shared: lastSharedBroadcast,
                      suppressControls: diverged,
-                     onControl: { [weak self] msg in
-                         Task { @MainActor in self?.handleSharedControl(msg) }
+                     rejoin: rebindOfExisting,
+                     onControl: { [weak self] msg, rejoinPending in
+                         Task { @MainActor in
+                             self?.handleSharedControl(msg, rejoinPending: rejoinPending)
+                         }
                      },
                      onDeliveryFailure: { [weak self] sid in
                          Task { @MainActor in self?.handleSharedDeliveryFailure(sessionId: sid) }
@@ -259,10 +270,16 @@ extension AppModel {
     /// The diverged re-exchange grace expired with nobody (focusing) left in
     /// presence — there is no state to converge with; ours IS the session
     /// (spec §Convergence amendments: a solo channel blip must not mute the
-    /// client's broadcasts forever). Clear the flag, un-suppress the
-    /// transport, and re-announce the current state at its ALREADY-monotonic
-    /// rev (the offline bumps made it strictly newer than anything delivered
-    /// pre-outage — no extra bump; receivers already at it LWW-ignore).
+    /// client's broadcasts forever). The channel only reports this after at
+    /// least one presence SYNC since the last rejoin (v2 §4 — an unsynced map
+    /// counts as a focusing peer, so a stale-presence race can't fake
+    /// "alone"). Clear the flag, un-suppress the transport, and re-announce
+    /// the current state at its ALREADY-monotonic rev (the offline bumps made
+    /// it strictly newer than anything delivered pre-outage — no extra bump;
+    /// receivers already at it LWW-ignore). The catch-up `updateTimer` below
+    /// is a CONTROL send, so it runs the channel's delivery gate: if it can't
+    /// be delivered, `onDeliveryFailure` → handleSharedDeliveryFailure
+    /// RE-FLAGS divergence + re-suppresses instead of leaking the state.
     func handleSharedDivergedAlone(sessionId: String) {
         guard let liveStore, var cur = (try? liveStore.get()) ?? nil,
               cur.sessionStart != nil, cur.id == sessionId,
@@ -296,8 +313,10 @@ extension AppModel {
 
     /// Apply a received `timer` message to the live session. Old-build messages
     /// (no sessionId) are display-only — the channel's peer overlay already
-    /// renders them; nothing to do here.
-    func handleSharedControl(_ msg: SharedSessionMsg) {
+    /// renders them; nothing to do here. `rejoinPending` (Rejoin
+    /// reconciliation v2) is the channel's per-message flag: true ⇒ this is
+    /// the FIRST same-session exchange after a rejoin.
+    func handleSharedControl(_ msg: SharedSessionMsg, rejoinPending: Bool = false) {
         guard msg.sessionId != nil else { return }
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
               cur.sessionStart != nil, let curId = cur.id else { return }
@@ -311,15 +330,21 @@ extension AppModel {
             atMs: max(lastSharedBroadcast?.atMs ?? 0,
                       max(cur.sharedSessionAtMs ?? 0, cur.lastAppliedAtMs ?? 0)),
             ended: false)
-        // Offline divergence (spec §Offline & reconnect convergence): while
-        // DIVERGED, a live same-session state runs MOST-AHEAD convergence
-        // instead of plain LWW. `ended` stays terminal — it falls through to
-        // the normal step below. Non-diverged behavior is COMPLETELY
-        // unchanged: the elapsed comparison never applies to live controls (a
-        // stale running re-announce cannot un-pause an online pause).
-        if cur.divergedOffline == true, let inc = msg.state,
-           inc.sessionId == curId, !inc.ended {
-            resolveDivergedControl(cur: cur, local: local, inc: inc, msg: msg)
+        // Most-ahead reconciliation gate (v2 §2 — `sharedSessionReconcilesMostAhead`):
+        // while DIVERGED, or on the first same-session exchange after ANY
+        // rejoin, a live same-session state runs MOST-AHEAD reconciliation
+        // instead of plain LWW (a dead socket goes unnoticed for up to ~2
+        // heartbeats, so an outage's controls can bump rev UNFLAGGED — the
+        // rejoin gate reconciles flag or no flag; the resolution itself is
+        // asymmetric unless genuinely flagged). `ended` stays terminal — it
+        // falls through to the normal step below. Steady-state non-diverged
+        // behavior is COMPLETELY unchanged: the elapsed comparison never
+        // applies to live controls (a stale running re-announce cannot
+        // un-pause an online pause).
+        let flagged = cur.divergedOffline == true
+        if sharedSessionReconcilesMostAhead(divergedOffline: flagged, rejoinPending: rejoinPending),
+           let inc = msg.state, inc.sessionId == curId, !inc.ended {
+            resolveDivergedControl(cur: cur, local: local, inc: inc, msg: msg, flagged: flagged)
             return
         }
 
@@ -387,20 +412,25 @@ extension AppModel {
         sharedSessionRemoteTick &+= 1
     }
 
-    /// Most-ahead convergence for a DIVERGED local session receiving a live
-    /// same-session state (pure `resolveDivergence`, ~3s slack, both elapsed
-    /// at OUR clock):
-    ///  • incoming ahead → adopt it wholesale + clear the flag;
-    ///  • local ahead → keep local, clear the flag, broadcast local as a
-    ///    GENUINE convergence control at rev = max(local, incoming) + 1 — the
-    ///    partner applies it via normal LWW (criterion 4: the online side
-    ///    needs no special logic);
-    ///  • within slack → the clocks agree: clear the flag, fall back to plain
-    ///    (rev, atMs) LWW; when LOCAL wins that LWW, idempotently re-announce
-    ///    it at the SAME rev so the partner's floor catches up to the rev
-    ///    bumps made offline (receivers already at it ignore non-newer).
+    /// Most-ahead reconciliation for a DIVERGED or rejoin-pending local
+    /// session receiving a live same-session state (pure `resolveRejoin` —
+    /// v2 §3 asymmetric — ~3s slack, both elapsed at OUR clock):
+    ///  • incoming ahead → adopt it wholesale + clear the flag (allowed with
+    ///    or without the flag — a rejoiner may always take the fresher clock);
+    ///  • local ahead + GENUINELY FLAGGED → keep local, clear the flag,
+    ///    broadcast local as a GENUINE convergence control at rev =
+    ///    max(local, incoming) + 1 — the partner applies it via normal LWW
+    ///    (criterion 4: the online side needs no special logic);
+    ///  • local ahead + UN-flagged (rejoin blip) → plain (rev, atMs) LWW,
+    ///    NOTHING announced — a blip must never bulldoze the partner's
+    ///    genuine online pause by rev authority (v2 §3);
+    ///  • within slack → the clocks agree: fall back to plain LWW; when
+    ///    FLAGGED and LOCAL wins that LWW, idempotently re-announce it at the
+    ///    SAME rev so the partner's floor catches up to the rev bumps made
+    ///    offline (receivers already at it ignore non-newer).
     private func resolveDivergedControl(cur: LiveSession, local: SharedSessionState,
-                                        inc: SharedSessionState, msg: SharedSessionMsg) {
+                                        inc: SharedSessionState, msg: SharedSessionMsg,
+                                        flagged: Bool) {
         let now = (Date().timeIntervalSince1970 * 1000).rounded()
         let localShared = SharedSessionState(
             sessionId: local.sessionId, sessionStartMs: cur.sessionStart ?? 0,
@@ -412,7 +442,8 @@ extension AppModel {
                                       paused: cur.paused, pausedAtMs: cur.pausedAt,
                                       estimateMin: cur.sessionEstimateMin)
 
-        switch resolveDivergence(local: localShared, incoming: inc, now: now) {
+        switch resolveRejoin(local: localShared, incoming: inc, now: now,
+                             flaggedDiverged: flagged) {
         case .adopt:
             // The partner's clock is ahead — theirs is THE session now,
             // cursors included (resetRevFloor: the offline-inflated local rev
@@ -443,6 +474,15 @@ extension AppModel {
             liveCoFocus?.updateTimer(timer, shared: snapshot)
 
         case .lww:
+            guard flagged else {
+                // Un-flagged rejoin (v2 §3): plain LWW only — apply a strictly
+                // newer incoming, and when LOCAL wins say NOTHING (no flag to
+                // clear, no state debt; announcing here would impose the local
+                // state by rev authority — the exact build-28 bulldoze).
+                let step = sharedSessionStep(local: local, incoming: msg)
+                if step.apply { applyRemoteSnapshot(cur: cur, inc: step.next, by: by) }
+                return
+            }
             var next = cur
             next.divergedOffline = nil
             try? liveStore?.set(next)

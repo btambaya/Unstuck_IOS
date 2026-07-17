@@ -536,3 +536,161 @@ final class FocusTimerAdoptTests: XCTestCase {
         XCTAssertEqual(back.divergedOffline, true)
     }
 }
+
+// MARK: - Rejoin reconciliation v2 (spec §Rejoin reconciliation v2)
+
+final class RejoinGateTests: XCTestCase {
+    // v2 §2: the most-ahead gate widens to (divergedOffline || rejoinPending)
+    // — the first same-session exchange after ANY rejoin reconciles, flag or
+    // no flag (a dead socket goes unnoticed for up to ~2 heartbeats, so an
+    // outage's controls can bump rev UNFLAGGED).
+    func testGateWidensToRejoinPending() {
+        XCTAssertFalse(sharedSessionReconcilesMostAhead(divergedOffline: false, rejoinPending: false))
+        XCTAssertTrue(sharedSessionReconcilesMostAhead(divergedOffline: true, rejoinPending: false))
+        XCTAssertTrue(sharedSessionReconcilesMostAhead(divergedOffline: false, rejoinPending: true))
+        XCTAssertTrue(sharedSessionReconcilesMostAhead(divergedOffline: true, rejoinPending: true))
+    }
+}
+
+final class ResolveRejoinTests: XCTestCase {
+    // v2 §3 — THE standing guard: a trivial connection blip (rejoin-pending,
+    // no genuine divergedOffline flag) can never bulldoze the partner's
+    // genuine online pause. Local ran ahead (running clock) vs the partner's
+    // online pause frozen behind: un-flagged → NO keepAndBroadcast — plain
+    // LWW — and the partner's strictly-newer pause APPLIES (we pause too).
+    func testBlipCannotBulldozeOnlinePause() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 4, at: T0)                    // running, elapsed 100
+        let pause = state(start: T0, paused: true, pausedAt: T0 + 40_000,
+                          rev: 5, at: T0 + 40_000)                      // online pause, frozen at 40
+        XCTAssertEqual(resolveRejoin(local: local, incoming: pause, now: now,
+                                     flaggedDiverged: false), .lww)
+        // ...and the plain LWW it falls back to applies the pause (rev 5 > 4).
+        let (apply, next) = sharedSessionStep(
+            local: local,
+            incoming: msg(start: T0, paused: true, pausedAt: T0 + 40_000,
+                          rev: 5, at: T0 + 40_000))
+        XCTAssertTrue(apply)
+        XCTAssertTrue(next.paused)
+    }
+
+    // v2 §3 — a DETECTED outage still wins tester criteria 3/4: genuinely
+    // flagged diverged keeps the full most-ahead resolution, keepAndBroadcast
+    // included (the flagged-outage runner is not rewound by a behind pause).
+    func testFlaggedOutageKeepAndBroadcastStillWins() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 4, at: T0)                    // elapsed 100
+        let pause = state(start: T0, paused: true, pausedAt: T0 + 40_000,
+                          rev: 5, at: T0 + 40_000)                      // frozen at 40
+        XCTAssertEqual(resolveRejoin(local: local, incoming: pause, now: now,
+                                     flaggedDiverged: true),
+                       .keepAndBroadcast(rev: 6))
+    }
+
+    // v2 §3 — `adopt` is allowed with or without the flag: a rejoining client
+    // always may take an AHEAD incoming clock (criterion 3 for the flagged
+    // outage; harmless convergence for the un-flagged blip).
+    func testAdoptAllowedFlaggedOrNot() {
+        let now = T0 + 100_000
+        let local = state(start: T0, paused: true, pausedAt: T0 + 40_000,
+                          rev: 9, at: T0 + 95_000)                      // frozen at 40, rev inflated
+        let incoming = state(start: T0, rev: 5, at: T0 + 60_000)        // running, elapsed 100
+        XCTAssertEqual(resolveRejoin(local: local, incoming: incoming, now: now,
+                                     flaggedDiverged: false), .adopt)
+        XCTAssertEqual(resolveRejoin(local: local, incoming: incoming, now: now,
+                                     flaggedDiverged: true), .adopt)
+    }
+
+    // Within slack the clocks agree — plain LWW regardless of the flag.
+    func testWithinSlackIsLwwEitherWay() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 5, at: T0)
+        let incoming = state(start: T0 + 2000, rev: 4, at: T0)
+        XCTAssertEqual(resolveRejoin(local: local, incoming: incoming, now: now,
+                                     flaggedDiverged: false), .lww)
+        XCTAssertEqual(resolveRejoin(local: local, incoming: incoming, now: now,
+                                     flaggedDiverged: true), .lww)
+    }
+
+    // `ended` stays terminal: the resolver returns .lww either way (callers
+    // pre-filter ended into the terminal step — platform parity).
+    func testEndedIncomingStaysLwwEitherWay() {
+        let now = T0 + 100_000
+        let local = state(start: T0, rev: 9, at: now)
+        let incoming = state(start: T0 + 60_000, rev: 2, at: T0, ended: true)
+        XCTAssertEqual(resolveRejoin(local: local, incoming: incoming, now: now,
+                                     flaggedDiverged: false), .lww)
+        XCTAssertEqual(resolveRejoin(local: local, incoming: incoming, now: now,
+                                     flaggedDiverged: true), .lww)
+    }
+
+    // The live-reproduced build-28 failure shape (42/42: web rewound onto the
+    // iPhone's frozen clock). The iPhone's dead socket went unnoticed (~2
+    // heartbeats), its offline pause bumped rev UNFLAGGED in that window, and
+    // the rejoin re-announce imposed the frozen state on web by rev
+    // authority. Under v2 the rejoin is hello-only (nothing re-announced) and
+    // the first exchange — web's running state, clock AHEAD — resolves
+    // `.adopt` for the un-flagged iPhone: web's clock survives on BOTH sides.
+    func testReproducedRejoinBulldozeShapeNowAdopts() {
+        let now = T0 + 300_000
+        // iPhone: paused at 120s during the unnoticed dead-socket window;
+        // rev bumped to 6 — ABOVE web's 5.
+        let iphone = state(start: T0, paused: true, pausedAt: T0 + 120_000,
+                           rev: 6, at: T0 + 120_000)
+        // Web: healthy + running the whole time — elapsed 300.
+        let web = state(start: T0, rev: 5, at: T0 + 10_000)
+        // Build 28 re-announced `iphone` on rejoin; web's plain LWW HAD to
+        // apply it (rev 6 > 5) — the reproduced rewind:
+        let bulldozed = sharedSessionStep(
+            local: web,
+            incoming: msg(start: T0, paused: true, pausedAt: T0 + 120_000,
+                          rev: 6, at: T0 + 120_000))
+        XCTAssertTrue(bulldozed.apply)
+        XCTAssertEqual(canonicalElapsedSec(bulldozed.next, now: now), 120)   // rewound
+        // v2: the iPhone announces nothing on rejoin; web's reply reconciles
+        // the un-flagged iPhone via adopt — one clock, the most ahead.
+        XCTAssertEqual(resolveRejoin(local: iphone, incoming: web, now: now,
+                                     flaggedDiverged: false), .adopt)
+        XCTAssertEqual(canonicalElapsedSec(web, now: now), 300)
+    }
+}
+
+// MARK: - divergence grace expiry (v2 §4 — the stale-presences race)
+
+final class DivergenceGraceExpiryTests: XCTestCase {
+    func testUnsyncedPresenceCountsAsFocuserPresent() {
+        // Right after a rejoin the presence map may be cleared/stale — it
+        // proves nothing, so the grace must RETRY, never conclude "alone".
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: false,
+                                             presenceSynced: false, tries: 0), .rehello)
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: false,
+                                             presenceSynced: false, tries: 2), .rehello)
+    }
+
+    func testUnsyncedNeverConcludesAlone() {
+        // Retries exhausted with presence NEVER synced: the join is broken —
+        // stand down (the next rejoin cycle restarts the grace); announcing
+        // stale state over an unseen live partner is the race this prevents.
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: false,
+                                             presenceSynced: false,
+                                             tries: sharedSessionGraceMaxTries), .standDown)
+    }
+
+    func testSyncedEmptyPresenceConcludesAlone() {
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: false,
+                                             presenceSynced: true, tries: 0), .clearAndAnnounce)
+    }
+
+    func testSyncedFocuserRetriesBounded() {
+        // A visible focuser may just be slow: re-hello, bounded to 3 tries —
+        // then fall back to clear-and-announce (never muted forever).
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: true,
+                                             presenceSynced: true, tries: 0), .rehello)
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: true,
+                                             presenceSynced: true,
+                                             tries: sharedSessionGraceMaxTries - 1), .rehello)
+        XCTAssertEqual(divergenceGraceExpiry(focusingPeerPresent: true,
+                                             presenceSynced: true,
+                                             tries: sharedSessionGraceMaxTries), .clearAndAnnounce)
+    }
+}
