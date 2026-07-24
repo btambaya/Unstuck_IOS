@@ -71,6 +71,11 @@ struct ListsView: View {
             .sheet(isPresented: $showNew) { newCollectionSheet }
             .feedbackBubble()
         }
+        // The guided tour is about to navigate — close the locally-presented
+        // sheets (they live on this view's @State, out of the router's reach).
+        .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
+            showSettings = false; showPalette = false; showNew = false
+        }
         .task {
             guard vm == nil, let db = model.db else { return }
             let m = CollectionsModel(Repository<ItemCollection>(db, orderColumn: "sortOrder"))

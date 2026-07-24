@@ -69,6 +69,11 @@ final class AmbientAudio {
         teardown()
     }
 
+    /// The bed is live (engine running). Read by TourAudioPlayer.stop() so
+    /// tour narration never deactivates the shared session out from under a
+    /// playing ambient bed.
+    var isRunning: Bool { running }
+
     /// True while the bed is paused specifically for the Focus Copilot (so a
     /// restore() only resumes a bed the copilot itself ducked, never one the
     /// user muted). Best-effort.

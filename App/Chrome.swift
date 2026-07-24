@@ -49,7 +49,9 @@ struct BottomNavBar: View {
             .background(theme.palette.bg)
             .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 0.5) }
 
-            CoralFab(action: onFab).offset(y: -28)
+            // Tour anchor: the New-task fallback when an empty account has no
+            // task detail to spotlight on the first-action step.
+            CoralFab(action: onFab).tourTarget(.newTask).offset(y: -28)
         }
     }
 

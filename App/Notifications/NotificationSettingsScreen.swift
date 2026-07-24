@@ -32,6 +32,8 @@ struct NotificationSettingsView: View {
                 }
                 .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+                // Tour anchor: the notifications step rings the level picker.
+                .tourTarget(.notifBody)
 
                 SectionLabel("Remind me before a scheduled task")
                     .padding(.top, 22).padding(.bottom, 8)

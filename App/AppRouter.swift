@@ -8,8 +8,14 @@ import UnstuckCore
 @Observable
 final class AppRouter {
     enum Tab: Hashable, CaseIterable { case today, tasks, calendar, lists }
-    enum Sheet: Identifiable {
+    enum Sheet: Identifiable, Hashable {
         case newTask, quickCapture, inbox
+        /// Insights/Analytics presented router-side (the guided tour drives
+        /// this; Today's week-pill keeps its local sheet).
+        case insights
+        /// Settings presented router-side, optionally deep-linked to a section
+        /// ("Notifications" / "Interface") — the tour's settings steps.
+        case settings(section: String?)
         var id: Int { hashValue }
     }
 
@@ -62,6 +68,17 @@ final class AppRouter {
         detailTask = nil
         focusTask = nil
         sharedFocus = nil
+    }
+
+    /// The guided tour's dismiss: closes only the modals the TOUR can have
+    /// opened (router sheet, task detail, assistant bubble). `focusTask` is
+    /// deliberately left alone — the tour never presents Focus (its focus
+    /// steps stay on Today), so a live focus cover can only be a session the
+    /// USER started, and tour navigation must never tear that down.
+    func dismissTourPresentations() {
+        activeSheet = nil
+        showBubble = false
+        detailTask = nil
     }
 }
 

@@ -184,6 +184,11 @@ struct CalendarView: View {
         }
         // No bubble on Calendar (Android gates it off `tab == "calendar"`): it
         // sits bottom-trailing over the drag-to-schedule gesture area.
+        // The guided tour is about to navigate — close the locally-presented
+        // sheets (they live on this view's @State, out of the router's reach).
+        .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
+            showSettings = false; showPalette = false; createAt = nil
+        }
         .task {
             guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }
             let m = CalendarModel(taskRepo, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))

@@ -314,6 +314,22 @@ final class AssistantModel {
         }
     }
 
+    // MARK: - tour Q&A (guided-tour "Ask a question")
+
+    /// One STATELESS round-trip for the guided tour, through the SAME
+    /// `assistant` edge fn + transport as the chat — with `context.tour`
+    /// flagging product-tour Q&A mode server-side (the edge fn appends its
+    /// stricter tour addendum and withholds the tool schemas; the guardrail
+    /// lives on the SERVER). Never touches `history`/`sending`; the tour
+    /// ignores any tool_calls in the reply and falls back to canned TOUR_QA
+    /// on error/timeout (see Tour/TourAsk.swift).
+    func tourAsk(messages: [ChatMessage], stepId: String, stepTitle: String) async -> AssistantResult {
+        guard let client else { return .err("not_configured") }
+        var context = buildContext()
+        context["tour"] = .object(["step": .string(stepId), "title": .string(stepTitle)])
+        return await client.ask(messages: messages, context: context)
+    }
+
     // MARK: - store reads
 
     private func liveTasks() -> [TaskItem] {

@@ -41,6 +41,8 @@ struct FeedbackBubbleModifier: ViewModifier {
                 model.router.bubbleStartTab = .assistant
                 model.router.showBubble = true
             }
+            // Tour anchor: the assistant/re-entry steps ring this launcher.
+            .tourTarget(.assistantLaunch)
             .padding(.trailing, 16)
             // Clear the floating bottom nav (~84pt incl. the safe area) so the
             // bubble — now the Assistant entry — isn't occluded by / mis-tapped

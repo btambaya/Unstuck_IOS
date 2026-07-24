@@ -217,6 +217,9 @@ struct TaskEditor: View {
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // Tour anchor: the first-action step opens a real task and rings this
+        // block (empty account → the New-task FAB fallback takes over).
+        .tourTarget(.firstAction)
         .padding(.top, 14)
     }
 

@@ -142,6 +142,11 @@ struct UnstuckApp: App {
                     }
                     if phase == .background {
                         BackgroundSync.schedule()
+                        // A RUNNING guided tour checkpoints { paused, index,
+                        // mode } now, so a jetsam kill relaunches into the
+                        // resume card instead of losing the run. Reads the
+                        // lazy backing — never *constructs* the tour here.
+                        model._tour?.appDidEnterBackground()
                         // Capture the latest in-session state into the App-Group
                         // snapshot NOW, so a hands-free Siri query right after
                         // backgrounding reflects what the user just did.

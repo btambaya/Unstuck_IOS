@@ -18,6 +18,17 @@ struct SettingsView: View {
     @Environment(\.uTheme) private var theme
     @State private var exportURL: URL?
 
+    /// Deep-link a section on first appearance (the guided tour presents
+    /// Settings open on Notifications / Interface — the iOS analogue of the
+    /// web `?section=` seed).
+    private let initialSection: String?
+    @State private var showNotificationsSection = false
+    @State private var showInterfaceSection = false
+
+    init(section: String? = nil) {
+        self.initialSection = section
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -52,6 +63,17 @@ struct SettingsView: View {
                 // Delete the full-PII dump once the share finishes/cancels so
                 // it doesn't linger in tmp (makeExportFile sweeps stragglers).
                 ActivityView(items: [url]) { AppModel.removeExportFile(url) }
+            }
+            // Programmatic section pushes (tour deep-link). These coexist with
+            // the NavigationLink rows above — same destinations, different entry.
+            .navigationDestination(isPresented: $showNotificationsSection) { NotificationSettingsView() }
+            .navigationDestination(isPresented: $showInterfaceSection) { InterfaceSettingsView() }
+            .onAppear {
+                switch initialSection {
+                case "Notifications": showNotificationsSection = true
+                case "Interface": showInterfaceSection = true
+                default: break
+                }
             }
         }
     }
@@ -465,6 +487,13 @@ private struct AccountSettingsView: View {
                 CardDivider()
                 SettingTapRow(label: "Export everything", value: "A full JSON snapshot of your data.") {
                     exportURL = model.makeExportFile()
+                }
+                CardDivider()
+                // Guided product tour — resume an UNFINISHED run at its saved
+                // step; a finished or fresh tour RESTARTS at the welcome card
+                // (the web's Settings → Account → Product tour semantics).
+                SettingTapRow(label: "Product tour", value: "Replay the guided walkthrough") {
+                    model.tour.openExplicit()
                 }
                 CardDivider()
                 SettingTapRow(label: "Delete my account", value: "Permanently removes your data",

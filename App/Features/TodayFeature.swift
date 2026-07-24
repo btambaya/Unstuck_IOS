@@ -259,6 +259,11 @@ struct TodayView: View {
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
         .feedbackBubble()
+        // The guided tour is about to navigate — close the locally-presented
+        // sheets (they live on this view's @State, out of the router's reach).
+        .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
+            showSettings = false; showNotifCenter = false; showPalette = false; showInsights = false
+        }
         .task {
             model.shareState.start()   // live "shared with you" + delegation state
             guard vm == nil, let repo = model.taskRepo else { return }
@@ -372,6 +377,9 @@ struct TodayView: View {
                         .foregroundStyle(.white).padding(.horizontal, 18).padding(.vertical, 13)
                         .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }.buttonStyle(.plain)
+                        // Tour anchor: the focus/capture steps ring this begin
+                        // affordance (iOS has no idle Focus state to spotlight).
+                        .tourTarget(.focusBegin)
                     Button { showPalette = true } label: {
                         Text("Pick another").font(UFont.sans(13, .medium))
                             .foregroundStyle(theme.palette.primaryDeep)
@@ -383,6 +391,7 @@ struct TodayView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
                         in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .tourTarget(.startNext)
         } else if vm.backlogCount > 0 {
             // Nothing scheduled today — point to the Backlog (don't pull a backlog
             // task into the hero). Tapping flips the list below to the Backlog.
@@ -402,6 +411,8 @@ struct TodayView: View {
                 .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
                             in: RoundedRectangle(cornerRadius: 24, style: .continuous))
             }.buttonStyle(.plain)
+                // Tour fallback: no hero → the backlog pointer stands in.
+                .tourTarget(.backlogPointer)
         } else {
             VStack(spacing: 10) {
                 Mark(size: 48)
@@ -511,6 +522,9 @@ struct TodayView: View {
             ForEach(rows) { t in taskRow(t) }
         }
         .padding(.horizontal, 18)
+        // Tour fallback anchor: an empty account renders no hero at all — the
+        // today/finish steps spotlight the list section instead.
+        .tourTarget(.todayList)
         // Per-view empty note — only when nothing else is on screen (the live
         // card counts as content), and only inside Backlog or an area filter
         // (matches Android's displayRows.isEmpty && liveTask == null gate).

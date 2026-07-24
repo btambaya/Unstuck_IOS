@@ -26,6 +26,8 @@ struct MainTabScaffold: View {
                 case .newTask: NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin)
                 case .quickCapture: NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin)
                 case .inbox: InboxView()
+                case .insights: NavigationStack { AnalyticsView() }
+                case .settings(let section): SettingsView(section: section)
                 }
             }
             .sheet(isPresented: $router.showBubble, onDismiss: { model.flushPendingDeepLink() }) {
@@ -58,6 +60,12 @@ struct MainTabScaffold: View {
             } message: { msg in
                 Text(msg)
             }
+            // Guided product tour — lives in its OWN always-on-top passthrough
+            // window so the spotlight + panel render above every sheet and the
+            // focus fullScreenCover (a root overlay here would be covered).
+            // Mounted from the scaffold = signed-in + onboarded only.
+            .background(TourWindowMounter(model: model,
+                                          colorSchemeOverride: model.settings.theme.colorScheme))
     }
 
     // MARK: - invite-prompt bindings (confirm + result over circleInvitePrompt)

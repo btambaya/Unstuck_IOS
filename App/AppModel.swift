@@ -193,6 +193,20 @@ final class AppModel {
         return a
     }
 
+    /// Backing for the lazily-built guided-tour orchestrator. Observation-
+    /// ignored for the same reason as `_assistant`: TourModel is itself
+    /// @Observable and drives the tour UI.
+    @ObservationIgnored private(set) var _tour: TourModel?
+
+    /// The guided product tour (welcome/running/paused phase machine + the
+    /// spotlight/panel state). Built on first access from the tour overlay.
+    var tour: TourModel {
+        if let t = _tour { return t }
+        let t = TourModel(app: self)
+        _tour = t
+        return t
+    }
+
     /// Backing for the app-wide per-task sharing state (tasks shared WITH me +
     /// my outgoing badges / delegation map). Single shared instance so Today,
     /// Tasks, the share sheet, and the Start-Next picker all read one source of
@@ -262,6 +276,12 @@ final class AppModel {
         UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
+
+        // Arm the ONE-TIME guided-tour auto-welcome for accounts that finish
+        // onboarding after the tour shipped (it surfaces on the next Today
+        // appearance). Existing accounts only ever reach the tour via
+        // Settings → Account → Product tour.
+        TourStore().save { $0.eligible = true }
 
         // Seed life areas (single source — only when empty).
         if let write = coordinator?.write, ((try? db?.fetchAllLifeAreas())?.isEmpty ?? true) {
@@ -343,6 +363,11 @@ final class AppModel {
         signedIn = true
         onboarded = true
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
+        // Tour UITest hook: reset the tour to a fresh 'eligible' state so the
+        // one-time welcome fires deterministically on this boot.
+        if ProcessInfo.processInfo.environment["UITEST_TOUR"] == "1" {
+            TourStore().save { $0 = TourState(eligible: true) }
+        }
         // Debug hook: jump straight into Focus on launch (crash isolation).
         if ProcessInfo.processInfo.environment["UITEST_FOCUS"] == "1",
            let t = (try? taskRepo?.fetch(id: "t-proposal")) ?? nil {
