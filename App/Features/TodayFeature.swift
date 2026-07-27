@@ -377,9 +377,6 @@ struct TodayView: View {
                         .foregroundStyle(.white).padding(.horizontal, 18).padding(.vertical, 13)
                         .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }.buttonStyle(.plain)
-                        // Tour anchor: the focus/capture steps ring this begin
-                        // affordance (iOS has no idle Focus state to spotlight).
-                        .tourTarget(.focusBegin)
                     Button { showPalette = true } label: {
                         Text("Pick another").font(UFont.sans(13, .medium))
                             .foregroundStyle(theme.palette.primaryDeep)

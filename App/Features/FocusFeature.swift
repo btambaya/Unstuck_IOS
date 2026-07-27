@@ -899,7 +899,9 @@ struct FocusView: View {
 /// Ambient progress ring with a white Orbit mark in the center.
 /// Background arc = white 10%; the progress arc sweeps from 12 o'clock
 /// (amber while paused, white while running) — 1:1 with the Android Canvas.
-private struct ProgressRing: View {
+/// Internal (not private): the guided tour's DEMO focus surface
+/// (TourDemoFocus) reuses the REAL ring so the demo can't drift.
+struct ProgressRing: View {
     let progress: Double
     let paused: Bool
     /// When false (Settings · Accessibility → Reduce motion), the arc snaps to
@@ -928,7 +930,8 @@ private struct ProgressRing: View {
 /// White-on-dark Orbit mark (the shared `Mark` reads the theme ink, which is
 /// dark on the light theme — but the focus screen is always dark, so we draw
 /// the ring + anchor + coral dot in white here). Geometry mirrors `Mark`.
-private struct WhiteOrbit: View {
+/// Internal: ProgressRing is reused by the tour's demo focus surface.
+struct WhiteOrbit: View {
     let size: CGFloat
     private let coral = Color(hex: "#E89077")
 

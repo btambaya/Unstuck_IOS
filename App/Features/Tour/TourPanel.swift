@@ -75,11 +75,12 @@ struct TourPanel: View {
         .frame(maxWidth: 380)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Product tour")
-        // Swipe-down = pause (the iOS Escape-equivalent: dismiss, keep progress).
+        // Swipe-down = the pause flow (the iOS Escape-equivalent) — shows the
+        // inline confirm first; progress is only saved-and-dismissed on confirm.
         .gesture(
             DragGesture(minimumDistance: 30)
                 .onEnded { value in
-                    if value.translation.height > 60 && abs(value.translation.width) < 80 { tour.pause() }
+                    if value.translation.height > 60 && abs(value.translation.width) < 80 { tour.requestPause() }
                 }
         )
         .onChange(of: tour.currentStep.id) { _, _ in
@@ -136,7 +137,7 @@ struct TourPanel: View {
         .overlay(alignment: .bottom) { Rectangle().fill(theme.palette.line).frame(height: 1) }
     }
 
-    // MARK: listen bar (bundled audio — "Voice · Cherry")
+    // MARK: listen bar (bundled audio — "Voice · Cherry" + live captions)
 
     private var listenBar: some View {
         VStack(spacing: 7) {
@@ -176,9 +177,22 @@ struct TourPanel: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Narration speed \(speedLabel)x")
             }
+            // Live caption (round 2): the sentence CURRENTLY being spoken —
+            // narration or the Tell-me-more clip — one subtitle-style line
+            // synced to audio progress (char-weighted spans). The panel never
+            // grows: one line, gently scaled when a sentence runs long.
+            if let caption = captionSentence {
+                Text(caption)
+                    .font(UFont.sans(11.5))
+                    .foregroundStyle(theme.palette.ink2)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.62)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("TourCaption")
+            }
             HStack(spacing: 5) {
                 Text("CAPTIONS").font(UFont.mono(9, .medium)).tracking(0.8).foregroundStyle(theme.palette.ink3)
-                Text("· always on").font(UFont.sans(11)).foregroundStyle(theme.palette.ink4)
+                Text("· live").font(UFont.sans(11)).foregroundStyle(theme.palette.ink4)
                 Spacer(minLength: 0)
                 Text("Voice · \(TourAudioPlayer.voiceLabel)")
                     .font(UFont.sans(10.5, .semibold)).foregroundStyle(theme.palette.ink3)
@@ -187,6 +201,16 @@ struct TourPanel: View {
         .padding(.horizontal, 12).padding(.vertical, 10)
         .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.top, 12)
+    }
+
+    /// The sentence being spoken right now, from the ACTIVE clip's text
+    /// (narration, or the step's `more` while its clip plays) and progress.
+    private var captionSentence: String? {
+        let step = tour.currentStep
+        let text = tour.audio.clip == .more ? (step.more ?? step.narration) : step.narration
+        let sentences = splitTourSentences(text)
+        guard !sentences.isEmpty else { return nil }
+        return sentences[tourCaptionIndex(progress: tour.audio.progress, sentences: sentences)]
     }
 
     private var speedLabel: String {
@@ -274,7 +298,13 @@ struct TourPanel: View {
                 if !tour.ask.asking { askFocused = false }
             }
             if step.more != nil {
-                miniLink(showMore ? "Less" : "Tell me more") { showMore.toggle() }
+                // Round 2: in Listen mode the expand also plays the step's
+                // <id>-more.m4a (narration pauses, resumes after); collapse
+                // stops it. Read mode just toggles the text.
+                miniLink(showMore ? "Less" : "Tell me more") {
+                    showMore.toggle()
+                    tour.moreToggled(expanded: showMore)
+                }
             }
             if TourAudioPlayer.hasAudio(forStep: step.id) {
                 miniLink(tour.mediaMode == .listen ? "Read instead" : "Listen") {
@@ -298,11 +328,25 @@ struct TourPanel: View {
         .buttonStyle(.plain)
     }
 
-    // MARK: footer
+    // MARK: footer (controls, or the inline pause confirm — round 2)
 
+    @ViewBuilder
     private func footer(_ step: TourStep) -> some View {
+        Group {
+            if tour.confirmingPause {
+                pauseConfirm
+            } else {
+                controls
+            }
+        }
+        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 14)
+        .padding(.top, 6)
+        .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 1) }
+    }
+
+    private var controls: some View {
         HStack(spacing: 8) {
-            ghostButton("Pause") { tour.pause() }
+            ghostButton("Pause") { tour.requestPause() }
             ghostButton("Skip") { tour.advance() }
             Spacer(minLength: 0)
             if tour.index > 0 {
@@ -322,9 +366,45 @@ struct TourPanel: View {
             }
             .buttonStyle(.plain)
         }
-        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 14)
-        .padding(.top, 6)
-        .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 1) }
+    }
+
+    /// Inline pause confirm: nothing is dismissed until [Pause]; the Settings
+    /// path is always named so the run is never "lost".
+    private var pauseConfirm: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Pause the tour? Your progress is saved.")
+                .font(UFont.sans(13, .semibold))
+                .foregroundStyle(theme.palette.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("Pick it back up anytime from Settings → Account → Product tour.")
+                .font(UFont.sans(11.5))
+                .lineSpacing(2.5)
+                .foregroundStyle(theme.palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button { tour.confirmPause() } label: {
+                    Text("Pause")
+                        .font(UFont.sans(13, .semibold))
+                        .foregroundStyle(theme.palette.bg)
+                        .padding(.horizontal, 18).padding(.vertical, 9)
+                        .background(theme.palette.ink, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Confirm pause")
+                Button { tour.cancelPause() } label: {
+                    Text("Keep going")
+                        .font(UFont.sans(13, .semibold))
+                        .foregroundStyle(theme.palette.ink)
+                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .background(theme.palette.surface, in: Capsule())
+                        .overlay(Capsule().stroke(theme.palette.line2, lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func ghostButton(_ label: String, action: @escaping () -> Void) -> some View {

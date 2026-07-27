@@ -17,8 +17,9 @@ enum TourMode: String, Codable, Sendable { case essential, full }
 enum TourMediaMode: String, Codable, Sendable { case read, listen }
 
 /// Persisted tour state — the same shape/semantics as the web TourState
-/// (started/done/paused/eligible/mode/mediaMode/speed/index). voiceURI is
-/// web-only (speechSynthesis fallback); iOS always narrates the bundled clips.
+/// (started/done/paused/eligible/mode/mediaMode/speed/index/chipDismissed).
+/// voiceURI is web-only (speechSynthesis fallback); iOS always narrates the
+/// bundled clips.
 struct TourState: Codable, Equatable, Sendable {
     /// Set once the user has begun (or explicitly declined) the tour.
     var started: Bool?
@@ -31,6 +32,10 @@ struct TourState: Codable, Equatable, Sendable {
     var mediaMode: TourMediaMode?
     var speed: Double?
     var index: Int?
+    /// The user ✕-dismissed the floating "Resume tour" chip — it never comes
+    /// back for this run (the Settings → Account path remains). Cleared when a
+    /// fresh run begins.
+    var chipDismissed: Bool?
 }
 
 /// UserDefaults-backed store for `TourState` under the web-parity key.
@@ -63,10 +68,10 @@ struct TourStore: @unchecked Sendable {
 
 /// The surfaces a step can open. iOS maps these onto the real tabs/sheets
 /// (today→Today tab, captures→Inbox sheet, settings→Settings sheet, …).
-/// NOTE `focus`: the iOS FocusView always mints a live session on init (there
-/// is no idle focus state), so the orchestrator maps focus-view steps onto the
-/// Today tab and spotlights the hero's Focus begin affordance instead — the
-/// tour must NEVER start a real session (spec deviation, noted).
+/// NOTE `focus` (round 2): the tour renders its OWN full-screen DEMO focus
+/// surface (TourDemoFocus, inside the tour window) — the app stays on Today
+/// underneath and a real session is NEVER minted. The spotlight targets for
+/// these steps live inside the demo.
 enum TourStepView: String, Sendable {
     case today, tasks, calendar, captures, collections, insights, settings, focus
 }
@@ -81,9 +86,11 @@ enum TourTargetID: String, CaseIterable, Sendable {
     case newTask = "new-task"
     case assistantLaunch = "assistant-launch"
     case notifBody = "notif-body"
-    /// The Today hero's "Focus" begin button — stands in for the web's
-    /// `focus-ring` (no idle focus state exists on iOS; see TourStepView.focus).
-    case focusBegin = "focus-begin"
+    /// The DEMO focus surface's progress ring (rendered by the tour itself —
+    /// the analogue of web's `focus-ring`).
+    case focusRing = "focus-ring"
+    /// The DEMO focus surface's Capture pill — the capture step's anchor.
+    case captureHint = "capture-hint"
 }
 
 struct TourStep: Identifiable, Sendable {
@@ -104,6 +111,18 @@ struct TourStep: Identifiable, Sendable {
     let primary: String
     /// The primary CTA opens the assistant bubble (web `onShow: openAssistant`).
     var opensAssistant: Bool = false
+    /// Round 3 (cross-platform cutout policy): the spotlight cutout passes
+    /// touches through to the app ONLY on this step — every other step's ring
+    /// is DISPLAY-ONLY and claims() swallows the cutout region too. TRUE only
+    /// for the assistant/reentry steps, whose whole point is tapping the
+    /// ringed launcher (and using the sheet it opens). Everywhere else a
+    /// pass-through cutout was a live gun: tapping the ringed Start-Next hero
+    /// minted a REAL focus session mid-tour.
+    var cutoutInteractive: Bool = false
+
+    /// Round 2: the focus/capture steps present the tour's own DEMO focus
+    /// surface (TourDemoFocus) instead of navigating anywhere.
+    var isDemoFocus: Bool { view == .focus }
 }
 
 /// The step script — copy ported VERBATIM from web tour-data.ts.
@@ -140,14 +159,14 @@ enum TourScript {
             body: "The Assistant lives here, bottom-right. Brain-dump in plain language — “break this down”, “what should I do first?”, “schedule this” — and it performs the real action after you confirm. It operates the app; it isn’t a separate chatbot.",
             narration: "Down here is the Assistant. You can brain-dump in plain language — break this down, what should I do first, schedule this — and it carries out the real action after you confirm. It’s wired into the whole app. Action over conversation.",
             more: "The Assistant only makes high-impact changes (sharing, bulk rescheduling, deleting) after you confirm. Low-risk things like saving a capture happen directly, with Undo.",
-            primary: "Open the Assistant", opensAssistant: true),
+            primary: "Open the Assistant", opensAssistant: true, cutoutInteractive: true),
         TourStep(
-            // The web tour navigates to /focus in its idle "Begin focus" state.
-            // iOS has NO idle focus state (FocusView mints a session on init),
-            // so this step stays on Today and rings the hero's Focus button —
-            // it must never mint a real session.
+            // Round 2 (all platforms): the focus/capture steps present a DEMO
+            // focus surface rendered by the tour itself — ring mid-progress,
+            // state colors, capture hint — visually faithful, ZERO sessions,
+            // zero navigation. The spotlight targets live inside the demo.
             id: "focus", stage: "Focus", view: .focus,
-            target: .focusBegin, targetFallbacks: [.startNext, .backlogPointer, .todayList],
+            target: .focusRing,
             title: "Focus, and the Ring",
             body: "A session counts upward against your estimate; the screen color follows the state. Calm while you work, warm coral if you run over. No alarms — returning is always supported.",
             narration: "When you start a session you enter Focus. The ring counts upward against your estimate, and the whole screen’s colour follows the state — calm while you work, a warm coral if you run past the estimate. Never an alarm. This is where execution actually happens.",
@@ -155,7 +174,7 @@ enum TourScript {
             primary: "Enter Focus"),
         TourStep(
             id: "capture", stage: "Focus", view: .focus,
-            target: .focusBegin, targetFallbacks: [.startNext, .backlogPointer, .todayList],
+            target: .captureHint,
             title: "Capture without leaving",
             body: "A stray thought mid-session? Press C or tap the mic and it’s saved — “add washing liquid to Groceries” — linked to this session, without breaking your focus.",
             narration: "While focusing, thoughts will surface. Don’t chase them. Press C, or tap the microphone, and Unstuck saves it — say, add washing liquid to groceries — linked to this session. You stay in focus; the thought is safe.",
@@ -167,7 +186,7 @@ enum TourScript {
             body: "Life interrupts. When you come back, Unstuck rebuilds the context — the task, time spent, your captures, and the next action — so you don’t start from scratch. Returning is a feature, not a failure.",
             narration: "You’ll get interrupted — that’s expected. When you return, ask the Assistant “what was I doing?” and Unstuck rebuilds the picture: the task, the time you spent, the thoughts you captured, and your next physical action. You don’t reconstruct anything. Returning is part of the design.",
             more: "Pausing asks for an optional reason, and you can Save for later instead of ending — so the thread is never dropped.",
-            primary: "Continue"),
+            primary: "Continue", cutoutInteractive: true),
         TourStep(
             id: "notifications", stage: "Trust", view: .settings, section: "Notifications",
             target: .notifBody,
@@ -331,6 +350,143 @@ func nextTourSpeed(_ speed: Double) -> Double {
     speed >= 2 ? 0.75 : ((speed + 0.25) * 100).rounded() / 100
 }
 
+// MARK: - live captions (round 2 — web tour-voice splitSentences + spans)
+
+/// Split narration into sentences — the Swift port of web tour-voice's
+/// splitSentences: keep the terminal punctuation (. ! ? …) plus trailing
+/// closing quotes/brackets, fold stray fragments (< 4 chars — a lone closing
+/// quote, an initialism tail) into the previous sentence, and never return
+/// empty for non-empty input. Pure — unit-tested.
+func splitTourSentences(_ text: String) -> [String] {
+    let pattern = "[^.!?…]+[.!?…]+[\"'”’)\\]]*\\s*"
+    guard let regex = try? NSRegularExpression(pattern: pattern) else {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? [] : [t]
+    }
+    let ns = text as NSString
+    var out: [String] = []
+    var last = 0
+    for m in regex.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
+        let s = ns.substring(with: m.range).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !s.isEmpty { out.append(s) }
+        last = m.range.location + m.range.length
+    }
+    let rest = ns.substring(from: last).trimmingCharacters(in: .whitespacesAndNewlines)
+    if !rest.isEmpty { out.append(rest) }
+    var merged: [String] = []
+    for s in out {
+        if !merged.isEmpty && s.count < 4 { merged[merged.count - 1] += " \(s)" }
+        else { merged.append(s) }
+    }
+    if merged.isEmpty {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? [] : [t]
+    }
+    return merged
+}
+
+/// Which sentence is being spoken at `progress` (0…1) through a clip —
+/// each sentence owns a span of the audio proportional to its CHARACTER
+/// count (the same char-weighted estimate the web tour voice uses). The
+/// Listen bar shows sentences[index] as the live caption. Pure.
+func tourCaptionIndex(progress: Double, sentences: [String]) -> Int {
+    guard !sentences.isEmpty else { return 0 }
+    let total = sentences.reduce(0) { $0 + max(1, $1.count) }
+    let p = min(max(progress, 0), 1)
+    var acc = 0.0
+    for (i, s) in sentences.enumerated() {
+        acc += Double(max(1, s.count)) / Double(total)
+        if p < acc { return i }
+    }
+    return sentences.count - 1
+}
+
+// MARK: - Tell-me-more handback progress (round 3)
+
+/// Progress to show once a Tell-me-more clip hands playback back to the
+/// narration. Normally the narration's paused position — but a narration that
+/// already finished NATURALLY must stay at 1: AVAudioPlayer rewinds
+/// currentTime to 0 after a clip plays to its end, so recomputing from the
+/// player would snap the Listen bar 1 → 0 on the handback. Pure — unit-tested.
+func tourHandbackProgress(preMoreProgress: Double, currentTime: TimeInterval, duration: TimeInterval) -> Double {
+    if preMoreProgress >= 1 { return 1 }
+    guard duration > 0 else { return 0 }
+    return min(1, currentTime / duration)
+}
+
+// MARK: - paused "Resume tour" chip (round 2)
+
+/// The floating "Resume tour" chip is offered while a resumable paused run
+/// exists and the user hasn't ✕-dismissed the chip. done/declined runs and
+/// paused states without a mode (can't resume) never show it. Pure.
+func tourChipEligible(_ s: TourState) -> Bool {
+    s.paused == true && s.done != true && s.started == true
+        && s.mode != nil && s.chipDismissed != true
+}
+
+// MARK: - hit-test claims (round 2 — spotlight-only lockdown)
+
+/// Spotlight pad (8) + ring stroke/halo allowance (6) — the pass-through
+/// cutout around a target matches what the ring visually encloses.
+let tourClaimRingPad: CGFloat = 14
+
+/// Everything TourModel.claims(point:) needs, flattened so the decision is
+/// pure and unit-testable.
+struct TourClaimContext: Equatable, Sendable {
+    /// The welcome/resume card is up — modal, claims the whole screen.
+    var cardVisible = false
+    /// The paused "Resume tour" chip is up — ONLY the chip is claimable;
+    /// the app underneath stays fully usable.
+    var chipVisible = false
+    var chipFrame = CGRect.zero
+    var running = false
+    var panelFrame = CGRect.zero
+    /// The current step's resolved spotlight rect (nil = no-target step).
+    var targetRect: CGRect? = nil
+    /// The step renders the tour's own demo focus surface (focus/capture).
+    var demoStep = false
+    /// The step's cutout PASSES touches through (assistant/reentry only —
+    /// TourStep.cutoutInteractive). Every other ring is display-only.
+    var cutoutInteractive = false
+    /// A sheet/cover is presented in the APP window (assistant bubble,
+    /// settings/inbox/insights sheet, task detail). While it's up it is the
+    /// step's SUBJECT — the tour claims only the panel so the whole surface
+    /// stays interactive.
+    var presentationActive = false
+}
+
+/// Which screen points the tour overlay window OWNS (handles or swallows) vs.
+/// passes through to the app. Round-2 lockdown: while the tour runs, ONLY the
+/// spotlighted element and the panel are interactive — everything else (dim
+/// panels, nav/tabs, FAB) is claimed and swallowed; swallowed touches do
+/// nothing. Round-3 refinements (cross-platform cutout policy):
+///  • the cutout passes through ONLY on cutoutInteractive steps (assistant /
+///    reentry — the launcher + its sheet ARE the step). Every other ring is
+///    display-only: the cutout region is claimed and swallowed too, so the
+///    spotlighted Start-Next hero can never mint a real session mid-tour;
+///  • demo focus steps claim everything, EVEN while a presentation is active
+///    (the demoStep check sits above presentationActive): a live REAL focus
+///    cover under the opaque demo must never receive blind pass-through
+///    touches. (The render side skips the demo over a live cover — see
+///    TourRootView.runningLayer — but the claim swallows regardless.);
+///  • a step-opened surface (assistant sheet, settings section, task detail,
+///    inbox/insights) reverts the claim to panel-only while it's presented;
+///  • no-target steps claim everything except the panel.
+func tourClaims(point: CGPoint, ctx: TourClaimContext) -> Bool {
+    if ctx.cardVisible { return true }
+    if ctx.chipVisible { return ctx.chipFrame.insetBy(dx: -8, dy: -8).contains(point) }
+    guard ctx.running else { return false }
+    if ctx.panelFrame.insetBy(dx: -8, dy: -8).contains(point) { return true }
+    if ctx.demoStep { return true }
+    if ctx.presentationActive { return false }
+    if ctx.cutoutInteractive,
+       let t = ctx.targetRect, t.width > 0, t.height > 0,
+       t.insetBy(dx: -tourClaimRingPad, dy: -tourClaimRingPad).contains(point) {
+        return false
+    }
+    return true
+}
+
 // MARK: - panel placement (non-negotiable #1: NEVER cover the spotlight)
 
 enum TourPanelDock: Equatable, Sendable { case top, bottom }
@@ -341,6 +497,10 @@ struct TourPanelPlacement: Equatable, Sendable {
     /// full panel → collapse the panel to title + controls rather than cover
     /// the ring.
     var collapsed: Bool
+    /// Keyboard-time nudge (round 3): extra top inset pushing the forced-TOP
+    /// panel just BELOW a top-half ring when both fit above the keyboard.
+    /// 0 everywhere else.
+    var topOffset: CGFloat = 0
 }
 
 /// Compute where the panel docks for a target rect (screen coordinates):
@@ -365,7 +525,30 @@ struct TourPanelPlacement: Equatable, Sendable {
 func tourPanelPlacement(target: CGRect?, screen: CGRect, panelHeight: CGFloat,
                         keyboard: Bool = false,
                         margin: CGFloat = 16, ringPad: CGFloat = 14) -> TourPanelPlacement {
-    if keyboard { return TourPanelPlacement(dock: .top, collapsed: false) }
+    if keyboard {
+        // KEYBOARD × TOP-HALF RING — the documented decision (round 3): the
+        // keyboard owns the bottom, so the panel is forced to the TOP dock —
+        // which can land on a ring whose target sits in the top half. The
+        // PANEL WINS visually (typing is the user's current intent, and the
+        // claim order already prefers the panel; on a cutoutInteractive step
+        // the ring's cutout stays pass-through wherever the panel doesn't
+        // cover it — tourClaims checks the panel frame first). But when the
+        // ring AND the expanded panel both fit above a conservative keyboard
+        // top (55% of screen height — below every iPhone keyboard layout),
+        // nudge the panel to sit just below the ring so neither is covered.
+        // Otherwise accept the overlap.
+        var topOffset: CGFloat = 0
+        if let target, target.width > 0, target.height > 0 {
+            let ring = target.insetBy(dx: -ringPad, dy: -ringPad)
+            let panelTop = screen.minY + margin
+            let overlapsRing = ring.minY < panelTop + panelHeight && ring.maxY > panelTop
+            let keyboardTop = screen.minY + screen.height * 0.55
+            if overlapsRing, ring.maxY + margin + panelHeight + margin <= keyboardTop {
+                topOffset = ring.maxY + margin - panelTop
+            }
+        }
+        return TourPanelPlacement(dock: .top, collapsed: false, topOffset: topOffset)
+    }
     guard let target, target.width > 0, target.height > 0 else {
         return TourPanelPlacement(dock: .bottom, collapsed: false)
     }

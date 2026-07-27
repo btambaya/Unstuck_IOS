@@ -59,13 +59,21 @@ final class TourDataTests: XCTestCase {
         XCTAssertEqual(pers.section, "Interface")
     }
 
-    func testFocusStepsRingTheBeginAffordanceNotASession() {
-        // iOS deviation: no idle Focus state exists, so focus/capture steps
-        // target the Today hero's Focus button (with hero/list fallbacks).
-        for id in ["focus", "capture"] {
-            let s = TourScript.essential.first { $0.id == id }!
-            XCTAssertEqual(s.target, .focusBegin, id)
-            XCTAssertEqual(s.targetFallbacks, [.startNext, .backlogPointer, .todayList], id)
+    func testFocusStepsPresentTheDemoSurface() {
+        // Round 2: focus/capture render the tour's own DEMO focus surface;
+        // their spotlight targets live INSIDE the demo (always resolvable —
+        // no fallbacks needed) and no session/navigation ever happens.
+        let focus = TourScript.essential.first { $0.id == "focus" }!
+        XCTAssertTrue(focus.isDemoFocus)
+        XCTAssertEqual(focus.target, .focusRing)
+        XCTAssertTrue(focus.targetFallbacks.isEmpty)
+        let capture = TourScript.essential.first { $0.id == "capture" }!
+        XCTAssertTrue(capture.isDemoFocus)
+        XCTAssertEqual(capture.target, .captureHint)
+        XCTAssertTrue(capture.targetFallbacks.isEmpty)
+        // No other step is a demo step.
+        for s in TourScript.full where !["focus", "capture"].contains(s.id) {
+            XCTAssertFalse(s.isDemoFocus, s.id)
         }
     }
 
@@ -190,6 +198,7 @@ final class TourDataTests: XCTestCase {
         store.save {
             $0.started = true; $0.done = false; $0.paused = true; $0.eligible = true
             $0.mode = .essential; $0.mediaMode = .read; $0.speed = 1.25; $0.index = 2
+            $0.chipDismissed = true
         }
         let data = try XCTUnwrap(defaults.data(forKey: TourStore.key))
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -200,6 +209,7 @@ final class TourDataTests: XCTestCase {
         XCTAssertEqual(obj["eligible"] as? Bool, true)
         XCTAssertEqual(obj["index"] as? Int, 2)
         XCTAssertEqual(obj["speed"] as? Double, 1.25)
+        XCTAssertEqual(obj["chipDismissed"] as? Bool, true)
     }
 
     func testStoreSurvivesCorruptData() {
@@ -304,6 +314,46 @@ final class TourDataTests: XCTestCase {
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340, keyboard: false)
         XCTAssertEqual(p, tourPanelPlacement(target: target, screen: screen, panelHeight: 340))
         XCTAssertEqual(p.dock, .bottom)
+        XCTAssertEqual(p.topOffset, 0, "the nudge is keyboard-time only")
+    }
+
+    // MARK: - keyboard × top-half ring (round 3 — the documented nudge)
+
+    func testKeyboardNudgesTopDockBelowATopRingWhenBothFit() {
+        // Ring: target (20,80,350,60) + 14pt pad → maxY 154. With a 260pt
+        // panel: 154 + 16 + 260 + 16 = 446 ≤ 464 (55% keyboard floor) → the
+        // panel is nudged to sit just below the ring (offset = ring.maxY +
+        // margin − default panel top = 154).
+        let target = CGRect(x: 20, y: 80, width: 350, height: 60)
+        let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 260, keyboard: true)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertFalse(p.collapsed)
+        XCTAssertEqual(p.topOffset, 154)
+    }
+
+    func testKeyboardAcceptsOverlapWhenTheNudgeCannotFit() {
+        // Same ring, 340pt panel: 154 + 16 + 340 + 16 = 526 > 464 — nudging
+        // would shove the panel under the keyboard, so the PANEL WINS the
+        // overlap (documented decision: typing is the user's current intent;
+        // the ring's claim behavior is unchanged — tourClaims checks the
+        // panel frame first, and a cutoutInteractive ring still passes
+        // through wherever the panel doesn't cover it).
+        let target = CGRect(x: 20, y: 80, width: 350, height: 60)
+        let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340, keyboard: true)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertFalse(p.collapsed)
+        XCTAssertEqual(p.topOffset, 0)
+    }
+
+    func testKeyboardNoNudgeWhenTheRingDoesNotOverlapTheTopDock() {
+        // A bottom-half ring never conflicts with the forced top dock.
+        let target = CGRect(x: 20, y: 700, width: 350, height: 80)
+        let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340, keyboard: true)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertEqual(p.topOffset, 0)
+        // No target at all → no nudge either.
+        XCTAssertEqual(tourPanelPlacement(target: nil, screen: screen,
+                                          panelHeight: 340, keyboard: true).topOffset, 0)
     }
 }
 

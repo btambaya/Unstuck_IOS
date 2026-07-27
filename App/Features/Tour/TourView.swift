@@ -9,8 +9,17 @@
 // be hidden by every sheet (Settings, TaskEditor, Inbox, the bubble) and by
 // the focus fullScreenCover — the separate window is the one context that
 // verifiably renders above all of them (checked on simulator), the iOS
-// equivalent of the web's root-mount pattern. Empty space passes touches
-// through (hitTest), so the app stays fully usable under the spotlight.
+// equivalent of the web's root-mount pattern.
+//
+// ROUND-2 LOCKDOWN: while the tour runs the window claims (and swallows)
+// every touch EXCEPT the panel and — on cutoutInteractive steps only
+// (assistant/reentry) — the spotlight cutout; every other ring is display-
+// only (round-3 cutout policy: the ringed Start-Next hero must never mint a
+// real session). A step-opened surface (assistant sheet, settings section,
+// task detail) reverts the claim to panel-only so that surface stays usable
+// while it's the step's subject. While PAUSED, a floating "Resume tour" chip
+// is the only claimed region and the app is fully usable underneath. See
+// tourClaims() in TourData.swift.
 //
 // Launch triggers:
 //  • One-time auto-welcome on Today for accounts that finish onboarding AFTER
@@ -56,6 +65,23 @@ final class TourModel {
     /// The step the primary CTA already opened the assistant for (two-tap
     /// deviation from web — see primaryAction).
     private(set) var assistantOpenedForStep: String?
+    /// Pause is a two-step: the footer shows an inline confirm ("Pause the
+    /// tour?") before anything is dismissed (round 2).
+    private(set) var confirmingPause = false
+    /// A resumable paused run exists and the chip wasn't ✕-dismissed —
+    /// mirrors tourChipEligible(store) so hit-testing never hits UserDefaults.
+    private(set) var chipEligible = false
+    /// The floating "Resume tour" chip's on-screen frame (claim fallback).
+    var chipFrame: CGRect = .zero
+    /// OBSERVED mirror of "a UIKit-presented VC is up in the app window"
+    /// (circle-invite alerts, share sheets — presentations the router can't
+    /// see). The raw `presentedViewController` read is UNOBSERVABLE: when
+    /// render and the hit-test claim each read it live they can drift — the
+    /// full-screen card CLAIM stays live while the card is NOT rendered
+    /// (e.g. an invite alert lands after render), soft-locking every touch
+    /// into an invisible card. Polled into @Observable state so render and
+    /// claims() consume the SAME value and a change re-renders the overlay.
+    private(set) var uikitPresentationActive = false
 
     let audio = TourAudioPlayer()
     let ask = TourAskModel()
@@ -64,6 +90,7 @@ final class TourModel {
     private unowned let app: AppModel
     private var pollTask: Task<Void, Never>?
     private var navTask: Task<Void, Never>?
+    private var presentationWatchTask: Task<Void, Never>?
 
     init(app: AppModel, store: TourStore = TourStore()) {
         self.app = app
@@ -83,27 +110,64 @@ final class TourModel {
         // Auto-offer gate: the router's modals AND any UIKit-presented VC —
         // several screens present sheets from LOCAL @State the router can't
         // see, and the card must never ambush over (or under) one of those.
+        // `uikitPresentationActive` (never the raw unobservable read) so this
+        // re-renders when an alert appears/dismisses and claims() can't drift
+        // from what's on screen.
         return app.router.tab == .today
             && !app.router.hasActivePresentation
-            && TourWindowHandle.shared.appWindow?.rootViewController?.presentedViewController == nil
+            && !uikitPresentationActive
+    }
+
+    /// The paused "Resume tour" chip is on screen: after an in-session pause
+    /// (phase .dismissed) it shows everywhere; on a relaunch into the paused
+    /// phase it shows wherever the auto resume card can't (non-Today / a
+    /// modal up) so the run stays one tap away on every screen.
+    var chipVisible: Bool {
+        guard chipEligible else { return false }
+        switch phase {
+        case .dismissed: return true
+        case .paused: return !cardVisible
+        default: return false
+        }
     }
 
     /// Which screen points the tour overlay window owns. SwiftUI renders the
     /// whole tree inside ONE hosting view, so UIKit hitTest can't distinguish
-    /// a button from empty scrim — the model decides by region instead: the
-    /// modal cards claim everything; running claims only the panel; hidden
-    /// claims nothing (full passthrough).
+    /// a button from empty scrim — the model decides by region and delegates
+    /// to the pure tourClaims() rule (round-2 lockdown: running claims
+    /// EVERYTHING except the spotlight cutout, with the panel-only reversion
+    /// while a step-opened surface is presented; the paused chip claims only
+    /// itself; hidden claims nothing).
     func claims(point: CGPoint) -> Bool {
-        if cardVisible { return true }
-        if phase == .running {
-            // Prefer the panel's LIVE UIKit frame (layout is complete by
-            // hitTest time); fall back to the last SwiftUI measurement.
-            if let v = TourWindowHandle.shared.panelAnchorView, v.window != nil {
-                return v.convert(v.bounds, to: nil).insetBy(dx: -8, dy: -8).contains(point)
-            }
-            return panelFrame.insetBy(dx: -8, dy: -8).contains(point)
-        }
-        return false
+        var ctx = TourClaimContext()
+        // "Card claims everything" holds ONLY while the card is actually
+        // RENDERED — the live UIKit anchor (mounted by the card views) is the
+        // proof of render. Without the gate, an unobserved presentation change
+        // could leave the full-screen claim standing with no card on screen:
+        // every touch swallowed, the app soft-locked (round-3 HIGH).
+        ctx.cardVisible = cardVisible
+            && Self.liveFrame(TourWindowHandle.shared.cardAnchorView) != nil
+        ctx.chipVisible = chipVisible
+        ctx.chipFrame = Self.liveFrame(TourWindowHandle.shared.chipAnchorView) ?? chipFrame
+        ctx.running = phase == .running
+        // Prefer the panel's LIVE UIKit frame (layout is complete by hitTest
+        // time); fall back to the last SwiftUI measurement.
+        ctx.panelFrame = Self.liveFrame(TourWindowHandle.shared.panelAnchorView) ?? panelFrame
+        ctx.targetRect = targetRect
+        ctx.demoStep = currentStep.isDemoFocus
+        ctx.cutoutInteractive = currentStep.cutoutInteractive
+        // Any presentation in the APP window — router modals AND UIKit-presented
+        // VCs — is the step's subject while it's up (the tour dismisses stray
+        // ones on every step change, so what's up was opened for/by this step).
+        // The UIKit half reads the same OBSERVED mirror render uses (see
+        // uikitPresentationActive) — never the raw unobservable property.
+        ctx.presentationActive = app.router.hasActivePresentation || uikitPresentationActive
+        return tourClaims(point: point, ctx: ctx)
+    }
+
+    private static func liveFrame(_ view: UIView?) -> CGRect? {
+        guard let view, view.window != nil else { return nil }
+        return view.convert(view.bounds, to: nil)
     }
 
     /// Web label rule: last step → step.primary; an onShow step → step.primary;
@@ -121,11 +185,13 @@ final class TourModel {
     /// Read persisted state once (first render of the overlay root).
     func bootIfNeeded() {
         guard phase == .boot else { return }
+        startPresentationWatch()
         let s = store.load()
         if let m = s.mode { mode = m }
         if let mm = s.mediaMode { mediaMode = mm }
         if let sp = s.speed { speed = sp; audio.speed = sp }
         if let i = s.index { index = i }
+        chipEligible = tourChipEligible(s)
         switch tourInitialPhase(s) {
         case .hidden: phase = .dismissed
         case .paused: phase = .paused
@@ -144,6 +210,7 @@ final class TourModel {
             if let m = s.mode { mode = m }
             index = min(saved, steps.count - 1)
             store.save { $0.paused = false; $0.done = false }
+            chipEligible = false
             phase = .running
             applyCurrentStep()
             startPolling()
@@ -160,7 +227,12 @@ final class TourModel {
         index = 0
         // Clear done/paused too: a RESTART of a finished tour must persist as
         // a live run, or a mid-run pause/kill could never offer the resume card.
-        store.save { $0.mode = m; $0.started = true; $0.index = 0; $0.done = false; $0.paused = false }
+        // chipDismissed is per-run — a fresh run re-arms the resume chip.
+        store.save {
+            $0.mode = m; $0.started = true; $0.index = 0
+            $0.done = false; $0.paused = false; $0.chipDismissed = nil
+        }
+        chipEligible = false
         explicitOpen = false
         phase = .running
         applyCurrentStep()
@@ -170,6 +242,7 @@ final class TourModel {
     /// "Explore with the Assistant" — no fixed path; opens the bubble.
     func explore() {
         store.save { $0.done = true; $0.started = true }
+        chipEligible = false
         explicitOpen = false
         phase = .done
         app.router.bubbleStartTab = .assistant
@@ -179,14 +252,16 @@ final class TourModel {
     /// Welcome "Not now" — never auto-offer again.
     func declineWelcome() {
         store.save { $0.done = true; $0.started = true }
+        chipEligible = false
         explicitOpen = false
         phase = .done
     }
 
-    // MARK: paused card
+    // MARK: paused card + resume chip
 
     func resume() {
         store.save { $0.paused = false }
+        chipEligible = false
         explicitOpen = false
         phase = .running
         applyCurrentStep()
@@ -196,6 +271,7 @@ final class TourModel {
     func startOver() {
         index = 0
         store.save { $0.index = 0; $0.paused = false }
+        chipEligible = false
         explicitOpen = false
         phase = .running
         applyCurrentStep()
@@ -204,8 +280,19 @@ final class TourModel {
 
     func declinePaused() {
         store.save { $0.done = true; $0.paused = false }
+        chipEligible = false
         explicitOpen = false
         phase = .done
+    }
+
+    /// The floating chip resumes the run exactly where it paused.
+    func resumeFromChip() { resume() }
+
+    /// Chip ✕ — the chip never returns for THIS run (persisted); the
+    /// Settings → Account → Product tour path remains.
+    func dismissChip() {
+        let saved = store.save { $0.chipDismissed = true }
+        chipEligible = tourChipEligible(saved)
     }
 
     // MARK: running controls
@@ -229,6 +316,7 @@ final class TourModel {
         guard phase == .running else { return }
         if index >= steps.count - 1 {
             store.save { $0.done = true; $0.paused = false }
+            chipEligible = false
             phase = .done
             teardownRunning()
             return
@@ -243,11 +331,28 @@ final class TourModel {
         applyCurrentStep()
     }
 
-    /// Pause = dismiss preserving progress; resume via the paused card on next
-    /// launch or Settings → Product tour.
-    func pause() {
+    // MARK: pause (round 2 — confirm, then dismiss + resume chip)
+
+    /// Pause button / swipe-down: show the inline footer confirm first —
+    /// nothing is dismissed until the user confirms.
+    func requestPause() {
         guard phase == .running else { return }
-        store.save { [index, mode] in $0.paused = true; $0.index = index; $0.mode = mode }
+        confirmingPause = true
+    }
+
+    /// "Keep going" — drop the confirm, stay on the step.
+    func cancelPause() {
+        confirmingPause = false
+    }
+
+    /// Confirmed pause = dismiss preserving progress; the floating "Resume
+    /// tour" chip (and the paused card on next launch / Settings → Product
+    /// tour) brings the run back.
+    func confirmPause() {
+        guard phase == .running else { return }
+        confirmingPause = false
+        let saved = store.save { [index, mode] in $0.paused = true; $0.index = index; $0.mode = mode }
+        chipEligible = tourChipEligible(saved)
         phase = .dismissed
         teardownRunning()
     }
@@ -256,6 +361,7 @@ final class TourModel {
     func exit() {
         guard phase == .running else { return }
         store.save { $0.done = true; $0.paused = false }
+        chipEligible = false
         phase = .done
         teardownRunning()
     }
@@ -295,6 +401,14 @@ final class TourModel {
         ask.submit(q, step: step, assistant: app.assistant)
     }
 
+    /// Tell-me-more expanded/collapsed (round 2): in Listen mode the expand
+    /// plays the step's `<id>-more.m4a` (pausing the narration, which resumes
+    /// after); collapsing stops it. Read mode unchanged.
+    func moreToggled(expanded: Bool) {
+        guard phase == .running, mediaMode == .listen else { return }
+        if expanded { audio.playMore() } else { audio.stopMore() }
+    }
+
     // MARK: internals
 
     private func applyCurrentStep() {
@@ -302,6 +416,7 @@ final class TourModel {
         ask.reset(step: step.id)
         askFieldFocused = false
         assistantOpenedForStep = nil
+        confirmingPause = false
         targetRect = nil
         navigate(step)
         audio.prepare(step: step.id, autoplay: mediaMode == .listen)
@@ -325,9 +440,9 @@ final class TourModel {
         navTask = nil
         switch step.view {
         case .today, .focus:
-            // FOCUS DEVIATION: FocusView mints a live session on init (no idle
-            // state exists), so focus/capture steps stay on Today and ring the
-            // hero's Focus begin affordance — a session is NEVER started.
+            // Focus/capture steps (round 2): the tour renders its OWN demo
+            // focus surface in the tour window — the app just settles on
+            // Today underneath; a real session is NEVER started.
             router.select(.today)
         case .calendar:
             router.select(.calendar)
@@ -381,6 +496,12 @@ final class TourModel {
         audio.stop()
         targetRect = nil
         explicitOpen = false
+        // Key-window handback (round-3 HIGH): exiting/pausing/finishing with
+        // the Ask keyboard focused unmounts the panel BEFORE its askFocused
+        // onChange can fire — the TOUR window would stay key forever and the
+        // app's text inputs go dead. Every teardown path (confirmPause, exit,
+        // advance-to-done) funnels through here; restoreAppKey is idempotent.
+        if askFieldFocused { TourWindowHandle.shared.restoreAppKey() }
         askFieldFocused = false
         // Close anything the tour itself opened (settings/inbox/insights sheet,
         // the task detail, the bubble) so the user isn't stranded in a modal.
@@ -388,6 +509,25 @@ final class TourModel {
         // one, so it can only be the user's.
         NotificationCenter.default.post(name: .unstuckTourWillNavigate, object: nil)
         app.router.dismissTourPresentations()
+    }
+
+    /// Poll the app window's UIKit presentation state into observable model
+    /// state for the model's lifetime (250ms, matching the target poll). The
+    /// property itself is unobservable, and BOTH the card render and the
+    /// hit-test claim depend on it — polling one shared value is what keeps
+    /// "claims ⊆ rendered" true when an alert appears or dismisses without
+    /// any SwiftUI-visible state change.
+    private func startPresentationWatch() {
+        presentationWatchTask?.cancel()
+        presentationWatchTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let live = TourWindowHandle.shared.appWindow?
+                    .rootViewController?.presentedViewController != nil
+                if live != self.uikitPresentationActive { self.uikitPresentationActive = live }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+        }
     }
 
     private func startPolling() {
@@ -429,9 +569,14 @@ struct TourRootView: View {
                 if tour.cardVisible { TourWelcomeCard(tour: tour) }
             case .paused:
                 if tour.cardVisible { TourResumeCard(tour: tour) }
+                else if tour.chipVisible { TourResumeChip(tour: tour) }
             case .running:
                 runningLayer(tour)
-            case .boot, .dismissed, .done:
+            case .dismissed:
+                // Paused mid-session: the floating "Resume tour" chip docks
+                // bottom-corner across every screen (round 2).
+                if tour.chipVisible { TourResumeChip(tour: tour) }
+            case .boot, .done:
                 EmptyView()
             }
         }
@@ -450,18 +595,48 @@ struct TourRootView: View {
             let placement = tourPanelPlacement(target: tour.targetRect, screen: screen,
                                                panelHeight: tour.panelExpandedHeight,
                                                keyboard: tour.askFieldFocused)
+            // Round 3: a LIVE real focus cover (always USER-started — the tour
+            // never mints one) must never sit under the opaque look-alike demo
+            // — skip the demo render and run the step panel-only. The claim
+            // still swallows every point on demo steps (tourClaims puts
+            // demoStep above presentationActive), so no blind touch can reach
+            // the session underneath either way. `focusTask` is observable —
+            // render and claims stay in step.
+            let showDemo = tour.currentStep.isDemoFocus && model.router.focusTask == nil
             ZStack {
+                // Round-2 lockdown swallow layer: the window claims almost
+                // every point while running (tourClaims), and THIS is the view
+                // that actually absorbs those touches — the spotlight above is
+                // hit-test-disabled, and UIKit needs a hit-testable SwiftUI
+                // region or the claimed tap would find nothing. Pass-through
+                // regions (spotlight cutout, an opened sheet) never reach it:
+                // claims() answers false and the window returns nil first.
+                Color.clear
+                    .contentShape(Rectangle())
+                    .onTapGesture {}
+                    .ignoresSafeArea()
+                // Focus/capture steps: the tour's own DEMO focus surface —
+                // under the spotlight + panel, above the swallow layer.
+                if showDemo {
+                    TourDemoFocus(reduceMotion: model.settings.reduceMotion)
+                        .transition(.opacity)
+                }
                 TourSpotlight(rect: tour.targetRect, reduceMotion: model.settings.reduceMotion)
                     .allowsHitTesting(false)
                 // ONE panel with a flipping alignment — a single structural
                 // identity, so the dock flip is a frame change (not a remount)
                 // and the geometry callback below reliably re-fires.
+                // `topOffset` (keyboard-time only): nudges the forced-top
+                // panel below a top-half ring when both fit — see
+                // tourPanelPlacement's documented keyboard × ring decision.
                 panel(tour, collapsed: placement.collapsed)
                     .frame(maxWidth: .infinity, maxHeight: .infinity,
                            alignment: placement.dock == .top ? .top : .bottom)
+                    .padding(.top, placement.dock == .top ? placement.topOffset : 0)
                     .padding(.horizontal, 24)
                     .padding(.vertical, 16)
             }
+            .animation(.easeOut(duration: 0.22), value: showDemo)
         }
         // The measuring frame must IGNORE the keyboard: SwiftUI keyboard
         // avoidance would shrink the GeometryReader when the Ask field
@@ -513,7 +688,7 @@ struct TourWelcomeCard: View {
                         .font(UFont.serifItalic(30))
                         .foregroundStyle(theme.palette.ink)
                         .padding(.top, 16)
-                    Text("A two-minute look at how Unstuck helps you begin, stay with it, and come back — nothing to configure. How would you like to explore?")
+                    Text("A quick look at how Unstuck helps you begin, stay with it, and come back — about three minutes for the essentials.")
                         .font(UFont.sans(14.5))
                         .lineSpacing(3.5)
                         .foregroundStyle(theme.palette.ink2)
@@ -543,11 +718,20 @@ struct TourWelcomeCard: View {
                         }
                     }
                     .padding(.top, 18)
+                    // Quiet footer (round 2): the tour is never a commitment.
+                    Text("Pause anytime — pick it back up from Settings → Account → Product tour.")
+                        .font(UFont.sans(11.5))
+                        .lineSpacing(2.5)
+                        .foregroundStyle(theme.palette.ink4)
+                        .padding(.top, 12)
                 }
                 .padding(EdgeInsets(top: 30, leading: 30, bottom: 26, trailing: 30))
                 .background(theme.palette.bg, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
                 .shadow(color: .black.opacity(0.2), radius: 24, y: 8)
+                // Proof-of-render anchor: the full-screen claim is honored
+                // only while this card is actually mounted (see claims()).
+                .background(TourCardFrameReader().allowsHitTesting(false))
                 .frame(maxWidth: 460)
                 .padding(20)
                 .frame(maxWidth: .infinity)
@@ -619,8 +803,68 @@ struct TourResumeCard: View {
             .background(theme.palette.bg, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
             .shadow(color: .black.opacity(0.2), radius: 24, y: 8)
+            // Proof-of-render anchor — same claim gate as the welcome card.
+            .background(TourCardFrameReader().allowsHitTesting(false))
             .frame(maxWidth: 400)
             .padding(20)
+        }
+    }
+}
+
+/// The floating "Resume tour" chip (round 2): a small pill docked at the
+/// bottom-leading corner (the assistant bubble owns bottom-trailing), present
+/// across all screens while a paused-with-progress run exists. Tap = resume at
+/// the saved step; ✕ = gone for good (the Settings path remains). The chip is
+/// the ONLY claimed region while paused — everything else passes through.
+struct TourResumeChip: View {
+    @Environment(\.uTheme) private var theme
+    @Bindable var tour: TourModel
+
+    var body: some View {
+        VStack {
+            Spacer()
+            HStack {
+                chip
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 16)
+            // Clear the floating bottom nav (~84pt incl. safe area).
+            .padding(.bottom, 92)
+        }
+    }
+
+    private var chip: some View {
+        HStack(spacing: 4) {
+            Button { tour.resumeFromChip() } label: {
+                HStack(spacing: 7) {
+                    Mark(size: 15)
+                    Text("Resume tour")
+                        .font(UFont.sans(12.5, .semibold))
+                        .foregroundStyle(theme.palette.ink)
+                }
+                .padding(.leading, 12).padding(.vertical, 9)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Resume tour")
+            Button { tour.dismissChip() } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(theme.palette.ink3)
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss resume tour chip")
+            .padding(.trailing, 6)
+        }
+        .background(theme.palette.bg, in: Capsule())
+        .overlay(Capsule().stroke(theme.palette.line, lineWidth: 1))
+        .shadow(color: .black.opacity(0.16), radius: 10, y: 3)
+        // Live UIKit frame for the hit-test claim (same pattern as the panel).
+        .background(TourChipFrameReader().allowsHitTesting(false))
+        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
+            tour.chipFrame = frame
         }
     }
 }
@@ -716,6 +960,14 @@ final class TourWindowHandle {
     /// The running panel's UIKit background view — its live window frame is
     /// the authoritative interactive region for the hit-test claim.
     weak var panelAnchorView: UIView?
+    /// The paused "Resume tour" chip's UIKit background view — the ONLY
+    /// claimed region while the chip is up.
+    weak var chipAnchorView: UIView?
+    /// The welcome/resume card's UIKit background view — the claim's PROOF OF
+    /// RENDER: "card claims everything" is honored only while this anchor is
+    /// live in a window (TourModel.claims), so the full-screen claim can never
+    /// outlive the card itself.
+    weak var cardAnchorView: UIView?
     /// Does the tour UI own this screen point right now? (Wired to
     /// TourModel.claims(point:) at mount; nil/false → full passthrough.)
     var claimsPoint: ((CGPoint) -> Bool)?
@@ -723,26 +975,49 @@ final class TourWindowHandle {
     func restoreAppKey() { appWindow?.makeKey() }
 }
 
-/// Invisible UIKit reader behind the running panel — registers itself as the
-/// live panel-frame source while mounted.
-private struct TourPanelFrameReader: UIViewRepresentable {
+/// Invisible UIKit reader that registers itself into a TourWindowHandle slot
+/// while mounted in a window — the live-frame/proof-of-render source for the
+/// hit-test claims (panel region, chip region, card render-gate). One generic
+/// reader so the three anchors can't drift apart in behavior.
+private struct TourHandleAnchorReader: UIViewRepresentable {
+    let slot: ReferenceWritableKeyPath<TourWindowHandle, UIView?>
+
     final class ReaderView: UIView {
+        var slot: ReferenceWritableKeyPath<TourWindowHandle, UIView?>?
         override func didMoveToWindow() {
             super.didMoveToWindow()
+            guard let slot else { return }
             if window != nil {
-                TourWindowHandle.shared.panelAnchorView = self
-            } else if TourWindowHandle.shared.panelAnchorView === self {
-                TourWindowHandle.shared.panelAnchorView = nil
+                TourWindowHandle.shared[keyPath: slot] = self
+            } else if TourWindowHandle.shared[keyPath: slot] === self {
+                TourWindowHandle.shared[keyPath: slot] = nil
             }
         }
     }
     func makeUIView(context: Context) -> ReaderView {
         let v = ReaderView()
+        v.slot = slot
         v.isUserInteractionEnabled = false
         v.backgroundColor = .clear
         return v
     }
     func updateUIView(_ view: ReaderView, context: Context) {}
+}
+
+/// The running panel's live-frame reader (authoritative claim region).
+private struct TourPanelFrameReader: View {
+    var body: some View { TourHandleAnchorReader(slot: \.panelAnchorView) }
+}
+
+/// The "Resume tour" chip's live-frame reader (paused-phase claim region).
+private struct TourChipFrameReader: View {
+    var body: some View { TourHandleAnchorReader(slot: \.chipAnchorView) }
+}
+
+/// The welcome/resume card's liveness reader — claims() only lets the card
+/// claim the screen while this is mounted (no claim without a render).
+private struct TourCardFrameReader: View {
+    var body: some View { TourHandleAnchorReader(slot: \.cardAnchorView) }
 }
 
 /// Above-everything window that passes touches through to the app window
