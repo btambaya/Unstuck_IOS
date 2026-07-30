@@ -157,11 +157,13 @@ final class TourModel {
         ctx.demoStep = currentStep.isDemoFocus
         ctx.cutoutInteractive = currentStep.cutoutInteractive
         // Any presentation in the APP window — router modals AND UIKit-presented
-        // VCs — is the step's subject while it's up (the tour dismisses stray
-        // ones on every step change, so what's up was opened for/by this step).
+        // VCs. Whether it UNLOCKS anything is the step's call: only
+        // surfaceInteractive steps (assistant/reentry/settings) revert to
+        // panel-only; elsewhere the sheet is display-only and stays swallowed.
         // The UIKit half reads the same OBSERVED mirror render uses (see
         // uikitPresentationActive) — never the raw unobservable property.
         ctx.presentationActive = app.router.hasActivePresentation || uikitPresentationActive
+        ctx.surfaceExempt = currentStep.surfaceInteractive
         return tourClaims(point: point, ctx: ctx)
     }
 
@@ -618,7 +620,8 @@ struct TourRootView: View {
                 // Focus/capture steps: the tour's own DEMO focus surface —
                 // under the spotlight + panel, above the swallow layer.
                 if showDemo {
-                    TourDemoFocus(reduceMotion: model.settings.reduceMotion)
+                    TourDemoFocus(reduceMotion: model.settings.reduceMotion,
+                                  stepID: tour.currentStep.id)
                         .transition(.opacity)
                 }
                 TourSpotlight(rect: tour.targetRect, reduceMotion: model.settings.reduceMotion)

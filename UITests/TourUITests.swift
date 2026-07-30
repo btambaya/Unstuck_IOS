@@ -148,7 +148,21 @@ final class TourUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Write the project update"].firstMatch.exists, "demo task title")
         tapPrimary()
         expectStep("Capture without leaving", shot: "06-capture")
-        XCTAssertTrue(app.staticTexts["Capture"].firstMatch.exists, "demo capture hint (ringed)")
+        // Round 3: the ringed pill is LIVE on this step — it opens the DEMO
+        // capture sheet (typing allowed, nothing stored).
+        let capturePill = app.buttons["Capture — opens a demo capture sheet"].firstMatch
+        XCTAssertTrue(capturePill.exists, "demo capture pill (ringed, live on this step)")
+        capturePill.tap()
+        let demoSheet = app.otherElements["Demo capture sheet"].firstMatch
+        XCTAssertTrue(demoSheet.waitForExistence(timeout: 4), "pill tap opens the demo capture sheet")
+        let field = demoSheet.textFields.firstMatch.exists
+            ? demoSheet.textFields.firstMatch : demoSheet.textViews.firstMatch
+        field.tap()
+        field.typeText("buy washing liquid")
+        snap("06b-demo-capture")
+        demoSheet.buttons["Save"].firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["Captured. In a real session it lands in your Inbox."]
+            .firstMatch.waitForExistence(timeout: 4), "save flashes the demo confirmation")
         tapPrimary()
         expectStep("Interruption, then re-entry", shot: "07-reentry")
         XCTAssertFalse(app.staticTexts["FOCUSING"].exists,

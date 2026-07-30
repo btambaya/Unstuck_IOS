@@ -123,6 +123,16 @@ struct TourStep: Identifiable, Sendable {
     /// Round 2: the focus/capture steps present the tour's own DEMO focus
     /// surface (TourDemoFocus) instead of navigating anywhere.
     var isDemoFocus: Bool { view == .focus }
+
+    /// Round 3 (video-verified leak): a step-opened sheet stays interactive
+    /// ONLY when using it IS the step — the assistant/reentry sheets (you type
+    /// into them) and the settings sections (choosing Calm/Balanced/Coach is
+    /// the demo). Every other presented surface (task detail on first-action,
+    /// Inbox, Insights) is display-only: the tester could scroll the task
+    /// sheet and edit a REAL estimate mid-tour through the old blanket
+    /// exemption. Web (inert <main>) and Android (settings-scoped) already
+    /// lock these.
+    var surfaceInteractive: Bool { cutoutInteractive || opensAssistant || view == .settings }
 }
 
 /// The step script — copy ported VERBATIM from web tour-data.ts.
@@ -449,10 +459,14 @@ struct TourClaimContext: Equatable, Sendable {
     /// TourStep.cutoutInteractive). Every other ring is display-only.
     var cutoutInteractive = false
     /// A sheet/cover is presented in the APP window (assistant bubble,
-    /// settings/inbox/insights sheet, task detail). While it's up it is the
-    /// step's SUBJECT — the tour claims only the panel so the whole surface
-    /// stays interactive.
+    /// settings/inbox/insights sheet, task detail).
     var presentationActive = false
+    /// The current step's surface is MEANT to be used (assistant/reentry/
+    /// settings — TourStep.surfaceInteractive). Only then does an active
+    /// presentation revert the claim to panel-only; on every other step the
+    /// presented sheet is display-only and the tour swallows it (round 3 —
+    /// the task-detail sheet was fully editable mid-tour).
+    var surfaceExempt = false
 }
 
 /// Which screen points the tour overlay window OWNS (handles or swallows) vs.
@@ -469,8 +483,11 @@ struct TourClaimContext: Equatable, Sendable {
 ///    cover under the opaque demo must never receive blind pass-through
 ///    touches. (The render side skips the demo over a live cover — see
 ///    TourRootView.runningLayer — but the claim swallows regardless.);
-///  • a step-opened surface (assistant sheet, settings section, task detail,
-///    inbox/insights) reverts the claim to panel-only while it's presented;
+///  • a step-opened surface reverts the claim to panel-only while presented
+///    ONLY on surfaceInteractive steps (assistant/reentry/settings — using
+///    the sheet IS the step). On every other step (task detail, inbox,
+///    insights) the presented sheet is display-only: claimed and swallowed
+///    (round 3 — the task-detail sheet was live and real edits got through);
 ///  • no-target steps claim everything except the panel.
 func tourClaims(point: CGPoint, ctx: TourClaimContext) -> Bool {
     if ctx.cardVisible { return true }
@@ -478,7 +495,7 @@ func tourClaims(point: CGPoint, ctx: TourClaimContext) -> Bool {
     guard ctx.running else { return false }
     if ctx.panelFrame.insetBy(dx: -8, dy: -8).contains(point) { return true }
     if ctx.demoStep { return true }
-    if ctx.presentationActive { return false }
+    if ctx.presentationActive { return !ctx.surfaceExempt }
     if ctx.cutoutInteractive,
        let t = ctx.targetRect, t.width > 0, t.height > 0,
        t.insetBy(dx: -tourClaimRingPad, dy: -tourClaimRingPad).contains(point) {

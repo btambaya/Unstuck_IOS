@@ -156,15 +156,44 @@ final class TourClaimsTests: XCTestCase {
                       "a zero-sized target is treated as none")
     }
 
-    func testOpenedSheetRevertsToPanelOnly() {
-        // A step-opened surface (assistant sheet, settings section, task
-        // detail) is the step's subject: ONLY the panel is claimed — the
-        // whole sheet stays interactive, cutout or not.
-        let ctx = running { $0.presentationActive = true }
+    func testOpenedSheetRevertsToPanelOnlyOnExemptSteps() {
+        // Round 3: a presented surface unlocks ONLY on surfaceInteractive
+        // steps (assistant/reentry/settings) — there the panel is claimed and
+        // the whole sheet stays usable, cutout or not.
+        let ctx = running {
+            $0.presentationActive = true
+            $0.surfaceExempt = true
+        }
         XCTAssertTrue(tourClaims(point: CGPoint(x: 100, y: 600), ctx: ctx))    // panel
         XCTAssertFalse(tourClaims(point: CGPoint(x: 200, y: 400), ctx: ctx))   // sheet body
         XCTAssertFalse(tourClaims(point: CGPoint(x: 100, y: 150), ctx: ctx))   // cutout area
         XCTAssertFalse(tourClaims(point: CGPoint(x: 10, y: 830), ctx: ctx))
+    }
+
+    func testOpenedSheetStaysLockedOnNonExemptSteps() {
+        // Round 3 (the tester's video): the task-detail sheet on first-action
+        // (and inbox/insights) is DISPLAY-ONLY — with no exemption the tour
+        // claims everything except the panel, so estimate chips / custom-time
+        // keypad / scroll can't happen mid-tour.
+        let ctx = running { $0.presentationActive = true }   // surfaceExempt = false
+        XCTAssertTrue(tourClaims(point: CGPoint(x: 100, y: 600), ctx: ctx))    // panel
+        XCTAssertTrue(tourClaims(point: CGPoint(x: 200, y: 400), ctx: ctx),
+                      "sheet body is swallowed")
+        XCTAssertTrue(tourClaims(point: CGPoint(x: 100, y: 150), ctx: ctx),
+                      "even the ringed block is display-only")
+        XCTAssertTrue(tourClaims(point: CGPoint(x: 10, y: 830), ctx: ctx))
+    }
+
+    func testSurfaceInteractiveOnlyOnAssistantReentryAndSettingsSteps() {
+        // Drift guard, mirrors the cutoutInteractive one: the exemption is
+        // exactly assistant + reentry + the settings steps.
+        for steps in [TourScript.essential, TourScript.full] {
+            for s in steps {
+                let expected = ["assistant", "reentry", "notifications", "personalization"].contains(s.id)
+                XCTAssertEqual(s.surfaceInteractive, expected,
+                               "surfaceInteractive drift on '\(s.id)'")
+            }
+        }
     }
 
     func testDemoStepClaimsEverything() {
