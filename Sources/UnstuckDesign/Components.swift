@@ -2,9 +2,13 @@
 
 import SwiftUI
 
-/// The Orbit mark: ink anchor + ~270° ink ring with a gap at 3 o'clock +
-/// a coral orbit dot in the gap. Ink/coral read from the theme so it
-/// flips to cream-on-dark automatically. Port of components/ui/wordmark.tsx.
+/// The Orbit mark: ink anchor + near-full ink ring with a tight ~51° gap
+/// at the lower-right, and the coral orbit dot resting ON the ring at
+/// 3 o'clock (the gap's edge). Canonical geometry = brand mark.svg
+/// (`M 26.5 16 A 10.5 10.5 0 1 0 22.6 24.1`) — the previous 90°-gap trim
+/// read as a "C" with a floating dot and was flagged as off-brand.
+/// Ink/coral read from the theme so it flips to cream-on-dark
+/// automatically. Port of components/ui/wordmark.tsx.
 public struct Mark: View {
     @Environment(\.uTheme) private var theme
     public let size: CGFloat
@@ -16,14 +20,15 @@ public struct Mark: View {
         let anchor = size * 6.8 / 32     // anchor circle (r 3.4)
         let dot = size * 4.2 / 32        // coral dot (r 2.1)
         ZStack {
-            // 270° ring, gap centered at 3 o'clock (trim leaves 0.875→0.125).
+            // Ring: SwiftUI trim runs clockwise from 3 o'clock; the arc spans
+            // 51°→360° so the gap is exactly the SVG's 0°→51° lower-right slice.
             Circle()
-                .trim(from: 0.125, to: 0.875)
+                .trim(from: 51.0 / 360.0, to: 1.0)
                 .stroke(theme.palette.ink, style: StrokeStyle(lineWidth: stroke, lineCap: .round))
                 .frame(width: ring, height: ring)
             Circle().fill(theme.palette.ink).frame(width: anchor, height: anchor)
             Circle().fill(theme.palette.coral).frame(width: dot, height: dot)
-                .offset(x: ring / 2)     // sits in the gap at 3 o'clock
+                .offset(x: ring / 2)     // ON the ring at 3 o'clock (gap edge)
         }
         .frame(width: size, height: size)
     }
