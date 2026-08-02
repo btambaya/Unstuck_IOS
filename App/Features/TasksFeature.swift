@@ -314,15 +314,21 @@ struct TasksView: View {
         // the web task-list-pane filter.
         let assignedOut = model.shareState.assignedOut
         let rows = vm.view == .completed ? vm.visible : vm.visible.filter { assignedOut[$0.id] == nil }
-        // The two collaboration groups sit atop the main "All"/"Today" lists.
-        let showGroups = vm.view == .all || vm.view == .today
+        // "Shared with you" sits atop All / Today AND Completed — a finished
+        // share has to land under Completed like every other task (the view
+        // picks the mode). Delegation stays an All/Today-only group.
+        let showShared = vm.view == .all || vm.view == .today || vm.view == .completed
+        let showDelegated = vm.view == .all || vm.view == .today
         ScrollView {
             LazyVStack(spacing: 6) {
-                if showGroups {
+                if showShared {
                     SharedWithYouGroup(items: model.shareState.sharedWithMe,
+                                       mode: ShareViewMode(vm.view),
                                        makeCoFocus: { model.makeCoFocusModel(taskId: $0) }) { taskId, done in
                         Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
                     }
+                }
+                if showDelegated {
                     DelegatedGroup(tasks: vm.all, assignedOut: assignedOut,
                                    activeArea: vm.view == .today ? nil : vm.activeArea,
                                    now: Date().timeIntervalSince1970 * 1000) { t in editing = t }

@@ -104,7 +104,24 @@ final class ShareModel {
     /// the OWNER (share-notify task_done → shared_task_done push), 1:1 with the
     /// web use-task-shares.ts.
     func completeSharedTask(taskId: String, done: Bool) async throws {
-        try await client?.setSharedTaskDone(taskId: taskId, done: done)
+        // Optimistic, stamp included: the row must move views (out of Today,
+        // into Completed) the instant it's ticked, not only after the refetch —
+        // and the visibility rule needs a completion time to place it. Mirrors
+        // the web useSharedWithMe.setDone. On failure we re-read the truth.
+        let stamp = done ? AppModel.isoNow() : nil
+        sharedWithMe = sharedWithMe.map { s in
+            guard s.taskId == taskId else { return s }
+            var next = s
+            next.done = done
+            next.completedAt = stamp
+            return next
+        }
+        do {
+            try await client?.setSharedTaskDone(taskId: taskId, done: done)
+        } catch {
+            await refresh()
+            throw error
+        }
         if done { await client?.shareNotify(kind: "task_done", taskId: taskId) }
         await refresh()
     }
@@ -382,6 +399,10 @@ struct ShareSheet: View {
 struct SharedWithYouGroup: View {
     @Environment(\.uTheme) private var theme
     let items: [SharedWithMe]
+    /// Which list this group is sitting in — decides where a COMPLETED share
+    /// belongs (gone from Today, today's win still in All, and it lives under
+    /// Completed from then on), exactly like the user's own tasks.
+    var mode: ShareViewMode = .all
     /// Builds a co-focus presence model for a partner-row taskId (nil on the
     /// demo/UITest boot → the presence indicator is simply omitted).
     var makeCoFocus: ((String) -> CoFocusModel)? = nil
@@ -397,12 +418,20 @@ struct SharedWithYouGroup: View {
     @State private var detailTarget: SharedDetailTarget?
 
     var body: some View {
-        if items.isEmpty {
+        // A completed shared task follows the same rules as your own completed
+        // tasks — SharedTaskVisibility (port of lib/shared-task-visibility.ts).
+        let visible = visibleShares(items, mode: mode, now: Date().timeIntervalSince1970 * 1000)
+        // Keep the container alive while the detail sheet is open even if its
+        // row just filtered out (completing the last share from inside the
+        // sheet) — tearing the host down would yank the sheet away mid-read.
+        if visible.isEmpty && detailTarget == nil {
             EmptyView()
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                GroupHeader("Shared with you")
-                ForEach(items) { s in row(s) }
+                if !visible.isEmpty {
+                    GroupHeader(mode == .completed ? "Shared with you · completed" : "Shared with you")
+                    ForEach(visible) { s in row(s) }
+                }
             }
             .padding(.bottom, 8)
             // Read-only detail — the only window a recipient has into the task

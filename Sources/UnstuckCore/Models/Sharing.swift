@@ -80,16 +80,53 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
     public var title: String
     /// All levels project the done state (v3). Coalesced from a nullable column.
     public var done: Bool
+    /// When it was completed (migration 049). nil against an older projection —
+    /// the visibility rules (SharedTaskVisibility) degrade gracefully.
+    public var completedAt: String?
 
     public var id: String { shareId }
 
-    public init(shareId: String, taskId: String, ownerName: String, level: ShareLevel, title: String, done: Bool) {
+    public init(shareId: String, taskId: String, ownerName: String, level: ShareLevel,
+                title: String, done: Bool, completedAt: String? = nil) {
         self.shareId = shareId
         self.taskId = taskId
         self.ownerName = ownerName
         self.level = level
         self.title = title
         self.done = done
+        self.completedAt = completedAt
+    }
+
+    // Hand-written Codable so the completion stamp is FORGIVING: the key may be
+    // absent entirely (pre-049 RPC), null, or arrive in either the camelCase
+    // shape we encode or the raw snake_case `completed_at` the RPC projects.
+    // Every other field keeps its original (synthesized) strictness.
+    private enum CodingKeys: String, CodingKey {
+        case shareId, taskId, ownerName, level, title, done, completedAt
+        case completedAtSnake = "completed_at"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        shareId = try c.decode(String.self, forKey: .shareId)
+        taskId = try c.decode(String.self, forKey: .taskId)
+        ownerName = try c.decode(String.self, forKey: .ownerName)
+        level = try c.decode(ShareLevel.self, forKey: .level)
+        title = try c.decode(String.self, forKey: .title)
+        done = try c.decode(Bool.self, forKey: .done)
+        completedAt = try c.decodeIfPresent(String.self, forKey: .completedAt)
+            ?? c.decodeIfPresent(String.self, forKey: .completedAtSnake)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(shareId, forKey: .shareId)
+        try c.encode(taskId, forKey: .taskId)
+        try c.encode(ownerName, forKey: .ownerName)
+        try c.encode(level, forKey: .level)
+        try c.encode(title, forKey: .title)
+        try c.encode(done, forKey: .done)
+        try c.encodeIfPresent(completedAt, forKey: .completedAt)
     }
 }
 

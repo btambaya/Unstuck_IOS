@@ -276,10 +276,14 @@ struct SharedWithMeRow: Decodable {
     let level: String
     let title: String
     let done: Bool?
+    /// Migration 049. Optional (decodeIfPresent) so an un-migrated projection —
+    /// which omits the column entirely — still decodes.
+    let completed_at: String?
 
     func model() -> SharedWithMe {
         SharedWithMe(shareId: share_id, taskId: task_id, ownerName: owner_name,
-                     level: ShareLevel(rawValue: level) ?? .view, title: title, done: done == true)
+                     level: ShareLevel(rawValue: level) ?? .view, title: title,
+                     done: done == true, completedAt: completed_at)
     }
 }
 

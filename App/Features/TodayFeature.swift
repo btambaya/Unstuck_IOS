@@ -525,7 +525,10 @@ struct TodayView: View {
             // Company + delegation sit atop the Today list (not the Backlog view),
             // 1:1 with the web today-list. Each renders nothing when empty.
             if !backlogActive {
+                // Today mode: a completed share leaves this list at once, the
+                // same as your own completed tasks.
                 SharedWithYouGroup(items: model.shareState.sharedWithMe,
+                                   mode: .today,
                                    makeCoFocus: { model.makeCoFocusModel(taskId: $0) },
                                    suppressPresenceTaskId: liveId) { taskId, done in
                     Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }

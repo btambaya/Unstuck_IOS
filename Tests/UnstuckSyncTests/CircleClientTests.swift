@@ -84,6 +84,28 @@ final class CircleClientTests: XCTestCase {
         let nullDone = try decode(SharedWithMeRow.self, nullJson).model()
         XCTAssertFalse(nullDone.done)
         XCTAssertEqual(nullDone.level, .view)
+
+        // Pre-049 projection omits completed_at entirely — must still decode.
+        XCTAssertNil(done.completedAt)
+        XCTAssertNil(nullDone.completedAt)
+    }
+
+    /// Migration 049 projects the completion stamp so a completed share can
+    /// move to Completed like any other task (SharedTaskVisibility).
+    func testSharedWithMeRowCarriesCompletedAt() throws {
+        let json = """
+        {"share_id":"s5","task_id":"t9","owner_name":"Pat","level":"partner",
+         "title":"Ship the deck","done":true,"completed_at":"2026-08-02T09:30:00+00:00"}
+        """
+        let s = try decode(SharedWithMeRow.self, json).model()
+        XCTAssertEqual(s.completedAt, "2026-08-02T09:30:00+00:00")
+
+        // Nullable column: an un-completed row projects null.
+        let nullJson = """
+        {"share_id":"s6","task_id":"t10","owner_name":"Pat","level":"partner",
+         "title":"Draft it","done":false,"completed_at":null}
+        """
+        XCTAssertNil(try decode(SharedWithMeRow.self, nullJson).model().completedAt)
     }
 
     func testShareBadgeRowMapping() throws {
