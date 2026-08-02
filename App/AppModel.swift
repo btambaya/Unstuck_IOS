@@ -184,13 +184,26 @@ final class AppModel {
     @ObservationIgnored private(set) var _assistant: AssistantModel?
 
     /// The in-app agent (text chat + client-side tool execution). Built on first
-    /// bubble open so the persisted history load + the client are only touched
-    /// when the user actually uses it. Voice is deferred.
+    /// panel open so the persisted thread load + the client are only touched
+    /// when the user actually uses it.
     var assistant: AssistantModel {
         if let a = _assistant { return a }
         let a = AssistantModel(model: self, client: coordinator?.assistant)
         _assistant = a
         return a
+    }
+
+    /// The AI kill-switch (Settings → Interface → "AI Assistant"). OFF removes
+    /// the launcher, the panel and voice entirely — the promise the published
+    /// privacy policy makes. Device-local, never synced.
+    var assistantEnabled: Bool { settings.assistantEnabled }
+
+    /// The ONE way to open the Assistant panel (launcher, Siri deep link, the
+    /// guided tour). No-ops while the kill-switch is off, so a stale deep link
+    /// or tour step can never resurrect a disabled assistant.
+    func openAssistant() {
+        guard assistantEnabled else { return }
+        router.showAssistant = true
     }
 
     /// Backing for the lazily-built guided-tour orchestrator. Observation-
@@ -325,8 +338,10 @@ final class AppModel {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
     /// Gate the Talk button: a non-blank proxy URL (matches Android — no token
-    /// check, so Talk stays visible during token-refresh / cold-start).
-    var voiceConfigured: Bool { !voiceProxyURL.isEmpty }
+    /// check, so Talk stays visible during token-refresh / cold-start) AND the
+    /// AI kill-switch — "off" means no voice either, which is what the privacy
+    /// policy promises.
+    var voiceConfigured: Bool { !voiceProxyURL.isEmpty && assistantEnabled }
     /// The realtime model id (DashScope Qwen-Omni).
     var voiceModel: String { "qwen3.5-omni-flash-realtime" }
     /// The Supabase access token the proxy validates.

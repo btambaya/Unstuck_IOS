@@ -273,7 +273,7 @@ struct TodayView: View {
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
-        .feedbackBubble()
+        .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in

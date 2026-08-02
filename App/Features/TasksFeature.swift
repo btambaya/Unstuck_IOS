@@ -117,7 +117,7 @@ struct TasksView: View {
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
-        .feedbackBubble()
+        .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in

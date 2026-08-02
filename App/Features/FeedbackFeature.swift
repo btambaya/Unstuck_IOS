@@ -1,17 +1,20 @@
-// In-app beta feedback — a floating bubble that opens a one-way composer.
-// Type → pick a category → Send → "Thanks". Triaged in the Supabase dashboard
-// (no replies). Each submission auto-attaches app version / device / screen /
-// email so a one-line report is still actionable. 1:1 with the Android
-// FeedbackSheet + bubble; gated on the same on-by-default intent.
+// In-app beta feedback — a one-way composer. Type → pick a category → Send →
+// "Thanks". Triaged in the Supabase dashboard (no replies). Each submission
+// auto-attaches app version / device / screen / email so a one-line report is
+// still actionable.
+//
+// Since the assistant redesign the composer is NO LONGER inside the assistant
+// panel: its entry point is Settings → Account → "Send feedback" (matching the
+// web, which moved it out for the same reason — the panel is the assistant,
+// nothing else). The floating ✦ launcher below opens the Assistant.
 
 import SwiftUI
 import UnstuckCore
 import UnstuckDesign
 
-/// The floating coral bubble, overlaid bottom-trailing over the tab content.
-/// Opens the dual-purpose sheet (Assistant chat + Feedback) — matching Android,
-/// whose bubble exposes both surfaces behind one entry point.
-struct FeedbackBubble: View {
+/// The floating coral ✦ launcher, overlaid bottom-trailing over the tab
+/// content. Opens the Assistant panel.
+struct AssistantLauncher: View {
     @Environment(\.uTheme) private var theme
     let action: () -> Void
     var body: some View {
@@ -33,31 +36,46 @@ struct FeedbackBubble: View {
     }
 }
 
-/// Overlays the bubble on a tab's ROOT content (bottom-trailing). Applied
+/// Overlays the launcher on a tab's ROOT content (bottom-trailing). Applied
 /// INSIDE each tab's NavigationStack so a pushed detail screen covers it —
-/// mirroring Android's `stack.isEmpty()` gate. Opens the bubble sheet on the
-/// Assistant tab.
-struct FeedbackBubbleModifier: ViewModifier {
+/// mirroring Android's `stack.isEmpty()` gate. Renders NOTHING while the AI
+/// kill-switch (Settings → Interface) is off.
+struct AssistantLauncherModifier: ViewModifier {
     @Environment(AppModel.self) private var model
     func body(content: Content) -> some View {
         content.overlay(alignment: .bottomTrailing) {
-            FeedbackBubble {
-                model.router.bubbleStartTab = .assistant
-                model.router.showBubble = true
+            if model.assistantEnabled {
+                AssistantLauncher { model.openAssistant() }
+                    // Tour anchor: the assistant/re-entry steps ring this launcher.
+                    .tourTarget(.assistantLaunch)
+                    .padding(.trailing, 16)
+                    // Clear the floating bottom nav (~84pt incl. the safe area) so
+                    // the launcher isn't occluded by / mis-tapped into the
+                    // Collections tab beneath it. Content already pads 96pt here.
+                    .padding(.bottom, 96)
             }
-            // Tour anchor: the assistant/re-entry steps ring this launcher.
-            .tourTarget(.assistantLaunch)
-            .padding(.trailing, 16)
-            // Clear the floating bottom nav (~84pt incl. the safe area) so the
-            // bubble — now the Assistant entry — isn't occluded by / mis-tapped
-            // into the Collections tab beneath it. Content already pads 96pt here.
-            .padding(.bottom, 96)
         }
     }
 }
 
 extension View {
-    func feedbackBubble() -> some View { modifier(FeedbackBubbleModifier()) }
+    func assistantLauncher() -> some View { modifier(AssistantLauncherModifier()) }
+}
+
+/// The feedback composer as its own sheet — the Settings → Account entry point.
+struct FeedbackSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        FeedbackForm(screen: model.router.tab.screenKey, onDone: { dismiss() })
+            .padding(.top, 18)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(theme.palette.bg.ignoresSafeArea())
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
+    }
 }
 
 private enum FeedbackCategory: String, CaseIterable, Identifiable {

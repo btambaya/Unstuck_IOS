@@ -21,14 +21,11 @@ final class AppRouter {
 
     var tab: Tab = .today
     var activeSheet: Sheet?
-    /// The floating bubble's dual-purpose sheet (Assistant chat + Feedback),
-    /// driven by the bottom-trailing bubble. Matches Android's bubble, which
-    /// exposes both surfaces behind one entry point.
-    var showBubble = false
-    /// Which tab the bubble sheet opens on. The bubble itself opens Assistant;
-    /// kept here so a future "report a bug" entry can deep-link to Feedback.
-    var bubbleStartTab: BubbleTab = .assistant
-    enum BubbleTab { case assistant, feedback }
+    /// The Assistant panel, driven by the bottom-trailing ✦ launcher. Assistant
+    /// ONLY since the redesign — feedback moved to Settings → Account → "Send
+    /// feedback" (matching the web). Never set this directly: go through
+    /// `AppModel.openAssistant()`, which honours the AI kill-switch.
+    var showAssistant = false
     /// When set, the Focus surface is presented full-screen for this task.
     var focusTask: TaskItem?
     /// Set ALONGSIDE `focusTask` when the presented Focus session is on a task
@@ -57,14 +54,14 @@ final class AppRouter {
     /// one silently no-ops), so a push deep-link arriving now must dismiss first
     /// and present after (see AppModel.routeDeepLink).
     var hasActivePresentation: Bool {
-        activeSheet != nil || showBubble || detailTask != nil || focusTask != nil
+        activeSheet != nil || showAssistant || detailTask != nil || focusTask != nil
     }
 
     /// Tear down every active modal so a deferred deep-link can present cleanly
     /// once they finish dismissing (each host's onDismiss flushes the pending link).
     func dismissAllPresentations() {
         activeSheet = nil
-        showBubble = false
+        showAssistant = false
         detailTask = nil
         focusTask = nil
         sharedFocus = nil
@@ -77,7 +74,7 @@ final class AppRouter {
     /// USER started, and tour navigation must never tear that down.
     func dismissTourPresentations() {
         activeSheet = nil
-        showBubble = false
+        showAssistant = false
         detailTask = nil
     }
 }

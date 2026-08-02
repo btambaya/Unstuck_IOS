@@ -435,6 +435,7 @@ private struct AccessibilitySettingsView: View {
 
 private struct InterfaceSettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
     var body: some View {
         @Bindable var settings = model.settings
         SettingsScaffold(eyebrow: "Settings · Interface", title: "How things look.") {
@@ -456,7 +457,15 @@ private struct InterfaceSettingsView: View {
                        selected: settings.density.rawValue) { v in
                     settings.density = DensityPref(rawValue: v) ?? .regular
                 }
+                CardDivider()
+                // The AI kill-switch the privacy policy promises. OFF removes
+                // the ✦ launcher, the panel and voice entirely, and open-
+                // assistant deep links are ignored.
+                ToggleRow(label: "AI Assistant", isOn: $settings.assistantEnabled)
             }
+            Text("Turn the AI Assistant off to remove it completely — no launcher, no panel, no voice. Nothing is sent to the model unless you ask it something.")
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                .padding(.top, 10)
         }
     }
 }
@@ -472,6 +481,7 @@ private struct AccountSettingsView: View {
     @State private var showName = false
     @State private var showPassword = false
     @State private var showDelete = false
+    @State private var showFeedback = false
     @State private var message: String?
     @State private var messageIsError = false
 
@@ -496,6 +506,12 @@ private struct AccountSettingsView: View {
                     model.tour.openExplicit()
                 }
                 CardDivider()
+                // Feedback moved OUT of the assistant panel in the redesign —
+                // this is now its only entry point (web parity).
+                SettingTapRow(label: "Send feedback", value: "Tell us what’s working (or isn’t)") {
+                    showFeedback = true
+                }
+                CardDivider()
                 SettingTapRow(label: "Delete my account", value: "Permanently removes your data",
                               destructive: true) { showDelete = true }
                 CardDivider()
@@ -513,6 +529,7 @@ private struct AccountSettingsView: View {
         .sheet(item: $exportURL) { url in
             ActivityView(items: [url]) { AppModel.removeExportFile(url) }
         }
+        .sheet(isPresented: $showFeedback) { FeedbackSheet() }
         .sheet(isPresented: $showName) {
             DisplayNameSheet(initial: model.currentUserName ?? "") { name in
                 Task {

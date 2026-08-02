@@ -1,134 +1,65 @@
-// The bubble's dual-purpose surface: an Assistant chat (agentic — brain-dump to
-// manage your schedule) + the existing Feedback composer, switched by a top
-// toggle. The chat drives AssistantModel (which calls the qwen edge fn +
-// executes tool calls locally). 1:1 with the Android AssistantSheet, MINUS the
-// voice entry (deferred): no "Talk" button, no mic, no speaker toggle.
+// The Assistant panel — the iOS port of the web redesign
+// (components/assistant/assistant-bubble.tsx): a header with the ask-Unstuck
+// eyebrow, a live tappable context strip (NEXT / USABLE / PAUSED), ONE endless
+// thread with day dividers + action receipts, and the dynamic data-driven
+// suggestion card that fills the view on open (history sits above the fold).
+//
+// There is no "new chat": the sheet opens scrolled to the top of the chips
+// block, so the suggestions fill the viewport and scrolling UP reveals the
+// conversation's history. Feedback now lives in Settings → Account → "Send
+// feedback" (the panel is the assistant, nothing else).
+//
+// Everything the agent changes comes back as a deterministic ✓ receipt with
+// Undo; a `share_task` request renders a confirm card and only leaves the
+// device on the user's tap.
 
 import SwiftUI
 import UnstuckCore
 import UnstuckDesign
 import UnstuckSync
 
-/// The sheet presented by the floating bubble. A top toggle switches between
-/// the Assistant chat and the Feedback composer; both stay reachable.
-struct BubbleSheet: View {
+/// The sheet presented by the floating assistant launcher.
+struct AssistantSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @Environment(\.dismiss) private var dismiss
 
-    /// The tab the user was on (for Feedback triage).
-    let screen: String
-    /// Which surface to open on (Assistant by default; bug-report deep-links Feedback).
-    let startTab: AppRouter.BubbleTab
-
-    @State private var tab: AppRouter.BubbleTab
-
-    init(screen: String, startTab: AppRouter.BubbleTab) {
-        self.screen = screen
-        self.startTab = startTab
-        _tab = State(initialValue: startTab)
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Top toggle: Assistant | Feedback.
-            HStack(spacing: 8) {
-                ToggleChip(label: "Assistant", selected: tab == .assistant) { tab = .assistant }
-                ToggleChip(label: "Feedback", selected: tab == .feedback) { tab = .feedback }
-                Spacer()
-            }
-            .padding(.horizontal, 20)
-            .padding(.top, 16)
-            .padding(.bottom, 4)
-
-            switch tab {
-            case .assistant: AssistantChat()
-            case .feedback: FeedbackForm(screen: screen, onDone: { dismiss() })
-            }
-        }
-        .background(theme.palette.bg.ignoresSafeArea())
-        .presentationDetents([.large])
-        .presentationDragIndicator(.visible)
-    }
-}
-
-private struct ToggleChip: View {
-    @Environment(\.uTheme) private var theme
-    let label: String
-    let selected: Bool
-    let onTap: () -> Void
-    var body: some View {
-        Button(action: onTap) {
-            Text(label)
-                .font(UFont.sans(13, .semibold))
-                .padding(.horizontal, 16).padding(.vertical, 8)
-                .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
-                .background(selected ? theme.palette.ink : theme.palette.bg2)
-                .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(selected ? [.isSelected] : [])
-    }
-}
-
-/// The agentic chat: transcript of user/assistant bubbles, a "Thinking…" row
-/// while a turn is in flight, an inline error row, an input field + send button,
-/// and a "New chat" clear action. History + the in-flight turn live on the
-/// AssistantModel (the turn runs in a detached Task) so dismissing the sheet
-/// mid-turn doesn't cancel it.
-private struct AssistantChat: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.uTheme) private var theme
-
     @State private var input = ""
-    @State private var showVoice = false        // realtime "Talk" mode
+    @State private var showVoice = false         // realtime "Talk" mode
     @State private var speakReplies = false      // TTS read-aloud toggle
     @State private var note: String?             // local notice (mic permission / STT unavailable)
     @State private var userStoppedMic = false    // distinguishes a tap-to-stop from an auto-end (denial)
     @State private var voice = VoiceController()
+    /// The suggestion card shows at the thread tail until the user engages this
+    /// visit; the ✦ button re-summons it.
+    @State private var showChips = true
+    @State private var ctx = AssistantContext.empty
     @SwiftUI.FocusState private var fieldFocused: Bool
+
+    private static let chipsAnchor = "assistant.chips"
+    private static let bottomAnchor = "assistant.bottom"
 
     private var assistant: AssistantModel { model.assistant }
 
     var body: some View {
-        let shown = assistant.transcript
         VStack(spacing: 0) {
-            // Header: a "Talk" entry into realtime voice (when configured) +
-            // "New chat" clear (only when there's a conversation).
-            HStack {
-                if model.voiceConfigured {
-                    Button { showVoice = true } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "waveform").font(.system(size: 12))
-                            Text("Talk").font(UFont.sans(12, .semibold))
-                        }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 12).padding(.vertical, 6)
-                        .background(theme.palette.coral, in: Capsule())
-                    }.buttonStyle(.plain)
-                }
-                Spacer()
-                if !shown.isEmpty {
-                    Button("New chat") { assistant.clear(); input = "" }
-                        .font(UFont.sans(12, .medium))
-                        .foregroundStyle(theme.palette.ink3)
-                        .buttonStyle(.plain)
-                        .padding(.horizontal, 8).padding(.vertical, 4)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.bottom, 2)
+            header
+            AssistantContextStrip(ctx: ctx, onJump: jump)
 
-            // Transcript (or the empty hint).
-            if shown.isEmpty && !assistant.sending {
-                emptyHint
+            if !assistant.hasHistory && !assistant.sending {
+                // Brand-new conversation — the full "first page".
+                ScrollView {
+                    AssistantHomeBlock(ctx: ctx, onAsk: ask, onResumeTour: resumeTour,
+                                       undoAll: undoAll)
+                        .padding(.horizontal, 16).padding(.vertical, 20)
+                }
             } else {
-                transcript(shown)
+                GeometryReader { geo in thread(viewport: geo.size.height) }
             }
 
             // Local notice (mic permission / STT unavailable) or the last turn's
             // error off the model (which survives close/reopen). A live region so
-            // VoiceOver announces failures. 1:1 with Android `note ?: errorCode`.
+            // VoiceOver announces failures.
             if let message = note ?? assistant.error.map(assistantFriendlyError) {
                 Text(message)
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
@@ -139,61 +70,188 @@ private struct AssistantChat: View {
 
             inputBar
         }
+        .background(theme.palette.bg.ignoresSafeArea())
+        .presentationDetents([.large])
+        .presentationDragIndicator(.visible)
         .fullScreenCover(isPresented: $showVoice) { VoiceModeScreen() }
-        // Read each new assistant reply aloud while the speaker toggle is on.
+        .task {
+            let built = buildAssistantContext(model)
+            ctx = built
+            // Once per day, greet with a grounded line built from real counts
+            // (local — it never enters the model window).
+            assistant.maybeInjectCheckin(line: built.checkinLine)
+            // The circle roster the share_task tool resolves names against.
+            await assistant.refreshShareCandidates()
+        }
+        // Tool calls change the underlying data — rebuild the strip + chips
+        // when a turn lands so the panel never shows a stale day.
+        .onChange(of: assistant.sending) { _, busy in if !busy { refreshContext() } }
+        // Read each new assistant reply aloud while the toggle is on.
         .onChange(of: assistant.lastReplyTick) { _, _ in
             if speakReplies, let r = assistant.lastReply { voice.speak(r) }
         }
         // On-device dictation streams into the input field via the model bridge.
         .onChange(of: assistant.voiceDraft) { _, v in if assistant.dictating || !v.isEmpty { input = v } }
-        .onDisappear { voice.stopListening(); assistant.dictating = false }
-    }
-
-    private var emptyHint: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Brain-dump it.")
-                .font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
-            Text("Tell me what's on your plate and I'll sort it — \"add a dentist appt next Tue 3pm\", "
-                + "\"move my report to tomorrow morning\", \"what should I start?\". Type or tap the mic.")
-                .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+        .onDisappear {
+            voice.stopListening()
+            voice.stopSpeaking()
+            assistant.dictating = false
+            assistant.panelClosed()
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
-        .padding(.horizontal, 22)
     }
 
-    private func transcript(_ shown: [ChatMessage]) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: 8) {
-                    ForEach(shown) { m in
-                        MessageBubble(text: m.content ?? "", fromUser: m.role == "user")
-                    }
-                    if assistant.sending { ThinkingRow().id("thinking") }
-                    Color.clear.frame(height: 1).id("bottom")
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
+    // MARK: - header
+
+    private var header: some View {
+        HStack(spacing: 10) {
+            Mark(size: 20)
+                .frame(width: 36, height: 36)
+                .background(theme.palette.bg2, in: Circle())
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Assistant")
+                    .font(UFont.sans(15.5, .semibold)).foregroundStyle(theme.palette.ink)
+                Text("ASK UNSTUCK TO HANDLE IT")
+                    .font(UFont.mono(9.5, .semibold)).tracking(1.5)
+                    .foregroundStyle(theme.palette.ink3)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onChange(of: shown.count) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-            .onChange(of: assistant.sending) { _, _ in withAnimation { proxy.scrollTo("bottom", anchor: .bottom) } }
-            .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+            Spacer(minLength: 0)
+
+            if model.voiceConfigured {
+                Button { showVoice = true } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "mic.fill").font(.system(size: 11))
+                        Text("Talk").font(UFont.sans(12.5, .semibold))
+                    }
+                    .foregroundStyle(theme.palette.ink)
+                    .padding(.horizontal, 13).padding(.vertical, 7)
+                    .background(theme.palette.bg2, in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Talk")
+            }
+
+            Menu {
+                Toggle("Read replies aloud", isOn: $speakReplies)
+                if assistant.hasHistory {
+                    Button("Clear conversation", role: .destructive) {
+                        assistant.clear()
+                        input = ""
+                        showChips = true
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 16)).foregroundStyle(theme.palette.ink3)
+                    .frame(width: 32, height: 32)
+            }
+            .accessibilityLabel("Conversation options")
+        }
+        .padding(.leading, 16).padding(.trailing, 10)
+        .padding(.top, 14).padding(.bottom, 10)
+    }
+
+    // MARK: - the one endless thread
+
+    private func thread(viewport: CGFloat) -> some View {
+        let shown = assistant.transcript
+        return ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 10) {
+                    ForEach(Array(shown.enumerated()), id: \.element.id) { i, turn in
+                        if let label = dayDivider(shown, at: i) {
+                            Text(label)
+                                .font(UFont.mono(10, .semibold)).tracking(0.8)
+                                .foregroundStyle(theme.palette.ink3)
+                                .frame(maxWidth: .infinity, alignment: .center)
+                                .padding(.top, 6)
+                        }
+                        MessageBubble(text: turn.text, fromUser: turn.role == "user",
+                                      local: turn.isLocal)
+                        ForEach(Array((turn.receipts ?? []).enumerated()), id: \.offset) { ri, receipt in
+                            AssistantReceiptRow(receipt: receipt) {
+                                assistant.undoReceipt(turnId: turn.id, index: ri)
+                                refreshContext()
+                            }
+                            .frame(maxWidth: 320, alignment: .leading)
+                        }
+                    }
+
+                    ForEach(assistant.pendingShares) { pending in
+                        AssistantShareConfirmCard(
+                            pending: pending,
+                            performer: ShareModelPerformer(shares: model.shareState),
+                            onResolved: { assistant.resolveShare(id: pending.id, outcome: $0) })
+                    }
+
+                    if assistant.sending { ThinkingRow() }
+
+                    if showChips && !assistant.sending {
+                        // min-height = the viewport, so aligning its TOP with the
+                        // top of the scroll view hides everything before it; the
+                        // history is one scroll-up away (web parity).
+                        AssistantHomeBlock(ctx: ctx, compact: true, onAsk: ask,
+                                           onResumeTour: resumeTour, undoAll: undoAll)
+                            .padding(.top, 8)
+                            .frame(minHeight: max(0, viewport - 24), alignment: .top)
+                            .id(Self.chipsAnchor)
+                    }
+                    Color.clear.frame(height: 1).id(Self.bottomAnchor)
+                }
+                .padding(.horizontal, 16).padding(.vertical, 12)
+            }
+            .onAppear { syncScroll(proxy, animated: false) }
+            .onChange(of: shown.count) { _, _ in syncScroll(proxy, animated: true) }
+            .onChange(of: assistant.sending) { _, _ in syncScroll(proxy, animated: true) }
+            .onChange(of: showChips) { _, _ in syncScroll(proxy, animated: true) }
+            .onChange(of: assistant.pendingShares.count) { _, _ in syncScroll(proxy, animated: true) }
         }
     }
+
+    /// The divider label for row `i`, or nil when it repeats the row above.
+    private func dayDivider(_ turns: [AssistantTurn], at i: Int) -> String? {
+        guard let label = assistantDayLabel(at: turns[i].at) else { return nil }
+        let previous = i > 0 ? assistantDayLabel(at: turns[i - 1].at) : nil
+        return label == previous ? nil : label
+    }
+
+    /// Opening on the chips puts the suggestion card in the viewport with the
+    /// history above the fold; a live conversation (or a staged share awaiting
+    /// a tap) pins to the bottom instead.
+    private func syncScroll(_ proxy: ScrollViewProxy, animated: Bool) {
+        let awaitingShare = assistant.pendingShares.contains { $0.outcome == nil }
+        let target = (showChips && !assistant.sending && !awaitingShare)
+            ? Self.chipsAnchor : Self.bottomAnchor
+        let anchor: UnitPoint = target == Self.chipsAnchor ? .top : .bottom
+        // A scroll during the same layout pass that appended the row lands
+        // short — hop to the next runloop turn.
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation { proxy.scrollTo(target, anchor: anchor) }
+            } else {
+                proxy.scrollTo(target, anchor: anchor)
+            }
+        }
+    }
+
+    // MARK: - input
 
     private var inputBar: some View {
         HStack(spacing: 8) {
-            // Read replies aloud (on-device TTS).
-            Button { speakReplies.toggle(); if !speakReplies { voice.stopSpeaking() } } label: {
-                Image(systemName: speakReplies ? "speaker.wave.2.fill" : "speaker.slash")
-                    .font(.system(size: 15))
-                    .foregroundStyle(speakReplies ? theme.palette.coral : theme.palette.ink3)
-                    .frame(width: 34, height: 34)
+            // ✦ re-summons the suggestion card once the user has engaged.
+            if assistant.hasHistory && !showChips {
+                Button { showChips = true } label: {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 15))
+                        .foregroundStyle(theme.palette.ink2)
+                        .frame(width: 40, height: 40)
+                        .overlay(Circle().stroke(theme.palette.line2))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Show suggestions")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel(speakReplies ? "Stop reading replies aloud" : "Read replies aloud")
 
-            TextField(assistant.dictating ? "Listening…" : "Message…", text: $input, axis: .vertical)
+            TextField(assistant.dictating ? "Listening…" : "Ask Unstuck to handle something…",
+                      text: $input, axis: .vertical)
                 .font(UFont.sans(15))
                 .textFieldStyle(.plain)
                 .lineLimit(1...5)
@@ -230,6 +288,55 @@ private struct AssistantChat: View {
             .accessibilityLabel("Send")
         }
         .padding(.horizontal, 16).padding(.vertical, 10)
+        .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 0.5) }
+    }
+
+    // MARK: - actions
+
+    private func refreshContext() { ctx = buildAssistantContext(model) }
+
+    private var undoAll: (count: Int, run: () -> Void)? {
+        guard let target = assistant.undoAllTarget else { return nil }
+        return (target.count, {
+            assistant.undoAll(turnId: target.turnId)
+            refreshContext()
+        })
+    }
+
+    /// A chip tap sends its message through the NORMAL guardrailed agent path —
+    /// no special-cased local execution, no new server surface.
+    private func ask(_ message: String) {
+        guard !assistant.sending else { return }
+        showChips = false
+        note = nil
+        assistant.send(message)
+    }
+
+    private var canSend: Bool {
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !assistant.sending
+    }
+
+    private func send() {
+        let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, !assistant.sending else { return }
+        input = ""
+        note = nil
+        showChips = false
+        assistant.send(t)
+    }
+
+    private func jump(_ destination: AssistantJump) {
+        dismiss()
+        switch destination {
+        case .tasks: model.router.tab = .tasks
+        case .calendar: model.router.tab = .calendar
+        case .focus(let task): model.router.beginFocus(task)
+        }
+    }
+
+    private func resumeTour() {
+        dismiss()
+        model.tour.openExplicit()
     }
 
     private static let micDeniedNote = "Mic permission is needed to talk to the assistant."
@@ -274,37 +381,38 @@ private struct AssistantChat: View {
                 }
             })
     }
-
-    private var canSend: Bool {
-        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !assistant.sending
-    }
-
-    private func send() {
-        let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, !assistant.sending else { return }
-        input = ""
-        note = nil   // 1:1 with Android send(): clear any local notice on send
-        assistant.send(t)
-    }
 }
+
+// MARK: - rows
 
 private struct MessageBubble: View {
     @Environment(\.uTheme) private var theme
     let text: String
     let fromUser: Bool
+    /// A locally-injected turn (the daily check-in) — marked with the ✦ tell.
+    var local = false
+
     var body: some View {
         HStack {
             if fromUser { Spacer(minLength: 40) }
-            Text(text)
-                .font(UFont.sans(15))
-                .foregroundStyle(fromUser ? Color.white : theme.palette.ink)
-                .padding(.horizontal, 14).padding(.vertical, 10)
-                .background(fromUser ? theme.palette.coral : theme.palette.surface)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(
-                    fromUser ? nil :
-                        RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(theme.palette.line))
-                .frame(maxWidth: 300, alignment: fromUser ? .trailing : .leading)
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                if local {
+                    Image(systemName: "sparkle")
+                        .font(.system(size: 10))
+                        .foregroundStyle(theme.palette.ink3)
+                        .accessibilityHidden(true)
+                }
+                Text(text)
+                    .font(UFont.sans(15))
+                    .foregroundStyle(fromUser ? Color.white : theme.palette.ink)
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(fromUser ? theme.palette.coral : theme.palette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                fromUser ? nil :
+                    RoundedRectangle(cornerRadius: 16, style: .continuous).stroke(theme.palette.line))
+            .frame(maxWidth: 300, alignment: fromUser ? .trailing : .leading)
             if !fromUser { Spacer(minLength: 40) }
         }
         .frame(maxWidth: .infinity, alignment: fromUser ? .trailing : .leading)

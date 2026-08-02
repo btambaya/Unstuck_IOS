@@ -128,11 +128,11 @@ final class TourUITests: XCTestCase {
         // ROUND-2 LOCKDOWN, pass-through side — narrowed by the round-3
         // cutout policy to the assistant/reentry steps (cutoutInteractive):
         // HERE the spotlighted element works — tapping the ringed assistant
-        // launcher opens the real bubble sheet.
+        // launcher opens the real Assistant panel.
         expectStep("Ask Unstuck to handle it", shot: "04-assistant")
         app.buttons["Assistant"].firstMatch.tap()
-        XCTAssertTrue(app.buttons["Feedback"].firstMatch.waitForExistence(timeout: 8),
-                      "the spotlighted launcher must open the bubble sheet")
+        XCTAssertTrue(app.staticTexts["ASK UNSTUCK TO HANDLE IT"].firstMatch.waitForExistence(timeout: 8),
+                      "the spotlighted launcher must open the assistant panel")
         snap("04b-assistant-sheet")
         // The panel stays interactive above the sheet; Skip advances (and the
         // step navigation closes the tour-opened sheet).

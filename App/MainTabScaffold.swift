@@ -30,8 +30,12 @@ struct MainTabScaffold: View {
                 case .settings(let section): SettingsView(section: section)
                 }
             }
-            .sheet(isPresented: $router.showBubble, onDismiss: { model.flushPendingDeepLink() }) {
-                BubbleSheet(screen: screenLabel(router.tab), startTab: router.bubbleStartTab)
+            // The Assistant panel. `showAssistant` is only ever set through
+            // AppModel.openAssistant(), which honours the AI kill-switch — the
+            // extra guard here means flipping the switch OFF mid-session
+            // dismisses whatever is open.
+            .sheet(isPresented: assistantSheetShown, onDismiss: { model.flushPendingDeepLink() }) {
+                AssistantSheet()
             }
             // Notification deep links (unstuck://task/<id>) open the task
             // editor from anywhere — Android's Route.Detail push. onDismiss
@@ -66,6 +70,14 @@ struct MainTabScaffold: View {
             // Mounted from the scaffold = signed-in + onboarded only.
             .background(TourWindowMounter(model: model,
                                           colorSchemeOverride: model.settings.theme.colorScheme))
+    }
+
+    /// Presented only while the assistant is enabled — turning the kill-switch
+    /// off closes an open panel instead of leaving it stranded.
+    private var assistantSheetShown: Binding<Bool> {
+        Binding(
+            get: { model.router.showAssistant && model.assistantEnabled },
+            set: { model.router.showAssistant = $0 })
     }
 
     // MARK: - invite-prompt bindings (confirm + result over circleInvitePrompt)
@@ -109,12 +121,4 @@ struct MainTabScaffold: View {
         }
     }
 
-    private func screenLabel(_ tab: AppRouter.Tab) -> String {
-        switch tab {
-        case .today: return "today"
-        case .tasks: return "tasks"
-        case .calendar: return "calendar"
-        case .lists: return "lists"
-        }
-    }
 }

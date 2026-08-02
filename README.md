@@ -22,11 +22,14 @@ repo ([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)).
 > Notification Center, levels, action routing) and the audit-driven sync
 > hardening (poison-pill outbox, per-row FIFO, sign-out drain +
 > push-token unregister, scenePhase/BG-refresh sync triggers, Google
-> pull reconcile, privacy manifest) landed 2026-06-09. Remaining gaps:
-> the Android assistant/voice bubble (not in the spec, not ported), the
-> Today recap card, server push payload custom keys (backend), and the
-> manual deploy/capability steps — see [`handover.md`](handover.md) for
-> the honest list.
+> pull reconcile, privacy manifest) landed 2026-06-09. The assistant
+> (agentic chat + realtime voice) shipped after that, and was rebuilt to
+> match the web cockpit redesign on 2026-08-02 — one endless thread, a
+> live context strip, data-driven suggestion chips, undoable action
+> receipts, and an AI kill-switch in Settings → Interface. Remaining
+> gaps: server push payload custom keys (backend) and the manual
+> deploy/capability steps — see [`handover.md`](handover.md) for the
+> honest list.
 
 ## Architecture
 

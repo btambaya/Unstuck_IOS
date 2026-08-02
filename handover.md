@@ -3,7 +3,45 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-07-16, latest) — one true shared session (partner co-focus v2)
+## Where things stand (2026-08-02, latest) — assistant redesign (port of the web cockpit)
+
+Source of truth: `../unstuck/components/assistant/*` + `../unstuck/lib/assistant/*`.
+The bubble's dual Assistant|Feedback sheet is GONE — the ✦ launcher opens the
+Assistant panel and nothing else.
+
+- **Pure ports in UnstuckCore** (all unit-tested against the web's own cases):
+  `AssistantSuggestions.swift` (`buildSuggestions` — 3 chip groups built from
+  the user's real tasks/lists, same predicates + copy, real Sat/Sun dates),
+  `AssistantReceipts.swift` (`deriveReceipt` from the executor's `ok: …` string
+  + `planReceiptUndo`), `AssistantCheckin.swift` (`buildCheckin`),
+  `AssistantShareRequest.swift` (`matchCandidate` / `normalizeLevel` /
+  `resolveShareRequest` — stages, never shares), `UsableToday.swift`
+  (`usableToday` + `fmtHrs`, the web's right-rail math).
+- **AssistantModel** now owns ONE endless thread of `AssistantTurn` (the wire
+  `ChatMessage` + `at` / `local` / `receipts`). Display persists 200 turns
+  under `unstuck.assistant.thread` (the old `unstuck.assistant.history`
+  `[ChatMessage]` blob migrates once); `modelWindow` derives the 40-turn model
+  view per request, aligned to a user turn, local turns excluded. Receipts
+  attach to the CLOSING assistant turn; `undoReceipt` / `undoAllTarget` /
+  `undoAll` apply through the same write methods the UI uses. `share_task`
+  resolves against a cached circle roster and appends to `pendingShares`;
+  nothing leaves the device until the confirm card's tap.
+- **UI**: `AssistantSheet.swift` (panel shell — header + eyebrow, ⋯ menu with
+  read-aloud + Clear conversation, thread with day dividers / receipts / share
+  cards, chips block sized to the viewport and scrolled to its top on open, ✦
+  re-summon) and `AssistantHome.swift` (context strip NEXT/USABLE/PAUSED, chip
+  groups + WrapLayout, receipt row, share confirm card + the testable
+  `performConfirmedShare` seam, `assistantDayLabel`).
+- **Feedback** moved to Settings → Account → "Send feedback" (`FeedbackSheet`).
+- **AI kill-switch**: `settings.assistantEnabled` (Settings → Interface).
+  OFF ⇒ no launcher (`AssistantLauncherModifier`), no panel (the sheet binding
+  in MainTabScaffold), no voice (`voiceConfigured`), and `unstuck://assistant`
+  is dropped. Everything opens through `AppModel.openAssistant()`;
+  `AppRouter.showBubble` / `BubbleTab` are gone (now `showAssistant`).
+- Tests: +47 UnstuckCoreTests, +13 UnstuckAppTests (558 package / 160 app, all
+  green). UITest anchors updated (the Feedback toggle no longer exists).
+
+## Where things stand (2026-07-16) — one true shared session (partner co-focus v2)
 
 Spec: `../unstuck/docs/shared-session-spec.md` (migration 047 already applied:
 `log_shared_focus` now admits the task OWNER + 12h server clamp). A

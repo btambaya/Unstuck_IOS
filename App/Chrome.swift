@@ -23,6 +23,15 @@ extension AppRouter.Tab {
         case .lists: return "square.stack.3d.up"
         }
     }
+    /// Lowercase key attached to a feedback submission for triage.
+    var screenKey: String {
+        switch self {
+        case .today: return "today"
+        case .tasks: return "tasks"
+        case .calendar: return "calendar"
+        case .lists: return "lists"
+        }
+    }
 }
 
 /// Bottom nav: 4 cells split around a centered FAB gap, a hairline top divider,

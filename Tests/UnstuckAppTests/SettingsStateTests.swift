@@ -61,6 +61,23 @@ final class SettingsStateTests: XCTestCase {
         XCTAssertTrue(s.reduceMotion)
     }
 
+    /// The AI kill-switch (privacy policy §21). ON unless the user turned it
+    /// off; an explicit OFF must survive relaunch — the whole point of the
+    /// promise is that it stays off.
+    func testAssistantKillSwitchDefaultsOnAndPersistsOff() {
+        XCTAssertTrue(SettingsState.loaded(defaults: freshDefaults()).assistantEnabled)
+
+        let d = freshDefaults()
+        let s = SettingsState(defaults: d)
+        s.load()
+        s.assistantEnabled = false
+        XCTAssertFalse(d.bool(forKey: "unstuck.assistantEnabled"), "the choice must be written through")
+
+        let reloaded = SettingsState(defaults: d)
+        reloaded.load()
+        XCTAssertFalse(reloaded.assistantEnabled, "a disabled assistant must stay disabled after relaunch")
+    }
+
     func testIntScalarsDefaultToAndroidParityWhenUnset() {
         let s = SettingsState(defaults: freshDefaults())
         s.load()

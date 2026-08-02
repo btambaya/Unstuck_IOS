@@ -5,18 +5,24 @@
 // the tool calls against the user's data through the same offline-first methods
 // the UI uses, looping until a plain-text reply.
 //
-// 1:1 with the Android AppViewModel assistant block + AssistantSheet:
-//  • AssistantModel owns the conversation (`history`), the in-flight `sending`
-//    flag, the last `error` code, the agentic turn loop (≤5 iterations), the
-//    tool dispatcher, and the compact context builder.
+// 1:1 with the Android AppViewModel assistant block + the WEB redesign
+// (components/assistant/*, lib/assistant/*):
+//  • AssistantModel owns the ONE endless conversation (`turns`), the in-flight
+//    `sending` flag, the last `error` code, the agentic turn loop (≤5
+//    iterations), the tool dispatcher, and the compact context builder.
 //  • The turn runs in a detached Task (NOT tied to the sheet's lifetime) so
 //    dismissing the sheet mid-"Thinking…" can't cancel a multi-step turn and
 //    leave tool actions half-applied with no reply.
-//  • History is persisted to UserDefaults (windowed to the last 40 messages
-//    starting at a user turn) so it survives close/reopen + an app restart,
-//    and is scrubbed on sign-out / account-delete (cross-account leak class).
+//  • DISPLAY history persists LONG (200 turns, with day dividers + receipts);
+//    the MODEL window stays short (40, aligned to start at a user turn, local
+//    check-in turns excluded) so a long thread never blows the context.
+//  • Every successful write tool yields a deterministic action RECEIPT derived
+//    from the executor's own result string (never model prose), with Undo for
+//    create/complete.
+//  • `share_task` NEVER shares: it stages a request the user confirms on
+//    screen (the one action that sends their content to another person).
 //
-// VOICE IS DEFERRED — text chat + tool execution only. No realtime, no audio.
+// Both text and realtime-voice tool calls run through the same dispatcher.
 
 import SwiftUI
 import UnstuckCore
@@ -25,12 +31,50 @@ import UnstuckDesign
 import Supabase
 import UnstuckSync
 
+/// One turn in the endless thread: the wire message the model sees, plus the
+/// display-only metadata the panel renders. The wire shape (`ChatMessage`) is
+/// untouched — `at` / `local` / `receipts` never reach the edge function
+/// because only `message` is sent (see `modelWindow`).
+struct AssistantTurn: Codable, Equatable, Identifiable {
+    var id: String
+    var message: ChatMessage
+    /// Epoch ms — drives the Today / Yesterday / date dividers.
+    var at: Double?
+    /// Locally injected (the daily check-in): displayed, never sent upstream.
+    var local: Bool?
+    /// Deterministic ✓-cards for what this turn actually changed.
+    var receipts: [Receipt]?
+
+    init(_ message: ChatMessage, id: String = newUUID(), at: Double? = nil,
+         local: Bool? = nil, receipts: [Receipt]? = nil) {
+        self.id = id
+        self.message = message
+        self.at = at
+        self.local = local
+        self.receipts = receipts
+    }
+
+    var role: String { message.role }
+    var text: String { message.content ?? "" }
+    var isLocal: Bool { local == true }
+    /// The undoable receipts still on offer for this turn.
+    var undoableReceipts: [Receipt] { (receipts ?? []).filter(\.isUndoable) }
+}
+
 @MainActor
 @Observable
 final class AssistantModel {
-    /// The full OpenAI-shape conversation (user / assistant / tool). The UI
-    /// derives the visible transcript from this; the turn loop appends to it.
-    private(set) var history: [ChatMessage] = []
+    /// The ONE endless conversation (user / assistant / tool turns + local
+    /// check-ins). The UI derives the visible transcript from this; the turn
+    /// loop appends to it; `modelWindow` narrows it for the edge function.
+    private(set) var turns: [AssistantTurn] = []
+    /// Share requests the agent PREPARED this session — the panel renders a
+    /// confirm card for each; nothing is shared without the user's tap.
+    private(set) var pendingShares: [PendingShare] = []
+    /// The user's trusted circle, refreshed when the panel opens. Cached so the
+    /// synchronous tool dispatcher can resolve "share it with Zubair" without a
+    /// blocking network call.
+    private(set) var shareCandidates: [ShareCandidate] = []
     /// True while an agentic turn is in flight (survives sheet reopen).
     private(set) var sending = false
     /// Error code of the last failed turn (nil = none); survives sheet reopen.
@@ -60,7 +104,24 @@ final class AssistantModel {
     /// avoiding — same reason Android runs it on viewModelScope).
     private var turnTask: Task<Void, Never>?
 
-    private static let historyKey = "unstuck.assistant.history"
+    /// Display persistence (the endless thread) + the model window. Both mirror
+    /// the web (lib/assistant/use-assistant.ts). `nonisolated` so the pure
+    /// `modelWindow` (and its unit tests) can read them off the main actor.
+    nonisolated static let maxPersisted = 200
+    nonisolated static let maxModelWindow = 40
+
+    private static let threadKey = "unstuck.assistant.thread"
+    /// Pre-redesign key (a bare `[ChatMessage]` array) — migrated once on load.
+    private static let legacyHistoryKey = "unstuck.assistant.history"
+    /// Day stamp of the last injected check-in line.
+    private static let checkinKey = "unstuck.assistant.checkin"
+
+    /// This VISIT's check-in bookkeeping (the web keeps these as refs on the
+    /// panel component; the model outlives the sheet here, so the panel resets
+    /// them on dismiss). `engaged` stops a mid-conversation send from summoning
+    /// the greeting retroactively.
+    @ObservationIgnored private var checkinConsidered = false
+    @ObservationIgnored private var engagedThisVisit = false
 
     init(model: AppModel, client: AssistantClient?) {
         self.model = model
@@ -71,13 +132,14 @@ final class AssistantModel {
     // MARK: - public surface
 
     /// Append a user message + run the agentic turn. Fire-and-forget for the
-    /// caller: progress/result surface via `sending`/`error`/`history`.
+    /// caller: progress/result surface via `sending`/`error`/`turns`.
     func send(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty, !sending else { return }
         sending = true
         error = nil
-        history.append(ChatMessage(role: "user", content: t))
+        engagedThisVisit = true
+        turns.append(AssistantTurn(ChatMessage(role: "user", content: t), at: Self.nowMillis()))
         persist()
         // The Task inherits this @MainActor isolation, so the loop + the state
         // writes below run on the main actor. It is NOT tied to the sheet, so
@@ -86,7 +148,7 @@ final class AssistantModel {
             guard let self else { return }
             let outcome = await self.runTurn()
             switch outcome {
-            case .reply(let text):   // already appended to history by the loop
+            case .reply(let text):   // already appended to the thread by the loop
                 self.lastReply = text
                 self.lastReplyTick += 1
             case .error(let code): self.error = code
@@ -96,29 +158,137 @@ final class AssistantModel {
         }
     }
 
-    /// "New chat" + the sign-out / account-delete scrub. Cancels any in-flight
-    /// turn and wipes the persisted conversation so the next account on a shared
-    /// device never sees the previous user's chat/brain-dump.
+    /// "Clear conversation" (the ⋯ menu) + the sign-out / account-delete scrub.
+    /// Cancels any in-flight turn and wipes the persisted thread so the next
+    /// account on a shared device never sees the previous user's brain-dump.
     func clear() {
         turnTask?.cancel()
         turnTask = nil
         sending = false
         error = nil
-        history.removeAll()
+        turns.removeAll()
+        pendingShares.removeAll()
         Self.scrubPersisted()
     }
 
-    /// Wipe the persisted assistant history WITHOUT building the live model.
+    /// Wipe the persisted assistant thread WITHOUT building the live model.
     /// Called from sign-out / account-delete so the scrub doesn't pay the cost
     /// of instantiating the agent just to clear it when the user never opened it.
     static func scrubPersisted() {
-        UserDefaults.standard.removeObject(forKey: historyKey)
+        UserDefaults.standard.removeObject(forKey: threadKey)
+        UserDefaults.standard.removeObject(forKey: legacyHistoryKey)
+        UserDefaults.standard.removeObject(forKey: checkinKey)
     }
 
     /// The visible transcript: user + assistant text bubbles (tool steps and
-    /// empty assistant tool-call turns are hidden). Mirrors Android's `shown`.
-    var transcript: [ChatMessage] {
-        history.filter { ($0.role == "user" || $0.role == "assistant") && !($0.content ?? "").isEmpty }
+    /// empty assistant tool-call turns are hidden). Mirrors Android's `shown`
+    /// and the web's `messages`.
+    var transcript: [AssistantTurn] {
+        turns.filter { ($0.role == "user" || $0.role == "assistant") && !$0.text.isEmpty }
+    }
+
+    var hasHistory: Bool { !transcript.isEmpty }
+
+    /// The per-request model window: the non-local tail, aligned to start at a
+    /// user turn so the model never resumes from a dangling tool/assistant turn.
+    nonisolated static func modelWindow(_ turns: [AssistantTurn]) -> [ChatMessage] {
+        var win = Array(turns.filter { !$0.isLocal }.suffix(maxModelWindow))
+        if let firstUser = win.firstIndex(where: { $0.role == "user" }), firstUser > 0 {
+            win = Array(win[firstUser...])
+        }
+        return win.map(\.message)
+    }
+
+    // MARK: - local (zero-token) turns + the daily check-in
+
+    /// Inject a LOCAL display-only assistant turn. Never enters the model
+    /// window; persists like any other display turn.
+    func appendLocal(_ content: String) {
+        turns.append(AssistantTurn(ChatMessage(role: "assistant", content: content),
+                                   at: Self.nowMillis(), local: true))
+        persist()
+    }
+
+    /// Once per day, when the panel opens onto an EXISTING conversation, say
+    /// the grounded check-in line (a fresh account gets the full hero instead;
+    /// a send mid-visit must not summon it retroactively). Zero tokens.
+    func maybeInjectCheckin(line: String, now: Date = Date()) {
+        guard !checkinConsidered, hasHistory else { return }
+        checkinConsidered = true
+        guard !engagedThisVisit else { return }
+        let today = Self.dayStamp(now)
+        let d = UserDefaults.standard
+        guard d.string(forKey: Self.checkinKey) != today else { return }
+        d.set(today, forKey: Self.checkinKey)
+        appendLocal(line)
+    }
+
+    /// The panel dismissed — a later reopen counts as a fresh visit.
+    func panelClosed() {
+        checkinConsidered = false
+        engagedThisVisit = false
+    }
+
+    private static func dayStamp(_ date: Date) -> String { Clock.dateISO(date) }
+    private static func nowMillis() -> Double { Date().timeIntervalSince1970 * 1000 }
+
+    // MARK: - receipts (undo)
+
+    /// Undo one receipt on a persisted turn; flips `undone` so the button
+    /// doesn't come back. Returns true when the undo applied.
+    @discardableResult
+    func undoReceipt(turnId: String, index: Int) -> Bool {
+        guard let ti = turns.firstIndex(where: { $0.id == turnId }),
+              let receipts = turns[ti].receipts, index < receipts.count else { return false }
+        let receipt = receipts[index]
+        guard let undo = receipt.undo, !(receipt.undone ?? false),
+              let action = planReceiptUndo(undo, tasks: liveTasks(), nowISO: AppModel.isoNow())
+        else { return false }
+        switch action {
+        case .deleteTask(let id): model.deleteTask(id)
+        case .restoreTask(let task): model.saveTask(task)
+        }
+        turns[ti].receipts?[index].undone = true
+        persist()
+        return true
+    }
+
+    /// The LAST turn that still has undoable changes — the "Undo all N changes"
+    /// affordance. nil once every receipt has been used.
+    var undoAllTarget: (turnId: String, count: Int)? {
+        guard let turn = turns.last(where: { !$0.undoableReceipts.isEmpty }) else { return nil }
+        return (turn.id, turn.undoableReceipts.count)
+    }
+
+    /// One-tap revert of every still-undoable change on `turnId`.
+    func undoAll(turnId: String) {
+        guard let ti = turns.firstIndex(where: { $0.id == turnId }) else { return }
+        for (i, r) in (turns[ti].receipts ?? []).enumerated() where r.isUndoable {
+            undoReceipt(turnId: turnId, index: i)
+        }
+    }
+
+    // MARK: - staged shares (never sent without a tap)
+
+    /// Refresh the trusted-circle roster the `share_task` tool resolves against.
+    /// Called when the panel opens; active members only (a pending invite can't
+    /// receive a share).
+    func refreshShareCandidates() async {
+        guard let circle = model.coordinator?.circle else { shareCandidates = []; return }
+        let members = await circle.listCircle()
+        shareCandidates = members.compactMap { m in
+            guard m.status == "active", let uid = m.memberUserId, !uid.isEmpty else { return nil }
+            let name = [m.memberName, m.relationshipLabel]
+                .compactMap { $0?.trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty } ?? "Someone"
+            return ShareCandidate(userId: uid, name: name)
+        }
+    }
+
+    /// Mark a staged share resolved (after the user's tap, or dismissal).
+    func resolveShare(id: String, outcome: PendingShareOutcome) {
+        guard let i = pendingShares.firstIndex(where: { $0.id == id }) else { return }
+        pendingShares[i].outcome = outcome
     }
 
     // MARK: - the agentic turn
@@ -130,39 +300,79 @@ final class AssistantModel {
 
     /// Up to 5 iterations: ask → if the reply has tool_calls, run each via the
     /// dispatcher and append a role:"tool" result, then loop; if no tool_calls,
-    /// return the content (or "Done."). 1:1 with Android assistantTurn.
+    /// return the content (or "Done."). 1:1 with Android assistantTurn + the
+    /// web loop, plus the deterministic receipts attached to the CLOSING
+    /// assistant turn.
     private func runTurn() async -> Turn {
         guard let client else { return .error("not_configured") }
         // Scratch for entities created mid-turn (the live store lags the
         // optimistic write), so a later tool call can reference them by id.
         var newTasks: [String: TaskItem] = [:]
         var newLists: [String: ItemCollection] = [:]
+        // Everything this turn actually changed, in order.
+        var receipts: [Receipt] = []
 
         var iterations = 0
         while iterations < 5 {
             iterations += 1
             if Task.isCancelled { return .reply("Done.") }
             let context = buildContext()
-            switch await client.ask(messages: history, context: context) {
+            switch await client.ask(messages: Self.modelWindow(turns), context: context) {
             case .err(let code):
                 return .error(code)
             case .ok(let reply):
-                history.append(ChatMessage(role: "assistant", content: reply.content, toolCalls: reply.toolCalls))
                 let calls = reply.toolCalls ?? []
+                let text = (reply.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
                 if calls.isEmpty {
-                    let text = (reply.content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    return .reply(text.isEmpty ? "Done." : text)
+                    // Final reply — never an empty bubble, and it carries the
+                    // turn's receipts.
+                    let closing = text.isEmpty ? "Done." : text
+                    turns.append(AssistantTurn(ChatMessage(role: "assistant", content: closing),
+                                               at: Self.nowMillis(),
+                                               receipts: receipts.isEmpty ? nil : receipts))
+                    return .reply(closing)
                 }
+                turns.append(AssistantTurn(
+                    ChatMessage(role: "assistant", content: reply.content, toolCalls: reply.toolCalls),
+                    at: Self.nowMillis()))
                 for call in calls {
-                    let result = runTool(name: call.function.name,
-                                         args: parseArgs(call.function.arguments),
+                    let args = parseArgs(call.function.arguments)
+                    let result = runTool(name: call.function.name, args: args,
                                          newTasks: &newTasks, newLists: &newLists)
-                    history.append(ChatMessage(role: "tool", content: result,
-                                               toolCallId: call.id, name: call.function.name))
+                    // Derived from the EXECUTOR's structured result, so a
+                    // receipt can never claim something that didn't happen.
+                    if let receipt = deriveReceipt(name: call.function.name,
+                                                   args: Self.receiptArgs(args),
+                                                   result: result, tasks: liveTasks()) {
+                        receipts.append(receipt)
+                    }
+                    turns.append(AssistantTurn(ChatMessage(role: "tool", content: result,
+                                                           toolCallId: call.id, name: call.function.name)))
                 }
             }
         }
+        // Ran out of iterations — close out gracefully, keeping the receipts.
+        turns.append(AssistantTurn(ChatMessage(role: "assistant", content: "Done."),
+                                   at: Self.nowMillis(),
+                                   receipts: receipts.isEmpty ? nil : receipts))
         return .reply("Done.")
+    }
+
+    /// The slice of a tool call's arguments the receipt derivation reads.
+    private static func receiptArgs(_ args: [String: AnyJSON]) -> ReceiptArgs {
+        func str(_ k: String) -> String? {
+            if case .string(let v)? = args[k] {
+                let t = v.trimmingCharacters(in: .whitespaces)
+                return t.isEmpty ? nil : t
+            }
+            return nil
+        }
+        func bool(_ k: String) -> Bool? {
+            if case .bool(let v)? = args[k] { return v }
+            return nil
+        }
+        return ReceiptArgs(taskId: str("taskId"), date: str("date"), startTime: str("startTime"),
+                           later: bool("later"), kind: str("kind"))
     }
 
     private func parseArgs(_ s: String) -> [String: AnyJSON] {
@@ -309,6 +519,18 @@ final class AssistantModel {
             model.moveItemToTask(c, item: item, mode: mode, dueAtIso: str("dueAt"))
             return "ok: promoted \"\(item.body)\""
 
+        case "share_task":
+            // NEVER shares here: sharing sends the user's content to another
+            // person, so it always waits for an on-screen confirm tap. The
+            // model gets an explanation in every path (empty circle, unknown
+            // person, unknown task) so it can ask instead of inventing.
+            let resolved = resolveShareRequest(
+                taskId: str("taskId"), taskName: str("taskName"),
+                person: str("person"), level: str("level"),
+                tasks: liveTasks(), people: shareCandidates, newId: { newUUID() })
+            if let pending = resolved.pending { pendingShares.append(pending) }
+            return resolved.message
+
         default:
             return "error: unknown tool \(name)"
         }
@@ -401,19 +623,31 @@ final class AssistantModel {
 
     // MARK: - persistence
 
-    /// Persist the window (last 40 messages, starting at a user turn so we never
-    /// re-send an orphaned tool_call). 1:1 with Android persistAssistant.
+    /// Persist the DISPLAY thread (last 200 turns). The model window is derived
+    /// per-request from this (`modelWindow`), so persistence no longer has to
+    /// trim for the context budget — the endless thread is the point.
     private func persist() {
-        let tail = Array(history.suffix(40))
-        let window = Array(tail.drop(while: { $0.role != "user" }))
-        guard let data = try? JSONEncoder().encode(window) else { return }
-        UserDefaults.standard.set(data, forKey: Self.historyKey)
+        let tail = Array(turns.suffix(Self.maxPersisted))
+        guard let data = try? JSONEncoder().encode(tail) else { return }
+        UserDefaults.standard.set(data, forKey: Self.threadKey)
     }
 
+    /// Load the thread, migrating a pre-redesign `[ChatMessage]` blob once so an
+    /// existing conversation survives the upgrade (timestamp-less turns simply
+    /// render without a day divider).
     private func loadHistory() {
-        guard let data = UserDefaults.standard.data(forKey: Self.historyKey),
-              let loaded = try? JSONDecoder().decode([ChatMessage].self, from: data) else { return }
-        history = loaded
+        let d = UserDefaults.standard
+        if let data = d.data(forKey: Self.threadKey),
+           let loaded = try? JSONDecoder().decode([AssistantTurn].self, from: data) {
+            turns = loaded
+            return
+        }
+        if let data = d.data(forKey: Self.legacyHistoryKey),
+           let legacy = try? JSONDecoder().decode([ChatMessage].self, from: data) {
+            turns = legacy.map { AssistantTurn($0) }
+            d.removeObject(forKey: Self.legacyHistoryKey)
+            persist()
+        }
     }
 
     // MARK: - voice (realtime "Talk" mode wiring)

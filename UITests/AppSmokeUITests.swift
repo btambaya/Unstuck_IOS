@@ -55,21 +55,28 @@ final class AppSmokeUITests: XCTestCase {
         }
     }
 
-    /// The in-app Assistant bubble → chat sheet with the voice affordances
-    /// (dictate mic + read-aloud toggle), and Feedback still reachable. The
-    /// realtime "Talk" button only appears when VOICE_PROXY_URL is configured
-    /// (not in the demo boot), so we don't assert it here.
-    func testAssistantBubble() throws {
+    /// The ✦ launcher → the Assistant panel: the suggestion card it opens on,
+    /// the dictation mic, and the ⋯ options menu (which now carries read-aloud
+    /// + Clear conversation). Feedback is NO longer here — it moved to
+    /// Settings → Account → "Send feedback". The realtime "Talk" button only
+    /// appears when VOICE_PROXY_URL is configured (not in the demo boot), so we
+    /// don't assert it here.
+    func testAssistantPanel() throws {
         _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
         usleep(600_000)
-        let bubble = app.buttons["Assistant"].firstMatch
-        XCTAssertTrue(bubble.waitForExistence(timeout: 6), "assistant bubble missing")
-        bubble.tap(); usleep(900_000); snap("12-assistant-chat")
+        let launcher = app.buttons["Assistant"].firstMatch
+        XCTAssertTrue(launcher.waitForExistence(timeout: 6), "assistant launcher missing")
+        launcher.tap(); usleep(900_000); snap("12-assistant-panel")
         XCTAssertTrue(app.buttons["Dictate"].firstMatch.waitForExistence(timeout: 4), "dictation mic missing")
-        XCTAssertTrue(app.buttons["Read replies aloud"].firstMatch.exists, "read-aloud toggle missing")
-        // Feedback surface still reachable via the toggle.
-        let feedback = app.buttons["Feedback"].firstMatch
-        if feedback.waitForExistence(timeout: 3) { feedback.tap(); usleep(600_000); snap("13-feedback") }
+        XCTAssertTrue(app.staticTexts["ASK UNSTUCK TO HANDLE IT"].firstMatch.exists,
+                      "the assistant panel header is missing")
+        // The redesigned panel leads with the suggestion card, not a bare input.
+        XCTAssertTrue(app.staticTexts["What can I take off your plate?"].firstMatch.exists
+                        || app.staticTexts["GETTING STARTED"].firstMatch.exists,
+                      "the panel must open on the suggestion card")
+        // Feedback must NOT live inside the assistant panel any more.
+        XCTAssertFalse(app.buttons["Feedback"].firstMatch.exists,
+                       "feedback moved to Settings → Account")
     }
 
     /// The new Settings depth: the hub links into the Focus + Account sub-screens.

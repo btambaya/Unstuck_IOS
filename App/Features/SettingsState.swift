@@ -71,6 +71,14 @@ final class SettingsState {
         didSet { if !loading { d.set(density.rawValue, forKey: "unstuck.density") } }
     }
 
+    /// The AI kill-switch the published privacy policy promises (§21: "Settings
+    /// → Interface → AI Assistant. Turn it off entirely"). Default ON; when OFF
+    /// there is no launcher, no panel, no voice, and open-assistant deep links
+    /// are ignored. Device-local, never synced. Settings · Interface.
+    var assistantEnabled: Bool = true {
+        didSet { if !loading { d.set(assistantEnabled, forKey: "unstuck.assistantEnabled") } }
+    }
+
     // MARK: Accessibility
 
     var reduceMotion: Bool = false {
@@ -180,6 +188,8 @@ final class SettingsState {
         theme = ThemePref(rawValue: d.string(forKey: "unstuck.theme") ?? "") ?? .system
         accent = Accent(rawValue: d.string(forKey: "unstuck.accent") ?? "") ?? .indigo
         density = DensityPref(rawValue: d.string(forKey: "unstuck.density") ?? "") ?? .regular
+        // ON unless the user explicitly turned the assistant off.
+        assistantEnabled = d.object(forKey: "unstuck.assistantEnabled") == nil ? true : d.bool(forKey: "unstuck.assistantEnabled")
         reduceMotion = d.bool(forKey: "unstuck.reduceMotion")   // default false
         largerType = d.bool(forKey: "unstuck.largerType")       // default false
         highContrast = d.bool(forKey: "unstuck.highContrast")   // default false

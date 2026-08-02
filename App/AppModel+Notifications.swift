@@ -120,11 +120,13 @@ extension AppModel {
             return
         }
         if link == "unstuck://assistant" {
-            // Siri "Ask Unstuck …" — open the assistant bubble and send the
+            // Siri "Ask Unstuck …" — open the assistant panel and send the
             // stashed prompt through the Qwen agent (client-side tool execution).
             let prompt = AppGroup.consumePendingAssistantPrompt()
-            router.bubbleStartTab = .assistant
-            router.showBubble = true
+            // The AI kill-switch wins: with the assistant off the link is
+            // DROPPED — nothing opens and the stashed prompt is never sent.
+            guard assistantEnabled else { return }
+            openAssistant()
             if let prompt, !prompt.isEmpty { assistant.send(prompt) }
             return
         }

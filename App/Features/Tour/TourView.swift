@@ -247,8 +247,7 @@ final class TourModel {
         chipEligible = false
         explicitOpen = false
         phase = .done
-        app.router.bubbleStartTab = .assistant
-        app.router.showBubble = true
+        app.openAssistant()
     }
 
     /// Welcome "Not now" — never auto-offer again.
@@ -307,8 +306,7 @@ final class TourModel {
         let step = currentStep
         if step.opensAssistant && assistantOpenedForStep != step.id {
             assistantOpenedForStep = step.id
-            app.router.bubbleStartTab = .assistant
-            app.router.showBubble = true
+            app.openAssistant()
             return
         }
         advance()
