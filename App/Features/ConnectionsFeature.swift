@@ -232,6 +232,7 @@ private struct AddSomeoneSection: View {
             TextField("name@example.com", text: $email)
                 .textFieldStyle(.roundedBorder)
                 .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
+                .submitLabel(.done)
                 .onSubmit(submit)
             Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
@@ -346,6 +347,7 @@ private struct RedeemSection: View {
                         TextField("code", text: $code)
                             .textFieldStyle(.roundedBorder)
                             .textInputAutocapitalization(.never).autocorrectionDisabled()
+                            .submitLabel(.done)
                             .onSubmit(submit)
                         Button(action: submit) {
                             Text(busy ? "Joining…" : "Join")

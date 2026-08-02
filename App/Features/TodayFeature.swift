@@ -1,5 +1,6 @@
 // Today — 1:1 with the Android TodayScreen: Orbit + bell + avatar header, a
-// date eyebrow + "<greeting>, Unstuck." serif line, a "This week · focused"
+// date eyebrow + "<greeting>, <first name>." serif line ("Unstuck." when no
+// name is set — web greeting-header parity), a "This week · focused"
 // pill, the gradient Start-Next hero (full-width Focus), the Today/Backlog +
 // area filter pills, and the filtered today list. Live store via GRDB.
 
@@ -20,6 +21,20 @@ private enum TodayFmt {
     nonisolated(unsafe) static let eyebrow: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEEE · h:mm a"; return f
     }()
+}
+
+/// Pure first-name derivation for the Today greeting — mirrors the web
+/// `firstName()` in components/dashboard/greeting-header.tsx: first token of
+/// the display name split on whitespace / "." / "_" / "-" (so an email
+/// local-part fallback like "maya.chen" still greets as "maya"). nil, empty,
+/// or separator-only input → nil, so the caller falls back to the brand
+/// "Unstuck." line. Internal (not private) for UnstuckAppTests.
+enum GreetingName {
+    static func firstName(_ full: String?) -> String? {
+        guard let full else { return nil }
+        let first = full.split(whereSeparator: { $0.isWhitespace || $0 == "." || $0 == "_" || $0 == "-" }).first
+        return first.map(String.init)
+    }
 }
 
 @MainActor
@@ -321,10 +336,14 @@ struct TodayView: View {
     }
 
     // Greeting block — scrolls with the content (only topBar is pinned).
+    // Greets by first name (web greeting-header.tsx parity: "Good evening,
+    // Maya."); no name → the brand "Unstuck." line, exactly as before. Reads
+    // the CACHED identity (currentUserName → cachedUserName — the same source
+    // Settings · Account shows), never the keychain-backed session in body (T4).
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(dateEyebrow).foregroundStyle(theme.palette.primaryDeep)
-            Text("\(greeting)\nUnstuck.")
+            Text("\(greeting)\n\(GreetingName.firstName(model.currentUserName) ?? "Unstuck").")
                 .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
             weekPill
         }

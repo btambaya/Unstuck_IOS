@@ -430,6 +430,8 @@ struct NewTaskSheet: View {
                 TextField("name@example.com", text: $inviteEmail)
                     .textFieldStyle(.roundedBorder)
                     .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .onSubmit { generateInvite() }
                 Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 if let inviteErr {
@@ -550,6 +552,15 @@ struct NewTaskSheet: View {
                 .padding(10)
                 .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .padding(8)
+                .submitLabel(.done)
+                // Return = the "Create" row when the query is a new tag; else
+                // it just drops the keyboard.
+                .onSubmit {
+                    guard showCreate else { return }
+                    let name = ensureTag(q)
+                    if !tags.contains(name) { tags.append(name) }
+                    tagQuery = ""
+                }
             ForEach(matches) { tag in
                 let on = tags.contains(tag.name)
                 Button {

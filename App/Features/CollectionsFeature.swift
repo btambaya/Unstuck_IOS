@@ -661,6 +661,7 @@ struct CollectionShareView: View {
                     TextField("partner@email.com", text: $email)
                         .textFieldStyle(.roundedBorder).textInputAutocapitalization(.never)
                         .keyboardType(.emailAddress).autocorrectionDisabled()
+                        .submitLabel(.done)
                         .onSubmit(submit)
 
                     HStack(spacing: 8) {

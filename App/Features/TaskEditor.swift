@@ -431,6 +431,13 @@ struct TaskEditor: View {
             TextField("Search or create…", text: $tagQuery)
                 .font(UFont.sans(13)).textFieldStyle(.plain).padding(10)
                 .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 8, style: .continuous)).padding(8)
+                .submitLabel(.done)
+                // Return = the "Create" row when the query is a new tag; else
+                // it just drops the keyboard.
+                .onSubmit {
+                    guard showCreate else { return }
+                    setTags(selected + [ensureTag(q)]); tagQuery = ""
+                }
             ForEach(matches) { tag in
                 let on = selected.contains(tag.name)
                 Button { setTags(on ? selected.filter { $0 != tag.name } : selected + [tag.name]) } label: {
@@ -511,6 +518,9 @@ struct TaskEditor: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 TextField("Capture a thought…", text: $captureBody).font(UFont.sans(14)).textFieldStyle(.plain)
+                    // Return = Add (addCapture no-ops on empty → just drops focus).
+                    .submitLabel(.done)
+                    .onSubmit(addCapture)
                 if !captureBody.trimmingCharacters(in: .whitespaces).isEmpty {
                     Button { addCapture() } label: {
                         Text("Add").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)

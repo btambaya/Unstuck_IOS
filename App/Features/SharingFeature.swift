@@ -315,6 +315,8 @@ struct ShareSheet: View {
                 TextField("name@example.com", text: $inviteEmail)
                     .textFieldStyle(.roundedBorder)
                     .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .submitLabel(.done)
+                    .onSubmit { generateInvite() }
                 Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 if let inviteErr {

@@ -583,17 +583,22 @@ private struct DisplayNameSheet: View {
                 .padding(12).background(theme.palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).stroke(theme.palette.line))
-            UButton("Save") {
-                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return }
-                onSave(trimmed); dismiss()
-            }
+                // Return = Save when non-empty; else just drops the keyboard.
+                .submitLabel(.done)
+                .onSubmit(save)
+            UButton("Save") { save() }
             Spacer()
         }
         .padding(20)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(theme.palette.bg.ignoresSafeArea())
         .presentationDetents([.height(220)])
+    }
+
+    private func save() {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        onSave(trimmed); dismiss()
     }
 }
 
@@ -607,6 +612,9 @@ private struct PasswordSheet: View {
     @State private var current = ""
     @State private var pw = ""
     @State private var confirm = ""
+    @SwiftUI.FocusState private var focus: Field?
+
+    private enum Field: Hashable { case current, pw, confirm }
 
     private var error: String? {
         if !pw.isEmpty && pw.count < 8 { return "At least 8 characters." }
@@ -618,9 +626,14 @@ private struct PasswordSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             SectionLabel(hasPassword ? "Change password" : "Add a password")
-            if hasPassword { secureField("Current password", text: $current) }
-            secureField("New password", text: $pw)
-            secureField("Confirm password", text: $confirm)
+            if hasPassword {
+                secureField("Current password", text: $current, field: .current, submit: .next) { focus = .pw }
+            }
+            secureField("New password", text: $pw, field: .pw, submit: .next) { focus = .confirm }
+            // Last field: Done saves when valid, else just drops focus.
+            secureField("Confirm password", text: $confirm, field: .confirm, submit: .done) {
+                if canSave { onSave(hasPassword ? current : nil, pw); dismiss() }
+            }
             if let error {
                 Text(error).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
             }
@@ -637,12 +650,16 @@ private struct PasswordSheet: View {
         .presentationDetents([.medium])
     }
 
-    private func secureField(_ placeholder: String, text: Binding<String>) -> some View {
+    private func secureField(_ placeholder: String, text: Binding<String>, field: Field,
+                             submit: SubmitLabel, onSubmit: @escaping () -> Void) -> some View {
         SecureField(placeholder, text: text)
             .font(UFont.sans(16)).textFieldStyle(.plain)
             .padding(12).background(theme.palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).stroke(theme.palette.line))
+            .focused($focus, equals: field)
+            .submitLabel(submit)
+            .onSubmit(onSubmit)
     }
 }
 
@@ -671,6 +688,10 @@ private struct DeleteAccountSheet: View {
                 .padding(12).background(theme.palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).stroke(theme.palette.line))
+                // Return = the type-to-confirm gate: only an exact match fires
+                // the destructive action; anything else just drops the keyboard.
+                .submitLabel(.done)
+                .onSubmit { if matches { onConfirm(); dismiss() } }
             Button {
                 onConfirm(); dismiss()
             } label: {

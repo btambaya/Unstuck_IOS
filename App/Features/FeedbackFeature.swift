@@ -20,7 +20,11 @@ struct FeedbackBubble: View {
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(.white)
                 .frame(width: 46, height: 46)
-                .background(theme.palette.coralDeep)
+                // Brand coral — the Focus/Start-now action color. Matches the
+                // Android bubble tint (c.coral) and the web launcher's
+                // var(--u-coral), so the AI affordance reads the same on all
+                // three platforms.
+                .background(theme.palette.coral)
                 .clipShape(Circle())
                 .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
         }

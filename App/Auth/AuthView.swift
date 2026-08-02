@@ -321,6 +321,9 @@ struct SetNewPasswordView: View {
     @State private var confirm = ""
     @State private var status: String?
     @State private var busy = false
+    @SwiftUI.FocusState private var focus: Field?
+
+    enum Field: Hashable { case password, confirm }
 
     private var error: String? {
         if !password.isEmpty && password.count < 8 { return "At least 8 characters." }
@@ -341,8 +344,11 @@ struct SetNewPasswordView: View {
                     .multilineTextAlignment(.center).padding(.top, 8)
 
                 VStack(spacing: 14) {
-                    field("New password", text: $password)
-                    field("Confirm password", text: $confirm)
+                    field("New password", text: $password, field: .password, submit: .next) { focus = .confirm }
+                    // Last field: Done saves when valid, else just drops focus.
+                    field("Confirm password", text: $confirm, field: .confirm, submit: .done) {
+                        if canSave { Task { await save() } }
+                    }
                 }
                 .padding(.top, 22)
 
@@ -365,12 +371,16 @@ struct SetNewPasswordView: View {
         .disabled(busy)
     }
 
-    private func field(_ label: String, text: Binding<String>) -> some View {
+    private func field(_ label: String, text: Binding<String>, field: Field,
+                       submit: SubmitLabel, onSubmit: @escaping () -> Void) -> some View {
         SecureField(label, text: text)
             .textFieldStyle(.plain).font(UFont.sans(14))
             .padding(.horizontal, 14).padding(.vertical, 14).frame(maxWidth: .infinity)
             .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(theme.palette.line2))
             .textInputAutocapitalization(.never).autocorrectionDisabled()
+            .focused($focus, equals: field)
+            .submitLabel(submit)
+            .onSubmit(onSubmit)
     }
 
     private func save() async {

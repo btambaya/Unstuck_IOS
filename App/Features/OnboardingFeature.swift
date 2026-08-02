@@ -22,6 +22,9 @@ struct OnboardingView: View {
     @State private var firstTask = ""
     @State private var firstAction = ""
     @State private var treatment: FocusTreatment = .ambient
+    @SwiftUI.FocusState private var focus: Field?
+
+    enum Field: Hashable { case firstTask, firstAction }
 
     // Match the web/Android vocabulary so the synced adhd_struggles + seeded
     // areas stay consistent across platforms (the morning brief keys on them).
@@ -124,9 +127,14 @@ struct OnboardingView: View {
             wrap(struggleOptions, selected: struggles) { toggle($0, in: &struggles) }
         case 3:
             stepHeader("What's one thing on your mind right now?", "Just one. Small is good. We'll start there.")
-            field("Reply to landlord about parking", text: $firstTask)
+            field("Reply to landlord about parking", text: $firstTask, field: .firstTask, submit: .next) {
+                focus = .firstAction
+            }
             SectionLabel("FIRST STEP").foregroundStyle(theme.palette.primaryDeep).padding(.top, 10)
-            field("The smallest first move (optional)", text: $firstAction)
+            // Last field: Done = the step's Continue (both fields are optional).
+            field("The smallest first move (optional)", text: $firstAction, field: .firstAction, submit: .done) {
+                withAnimation(.easeInOut(duration: 0.2)) { step += 1 }
+            }
         default:
             stepHeader("Pick how focus feels.", "You can switch any time. Most people start with Ambient.")
             VStack(spacing: 10) {
@@ -169,13 +177,17 @@ struct OnboardingView: View {
         .padding(.top, 14)
     }
 
-    private func field(_ placeholder: String, text: Binding<String>) -> some View {
+    private func field(_ placeholder: String, text: Binding<String>, field: Field,
+                       submit: SubmitLabel, onSubmit: @escaping () -> Void) -> some View {
         TextField(placeholder, text: text)
             .textFieldStyle(.plain).font(UFont.sans(16))
             .padding(12).background(theme.palette.surface)
             .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).stroke(theme.palette.line))
             .padding(.top, 12)
+            .focused($focus, equals: field)
+            .submitLabel(submit)
+            .onSubmit(onSubmit)
     }
 
     private func treatmentRow(_ t: FocusTreatment, _ name: String, _ blurb: String) -> some View {
