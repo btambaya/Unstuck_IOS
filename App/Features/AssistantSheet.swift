@@ -322,6 +322,11 @@ struct AssistantSheet: View {
         input = ""
         note = nil
         showChips = false
+        // Drop the keyboard on send. It used to stay up for the whole
+        // exchange, so the reply you just asked for landed behind it (found
+        // while capturing marketing shots: focus survived until the sheet was
+        // re-presented). Tap the field again to keep typing.
+        fieldFocused = false
         assistant.send(t)
     }
 
