@@ -56,6 +56,38 @@ public struct PreferencesClient: Sendable {
                         paused_checkin_enabled: pausedCheckin), onConflict: "user_id")
             .execute()
     }
+
+    /// Mirror the usable-minutes budget (Settings / the assistant's
+    /// `set_usable_minutes`) to user_preferences — upsert on user_id, like the
+    /// web `setUsableMinutes`. A nil value is NOT sent (synthesised Encodable
+    /// omits nil optionals), so that column keeps what it had — PostgREST
+    /// updates only the columns present. Columns: usable_minutes_per_day /
+    /// usable_minutes_weekend (migration 007; check 1…1440 — callers validate).
+    public func setUsableMinutes(userId: String, perDay: Int?, weekend: Int?) async throws {
+        struct Row: Encodable {
+            let user_id: String
+            let usable_minutes_per_day: Int?
+            let usable_minutes_weekend: Int?
+        }
+        _ = try await client.from("user_preferences")
+            .upsert(Row(user_id: userId, usable_minutes_per_day: perDay, usable_minutes_weekend: weekend),
+                    onConflict: "user_id")
+            .execute()
+    }
+
+    /// Same, for the signed-in user (resolved from the current session —
+    /// lowercase uuid, matching AuthService.currentUserId). Throws
+    /// `PreferencesClientError.notSignedIn` when there's no session.
+    public func setUsableMinutes(perDay: Int?, weekend: Int?) async throws {
+        guard let uid = client.auth.currentSession?.user.id.uuidString.lowercased() else {
+            throw PreferencesClientError.notSignedIn
+        }
+        try await setUsableMinutes(userId: uid, perDay: perDay, weekend: weekend)
+    }
+}
+
+public enum PreferencesClientError: Error, Sendable, Equatable {
+    case notSignedIn
 }
 
 /// Records a sign-in for usage analytics via the `track-login` Edge Function

@@ -39,4 +39,52 @@ public enum SyncDecision {
         for b in remote { byId[b.id] = b }
         return Array(byId.values)
     }
+
+    /// Outcome of a `profile_facts` hydrate merge.
+    public struct ProfileFactsMerge: Equatable, Sendable {
+        /// What the local table becomes (server-canonical + surviving local rows).
+        public var merged: [ProfileFact]
+        /// Local rows the server has never seen — push them up (web hydrate:
+        /// "local-only rows get pushed up").
+        public var pushLocalOnly: [ProfileFact]
+        /// Local rows a strictly-newer server row replaced — their queued
+        /// upsert ops are stale and must be dropped before the next flush.
+        public var staleLocalIds: [String]
+    }
+
+    /// Hydrate merge for `profile_facts` (mirrors web hydrateProfileFacts, with
+    /// last-write-wins instead of remote-always-wins):
+    ///  • shared id → the row with the strictly newer `updatedAt` INSTANT wins
+    ///    (ties, and anything that won't parse, go to the server — it is the
+    ///    cross-device truth); server tombstones are kept as local tombstones;
+    ///  • local-only rows (server never saw them — created before the table
+    ///    existed, or an offline save whose push hasn't landed) survive AND are
+    ///    reported for pushing, tombstones included (a tombstone the server
+    ///    lacks is harmless and keeps every device consistent).
+    /// Output order is deterministic: remote order, then local-only in local order.
+    public static func mergeHydratedProfileFacts(remote: [ProfileFact], local: [ProfileFact]) -> ProfileFactsMerge {
+        var localById: [String: ProfileFact] = [:]
+        for f in local { localById[f.id] = f }
+        var merged: [ProfileFact] = []
+        var stale: [String] = []
+        var seen = Set<String>()
+        for r in remote {
+            guard seen.insert(r.id).inserted else { continue }   // duplicate server row → first wins
+            if let l = localById[r.id] {
+                let localMs = Time.parseMillis(l.updatedAt)
+                let remoteMs = Time.parseMillis(r.updatedAt)
+                if let localMs, let remoteMs, localMs > remoteMs {
+                    merged.append(l)
+                } else {
+                    merged.append(r)
+                    if l != r { stale.append(l.id) }
+                }
+            } else {
+                merged.append(r)
+            }
+        }
+        let localOnly = local.filter { !seen.contains($0.id) }
+        merged.append(contentsOf: localOnly)
+        return ProfileFactsMerge(merged: merged, pushLocalOnly: localOnly, staleLocalIds: stale)
+    }
 }

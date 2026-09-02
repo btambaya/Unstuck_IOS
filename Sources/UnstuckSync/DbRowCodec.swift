@@ -435,3 +435,60 @@ struct CalendarConnectionRow: Codable, Sendable {
                            lastSyncCursor: lastSyncCursor, connectedAt: connectedAt)
     }
 }
+
+/// `profile_facts` (migration 050) — the assistant's memory. Wire shape is
+/// the web's pushRemote payload: `id, category, fact, source, when_iso,
+/// active, created_at, updated_at` (+ `user_id`, attached by the gateway).
+/// `when_iso` encodes an explicit null so clearing a date clears it. Decoding
+/// tolerates a missing `active` / `source` (server defaults true / 'chat').
+struct ProfileFactRow: Codable, Sendable {
+    var id: String
+    var category: ProfileFactCategory
+    var fact: String
+    var source: ProfileFactSource
+    var whenIso: String?
+    var active: Bool
+    var createdAt: String
+    var updatedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, category, fact, source, active
+        case whenIso = "when_iso"
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
+
+    init(_ f: ProfileFact) {
+        id = f.id; category = f.category; fact = f.fact; source = f.source
+        whenIso = f.whenIso; active = f.active; createdAt = f.createdAt; updatedAt = f.updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        category = try c.decode(ProfileFactCategory.self, forKey: .category)
+        fact = try c.decode(String.self, forKey: .fact)
+        source = try c.decodeIfPresent(ProfileFactSource.self, forKey: .source) ?? .chat
+        whenIso = try c.decodeIfPresent(String.self, forKey: .whenIso)
+        active = try c.decodeIfPresent(Bool.self, forKey: .active) ?? true
+        createdAt = try c.decode(String.self, forKey: .createdAt)
+        updatedAt = try c.decode(String.self, forKey: .updatedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(category, forKey: .category)
+        try c.encode(fact, forKey: .fact)
+        try c.encode(source, forKey: .source)
+        try c.encode(whenIso, forKey: .whenIso)
+        try c.encode(active, forKey: .active)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+    }
+
+    func model() -> ProfileFact {
+        ProfileFact(id: id, category: category, fact: fact, source: source, whenIso: whenIso,
+                    active: active, createdAt: createdAt, updatedAt: updatedAt)
+    }
+}

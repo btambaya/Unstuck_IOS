@@ -3,7 +3,91 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-08-02, latest) — assistant redesign (port of the web cockpit)
+## Where things stand (2026-09-02, latest) — AI gateway + calls (port of the web gateway)
+
+Plan: `../unstuck/docs/ios-gateway-plan.md`. Source of truth: the web's
+`lib/assistant/*`, `components/dashboard/gateway-card.tsx`,
+`components/settings/facts-panel.tsx` and the generated
+`docs/assistant-tool-contract.md` (tool names + `ok:`/`error:` strings are
+the contract the server prompt reads — iOS matches them byte-for-byte).
+
+- **Memory (A0).** `profile_facts` in GRDB (`UnstuckData` Records /
+  Repositories / AppDatabase) with outbox push, hydrate, realtime mirror and
+  soft-delete tombstones (`UnstuckSync/ProfileFactsService.swift`, DbRowCodec,
+  Hydrator, RealtimeMirror, WriteThrough); the pure `ProfileFactsLogic` in
+  `UnstuckCore/Logic/ProfileFacts.swift` (save with person-only refine,
+  `preferredName` / `noNamePreference` / `detectStylePreference`,
+  `isInstructionLike`). Ritual prefs + dismissed moment ids live in
+  `App/Features/PAPrefs.swift` (`PAPrefsStore` static get/set over the web's
+  UserDefaults keys + the `@Observable PAPrefs`; ONE instance =
+  `AppModel.paPrefs`, read by the gateway card, the interview picker, Settings
+  and the `set_ritual` tool). `AppModel.profileFacts` is the service.
+- **Engine — 56 tools, honest harness (A1).** `AssistantContext.swift` builds
+  the contract-shape context (sending `profile` flips the server into profile
+  mode) and `VOICE_TOOLS` (56 = 52 + the four call tools). `AssistantTools*.swift`
+  run the 52 app tools with the contract strings; `App/Calls/CallTools.swift`
+  runs `request_call` / `cancel_call` / `update_call` / `get_calls` (+ the
+  call-level `snooze_call`) as the LAST hop of `runAssistantTool`, so text and
+  voice share one dispatcher. `AssistantHarness.swift` is the honest harness:
+  no synthesised "Done.", the fabrication guard + one hidden bounce,
+  `stripSelfCorrection`, `READ_ONLY_TOOLS`, the `finish_reason=length` hint,
+  a visible send queue. Pure ports with the web tests translated in
+  `UnstuckCore/Logic`: AssistantGuard, AssistantTime, AssistantInsights,
+  InsightsRead, Brief, Moments, Patterns, AssistantReceipts (receipts + undo
+  for every tool — undoing a booked call cancels it through
+  `CallCoordinator.shared.callsClient`, async, receipt flips once the server
+  accepts).
+- **Surfaces (A2).** `GatewayCard.swift` on Today (zero-token brief, ONE
+  moment with its actions — `GatewayActions` / `GatewayMomentState` are pure
+  and tested — the interview pill, chips, a composer whose send hands off to
+  the Assistant sheet; mic inside the bar → VoiceModeScreen).
+  `Interview.swift` (`InterviewMachine`: resumable, skippable, auto-done at
+  ≥3 facts but never while open; `InterviewFlowView`). `FactsPanel.swift` =
+  Settings → "What Unstuck knows" (list with dates, edit = forget + re-save,
+  forget one / everything, add, ritual toggles). `AssistantSheet` sends while
+  a turn is in flight (queued, faded pending bubble). Voice parity in
+  `VoiceRealtimeClient` / `VoiceModeScreen` (opening primer, vocabulary,
+  integrity corrective, English pin, name-once).
+- **CallKit path (C1) — `App/Calls/*`.** `VoipPushRegistry` (PushKit; reports
+  to CallKit SYNCHRONOUSLY even from a killed launch), `CallKitBridge`
+  (CXProvider / CXCallController behind the `CallProviding` /
+  `CallControlling` seams; the delegate conformances are `@preconcurrency`
+  because both queues are main), `CallCoordinator` (the state machine — ring
+  timeout, focus-busy, stale anchor, hours window, snooze, launcher grace —
+  fully unit-tested against the fakes in `CallSeams.swift`),
+  `AppCallEnvironment` (environment + notifier + buffered outcome reporter;
+  `attach(model:client:)` from `AppModel.start`), `CallScript` (deterministic
+  call opening), `IncomingCallPayload`, `CallSettings` + `CallSettingsView`
+  (Settings → "Calls from Unstuck": allowed hours, default lead, Test call
+  now), `CallMeSection` in the task editor ("Call me about this").
+  `UnstuckSync/CallsClient.swift` = `call_requests` + `call-outcome`
+  (live statuses = scheduled / snoozed / calling, like the web).
+  Info.plist / entitlements carry the `voip` background mode.
+- **Seams.** (1) `AppModel.installCallVoiceLauncher()` runs right after
+  `CallCoordinator.shared.attach(model:client:)` in `start()`; until
+  `App/Calls/RealtimeCallVoiceLauncher.swift` lands it is the no-op in
+  `App/Calls/CallVoiceLauncherStub.swift` — delete the stub with it.
+  (2) `CallCoordinator.shared.onFallbackAnswer` (fallback B: a tapped "call"
+  alert push opens Talk with the `CallSession`) is still unset — wire it from
+  the launcher. (3) The call tools reach voice through `runAssistantTool`;
+  `VOICE_TOOLS` carries their schemas. (4) The VoIP dispatcher + `call-outcome`
+  edge functions (C0) live in the web repo.
+- **Device-only validation** (nothing here runs on the simulator): a VoIP
+  push ringing CallKit on a physical iPhone (sandbox APNs under Debug),
+  `provider(_:didActivate:)` → voice engine start (the silent-call rule),
+  audio staying up in the background during a call, snooze re-dispatch, the
+  hours window applied on receipt, "Test call now" end-to-end, the voice
+  opening on a real realtime session, the gateway interview on a fresh
+  account, and cross-device facts (hydrate + realtime) against the web.
+- **Tests / build.** `xcodegen generate` first (the project is generated and
+  files were added). Packages: `TZ=UTC swift test --scratch-path .build-int`
+  (779 tests, green). App: `xcodebuild -project Unstuck.xcodeproj -scheme
+  Unstuck -destination 'platform=iOS Simulator,name=iPhone 17'
+  -derivedDataPath /tmp/dd-int test -only-testing:UnstuckAppTests`
+  (302 tests, green). Build: the same command with `build`.
+  Scratch build dirs (`.build-*/`) are git-ignored.
+
+## Where things stand (2026-08-02) — assistant redesign (port of the web cockpit)
 
 Source of truth: `../unstuck/components/assistant/*` + `../unstuck/lib/assistant/*`.
 The bubble's dual Assistant|Feedback sheet is GONE — the ✦ launcher opens the

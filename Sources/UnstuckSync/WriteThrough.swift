@@ -94,6 +94,26 @@ public actor WriteThrough {
         try enqueue(table: "life_areas", rowId: a.id, kind: .upsert, payload: try jsonString(LifeAreaDbRow(a)), nowISO: nowISO)
     }
 
+    /// Optimistic local save of a profile fact + push (see pushProfileFact).
+    public func upsertProfileFact(_ f: ProfileFact, nowISO: String) throws {
+        try db.save(f)
+        try pushProfileFact(id: f.id, nowISO: nowISO)
+    }
+
+    /// Enqueue the CURRENT local `profile_facts` row for upsert (the row is
+    /// already written by ProfileFactsService / the repository). Reads the row
+    /// back from GRDB and cancels any older queued upsert for it first, so two
+    /// rapid saves of the same fact (a refine right after a save) converge on
+    /// the latest local state server-side regardless of Task ordering. A soft
+    /// delete is the same op with `active=false` — an upsert on `id` that
+    /// tombstones the server row (the web does an UPDATE; the result is
+    /// identical, and this also tombstones a row the server never received).
+    public func pushProfileFact(id: String, nowISO: String) throws {
+        guard let f = try db.fetchById(ProfileFact.self, id: id) else { return }
+        try ProfileFactPush.enqueue(f, box: box, nowISO: nowISO)
+        onEnqueue?()
+    }
+
     /// Local delete + enqueue a server delete. The caller is responsible
     /// for the local-row removal of the right type; this records intent.
     public func enqueueDelete(table: String, id: String, nowISO: String) throws {

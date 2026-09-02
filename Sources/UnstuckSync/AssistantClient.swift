@@ -74,15 +74,22 @@ public struct ToolFunction: Codable, Equatable, Sendable {
 public struct AssistantReply: Codable, Equatable, Sendable {
     public var content: String?
     public var toolCalls: [ToolCall]?
+    /// The upstream's finish reason ("stop" | "length" | "tool_calls" | …),
+    /// lifted from the edge fn's TOP-LEVEL `finish_reason` — it is NOT part of
+    /// the nested `assistant` object's wire shape (outside CodingKeys), so a
+    /// persisted/decoded reply carries nil. "length" ⇒ the harness sends the
+    /// cut-off hint instead of inferring truncation from bad tool JSON.
+    public var finishReason: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case content
         case toolCalls = "tool_calls"
     }
 
-    public init(content: String? = nil, toolCalls: [ToolCall]? = nil) {
+    public init(content: String? = nil, toolCalls: [ToolCall]? = nil, finishReason: String? = nil) {
         self.content = content
         self.toolCalls = toolCalls
+        self.finishReason = finishReason
     }
 }
 
@@ -103,9 +110,16 @@ public struct AssistantClient: Sendable {
         let context: [String: AnyJSON]
     }
 
+    /// The edge fn body: `{ assistant, finish_reason, usage }` or `{ error }`.
     private struct Response: Decodable {
         var assistant: AssistantReply?
         var error: String?
+        var finishReason: String?
+
+        enum CodingKeys: String, CodingKey {
+            case assistant, error
+            case finishReason = "finish_reason"
+        }
     }
 
     /// One round-trip to the edge function. One retry on a thrown error
@@ -120,7 +134,10 @@ public struct AssistantClient: Sendable {
                     "assistant",
                     options: FunctionInvokeOptions(method: .post, body: Request(messages: messages, context: context)))
                 if let error = resp.error { return .err(error) }
-                if let assistant = resp.assistant { return .ok(assistant) }
+                if var assistant = resp.assistant {
+                    assistant.finishReason = resp.finishReason
+                    return .ok(assistant)
+                }
                 return .err("empty")
             } catch {
                 lastWasTimeout = (error as? URLError)?.code == .timedOut

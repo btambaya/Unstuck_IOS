@@ -55,8 +55,22 @@ final class VoiceSessionModel {
     private func connect(token: String, assistant: AssistantModel) {
         let proxyURL = model.voiceProxyURL
         let modelId = model.voiceModel
-        let instructions = assistant.voiceInstructions()
-        let tools = assistant.voiceTools()
+        var instructions = assistant.voiceInstructions()
+        var opening = assistant.voiceOpening()
+        var tools = assistant.voiceTools()
+        var runTool: @Sendable (String, String) async -> String = { name, argsJSON in
+            await assistant.runVoiceTool(name: name, argsJSON: argsJSON)
+        }
+        // "Unstuck calls you", fallback B (no CallKit): a tapped call alert parks
+        // the CallSession on the launcher — take it and run the CALL configuration
+        // (notes read back first, call tools only) instead of a plain Talk.
+        if let call = RealtimeCallVoiceLauncher.shared.takePendingSession(),
+           let cfg = RealtimeCallVoiceLauncher.shared.talkConfiguration(for: call) {
+            instructions = cfg.instructions
+            opening = cfg.primer
+            tools = cfg.tools
+            runTool = cfg.runTool
+        }
         // Mic acquisition failed (session activate / engine.start() — typically
         // the mic held by another app). Stop the client + surface a note instead
         // of leaving the UI stuck on "Listening…". 1:1 with Android.
@@ -70,8 +84,8 @@ final class VoiceSessionModel {
         }
         let rc = VoiceRealtimeClient(
             proxyURL: proxyURL, token: token, model: modelId,
-            instructions: instructions, tools: tools, audio: audio,
-            runTool: { name, argsJSON in await assistant.runVoiceTool(name: name, argsJSON: argsJSON) },
+            instructions: instructions, opening: opening, tools: tools, audio: audio,
+            runTool: runTool,
             onState: { [weak self] s in Task { @MainActor in self?.state = s } },
             onCaption: { [weak self] role, text, done in
                 Task { @MainActor in
@@ -108,6 +122,9 @@ final class VoiceSessionModel {
         routeChange = nil
         if let client { client.stop() } else { audio.shutdown() }
         client = nil
+        // The session's receipts (and their Undo) land in the shared thread as
+        // a local turn so they don't vanish with the overlay.
+        model.assistant.endVoiceSession()
     }
 
     /// End the session if another app (e.g. an incoming call) interrupts audio —

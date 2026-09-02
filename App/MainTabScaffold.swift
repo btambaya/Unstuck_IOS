@@ -8,6 +8,7 @@ import UnstuckCore
 import UnstuckDesign
 
 struct MainTabScaffold: View {
+    @State private var showCallTalk = false
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
 
@@ -43,6 +44,12 @@ struct MainTabScaffold: View {
             // sheet was open presents cleanly once it's gone (bug-8 guard).
             .sheet(item: $router.detailTask, onDismiss: { model.flushPendingDeepLink() }) { task in
                 TaskEditor(task: task)
+            }
+            .fullScreenCover(isPresented: $showCallTalk) { VoiceModeScreen() }
+            // "Unstuck calls you", fallback B: a tapped call alert parks a CallSession on
+            // the launcher; present Talk, which takes it and runs the call configuration.
+            .onChange(of: RealtimeCallVoiceLauncher.shared.pendingSession != nil) { _, hasCall in
+                if hasCall { showCallTalk = true }
             }
             .fullScreenCover(item: $router.focusTask, onDismiss: { router.sharedFocus = nil; model.flushPendingDeepLink() }) { task in
                 // `sharedFocus` (set alongside focusTask by beginSharedFocus) makes

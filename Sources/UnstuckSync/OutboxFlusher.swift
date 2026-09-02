@@ -208,6 +208,9 @@ public actor OutboxFlusher {
         case "collections":  try await gateway.upsert(decoder.decode(CollectionRow.self, from: data), table: op.tableName, userId: userId)
         case "tags":         try await gateway.upsert(decoder.decode(TagDbRow.self, from: data), table: op.tableName, userId: userId)
         case "life_areas":   try await gateway.upsert(decoder.decode(LifeAreaDbRow.self, from: data), table: op.tableName, userId: userId)
+        // Soft deletes travel as upserts with active=false (see WriteThrough.
+        // pushProfileFact); profile_facts never enqueues a `delete` op.
+        case "profile_facts": try await gateway.upsert(decoder.decode(ProfileFactRow.self, from: data), table: op.tableName, userId: userId)
         // An unknown table can never be routed. Quarantine rather than the old
         // `default: break` (which fell through to markDone, dropping the row).
         default: throw MalformedOpError(reason: .unknownTable(op.tableName))

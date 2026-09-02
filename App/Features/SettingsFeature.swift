@@ -93,8 +93,17 @@ struct SettingsView: View {
             navRow("Interface") { InterfaceSettingsView() }
 
             divider
+            // The assistant's memory — every fact it has learned, editable and
+            // deletable, plus which recurring moments it runs (web FactsPanel).
+            navRow("What Unstuck knows") { FactsPanelView() }
+
+            divider
             // Notification level (Calm/Balanced/Coach) + reminder lead.
             navRow("Notifications") { NotificationSettingsView() }
+
+            divider
+            // "Unstuck calls you": allowed hours, default lead, test call.
+            navRow("Calls from Unstuck") { CallSettingsView() }
 
             divider
             // Trusted circle — the people you share tasks + lists with.

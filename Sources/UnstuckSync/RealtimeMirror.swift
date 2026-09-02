@@ -112,6 +112,16 @@ public actor RealtimeMirror {
         await subscribe("reason_logs", ReasonLogRow.self, userId: userId,
                         onUpsert: { [db] in try? db.save($0.model()) },
                         onDelete: { [db] in try? db.deleteById(ReasonLog.self, id: $0) })
+        // profile_facts: a "forget" on another device arrives as an UPDATE to
+        // active=false — saved as a local tombstone, which every read filters
+        // out. Same updated_at last-write-wins guard as tasks so a stale echo
+        // can't clobber a newer local save.
+        await subscribe("profile_facts", ProfileFactRow.self, userId: userId,
+                        onUpsert: { [db] in try? db.save($0.model()) },
+                        onDelete: { [db] in try? db.deleteById(ProfileFact.self, id: $0) },
+                        shouldApplyUpdate: { [db] incoming in
+                            Self.incomingProfileFactWins(incoming, db: db)
+                        })
         // Collections: shared rows are owned by someone else, so subscribe
         // WITHOUT the user_id filter and rely on RLS for delivery (members get
         // the owner's edits). Preserve the client-only members/myRole across the
@@ -146,6 +156,15 @@ public actor RealtimeMirror {
     /// usable timestamp, or the incoming is at-or-after the local one.
     static func incomingTaskWins(_ incoming: TaskRow, db: AppDatabase) -> Bool {
         guard let local = try? db.fetchById(TaskItem.self, id: incoming.id),
+              let localMs = Time.parseMillis(local.updatedAt),
+              let incomingMs = Time.parseMillis(incoming.updatedAt) else { return true }
+        return incomingMs >= localMs
+    }
+
+    /// The same last-write-wins guard for an incoming `profile_facts` UPDATE
+    /// (a tombstone from another device included).
+    static func incomingProfileFactWins(_ incoming: ProfileFactRow, db: AppDatabase) -> Bool {
+        guard let local = try? db.fetchById(ProfileFact.self, id: incoming.id),
               let localMs = Time.parseMillis(local.updatedAt),
               let incomingMs = Time.parseMillis(incoming.updatedAt) else { return true }
         return incomingMs >= localMs

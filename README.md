@@ -23,13 +23,13 @@ repo ([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)).
 > hardening (poison-pill outbox, per-row FIFO, sign-out drain +
 > push-token unregister, scenePhase/BG-refresh sync triggers, Google
 > pull reconcile, privacy manifest) landed 2026-06-09. The assistant
-> (agentic chat + realtime voice) shipped after that, and was rebuilt to
-> match the web cockpit redesign on 2026-08-02 — one endless thread, a
-> live context strip, data-driven suggestion chips, undoable action
-> receipts, and an AI kill-switch in Settings → Interface. Remaining
-> gaps: server push payload custom keys (backend) and the manual
-> deploy/capability steps — see [`handover.md`](handover.md) for the
-> honest list.
+> (agentic chat + realtime voice, rebuilt to the web cockpit on 2026-08-02)
+> became the AI gateway on 2026-09-02: cross-device memory (`profile_facts`),
+> the same 56 tools and honest harness as the web, a gateway card on Today
+> with a first-run interview, Settings → "What Unstuck knows", and "Unstuck
+> calls you" (CallKit + VoIP push, calls booked by voice, text, or the task
+> editor). Remaining gaps: the on-device call/voice validation and the manual
+> deploy/capability steps — see [`handover.md`](handover.md) for the honest list.
 
 ## Architecture
 

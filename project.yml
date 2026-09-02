@@ -84,6 +84,9 @@ targets:
         product: UnstuckShared
       - target: UnstuckWidgets
         embed: true
+      # "Unstuck calls you" (C1): PushKit VoIP pushes + CallKit incoming calls.
+      - sdk: PushKit.framework
+      - sdk: CallKit.framework
     scheme:
       testTargets:
         - UnstuckAppTests

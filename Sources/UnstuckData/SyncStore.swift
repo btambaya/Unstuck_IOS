@@ -72,6 +72,13 @@ public extension AppDatabase {
         try writer.read { try TagRow.order(Column("sortOrder")).fetchAll($0) }
     }
 
+    /// Every locally-cached profile fact INCLUDING tombstones. The hydrator's
+    /// last-write-wins merge needs the inactive rows too (a local tombstone
+    /// newer than the server's active row must win, and vice versa).
+    func fetchAllProfileFacts() throws -> [ProfileFact] {
+        try writer.read { try ProfileFact.fetchAll($0) }
+    }
+
     /// The user's first calendar connection (for choosing a Google push target).
     func firstCalendarConnection() throws -> CalendarConnection? {
         try writer.read { try CalendarConnection.fetchOne($0) }
@@ -107,7 +114,7 @@ public extension AppDatabase {
     func clearAll() throws {
         let tables = ["tasks", "sessions", "cal_blocks", "captures", "reason_logs",
                       "collections", "tags", "life_areas", "calendar_connections",
-                      "outbox", "live_session"]
+                      "profile_facts", "outbox", "live_session"]
         try writer.write { db in
             for t in tables { try db.execute(sql: "DELETE FROM \(t)") }
         }

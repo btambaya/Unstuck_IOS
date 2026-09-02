@@ -18,10 +18,21 @@ final class AppModel {
     /// Device-local user preferences (theme / focus / sound / accessibility),
     /// UserDefaults-backed. Single shared instance the whole app observes.
     let settings = SettingsState.loaded()
+    /// The gateway's device-local PA prefs (ritual toggles + dismissed moment
+    /// ids) — ONE observable instance so the Today card, the interview picker,
+    /// Settings → "What Unstuck knows" and the `set_ritual` tool all see the
+    /// same state. Wiped on sign-out (scrubDeviceLocalUserContent).
+    let paPrefs = PAPrefs()
     private(set) var coordinator: SyncCoordinator?
     private(set) var db: AppDatabase?
     private(set) var taskRepo: TaskRepository?
     private(set) var liveStore: LiveSessionStore?
+    /// The assistant's cross-device memory (`profile_facts`): save / forget /
+    /// list facts over the live store + outbox write-through. Stateless, so
+    /// it's built on access; nil until the store exists (before start()).
+    var profileFacts: ProfileFactsService? {
+        db.map { ProfileFactsService(db: $0, write: write) }
+    }
     var signedIn = false
     var configured = true
     /// Set when a password-RECOVERY link lands (the user tapped "Forgot
@@ -419,6 +430,9 @@ final class AppModel {
         // Register the APNs token (now or when it arrives).
         PushRegistrar.shared.onToken = { [weak self] hex in self?.registerPush(hex) }
         if let existing = PushRegistrar.shared.apnsTokenHex { registerPush(existing) }
+        // "Unstuck calls you" (C1): bind the CallKit coordinator to the live store + calls client.
+        CallCoordinator.shared.attach(model: self, client: coord.calls)
+        installCallVoiceLauncher()
 
         // Register Live Activity per-update push tokens as they're issued.
         LiveActivityController.shared.onPushToken = { [weak self] activityId, token in
@@ -823,6 +837,16 @@ final class AppModel {
         NotificationPrefs.clearUserContent()
         PausedCheckinScheduler.cancel()
         archivedCaptureIds = []
+        // The assistant's memory is personal by definition — wipe the local
+        // rows (the server keeps the account's facts; the sync clearAll on the
+        // signed-out event covers the same table for reactive sign-outs).
+        profileFacts?.wipeLocal()
+        // Gateway state is per-user too: ritual prefs + dismissed moments
+        // (PAPrefsStore.scrub() under the hood, then the in-memory reset) and
+        // the first-run interview flag + resume step, so the next account on
+        // this device is greeted, not silently skipped.
+        paPrefs.scrub()
+        InterviewMachine.resetDone()
         _assistant?.clear()
         AssistantModel.scrubPersisted()
         Task { await ReminderScheduler.shared.cancelAll() }

@@ -46,3 +46,11 @@ extension LifeArea: FetchableRecord, PersistableRecord {
 extension CalendarConnection: FetchableRecord, PersistableRecord {
     public static let databaseTableName = "calendar_connections"
 }
+
+/// The assistant's memory rows (server `profile_facts`, migration 050). Same
+/// direct-conformance shape as every other entity: the UnstuckCore model IS
+/// the record (columns = the Codable keys; `category` / `source` as their raw
+/// strings, `active` as the boolean tombstone flag).
+extension ProfileFact: FetchableRecord, PersistableRecord {
+    public static let databaseTableName = "profile_facts"
+}

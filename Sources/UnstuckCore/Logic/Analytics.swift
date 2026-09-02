@@ -206,7 +206,10 @@ public struct Insight: Equatable, Sendable {
 
 private let WEEKDAY_NAMES = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"]
 
-public func topInsights(sessions: [Session], tasks: [TaskItem], captures: [Capture], reasonLogs: [ReasonLog]) -> [Insight] {
+/// `now` defaults to the wall clock (the Insights screen); the assistant's
+/// `renderInsights` passes its own clock so the slip card is deterministic.
+public func topInsights(sessions: [Session], tasks: [TaskItem], captures: [Capture], reasonLogs: [ReasonLog],
+                        now: EpochMillis = Date().timeIntervalSince1970 * 1000) -> [Insight] {
     var out: [Insight] = []
 
     if sessions.count >= REAL_DATA_THRESHOLD {
@@ -234,7 +237,7 @@ public func topInsights(sessions: [Session], tasks: [TaskItem], captures: [Captu
     }
 
     // 3. Slipping task (works even at low session counts).
-    let slips = slipping(tasks)
+    let slips = slipping(tasks, now: now)
     if let top = slips.first {
         let reason = top.moveCount >= 3 ? "rescheduled \(top.moveCount) times" : "\(top.weeks)+ weeks on the list"
         out.append(Insight(title: "\"\(top.name)\" keeps slipping.", sub: "\(reason). Remove it, or break it down differently?"))

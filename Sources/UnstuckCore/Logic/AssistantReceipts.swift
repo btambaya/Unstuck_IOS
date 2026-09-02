@@ -11,15 +11,29 @@
 import Foundation
 
 /// What an Undo would do. Codable so it round-trips with the persisted thread.
+/// Cases mirror the web's `ReceiptUndo.kind` one for one.
 public enum ReceiptUndo: Codable, Equatable, Sendable {
     case deleteTask(id: String)
     case uncompleteTask(id: String)
+    case uncompleteTasks(ids: [String])
+    case deleteTasks(ids: [String])
+    case forgetFact(id: String)
+    case deleteCapture(id: String)
+    case completeTask(id: String)
+    /// Part B ("Unstuck calls you"): undo of `request_call`.
+    case cancelCall(id: String)
 
-    public var taskId: String {
+    /// The task ids this undo touches (empty for a fact / capture / call undo).
+    public var taskIds: [String] {
         switch self {
-        case .deleteTask(let id), .uncompleteTask(let id): return id
+        case .deleteTask(let id), .uncompleteTask(let id), .completeTask(let id): return [id]
+        case .uncompleteTasks(let ids), .deleteTasks(let ids): return ids
+        case .forgetFact, .deleteCapture, .cancelCall: return []
         }
     }
+
+    /// First task id (kept for the pre-2026-09 call sites); nil for non-task undos.
+    public var taskId: String? { taskIds.first }
 }
 
 /// Small glyph for the card. Raw values are the web's icon names, so the two
@@ -66,12 +80,13 @@ public struct ReceiptArgs: Equatable, Sendable {
     }
 }
 
-/// The first `"…"` run in a result string — how the executor names the entity.
+/// The OUTERMOST `"…"` span in a result string — how the executor names the
+/// entity. The name-bearing results each carry exactly ONE quoted segment, so
+/// spanning the outermost quotes keeps names that contain their own quote
+/// chars intact (web `quoted`, audit 2026-08-29).
 func quotedFragment(_ s: String) -> String? {
-    guard let open = s.firstIndex(of: "\"") else { return nil }
-    let after = s.index(after: open)
-    guard after < s.endIndex, let close = s[after...].firstIndex(of: "\"") else { return nil }
-    return String(s[after..<close])
+    guard let open = s.firstIndex(of: "\""), let close = s.lastIndex(of: "\""), open < close else { return nil }
+    return String(s[s.index(after: open)..<close])
 }
 
 /// The `id=…` token in a result string (up to the next whitespace).
@@ -81,14 +96,50 @@ private func idFragment(_ s: String) -> String? {
     return rest.isEmpty ? nil : String(rest)
 }
 
+/// The `ids=a,b,c` token in a bulk result, split and emptied of blanks.
+private func idsFragment(_ s: String) -> [String] {
+    guard let r = s.range(of: "ids=") else { return [] }
+    let rest = s[r.upperBound...].prefix { !$0.isWhitespace }
+    return rest.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+}
+
+/// The integer right after `"<word> "` in a result ("created 3 tasks" → "3"), as the web's `/created (\d+)/`.
+private func countAfter(_ word: String, in s: String) -> String {
+    guard let r = s.range(of: word + " ") else { return "?" }
+    let digits = s[r.upperBound...].prefix { $0.isNumber }
+    return digits.isEmpty ? "?" : String(digits)
+}
+
+/// `result` minus its leading "ok: ".
+private func stripOk(_ s: String) -> String {
+    s.hasPrefix("ok: ") ? String(s.dropFirst(4)) : s
+}
+
+/// `result` minus a trailing " (…)" parenthetical — the web's `/\s*\(.*\)$/`
+/// (greedy: from the FIRST "(" when the string ends in ")").
+private func stripTrailingParenthetical(_ s: String) -> String {
+    guard s.hasSuffix(")"), let open = s.firstIndex(of: "(") else { return s }
+    var head = String(s[..<open])
+    while let last = head.last, last.isWhitespace { head.removeLast() }
+    return head
+}
+
+/// `result` minus everything from the first " — " (the web's `/ — .*$/`).
+private func stripAfterDash(_ s: String) -> String {
+    guard let r = s.range(of: " — ") else { return s }
+    return String(s[..<r.lowerBound])
+}
+
 /// Build the receipt for one SUCCESSFUL tool call (result starts "ok").
-/// `tasks` resolves live entities for undo targets. Returns nil for read-only
+/// `tasks` resolves live entities for undo targets; `tone` (from
+/// `toneFromFacts`) phrases the quiet-win line. Returns nil for read-only
 /// tools and unrecognized results — no receipt beats a wrong receipt.
 public func deriveReceipt(
     name: String,
     args: ReceiptArgs,
     result: String,
-    tasks: [TaskItem]
+    tasks: [TaskItem],
+    tone: Tone = .gentle
 ) -> Receipt? {
     guard result.hasPrefix("ok") else { return nil }
     switch name {
@@ -127,12 +178,102 @@ public func deriveReceipt(
 
     case "complete_task":
         let nm = quotedFragment(result) ?? "task"
-        let t = tasks.first { $0.name == nm && $0.done }
-        return Receipt(icon: .check, label: "Completed “\(nm)”",
+        // Prefer the executor's id — resolving by NAME un-completed the wrong
+        // duplicate (flow review, 2026-08-30). Name fallback keeps legacy
+        // persisted results working.
+        let id = idFragment(result)
+        let t = id.flatMap { id in tasks.first { $0.id == id } }
+            ?? tasks.first { $0.name == nm && $0.done }
+        // Quiet win: a task that dodged them 3+ times deserves more than a
+        // checkmark — the assistant KNOWS this one was the hard kind of done.
+        let win = t.flatMap { quietWinLine(taskName: nm, moveCount: $0.moveCount ?? 0, tone: tone) }
+        return Receipt(icon: .check, label: win ?? "Completed “\(nm)”",
                        undo: t.map { .uncompleteTask(id: $0.id) })
+
+    case "create_tasks":
+        let n = countAfter("created", in: result)
+        let ids = idsFragment(result)
+        return Receipt(icon: .plus, label: "Created \(n) tasks",
+                       undo: ids.isEmpty ? nil : .deleteTasks(ids: ids))
+
+    case "complete_tasks":
+        let n = countAfter("completed", in: result)
+        let ids = idsFragment(result)
+        return Receipt(icon: .check, label: "Completed \(n) tasks",
+                       undo: ids.isEmpty ? nil : .uncompleteTasks(ids: ids))
 
     case "delete_task":
         return Receipt(icon: .trash, label: "Deleted “\(quotedFragment(result) ?? "task")”")
+
+    case "save_profile_fact":
+        // The learning receipt IS the consent UX: every remembered fact is
+        // visible the moment it's saved, with a one-tap forget.
+        let id = idFragment(result)
+        let fact = quotedFragment(result) ?? "that"
+        return Receipt(icon: .pencil, label: "Noted: \(fact)", undo: id.map { .forgetFact(id: $0) })
+
+    // ── full app surface (2026-09-02) ──
+    case "uncomplete_task":
+        let id = idFragment(result)
+        return Receipt(icon: .check, label: "Reopened \(quotedFragment(result) ?? "task")",
+                       undo: id.map { .completeTask(id: $0) })
+
+    case "unschedule_task":
+        return Receipt(icon: .calendar, label: "Unscheduled \(quotedFragment(result) ?? "task")")
+
+    case "skip_occurrence":
+        return Receipt(icon: .calendar, label: "Skipped \(quotedFragment(result) ?? "task") today")
+
+    case "complete_occurrence":
+        return Receipt(icon: .check, label: "Done for today: \(quotedFragment(result) ?? "task")")
+
+    case "block_time":
+        let id = idFragment(result)
+        return Receipt(icon: .calendar, label: "Blocked \(quotedFragment(result) ?? "time")",
+                       undo: id.map { .deleteTask(id: $0) })
+
+    case "carry_to_tomorrow":
+        return Receipt(icon: .calendar, label: stripAfterDash(stripOk(result)))
+
+    case "start_focus":
+        return Receipt(icon: .check, label: "Focus started: \(quotedFragment(result) ?? "task")")
+
+    case "pause_focus":
+        return Receipt(icon: .pencil, label: "Focus paused")
+
+    case "resume_focus":
+        return Receipt(icon: .pencil, label: "Focus resumed")
+
+    case "extend_focus":
+        return Receipt(icon: .pencil, label: stripOk(result))
+
+    case "cancel_focus":
+        return Receipt(icon: .pencil, label: "Focus cancelled")
+
+    case "add_capture":
+        let id = idFragment(result)
+        return Receipt(icon: .plus, label: "Captured: \(quotedFragment(result) ?? "")",
+                       undo: id.map { .deleteCapture(id: $0) })
+
+    case "promote_capture":
+        let id = idFragment(result)
+        return Receipt(icon: .plus, label: "Task from capture: \(quotedFragment(result) ?? "")",
+                       undo: id.map { .deleteTask(id: $0) })
+
+    case "resolve_capture":
+        return Receipt(icon: .check, label: "Resolved: \(quotedFragment(result) ?? "capture")")
+
+    case "delete_capture":
+        return Receipt(icon: .pencil, label: "Deleted capture")
+
+    case "rename_list", "archive_list", "delete_list", "edit_list_item", "remove_list_item", "set_list_item_done",
+         "create_area", "rename_area", "delete_area", "create_tag", "rename_tag", "delete_tag",
+         "unshare_task", "set_usable_minutes", "set_notification_level", "set_reminder_lead", "set_ritual":
+        let icon: ReceiptIcon = name.hasPrefix("create") ? .plus : name.contains("done") ? .check : .pencil
+        return Receipt(icon: icon, label: stripTrailingParenthetical(stripOk(result)))
+
+    case "forget_fact":
+        return Receipt(icon: .pencil, label: "Forgot: \(quotedFragment(result) ?? "that")")
 
     case "create_list":
         return Receipt(icon: .list, label: "Created list “\(quotedFragment(result) ?? "list")”")
@@ -143,32 +284,107 @@ public func deriveReceipt(
     case "promote_item_to_task":
         return Receipt(icon: .plus, label: "Promoted “\(quotedFragment(result) ?? "item")” to a task")
 
+    // ── calls ("Unstuck calls you", Part B) — "Call booked Thu 14:45 — speak to James · 4 notes" ──
+    case "request_call":
+        guard let m = callBooked(result) else { return nil }
+        return Receipt(icon: .calendar,
+                       label: "Call booked \(shortWeekday(m.date)) \(m.hm) — \(m.label) · \(m.n) note\(m.n == "1" ? "" : "s")",
+                       undo: .cancelCall(id: m.id))
+
+    case "update_call":
+        guard let m = callUpdated(result) else { return nil }
+        return Receipt(icon: .pencil,
+                       label: "Call updated \(shortWeekday(m.date)) \(m.hm) — \(m.label) · \(m.n) note\(m.n == "1" ? "" : "s")")
+
+    case "cancel_call":
+        return Receipt(icon: .trash, label: "Call cancelled — \(quotedFragment(result) ?? "call")")
+
     default:
         return nil
     }
 }
 
+/// 'YYYY-MM-DD' → 'Thu' (local calendar day, no timezone shift).
+private func shortWeekday(_ date: String) -> String {
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][LocalDate.dayOfWeek(date)]
+}
+
+private let CALL_BOOKED_RE = try! NSRegularExpression(
+    pattern: "^ok: call booked (\\d{4}-\\d{2}-\\d{2}) (\\d{2}:\\d{2}) \"(.*)\" \\((\\d+) notes?\\) id=(\\S+)")
+private let CALL_UPDATED_RE = try! NSRegularExpression(
+    pattern: "^ok: updated call \"(.*)\" — (\\d{4}-\\d{2}-\\d{2}) (\\d{2}:\\d{2}), (\\d+) notes?")
+
+private func groups(_ re: NSRegularExpression, _ s: String) -> [String]? {
+    guard let m = re.firstMatch(in: s, range: NSRange(s.startIndex..<s.endIndex, in: s)) else { return nil }
+    return (1..<m.numberOfRanges).map { Range(m.range(at: $0), in: s).map { String(s[$0]) } ?? "" }
+}
+
+private func callBooked(_ s: String) -> (date: String, hm: String, label: String, n: String, id: String)? {
+    guard let g = groups(CALL_BOOKED_RE, s) else { return nil }
+    return (g[0], g[1], g[2], g[3], g[4])
+}
+
+private func callUpdated(_ s: String) -> (label: String, date: String, hm: String, n: String)? {
+    guard let g = groups(CALL_UPDATED_RE, s) else { return nil }
+    return (g[0], g[1], g[2], g[3])
+}
+
 /// The mutation an Undo tap performs. The app layer applies it through the same
 /// write methods the UI uses (delete / save), so sync + the outbox are honoured.
 public enum ReceiptUndoAction: Equatable, Sendable {
+    /// Remove the task AND its calendar blocks (the executor's delete_task
+    /// cascade — ghost blocks were a confirmed flow bug, 2026-08-30).
     case deleteTask(id: String)
     /// The task with `done` flipped back off (completion stamp cleared).
     case restoreTask(TaskItem)
+    /// Several tasks (+ their blocks) to remove — undo of `create_tasks`.
+    case deleteTasks(ids: [String])
+    /// Several tasks flipped back open — undo of `complete_tasks` (only the ones still present).
+    case restoreTasks([TaskItem])
+    /// Soft-delete the remembered fact — undo of `save_profile_fact`.
+    case forgetFact(id: String)
+    /// Remove the capture — undo of `add_capture`.
+    case deleteCapture(id: String)
+    /// The task with `done` set (stamped `nowISO`) — undo of `uncomplete_task`.
+    case completeTask(TaskItem)
+    /// Cancel the booked call — undo of `request_call` (Part B).
+    case cancelCall(id: String)
 }
 
 /// Plan a receipt's undo against the live task list. `nil` = nothing to do
 /// (the web's `false`): the task the undo targets is already gone.
 public func planReceiptUndo(_ undo: ReceiptUndo, tasks: [TaskItem], nowISO: String) -> ReceiptUndoAction? {
+    func reopened(_ t: TaskItem) -> TaskItem {
+        var t = t
+        t.done = false
+        t.completedAt = nil
+        t.updatedAt = nowISO
+        return t
+    }
     switch undo {
     case .deleteTask(let id):
         // Deleting an id that no longer exists is a harmless no-op, and the web
         // reports success unconditionally here — keep the receipt struck through.
         return .deleteTask(id: id)
     case .uncompleteTask(let id):
+        guard let t = tasks.first(where: { $0.id == id }) else { return nil }
+        return .restoreTask(reopened(t))
+    case .deleteTasks(let ids):
+        return .deleteTasks(ids: ids)
+    case .uncompleteTasks(let ids):
+        let present = ids.compactMap { id in tasks.first { $0.id == id } }.map(reopened)
+        return present.isEmpty ? nil : .restoreTasks(present)
+    case .forgetFact(let id):
+        return .forgetFact(id: id)
+    case .deleteCapture(let id):
+        return .deleteCapture(id: id)
+    case .completeTask(let id):
         guard var t = tasks.first(where: { $0.id == id }) else { return nil }
-        t.done = false
-        t.completedAt = nil
+        t.done = true
+        t.completedAt = nowISO
         t.updatedAt = nowISO
-        return .restoreTask(t)
+        return .completeTask(t)
+    case .cancelCall(let id):
+        return .cancelCall(id: id)
     }
 }

@@ -52,9 +52,14 @@
 	<true/>
 	<key>SUPABASE_ANON_KEY</key>
 	<string>$(SUPABASE_ANON_KEY)</string>
+	<!-- voip: PushKit VoIP pushes wake the app for "Unstuck calls you"
+	     (CallKit); audio: the voice conversation keeps running once the
+	     call screen is backgrounded. -->
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>fetch</string>
+		<string>voip</string>
+		<string>audio</string>
 	</array>
 	<key>SUPABASE_HOST</key>
 	<string>$(SUPABASE_HOST)</string>

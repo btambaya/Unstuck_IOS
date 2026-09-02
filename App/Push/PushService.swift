@@ -13,10 +13,25 @@ final class PushRegistrar {
     private(set) var apnsTokenHex: String?
     /// Set by AppModel once the coordinator exists; called when a token arrives.
     var onToken: ((String) -> Void)?
+    /// The PushKit VoIP token (C1 "Unstuck calls you"), hex. Persisted by
+    /// VoipPushRegistry; surfaces here so Settings can show "this iPhone can
+    /// take calls" and so a refresh re-registers BOTH tokens.
+    private(set) var voipTokenHex: String? = VoipPushRegistry.storedToken
+    /// Wired by CallCoordinator.attach(model:) → AppModel.registerPush.
+    var onVoipToken: ((String) -> Void)?
 
     func didReceive(_ tokenHex: String) {
         apnsTokenHex = tokenHex
         onToken?(tokenHex)
+    }
+
+    func didReceiveVoip(_ tokenHex: String) {
+        voipTokenHex = tokenHex
+        onVoipToken?(tokenHex)
+    }
+
+    func didInvalidateVoip() {
+        voipTokenHex = nil
     }
 }
 
@@ -29,6 +44,12 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         NotificationCategories.registerAll()
         // BG refresh must register its handler before launch completes.
         BackgroundSync.register()
+        // PushKit VoIP registry (C1): must exist before launch completes so a
+        // VoIP push can wake the app from a killed state and report its
+        // CallKit call synchronously. Touching CallCoordinator.shared here
+        // also builds the CXProvider up front.
+        VoipPushRegistry.shared.start()
+        _ = CallCoordinator.shared
         // Skip the auth prompt under XCUITest so the system alert doesn't block
         // the run (the demo boot needs no push).
         #if DEBUG
@@ -84,6 +105,13 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         }
     }
 
+    /// `kind` of a push, whether the server put it at the top level or under
+    /// `data` (the call fallback push uses `data.kind='call'`).
+    nonisolated static func callKind(_ info: [AnyHashable: Any]) -> String? {
+        if let k = info["kind"] as? String { return k }
+        return (info["data"] as? [AnyHashable: Any])?["kind"] as? String
+    }
+
     // Notification taps + action buttons (spec 10 §1.3/§1.5). See the
     // main-thread-completion note above — this is the crash-fix shape.
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
@@ -97,6 +125,22 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         let taskName = (info["taskName"] as? String)
             ?? (content.body.isEmpty ? "your task" : content.body)
         let drifted = info["drifted"] as? Bool ?? false
+
+        // Fallback B for "Unstuck calls you": a time-sensitive alert push with
+        // kind='call' (no VoIP token registered). A tap on it opens the call
+        // conversation in Talk with the same payload the VoIP path would get.
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+           PushAppDelegate.callKind(info) == "call",
+           let payload = IncomingCallPayload(dictionary: info) {
+            let posted = PostedNotification(response.notification)
+            let done = CompletionBox(call: completionHandler)
+            Task { @MainActor in
+                NotificationLog.shared.add(posted)
+                CallCoordinator.shared.handleFallbackTap(payload)
+                done.call()
+            }
+            return
+        }
 
         let action: PushAction?
         switch response.actionIdentifier {

@@ -172,6 +172,24 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        // The assistant's cross-device memory (server migration 050
+        // `profile_facts`). `active` is a soft-delete tombstone — rows are
+        // never hard-deleted by a client, so another device's cache can't
+        // resurrect a forgotten fact. Columns mirror the server; `whenIso`
+        // is the `when_iso` date (YYYY-MM-DD) a fact refers to.
+        m.registerMigration("v3_profile_facts") { db in
+            try db.create(table: "profile_facts") { t in
+                t.primaryKey("id", .text)
+                t.column("category", .text).notNull()
+                t.column("fact", .text).notNull()
+                t.column("source", .text).notNull()
+                t.column("whenIso", .text)
+                t.column("active", .boolean).notNull().defaults(to: true)
+                t.column("createdAt", .text).notNull()
+                t.column("updatedAt", .text).notNull().indexed()
+            }
+        }
+
         return m
     }()
 }

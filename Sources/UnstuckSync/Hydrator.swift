@@ -95,6 +95,36 @@ public actor Hydrator {
         await replace("life_areas", LifeAreaDbRow.self) { try self.db.replaceAll(LifeArea.self, with: $0.map { $0.model() }) }
         await replace("calendar_connections", CalendarConnectionRow.self) { try self.db.replaceAll(CalendarConnection.self, with: $0.map { $0.model() }) }
         await hydrateCalBlocks()
+        await hydrateProfileFacts()
+    }
+
+    /// `profile_facts` — the assistant's cross-device memory. NOT a blanket
+    /// replace: the server is cross-device truth, but a strictly-newer local
+    /// row (an offline save / forget whose push hasn't landed) must survive,
+    /// and rows the server has never seen get PUSHED — mirroring the web's
+    /// `hydrateProfileFacts` (remote wins on shared ids, local-only rows
+    /// pushed up) with last-write-wins on `updated_at` instead of remote-
+    /// always-wins. Server tombstones (`active=false`) are kept locally as
+    /// tombstones so "forget" propagates everywhere and nothing resurrects.
+    /// A local row the server superseded also drops its queued upsert op, so
+    /// a stale offline edit can't clobber the newer server state on the next
+    /// flush (the same trap pruneStaleTaskOps closes for tasks).
+    public func hydrateProfileFacts() async {
+        do {
+            let remote = try await gateway.fetchAllTolerant(ProfileFactRow.self, table: "profile_facts").map { $0.model() }
+            let local = try db.fetchAllProfileFacts()
+            let merge = SyncDecision.mergeHydratedProfileFacts(remote: remote, local: local)
+            for id in merge.staleLocalIds {
+                try? box.cancelPendingUpserts(table: "profile_facts", rowId: id)
+            }
+            try db.replaceAll(ProfileFact.self, with: merge.merged)
+            let now = ProfileFactsService.isoNow()
+            for f in merge.pushLocalOnly {
+                try? ProfileFactPush.enqueue(f, box: box, nowISO: now)
+            }
+        } catch {
+            print("[hydrate] profile_facts failed, leaving local intact: \(error)")
+        }
     }
 
     /// Collections + their membership. RLS returns own AND shared-with-me rows;

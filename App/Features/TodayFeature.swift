@@ -229,6 +229,9 @@ struct TodayView: View {
     @State private var notifsEnabled = true
     @State private var areaFilter: String?
     @State private var backlogActive = false
+    /// Realtime "Talk" mode from the gateway card's mic — the same
+    /// VoiceModeScreen cover the Assistant sheet presents for its Talk button.
+    @State private var showTalk = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -246,18 +249,23 @@ struct TodayView: View {
                     let hero = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter,
                                             excludeIds: model.shareState.assignedOutIds)
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
+                    // The AI gateway — brief + one moment + composer — sits
+                    // between the greeting and the recap/hero (additive; the
+                    // classic Today continues underneath). Renders nothing
+                    // while the AI kill-switch is off.
+                    GatewayCard(vm: vm, onTalk: { showTalk = true })
+                        .padding(.horizontal, 18).padding(.top, 10)
                     // "Just now" session recap — shows for 6h after a finished
-                    // focus session, between the notif banner and the hero
+                    // focus session, between the gateway and the hero
                     // (Android TodayScreen recap parity).
                     if let recap = model.lastRecap,
                        Date().timeIntervalSince1970 * 1000 - recap.at < 6 * 3_600_000 {
                         recapCard(recap).padding(.horizontal, 18).padding(.top, 8)
                     }
-                    // Quiet in-app nudge — the FIRST of "things slipping" surfaced
-                    // between the recap and the hero (Android TodayScreen parity).
-                    if let nudge = vm.nudges.first {
-                        nudgeCard(vm, nudge).padding(.horizontal, 18).padding(.top, 6)
-                    }
+                    // The quiet nudge card is no longer rendered: gateway
+                    // moments replace it (they subsume slip radar / habit
+                    // gaps — docs/ios-gateway-plan.md decision 2). The
+                    // `computeNudges` path + `nudgeCard` stay for parity/tests.
                     heroOrEmpty(vm, hero: hero).padding(.horizontal, 18).padding(.top, 14)
                     filterBar(vm)
                     list(vm, hero: hero)
@@ -273,11 +281,14 @@ struct TodayView: View {
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
+        // Gateway mic → realtime Talk. Same cover the Assistant sheet uses.
+        .fullScreenCover(isPresented: $showTalk) { VoiceModeScreen() }
         .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
             showSettings = false; showNotifCenter = false; showPalette = false; showInsights = false
+            showTalk = false
         }
         .task {
             model.shareState.start()   // live "shared with you" + delegation state

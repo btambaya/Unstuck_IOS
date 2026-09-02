@@ -121,6 +121,8 @@ struct TaskEditor: View {
                             .buttonStyle(.plain).padding(.top, 8)
                     }
                     metaCard.padding(.top, 18)
+                    // "Call me about this" (C1) — anchored to the task's next block.
+                    if !isOcc { CallMeSection(task: editTarget, blocks: myBlocks).padding(.top, 18) }
                     repeatSection.padding(.top, 18)
                     tagsSection.padding(.top, 18)
                     if !taskSessions.isEmpty { sessionsSection.padding(.top, 18) }

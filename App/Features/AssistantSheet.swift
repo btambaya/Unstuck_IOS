@@ -167,6 +167,9 @@ struct AssistantSheet: View {
                         }
                         MessageBubble(text: turn.text, fromUser: turn.role == "user",
                                       local: turn.isLocal)
+                            // A queued send (typed while a turn was in flight)
+                            // shows faded until the model picks it up — web parity.
+                            .opacity(turn.isPending ? 0.5 : 1)
                         ForEach(Array((turn.receipts ?? []).enumerated()), id: \.offset) { ri, receipt in
                             AssistantReceiptRow(receipt: receipt) {
                                 assistant.undoReceipt(turnId: turn.id, index: ri)
@@ -312,13 +315,16 @@ struct AssistantSheet: View {
         assistant.send(message)
     }
 
+    /// No `sending` gate: a message typed while a turn is in flight is QUEUED
+    /// by the model (`AssistantModel.send` → `queued`) and shown as a faded
+    /// pending bubble, then sent when the turn finishes — web parity.
     private var canSend: Bool {
-        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !assistant.sending
+        !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func send() {
         let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !t.isEmpty, !assistant.sending else { return }
+        guard !t.isEmpty else { return }
         input = ""
         note = nil
         showChips = false

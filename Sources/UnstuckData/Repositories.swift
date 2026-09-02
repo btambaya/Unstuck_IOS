@@ -107,6 +107,62 @@ public struct TaskRepository: Sendable {
     }
 }
 
+/// The assistant's memory (`profile_facts`). Reads default to ACTIVE rows only —
+/// `active == false` rows are soft-delete tombstones kept so a hydrate /
+/// realtime echo from another device can't resurrect a forgotten fact. The
+/// refine / injection / style rules live in UnstuckCore (ProfileFactsLogic);
+/// the push side (outbox op + flush) in UnstuckSync (ProfileFactsService /
+/// WriteThrough). Newest-updated first, matching the model context order.
+public struct ProfileFactsRepository: Sendable {
+    let db: AppDatabase
+    public init(_ db: AppDatabase) { self.db = db }
+
+    private static func query(activeOnly: Bool) -> QueryInterfaceRequest<ProfileFact> {
+        let base = ProfileFact.order(Column("updatedAt").desc, Column("createdAt").desc, Column("id"))
+        return activeOnly ? base.filter(Column("active") == true) : base
+    }
+
+    public func all(activeOnly: Bool = true) throws -> [ProfileFact] {
+        try db.writer.read { try Self.query(activeOnly: activeOnly).fetchAll($0) }
+    }
+
+    public func fetch(id: String) throws -> ProfileFact? {
+        try db.writer.read { try ProfileFact.fetchOne($0, key: id) }
+    }
+
+    /// Insert-or-update by id (the whole row, tombstone flag included).
+    public func upsert(_ fact: ProfileFact) throws {
+        try db.writer.write { try fact.upsert($0) }
+    }
+
+    /// Soft delete: the row STAYS with `active = false` and a bumped
+    /// `updatedAt` (so last-write-wins merges carry the deletion). Returns
+    /// false when there is no active row to remove (web `removeProfileFact`).
+    @discardableResult
+    public func softRemove(id: String, nowISO: String) throws -> Bool {
+        try db.writer.write { db in
+            guard var f = try ProfileFact.fetchOne(db, key: id), f.active else { return false }
+            f.active = false
+            f.updatedAt = nowISO
+            try f.update(db)
+            return true
+        }
+    }
+
+    /// Local wipe of EVERY row, tombstones included — the sign-out / user-
+    /// switch path. (Forgetting on purpose goes through soft removes so the
+    /// tombstones reach the server; see ProfileFactsService.clear.)
+    public func clear() throws {
+        _ = try db.writer.write { try ProfileFact.deleteAll($0) }
+    }
+
+    /// Live stream of the facts (active only by default) for the UI —
+    /// Settings "What Unstuck knows", the gateway card, the interview.
+    public func observeValues(activeOnly: Bool = true) -> AsyncValueObservation<[ProfileFact]> {
+        ValueObservation.tracking { try Self.query(activeOnly: activeOnly).fetchAll($0) }.values(in: db.writer)
+    }
+}
+
 public struct ReminderInputs: Sendable {
     public let tasks: [TaskItem]
     public let blocks: [CalBlock]

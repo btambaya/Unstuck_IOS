@@ -34,6 +34,8 @@ public actor SyncCoordinator {
     public nonisolated let feedback: FeedbackClient
     public nonisolated let loginTracker: LoginTrackerClient
     public nonisolated let assistant: AssistantClient
+    /// "Unstuck calls you" (C1): call_requests rows + the call-outcome edge fn.
+    public nonisolated let calls: CallsClient
     private let hydrator: Hydrator
     private let realtime: RealtimeMirror
     /// Live change-signal for sharing (posts NotificationCenter; the UI refetches
@@ -59,6 +61,7 @@ public actor SyncCoordinator {
         self.feedback = FeedbackClient(provider.client)
         self.loginTracker = LoginTrackerClient(provider.client)
         self.assistant = AssistantClient(provider.client)
+        self.calls = CallsClient(provider.client)
         self.hydrator = Hydrator(gateway: gateway, db: db)
         self.realtime = RealtimeMirror(client: provider.client, db: db)
         self.collab = CollabRealtime(client: provider.client)
@@ -101,7 +104,17 @@ public actor SyncCoordinator {
         await hydrator.pruneStaleTaskOps()
         await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
         await hydrator.hydrate(userId: uid)
+        kickFlushIfOutboxPending()
         await pullCalendar()   // ingest Google events if connected (best-effort)
+    }
+
+    /// A hydrate can itself ENQUEUE ops — profile_facts rows the server has
+    /// never seen get pushed up (web hydrate parity). Those land after the
+    /// pre-hydrate flush, so kick the debounced flush rather than leaving them
+    /// for the next foreground / auth event.
+    private func kickFlushIfOutboxPending() {
+        guard ((try? OutboxStore(db).count()) ?? 0) > 0 else { return }
+        scheduleDebouncedFlush()
     }
 
     /// Pull external Google events for [-7d, +30d] and reconcile them into
@@ -213,6 +226,7 @@ public actor SyncCoordinator {
             await hydrator.pruneStaleTaskOps()
             await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
             await hydrator.hydrate(userId: uid)
+            kickFlushIfOutboxPending()
             let hydrator = self.hydrator
             await realtime.subscribeAll(userId: uid, onMembersChanged: {
                 await hydrator.hydrateCollections(userId: uid)

@@ -11,14 +11,64 @@
 // real-device testing shows residual self-triggering on the built-in speaker,
 // gate `onFrame` on `!isPlaying` for a half-duplex fallback (see note below).
 //
+// AUDIO SESSION OWNERSHIP (the classic silent-call bug): in Talk mode the
+// engine configures + activates the shared AVAudioSession and deactivates it
+// on shutdown. In a CallKit call (`.callKit`) CallKit owns activation — it
+// activates the session and tells the app via provider(_:didActivate:), and
+// deactivates it when the call ends — so the engine only re-asserts the
+// category/mode (the same values the CallKit bridge already set) and NEVER
+// calls setActive; deactivation on shutdown is a no-op. Activating it
+// ourselves races CallKit's activation and yields a connected call with no
+// audio either way.
+//
 // NOTE: this compiles and wires the full graph, but end-to-end audio (levels,
 // echo, sample-rate drift) can only be validated on a real device.
 
 import AVFoundation
 
+/// Who activates / deactivates the shared AVAudioSession for a voice session.
+enum VoiceAudioSessionOwnership: Sendable {
+    /// Talk mode: the engine configures AND activates the session, and
+    /// deactivates it on shutdown.
+    case app
+    /// A CallKit call: CallKit activates/deactivates. The engine re-asserts
+    /// category+mode only and never touches setActive.
+    case callKit
+}
+
+/// The AVAudioSession surface the engine touches — a seam so the ownership
+/// rule is unit-testable without AVFoundation (RealtimeCallVoiceLauncherTests).
+protocol VoiceAudioSessionControlling: AnyObject, Sendable {
+    /// `.playAndRecord` / `.voiceChat` with `options`.
+    func configureVoiceChat(options: AVAudioSession.CategoryOptions) throws
+    /// setActive(true) / setActive(false, notifyOthersOnDeactivation).
+    func setActive(_ active: Bool) throws
+}
+
+/// The real shared AVAudioSession.
+final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
+    func configureVoiceChat(options: AVAudioSession.CategoryOptions) throws {
+        try AVAudioSession.sharedInstance().setCategory(.playAndRecord, mode: .voiceChat, options: options)
+    }
+    func setActive(_ active: Bool) throws {
+        let s = AVAudioSession.sharedInstance()
+        if active {
+            try s.setActive(true, options: [])
+        } else {
+            try s.setActive(false, options: [.notifyOthersOnDeactivation])
+        }
+    }
+}
+
 final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     static let inRate: Double = 16_000
     static let outRate: Double = 24_000
+    /// Talk mode: two-way voice on the loudspeaker by default.
+    static let talkSessionOptions: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker]
+    /// CallKit mode: identical to CallKitProvider.configureAudioSession — the
+    /// call's route (receiver / speaker / headset) is the user's CallKit choice,
+    /// so NO defaultToSpeaker here.
+    static let callKitSessionOptions: AVAudioSession.CategoryOptions = [.allowBluetooth, .allowBluetoothA2DP]
 
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
@@ -35,6 +85,9 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private var started = false
     private let lock = NSLock()
 
+    let sessionOwnership: VoiceAudioSessionOwnership
+    private let sessionControl: VoiceAudioSessionControlling
+
     /// Mic capture couldn't start (audio-session activation or engine.start()
     /// failed — typically the mic is held by another app). The owner (the voice
     /// session) wires this to surface a note + end the session, instead of
@@ -45,23 +98,40 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private var pending = Data()
     private static let frameBytes = Int(inRate / 10) * 2   // 100ms mono pcm16 = 3200 bytes
 
+    /// `.app` (default) keeps Talk mode's behaviour; `.callKit` for a
+    /// CallKit-managed call (see the file header).
+    init(sessionOwnership: VoiceAudioSessionOwnership = .app,
+         sessionControl: VoiceAudioSessionControlling = SystemVoiceAudioSession()) {
+        self.sessionOwnership = sessionOwnership
+        self.sessionControl = sessionControl
+    }
+
     // MARK: session
 
-    /// Configure + activate the shared audio session for two-way voice.
-    private func activateSession() -> Bool {
-        let s = AVAudioSession.sharedInstance()
-        do {
-            try s.setCategory(.playAndRecord, mode: .voiceChat,
-                              options: [.allowBluetooth, .allowBluetoothA2DP, .defaultToSpeaker])
-            try s.setActive(true, options: [])
+    /// Configure (+ in `.app` mode activate) the shared audio session for
+    /// two-way voice. `.callKit`: category/mode only, best-effort — CallKit
+    /// has already activated the session; setActive is NEVER called.
+    func activateSession() -> Bool {
+        switch sessionOwnership {
+        case .app:
+            do {
+                try sessionControl.configureVoiceChat(options: Self.talkSessionOptions)
+                try sessionControl.setActive(true)
+                return true
+            } catch {
+                return false
+            }
+        case .callKit:
+            try? sessionControl.configureVoiceChat(options: Self.callKitSessionOptions)
             return true
-        } catch {
-            return false
         }
     }
 
-    private func deactivateSession() {
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+    /// `.app`: setActive(false, notifyOthers). `.callKit`: no-op — CallKit
+    /// deactivates when the call ends (provider(_:didDeactivate:)).
+    func deactivateSession() {
+        guard sessionOwnership == .app else { return }
+        try? sessionControl.setActive(false)
     }
 
     // MARK: graph

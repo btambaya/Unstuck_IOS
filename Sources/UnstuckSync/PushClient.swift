@@ -21,9 +21,26 @@ public struct PushClient: Sendable {
         #endif
     }
 
+    /// The PushKit VoIP token source (C1 "Unstuck calls you"). Installed ONCE
+    /// at launch by the app (VoipPushRegistry → a UserDefaults-backed read), so
+    /// EVERY registration — the APNs-token path, the auth-transition
+    /// re-register, and a VoIP token refresh — carries both tokens without the
+    /// callers having to know about PushKit. Read from any actor; the app sets
+    /// it before any register() runs (`nonisolated(unsafe)` documents that).
+    nonisolated(unsafe) public static var voipTokenProvider: (@Sendable () -> String?)?
+
+    /// Register this device's tokens with `register-push-token`.
+    /// - `apnsToken`: the alert-push token; an EMPTY string is treated as nil
+    ///   (no APNs token yet — the VoIP token can still go up on its own, e.g.
+    ///   when notification permission was denied but calls are wanted). A nil
+    ///   token is OMITTED from the body so the server keeps what it has.
+    /// - `voipToken`: the PushKit VoIP token (hex); defaults to
+    ///   `voipTokenProvider`. The server sends CallKit calls to it and falls
+    ///   back to a time-sensitive alert push when it's absent.
     public func register(
         deviceId: String,
         apnsToken: String?,
+        voipToken: String? = nil,
         liveActivityPushToStartToken: String? = nil,
         timezone: String = TimeZone.current.identifier,
         apnsEnvironment: String = PushClient.defaultApnsEnvironment
@@ -31,6 +48,7 @@ public struct PushClient: Sendable {
         struct Body: Encodable {
             let deviceId: String
             let apnsToken: String?
+            let voipToken: String?
             let liveActivityPushToStartToken: String?
             // Always sent explicitly and non-optionally (spec 10 §1.8 gotcha 1):
             // the edge fn happens to fall through to its 'ios' branch when
@@ -40,10 +58,13 @@ public struct PushClient: Sendable {
             let timezone: String
             let apnsEnvironment: String
         }
+        let apns = (apnsToken?.isEmpty ?? true) ? nil : apnsToken
+        let voip = voipToken ?? Self.voipTokenProvider?()
         try await client.functions.invoke(
             "register-push-token",
             options: FunctionInvokeOptions(method: .post, body: Body(
-                deviceId: deviceId, apnsToken: apnsToken,
+                deviceId: deviceId, apnsToken: apns,
+                voipToken: (voip?.isEmpty ?? true) ? nil : voip,
                 liveActivityPushToStartToken: liveActivityPushToStartToken,
                 platform: "ios",
                 timezone: timezone, apnsEnvironment: apnsEnvironment)))
