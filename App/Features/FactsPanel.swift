@@ -83,13 +83,14 @@ struct FactsPanelView: View {
         .sheet(item: $editing) { f in
             FactEditSheet(fact: f) { text in
                 guard text != f.fact else { return }
-                // Edit = re-save. Non-person categories only refine on EXACT
-                // text, so a changed fact would otherwise sit beside the old
-                // one: forget the old row first, then store the new text
-                // (same category + date).
-                guard let service = model.profileFacts else { return }
-                _ = service.remove(id: f.id)
-                service.save(category: f.category, fact: text, source: .settings, whenIso: f.whenIso)
+                // Edit = update IN PLACE (same id: one outbox op, and a moment
+                // dismissed against this fact's id stays dismissed). The old
+                // soft-remove + re-save minted a new id and re-fired those.
+                // Falls back to a plain save only if the row vanished
+                // underneath the sheet (forgotten on another device).
+                if !model.updateProfileFact(id: f.id, fact: text, whenIso: f.whenIso) {
+                    model.profileFacts?.save(category: f.category, fact: text, source: .settings, whenIso: f.whenIso)
+                }
             }
         }
     }
@@ -127,7 +128,7 @@ struct FactsPanelView: View {
             Button { _ = model.profileFacts?.remove(id: f.id) } label: {
                 Image(systemName: "xmark")
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.palette.ink3)
-                    .frame(width: 32, height: 32).contentShape(Rectangle())
+                    .frame(width: 44, height: 44).contentShape(Rectangle())
             }.buttonStyle(.plain)
                 .accessibilityLabel("Forget \"\(f.fact)\"")
         }

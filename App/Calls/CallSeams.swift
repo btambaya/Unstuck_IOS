@@ -73,6 +73,11 @@ final class NoopCallVoiceLauncher: CallVoiceLauncher {
 /// on a killed-state launch before AppModel exists (see AppCallEnvironment).
 @MainActor
 protocol CallEnvironment: AnyObject {
+    /// Someone is signed in on this device. A call that arrives with NO session
+    /// (a reactive sign-out left the VoIP token registered and the server still
+    /// had a queued call) is dropped at once as `.failed` — no ring, no
+    /// notification, no notes from the previous account.
+    var isSignedIn: Bool { get }
     /// A focus session is live (started, paused or not) → the call ends as `busy`.
     var isFocusSessionLive: Bool { get }
     /// The task/block the call anchors to still stands. `nil` taskId → true.
@@ -100,7 +105,9 @@ protocol CallNotifier: AnyObject {
 
 @MainActor
 protocol CallOutcomeReporting: AnyObject {
-    func report(callId: String, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?)
+    /// `callKitId` is the CXCall UUID the phone presented (CallSession.uuid);
+    /// the server stores it on the row (`call_id`) for cross-referencing.
+    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?)
     /// Late-bind the network client (a killed-state launch reports before the
     /// coordinator has one — implementations buffer + flush).
     func attach(client: CallsClient)

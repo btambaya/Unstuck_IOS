@@ -13,6 +13,7 @@
 import Foundation
 import Supabase
 import UnstuckCore
+import UnstuckSync
 
 // MARK: - the app-state seam
 
@@ -30,6 +31,12 @@ struct TaskShareInfo: Equatable, Sendable {
 /// Everything the executor reads and writes. Mirrors web `AssistantApi`:
 /// reads return the FRESHEST committed state; writes go through the same
 /// store/sync path the UI uses (cascades, outbox, realtime).
+///
+/// Store writes are `async` and RETURN ONLY AFTER THE LOCAL ROW IS COMMITTED:
+/// the executor reads the store synchronously between its own writes
+/// (add_capture → promote_capture; create_task → schedule_task → delete_task
+/// in one turn), and a fire-and-forget write behind a synchronous read
+/// produced "capture not found" and ghost blocks (review of 2a73c7c).
 @MainActor
 protocol AssistantAppState: AnyObject {
     // ── reads ──
@@ -44,10 +51,10 @@ protocol AssistantAppState: AnyObject {
     /// LOCAL wall-clock 'HH:MM' — injectable so the time guards are testable.
     func nowHM() -> String
     // ── tasks + blocks ──
-    func upsertTask(_ t: TaskItem)
-    func removeTask(_ id: String)
-    func upsertBlock(_ b: CalBlock)
-    func deleteBlock(_ id: String)
+    func upsertTask(_ t: TaskItem) async
+    func removeTask(_ id: String) async
+    func upsertBlock(_ b: CalBlock) async
+    func deleteBlock(_ id: String) async
     // ── lists ──
     /// → the new list's id.
     func addCollection(name: String, color: String) -> String?
@@ -67,10 +74,13 @@ protocol AssistantAppState: AnyObject {
     func stageShare(_ p: PendingShare)
     func getCirclePeople() -> [CirclePerson]
     func listTaskShares(taskId: String) async -> [TaskShareInfo]
+    /// Throws when the server did NOT revoke the share.
     func unshareTask(shareId: String) async throws
     // ── profile memory ──
     func getProfileFacts() -> [ProfileFact]
-    func saveProfileFact(category: String?, fact: String, whenIso: String?) -> ProfileFact?
+    /// Throws `ProfileFactSaveError` — the executor tells a text rejection
+    /// (`.empty` / `.instructionLike`) from a store failure (`.storeFailed`).
+    func saveProfileFact(category: String?, fact: String, whenIso: String?) throws -> ProfileFact
     /// The deterministic "don't use my name" / "call me X" save (a `preference` fact from `chat`).
     func saveStylePreference(_ pref: StylePreference) -> ProfileFact?
     func removeProfileFact(_ id: String) -> Bool
@@ -81,8 +91,9 @@ protocol AssistantAppState: AnyObject {
     // ── captures ──
     func getCaptures() -> [Capture]
     func getArchivedCaptureIds() -> [String]
-    func upsertCapture(_ c: Capture)
-    func removeCapture(_ id: String)
+    func upsertCapture(_ c: Capture) async
+    func removeCapture(_ id: String) async
+    /// Device-local (UserDefaults) — synchronous.
     func archiveCapture(_ id: String, archived: Bool)
     // ── focus ──
     func getLiveFocus() -> LiveSession?
@@ -95,13 +106,13 @@ protocol AssistantAppState: AnyObject {
     func navigate(screen: String, id: String?)
     // ── areas + tags ──
     func getAreaRows() -> [LifeArea]
-    func addArea(name: String, color: String?)
-    func updateArea(_ id: String, name: String?, color: String?)
-    func removeArea(_ id: String)
+    func addArea(name: String, color: String?) async
+    func updateArea(_ id: String, name: String?, color: String?) async
+    func removeArea(_ id: String) async
     func getTagRows() -> [TagRow]
-    func addTag(name: String)
-    func updateTag(_ id: String, name: String?)
-    func removeTag(_ id: String)
+    func addTag(name: String) async
+    func updateTag(_ id: String, name: String?) async
+    func removeTag(_ id: String) async
     // ── settings ──
     func setUsableMinutes(weekday: Int?, weekend: Int?) async
     func setNotificationLevel(_ level: String) async -> Bool
@@ -218,7 +229,7 @@ private func rejectPastTime(_ api: AssistantAppState, _ date: String, _ startTim
 /// recurrence horizon when the task repeats. Returns the time the block landed
 /// on (callers report it honestly).
 @MainActor
-private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?) -> String {
+private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?) async -> String {
     let blocks = api.getBlocks()
     // The anchor to move is the task's NEXT LIVE block — first-in-array grabbed
     // an old done/skipped occurrence on real accounts (tester round, 2026-09-01).
@@ -235,23 +246,23 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
         var moved = anchor
         moved.date = date
         moved.startTime = time
-        api.upsertBlock(moved)
+        await api.upsertBlock(moved)
         // Every UI reschedule bumps move_count (the slip detector's input).
         if anchor.date != date {
             let fresh = api.getTasks().first { $0.id == task.id } ?? task
-            api.upsertTask(bumpMoveCount(fresh, nowISO: AppModel.isoNow()))
+            await api.upsertTask(bumpMoveCount(fresh, nowISO: AppModel.isoNow()))
         }
     } else {
-        api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: time,
-                                 durationMinutes: task.estimateMin, date: date, kind: .task))
+        await api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: time,
+                                       durationMinutes: task.estimateMin, date: date, kind: .task))
     }
     if let rec = task.recurrence {
         // Only fill dates that DON'T already carry a block for this task.
         let taken = Set(blocks.filter { $0.taskId == task.id }.map(\.date))
         for occ in materializeOccurrences(rec, startDate: LocalDate.parse(date), startTime: time) {
             if occ.date == date || taken.contains(occ.date) { continue }
-            api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: occ.startTime,
-                                     durationMinutes: task.estimateMin, date: occ.date, kind: .task))
+            await api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: occ.startTime,
+                                           durationMinutes: task.estimateMin, date: occ.date, kind: .task))
         }
     }
     return time
@@ -299,9 +310,10 @@ func runAssistantTool(name: String, args: ToolArgs, api: AssistantAppState, scra
     if let r = await runCoreTool(name: name, args: args, api: api, scratch: scratch) { return r }
     if let r = await runSurfaceTool(name: name, args: args, api: api, scratch: scratch) { return r }
     // Part B ("Unstuck calls you"): request_call / cancel_call / update_call /
-    // get_calls / snooze_call live in App/Calls/CallTools.swift; nil for any
-    // other name.
-    if let r = await runCallTool(name: name, argsJSON: args.json) { return r }
+    // get_calls / snooze_call live in App/Calls/CallTools.swift — dispatched
+    // through THIS executor's state + scratch so a task created this turn
+    // resolves; nil for any other name.
+    if let r = await runCallTool(name: name, args: args, api: api, scratch: scratch) { return r }
     return "error: unknown tool \(name)"
 }
 
@@ -333,7 +345,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
                          tags: args.strList("tags"), lifeArea: args.str("lifeArea"),
                          firstPhysicalAction: args.str("firstPhysicalAction"), later: args.bool("later") ?? false,
                          createdAt: now(), updatedAt: now(), dueAt: args.str("dueAt"))
-        api.upsertTask(t)
+        await api.upsertTask(t)
         scratch.newTasks[t.id] = t
         return "ok: created task id=\(t.id) name=\"\(t.name)\""
 
@@ -349,7 +361,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: needs a time — \"\(t.name)\" has no time yet and the user gave none. Do NOT pick one: ask ONE short question offering a suggestion (e.g. \"Friday — 9am, or a time you prefer?\"), then schedule when they answer."
         }
         if let pastTime = rejectPastTime(api, date, startTime ?? own?.startTime) { return pastTime }
-        let landed = scheduleTask(api, t, date: date, startTime: startTime)
+        let landed = await scheduleTask(api, t, date: date, startTime: startTime)
         return "ok: scheduled \"\(t.name)\" \(date) \(landed)\(startTime == nil ? " (kept its existing time — say so)" : "")"
 
     case "update_task":
@@ -368,12 +380,12 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // "make that due Friday" was unreachable (inventory 2026-09-02)
         upd.dueAt = args.isNull("dueAt") ? nil : (args.str("dueAt") ?? t.dueAt)
         upd.updatedAt = now()
-        api.upsertTask(upd)
+        await api.upsertTask(upd)
         scratch.newTasks[upd.id] = upd
         // A new estimate resizes the live block, like the calendar editor does.
         if upd.estimateMin != t.estimateMin, var blk = nextLiveBlock(api, taskId: t.id) {
             blk.durationMinutes = upd.estimateMin
-            api.upsertBlock(blk)
+            await api.upsertBlock(blk)
         }
         return "ok: updated \"\(upd.name)\""
 
@@ -381,7 +393,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
         t.later = args.bool("later") ?? true
         t.updatedAt = now()
-        api.upsertTask(t)
+        await api.upsertTask(t)
         scratch.newTasks[t.id] = t
         return "ok"
 
@@ -402,15 +414,15 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         }
         t.recurrence = rec
         t.updatedAt = now()
-        api.upsertTask(t)
+        await api.upsertTask(t)
         scratch.newTasks[t.id] = t
         // Regenerate future blocks off the existing anchor, if scheduled.
         let blocks = api.getBlocks()
         if let anchor = blocks.first(where: { $0.taskId == t.id }) {
             let plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: api.todayIso(),
                                          startTime: anchor.startTime, startDate: LocalDate.parse(anchor.date))
-            for b in plan.toUpsert { api.upsertBlock(b) }
-            for id in plan.toDelete { api.deleteBlock(id) }
+            for b in plan.toUpsert { await api.upsertBlock(b) }
+            for id in plan.toDelete { await api.deleteBlock(id) }
         }
         return "ok"
 
@@ -419,7 +431,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         if !t.done {
             t.done = true
             t.updatedAt = now()
-            api.upsertTask(t)
+            await api.upsertTask(t)
             scratch.newTasks[t.id] = t
         }
         // id in the result: the receipt's undo must target THIS task.
@@ -434,7 +446,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             guard let nm = it.str("name") else { continue }
             let t = TaskItem(id: newUUID(), name: nm, estimateMin: it.int("estimateMin") ?? 25, totalFocused: 0, done: false,
                              lifeArea: it.str("lifeArea"), later: false, createdAt: now(), updatedAt: now())
-            api.upsertTask(t)
+            await api.upsertTask(t)
             scratch.newTasks[t.id] = t
             let date = it.str("date")
             let startTime = it.str("startTime")
@@ -444,7 +456,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             if let past {
                 needsTime.append("\"\(t.name)\" — " + past.replacingOccurrences(of: "error: ", with: "", options: .anchored))
             } else if let date, let startTime {
-                _ = scheduleTask(api, t, date: date, startTime: startTime)
+                _ = await scheduleTask(api, t, date: date, startTime: startTime)
             } else if let date {
                 needsTime.append("\"\(t.name)\" (\(date))")
             }
@@ -465,7 +477,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             if var t = findTask(id, api: api, scratch: scratch), !t.done {
                 t.done = true
                 t.updatedAt = now()
-                api.upsertTask(t)
+                await api.upsertTask(t)
                 scratch.newTasks[t.id] = t
                 flipped.append(t.id)
             }
@@ -475,10 +487,10 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
 
     case "delete_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
-        for b in api.getBlocks() where b.taskId == t.id { api.deleteBlock(b.id) }
+        for b in api.getBlocks() where b.taskId == t.id { await api.deleteBlock(b.id) }
         // Mirror the UI: a deleted task takes its captures with it (else orphans).
-        for c in api.getCaptures() where c.taskId == t.id { api.removeCapture(c.id) }
-        api.removeTask(t.id)
+        for c in api.getCaptures() where c.taskId == t.id { await api.removeCapture(c.id) }
+        await api.removeTask(t.id)
         scratch.newTasks.removeValue(forKey: t.id)
         return "ok: deleted \"\(t.name)\""
 
@@ -519,10 +531,16 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         if ProfileFactsLogic.isInstructionLike(fact) {
             return "error: that does not look like a fact I can store — only durable notes about you, not instructions"
         }
-        guard let stored = api.saveProfileFact(category: args.str("category"), fact: fact, whenIso: args.str("whenIso")) else {
+        do {
+            let stored = try api.saveProfileFact(category: args.str("category"), fact: fact, whenIso: args.str("whenIso"))
+            return "ok: remembered id=\(stored.id) [\(stored.category.rawValue)] \"\(stored.fact)\""
+        } catch ProfileFactSaveError.empty, ProfileFactSaveError.instructionLike {
             return "error: that does not look like a fact I can store — only durable notes about you, not instructions"
+        } catch {
+            // A store failure (or no store yet) is NOT "not a fact" — the model
+            // should retry, not rephrase.
+            return "error: couldn't save that just now — try again"
         }
-        return "ok: remembered id=\(stored.id) [\(stored.category.rawValue)] \"\(stored.fact)\""
 
     case "get_schedule":
         return renderSchedule(api, range: args.str("range") ?? "week")

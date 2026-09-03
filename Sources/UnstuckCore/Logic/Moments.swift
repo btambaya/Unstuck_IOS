@@ -185,14 +185,40 @@ private func leadName(_ fact: String) -> String {
 
 /// Whole-word, case-insensitive name match ("Maleek" ≠ "Maleeka").
 private func containsName(_ text: String, _ name: String) -> Bool {
-    let pattern = "\\b\(NSRegularExpression.escapedPattern(for: name))\\b"
-    guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return false }
-    return re.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)) != nil
+    guard let re = NameRegexCache.shared.regex(for: name) else { return false }
+    return matches(re, text)
 }
 
-private func matchesRe(_ pattern: String, _ text: String) -> Bool {
-    let re = try! NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
-    return re.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)) != nil
+private func matches(_ re: NSRegularExpression, _ text: String) -> Bool {
+    re.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)) != nil
+}
+
+/// The fixed patterns, compiled ONCE. `pickMoment` runs on every gateway
+/// body evaluation; compiling NSRegularExpressions per call was the hot spot.
+private enum Re {
+    nonisolated(unsafe) static let isoDatePrefix = try! NSRegularExpression(pattern: "^\\d{4}-\\d{2}-\\d{2}", options: [.caseInsensitive])
+    nonisolated(unsafe) static let birthday = try! NSRegularExpression(pattern: "birthday|turning\\s+\\d", options: [.caseInsensitive])
+    nonisolated(unsafe) static let gift = try! NSRegularExpression(pattern: "gift|birthday|present", options: [.caseInsensitive])
+}
+
+/// Per-name whole-word regexes (`\bMaleek\b`), compiled once per distinct
+/// name. Locked: `MomentState` is Sendable, so the engine may run off-main.
+/// Bounded — a profile has a handful of people, but a runaway caller must
+/// not grow this without limit.
+private final class NameRegexCache: @unchecked Sendable {
+    static let shared = NameRegexCache()
+    private let lock = NSLock()
+    private var cache: [String: NSRegularExpression] = [:]
+
+    func regex(for name: String) -> NSRegularExpression? {
+        lock.lock(); defer { lock.unlock() }
+        if let hit = cache[name] { return hit }
+        let pattern = "\\b\(NSRegularExpression.escapedPattern(for: name))\\b"
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+        if cache.count >= 256 { cache.removeAll(keepingCapacity: true) }
+        cache[name] = re
+        return re
+    }
 }
 
 // Filler words dropped when lifting the activity out of a block name:
@@ -244,7 +270,7 @@ private func datesThatMatter(_ state: MomentState, _ tone: Tone) -> Candidate? {
     struct Hit { let fact: ProfileFact; let when: String; let du: Int }
     var hits: [Hit] = []
     for f in state.facts {
-        guard let whenIso = f.whenIso, whenIso.count >= 10, matchesRe("^\\d{4}-\\d{2}-\\d{2}", whenIso) else { continue }
+        guard let whenIso = f.whenIso, whenIso.count >= 10, matches(Re.isoDatePrefix, whenIso) else { continue }
         let w = String(whenIso.prefix(10))
         let du = LocalDate.daysUntil(state.todayIso, w)
         if du < 3 || du > 14 { continue }
@@ -257,13 +283,13 @@ private func datesThatMatter(_ state: MomentState, _ tone: Tone) -> Candidate? {
     let fact = hit.fact, when = hit.when, du = hit.du
 
     let name = leadName(fact.fact)
-    let isBirthday = matchesRe("birthday|turning\\s+\\d", fact.fact)
+    let isBirthday = matches(Re.birthday, fact.fact)
 
     if isBirthday {
         // Already sorted? An open task naming both the person and the gift/birthday
         // means the PA has nothing to add — stay quiet.
         let covered = state.tasks.contains {
-            !$0.done && containsName($0.name, name) && matchesRe("gift|birthday|present", $0.name)
+            !$0.done && containsName($0.name, name) && matches(Re.gift, $0.name)
         }
         if covered { return nil }
         return Moment(

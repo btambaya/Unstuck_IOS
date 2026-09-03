@@ -63,13 +63,24 @@ public struct ProfileFactsService: Sendable {
 
     /// Add — or refine in place — a fact (web `saveProfileFact`). Returns the
     /// stored fact, or nil when the text is empty or, for MODEL-written
-    /// sources (chat / derived), reads like an instruction. The local write
-    /// is synchronous; the server push is enqueued behind it.
+    /// sources (chat / derived), reads like an instruction — or when the
+    /// local write failed. Callers that must tell those apart (the assistant's
+    /// `save_profile_fact` reports a filter rejection and a store failure
+    /// differently) use `store(…)`, which throws the reason.
     @discardableResult
     public func save(category: ProfileFactCategory, fact: String, source: ProfileFactSource,
                      whenIso: String? = nil) -> ProfileFact? {
-        guard let text = ProfileFactsLogic.prepareFact(fact) else { return nil }
-        if ProfileFactsLogic.guardsAgainstInjection(source), ProfileFactsLogic.isInstructionLike(text) { return nil }
+        try? store(category: category, fact: fact, source: source, whenIso: whenIso)
+    }
+
+    /// `save`, with the failure reason: `.empty` / `.instructionLike` are
+    /// rejections of the TEXT (nothing to retry), `.storeFailed` is the local
+    /// GRDB write failing (worth a retry). The local write is synchronous; the
+    /// server push is enqueued behind it.
+    public func store(category: ProfileFactCategory, fact: String, source: ProfileFactSource,
+                      whenIso: String? = nil) throws(ProfileFactSaveError) -> ProfileFact {
+        guard let text = ProfileFactsLogic.prepareFact(fact) else { throw .empty }
+        if ProfileFactsLogic.guardsAgainstInjection(source), ProfileFactsLogic.isInstructionLike(text) { throw .instructionLike }
         let when = ProfileFactsLogic.validWhenIso(whenIso)
         let nowISO = now()
         let existing = all()
@@ -85,7 +96,7 @@ public struct ProfileFactsService: Sendable {
             stored = ProfileFact(id: newUUID(), category: category, fact: text, source: source,
                                  whenIso: when, active: true, createdAt: nowISO, updatedAt: nowISO)
         }
-        do { try repo.upsert(stored) } catch { return nil }
+        do { try repo.upsert(stored) } catch { throw .storeFailed }
         push(id: stored.id, nowISO: nowISO)
         return stored
     }
@@ -128,14 +139,36 @@ public struct ProfileFactsService: Sendable {
     }
 }
 
+/// Why a profile-fact save didn't store anything (see `ProfileFactsService.store`).
+public enum ProfileFactSaveError: Error, Equatable, Sendable {
+    /// Blank after trimming — nothing to remember.
+    case empty
+    /// A MODEL-written save that reads like an instruction (the injection filter).
+    case instructionLike
+    /// The local write failed (or no store exists) — transient, worth a retry.
+    case storeFailed
+}
+
 /// The one way a `profile_facts` row is queued for the server, shared by the
 /// write-through (saves / forgets) and the Hydrator (local-only rows found
 /// on pull). Cancels the row's older queued upserts first so the outbox
 /// always carries ONE op per fact — the latest state.
 enum ProfileFactPush {
     static func enqueue(_ f: ProfileFact, box: OutboxStore, nowISO: String) throws {
-        let payload = String(data: try JSONEncoder().encode(ProfileFactRow(f)), encoding: .utf8) ?? "{}"
+        let payload = try Self.payload(f)
         try box.cancelPendingUpserts(table: "profile_facts", rowId: f.id)
         try box.enqueue(table: "profile_facts", rowId: f.id, kind: .upsert, payload: payload, nowISO: nowISO)
+    }
+
+    /// Same, inside an open write transaction (the hydrate merge commits its
+    /// local-only pushes together with the rows they describe).
+    static func enqueue(_ f: ProfileFact, in db: Database, nowISO: String) throws {
+        let payload = try Self.payload(f)
+        try OutboxStore.cancelPendingUpserts(in: db, table: "profile_facts", rowId: f.id)
+        try OutboxStore.enqueue(in: db, table: "profile_facts", rowId: f.id, kind: .upsert, payload: payload, nowISO: nowISO)
+    }
+
+    private static func payload(_ f: ProfileFact) throws -> String {
+        String(data: try JSONEncoder().encode(ProfileFactRow(f)), encoding: .utf8) ?? "{}"
     }
 }

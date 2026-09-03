@@ -9,37 +9,57 @@
 //   ok: <n> upcoming call[s]:\n- <date> <HH:MM> "<label>" (<n> notes)[ for "<task>"][ · snoozed| · ringing now] [id=<id>]
 //   error: calls can only be booked between 06:00 and 23:00 — suggest a time inside that window
 //   error: a call is already booked for "<label>" at <date> <HH:MM> id=<id> — update_call or cancel_call it
-// The only iOS-local strings are the past-time guards (the web's carry the
-// day's free windows, which the pure guard doesn't have) and the network
-// failure. `runCallTool` is wired into the text + voice dispatchers by
-// runAssistantTool; it returns nil for any other tool name.
+//   error: <date> is in the PAST (today is <today>). If the user meant the coming <weekday>, use <date> — see context.upcoming. …
+//   error: <HH:MM> today is already past (it's <now> now). Ask for a later time or another day — free today: <windows>.
+// The past-date / past-time refusals are the SHARED UnstuckCore strings
+// (rejectPastDate / rejectPastTime — the same repair hints every other tool
+// gives); the only iOS-local strings are the network failure and the
+// "changed underneath me" compare-and-set miss.
+//
+// ENTRY POINTS. The executor (runAssistantTool) calls
+//   runCallTool(name:args:api:scratch:)
+// so a task created THIS turn (create_task → request_call) resolves through
+// the executor's TurnScratch + AssistantAppState exactly like every other
+// tool (findTask / nextLiveBlock). The older
+//   runCallTool(name:argsJSON:)  /  runCallTool(name:args:)
+// forms still work — they build the live AppModelAssistantState with a fresh
+// (empty) scratch. The network + userId come from the attached AppModel's
+// coordinator either way. nil ⇒ not a call tool (the normal dispatcher runs).
 //
 // Pure pieces (when-parsing, guards, formatting) live in CallToolLogic and
-// are unit-tested; the network + store reads are in `CallTools.run`.
+// are unit-tested; the network is behind `CallStore` (CallsClient in
+// production, a fake in CallScriptTests).
 
 import Foundation
 import UnstuckCore
 import UnstuckSync
 
-/// Dispatch a call tool. nil ⇒ not a call tool (let the normal dispatcher run).
+/// Dispatch a call tool through the executor's state + scratch (the call
+/// site in runAssistantTool). nil ⇒ not a call tool.
+@MainActor
+func runCallTool(name: String, args: ToolArgs, api: AssistantAppState, scratch: TurnScratch) async -> String? {
+    guard CallTools.names.contains(name) else { return nil }
+    let parsed = (try? JSONSerialization.jsonObject(with: Data(args.json.utf8))) as? [String: Any]
+    return await CallTools.dispatch(name: name, args: parsed ?? [:], api: api, scratch: scratch)
+}
+
+/// Legacy entry: dictionary args, no executor scratch (the live AppModel
+/// state with an empty scratch is used). nil ⇒ not a call tool.
 @MainActor
 func runCallTool(name: String, args: [String: Any]) async -> String? {
     guard CallTools.names.contains(name) else { return nil }
-    if name == "snooze_call" {
-        let m = CallToolLogic.int(args["minutes"]) ?? 10
-        return CallCoordinator.shared.snoozeActiveCall(minutes: m)
+    guard let model = CallCoordinator.shared.attachedModel else {
+        return name == "snooze_call"
+            ? CallCoordinator.shared.snoozeActiveCall(minutes: CallToolLogic.int(args["minutes"]) ?? 10)
+            : "error: calls aren't available right now — sign in on the phone first"
     }
-    guard let model = CallCoordinator.shared.attachedModel,
-          let client = model.coordinator?.calls,
-          let userId = model.coordinator?.auth.currentUserId else {
-        return "error: calls aren't available right now — sign in on the phone first"
-    }
-    return await CallTools.run(name: name, args: args, model: model, client: client, userId: userId)
+    let api = AppModelAssistantState(model: model, assistant: model.assistant)
+    return await CallTools.dispatch(name: name, args: args, api: api, scratch: TurnScratch())
 }
 
-/// Same, from the raw JSON-string arguments both dispatchers already hold
-/// (VoiceRealtimeClient's `runTool(name, argsJSON)` / the harness's
-/// `call.function.arguments`). Unparseable JSON → `[:]`.
+/// Legacy entry from the raw JSON-string arguments (VoiceRealtimeClient's
+/// `runTool(name, argsJSON)` / the harness's `call.function.arguments`).
+/// Unparseable JSON → `[:]`. nil ⇒ not a call tool.
 @MainActor
 func runCallTool(name: String, argsJSON: String) async -> String? {
     guard CallTools.names.contains(name) else { return nil }
@@ -47,18 +67,65 @@ func runCallTool(name: String, argsJSON: String) async -> String? {
     return await runCallTool(name: name, args: parsed ?? [:])
 }
 
+/// The call_requests reads/writes the tools need — CallsClient in production,
+/// a fake in tests. Writes that can lose a race return nil for "zero rows".
+protocol CallStore: Sendable {
+    func liveCalls() async throws -> [CallRequest]
+    func call(id: String) async throws -> CallRequest?
+    func book(userId: String, taskId: String?, blockId: String?, callAt: Date, leadMin: Int?,
+              label: String, notes: [String]) async throws -> CallRequest
+    func patch(id: String, callAt: Date?, blockId: String??, leadMin: Int??,
+               label: String?, notes: [String]?) async throws -> CallRequest?
+    func cancelCall(id: String) async throws -> CallRequest?
+}
+
+extension CallsClient: CallStore {
+    func liveCalls() async throws -> [CallRequest] { try await list(upcoming: true) }
+    func call(id: String) async throws -> CallRequest? { try await get(id: id) }
+    func book(userId: String, taskId: String?, blockId: String?, callAt: Date, leadMin: Int?,
+              label: String, notes: [String]) async throws -> CallRequest {
+        try await create(userId: userId, taskId: taskId, blockId: blockId, callAt: callAt,
+                         leadMin: leadMin, label: label, notes: notes)
+    }
+    func patch(id: String, callAt: Date?, blockId: String??, leadMin: Int??,
+               label: String?, notes: [String]?) async throws -> CallRequest? {
+        try await update(id: id, callAt: callAt, blockId: blockId, leadMin: leadMin, label: label, notes: notes)
+    }
+    func cancelCall(id: String) async throws -> CallRequest? { try await cancel(id: id) }
+}
+
 @MainActor
 enum CallTools {
     static let names: Set<String> = ["request_call", "cancel_call", "update_call", "get_calls", "snooze_call"]
 
-    static func run(name: String, args: [String: Any], model: AppModel, client: CallsClient,
-                    userId: String, now: Date = Date()) async -> String {
+    /// Compare-and-set miss: the row was cancelled / rang / finished between
+    /// the read and the write. Never echo the stale row as `ok:`.
+    static let changedUnderneath = "error: that call changed underneath me — get_calls and try again"
+
+    /// The production dispatch: snooze → the CallKit coordinator; the rest →
+    /// `run` over the attached coordinator's CallsClient + user id.
+    static func dispatch(name: String, args: [String: Any], api: AssistantAppState, scratch: TurnScratch) async -> String {
+        if name == "snooze_call" {
+            return CallCoordinator.shared.snoozeActiveCall(minutes: CallToolLogic.int(args["minutes"]) ?? 10)
+        }
+        guard let model = CallCoordinator.shared.attachedModel,
+              let client = model.coordinator?.calls,
+              let userId = model.coordinator?.auth.currentUserId else {
+            return "error: calls aren't available right now — sign in on the phone first"
+        }
+        return await run(name: name, args: args, api: api, scratch: scratch, store: client, userId: userId)
+    }
+
+    static func run(name: String, args: [String: Any], api: AssistantAppState, scratch: TurnScratch,
+                    store: any CallStore, userId: String, now: Date = Date(),
+                    calendar: Calendar = .current) async -> String {
         do {
             switch name {
-            case "request_call": return try await requestCall(args, model: model, client: client, userId: userId, now: now)
-            case "cancel_call": return try await cancelCall(args, client: client)
-            case "update_call": return try await updateCall(args, model: model, client: client, now: now)
-            case "get_calls": return try await getCalls(model: model, client: client)
+            case "request_call":
+                return try await requestCall(args, api: api, scratch: scratch, store: store, userId: userId, now: now, calendar: calendar)
+            case "cancel_call": return try await cancelCall(args, store: store, calendar: calendar)
+            case "update_call": return try await updateCall(args, api: api, store: store, now: now, calendar: calendar)
+            case "get_calls": return try await getCalls(api: api, scratch: scratch, store: store, calendar: calendar)
             default: return "error: unknown tool \(name)"
             }
         } catch {
@@ -68,8 +135,8 @@ enum CallTools {
 
     // MARK: request_call(when | taskId+leadMin, label, notes[])
 
-    private static func requestCall(_ args: [String: Any], model: AppModel, client: CallsClient,
-                                    userId: String, now: Date) async throws -> String {
+    private static func requestCall(_ args: [String: Any], api: AssistantAppState, scratch: TurnScratch,
+                                    store: any CallStore, userId: String, now: Date, calendar: Calendar) async throws -> String {
         let taskId = CallToolLogic.str(args["taskId"])
         let whenRaw = CallToolLogic.str(args["when"]) ?? CallToolLogic.joinDateTime(args)
         let notes = CallToolLogic.notes(args["notes"])
@@ -77,7 +144,9 @@ enum CallTools {
 
         var task: TaskItem?
         if let taskId {
-            guard let t = (try? model.taskRepo?.fetch(id: taskId)) ?? nil else { return "error: task not found" }
+            // The executor's resolver: a task created THIS turn lives in the
+            // scratch before the store has it.
+            guard let t = findTask(taskId, api: api, scratch: scratch) else { return "error: task not found" }
             task = t
             if label == nil { label = String(t.name.prefix(120)) }
         }
@@ -89,20 +158,21 @@ enum CallTools {
         var blockId: String?
         var leadMin: Int?
         if let whenRaw {
-            guard let d = CallToolLogic.parseWhen(whenRaw, now: now) else {
+            guard let d = CallToolLogic.parseWhen(whenRaw, now: now, calendar: calendar) else {
                 return "error: when must be 'YYYY-MM-DD HH:MM' in the user's local time (got \"\(whenRaw)\")"
             }
             callAt = d
         } else if let task {
             let lead = min(1440, max(0, CallToolLogic.int(args["leadMin"]) ?? CallSettings.defaultLeadMin))
-            let blocks = (try? model.db?.blocks(forTask: task.id)) ?? []
-            guard let block = CallToolLogic.nextLiveBlock(blocks, now: now),
-                  let start = CallToolLogic.blockStart(block) else {
+            // The same anchor schedule_task / block_time just moved — read
+            // through the executor's state, not a stale repo snapshot.
+            guard let block = nextLiveBlock(api, taskId: task.id),
+                  let start = CallToolLogic.blockStart(block, calendar: calendar) else {
                 return "error: \"\(task.name)\" has no upcoming slot — schedule_task it first, or give a time with when"
             }
             callAt = start.addingTimeInterval(TimeInterval(-lead * 60))
             if callAt.timeIntervalSince(now) < -30 {
-                return "error: \(lead) min before \"\(task.name)\" (\(CallToolLogic.fmt(callAt))) is already past — give a time with when instead"
+                return "error: \(lead) min before \"\(task.name)\" (\(CallToolLogic.fmt(callAt, calendar: calendar))) is already past — give a time with when instead"
             }
             blockId = block.id
             leadMin = lead
@@ -110,41 +180,43 @@ enum CallTools {
             return "error: needs a time — ask ONE short question suggesting one (e.g. \"3pm today, or a time you prefer?\"), then book when they answer"
         }
 
-        if let e = CallToolLogic.timeGuard(callAt, now: now) { return e }
+        if let e = CallToolLogic.timeGuard(callAt, now: now, blocks: api.getBlocks(), calendar: calendar) { return e }
 
-        // One live call per anchor: the task when given, else the label (web),
-        // plus the same-minute standalone rule.
-        let live = try await client.list(upcoming: true)
-        if let dup = CallToolLogic.duplicate(in: live, taskId: task?.id, blockId: blockId, callAt: callAt, label: label) {
-            return "error: a call is already booked for \"\(dup.label)\" at \(CallToolLogic.fmt(dup.effectiveAtDate ?? callAt)) id=\(dup.id) — update_call or cancel_call it"
+        // One live call per anchor: the task when given, else the label (web rule).
+        let live = try await store.liveCalls()
+        if let dup = CallToolLogic.duplicate(in: live, taskId: task?.id, label: label) {
+            return "error: a call is already booked for \"\(dup.label)\" at \(CallToolLogic.fmt(dup.callAtDate ?? callAt, calendar: calendar)) id=\(dup.id) — update_call or cancel_call it"
         }
 
-        let row = try await client.create(userId: userId, taskId: task?.id, blockId: blockId,
-                                          callAt: callAt, leadMin: leadMin, label: label, notes: notes)
-        return "ok: call booked \(CallToolLogic.fmt(callAt)) \"\(label)\" (\(CallToolLogic.notesCount(notes))) id=\(row.id)"
+        let row = try await store.book(userId: userId, taskId: task?.id, blockId: blockId,
+                                       callAt: callAt, leadMin: leadMin, label: label, notes: notes)
+        return "ok: call booked \(CallToolLogic.fmt(callAt, calendar: calendar)) \"\(label)\" (\(CallToolLogic.notesCount(notes))) id=\(row.id)"
     }
 
     // MARK: cancel_call(callId)
 
-    private static func cancelCall(_ args: [String: Any], client: CallsClient) async throws -> String {
+    private static func cancelCall(_ args: [String: Any], store: any CallStore, calendar: Calendar) async throws -> String {
         guard let id = CallToolLogic.str(args["callId"]) ?? CallToolLogic.str(args["id"]) else {
             return "error: callId required — use get_calls to find it"
         }
-        guard let row = try await client.get(id: id) else { return "error: call not found — use get_calls" }
+        guard let row = try await store.call(id: id) else { return "error: call not found — use get_calls" }
         guard row.isLive else { return "error: that call is already \(row.status)" }
-        try await client.cancel(id: id)
-        return "ok: cancelled the call about \"\(row.label)\" (\(CallToolLogic.fmt(row.callAtDate)))"
+        guard let cancelled = try await store.cancelCall(id: id) else { return changedUnderneath }
+        return "ok: cancelled the call about \"\(cancelled.label)\" (\(CallToolLogic.fmt(cancelled.callAtDate, calendar: calendar)))"
     }
 
     // MARK: update_call(callId, notes | when | leadMin | label)
 
-    private static func updateCall(_ args: [String: Any], model: AppModel, client: CallsClient, now: Date) async throws -> String {
+    private static func updateCall(_ args: [String: Any], api: AssistantAppState, store: any CallStore,
+                                   now: Date, calendar: Calendar) async throws -> String {
         guard let id = CallToolLogic.str(args["callId"]) ?? CallToolLogic.str(args["id"]) else {
             return "error: callId required — use get_calls to find it"
         }
-        guard let row = try await client.get(id: id) else { return "error: call not found — use get_calls" }
+        guard let row = try await store.call(id: id) else { return "error: call not found — use get_calls" }
         guard row.isLive else { return "error: that call is already \(row.status) — book a new one with request_call" }
-        let notes = args["notes"] != nil ? CallToolLogic.notes(args["notes"]) : nil
+        // A JSON `null` (NSNull) or an absent key leaves the notes untouched;
+        // only a real array/string replaces them.
+        let notes: [String]? = CallToolLogic.isPresent(args["notes"]) ? CallToolLogic.notes(args["notes"]) : nil
         let label = CallToolLogic.str(args["label"]).map { String($0.prefix(120)) }
         let whenRaw = CallToolLogic.str(args["when"]) ?? CallToolLogic.joinDateTime(args)
         let lead = CallToolLogic.int(args["leadMin"])
@@ -156,7 +228,7 @@ enum CallTools {
         var leadPatch: Int?? = nil
         var blockPatch: String?? = nil
         if let whenRaw {
-            guard let d = CallToolLogic.parseWhen(whenRaw, now: now) else {
+            guard let d = CallToolLogic.parseWhen(whenRaw, now: now, calendar: calendar) else {
                 return "error: when must be 'YYYY-MM-DD HH:MM' in the user's local time (got \"\(whenRaw)\")"
             }
             callAt = d
@@ -164,35 +236,39 @@ enum CallTools {
             blockPatch = .some(nil)
         } else if let lead {
             guard let taskId = row.taskId else { return "error: this call isn't anchored to a task — give a time instead" }
-            let blocks = (try? model.db?.blocks(forTask: taskId)) ?? []
-            guard let block = CallToolLogic.nextLiveBlock(blocks, now: now), let start = CallToolLogic.blockStart(block) else {
+            guard let block = nextLiveBlock(api, taskId: taskId),
+                  let start = CallToolLogic.blockStart(block, calendar: calendar) else {
                 return "error: the task has no scheduled time any more — schedule_task it first"
             }
             callAt = start.addingTimeInterval(TimeInterval(-lead * 60))
             leadPatch = .some(lead)
             blockPatch = .some(block.id)
         }
-        if let callAt, let e = CallToolLogic.timeGuard(callAt, now: now) { return e }
+        if let callAt, let e = CallToolLogic.timeGuard(callAt, now: now, blocks: api.getBlocks(), calendar: calendar) { return e }
 
-        let updated = try await client.update(id: id, callAt: callAt, blockId: blockPatch, leadMin: leadPatch,
-                                              label: label, notes: notes)
-        let r = updated ?? row
-        return "ok: updated call \"\(r.label)\" — \(CallToolLogic.fmt(r.callAtDate)), \(CallToolLogic.notesCount(r.notes)) id=\(r.id)"
+        guard let r = try await store.patch(id: id, callAt: callAt, blockId: blockPatch, leadMin: leadPatch,
+                                            label: label, notes: notes) else { return changedUnderneath }
+        return "ok: updated call \"\(r.label)\" — \(CallToolLogic.fmt(r.callAtDate, calendar: calendar)), \(CallToolLogic.notesCount(r.notes)) id=\(r.id)"
     }
 
     // MARK: get_calls()
 
-    private static func getCalls(model: AppModel, client: CallsClient) async throws -> String {
-        let rows = try await client.list(upcoming: true)
+    private static func getCalls(api: AssistantAppState, scratch: TurnScratch, store: any CallStore,
+                                 calendar: Calendar) async throws -> String {
+        let rows = try await store.liveCalls()
             .sorted { ($0.callAtDate ?? .distantFuture) < ($1.callAtDate ?? .distantFuture) }
         guard !rows.isEmpty else { return "ok: no calls booked" }
-        let tasks = (try? model.taskRepo?.all()) ?? []
-        return CallToolLogic.formatCalls(rows, taskName: { id in tasks.first { $0.id == id }?.name })
+        return CallToolLogic.formatCalls(rows, taskName: { findTask($0, api: api, scratch: scratch)?.name },
+                                         calendar: calendar)
     }
 }
 
 /// Pure helpers (tested in CallScriptTests).
 enum CallToolLogic {
+    /// Web `MAX_CALL_NOTES` / per-note cap.
+    static let maxNotes = 20
+    static let maxNoteLength = 300
+
     static func str(_ v: Any?) -> String? {
         guard let s = v as? String else { return nil }
         let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -206,14 +282,20 @@ enum CallToolLogic {
         default: return nil
         }
     }
-    /// notes: an array of strings, or one string split on newlines / " ; ".
+    /// A key that is there AND not JSON `null` (JSONSerialization → NSNull).
+    static func isPresent(_ v: Any?) -> Bool {
+        guard let v else { return false }
+        return !(v is NSNull)
+    }
+    /// notes: an array of strings, or one string split on NEWLINES only (a
+    /// note may contain ";"). Trimmed, blanks dropped, 300 chars × 20 (web).
     static func notes(_ v: Any?) -> [String] {
         let raw: [String]
         if let a = v as? [Any] { raw = a.compactMap { $0 as? String } }
-        else if let s = v as? String { raw = s.components(separatedBy: CharacterSet.newlines).flatMap { $0.components(separatedBy: ";") } }
+        else if let s = v as? String { raw = s.components(separatedBy: CharacterSet.newlines) }
         else { raw = [] }
         return Array(raw.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }.map { String($0.prefix(200)) }.prefix(8))
+            .filter { !$0.isEmpty }.map { String($0.prefix(maxNoteLength)) }.prefix(maxNotes))
     }
     static func notesCount(_ n: [String]) -> String { "\(n.count) note\(n.count == 1 ? "" : "s")" }
 
@@ -247,41 +329,36 @@ enum CallToolLogic {
         return "ok: \(rows.count) upcoming call\(rows.count == 1 ? "" : "s"):\n" + lines.joined(separator: "\n")
     }
 
-    /// Past-time + server-window guards → the error string, or nil when fine.
-    static func timeGuard(_ callAt: Date, now: Date, calendar: Calendar = .current) -> String? {
-        if callAt.timeIntervalSince(now) < -30 {
-            if calendar.isDate(callAt, inSameDayAs: now) {
-                return "error: \(CallSettings.hhmm(callAt, calendar: calendar)) today is already past (it's \(CallSettings.hhmm(now, calendar: calendar)) now). Ask for a later time."
-            }
-            return "error: \(fmt(callAt, calendar: calendar)) is in the PAST (it's \(fmt(now, calendar: calendar)) now). Ask for a later time or another day."
-        }
+    /// Past-date / past-time (the SHARED UnstuckCore refusals, with the day's
+    /// free windows / the "use <date> — see context.upcoming" repair hint)
+    /// then the server window → the error string, or nil when fine. `blocks`
+    /// = the executor's live blocks (for the free windows).
+    static func timeGuard(_ callAt: Date, now: Date, blocks: [CalBlock] = [], calendar: Calendar = .current) -> String? {
+        let today = ymd(now, calendar: calendar)
+        let date = ymd(callAt, calendar: calendar)
+        if let e = rejectPastDate(today: today, date: date) { return e }
+        if let e = rejectPastTime(blocks: blocks, today: today, date: date,
+                                  startTime: CallSettings.hhmm(callAt, calendar: calendar),
+                                  nowHM: CallSettings.hhmm(now, calendar: calendar)) { return e }
         if !CallSettings.isWithinServerWindow(callAt, calendar: calendar) {
             return "error: calls can only be booked between \(CallSettings.serverWindowStart) and \(CallSettings.serverWindowEnd) — suggest a time inside that window"
         }
         return nil
     }
 
-    /// One live call per anchor: same task (task-anchored), else — standalone —
-    /// the same label (case-insensitive, the web rule) or the same minute.
-    static func duplicate(in live: [CallRequest], taskId: String?, blockId: String?, callAt: Date,
-                          label: String? = nil) -> CallRequest? {
-        if let taskId, let hit = live.first(where: { $0.taskId == taskId && ($0.blockId == nil || blockId == nil || $0.blockId == blockId) }) {
-            return hit
-        }
-        if let label = label?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !label.isEmpty,
-           let hit = live.first(where: { $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == label }) {
-            return hit
-        }
-        let minute = floor(callAt.timeIntervalSince1970 / 60)
-        return live.first { r in
-            guard let d = r.effectiveAtDate else { return false }
-            return floor(d.timeIntervalSince1970 / 60) == minute
-        }
+    /// One live call per anchor — the web rule exactly: with a task, any live
+    /// call for that task; without, a case-insensitive label match. Nothing else.
+    static func duplicate(in live: [CallRequest], taskId: String?, label: String?) -> CallRequest? {
+        let rows = live.filter(\.isLive)
+        if let taskId { return rows.first { $0.taskId == taskId } }
+        guard let label = label?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !label.isEmpty else { return nil }
+        return rows.first { $0.label.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == label }
     }
 
-    /// The task's next live task-block (today or later, not done/skipped).
+    /// The task's next live task-block (today or later, not done/skipped) —
+    /// the task-editor's anchor (CallMeSection has the task's own blocks).
     static func nextLiveBlock(_ blocks: [CalBlock], now: Date, calendar: Calendar = .current) -> CalBlock? {
-        let today = Clock.dateISO(now)
+        let today = ymd(now, calendar: calendar)
         return blocks
             .filter { isTaskBlock($0) && !$0.done && !$0.skipped && $0.date >= today }
             .sorted { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
@@ -297,11 +374,15 @@ enum CallToolLogic {
         return calendar.date(from: c)
     }
 
+    /// "YYYY-MM-DD" local.
+    static func ymd(_ d: Date, calendar: Calendar = .current) -> String {
+        let c = calendar.dateComponents([.year, .month, .day], from: d)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
     /// "YYYY-MM-DD HH:MM" local.
     static func fmt(_ d: Date?, calendar: Calendar = .current) -> String {
         guard let d else { return "?" }
-        let c = calendar.dateComponents([.year, .month, .day], from: d)
-        let ymd = String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
-        return "\(ymd) \(CallSettings.hhmm(d, calendar: calendar))"
+        return "\(ymd(d, calendar: calendar)) \(CallSettings.hhmm(d, calendar: calendar))"
     }
 }

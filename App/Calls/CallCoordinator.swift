@@ -2,9 +2,11 @@
 //
 //   VoIP push ──▶ reportIncoming ──▶ CXProvider.reportNewIncomingCall (SYNC)
 //                     │
-//                     ├─ outside call hours → end .declinedElsewhere, outcome declined, notify
-//                     ├─ focus session live → end .answeredElsewhere, outcome busy, notify
-//                     ├─ anchor gone        → end .remoteEnded, outcome stale (silent)
+//                     ├─ same uuid as the live call → duplicate push: state untouched
+//                     ├─ nobody signed in     → end .failed, silent (no outcome, no notes)
+//                     ├─ outside call hours   → end .declinedElsewhere, outcome declined, notify
+//                     ├─ focus session live   → end .answeredElsewhere, outcome busy, notify
+//                     ├─ anchor gone          → end .remoteEnded, outcome stale (silent)
 //                     └─ else ring; 30 s unanswered → .unanswered, outcome missed, notify
 //   CXAnswerCallAction ──▶ performAnswer (configure audio, fulfil, outcome answered)
 //   provider(_:didActivate:) ──▶ audioSessionDidActivate ──▶ launcher.start
@@ -13,6 +15,12 @@
 // Everything CallKit / PushKit / AVFoundation / network is behind the seams in
 // CallSeams.swift, so this file is plain Swift and fully unit-tested
 // (CallCoordinatorTests). `shared` binds the real CallKit bridge.
+//
+// ONE END PER CALL: `endActiveCall` records `pendingEnd` and asks CallKit to
+// end the call (CXEndCallAction → `performEnd`, ASYNC). Anything that wants
+// to end the call while that transaction is in flight — the launcher's
+// `onEnded`, a second snooze, the grace timer — is a no-op: `pendingEnd`
+// already set ⇒ one CXEndCallAction, one outcome report.
 //
 // Killed-state launches: PushKit delivers the push before AppModel.start()
 // runs. `reportIncoming` never waits on AppModel — the environment defaults
@@ -50,7 +58,8 @@ final class CallCoordinator {
         var phase: Phase
         var muted = false
         /// Set by an app-initiated hang-up (snooze / launcher ended) before the
-        /// CXEndCallAction round-trips, so `performEnd` knows the reason.
+        /// CXEndCallAction round-trips, so `performEnd` knows the reason — and
+        /// so a second hang-up while it's in flight is ignored.
         var pendingEnd: CallEndReason?
         var launcherRunning = false
     }
@@ -131,15 +140,33 @@ final class CallCoordinator {
 
     func reportIncoming(_ payload: IncomingCallPayload) {
         let session = CallSession(payload: payload, receivedAt: clock.now)
+
+        // A retried / duplicated push for the call that is ALREADY up (same
+        // callId ⇒ same CXCall UUID): Apple still requires a report per push,
+        // CallKit answers it with callUUIDAlreadyExists — swallow that, and
+        // touch NOTHING (phase, launcher, timers stay exactly as they are).
+        if let cur = active, cur.session.uuid == session.uuid {
+            provider.reportIncoming(uuid: session.uuid, callerName: "Unstuck · \(session.label)") { _ in }
+            return
+        }
+
         // Report FIRST, synchronously — every rule below runs after this line.
         provider.reportIncoming(uuid: session.uuid, callerName: "Unstuck · \(session.label)") { [weak self] error in
             self?.reportCompleted(uuid: session.uuid, error: error)
         }
 
+        // Nobody signed in (a reactive sign-out left the VoIP token registered):
+        // drop it at once — no ring, no outcome (no JWT to report with), and
+        // never the previous account's notes as a notification.
+        guard environment.isSignedIn else {
+            provider.reportEnded(uuid: session.uuid, reason: .failed)
+            return
+        }
+
         // A second push while a call is up (CallKit allows one — maximumCallGroups=1).
         if let cur = active, cur.session.uuid != session.uuid {
             provider.reportEnded(uuid: session.uuid, reason: .answeredElsewhere)
-            reporter.report(callId: session.callId, outcome: .busy, snoozeMinutes: nil, outcomeNotes: nil)
+            report(session, .busy)
             notifier.post(CallNotifications.busy(session))
             return
         }
@@ -170,21 +197,22 @@ final class CallCoordinator {
     }
 
     /// `reportNewIncomingCall` failed (Do Not Disturb / a Focus filtered it,
-    /// duplicate UUID, …): if we're still ringing, treat it as missed — the
-    /// user never saw it. A call already ended by a receipt rule is left alone.
+    /// …): if we're still ringing, treat it as missed — the user never saw
+    /// it. A call already ended by a receipt rule is left alone. (A duplicate
+    /// push's callUUIDAlreadyExists never reaches here — see reportIncoming.)
     private func reportCompleted(uuid: UUID, error: Error?) {
         guard let error, let cur = active, cur.session.uuid == uuid, cur.phase == .ringing else { return }
         _ = error
         ringTimer?.cancel(); ringTimer = nil
         active = nil
-        reporter.report(callId: cur.session.callId, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        report(cur.session, .missed)
         notifier.post(CallNotifications.missed(cur.session))
     }
 
     private func endSilently(_ session: CallSession, reason: CallEndedReason, outcome: CallOutcome,
                              notification: CallNotification?) {
         provider.reportEnded(uuid: session.uuid, reason: reason)
-        reporter.report(callId: session.callId, outcome: outcome, snoozeMinutes: nil, outcomeNotes: nil)
+        report(session, outcome)
         if let notification { notifier.post(notification) }
         active = nil
     }
@@ -194,8 +222,14 @@ final class CallCoordinator {
         ringTimer = nil
         active = nil
         provider.reportEnded(uuid: uuid, reason: .unanswered)
-        reporter.report(callId: cur.session.callId, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        report(cur.session, .missed)
         notifier.post(CallNotifications.missed(cur.session))
+    }
+
+    private func report(_ session: CallSession, _ outcome: CallOutcome,
+                        snoozeMinutes: Int? = nil, outcomeNotes: [String]? = nil) {
+        reporter.report(callId: session.callId, callKitId: session.uuid, outcome: outcome,
+                        snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes)
     }
 
     // MARK: - CallKit events (forwarded by CallKitProvider)
@@ -224,7 +258,7 @@ final class CallCoordinator {
         provider.configureAudioSession()
         cur.phase = .answering
         active = cur
-        reporter.report(callId: cur.session.callId, outcome: .answered, snoozeMinutes: nil, outcomeNotes: nil)
+        report(cur.session, .answered)
         if audioActive { startVoice() }   // rare: audio already up (reset mid-call)
         return true
     }
@@ -242,16 +276,15 @@ final class CallCoordinator {
         switch cur.phase {
         case .ringing:
             // Declined from the CallKit UI. Logged; no notification — they saw it.
-            reporter.report(callId: session.callId, outcome: .declined, snoozeMinutes: nil, outcomeNotes: nil)
+            report(session, .declined)
         case .answering, .active:
             switch cur.pendingEnd ?? .hungUp {
             case .snoozed(let minutes):
-                reporter.report(callId: session.callId, outcome: .snoozed, snoozeMinutes: minutes, outcomeNotes: nil)
+                report(session, .snoozed, snoozeMinutes: minutes)
             case .hungUp:
-                reporter.report(callId: session.callId, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+                report(session, .done)
             case .failed(let why):
-                reporter.report(callId: session.callId, outcome: .done, snoozeMinutes: nil,
-                                outcomeNotes: ["voice failed: \(why)"])
+                report(session, .done, outcomeNotes: ["voice failed: \(why)"])
                 notifier.post(CallNotifications.voiceFailed(session))
             }
         }
@@ -306,6 +339,8 @@ final class CallCoordinator {
         }
     }
 
+    /// The launcher's conversation ended on its own. If a hang-up is already
+    /// in flight (snooze), this is just the launcher confirming — no second end.
     private func launcherEnded(uuid: UUID, reason: CallEndReason) {
         guard var cur = active, cur.session.uuid == uuid else { return }
         cur.launcherRunning = false
@@ -317,9 +352,10 @@ final class CallCoordinator {
 
     /// Hang up from our side (snooze, the model said goodbye, voice failed):
     /// ask CallKit to end the call so the UI closes; the CXEndCallAction lands
-    /// in `performEnd` with `reason` as the pending end.
+    /// in `performEnd` with `reason` as the pending end. Idempotent: a second
+    /// call while the transaction is in flight is ignored (one end, one outcome).
     func endActiveCall(_ reason: CallEndReason) {
-        guard var cur = active else { return }
+        guard var cur = active, cur.pendingEnd == nil else { return }
         cur.pendingEnd = reason
         active = cur
         let uuid = cur.session.uuid
@@ -332,20 +368,42 @@ final class CallCoordinator {
     }
 
     /// The call-level `snooze_call` tool: "call me back in N minutes". Returns
-    /// the tool result string the model reads. Clamped 1…180.
+    /// the tool result string the model reads. Clamped 1…180. The SINGLE
+    /// source of truth for a snooze: this hangs up (→ `performEnd` stops the
+    /// launcher and reports `snoozed` once); the launcher must not end itself.
     func snoozeActiveCall(minutes: Int) -> String {
         guard let cur = active, cur.phase != .ringing else { return "error: no call is active" }
+        if case .snoozed(let m)? = cur.pendingEnd {
+            return "ok: I'll call back in \(m) minutes — say a quick goodbye; the call ends now"
+        }
         let m = min(180, max(1, minutes))
         endActiveCall(.snoozed(minutes: m))
         return "ok: I'll call back in \(m) minutes — say a quick goodbye; the call ends now"
     }
 
-    /// Fallback B: the user tapped the time-sensitive "call" alert. Hand the
-    /// session to Talk (via `onFallbackAnswer`), or buffer it until set.
+    /// Fallback B: the user tapped the time-sensitive "call" alert (or its
+    /// Answer action). Hand the session to Talk (via `onFallbackAnswer`), or
+    /// buffer it until set. Dropped when nobody is signed in.
     func handleFallbackTap(_ payload: IncomingCallPayload) {
+        guard environment.isSignedIn else { return }
         let session = CallSession(payload: payload, receivedAt: clock.now)
-        reporter.report(callId: session.callId, outcome: .answered, snoozeMinutes: nil, outcomeNotes: nil)
+        report(session, .answered)
         if let h = onFallbackAnswer { h(session) } else { pendingFallback = session }
+    }
+
+    /// The account signed out (VoipPushRegistry.unregisterBestEffort): tear
+    /// down whatever is up WITHOUT reporting or notifying — the JWT is gone
+    /// and the notes belong to the previous user.
+    func signedOut() {
+        ringTimer?.cancel(); ringTimer = nil
+        graceTimer?.cancel(); graceTimer = nil
+        awaitingLauncher = false
+        if let cur = active {
+            if cur.launcherRunning { launcher.stop() }
+            provider.reportEnded(uuid: cur.session.uuid, reason: .failed)
+        }
+        active = nil
+        pendingFallback = nil
     }
 }
 

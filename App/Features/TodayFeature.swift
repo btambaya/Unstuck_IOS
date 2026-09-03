@@ -231,7 +231,12 @@ struct TodayView: View {
     @State private var backlogActive = false
     /// Realtime "Talk" mode from the gateway card's mic — the same
     /// VoiceModeScreen cover the Assistant sheet presents for its Talk button.
-    @State private var showTalk = false
+    /// Router-owned (`AppRouter.showTalk`) so the assistant navigating from
+    /// Talk goes through the deferred deep-link path: Talk counts as an active
+    /// presentation, is dismissed, and its onDismiss presents the target.
+    private var showTalk: Binding<Bool> {
+        Binding(get: { model.router.showTalk }, set: { model.router.showTalk = $0 })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -253,7 +258,7 @@ struct TodayView: View {
                     // between the greeting and the recap/hero (additive; the
                     // classic Today continues underneath). Renders nothing
                     // while the AI kill-switch is off.
-                    GatewayCard(vm: vm, onTalk: { showTalk = true })
+                    GatewayCard(vm: vm, onTalk: { model.router.showTalk = true })
                         .padding(.horizontal, 18).padding(.top, 10)
                     // "Just now" session recap — shows for 6h after a finished
                     // focus session, between the gateway and the hero
@@ -282,13 +287,16 @@ struct TodayView: View {
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
         // Gateway mic → realtime Talk. Same cover the Assistant sheet uses.
-        .fullScreenCover(isPresented: $showTalk) { VoiceModeScreen() }
+        // onDismiss flushes a deep link the assistant parked while Talk was
+        // up (open_screen → insights / inbox / settings) so it presents once
+        // the cover is fully gone.
+        .fullScreenCover(isPresented: showTalk, onDismiss: { model.flushPendingDeepLink() }) { VoiceModeScreen() }
         .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
             showSettings = false; showNotifCenter = false; showPalette = false; showInsights = false
-            showTalk = false
+            model.router.showTalk = false
         }
         .task {
             model.shareState.start()   // live "shared with you" + delegation state

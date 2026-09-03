@@ -11,9 +11,15 @@
 //     lead_min?, label, notes text[], status, snooze_until, outcome_notes text[],
 //     call_id, attempts, created_at, updated_at)
 //   status: scheduled|calling|answered|declined|missed|busy|snoozed|stale|cancelled|done
-//   call-outcome (user JWT): { callId, outcome, snoozeMinutes?, outcomeNotes?[] }
+//   call-outcome (user JWT): { callId, outcome, snoozeMinutes?, outcomeNotes?[], callKitId? }
 // `callId` on call-outcome is the id the VoIP push carried (payload.callId),
-// passed through verbatim — the server resolves it to the row.
+// passed through verbatim — the server resolves it to the row; `callKitId` is
+// the CXCall UUID the phone presented (stored on the row as `call_id`).
+//
+// Writes that can lose a race (update / cancel) are compare-and-set on the
+// row still being LIVE and return the row the server actually wrote — nil
+// means zero rows matched (the call was cancelled / rang / finished
+// underneath the caller), and callers must say so rather than echo stale state.
 
 import Foundation
 import Supabase
@@ -115,18 +121,21 @@ public struct CallsClient: Sendable {
     /// `snoozeMinutes` only with `.snoozed`; `outcomeNotes` are free-text lines
     /// the conversation produced (what got ticked off / added).
     public func outcome(callId: String, outcome: CallOutcome,
-                        snoozeMinutes: Int? = nil, outcomeNotes: [String]? = nil) async throws {
+                        snoozeMinutes: Int? = nil, outcomeNotes: [String]? = nil,
+                        callKitId: String? = nil) async throws {
         struct Body: Encodable {
             let callId: String
             let outcome: String
             let snoozeMinutes: Int?
             let outcomeNotes: [String]?
+            let callKitId: String?
         }
         try await client.functions.invoke(
             "call-outcome",
             options: FunctionInvokeOptions(method: .post, body: Body(
                 callId: callId, outcome: outcome.rawValue,
-                snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes)))
+                snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes,
+                callKitId: callKitId)))
     }
 
     // MARK: - reads
@@ -198,7 +207,8 @@ public struct CallsClient: Sendable {
     }
 
     /// Patch a booked call — only the given fields change. Re-arms a snoozed
-    /// row back to `scheduled` when its time is moved.
+    /// row back to `scheduled` when its time is moved. Compare-and-set on the
+    /// row still being live: nil ⇒ nothing was written (it changed underneath).
     @discardableResult
     public func update(id: String, callAt: Date? = nil, blockId: String?? = nil, leadMin: Int?? = nil,
                        label: String? = nil, notes: [String]? = nil) async throws -> CallRequest? {
@@ -215,22 +225,38 @@ public struct CallsClient: Sendable {
         let rows: [CallRequest] = try await client.from("call_requests")
             .update(patch)
             .eq("id", value: id)
+            .in("status", values: CallRequest.liveStatuses)
             .select()
             .execute().value
         return rows.first
     }
 
     /// Cancel a booked call (status → cancelled; the row stays for history).
-    public func cancel(id: String) async throws {
+    /// Compare-and-set on the row still being live: the cancelled row, or nil
+    /// when zero rows matched (already cancelled / rang / done elsewhere).
+    @discardableResult
+    public func cancel(id: String) async throws -> CallRequest? {
         let patch: [String: AnyJSON] = [
             "status": .string("cancelled"),
             "updated_at": .string(Self.iso(Date())),
         ]
-        _ = try await client.from("call_requests").update(patch).eq("id", value: id).execute()
+        let rows: [CallRequest] = try await client.from("call_requests")
+            .update(patch)
+            .eq("id", value: id)
+            .in("status", values: CallRequest.liveStatuses)
+            .select()
+            .execute().value
+        return rows.first
     }
 
     // MARK: - time helpers
 
+    // THREAD SAFETY of the shared formatters (here and in the app's
+    // IncomingCallPayload): ISO8601DateFormatter is documented thread-safe —
+    // like DateFormatter since iOS 7 — once configured. Both instances are
+    // configured exactly once inside their static initializer and never
+    // mutated afterwards, so `nonisolated(unsafe)` only opts them out of the
+    // Swift 6 global-actor check; there is no data race to guard.
     nonisolated(unsafe) private static let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]

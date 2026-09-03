@@ -3,7 +3,36 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-02, latest) — AI gateway + calls (port of the web gateway)
+## Where things stand (2026-09-03, latest) — review round (3 independent reviewers → 49 findings → all fixed) + TestFlight 1.1.0 (34)
+
+Three independent reviews (harness/contract/data; CallKit/PushKit/voice; surfaces/parity) of the
+2026-09-02 build-out produced 25 + 8 + 16 findings; every one is fixed and covered by tests
+(packages 782, app bundle 368, all green). What matters to know:
+
+- **Executor writes now AWAIT the write-through** (`AppModel.*Awaiting` variants): a turn that
+  creates, schedules and deletes a task leaves no ghost block; `add_capture` → `promote_capture`
+  in one turn works. The UI's fire-and-forget methods wrap the awaiting ones.
+- **Calls:** a duplicate VoIP push for the same callId is a state no-op (CallKit still gets its
+  report); a spoken "call me back in ten" issues exactly ONE end transaction (the coordinator is
+  the single source of truth; the test fake now completes CallKit actions asynchronously); call
+  tools resolve tasks through the turn scratch and use the shared past-date/past-time strings;
+  outcomes are persisted + retried in order; `UNSTUCK_CALL` category with an Answer action; a
+  fallback call arriving while Talk is open takes over the open screen; signed-out devices drop
+  calls and unregister the VoIP token.
+- **Memory/surfaces:** the interview waits for the first `profile_facts` hydrate
+  (`AppModel.profileFactsHydrated`); "Skip for now" parks (resumable), "I'm done" finishes;
+  work-hours facts are `context` (web parity); people free text keeps "Maleek — son, 9" as one
+  fact; `open_screen` goes through the deferred deep-link path (works from the sheet and Talk),
+  switches calendar mode, reaches People / Areas in Settings; moments are memoised.
+- **Honesty:** `unshare_task`, `set_notification_level`, `set_reminder_lead`, `save_profile_fact`
+  (store failure vs filter), `update_call`/`cancel_call` (zero rows) report failure instead of
+  `ok:`; ADHD struggles are canonicalised (`AppModel.canonicalStruggles`) so the engine's
+  "Starting" rules fire.
+
+Device-only validation unchanged (see the 2026-09-02 section): VoIP ring on a physical iPhone,
+CallKit audio after `didActivate`, snooze re-ring, fallback-B, take-over while Talk is open.
+
+## Where things stand (2026-09-02) — AI gateway + calls (port of the web gateway)
 
 Plan: `../unstuck/docs/ios-gateway-plan.md`. Source of truth: the web's
 `lib/assistant/*`, `components/dashboard/gateway-card.tsx`,

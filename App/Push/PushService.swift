@@ -127,9 +127,11 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         let drifted = info["drifted"] as? Bool ?? false
 
         // Fallback B for "Unstuck calls you": a time-sensitive alert push with
-        // kind='call' (no VoIP token registered). A tap on it opens the call
+        // kind='call' (no VoIP token registered). A tap on it — or its
+        // "Answer" action (category UNSTUCK_CALL) — opens the call
         // conversation in Talk with the same payload the VoIP path would get.
-        if response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+        if response.actionIdentifier == UNNotificationDefaultActionIdentifier
+            || response.actionIdentifier == NotificationCategories.actionAnswerCall,
            PushAppDelegate.callKind(info) == "call",
            let payload = IncomingCallPayload(dictionary: info) {
             let posted = PostedNotification(response.notification)

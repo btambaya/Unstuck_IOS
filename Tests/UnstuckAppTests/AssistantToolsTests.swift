@@ -10,6 +10,7 @@
 import XCTest
 import Supabase
 import UnstuckCore
+import UnstuckSync
 @testable import Unstuck
 
 // MARK: - the in-memory app state
@@ -42,10 +43,21 @@ final class FakeAssistantState: AssistantAppState {
     var canEditOverride: Bool?
     var notificationSaveOk = true
     var reminderSaveOk = true
+    /// false → the revoke RPC "failed" (nothing recorded, shares untouched).
+    var unshareOk = true
+    /// Set → every profile-fact save throws this reason.
+    var factSaveError: ProfileFactSaveError?
+    /// Simulated commit latency for the store writes — the production seam
+    /// hops to the WriteThrough actor and returns after the GRDB commit; a
+    /// non-zero value proves the executor waits for that before reading.
+    var writeLatencyNs: UInt64 = 0
     var today = Clock.todayISO()
     var now = "10:00"
     private var seq = 0
     func nid(_ p: String) -> String { seq += 1; return "\(p)\(seq)" }
+    private func commit() async {
+        if writeLatencyNs > 0 { try? await Task.sleep(nanoseconds: writeLatencyNs) }
+    }
 
     func getTasks() -> [TaskItem] { tasks }
     func getBlocks() -> [CalBlock] { blocks }
@@ -56,14 +68,16 @@ final class FakeAssistantState: AssistantAppState {
     func todayIso() -> String { today }
     func nowHM() -> String { now }
 
-    func upsertTask(_ t: TaskItem) {
+    func upsertTask(_ t: TaskItem) async {
+        await commit()
         if let i = tasks.firstIndex(where: { $0.id == t.id }) { tasks[i] = t } else { tasks.append(t) }
     }
-    func removeTask(_ id: String) { tasks.removeAll { $0.id == id } }
-    func upsertBlock(_ b: CalBlock) {
+    func removeTask(_ id: String) async { await commit(); tasks.removeAll { $0.id == id } }
+    func upsertBlock(_ b: CalBlock) async {
+        await commit()
         if let i = blocks.firstIndex(where: { $0.id == b.id }) { blocks[i] = b } else { blocks.append(b) }
     }
-    func deleteBlock(_ id: String) { blocks.removeAll { $0.id == id } }
+    func deleteBlock(_ id: String) async { await commit(); blocks.removeAll { $0.id == id } }
 
     private func patch(_ id: String, _ fn: (inout ItemCollection) -> Void) {
         guard let i = collections.firstIndex(where: { $0.id == id }) else { return }
@@ -108,12 +122,14 @@ final class FakeAssistantState: AssistantAppState {
     func getCirclePeople() -> [CirclePerson] { people }
     func listTaskShares(taskId: String) async -> [TaskShareInfo] { shares[taskId] ?? [] }
     func unshareTask(shareId: String) async throws {
+        guard unshareOk else { throw AssistantStateError.revokeFailed }
         unshared.append(shareId)
         for k in shares.keys { shares[k] = shares[k]?.filter { $0.shareId != shareId } }
     }
 
     func getProfileFacts() -> [ProfileFact] { facts }
-    func saveProfileFact(category: String?, fact: String, whenIso: String?) -> ProfileFact? {
+    func saveProfileFact(category: String?, fact: String, whenIso: String?) throws -> ProfileFact {
+        if let factSaveError { throw factSaveError }
         let f = ProfileFact(id: nid("f"), category: ProfileFactsLogic.category(from: category), fact: fact, source: .chat,
                             whenIso: whenIso, createdAt: "2026-09-02T09:00:00.000Z", updatedAt: "2026-09-02T09:00:00.000Z")
         facts.append(f)
@@ -138,10 +154,11 @@ final class FakeAssistantState: AssistantAppState {
 
     func getCaptures() -> [Capture] { captures }
     func getArchivedCaptureIds() -> [String] { archivedIds }
-    func upsertCapture(_ c: Capture) {
+    func upsertCapture(_ c: Capture) async {
+        await commit()
         if let i = captures.firstIndex(where: { $0.id == c.id }) { captures[i] = c } else { captures.append(c) }
     }
-    func removeCapture(_ id: String) { captures.removeAll { $0.id == id } }
+    func removeCapture(_ id: String) async { await commit(); captures.removeAll { $0.id == id } }
     func archiveCapture(_ id: String, archived: Bool) {
         archivedIds.removeAll { $0 == id }
         if archived { archivedIds.append(id) }
@@ -160,20 +177,25 @@ final class FakeAssistantState: AssistantAppState {
     func navigate(screen: String, id: String?) { navigated.append(screen + (id.map { "?id=\($0)" } ?? "")) }
 
     func getAreaRows() -> [LifeArea] { areas }
-    func addArea(name: String, color: String?) { areas.append(LifeArea(id: nid("ar"), name: name, color: color ?? "indigo", sortOrder: areas.count)) }
-    func updateArea(_ id: String, name: String?, color: String?) {
+    func addArea(name: String, color: String?) async {
+        await commit()
+        areas.append(LifeArea(id: nid("ar"), name: name, color: color ?? "indigo", sortOrder: areas.count))
+    }
+    func updateArea(_ id: String, name: String?, color: String?) async {
+        await commit()
         guard let i = areas.firstIndex(where: { $0.id == id }) else { return }
         if let name { areas[i].name = name }
         if let color { areas[i].color = color }
     }
-    func removeArea(_ id: String) { areas.removeAll { $0.id == id } }
+    func removeArea(_ id: String) async { await commit(); areas.removeAll { $0.id == id } }
     func getTagRows() -> [TagRow] { tagRows }
-    func addTag(name: String) { tagRows.append(TagRow(id: nid("tg"), name: name, sortOrder: tagRows.count)) }
-    func updateTag(_ id: String, name: String?) {
+    func addTag(name: String) async { await commit(); tagRows.append(TagRow(id: nid("tg"), name: name, sortOrder: tagRows.count)) }
+    func updateTag(_ id: String, name: String?) async {
+        await commit()
         guard let i = tagRows.firstIndex(where: { $0.id == id }) else { return }
         if let name { tagRows[i].name = name }
     }
-    func removeTag(_ id: String) { tagRows.removeAll { $0.id == id } }
+    func removeTag(_ id: String) async { await commit(); tagRows.removeAll { $0.id == id } }
 
     func setUsableMinutes(weekday: Int?, weekend: Int?) async { prefCalls.append("usable:\(weekday.map(String.init) ?? "-"):\(weekend.map(String.init) ?? "-")") }
     func setNotificationLevel(_ level: String) async -> Bool { prefCalls.append("notif:\(level)"); return notificationSaveOk }
@@ -520,6 +542,54 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.blocks.first { $0.id == "b_td" }?.date, TOMORROW)
     }
 
+    func testCarryToTomorrowIgnoresBlocksWithoutATask() async {
+        // Web parity: `b.taskId && …` — a task-less slot has nothing to carry.
+        api.blocks = [CalBlock(id: "p", taskId: nil, taskName: "Lunch", startTime: "12:00", durationMinutes: 30, date: TODAY, kind: .task)]
+        await eq("carry_to_tomorrow", "{}", "error: nothing left on today to carry")
+        XCTAssertEqual(api.blocks[0].date, TODAY)
+    }
+
+    // MARK: write ordering (review of 2a73c7c)
+    //
+    // The production seam commits each write to GRDB before returning; the
+    // executor reads the store between its own writes. These run with a
+    // simulated commit latency so a write that returned BEFORE its row landed
+    // would surface as "not found" / a ghost row, exactly as it did on device.
+
+    func testOneTurnCreateScheduleDeleteLeavesNoGhostBlock() async {
+        api.writeLatencyNs = 5_000_000
+        let created = await run("create_task", #"{"name":"Alpha"}"#)
+        let id = created.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        await eq("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"09:00"}"#, "ok: scheduled \"Alpha\" \(TOMORROW) 09:00")
+        XCTAssertEqual(api.blocks.count, 1)
+        await eq("delete_task", #"{"taskId":"\#(id)"}"#, "ok: deleted \"Alpha\"")
+        XCTAssertTrue(api.blocks.isEmpty, "the block scheduled this turn must go with the task")
+        XCTAssertTrue(api.tasks.isEmpty)
+    }
+
+    func testOneTurnAddCaptureThenPromoteItSucceeds() async {
+        api.writeLatencyNs = 5_000_000
+        let added = await run("add_capture", #"{"body":"Call the plumber"}"#)
+        let id = added.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        let r = await run("promote_capture", #"{"captureId":"\#(id)"}"#)
+        XCTAssertTrue(r.hasPrefix("ok: promoted capture to task id="), r)
+        XCTAssertEqual(api.tasks.map(\.name), ["Call the plumber"])
+        XCTAssertEqual(api.captures.first?.taskId, api.tasks.first?.id)
+        XCTAssertEqual(api.archivedIds, [id])
+    }
+
+    func testUpdateTaskResizeThenScheduleKeepsTheResize() async {
+        api.writeLatencyNs = 5_000_000
+        api.tasks = [task("a", "Alpha")]
+        api.blocks = [block("live", "a", TOMORROW, "09:00")]
+        await eq("update_task", #"{"taskId":"a","estimateMin":50}"#, "ok: updated \"Alpha\"")
+        await eq("schedule_task", #"{"taskId":"a","date":"\#(NEXT_WEEK)"}"#, "ok: scheduled \"Alpha\" \(NEXT_WEEK) 09:00 (kept its existing time — say so)")
+        XCTAssertEqual(api.blocks.count, 1)
+        XCTAssertEqual(api.blocks[0].durationMinutes, 50, "the resize must not be overwritten by a stale snapshot")
+        XCTAssertEqual(api.blocks[0].date, NEXT_WEEK)
+        XCTAssertEqual(api.tasks[0].estimateMin, 50)
+    }
+
     func testGetScheduleMarksExternalEventsAndDoneSkipped() async {
         api.tasks = [task("a", "Alpha", done: true)]
         api.blocks = [block("a1", "a", TODAY, "09:00"), block("s1", "a", TODAY, "12:00", skipped: true),
@@ -734,6 +804,15 @@ final class AssistantToolsTests: XCTestCase {
         await eq("unshare_task", #"{"taskId":"a"}"#, "ok: stopped sharing \"Alpha\" with Sam")
     }
 
+    func testUnshareTaskReportsAFailedRevokeInsteadOfClaimingIt() async {
+        api.tasks = [task("a", "Alpha")]
+        api.shares = ["a": [TaskShareInfo(shareId: "s1", recipientName: "Sam", level: "view")]]
+        api.unshareOk = false
+        await eq("unshare_task", #"{"taskId":"a","person":"sam"}"#, "error: couldn't revoke the share — try again")
+        XCTAssertEqual(api.unshared, [])
+        XCTAssertEqual(api.shares["a"]?.count, 1, "the share is still there — and the model was told so")
+    }
+
     func testShareTaskOnlyStagesAConfirmCard() async {
         api.tasks = [task("a", "Alpha")]
         api.candidates = [ShareCandidate(userId: "u2", name: "Zubair")]
@@ -762,6 +841,38 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.facts.map(\.id), ["f2"])
     }
 
+    func testSaveProfileFactTellsAStoreFailureFromAFilterRejection() async {
+        let filtered = "error: that does not look like a fact I can store — only durable notes about you, not instructions"
+        // A store failure (or no store yet) must read as "retry", never "rephrase".
+        api.factSaveError = .storeFailed
+        await eq("save_profile_fact", #"{"category":"person","fact":"Sam — partner"}"#, "error: couldn't save that just now — try again")
+        api.factSaveError = .instructionLike
+        await eq("save_profile_fact", #"{"category":"person","fact":"Sam — partner"}"#, filtered)
+        api.factSaveError = .empty
+        await eq("save_profile_fact", #"{"category":"person","fact":"Sam — partner"}"#, filtered)
+        XCTAssertEqual(api.facts, [])
+        api.factSaveError = nil
+        await eq("save_profile_fact", #"{"category":"person","fact":"Sam — partner"}"#, "ok: remembered id=f1 [person] \"Sam — partner\"")
+    }
+
+    func testCanonicalStrugglesMapsTheOnboardingLabelsToTheEngineKeys() {
+        // The iOS/Android pickers stored their own labels; the engine keys on
+        // the web's. Legacy → canonical, canonical passes through, dedupe, order.
+        XCTAssertEqual(AppModel.canonicalStruggles(["Getting started", "Switching tasks", "Time blindness", "Distraction", "Overwhelm"]),
+                       ["Starting", "Switching", "Stopping", "Sustaining"])
+        XCTAssertEqual(AppModel.canonicalStruggles(["starting", "Recovering", "Starting", "Nope", " sustaining "]),
+                       ["Starting", "Recovering", "Sustaining"])
+        XCTAssertEqual(AppModel.canonicalStruggles([]), [])
+        // …so the context line the model reads resolves the engine's line.
+        api.struggles = AppModel.canonicalStruggles(["Getting started"])
+        XCTAssertEqual(buildAssistantContext(api)["struggle"],
+                       .string("Their hard part is Starting — offer a tiny first step before anything else."))
+    }
+
+    // The production seam (AppModelAssistantState) returns the REAL outcome for
+    // set_notification_level / set_reminder_lead: the local write read back,
+    // then the server mirror awaited (web parity — a failed upsert resolves
+    // false), so both `error: could not save …` branches below are reachable.
     func testSettingsTools() async {
         await eq("set_usable_minutes", #"{"weekdayMin":120}"#, "ok: usable time set — weekdays 120m")
         await eq("set_usable_minutes", #"{"weekdayMin":90,"weekendMin":240}"#, "ok: usable time set — weekdays 90m — weekends 240m")

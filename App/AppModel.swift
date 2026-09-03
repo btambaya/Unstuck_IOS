@@ -35,6 +35,14 @@ final class AppModel {
     }
     var signedIn = false
     var configured = true
+    /// True once the FIRST `profile_facts` hydrate of this sign-in has
+    /// completed — success, failure or offline alike. Surfaces that treat an
+    /// empty local memory as "never met" (the interview, the gateway card)
+    /// wait on this so a fresh install of an existing account isn't greeted
+    /// as a stranger while the pull is still in flight. Reset on sign-out so
+    /// the next account waits for its own hydrate; set immediately in the
+    /// UITest boot (nothing to pull).
+    private(set) var profileFactsHydrated = false
     /// Set when a password-RECOVERY link lands (the user tapped "Forgot
     /// password" → the email link). The recovery session authenticates them but
     /// RootView shows the set-new-password screen instead of the app until they
@@ -297,6 +305,9 @@ final class AppModel {
     func completeOnboarding(struggles: [String], areas: [String] = [],
                             firstTask: String = "", firstAction: String = "",
                             treatment: FocusTreatment? = nil) {
+        // Store the CANONICAL keys (the struggle engine + moments key on them)
+        // whatever labels the picker showed — see canonicalStruggles.
+        let struggles = Self.canonicalStruggles(struggles)
         UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
@@ -337,6 +348,57 @@ final class AppModel {
 
         if let coord = coordinator, let uid = coord.auth.currentUserId, !struggles.isEmpty {
             Task { try? await coord.preferences.setAdhdStruggles(userId: uid, struggles: struggles) }
+        }
+    }
+
+    /// The struggle vocabulary the ported engine keys on (`struggleProfile`,
+    /// `pickMoment`): the web's onboarding keys. The iOS/Android pickers
+    /// stored their own labels ("Getting started", "Switching tasks", …), so
+    /// the engine never matched and every struggle line fell to the generic
+    /// fallback. Maps legacy labels → canonical keys, passes canonical keys
+    /// through (case-insensitively), drops unknowns, dedupes, keeps order.
+    nonisolated static func canonicalStruggles(_ raw: [String]) -> [String] {
+        let canonical = ["Starting", "Sustaining", "Switching", "Stopping", "Recovering"]
+        let legacy: [String: String] = [
+            "getting started": "Starting",
+            "switching tasks": "Switching",
+            "distraction": "Sustaining",     // web: "I drift after a few minutes"
+            "time blindness": "Stopping",    // web: "hyperfocus runs me into the ground"
+            "overwhelm": "Starting",         // web: "tasks feel impossible to begin"
+        ]
+        var out: [String] = []
+        for s in raw {
+            let key = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard let mapped = canonical.first(where: { $0.lowercased() == key }) ?? legacy[key] else { continue }
+            if !out.contains(mapped) { out.append(mapped) }
+        }
+        return out
+    }
+
+    /// The canonical struggles for THIS device's account (what the engine +
+    /// the assistant context read).
+    var canonicalStruggles: [String] {
+        Self.canonicalStruggles(UserDefaults.standard.stringArray(forKey: "unstuck.adhdStruggles") ?? [])
+    }
+
+    /// Per-launch guard for the one-shot struggles pull below.
+    @ObservationIgnored private var strugglesPulledFor: String?
+
+    /// A fresh install of an existing account has no local struggles while
+    /// the server row does: pull `user_preferences.adhd_struggles` once per
+    /// sign-in when the local store is empty (canonicalised on the way in).
+    /// Driven off the profile-facts hydrate hook, so it runs when the rest of
+    /// the account's memory lands. A transport failure leaves the guard unset
+    /// so the next hydrate retries.
+    private func pullAdhdStrugglesIfNeeded() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId, strugglesPulledFor != uid else { return }
+        guard canonicalStruggles.isEmpty else { strugglesPulledFor = uid; return }
+        Task { [weak self] in
+            guard let raw = try? await coord.preferences.adhdStruggles(userId: uid) else { return }
+            guard let self, coord.auth.currentUserId == uid else { return }
+            self.strugglesPulledFor = uid
+            let mapped = Self.canonicalStruggles(raw)
+            if !mapped.isEmpty { UserDefaults.standard.set(mapped, forKey: "unstuck.adhdStruggles") }
         }
     }
 
@@ -387,6 +449,7 @@ final class AppModel {
         DemoSeed.seed(database)
         configured = true
         signedIn = true
+        profileFactsHydrated = true   // nothing to pull — the seed IS the memory
         onboarded = true
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         // Tour UITest hook: reset the tour to a fresh 'eligible' state so the
@@ -424,6 +487,15 @@ final class AppModel {
         cachedEmail = coord.auth.currentEmail
         cachedUserId = coord.auth.currentUserId
         cachedHasPassword = coord.auth.hasPassword
+        // "Profile facts hydrated once" — BEFORE start(), so the sign-in
+        // hydrate the auth observer kicks off is the first one observed.
+        await coord.setOnProfileFactsHydrated { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.profileFactsHydrated = true
+                self.pullAdhdStrugglesIfNeeded()
+            }
+        }
         await coord.start()
         await observeAuth(coord)
 
@@ -841,6 +913,15 @@ final class AppModel {
         // rows (the server keeps the account's facts; the sync clearAll on the
         // signed-out event covers the same table for reactive sign-outs).
         profileFacts?.wipeLocal()
+        // The next account waits for ITS hydrate before an empty memory means
+        // "never met" (and re-pulls its struggles).
+        profileFactsHydrated = false
+        strugglesPulledFor = nil
+        // Push tokens: a reactive sign-out (server revocation, refresh failure)
+        // never routes through signOutAndUnregister, so drop the VoIP token +
+        // any call in progress best-effort here too — else the previous
+        // account's calls could still ring this device.
+        VoipPushRegistry.shared.unregisterBestEffort()
         // Gateway state is per-user too: ritual prefs + dismissed moments
         // (PAPrefsStore.scrub() under the hood, then the in-memory reset) and
         // the first-run interview flag + resume step, so the next account on
@@ -859,9 +940,132 @@ final class AppModel {
     }
 
     func saveTask(_ task: TaskItem) {
+        Task { await saveTaskAwaiting(task) }
+    }
+
+    // MARK: awaiting writes (the assistant executor)
+    //
+    // The fire-and-forget methods are what UI taps call. The assistant executor
+    // READS the store synchronously between its own writes (add_capture →
+    // promote_capture, create_task → schedule_task → delete_task in one turn),
+    // so it needs writes that return only after the local GRDB row is committed
+    // and the outbox op enqueued — same WriteThrough, same cascades, awaited.
+    // Network side-effects (the Google mirror) stay fire-and-forget behind them.
+
+    /// True once the local row + outbox op are committed.
+    @discardableResult
+    func saveTaskAwaiting(_ task: TaskItem) async -> Bool {
+        guard let write = coordinator?.write else { return false }
+        do { try await write.upsertTask(task, nowISO: Self.isoNow()); return true } catch { return false }
+    }
+
+    @discardableResult
+    func deleteTaskAwaiting(_ id: String) async -> Bool {
+        guard let write = coordinator?.write else { return false }
+        do { try await write.deleteTask(id: id, nowISO: Self.isoNow()); return true } catch { return false }
+    }
+
+    func saveTagAwaiting(_ tag: TagRow) async {
         guard let write = coordinator?.write else { return }
-        let now = Self.isoNow()
-        Task { try? await write.upsertTask(task, nowISO: now) }
+        try? await write.upsertTag(tag, nowISO: Self.isoNow())
+    }
+
+    /// `deleteTag`, awaited through the whole cascade.
+    func deleteTagAwaiting(_ id: String) async {
+        guard let write = coordinator?.write else { return }
+        var name: String?
+        if let db, let fetched = try? db.fetchById(TagRow.self, id: id) { name = fetched.name }
+        let tasks = (try? taskRepo?.all()) ?? []
+        try? await write.deleteTag(id: id, nowISO: Self.isoNow())
+        guard let name else { return }
+        for t in tasks where (t.tags ?? []).contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
+            var next = t
+            let stripped = (t.tags ?? []).filter { $0.caseInsensitiveCompare(name) != .orderedSame }
+            next.tags = stripped.isEmpty ? nil : stripped
+            next.updatedAt = Self.isoNow()
+            try? await write.upsertTask(next, nowISO: Self.isoNow())
+        }
+    }
+
+    func saveLifeAreaAwaiting(_ area: LifeArea) async {
+        guard let write = coordinator?.write else { return }
+        try? await write.upsertLifeArea(area, nowISO: Self.isoNow())
+    }
+
+    func deleteLifeAreaAwaiting(_ id: String) async {
+        guard let write = coordinator?.write else { return }
+        try? await write.deleteLifeArea(id: id, nowISO: Self.isoNow())
+    }
+
+    /// `saveBlock`, returning once the local row is committed; the Google
+    /// mirror runs behind it exactly as before.
+    func saveBlockAwaiting(_ block: CalBlock) async {
+        guard let write = coordinator?.write else { return }
+        try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
+        // Only TASK blocks mirror to Google (spec §1.6): external g_ blocks are
+        // read-only mirrors of the remote calendar and must never be
+        // (re-)pushed; placeholders have nothing to push.
+        guard isTaskBlock(block) else { return }
+        Task { await self.mirrorBlockToGoogle(block) }
+    }
+
+    /// `deleteBlock`, returning once the local row is committed. The Google
+    /// event delete (if it was pushed) follows behind — order doesn't matter
+    /// to either side, and the executor must not wait on the network.
+    func deleteBlockAwaiting(_ block: CalBlock) async {
+        guard let write = coordinator?.write else { return }
+        try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
+        Task { await self.deleteGoogleEvent(for: block) }
+    }
+
+    /// `unschedule` (AppModel+CalendarControls), awaited: reconcile Google for a
+    /// pushed task block, plain delete when the block isn't in the store.
+    func unscheduleAwaiting(_ blockId: String) async {
+        if let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == blockId }) {
+            await deleteBlockAwaiting(block)
+        } else if let write = coordinator?.write {
+            try? await write.deleteCalBlock(id: blockId, nowISO: Self.isoNow())
+        }
+    }
+
+    @discardableResult
+    func saveCaptureAwaiting(_ capture: Capture) async -> Bool {
+        guard let write = coordinator?.write else { return false }
+        do { try await write.upsertCapture(capture, nowISO: Self.isoNow()); return true } catch { return false }
+    }
+
+    /// `discardCapture` (AppModel+Captures), awaited: delete the row, then drop
+    /// any device-local archived flag.
+    func discardCaptureAwaiting(_ id: String) async {
+        guard let write else { return }
+        try? await write.deleteCapture(id: id, nowISO: Self.isoNow())
+        unarchiveCapture(id)
+    }
+
+    /// `setNotificationLevel` (AppModel+Notifications) with the OUTCOME: the
+    /// local write read back, then the server mirror awaited — false when
+    /// either fails (web parity: `setNotificationLevel` resolves false on a
+    /// failed upsert), so the assistant's "could not save" branch is real.
+    func setNotificationLevelAwaiting(_ level: NotificationLevel) async -> Bool {
+        NotificationPrefs.level = level
+        ReminderScheduler.shared.resync()
+        guard NotificationPrefs.level == level else { return false }
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return false }
+        do {
+            try await coord.preferences.setNotificationLevel(
+                userId: uid, morningBrief: level.morningBrief, pausedCheckin: level.pausedCheckin, level: level.rawValue)
+            return true
+        } catch { return false }
+    }
+
+    /// `setReminderLeadMin`, with the outcome (local read-back + the awaited
+    /// `reminder_lead_min` mirror the web also writes).
+    func setReminderLeadAwaiting(_ minutes: Int) async -> Bool {
+        NotificationPrefs.reminderLeadMin = minutes
+        ReminderScheduler.shared.resync()
+        guard NotificationPrefs.reminderLeadMin == minutes else { return false }
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return false }
+        do { try await coord.preferences.setReminderLead(userId: uid, minutes: minutes); return true } catch { return false }
     }
 
     /// Save a task + reconcile its recurrence: materialize future cal_blocks
@@ -891,41 +1095,23 @@ final class AppModel {
     }
 
     func deleteTask(_ id: String) {
-        guard let write = coordinator?.write else { return }
-        Task { try? await write.deleteTask(id: id, nowISO: Self.isoNow()) }
+        Task { await deleteTaskAwaiting(id) }
     }
 
     func saveTag(_ tag: TagRow) {
-        guard let write = coordinator?.write else { return }
-        Task { try? await write.upsertTag(tag, nowISO: Self.isoNow()) }
+        Task { await saveTagAwaiting(tag) }
     }
     /// Delete a tag and strip its name from every task (case-insensitive
     /// cascade), mirroring the web/Android deleteTag — otherwise tasks keep a
     /// dangling reference to a vocabulary entry that no longer exists.
     func deleteTag(_ id: String) {
-        guard let write = coordinator?.write else { return }
-        var name: String?
-        if let db, let fetched = try? db.fetchById(TagRow.self, id: id) { name = fetched.name }
-        let tasks = (try? taskRepo?.all()) ?? []
-        Task {
-            try? await write.deleteTag(id: id, nowISO: Self.isoNow())
-            guard let name else { return }
-            for t in tasks where (t.tags ?? []).contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
-                var next = t
-                let stripped = (t.tags ?? []).filter { $0.caseInsensitiveCompare(name) != .orderedSame }
-                next.tags = stripped.isEmpty ? nil : stripped
-                next.updatedAt = Self.isoNow()
-                try? await write.upsertTask(next, nowISO: Self.isoNow())
-            }
-        }
+        Task { await deleteTagAwaiting(id) }
     }
     func saveLifeArea(_ area: LifeArea) {
-        guard let write = coordinator?.write else { return }
-        Task { try? await write.upsertLifeArea(area, nowISO: Self.isoNow()) }
+        Task { await saveLifeAreaAwaiting(area) }
     }
     func deleteLifeArea(_ id: String) {
-        guard let write = coordinator?.write else { return }
-        Task { try? await write.deleteLifeArea(id: id, nowISO: Self.isoNow()) }
+        Task { await deleteLifeAreaAwaiting(id) }
     }
 
     var calendar: CalendarClient? { coordinator?.calendar }
@@ -933,31 +1119,28 @@ final class AppModel {
     /// Save a cal_block (create or edit) + reconcile Google: PATCH if it
     /// already has an event id, otherwise INSERT and persist the new id.
     func saveBlock(_ block: CalBlock) {
-        guard let write = coordinator?.write else { return }
-        Task {
-            try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
-            // Only TASK blocks mirror to Google (spec §1.6): external g_
-            // blocks are read-only mirrors of the remote calendar and must
-            // never be (re-)pushed; placeholders have nothing to push.
-            guard isTaskBlock(block) else { return }
-            guard let calendar = coordinator?.calendar, let database = db,
-                  let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
-            let range = blockToIsoRange(block)
-            // Always write task blocks to the user's PRIMARY calendar —
-            // selectedCalendarIds can include read-only/subscribed calendars
-            // (which 403 on insert). "primary" is Google's alias for the
-            // main, always-writable calendar (Android pushBlockUpsert).
-            let calId = "primary"
-            if let eventId = block.externalEventId {
-                try? await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
-                                               summary: block.taskName, start: range.start, end: range.end)
-            } else if let newId = try? await calendar.insertEvent(
-                connectionId: conn.id, calendarId: calId,
-                summary: block.taskName, start: range.start, end: range.end) {
-                var updated = block
-                updated.externalEventId = newId
-                try? await write.upsertCalBlock(updated, nowISO: Self.isoNow())
-            }
+        Task { await saveBlockAwaiting(block) }
+    }
+
+    /// The Google half of saveBlock — task blocks only (the caller gates).
+    private func mirrorBlockToGoogle(_ block: CalBlock) async {
+        guard let write = coordinator?.write, let calendar = coordinator?.calendar, let database = db,
+              let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
+        let range = blockToIsoRange(block)
+        // Always write task blocks to the user's PRIMARY calendar —
+        // selectedCalendarIds can include read-only/subscribed calendars
+        // (which 403 on insert). "primary" is Google's alias for the
+        // main, always-writable calendar (Android pushBlockUpsert).
+        let calId = "primary"
+        if let eventId = block.externalEventId {
+            try? await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
+                                           summary: block.taskName, start: range.start, end: range.end)
+        } else if let newId = try? await calendar.insertEvent(
+            connectionId: conn.id, calendarId: calId,
+            summary: block.taskName, start: range.start, end: range.end) {
+            var updated = block
+            updated.externalEventId = newId
+            try? await write.upsertCalBlock(updated, nowISO: Self.isoNow())
         }
     }
 
@@ -965,17 +1148,16 @@ final class AppModel {
     /// blocks never delete the underlying Google event — they only mirror
     /// it (Android pushBlockDelete returns early for EXTERNAL).
     func deleteBlock(_ block: CalBlock) {
-        guard let write = coordinator?.write else { return }
-        Task {
-            if let eventId = block.externalEventId, !isExternalBlock(block),
-               let calendar = coordinator?.calendar,
-               let database = db, let conn = (try? database.firstCalendarConnection()) ?? nil {
-                // Task blocks are inserted on "primary" — delete there too.
-                try? await calendar.deleteEvent(eventId: eventId, connectionId: conn.id,
-                                                calendarId: "primary")
-            }
-            try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
-        }
+        Task { await deleteBlockAwaiting(block) }
+    }
+
+    /// The Google half of deleteBlock.
+    private func deleteGoogleEvent(for block: CalBlock) async {
+        guard let eventId = block.externalEventId, !isExternalBlock(block),
+              let calendar = coordinator?.calendar,
+              let database = db, let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
+        // Task blocks are inserted on "primary" — delete there too.
+        try? await calendar.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: "primary")
     }
 
     /// Move a block to a new day/time (drag-to-reschedule) + bump the task's
@@ -1074,9 +1256,7 @@ final class AppModel {
     }
 
     func saveCapture(_ capture: Capture) {
-        guard let write = coordinator?.write else { return }
-        let now = Self.isoNow()
-        Task { try? await write.upsertCapture(capture, nowISO: now) }
+        Task { await saveCaptureAwaiting(capture) }
     }
 
     static func isoNow() -> String {

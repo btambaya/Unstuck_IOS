@@ -181,6 +181,21 @@ extension AppModel {
             router.select(.lists)       // a shared collection
             return
         }
+        // Assistant `open_screen` modal targets (AppModel+Routing.openScreen)
+        // — router-presented sheets, so they take the dismiss-then-present
+        // guard above like every other modal link.
+        if link == "unstuck://insights" {
+            router.present(.insights)
+            return
+        }
+        if link == "unstuck://inbox" {
+            router.present(.inbox)
+            return
+        }
+        if link == "unstuck://settings" || link.hasPrefix("unstuck://settings?") {
+            router.present(.settings(section: Self.settingsSection(in: link)))
+            return
+        }
         if link == "unstuck://tasks" || link.hasPrefix("unstuck://tasks") {
             // Shared-task pushes (task_share / shared_session_start / _end /
             // shared_task_done) deep-link here. Recipients can't open the raw
@@ -200,6 +215,9 @@ extension AppModel {
             || link == "unstuck://new-task"
             || link == "unstuck://focus-next"
             || link == "unstuck://assistant"
+            || link == "unstuck://insights"
+            || link == "unstuck://inbox"
+            || link == "unstuck://settings" || link.hasPrefix("unstuck://settings?")
             || link.hasPrefix("unstuck://focus/")
             || link.hasPrefix("unstuck://task/")
     }

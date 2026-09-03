@@ -171,11 +171,22 @@ struct AssistantSheet: View {
                             // shows faded until the model picks it up — web parity.
                             .opacity(turn.isPending ? 0.5 : 1)
                         ForEach(Array((turn.receipts ?? []).enumerated()), id: \.offset) { ri, receipt in
-                            AssistantReceiptRow(receipt: receipt) {
-                                assistant.undoReceipt(turnId: turn.id, index: ri)
-                                refreshContext()
+                            // A network undo (cancel_call) shows "cancelling…" until
+                            // the server answers; a failure keeps Undo + says why.
+                            let inFlight = assistant.isUndoInFlight(turnId: turn.id, index: ri)
+                            AssistantReceiptRow(receipt: inFlight ? receipt.cancelling : receipt) {
+                                Task { @MainActor in
+                                    await assistant.undoReceipt(turnId: turn.id, index: ri)
+                                    refreshContext()
+                                }
                             }
                             .frame(maxWidth: 320, alignment: .leading)
+                            if let note = assistant.undoFailureNote(turnId: turn.id, index: ri) {
+                                Text(note)
+                                    .font(UFont.sans(11.5)).foregroundStyle(theme.palette.coralDeep)
+                                    .padding(.leading, 11)
+                                    .accessibilityAddTraits(.updatesFrequently)
+                            }
                         }
                     }
 
@@ -301,8 +312,10 @@ struct AssistantSheet: View {
     private var undoAll: (count: Int, run: () -> Void)? {
         guard let target = assistant.undoAllTarget else { return nil }
         return (target.count, {
-            assistant.undoAll(turnId: target.turnId)
-            refreshContext()
+            Task { @MainActor in
+                await assistant.undoAll(turnId: target.turnId)
+                refreshContext()
+            }
         })
     }
 
@@ -395,6 +408,12 @@ struct AssistantSheet: View {
 }
 
 // MARK: - rows
+
+private extension Receipt {
+    /// The in-flight look while a network undo runs: state in the label, no
+    /// Undo button (a second tap mid-flight would double-send the cancel).
+    var cancelling: Receipt { Receipt(icon: icon, label: "\(label) — cancelling…", undo: nil) }
+}
 
 private struct MessageBubble: View {
     @Environment(\.uTheme) private var theme

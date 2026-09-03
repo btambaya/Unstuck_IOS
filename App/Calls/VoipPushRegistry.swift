@@ -16,6 +16,17 @@
 // Token: hex → PushRegistrar.didReceiveVoip → AppModel.registerPush (both
 // tokens go up in one register-push-token call via PushClient.voipTokenProvider,
 // which reads the UserDefaults mirror below from any thread).
+//
+// SIGN-OUT: `unregisterBestEffort()` (called from AppModel.scrubDeviceLocal
+// UserContent, i.e. the Sign-out button AND every reactive session→nil) wipes
+// the stored token, drops the PushKit registration (desiredPushTypes = []),
+// and tears down any call in progress silently — so a call the server had
+// already queued for the previous account can't ring this device, and even
+// if a push slips through before PushKit catches up, the coordinator sees
+// "no VoIP registration" ⇒ "nobody signed in" and drops it. The server-side
+// row is deleted by SyncCoordinator.signOutAndUnregister when the JWT is
+// still valid; this is the device half that works without one. `rearm()`
+// (CallCoordinator.attach(model:client:) once signed in) re-registers.
 
 import Foundation
 import PushKit
@@ -49,6 +60,24 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
         r.delegate = self
         r.desiredPushTypes = [.voIP]
         registry = r
+    }
+
+    /// Sign-out (AppModel.scrubDeviceLocalUserContent): forget the token, stop
+    /// PushKit delivery, and drop any call in progress without a report or a
+    /// notification. Idempotent; never throws; needs no session.
+    func unregisterBestEffort() {
+        UserDefaults.standard.removeObject(forKey: Self.tokenKey)
+        PushRegistrar.shared.didInvalidateVoip()
+        registry?.desiredPushTypes = []
+        CallCoordinator.shared.signedOut()
+    }
+
+    /// Re-register for VoIP pushes after a sign-in (a fresh token arrives via
+    /// `didUpdate` and goes up with register-push-token). No-op while
+    /// already registered.
+    func rearm() {
+        guard let r = registry, !(r.desiredPushTypes ?? []).contains(.voIP) else { return }
+        r.desiredPushTypes = [.voIP]
     }
 
     // MARK: PKPushRegistryDelegate (main queue)

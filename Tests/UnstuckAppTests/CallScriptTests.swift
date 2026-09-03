@@ -1,7 +1,9 @@
 // CallScript vectors (the verbatim opening + the call instructions + the
 // live tool list), IncomingCallPayload decoding, CallSession derivations,
-// CallSettings window logic, and the pure CallToolLogic guards/formatting
-// behind request_call / update_call.
+// CallSettings window logic, the pure CallToolLogic guards/formatting behind
+// request_call / update_call, and the CallTools executor over a fake store +
+// the executor's in-memory AssistantAppState (scratch resolution, JSON-null
+// notes, the web duplicate rule, compare-and-set misses).
 
 import XCTest
 import UnstuckCore
@@ -164,23 +166,41 @@ final class CallScriptTests: XCTestCase {
 
     // MARK: tool logic
 
-    func testTimeGuardStrings() {
+    /// The past refusals are the SHARED UnstuckCore strings (with the free
+    /// windows / the "use <date> — see context.upcoming" repair hint); only
+    /// the 06:00–23:00 window string is local.
+    func testTimeGuardUsesTheSharedPastRefusalsThenTheServerWindow() {
         let now = date(2026, 9, 2, 15, 0)
-        XCTAssertEqual(CallToolLogic.timeGuard(date(2026, 9, 2, 10, 0), now: now, calendar: cal),
-                       "error: 10:00 today is already past (it's 15:00 now). Ask for a later time.")
+        let blocks = [CalBlock(id: "b", taskId: "t", taskName: "T", startTime: "16:00", durationMinutes: 30, date: "2026-09-02")]
+        XCTAssertEqual(CallToolLogic.timeGuard(date(2026, 9, 2, 10, 0), now: now, blocks: blocks, calendar: cal),
+                       rejectPastTime(blocks: blocks, today: "2026-09-02", date: "2026-09-02", startTime: "10:00", nowHM: "15:00"))
+        XCTAssertEqual(CallToolLogic.timeGuard(date(2026, 9, 2, 10, 0), now: now, blocks: blocks, calendar: cal),
+                       "error: 10:00 today is already past (it's 15:00 now). Ask for a later time or another day — free today: 15:15–16:00, 16:30–21:00.")
         XCTAssertEqual(CallToolLogic.timeGuard(date(2026, 9, 1, 10, 0), now: now, calendar: cal),
-                       "error: 2026-09-01 10:00 is in the PAST (it's 2026-09-02 15:00 now). Ask for a later time or another day.")
+                       rejectPastDate(today: "2026-09-02", date: "2026-09-01"))
+        XCTAssertTrue(CallToolLogic.timeGuard(date(2026, 9, 1, 10, 0), now: now, calendar: cal)!.contains("see context.upcoming"))
         XCTAssertEqual(CallToolLogic.timeGuard(date(2026, 9, 3, 5, 30), now: now, calendar: cal),
                        "error: calls can only be booked between 06:00 and 23:00 — suggest a time inside that window")
-        XCTAssertNil(CallToolLogic.timeGuard(date(2026, 9, 2, 15, 0), now: now, calendar: cal), "now itself is fine (30 s slack)")
+        XCTAssertEqual(CallToolLogic.timeGuard(date(2026, 9, 2, 23, 30), now: now, calendar: cal),
+                       "error: calls can only be booked between 06:00 and 23:00 — suggest a time inside that window")
+        XCTAssertNotNil(CallToolLogic.timeGuard(date(2026, 9, 2, 15, 0), now: now, calendar: cal), "the current minute is past, like the web")
+        XCTAssertNil(CallToolLogic.timeGuard(date(2026, 9, 2, 15, 1), now: now, calendar: cal))
         XCTAssertNil(CallToolLogic.timeGuard(date(2026, 9, 2, 16, 45), now: now, calendar: cal))
+        XCTAssertNil(CallToolLogic.timeGuard(date(2026, 9, 3, 6, 0), now: now, calendar: cal), "tomorrow at the window edge")
     }
 
-    func testNotesArgAcceptsArrayOrLines() {
+    /// 20 notes × 300 chars (web MAX_CALL_NOTES); a string splits on NEWLINES
+    /// only — a note may contain ";".
+    func testNotesArgAcceptsArrayOrLinesAndCapsLikeTheWeb() {
         XCTAssertEqual(CallToolLogic.notes(["A", " B ", ""]), ["A", "B"])
-        XCTAssertEqual(CallToolLogic.notes("A\nB; C"), ["A", "B", "C"])
+        XCTAssertEqual(CallToolLogic.notes("A\nB; C\r\n\nD"), ["A", "B; C", "D"])
         XCTAssertEqual(CallToolLogic.notes(nil), [])
-        XCTAssertEqual(CallToolLogic.notes(Array(repeating: "x", count: 12)).count, 8)
+        XCTAssertEqual(CallToolLogic.notes(NSNull()), [])
+        XCTAssertEqual(CallToolLogic.notes(Array(repeating: "x", count: 25)).count, 20)
+        XCTAssertEqual(CallToolLogic.notes([String(repeating: "y", count: 400)])[0].count, 300)
+        XCTAssertFalse(CallToolLogic.isPresent(nil))
+        XCTAssertFalse(CallToolLogic.isPresent(NSNull()))
+        XCTAssertTrue(CallToolLogic.isPresent([] as [String]))
         XCTAssertEqual(CallToolLogic.notesCount([]), "0 notes")
         XCTAssertEqual(CallToolLogic.notesCount(["a"]), "1 note")
     }
@@ -208,20 +228,25 @@ final class CallScriptTests: XCTestCase {
         XCTAssertNil(CallToolLogic.nextLiveBlock([], now: now, calendar: cal))
     }
 
-    func testDuplicateAnchorDetection() {
+    /// The web rule exactly: with a task → any live call for that task (the
+    /// block doesn't matter); without → a case-insensitive label match. No
+    /// same-minute rule.
+    func testDuplicateAnchorDetectionIsTheWebRule() {
         let at = date(2026, 9, 2, 16, 45)
         let rows = [
             CallRequest(id: "r1", taskId: "t1", blockId: "b1", callAt: CallsClient.iso(at), label: "x"),
             CallRequest(id: "r2", callAt: CallsClient.iso(date(2026, 9, 2, 18, 0)), label: "standalone"),
+            CallRequest(id: "r3", taskId: "t3", callAt: CallsClient.iso(date(2026, 9, 2, 19, 0)), label: "gone", status: "cancelled"),
         ]
-        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: "t1", blockId: "b1", callAt: at)?.id, "r1")
-        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: "t1", blockId: "b2", callAt: date(2026, 9, 2, 19, 0)), "a different block of the same task is a different anchor")
-        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: "t1", blockId: nil, callAt: date(2026, 9, 2, 19, 0))?.id, "r1", "no block given → the task is the anchor")
-        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: nil, blockId: nil, callAt: date(2026, 9, 2, 18, 0).addingTimeInterval(20))?.id, "r2")
-        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: "t9", blockId: nil, callAt: date(2026, 9, 2, 19, 0)))
-        // Web rule: a standalone call with the same label (case-insensitive) is the same anchor.
-        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: nil, blockId: nil, callAt: date(2026, 9, 2, 20, 0), label: " Standalone ")?.id, "r2")
-        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: nil, blockId: nil, callAt: date(2026, 9, 2, 20, 0), label: "other"))
+        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: "t1", label: "whatever")?.id, "r1")
+        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: "t1", label: nil)?.id, "r1", "a different block of the same task is STILL the same anchor")
+        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: "t9", label: "standalone"), "task given → only the task counts")
+        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: "t3", label: nil), "a cancelled call is not live")
+        XCTAssertEqual(CallToolLogic.duplicate(in: rows, taskId: nil, label: " Standalone ")?.id, "r2")
+        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: nil, label: "other"))
+        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: nil, label: nil))
+        // Same minute, different label → fine (the old iOS-only rule is gone).
+        XCTAssertNil(CallToolLogic.duplicate(in: rows, taskId: nil, label: "x at 18:00 too"))
     }
 
     func testGetCallsFormatMatchesTheWebContract() {
@@ -255,5 +280,190 @@ final class CallScriptTests: XCTestCase {
         XCTAssertTrue(r.isLive)
         XCTAssertEqual(r.callAtDate, ISO8601DateFormatter().date(from: "2026-09-02T14:45:00Z"))
         XCTAssertEqual(r.effectiveAtDate, ISO8601DateFormatter().date(from: "2026-09-02T15:00:00Z"), "snoozed → snooze_until")
+    }
+}
+
+// MARK: - CallTools over a fake store + the executor's in-memory app state
+
+/// call_requests as the tools see them — every write is recorded; `vanished`
+/// ids make patch/cancel return nil (zero rows: the row changed underneath).
+@MainActor
+final class FakeCallStore: CallStore {
+    var rows: [CallRequest] = []
+    var booked: [CallRequest] = []
+    struct Patch: Equatable { let id: String; let callAt: Date?; let blockId: String??; let leadMin: Int??; let label: String?; let notes: [String]? }
+    var patches: [Patch] = []
+    var cancelled: [String] = []
+    var vanished: Set<String> = []
+
+    func liveCalls() async throws -> [CallRequest] { rows.filter(\.isLive) }
+    func call(id: String) async throws -> CallRequest? { rows.first { $0.id == id } }
+    func book(userId: String, taskId: String?, blockId: String?, callAt: Date, leadMin: Int?,
+              label: String, notes: [String]) async throws -> CallRequest {
+        let r = CallRequest(id: "new-\(booked.count + 1)", userId: userId, taskId: taskId, blockId: blockId,
+                            callAt: CallsClient.iso(callAt), leadMin: leadMin, label: label, notes: notes)
+        booked.append(r); rows.append(r)
+        return r
+    }
+    func patch(id: String, callAt: Date?, blockId: String??, leadMin: Int??,
+               label: String?, notes: [String]?) async throws -> CallRequest? {
+        patches.append(Patch(id: id, callAt: callAt, blockId: blockId, leadMin: leadMin, label: label, notes: notes))
+        guard !vanished.contains(id), let i = rows.firstIndex(where: { $0.id == id }) else { return nil }
+        if let callAt { rows[i].callAt = CallsClient.iso(callAt); rows[i].status = "scheduled"; rows[i].snoozeUntil = nil }
+        if let blockId { rows[i].blockId = blockId }
+        if let leadMin { rows[i].leadMin = leadMin }
+        if let label { rows[i].label = label }
+        if let notes { rows[i].notes = notes }
+        return rows[i]
+    }
+    func cancelCall(id: String) async throws -> CallRequest? {
+        cancelled.append(id)
+        guard !vanished.contains(id), let i = rows.firstIndex(where: { $0.id == id }) else { return nil }
+        rows[i].status = "cancelled"
+        return rows[i]
+    }
+}
+
+@MainActor
+final class CallToolsTests: XCTestCase {
+    private let cal: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "Europe/London")!
+        return c
+    }()
+    private func date(_ y: Int, _ mo: Int, _ d: Int, _ h: Int, _ mi: Int) -> Date {
+        var c = DateComponents(); c.year = y; c.month = mo; c.day = d; c.hour = h; c.minute = mi
+        return cal.date(from: c)!
+    }
+    private var api: FakeAssistantState!
+    private var scratch: TurnScratch!
+    private var store: FakeCallStore!
+    /// 2026-09-02 15:00 London.
+    private var now: Date { date(2026, 9, 2, 15, 0) }
+
+    override func setUp() {
+        super.setUp()
+        api = FakeAssistantState(); api.today = "2026-09-02"; api.now = "15:00"
+        scratch = TurnScratch()
+        store = FakeCallStore()
+    }
+
+    private func run(_ name: String, _ args: [String: Any]) async -> String {
+        await CallTools.run(name: name, args: args, api: api, scratch: scratch, store: store,
+                            userId: "u1", now: now, calendar: cal)
+    }
+    private func expect(_ name: String, _ args: [String: Any], _ want: String?,
+                        file: StaticString = #filePath, line: UInt = #line) async {
+        let got = await run(name, args)
+        XCTAssertEqual(got, want, file: file, line: line)
+    }
+    private func task(_ id: String, _ name: String) -> TaskItem {
+        TaskItem(id: id, name: name, estimateMin: 25, tags: [], createdAt: "x", updatedAt: "x")
+    }
+
+    // MARK: request_call resolves through the executor's scratch + state
+
+    func testRequestCallFindsATaskCreatedThisTurnAndItsFreshBlock() async {
+        // create_task + block_time earlier in the SAME turn: the task is only
+        // in the scratch, the block only in the executor's state.
+        scratch.newTasks["t-new"] = task("t-new", "Speak to James")
+        api.blocks = [CalBlock(id: "b-new", taskId: "t-new", taskName: "Speak to James", startTime: "17:00", durationMinutes: 30, date: "2026-09-03")]
+        let r = await run("request_call", ["taskId": "t-new", "leadMin": 10, "notes": ["Ask about the invoice"]])
+        XCTAssertEqual(r, "ok: call booked 2026-09-03 16:50 \"Speak to James\" (1 note) id=new-1")
+        XCTAssertEqual(store.booked.count, 1)
+        XCTAssertEqual(store.booked[0].taskId, "t-new")
+        XCTAssertEqual(store.booked[0].blockId, "b-new")
+        XCTAssertEqual(store.booked[0].leadMin, 10)
+        XCTAssertEqual(store.booked[0].userId, "u1")
+    }
+
+    func testRequestCallUnknownTaskAndNoSlot() async {
+        await expect("request_call", ["taskId": "nope"], "error: task not found")
+        api.tasks = [task("t1", "Write the deck")]
+        await expect("request_call", ["taskId": "t1"], "error: \"Write the deck\" has no upcoming slot — schedule_task it first, or give a time with when")
+        XCTAssertTrue(store.booked.isEmpty)
+    }
+
+    func testRequestCallPastRefusalsAreTheSharedStrings() async {
+        let past = await run("request_call", ["label": "speak to James", "when": "2026-09-02 10:00"])
+        XCTAssertEqual(past, rejectPastTime(blocks: [], today: "2026-09-02", date: "2026-09-02", startTime: "10:00", nowHM: "15:00"))
+        let yesterday = await run("request_call", ["label": "speak to James", "when": "2026-09-01 10:00"])
+        XCTAssertEqual(yesterday, rejectPastDate(today: "2026-09-02", date: "2026-09-01"))
+        let window = await run("request_call", ["label": "speak to James", "when": "2026-09-03 05:00"])
+        XCTAssertEqual(window, "error: calls can only be booked between 06:00 and 23:00 — suggest a time inside that window")
+        XCTAssertTrue(store.booked.isEmpty)
+    }
+
+    func testRequestCallDuplicateIsTheWebRule() async {
+        api.tasks = [task("t1", "Speak to James")]
+        api.blocks = [CalBlock(id: "b2", taskId: "t1", taskName: "Speak to James", startTime: "18:00", durationMinutes: 30, date: "2026-09-03")]
+        store.rows = [
+            CallRequest(id: "r1", taskId: "t1", blockId: "b1", callAt: CallsClient.iso(date(2026, 9, 2, 16, 45)), label: "Speak to James"),
+            CallRequest(id: "r2", callAt: CallsClient.iso(date(2026, 9, 2, 18, 0)), label: "dentist"),
+        ]
+        // Same task, different block → still a duplicate.
+        await expect("request_call", ["taskId": "t1", "leadMin": 5], "error: a call is already booked for \"Speak to James\" at 2026-09-02 16:45 id=r1 — update_call or cancel_call it")
+        // Standalone: label match, case-insensitive.
+        await expect("request_call", ["label": "DENTIST", "when": "2026-09-02 20:00"], "error: a call is already booked for \"dentist\" at 2026-09-02 18:00 id=r2 — update_call or cancel_call it")
+        // Standalone at the SAME minute as r2 with another label → fine (no same-minute rule).
+        await expect("request_call", ["label": "call mum", "when": "2026-09-02 18:00"], "ok: call booked 2026-09-02 18:00 \"call mum\" (0 notes) id=new-1")
+    }
+
+    // MARK: update_call / cancel_call
+
+    func testUpdateCallJSONNullNotesLeavesNotesUntouched() async {
+        store.rows = [CallRequest(id: "r1", callAt: CallsClient.iso(date(2026, 9, 2, 18, 0)), label: "dentist", notes: ["bring the form"])]
+        // `notes: null` from the model → NSNull → not a change.
+        await expect("update_call", ["callId": "r1", "notes": NSNull()], "error: nothing to change — give notes and/or when")
+        XCTAssertTrue(store.patches.isEmpty)
+        let r = await run("update_call", ["callId": "r1", "notes": NSNull(), "label": "dentist appt"])
+        XCTAssertEqual(r, "ok: updated call \"dentist appt\" — 2026-09-02 18:00, 1 note id=r1")
+        XCTAssertEqual(store.patches.count, 1)
+        XCTAssertNil(store.patches[0].notes, "untouched")
+        XCTAssertEqual(store.patches[0].label, "dentist appt")
+        // A real (empty) array DOES replace them.
+        _ = await run("update_call", ["callId": "r1", "notes": [] as [String]])
+        XCTAssertEqual(store.patches.last?.notes, [])
+    }
+
+    func testUpdateCallMovesTimeAndDropsTheAnchor() async {
+        store.rows = [CallRequest(id: "r1", taskId: "t1", blockId: "b1", callAt: CallsClient.iso(date(2026, 9, 2, 16, 45)), leadMin: 15, label: "x")]
+        let r = await run("update_call", ["callId": "r1", "when": "2026-09-03 09:30", "notes": "A\nB; C"])
+        XCTAssertEqual(r, "ok: updated call \"x\" — 2026-09-03 09:30, 2 notes id=r1")
+        let p = store.patches[0]
+        XCTAssertEqual(p.callAt, date(2026, 9, 3, 9, 30))
+        XCTAssertEqual(p.blockId, .some(nil))
+        XCTAssertEqual(p.leadMin, .some(nil))
+        XCTAssertEqual(p.notes, ["A", "B; C"])
+        await expect("update_call", ["callId": "r1", "when": "2026-09-02 09:30"], rejectPastTime(blocks: [], today: "2026-09-02", date: "2026-09-02", startTime: "09:30", nowHM: "15:00"))
+    }
+
+    func testUpdateAndCancelReportAChangeUnderneathInsteadOfEchoingTheOldRow() async {
+        store.rows = [CallRequest(id: "r1", callAt: CallsClient.iso(date(2026, 9, 2, 18, 0)), label: "dentist")]
+        store.vanished = ["r1"]
+        await expect("update_call", ["callId": "r1", "label": "new"], CallTools.changedUnderneath)
+        await expect("cancel_call", ["callId": "r1"], CallTools.changedUnderneath)
+        XCTAssertEqual(CallTools.changedUnderneath, "error: that call changed underneath me — get_calls and try again")
+        store.vanished = []
+        await expect("cancel_call", ["callId": "r1"], "ok: cancelled the call about \"dentist\" (2026-09-02 18:00)")
+        await expect("cancel_call", ["callId": "r1"], "error: that call is already cancelled")
+        await expect("cancel_call", ["callId": "zzz"], "error: call not found — use get_calls")
+        await expect("cancel_call", [:], "error: callId required — use get_calls to find it")
+    }
+
+    // MARK: get_calls
+
+    func testGetCallsNamesTasksFromTheScratchToo() async {
+        scratch.newTasks["t-new"] = task("t-new", "Speak to James")
+        store.rows = [
+            CallRequest(id: "r1", taskId: "t-new", callAt: CallsClient.iso(date(2026, 9, 2, 16, 45)), label: "speak to James", notes: ["A"]),
+            CallRequest(id: "r0", callAt: CallsClient.iso(date(2026, 9, 2, 16, 0)), label: "first", status: "done"),
+        ]
+        await expect("get_calls", [:], """
+        ok: 1 upcoming call:
+        - 2026-09-02 16:45 "speak to James" (1 note) for "Speak to James" [id=r1]
+        """)
+        store.rows = []
+        await expect("get_calls", [:], "ok: no calls booked")
     }
 }

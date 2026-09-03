@@ -79,10 +79,18 @@ final class AssistantModel {
     /// check-ins). The UI derives the visible transcript from this; the turn
     /// loop appends to it; `modelWindow` narrows it for the edge function.
     private(set) var turns: [AssistantTurn] = []
+    /// A message sent while a turn was in flight. Minted with its own id at
+    /// enqueue time so the pending bubble's identity is stable across drains
+    /// (an index/hash id re-keyed every bubble when the head was drained, and
+    /// collided for a repeated message).
+    struct QueuedSend: Equatable, Identifiable {
+        let id: String
+        let text: String
+    }
     /// Messages sent while a turn was in flight — QUEUED, not dropped (a
     /// silently dropped message read as "it ignored me", prod 2026-09-01).
     /// Drained one per idle moment; shown in the thread as faded bubbles.
-    private(set) var queued: [String] = []
+    private(set) var queued: [QueuedSend] = []
     /// Share requests the agent PREPARED this session — the panel renders a
     /// confirm card for each; nothing is shared without the user's tap.
     private(set) var pendingShares: [PendingShare] = []
@@ -163,7 +171,7 @@ final class AssistantModel {
     func send(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        if sending { queued.append(t); return }
+        if sending { queued.append(QueuedSend(id: newUUID(), text: t)); return }
         startTurn(t)
     }
 
@@ -201,7 +209,7 @@ final class AssistantModel {
     private func drainQueue() {
         guard !sending, !queued.isEmpty else { return }
         let next = queued.removeFirst()
-        startTurn(next)
+        startTurn(next.text)
     }
 
     private func harnessDeps(base: [AssistantTurn], epoch: Int) -> AssistantHarness.Deps {
@@ -278,9 +286,7 @@ final class AssistantModel {
     /// + `queued`.
     var transcript: [AssistantTurn] {
         let shown = turns.filter { ($0.role == "user" || $0.role == "assistant") && !$0.isHidden && !$0.text.isEmpty }
-        let pending = queued.enumerated().map { i, text in
-            AssistantTurn(ChatMessage(role: "user", content: text), id: "queued:\(i):\(text.hashValue)", pending: true)
-        }
+        let pending = queued.map { AssistantTurn(ChatMessage(role: "user", content: $0.text), id: $0.id, pending: true) }
         return shown + pending
     }
 
@@ -335,42 +341,65 @@ final class AssistantModel {
 
     // MARK: - receipts (undo)
 
+    /// Receipts whose undo is waiting on a network round-trip (`cancel_call`),
+    /// keyed "turnId:index" — the panel shows "cancelling…" instead of Undo.
+    private(set) var undoInFlight: Set<String> = []
+    /// Inline note for a receipt whose last undo FAILED (the receipt stays
+    /// undoable; cleared on the next attempt).
+    private(set) var undoFailures: [String: String] = [:]
+    private static func undoKey(_ turnId: String, _ index: Int) -> String { "\(turnId):\(index)" }
+    func isUndoInFlight(turnId: String, index: Int) -> Bool { undoInFlight.contains(Self.undoKey(turnId, index)) }
+    func undoFailureNote(turnId: String, index: Int) -> String? { undoFailures[Self.undoKey(turnId, index)] }
+
+    /// The network cancel behind a `cancel_call` undo — the calls client the
+    /// coordinator holds (AppModel.start attaches it). Injectable for tests.
+    @ObservationIgnored var cancelCallRequest: (@MainActor (String) async throws -> Void)?
+    private func cancelCall(_ id: String) async throws {
+        if let override = cancelCallRequest { return try await override(id) }
+        guard let client = CallCoordinator.shared.callsClient else { throw AssistantStateError.offline }
+        try await client.cancel(id: id)
+    }
+
     /// Undo one receipt on a persisted turn; flips `undone` so the button
-    /// doesn't come back. Returns true when the undo applied.
+    /// doesn't come back. Returns true when the undo applied — after the
+    /// store write is committed (local undo) or the server accepted it
+    /// (`cancel_call`), never before.
     @discardableResult
-    func undoReceipt(turnId: String, index: Int) -> Bool {
+    func undoReceipt(turnId: String, index: Int) async -> Bool {
         guard let ti = turns.firstIndex(where: { $0.id == turnId }),
               let receipts = turns[ti].receipts, index < receipts.count else { return false }
         let receipt = receipts[index]
         guard let undo = receipt.undo, !(receipt.undone ?? false),
               let action = planReceiptUndo(undo, tasks: api.getTasks(), nowISO: AppModel.isoNow())
         else { return false }
+        let key = Self.undoKey(turnId, index)
+        undoFailures[key] = nil
         // Undoing a "Created" mirrors the executor's delete_task: the task AND
         // its calendar blocks — ghost blocks were a confirmed flow bug.
-        func removeTaskAndBlocks(_ id: String) {
-            for b in api.getBlocks() where b.taskId == id { api.deleteBlock(b.id) }
-            api.removeTask(id)
+        func removeTaskAndBlocks(_ id: String) async {
+            for b in api.getBlocks() where b.taskId == id { await api.deleteBlock(b.id) }
+            await api.removeTask(id)
         }
         switch action {
-        case .deleteTask(let id): removeTaskAndBlocks(id)
-        case .deleteTasks(let ids): ids.forEach(removeTaskAndBlocks)
-        case .restoreTask(let task): api.upsertTask(task)
-        case .restoreTasks(let tasks): tasks.forEach { api.upsertTask($0) }
-        case .completeTask(let task): api.upsertTask(task)
+        case .deleteTask(let id): await removeTaskAndBlocks(id)
+        case .deleteTasks(let ids): for id in ids { await removeTaskAndBlocks(id) }
+        case .restoreTask(let task): await api.upsertTask(task)
+        case .restoreTasks(let tasks): for t in tasks { await api.upsertTask(t) }
+        case .completeTask(let task): await api.upsertTask(task)
         case .forgetFact(let id):
             guard api.removeProfileFact(id) else { return false }
-        case .deleteCapture(let id): api.removeCapture(id)
+        case .deleteCapture(let id): await api.removeCapture(id)
         case .cancelCall(let id):
-            // Network write: cancel through the calls client the coordinator
-            // holds (AppModel.start attaches it). The receipt flips to undone
-            // only once the server accepted the cancel — a failed undo keeps
-            // the button so the user can retry.
-            guard let client = CallCoordinator.shared.callsClient else { return false }
-            Task { [weak self] in
-                guard (try? await client.cancel(id: id)) != nil else { return }
-                self?.markUndone(turnId: turnId, index: index)
+            // Network write: the receipt flips to undone only once the server
+            // accepted the cancel; meanwhile it reads "cancelling…". A failure
+            // keeps the button AND says so, so the user can retry.
+            guard !undoInFlight.contains(key) else { return false }
+            undoInFlight.insert(key)
+            defer { undoInFlight.remove(key) }
+            do { try await cancelCall(id) } catch {
+                undoFailures[key] = "Couldn't cancel the call — check your connection and try again."
+                return false
             }
-            return true
         }
         markUndone(turnId: turnId, index: index)
         return true
@@ -391,10 +420,10 @@ final class AssistantModel {
     }
 
     /// One-tap revert of every still-undoable change on `turnId`.
-    func undoAll(turnId: String) {
+    func undoAll(turnId: String) async {
         guard let ti = turns.firstIndex(where: { $0.id == turnId }) else { return }
         for (i, r) in (turns[ti].receipts ?? []).enumerated() where r.isUndoable {
-            undoReceipt(turnId: turnId, index: i)
+            await undoReceipt(turnId: turnId, index: i)
         }
     }
 

@@ -10,6 +10,11 @@ enum NotificationCategories {
     // Categories
     static let taskStarting = "unstuck.taskStarting"   // A2/A4 — Start / Reschedule
     static let paused = "unstuck.paused"               // B2 — Resume / Snooze / End
+    /// "Unstuck calls you", fallback B: the server's time-sensitive alert push
+    /// (send-call, no VoIP token) carries `aps.category = UNSTUCK_CALL` — the
+    /// identifier is the SERVER's, verbatim. Its one action, Answer, opens the
+    /// call conversation exactly like tapping the alert.
+    static let call = "UNSTUCK_CALL"
 
     // Action identifiers
     static let actionStart = "unstuck.action.start"
@@ -17,6 +22,7 @@ enum NotificationCategories {
     static let actionResume = "unstuck.action.resume"
     static let actionSnooze = "unstuck.action.snooze"
     static let actionEnd = "unstuck.action.end"
+    static let actionAnswerCall = "unstuck.action.answerCall"
 
     /// Thread identifiers grouping notifications like Android's channels.
     enum Thread {
@@ -58,7 +64,12 @@ enum NotificationCategories {
         let pausedCat = UNNotificationCategory(
             identifier: paused, actions: [resume, snooze, end], intentIdentifiers: [], options: [])
 
-        UNUserNotificationCenter.current().setNotificationCategories([starting, pausedCat])
+        // Answer opens the app into the call's Talk screen (needs .foreground).
+        let answer = UNNotificationAction(identifier: actionAnswerCall, title: "Answer", options: [.foreground])
+        let callCat = UNNotificationCategory(
+            identifier: call, actions: [answer], intentIdentifiers: [], options: [])
+
+        UNUserNotificationCenter.current().setNotificationCategories([starting, pausedCat, callCat])
     }
 }
 

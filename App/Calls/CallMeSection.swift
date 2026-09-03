@@ -2,7 +2,10 @@
 // call_requests row anchored to this task's next scheduled block. Lead-
 // relative (`lead_min` + `block_id`, so the server follows the block if it
 // moves); disabled with a hint until the task has a scheduled time. Notes
-// are one per line — they're read back verbatim when the phone rings.
+// are one per line (a note may contain ";"), 20 × 300 chars like the web —
+// they're read back verbatim when the phone rings. Update / cancel are
+// compare-and-set on the row still being live: a miss reloads instead of
+// showing stale state.
 
 import SwiftUI
 import UnstuckCore
@@ -141,7 +144,8 @@ struct CallMeSection: View {
         busy = true
         Task {
             do {
-                try await client.cancel(id: row.id)
+                // nil ⇒ it already rang / was cancelled elsewhere — gone either way.
+                _ = try await client.cancel(id: row.id)
                 self.row = nil
             } catch {
                 self.error = "Couldn't cancel the call — try again."
@@ -165,9 +169,14 @@ struct CallMeSection: View {
         Task {
             do {
                 if let row {
-                    let updated = try await client.update(id: row.id, callAt: callAt, blockId: .some(block.id),
-                                                          leadMin: .some(leadNow), notes: notesNow)
-                    self.row = updated ?? row
+                    if let updated = try await client.update(id: row.id, callAt: callAt, blockId: .some(block.id),
+                                                             leadMin: .some(leadNow), notes: notesNow) {
+                        self.row = updated
+                    } else {
+                        // Zero rows: the call rang / was cancelled underneath us.
+                        self.error = "That call changed underneath you — reloaded."
+                        await load()
+                    }
                 } else {
                     self.row = try await client.create(userId: uid, taskId: task.id, blockId: block.id,
                                                        callAt: callAt, leadMin: leadNow,

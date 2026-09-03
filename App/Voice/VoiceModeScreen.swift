@@ -5,6 +5,15 @@
 // and wires their callbacks to observable UI state; the tool calls reuse the
 // SAME dispatcher as text mode.
 //
+// "UNSTUCK CALLS YOU", FALLBACK B: three presenters can show this cover
+// (MainTabScaffold, TodayFeature's gateway mic, the Assistant sheet's Talk
+// button). Only ONE VoiceModeScreen is ever up — `VoiceSessionModel.isPresented`
+// tells the scaffold not to stack a second cover — so when a tapped call alert
+// parks a CallSession on RealtimeCallVoiceLauncher.shared.pendingSession while
+// a Talk is already open, THIS screen takes it: the running client is stopped
+// (its receipts land in the thread) and a fresh one connects with the call
+// configuration (notes read back first, call tools only).
+//
 // NOTE: the graph compiles + wires end-to-end, but real audio (levels, echo,
 // barge-in, sample-rate drift) can only be validated on a device.
 
@@ -15,6 +24,11 @@ import UnstuckDesign
 @MainActor
 @Observable
 final class VoiceSessionModel {
+    /// True while a VoiceModeScreen is on screen (set by its onAppear /
+    /// onDisappear). A fallback-B call arriving then is taken over by that
+    /// screen instead of a second cover being presented on top of it.
+    static fileprivate(set) var isPresented = false
+
     var state: VoiceState = .connecting
     /// The streaming assistant caption (cleared at the start of each user turn).
     var caption = ""
@@ -23,12 +37,17 @@ final class VoiceSessionModel {
     var userTranscript = ""
     /// A local note (permission / config / mic error) shown in the ERROR state.
     var note: String?
+    /// The call this screen is running (fallback B), nil for a plain Talk.
+    private(set) var callSession: CallSession?
 
     private let model: AppModel
-    private let audio = VoiceAudioEngine()
+    /// One engine per connection: a stopped client shuts its engine down, and
+    /// a take-over (call arriving mid-Talk) connects again on a fresh graph.
+    private var audio = VoiceAudioEngine()
     private var client: VoiceRealtimeClient?
     private var interruption: (any NSObjectProtocol)?
     private var routeChange: (any NSObjectProtocol)?
+    private var micGranted = false
 
     init(model: AppModel) { self.model = model }
 
@@ -41,20 +60,38 @@ final class VoiceSessionModel {
         }
         guard model.voiceConfigured else { note = "Voice isn't set up yet."; state = .error; return }
         note = nil; state = .connecting
-        let assistant = model.assistant
-        assistant.resetVoiceScratch()
         AVAudioApplication.requestRecordPermission { [weak self] granted in
             Task { @MainActor in
                 guard let self else { return }
                 guard granted else { self.note = "Microphone access is needed for voice."; self.state = .error; return }
-                self.connect(token: token, assistant: assistant)
+                self.micGranted = true
+                // A call may have arrived while the permission prompt was up —
+                // connect() takes it; nothing to restart yet.
+                self.connect(token: token)
             }
         }
     }
 
-    private func connect(token: String, assistant: AssistantModel) {
+    /// Fallback B, mid-Talk: a call alert was tapped while this screen is up.
+    /// Take the pending session and RESTART with the call configuration.
+    /// Before the mic permission lands, `start()`'s connect will take it.
+    func takeOverPendingCall() {
+        guard RealtimeCallVoiceLauncher.shared.pendingSession != nil, micGranted else { return }
+        guard let token = model.voiceAccessToken, !token.isEmpty, model.voiceConfigured else { return }
+        // Stop the current conversation; what it changed lands in the thread.
+        client?.stop()
+        client = nil
+        model.assistant.endVoiceSession()
+        caption = ""; userTranscript = ""; note = nil
+        state = .connecting
+        connect(token: token)
+    }
+
+    private func connect(token: String) {
         let proxyURL = model.voiceProxyURL
         let modelId = model.voiceModel
+        let assistant = model.assistant
+        assistant.resetVoiceScratch()
         var instructions = assistant.voiceInstructions()
         var opening = assistant.voiceOpening()
         var tools = assistant.voiceTools()
@@ -64,17 +101,23 @@ final class VoiceSessionModel {
         // "Unstuck calls you", fallback B (no CallKit): a tapped call alert parks
         // the CallSession on the launcher — take it and run the CALL configuration
         // (notes read back first, call tools only) instead of a plain Talk.
+        callSession = nil
         if let call = RealtimeCallVoiceLauncher.shared.takePendingSession(),
            let cfg = RealtimeCallVoiceLauncher.shared.talkConfiguration(for: call) {
+            callSession = call
             instructions = cfg.instructions
             opening = cfg.primer
             tools = cfg.tools
             runTool = cfg.runTool
         }
+        // A previous client (take-over) already shut its engine down — a fresh
+        // graph avoids re-attaching nodes to a stopped AVAudioEngine.
+        let engine = VoiceAudioEngine()
+        audio = engine
         // Mic acquisition failed (session activate / engine.start() — typically
         // the mic held by another app). Stop the client + surface a note instead
         // of leaving the UI stuck on "Listening…". 1:1 with Android.
-        audio.onCaptureError = { [weak self] in
+        engine.onCaptureError = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 self.client?.stop()
@@ -84,7 +127,7 @@ final class VoiceSessionModel {
         }
         let rc = VoiceRealtimeClient(
             proxyURL: proxyURL, token: token, model: modelId,
-            instructions: instructions, opening: opening, tools: tools, audio: audio,
+            instructions: instructions, opening: opening, tools: tools, audio: engine,
             runTool: runTool,
             onState: { [weak self] s in Task { @MainActor in self?.state = s } },
             onCaption: { [weak self] role, text, done in
@@ -122,6 +165,7 @@ final class VoiceSessionModel {
         routeChange = nil
         if let client { client.stop() } else { audio.shutdown() }
         client = nil
+        callSession = nil
         // The session's receipts (and their Undo) land in the shared thread as
         // a local turn so they don't vanish with the overlay.
         model.assistant.endVoiceSession()
@@ -130,8 +174,10 @@ final class VoiceSessionModel {
     /// End the session if another app (e.g. an incoming call) interrupts audio —
     /// the iOS analog of Android's audio-focus loss — or if the active input
     /// route disappears (e.g. headset unplugged), matching Android's
-    /// headset-removal teardown.
+    /// headset-removal teardown. Idempotent (a take-over reconnects on the
+    /// same observers).
     private func observeInterruptions() {
+        guard interruption == nil else { return }
         interruption = NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] n in
             guard let info = n.userInfo,
@@ -189,12 +235,21 @@ struct VoiceModeScreen: View {
                 }.buttonStyle(.plain).padding(.bottom, 48)
             }
         }
+        .onAppear { VoiceSessionModel.isPresented = true }
         .task {
             if session == nil { let s = VoiceSessionModel(model: model); session = s; s.start() }
         }
-        .onDisappear { session?.end(); UIApplication.shared.isIdleTimerDisabled = false }
+        .onDisappear {
+            VoiceSessionModel.isPresented = false
+            session?.end(); UIApplication.shared.isIdleTimerDisabled = false
+        }
         .onChange(of: session?.isLive ?? false) { _, live in
             UIApplication.shared.isIdleTimerDisabled = live   // keep the screen awake mid-call
+        }
+        // A call alert tapped while THIS Talk is open: take the pending call
+        // here (the scaffold won't present a second cover over us).
+        .onChange(of: RealtimeCallVoiceLauncher.shared.pendingSession != nil) { _, hasCall in
+            if hasCall { session?.takeOverPendingCall() }
         }
         // Backgrounding/locking the app under a fullScreenCover does NOT fire
         // .onDisappear, so without this a backgrounded session is a zombie call
@@ -220,6 +275,11 @@ struct VoiceModeScreen: View {
             PulsingOrb(active: live,
                        color: orbColor,
                        onTap: live ? { session.interrupt() } : nil)
+            if let call = session.callSession {
+                Text("Unstuck · \(call.label)")
+                    .font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink3)
+                    .multilineTextAlignment(.center)
+            }
             Text(stateLabel(session))
                 .font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink2)
                 .multilineTextAlignment(.center)

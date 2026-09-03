@@ -2,11 +2,14 @@
 // the SAME methods the UI uses (outbox, Google mirror, shared-list RPCs, Live
 // Activity), so the assistant can never leave the store in a state a tap
 // couldn't. Reads hit the GRDB store directly (freshest committed rows), the
-// way the web's api reads localStorage at call time.
+// way the web's api reads localStorage at call time — which is why the store
+// writes here use AppModel's `…Awaiting` variants: they return after the local
+// GRDB row is committed, so the executor's next read sees it.
 
 import Foundation
 import UnstuckCore
 import UnstuckData
+import UnstuckSync
 
 @MainActor
 final class AppModelAssistantState: AssistantAppState {
@@ -39,15 +42,17 @@ final class AppModelAssistantState: AssistantAppState {
         guard let db = model.db else { return [] }
         return (try? Repository<ReasonLog>(db, orderColumn: "at").all()) ?? []
     }
-    func getStruggles() -> [String] { UserDefaults.standard.stringArray(forKey: "unstuck.adhdStruggles") ?? [] }
+    /// The engine's vocabulary ("Starting", "Switching", …) whatever labels
+    /// onboarding stored — see AppModel.canonicalStruggles.
+    func getStruggles() -> [String] { model.canonicalStruggles }
 
-    // MARK: tasks + blocks
+    // MARK: tasks + blocks (committed locally before returning)
 
-    func upsertTask(_ t: TaskItem) { model.saveTask(t) }
-    func removeTask(_ id: String) { model.deleteTask(id) }
-    func upsertBlock(_ b: CalBlock) { model.saveBlock(b) }
+    func upsertTask(_ t: TaskItem) async { await model.saveTaskAwaiting(t) }
+    func removeTask(_ id: String) async { await model.deleteTaskAwaiting(id) }
+    func upsertBlock(_ b: CalBlock) async { await model.saveBlockAwaiting(b) }
     /// `unschedule` reconciles Google for a pushed task block, then deletes.
-    func deleteBlock(_ id: String) { model.unschedule(id) }
+    func deleteBlock(_ id: String) async { await model.unscheduleAwaiting(id) }
 
     // MARK: lists
 
@@ -103,14 +108,16 @@ final class AppModelAssistantState: AssistantAppState {
     }
     func unshareTask(shareId: String) async throws {
         guard let circle = model.coordinator?.circle else { throw AssistantStateError.offline }
-        await circle.unshareTask(shareId: shareId)
+        guard await circle.unshareTask(shareId: shareId) else { throw AssistantStateError.revokeFailed }
     }
 
     // MARK: profile memory
 
     func getProfileFacts() -> [ProfileFact] { model.profileFacts?.all() ?? [] }
-    func saveProfileFact(category: String?, fact: String, whenIso: String?) -> ProfileFact? {
-        model.profileFacts?.save(category: ProfileFactsLogic.category(from: category), fact: fact, source: .chat, whenIso: whenIso)
+    func saveProfileFact(category: String?, fact: String, whenIso: String?) throws -> ProfileFact {
+        // No store yet (before start()) is a store failure, not "not a fact".
+        guard let service = model.profileFacts else { throw ProfileFactSaveError.storeFailed }
+        return try service.store(category: ProfileFactsLogic.category(from: category), fact: fact, source: .chat, whenIso: whenIso)
     }
     func saveStylePreference(_ pref: StylePreference) -> ProfileFact? { model.profileFacts?.saveStylePreference(pref) }
     func removeProfileFact(_ id: String) -> Bool { model.profileFacts?.remove(id: id) ?? false }
@@ -122,8 +129,8 @@ final class AppModelAssistantState: AssistantAppState {
         return (try? Repository<Capture>(db, orderColumn: "at").all()) ?? []
     }
     func getArchivedCaptureIds() -> [String] { Array(model.archivedCaptureIds) }
-    func upsertCapture(_ c: Capture) { model.saveCapture(c) }
-    func removeCapture(_ id: String) { model.discardCapture(id) }
+    func upsertCapture(_ c: Capture) async { await model.saveCaptureAwaiting(c) }
+    func removeCapture(_ id: String) async { await model.discardCaptureAwaiting(id) }
     func archiveCapture(_ id: String, archived: Bool) {
         if archived { model.archiveCapture(id) } else { model.unarchiveCapture(id) }
     }
@@ -173,52 +180,52 @@ final class AppModelAssistantState: AssistantAppState {
 
     // MARK: areas + tags (rename/delete cascade like the web's use-life-areas / use-tags)
 
-    func addArea(name: String, color: String?) {
+    func addArea(name: String, color: String?) async {
         let next = (getAreaRows().map(\.sortOrder).max() ?? -1) + 1
-        model.saveLifeArea(LifeArea(id: newUUID(), name: name, color: color ?? "indigo", sortOrder: next))
+        await model.saveLifeAreaAwaiting(LifeArea(id: newUUID(), name: name, color: color ?? "indigo", sortOrder: next))
     }
-    func updateArea(_ id: String, name: String?, color: String?) {
+    func updateArea(_ id: String, name: String?, color: String?) async {
         guard let row = getAreaRows().first(where: { $0.id == id }) else { return }
-        model.saveLifeArea(LifeArea(id: row.id, name: name ?? row.name, color: color ?? row.color, sortOrder: row.sortOrder))
+        await model.saveLifeAreaAwaiting(LifeArea(id: row.id, name: name ?? row.name, color: color ?? row.color, sortOrder: row.sortOrder))
         if let name, name != row.name {
             for var t in getTasks() where t.lifeArea == row.name {
                 t.lifeArea = name
                 t.updatedAt = AppModel.isoNow()
-                model.saveTask(t)
+                await model.saveTaskAwaiting(t)
             }
         }
     }
-    func removeArea(_ id: String) {
+    func removeArea(_ id: String) async {
         let row = getAreaRows().first { $0.id == id }
-        model.deleteLifeArea(id)
+        await model.deleteLifeAreaAwaiting(id)
         // "its tasks keep everything else" — they just lose the label.
         if let row {
             for var t in getTasks() where t.lifeArea == row.name {
                 t.lifeArea = nil
                 t.updatedAt = AppModel.isoNow()
-                model.saveTask(t)
+                await model.saveTaskAwaiting(t)
             }
         }
     }
-    func addTag(name: String) {
+    func addTag(name: String) async {
         let next = (getTagRows().map(\.sortOrder).max() ?? -1) + 1
-        model.saveTag(TagRow(id: newUUID(), name: name, color: nil, sortOrder: next))
+        await model.saveTagAwaiting(TagRow(id: newUUID(), name: name, color: nil, sortOrder: next))
     }
-    func updateTag(_ id: String, name: String?) {
+    func updateTag(_ id: String, name: String?) async {
         guard let row = getTagRows().first(where: { $0.id == id }) else { return }
-        model.saveTag(TagRow(id: row.id, name: name ?? row.name, color: row.color, sortOrder: row.sortOrder))
+        await model.saveTagAwaiting(TagRow(id: row.id, name: name ?? row.name, color: row.color, sortOrder: row.sortOrder))
         if let name, name != row.name {
             for var t in getTasks() where (t.tags ?? []).contains(where: { $0.caseInsensitiveCompare(row.name) == .orderedSame }) {
                 var seen = Set<String>()
                 t.tags = (t.tags ?? []).map { $0.caseInsensitiveCompare(row.name) == .orderedSame ? name : $0 }
                     .filter { seen.insert($0.lowercased()).inserted }
                 t.updatedAt = AppModel.isoNow()
-                model.saveTask(t)
+                await model.saveTaskAwaiting(t)
             }
         }
     }
     /// AppModel.deleteTag already strips the name from every task.
-    func removeTag(_ id: String) { model.deleteTag(id) }
+    func removeTag(_ id: String) async { await model.deleteTagAwaiting(id) }
 
     // MARK: settings
 
@@ -231,6 +238,8 @@ final class AppModelAssistantState: AssistantAppState {
         // best-effort: the local value is what the brief math reads.
         try? await model.coordinator?.preferences.setUsableMinutes(perDay: weekday, weekend: weekend)
     }
+    /// The REAL outcome (web parity): the local write read back + the server
+    /// mirror awaited — false makes the contract's "could not save" reachable.
     func setNotificationLevel(_ level: String) async -> Bool {
         let mapped: NotificationLevel
         switch level {
@@ -238,12 +247,10 @@ final class AppModelAssistantState: AssistantAppState {
         case "coach": mapped = .coach
         default: mapped = .balanced
         }
-        model.setNotificationLevel(mapped)
-        return true
+        return await model.setNotificationLevelAwaiting(mapped)
     }
     func setReminderLead(_ minutes: Int) async -> Bool {
-        model.setReminderLeadMin(minutes)
-        return true
+        await model.setReminderLeadAwaiting(minutes)
     }
     func setRitual(_ ritual: String, on: Bool) {
         guard let key = RitualKey(rawValue: ritual) else { return }
@@ -255,5 +262,12 @@ final class AppModelAssistantState: AssistantAppState {
 
 enum AssistantStateError: LocalizedError {
     case offline
-    var errorDescription: String? { "offline" }
+    /// The server did not accept the unshare RPC.
+    case revokeFailed
+    var errorDescription: String? {
+        switch self {
+        case .offline: return "offline"
+        case .revokeFailed: return "couldn't revoke the share"
+        }
+    }
 }

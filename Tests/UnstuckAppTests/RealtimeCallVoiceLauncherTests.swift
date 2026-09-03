@@ -1,8 +1,9 @@
 // RealtimeCallVoiceLauncher against a fake realtime session — no socket, no
 // AVFoundation, no AppModel. Asserts the C1 launcher contract:
 //   composition (base instructions + call script, verbatim opening in the
-//   primer, call tools only + snooze_call), snooze → coordinator snooze +
-//   `.snoozed` (once, and not after stop()), transport drop → `.failed` /
+//   primer, call tools only + snooze_call), snooze → the coordinator ONLY
+//   (the launcher never ends itself — the coordinator's async CXEndCallAction
+//   stops it and reports `snoozed` exactly once), transport drop → `.failed` /
 //   clean close → `.hungUp` exactly once, nothing after stop(), mute
 //   passthrough (also when set before start), non-call tools refused, the
 //   fallback-B Talk configuration, and the audio engine's `.callKit`
@@ -148,31 +149,40 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
 
     // MARK: - snooze
 
-    func testSnoozeCallsCoordinatorSnoozeAndEndsSnoozedOnce() async {
+    /// snooze_call is the coordinator's: the launcher returns its result and
+    /// does NOT end itself — the coordinator's (async) CXEndCallAction lands
+    /// in performEnd, which calls stop() and reports `snoozed` once. Ending
+    /// here too used to fire onEnded → a second endActiveCall.
+    func testSnoozeHandsOffToTheCoordinatorAndNeverEndsItself() async {
         let live = start()
         let r = await live.tool("snooze_call", #"{"minutes":10}"#)
         XCTAssertTrue(r.hasPrefix("ok"))
         XCTAssertEqual(snoozes, [10])
-        XCTAssertEqual(ended, [.snoozed(minutes: 10)])
+        XCTAssertTrue(ended.isEmpty, "no onEnded — the coordinator owns the end")
+        XCTAssertEqual(live.stops, 0, "still talking until CallKit ends the call")
+        XCTAssertEqual(sessionEnds, 0)
+        // The coordinator's performEnd → stop(): silent, once.
+        launcher.stop()
         XCTAssertEqual(live.stops, 1)
         XCTAssertEqual(sessionEnds, 1)
+        XCTAssertTrue(ended.isEmpty)
         // Nothing after: a late transport drop / a second snooze are ignored.
         live.drop("socket closed")
-        _ = await live.tool("snooze_call", "{}")
-        XCTAssertEqual(ended, [.snoozed(minutes: 10)])
+        let again = await live.tool("snooze_call", "{}")
+        XCTAssertEqual(again, "error: the call has ended")
+        XCTAssertTrue(ended.isEmpty)
         XCTAssertEqual(snoozes, [10])
         XCTAssertEqual(live.stops, 1)
     }
 
-    func testSnoozeDefaultsToTenAndClampsTheReasonLikeTheCoordinator() async {
+    func testSnoozeDefaultsToTenAndPassesTheRawMinutesForTheCoordinatorToClamp() async {
         let a = start()
         _ = await a.tool("snooze_call", "{}")
         XCTAssertEqual(snoozes, [10])
-        XCTAssertEqual(ended, [.snoozed(minutes: 10)])
         let b = start()
         _ = await b.tool("snooze_call", #"{"minutes":999}"#)
         XCTAssertEqual(snoozes, [10, 999], "the raw minutes reach the coordinator, which clamps")
-        XCTAssertEqual(ended.last, .snoozed(minutes: 180))
+        XCTAssertTrue(ended.isEmpty)
     }
 
     func testSnoozeErrorLeavesTheCallRunning() async {
@@ -186,11 +196,12 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
     }
 
     /// End to end through a REAL CallCoordinator over the CallCoordinatorTests
-    /// fakes: answer → didActivate → launcher starts → snooze_call → the
-    /// coordinator hangs up (stop) and reports `snoozed` with the minutes; the
-    /// launcher ends its session exactly once and never calls onEnded after
-    /// stop() (only ONE end transaction is requested).
-    func testSnoozeThroughTheCoordinatorReportsSnoozedAndStopsOnce() async {
+    /// fakes, with CallKit's ASYNC end: answer → didActivate → launcher starts
+    /// → snooze_call → the coordinator asks CallKit to end (in flight) → the
+    /// model says goodbye and the transport closes BEFORE the CXEndCallAction
+    /// lands → still ONE end transaction; the action lands → ONE `snoozed`
+    /// outcome with the minutes, the launcher stopped exactly once.
+    func testSnoozeThroughTheCoordinatorIsOneEndAndOneOutcomeDespiteTheRace() async {
         let provider = FakeCallProvider(), controller = FakeCallController(), notifier = FakeNotifier()
         let reporter = FakeReporter(), env = FakeEnvironment(), clock = FakeClock()
         clock.now = Self.now
@@ -213,12 +224,58 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
 
         let r = await live.tool("snooze_call", #"{"minutes":10}"#)
         XCTAssertTrue(r.hasPrefix("ok: I'll call back in 10 minutes"))
-        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, outcome: .snoozed, snooze: 10, notes: nil))
-        XCTAssertNil(coordinator.active)
-        XCTAssertEqual(controller.requested.count, 1, "the coordinator's own hang-up; no second request from onEnded")
+        XCTAssertEqual(controller.requested.count, 1, "the coordinator's hang-up is in flight")
+        XCTAssertEqual(live.stops, 0, "nothing stopped until CallKit ends the call")
+        XCTAssertEqual(reporter.outcomes, [.answered], "nothing reported yet")
+        XCTAssertEqual(coordinator.active?.pendingEnd, .snoozed(minutes: 10))
+
+        // The race: the conversation ends on its own while the end is in flight.
+        live.drop(nil)
         XCTAssertEqual(live.stops, 1)
         XCTAssertEqual(sessionEnds, 1)
         XCTAssertNil(launcher.activeSession)
+        XCTAssertEqual(controller.requested.count, 1, "no second CXEndCallAction from onEnded")
+        XCTAssertEqual(reporter.outcomes, [.answered])
+
+        controller.flush()   // CallKit's CXEndCallAction lands
+        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, callKitId: UUID(uuidString: Self.callId), outcome: .snoozed, snooze: 10, notes: nil))
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed], "exactly one outcome for the end")
+        XCTAssertEqual(controller.requested.count, 1)
+        XCTAssertNil(coordinator.active)
+        XCTAssertEqual(live.stops, 1, "stopped exactly once")
+        XCTAssertEqual(sessionEnds, 1)
+    }
+
+    /// The plain path (no race): snooze → CallKit ends → performEnd stops the
+    /// launcher itself → `snoozed` once, stop once.
+    func testSnoozeThroughTheCoordinatorStopsTheLauncherFromPerformEnd() async {
+        let provider = FakeCallProvider(), controller = FakeCallController(), notifier = FakeNotifier()
+        let reporter = FakeReporter(), env = FakeEnvironment(), clock = FakeClock()
+        clock.now = Self.now
+        let coordinator = CallCoordinator(provider: provider, controller: controller, environment: env,
+                                          launcher: launcher, launcherAttached: true,
+                                          notifier: notifier, reporter: reporter, clock: clock)
+        controller.coordinator = coordinator
+        var d = deps()
+        d.snooze = { coordinator.snoozeActiveCall(minutes: $0) }
+        launcher.bind(d)
+        coordinator.reportIncoming(session().payload)
+        XCTAssertTrue(coordinator.performAnswer(uuid: UUID(uuidString: Self.callId)!))
+        coordinator.audioSessionDidActivate()
+        let live = sessions[0]
+        _ = await live.tool("snooze_call", #"{"minutes":15}"#)
+        controller.flush()
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
+        XCTAssertEqual(reporter.reports.last?.snooze, 15)
+        XCTAssertEqual(controller.requested.count, 1)
+        XCTAssertEqual(live.stops, 1)
+        XCTAssertEqual(sessionEnds, 1)
+        XCTAssertNil(coordinator.active)
+        XCTAssertNil(launcher.activeSession)
+        // A late drop from the old socket is ignored (generation moved on).
+        live.drop("late")
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
+        XCTAssertEqual(controller.requested.count, 1)
     }
 
     // MARK: - end contract

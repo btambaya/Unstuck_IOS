@@ -48,8 +48,11 @@ struct MainTabScaffold: View {
             .fullScreenCover(isPresented: $showCallTalk) { VoiceModeScreen() }
             // "Unstuck calls you", fallback B: a tapped call alert parks a CallSession on
             // the launcher; present Talk, which takes it and runs the call configuration.
+            // If a VoiceModeScreen is ALREADY up (Today's gateway mic / the Assistant
+            // sheet's Talk), it takes the call itself — a second cover here would
+            // strand the pending session behind the first one.
             .onChange(of: RealtimeCallVoiceLauncher.shared.pendingSession != nil) { _, hasCall in
-                if hasCall { showCallTalk = true }
+                if hasCall, !VoiceSessionModel.isPresented { showCallTalk = true }
             }
             .fullScreenCover(item: $router.focusTask, onDismiss: { router.sharedFocus = nil; model.flushPendingDeepLink() }) { task in
                 // `sharedFocus` (set alongside focusTask by beginSharedFocus) makes

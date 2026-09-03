@@ -4,6 +4,7 @@
 
 import Foundation
 import Supabase
+import os
 
 public struct PushClient: Sendable {
     let client: SupabaseClient
@@ -25,9 +26,14 @@ public struct PushClient: Sendable {
     /// at launch by the app (VoipPushRegistry → a UserDefaults-backed read), so
     /// EVERY registration — the APNs-token path, the auth-transition
     /// re-register, and a VoIP token refresh — carries both tokens without the
-    /// callers having to know about PushKit. Read from any actor; the app sets
-    /// it before any register() runs (`nonisolated(unsafe)` documents that).
-    nonisolated(unsafe) public static var voipTokenProvider: (@Sendable () -> String?)?
+    /// callers having to know about PushKit. Read + written from any actor:
+    /// the storage is a lock-guarded box, so a late install never races a
+    /// register() in flight.
+    public static var voipTokenProvider: (@Sendable () -> String?)? {
+        get { voipTokenProviderBox.withLock { $0 } }
+        set { voipTokenProviderBox.withLock { $0 = newValue } }
+    }
+    private static let voipTokenProviderBox = OSAllocatedUnfairLock<(@Sendable () -> String?)?>(initialState: nil)
 
     /// Register this device's tokens with `register-push-token`.
     /// - `apnsToken`: the alert-push token; an EMPTY string is treated as nil

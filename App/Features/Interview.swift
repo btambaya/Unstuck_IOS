@@ -33,7 +33,8 @@ struct InterviewQuestion: Sendable {
     let allowFree: Bool
     /// Free text is a comma-separated list of NAMES — each becomes its own
     /// person fact ("Maleek", "Sam" → two facts), so relationship moments can
-    /// match one name per fact (moments.ts `leadName`).
+    /// match one name per fact (moments.ts `leadName`). A descriptor
+    /// ("Maleek — son, 9") is ONE fact — see `InterviewMachine.splitPeople`.
     let splitNames: Bool
 
     init(key: String, category: UnstuckCore.ProfileFactCategory, question: String, chips: [InterviewChip],
@@ -62,7 +63,7 @@ let INTERVIEW_QUESTIONS: [InterviewQuestion] = [
         chips: [InterviewChip(label: "No one right now", fact: nil)],
         allowFree: true, splitNames: true),
     InterviewQuestion(
-        key: "work", category: .constraint,
+        key: "work", category: .context,   // web parity — .constraint here duplicated the fact across devices
         question: "What do your work days look like?",
         chips: [
             InterviewChip(label: "9–5 weekdays", fact: "Works roughly 9–5 on weekdays"),
@@ -111,7 +112,7 @@ final class InterviewMachine {
     private(set) var step: Int
     /// Facts saved this session, newest last — drives the "✓ Noted: …" line.
     private(set) var noted: [String] = []
-    /// True once `finish()`/`skip()` ran — the host stops rendering the panel.
+    /// True once `finish()` ran — the host stops rendering the panel.
     private(set) var finished = false
 
     @ObservationIgnored private let defaults: UserDefaults
@@ -143,14 +144,13 @@ final class InterviewMachine {
     }
 
     /// Free-text answer. Empty → no-op (stays on the question). Name questions
-    /// split on commas into one person fact per name.
+    /// split into one person fact per name (`splitPeople`).
     func answerFree(_ text: String) {
         guard let q = current else { return }
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
         if q.splitNames {
-            let names = t.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+            let names = Self.splitPeople(t)
             guard !names.isEmpty else { return }
             for n in names { store(q.category, n) }
         } else {
@@ -159,18 +159,59 @@ final class InterviewMachine {
         advance()
     }
 
+    /// The people answer → person facts. Commas separate NAMES ("Maleek, Sam")
+    /// — unless the text carries a descriptor dash ("Maleek — son, 9"), where
+    /// the comma is part of the description and the whole line is one fact
+    /// (profile.ts convention: leading name, dash, detail). Pieces without a
+    /// letter ("9") are dropped, and a name only ever yields one fact.
+    nonisolated static func splitPeople(_ text: String) -> [String] {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pieces: [String] = hasDescriptorDash(t) ? [t] : t.split(separator: ",").map(String.init)
+        var seen = Set<String>()
+        var out: [String] = []
+        for raw in pieces {
+            let p = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard p.contains(where: { $0.isLetter }) else { continue }
+            let key = leadName(p).lowercased()
+            guard !key.isEmpty, seen.insert(key).inserted else { continue }
+            out.append(p)
+        }
+        return out
+    }
+
+    /// An em/en dash anywhere, or a hyphen next to whitespace ("Maleek - son");
+    /// a hyphen INSIDE a word ("Mary-Jane") is part of the name.
+    private nonisolated static func hasDescriptorDash(_ s: String) -> Bool {
+        if s.contains("—") || s.contains("–") { return true }
+        let chars = Array(s)
+        for (i, c) in chars.enumerated() where c == "-" {
+            let before = i > 0 ? chars[i - 1] : " "
+            let after = i + 1 < chars.count ? chars[i + 1] : " "
+            if before.isWhitespace || after.isWhitespace { return true }
+        }
+        return false
+    }
+
+    /// "Maleek — son, 9" → "maleek"-comparable head (moments.ts `leadName`).
+    private nonisolated static func leadName(_ fact: String) -> String {
+        let seps: Set<Character> = ["—", "–", "-", ","]
+        return String(fact.prefix { !$0.isWhitespace && !seps.contains($0) })
+    }
+
     /// Skip just this question (nothing saved).
     func skipQuestion() { advance() }
 
-    /// "That's me set up" / "I'm done": mark done — never re-asks.
+    /// "That's me set up" / "I'm done": mark done — never re-asks. Facts
+    /// already saved stay.
     func finish() {
         Self.markDone(defaults)
         finished = true
     }
 
-    /// "Skip for now": also final — the interview never re-asks once skipped
-    /// (a nudge pill would read as nagging). Facts already saved stay.
-    func skip() { finish() }
+    /// "Skip for now": NOT final (web parity — its finisher is "I'm done").
+    /// The panel collapses and the step is persisted so the pill resumes
+    /// here; nothing is marked done. Same as `collapse`.
+    func skip() { collapse() }
 
     /// Collapse the panel mid-way WITHOUT finishing: the step is persisted so
     /// re-opening resumes here (also across relaunch).
@@ -204,19 +245,49 @@ final class InterviewMachine {
         defaults.removeObject(forKey: stepKey)
     }
 
+    /// True while a mid-way step is persisted (a collapse / "Skip for now",
+    /// or any advance that hasn't reached `finish`): the user is still IN the
+    /// interview, just not looking at it.
+    nonisolated static func hasResumeStep(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: stepKey) != nil
+    }
+
     /// Onboarding by CONVERSATION counts: once ≥3 real facts exist (saved by
     /// voice/chat/settings) the interview stands down — asking again reads as
     /// "the AI isn't saving anything". NEVER while the panel is open: its own
     /// answers grow the count and auto-closing at answer 3 of 5 looks like a
-    /// crash (web flow review, 2026-08-30).
-    nonisolated static func shouldAutoComplete(factCount: Int, isOpen: Bool, done: Bool) -> Bool {
-        !done && !isOpen && factCount >= 3
+    /// crash (web flow review, 2026-08-30). And NEVER while a resume step is
+    /// saved: those ≥3 facts are its OWN answers from a hidden-mid-way run,
+    /// and auto-completing there skipped the rituals picker on relaunch.
+    nonisolated static func shouldAutoComplete(factCount: Int, isOpen: Bool, done: Bool,
+                                               hasResumeStep: Bool = false) -> Bool {
+        !done && !isOpen && !hasResumeStep && factCount >= 3
     }
 
-    /// Whether to open the interview by itself: nothing learned anywhere and
-    /// not done. Every question is skippable.
-    nonisolated static func shouldAutoOpen(factCount: Int, done: Bool) -> Bool {
-        !done && factCount == 0
+    /// Whether to open the interview by itself: nothing learned anywhere, not
+    /// done, and not parked ("Skip for now" persists a resume step — popping
+    /// back open on the next launch would be the nag it exists to avoid; the
+    /// pill is the way back in). Every question is skippable.
+    nonisolated static func shouldAutoOpen(factCount: Int, done: Bool, hasResumeStep: Bool = false) -> Bool {
+        !done && !hasResumeStep && factCount == 0
+    }
+}
+
+/// When the card may open the interview BY ITSELF: exactly once, and only
+/// after BOTH the local facts have been read AND the server hydrate has
+/// completed (success or failure/offline). Deciding on the first local
+/// emission flashed the interview open on a fresh install whose facts live on
+/// the web, then slammed it shut when the hydrate landed. Pure and tested.
+struct InterviewAutoOpenGate: Equatable {
+    private(set) var decided = false
+
+    /// Feed every change (facts emission, hydrate flag flip). Returns true
+    /// exactly once — the moment the panel should open.
+    mutating func evaluate(hydrated: Bool, factsLoaded: Bool, factCount: Int, done: Bool,
+                           hasResumeStep: Bool = false) -> Bool {
+        guard !decided, hydrated, factsLoaded else { return false }
+        decided = true
+        return InterviewMachine.shouldAutoOpen(factCount: factCount, done: done, hasResumeStep: hasResumeStep)
     }
 }
 
@@ -247,18 +318,21 @@ struct InterviewFlowView: View {
                     .font(UFont.mono(10, .semibold)).tracking(1.2)
                     .foregroundStyle(theme.palette.ink3)
                 Spacer(minLength: 8)
-                // Always visible: the way out that never re-asks.
-                Button { machine.skip(); onFinished() } label: {
+                // Two ways out, both always visible: "Skip for now" parks it
+                // (the pill resumes here); "I'm done" is the finisher that
+                // never re-asks (web parity).
+                Button { machine.skip(); onCollapse() } label: {
                     Text("Skip for now").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                        .frame(minHeight: 32).contentShape(Rectangle())
+                        .frame(minHeight: 44).contentShape(Rectangle())
                 }.buttonStyle(.plain)
-                    .accessibilityLabel("Skip the interview for now")
-                Button { machine.collapse(); onCollapse() } label: {
-                    Image(systemName: "chevron.up").font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(theme.palette.ink3)
-                        .frame(width: 32, height: 32).contentShape(Rectangle())
+                    .accessibilityLabel("Skip for now")
+                    .accessibilityHint("Hides the questions; resume any time from the card")
+                Button { machine.finish(); onFinished() } label: {
+                    Text("I’m done").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .frame(minHeight: 44).contentShape(Rectangle())
                 }.buttonStyle(.plain)
-                    .accessibilityLabel("Hide for now — resume later")
+                    .accessibilityLabel("I’m done")
+                    .accessibilityHint("Finishes the interview; it won’t ask again")
             }
 
             if let q = machine.current {
@@ -271,6 +345,7 @@ struct InterviewFlowView: View {
                 Text("✓ Noted: \(last)")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                     .lineLimit(2)
+                    .accessibilityLabel("Noted: \(last)")
                     .accessibilityAddTraits(.updatesFrequently)
             }
         }
@@ -362,8 +437,10 @@ struct InterviewFlowView: View {
             Button { machine.finish(); onFinished() } label: {
                 Text("That’s me set up").font(UFont.sans(13, .semibold)).foregroundStyle(.white)
                     .padding(.horizontal, 16).padding(.vertical, 9)
+                    .frame(minHeight: 44)
                     .background(theme.palette.coral, in: Capsule())
             }.buttonStyle(.plain)
+                .accessibilityLabel("That’s me set up")
         }
     }
 }
@@ -380,7 +457,7 @@ struct RitualChips: View {
             ForEach(RITUAL_LABELS, id: \.key) { r in
                 let on = isOn(r.key)
                 Button { set(r.key, !on) } label: {
-                    Text((on ? "✓ " : "") + r.label)
+                    Text((on ? "✓ " : "") + r.label)   // glyph is visual only — label below reads the name
                         .font(UFont.sans(13)).foregroundStyle(on ? .white : theme.palette.ink)
                         .padding(.horizontal, 13).padding(.vertical, 8)
                         .background(on ? theme.palette.coral : theme.palette.surface, in: Capsule())

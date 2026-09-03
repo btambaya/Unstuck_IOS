@@ -1,9 +1,17 @@
 // Assistant navigation — maps the tool contract's screen vocabulary
-// (open_screen: today | tasks | calendar | week | month | focus | insights |
-// lists | captures | settings | people | notifications, + the web's aliases)
-// onto the existing tab / sheet / deep-link machinery. Extension only: no
-// stored state; everything routes through AppRouter + routeDeepLink so the
-// dismiss-before-present guard and the AI kill-switch keep applying.
+// (open_screen: today | tasks | calendar | day | week | month | focus |
+// insights | lists | captures | settings | people | notifications | areas, +
+// the web's aliases) onto the existing tab / sheet / deep-link machinery.
+// Extension only: no stored state; everything routes through AppRouter +
+// routeDeepLink so the dismiss-before-present guard and the AI kill-switch
+// keep applying.
+//
+// Modal targets (insights / inbox / settings sections) go through
+// `routeDeepLink`'s deferred path: the assistant sheet (or Talk cover) is up
+// while it navigates, and presenting a second sheet on the same host while
+// the first is still dismissing silently no-ops — so the link is parked on
+// `router.pendingDeepLink`, the modals are torn down, and the host's
+// `onDismiss` flush presents the target once they're gone.
 
 import Foundation
 import UnstuckCore
@@ -25,7 +33,13 @@ extension AppModel {
                 dismissForNavigation()
                 router.select(.tasks)
             }
-        case "calendar", "day", "week", "month":
+        case "calendar":
+            dismissForNavigation()
+            router.select(.calendar)
+        case "day", "week", "month":
+            // The mode actually switches — landing on the tab in whatever mode
+            // it was left in made "show me the week" a no-op.
+            router.calendarMode = Self.calendarMode(for: screen)
             dismissForNavigation()
             router.select(.calendar)
         case "focus":
@@ -45,38 +59,63 @@ extension AppModel {
             dismissForNavigation()
             router.select(.today)
         case "insights", "analytics":
-            dismissForNavigation()
-            router.present(.insights)
+            routeDeepLink("unstuck://insights")
         case "lists", "collections":
             dismissForNavigation()
             router.select(.lists)
             if let id { routeDeepLink("unstuck://collections/\(id)") }
         case "captures", "inbox":
-            dismissForNavigation()
-            router.present(.inbox)
+            routeDeepLink("unstuck://inbox")
         case "settings":
-            dismissForNavigation()
-            router.present(.settings(section: nil))
+            routeDeepLink("unstuck://settings")
         case "people":
-            dismissForNavigation()
-            router.present(.settings(section: "People"))
+            routeDeepLink("unstuck://settings?section=People")
         case "notifications":
-            dismissForNavigation()
-            router.present(.settings(section: "Notifications"))
+            routeDeepLink("unstuck://settings?section=Notifications")
         case "areas":
-            dismissForNavigation()
-            router.present(.settings(section: "Areas"))
+            routeDeepLink("unstuck://settings?section=Areas")
         default:
             return false
         }
         return true
     }
 
-    /// The assistant panel (or voice overlay) is up while it navigates; SwiftUI
-    /// can't present a second sheet from the same host, so close ours first.
+    /// The assistant panel (or voice overlay) is up while it navigates to a
+    /// TAB; SwiftUI applies a tab switch under a sheet, but the user should
+    /// see the destination, so close ours first. Modal targets don't come
+    /// through here — they take routeDeepLink's dismiss-then-present path.
     private func dismissForNavigation() {
         router.showAssistant = false
+        router.showTalk = false
         router.activeSheet = nil
         router.detailTask = nil
+    }
+
+    /// `day` / `week` / `month` → the calendar mode (anything else: day).
+    nonisolated static func calendarMode(for screen: String) -> AppRouter.CalendarMode {
+        switch screen.lowercased() {
+        case "week": return .week
+        case "month": return .month
+        default: return .day
+        }
+    }
+
+    /// The `section=` of an `unstuck://settings?section=…` link, normalised to
+    /// the names SettingsView pushes (Notifications / Interface / People /
+    /// Areas). Case-insensitive; "Areas & tags" and "tags" mean Areas. nil =
+    /// the Settings hub.
+    nonisolated static func settingsSection(in link: String) -> String? {
+        guard let comps = URLComponents(string: link),
+              let raw = comps.queryItems?.first(where: { $0.name == "section" })?.value?
+                  .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !raw.isEmpty
+        else { return nil }
+        switch raw {
+        case "notifications", "notification": return "Notifications"
+        case "interface": return "Interface"
+        case "people", "connections", "circle": return "People"
+        case "areas", "areas & tags", "areas-and-tags", "tags", "areas-tags": return "Areas"
+        default: return nil
+        }
     }
 }

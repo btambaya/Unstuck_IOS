@@ -41,19 +41,46 @@ public struct PreferencesClient: Sendable {
             .execute()
     }
 
+    /// The account's onboarding struggles as the server has them (any
+    /// platform's vocabulary — callers canonicalise). Empty when the row or
+    /// column is absent; throws only on transport failure.
+    public func adhdStruggles(userId: String) async throws -> [String] {
+        struct Row: Decodable { let adhd_struggles: [String]? }
+        let rows: [Row] = try await client.from("user_preferences")
+            .select("adhd_struggles").eq("user_id", value: userId).limit(1)
+            .execute().value
+        return rows.first?.adhd_struggles ?? []
+    }
+
     /// Mirror the device NotificationLevel to notification_preferences
     /// (owner-self RLS) so the server-driven morning brief + paused-checkin
     /// cap honour it (spec 10 §1.12). Only the level-derived toggles are
-    /// sent; other columns keep their values (Android PreferencesClient).
-    public func setNotificationLevel(userId: String, morningBrief: Bool, pausedCheckin: Bool) async throws {
+    /// sent — plus, when given, the level itself (`notification_level`, the
+    /// column the web reads back; lowercase per the migration-030 check);
+    /// other columns keep their values (Android PreferencesClient).
+    public func setNotificationLevel(userId: String, morningBrief: Bool, pausedCheckin: Bool,
+                                     level: String? = nil) async throws {
         struct Row: Encodable {
             let user_id: String
             let morning_brief_enabled: Bool
             let paused_checkin_enabled: Bool
+            let notification_level: String?
         }
         _ = try await client.from("notification_preferences")
             .upsert(Row(user_id: userId, morning_brief_enabled: morningBrief,
-                        paused_checkin_enabled: pausedCheckin), onConflict: "user_id")
+                        paused_checkin_enabled: pausedCheckin, notification_level: level?.lowercased()),
+                    onConflict: "user_id")
+            .execute()
+    }
+
+    /// Mirror the global reminder lead (`reminder_lead_min`, 0 = off) — the
+    /// same upsert the web's `setReminderLead` makes, so a lead chosen through
+    /// the assistant reads back identically on every platform. iOS reminders
+    /// still fire locally (the server cron only targets web devices).
+    public func setReminderLead(userId: String, minutes: Int) async throws {
+        struct Row: Encodable { let user_id: String; let reminder_lead_min: Int }
+        _ = try await client.from("notification_preferences")
+            .upsert(Row(user_id: userId, reminder_lead_min: minutes), onConflict: "user_id")
             .execute()
     }
 

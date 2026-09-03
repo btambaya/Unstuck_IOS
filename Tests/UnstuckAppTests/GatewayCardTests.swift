@@ -2,10 +2,14 @@
 // dismiss/done bookkeeping (GatewayMomentState) — the iOS mirror of the
 // gateway-card.tsx runAction/settle rules:
 //   • carry_tasks is recurring-safe (tomorrow already taken → today's block is
-//     SKIPPED, not moved) and bumps moveCount on every real carry;
-//   • schedule moves only a LIVE upcoming block, else creates a fresh one;
+//     SKIPPED, not moved), bumps moveCount on every real carry, and reports
+//     nothing (nil) when nothing moved;
+//   • schedule moves only the SOONEST live upcoming block, else creates a
+//     fresh one, and does nothing for a task that no longer exists;
 //   • a dismissal persists (cross-launch) and the ✓ done-state clears only for
-//     the confirmation that set it.
+//     the confirmation that set it;
+//   • the brief/moment memo recomputes only when an input changes;
+//   • the assistant's settings deep-link section parsing.
 
 import XCTest
 import UnstuckCore
@@ -88,7 +92,7 @@ final class GatewayCardTests: XCTestCase {
                                           todayIso: today, tomorrowIso: tomorrow, nowISO: nowISO)
         XCTAssertTrue(w.blocks.isEmpty)
         XCTAssertTrue(w.tasks.isEmpty)
-        XCTAssertEqual(w.confirmation, "Carried 0 to tomorrow.")
+        XCTAssertNil(w.confirmation, "nothing moved → no ✓ (\"Carried 0 to tomorrow\" was a lie) and the moment stays up")
     }
 
     // MARK: schedule
@@ -112,6 +116,26 @@ final class GatewayCardTests: XCTestCase {
                                         blocks: [anchor], todayIso: today, newId: "new")
         XCTAssertEqual(w.blocks[0].startTime, "18:00")
         XCTAssertEqual(w.confirmation, "Blocked — Task, 2026-09-05.")
+    }
+
+    func testScheduleAnchorsTheSoonestLiveBlockNotStoreOrder() {
+        let t = task("t1", name: "Gym")
+        let later = block("b-later", task: "t1", date: "2026-09-10", time: "08:00")
+        let soonerLateInDay = block("b-soon-pm", task: "t1", date: "2026-09-04", time: "18:00")
+        let soonerEarly = block("b-soon-am", task: "t1", date: "2026-09-04", time: "07:00")
+        let w = GatewayActions.schedule(taskId: "t1", date: "2026-09-05", time: nil, tasks: [t],
+                                        blocks: [later, soonerLateInDay, soonerEarly], todayIso: today, newId: "new")
+        XCTAssertEqual(w.blocks.map(\.id), ["b-soon-am"], "min by (date, startTime) — not the first in store order")
+        XCTAssertEqual(w.blocks[0].startTime, "07:00")
+    }
+
+    func testScheduleDoesNothingForATaskThatNoLongerExists() {
+        let orphan = block("b1", task: "gone", date: "2026-09-04")
+        let w = GatewayActions.schedule(taskId: "gone", date: "2026-09-05", time: "09:00", tasks: [task("other")],
+                                        blocks: [orphan], todayIso: today, newId: "new")
+        XCTAssertTrue(w.blocks.isEmpty, "no block titled “Task” for a ghost")
+        XCTAssertTrue(w.tasks.isEmpty)
+        XCTAssertNil(w.confirmation)
     }
 
     func testScheduleIgnoresSkippedAndHistoricalBlocksAndCreatesFresh() {
@@ -187,6 +211,58 @@ final class GatewayCardTests: XCTestCase {
         s.clearDone(if: "first")
         XCTAssertEqual(s.momentDone, "second")
         XCTAssertTrue(s.isDismissed("m1") && s.isDismissed("m2"))
+    }
+
+    // MARK: brief / moment memo (C7)
+
+    func testMemoComputesOncePerDistinctKey() {
+        let memo = GatewayMemo<Int, String>()
+        var calls = 0
+        XCTAssertEqual(memo.value(for: 1) { calls += 1; return "one" }, "one")
+        XCTAssertEqual(memo.value(for: 1) { calls += 1; return "again" }, "one", "same key → cached, closure not run")
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(memo.value(for: 2) { calls += 1; return "two" }, "two")
+        XCTAssertEqual(calls, 2)
+        XCTAssertEqual(memo.computeCount, 2)
+    }
+
+    func testInputsKeyChangesOnlyWhenAnEngineInputChanges() {
+        let base = GatewayInputs(tasks: [task("t1")], blocks: [block("b1", task: "t1", date: today)], sessions: [],
+                                 facts: [], struggles: ["Starting"], rituals: .defaults, dismissed: [],
+                                 todayIso: today, minute: 100)
+        XCTAssertEqual(base, base)
+        var typed = base                     // a keystroke in the composer changes none of these
+        typed.minute = 100
+        XCTAssertEqual(typed, base)
+        var dismissed = base
+        dismissed.dismissed = ["evening-sweep:2026-09-02"]
+        XCTAssertNotEqual(dismissed, base)
+        var nextMinute = base
+        nextMinute.minute = 101
+        XCTAssertNotEqual(nextMinute, base, "the time-gated moments move once a minute")
+        var moved = base
+        moved.tasks = [task("t1", moveCount: 3)]
+        XCTAssertNotEqual(moved, base)
+        let t0 = Date(timeIntervalSince1970: 60 * 1000 + 5)
+        let t1 = Date(timeIntervalSince1970: 60 * 1000 + 59)
+        let t2 = Date(timeIntervalSince1970: 60 * 1001)
+        XCTAssertEqual(GatewayInputs.minute(of: t0), GatewayInputs.minute(of: t1))
+        XCTAssertNotEqual(GatewayInputs.minute(of: t1), GatewayInputs.minute(of: t2))
+    }
+
+    // MARK: assistant routing helpers (C2)
+
+    func testSettingsSectionParsing() {
+        XCTAssertNil(AppModel.settingsSection(in: "unstuck://settings"))
+        XCTAssertEqual(AppModel.settingsSection(in: "unstuck://settings?section=People"), "People")
+        XCTAssertEqual(AppModel.settingsSection(in: "unstuck://settings?section=notifications"), "Notifications")
+        XCTAssertEqual(AppModel.settingsSection(in: "unstuck://settings?section=Areas"), "Areas")
+        XCTAssertEqual(AppModel.settingsSection(in: "unstuck://settings?section=tags"), "Areas")
+        XCTAssertEqual(AppModel.settingsSection(in: "unstuck://settings?section=Interface"), "Interface")
+        XCTAssertNil(AppModel.settingsSection(in: "unstuck://settings?section=bogus"), "unknown → the hub")
+        XCTAssertEqual(AppModel.calendarMode(for: "week"), .week)
+        XCTAssertEqual(AppModel.calendarMode(for: "Month"), .month)
+        XCTAssertEqual(AppModel.calendarMode(for: "day"), .day)
     }
 
     // MARK: prefs bridge — cross-launch persistence (web keys + shapes)

@@ -19,8 +19,19 @@ final class AppRouter {
         var id: Int { hashValue }
     }
 
+    /// Calendar's Day / Week / Month mode. Router-owned (not CalendarView
+    /// @State) so the assistant's `open_screen: week|month` actually switches
+    /// the mode instead of just landing on the tab.
+    enum CalendarMode: String, Hashable, CaseIterable { case day = "Day", week = "Week", month = "Month" }
+
     var tab: Tab = .today
     var activeSheet: Sheet?
+    var calendarMode: CalendarMode = .day
+    /// Realtime Talk presented from Today's gateway mic (a full-screen cover on
+    /// TodayView's host). Router-owned so a navigation the assistant drives
+    /// while Talk is up counts as an active presentation: the deferred
+    /// deep-link path dismisses it and presents the target on its onDismiss.
+    var showTalk = false
     /// The Assistant panel, driven by the bottom-trailing ✦ launcher. Assistant
     /// ONLY since the redesign — feedback moved to Settings → Account → "Send
     /// feedback" (matching the web). Never set this directly: go through
@@ -54,7 +65,7 @@ final class AppRouter {
     /// one silently no-ops), so a push deep-link arriving now must dismiss first
     /// and present after (see AppModel.routeDeepLink).
     var hasActivePresentation: Bool {
-        activeSheet != nil || showAssistant || detailTask != nil || focusTask != nil
+        activeSheet != nil || showAssistant || detailTask != nil || focusTask != nil || showTalk
     }
 
     /// Tear down every active modal so a deferred deep-link can present cleanly
@@ -62,6 +73,7 @@ final class AppRouter {
     func dismissAllPresentations() {
         activeSheet = nil
         showAssistant = false
+        showTalk = false
         detailTask = nil
         focusTask = nil
         sharedFocus = nil
@@ -75,6 +87,7 @@ final class AppRouter {
     func dismissTourPresentations() {
         activeSheet = nil
         showAssistant = false
+        showTalk = false
         detailTask = nil
     }
 }

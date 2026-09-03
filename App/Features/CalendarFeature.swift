@@ -138,12 +138,14 @@ struct CalendarView: View {
     @State private var vm: CalendarModel?
     @State private var showSettings = false
     @State private var showPalette = false
-    @State private var mode: CalMode = .day
     /// Tap-to-create prefill: the day + snapped time of an empty grid slot. A
     /// local sheet (the AppRouter's Sheet enum can't carry a prefill payload).
     @State private var createAt: CreateAt?
 
-    enum CalMode: String, Hashable, CaseIterable { case day = "Day", week = "Week", month = "Month" }
+    /// Day / Week / Month — router-owned (AppRouter.calendarMode) so the
+    /// assistant's `open_screen: week|month` switches it from anywhere.
+    typealias CalMode = AppRouter.CalendarMode
+    private var mode: CalMode { model.router.calendarMode }
 
     /// One tap-to-create intent: the date (YYYY-MM-DD) + snapped time (HH:mm).
     struct CreateAt: Identifiable, Equatable {
@@ -206,7 +208,7 @@ struct CalendarView: View {
         HStack(spacing: 2) {
             ForEach(CalMode.allCases, id: \.self) { m in
                 let on = mode == m
-                Button { mode = m } label: {
+                Button { model.router.calendarMode = m } label: {
                     Text(m.rawValue)
                         // ink2 (not ink3) for inactive labels: 11pt on bg2 needs ≥4.5:1 AA contrast.
                         .font(UFont.sans(11, .semibold))

@@ -234,7 +234,7 @@ final class AssistantHarnessTests: XCTestCase {
         XCTAssertTrue(assistant.sending)
         assistant.send("second")
         assistant.send("third")
-        XCTAssertEqual(assistant.queued, ["second", "third"])
+        XCTAssertEqual(assistant.queued.map(\.text), ["second", "third"])
         // Queued sends show in the thread as faded pending bubbles, after the live turns.
         let pending = assistant.transcript.filter(\.isPending)
         XCTAssertEqual(pending.map(\.text), ["second", "third"])
@@ -246,9 +246,25 @@ final class AssistantHarnessTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertFalse(assistant.sending)
-        XCTAssertEqual(assistant.queued, [])
+        XCTAssertTrue(assistant.queued.isEmpty)
         XCTAssertEqual(assistant.turns.filter { $0.role == "user" }.map(\.text), ["first", "second", "third"], "drained in order, none dropped")
         XCTAssertEqual(assistant.error, "not_configured")
+        assistant.clear()
+        withExtendedLifetime(app) {}
+    }
+
+    func testQueuedBubblesCarryStableDistinctIds() {
+        AssistantModel.scrubPersisted()
+        let app = AppModel()   // retained: AssistantModel holds it unowned
+        let assistant = AssistantModel(model: app, client: nil)
+        assistant.send("first")
+        assistant.send("again")
+        assistant.send("again")   // a repeated message must not collide
+        let ids = assistant.transcript.filter(\.isPending).map(\.id)
+        XCTAssertEqual(ids.count, 2)
+        XCTAssertEqual(Set(ids).count, 2)
+        XCTAssertTrue(ids.allSatisfy(isUUID), "\(ids)")
+        XCTAssertEqual(ids, assistant.queued.map(\.id), "the bubble id IS the queued entry's id — stable across drains")
         assistant.clear()
         withExtendedLifetime(app) {}
     }
@@ -261,9 +277,40 @@ final class AssistantHarnessTests: XCTestCase {
         assistant.send("second")
         assistant.clear()
         withExtendedLifetime(app) {}
-        XCTAssertEqual(assistant.queued, [])
+        XCTAssertTrue(assistant.queued.isEmpty)
         XCTAssertFalse(assistant.sending)
         XCTAssertTrue(assistant.turns.isEmpty)
+    }
+
+    // MARK: cancel_call undo (a network write)
+
+    func testCancelCallUndoMarksUndoneOnlyOnceTheServerAcceptedAndSurfacesAFailure() async {
+        AssistantModel.scrubPersisted()
+        let app = AppModel()   // retained: AssistantModel holds it unowned
+        let assistant = AssistantModel(model: app, client: nil)
+        assistant.appendLocal("Booked.", receipts: [Receipt(icon: .calendar, label: "Call booked", undo: .cancelCall(id: "call-1"))])
+        let turnId = assistant.turns.last!.id
+        struct Boom: Error {}
+        assistant.cancelCallRequest = { _ in throw Boom() }
+        let failed = await assistant.undoReceipt(turnId: turnId, index: 0)
+        XCTAssertFalse(failed)
+        XCTAssertNotEqual(assistant.turns.last?.receipts?[0].undone, true, "a failed cancel keeps the receipt undoable")
+        XCTAssertTrue(assistant.turns.last?.receipts?[0].isUndoable ?? false)
+        XCTAssertNotNil(assistant.undoFailureNote(turnId: turnId, index: 0), "…and says so")
+        XCTAssertFalse(assistant.isUndoInFlight(turnId: turnId, index: 0))
+        var cancelled: [String] = []
+        assistant.cancelCallRequest = { id in
+            cancelled.append(id)
+            XCTAssertTrue(assistant.isUndoInFlight(turnId: turnId, index: 0), "reads cancelling… while the server answers")
+        }
+        let ok = await assistant.undoReceipt(turnId: turnId, index: 0)
+        XCTAssertTrue(ok)
+        XCTAssertEqual(cancelled, ["call-1"])
+        XCTAssertEqual(assistant.turns.last?.receipts?[0].undone, true)
+        XCTAssertNil(assistant.undoFailureNote(turnId: turnId, index: 0))
+        XCTAssertFalse(assistant.isUndoInFlight(turnId: turnId, index: 0))
+        assistant.clear()
+        withExtendedLifetime(app) {}
     }
 
     // MARK: model window

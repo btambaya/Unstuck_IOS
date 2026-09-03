@@ -150,8 +150,21 @@ struct CallSettingsView: View {
         guard let coord = model.coordinator, let uid = coord.auth.currentUserId else {
             testState = .failed("Sign in first."); return
         }
+        // The same guards the assistant's request_call applies (server window
+        // 06:00–23:00) plus the user's own allowed hours — otherwise the
+        // server would refuse or the phone would decline it quietly and the
+        // "Booked — ringing at …" line would be a lie.
+        let now = Date()
+        let at = now.addingTimeInterval(60)
+        if let e = CallToolLogic.timeGuard(at, now: now) {
+            testState = .failed(e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst + ".")
+            return
+        }
+        if !CallSettings.isWithinWindow(at) {
+            testState = .failed("\(CallSettings.hhmm(at)) is outside your allowed hours (\(CallSettings.windowStart)–\(CallSettings.windowEnd)) — the phone would decline it quietly. Widen the hours above to try it now.")
+            return
+        }
         testState = .booking
-        let at = Date().addingTimeInterval(60)
         let client = coord.calls
         Task {
             do {
@@ -169,5 +182,12 @@ struct CallSettingsView: View {
         var c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
         c.hour = m / 60; c.minute = m % 60
         return Calendar.current.date(from: c) ?? Date()
+    }
+}
+
+private extension String {
+    var capitalizedFirst: String {
+        guard let f = first else { return self }
+        return f.uppercased() + dropFirst()
     }
 }

@@ -26,6 +26,24 @@ public extension AppDatabase {
         }
     }
 
+    /// Read → decide → replace, in ONE write transaction. `body` receives the
+    /// current local rows (plus the connection, for outbox edits that must
+    /// commit with the merge) and returns what the table becomes. Because the
+    /// read and the replace share the transaction, a row written by another
+    /// caller lands either BEFORE (so `body` sees it) or AFTER (so it isn't
+    /// deleted) — never in between. The profile_facts hydrate merge needs
+    /// this: with separate transactions, a fact saved between the local read
+    /// and the replace was silently deleted.
+    func replaceAllAtomically<T: PersistableRecord & FetchableRecord & Sendable>(
+        _ type: T.Type, _ body: (Database, [T]) throws -> [T]) throws {
+        try writer.write { db in
+            let local = try T.fetchAll(db)
+            let rows = try body(db, local)
+            try type.deleteAll(db)
+            for r in rows { try r.upsert(db) }
+        }
+    }
+
     func deleteById<T: PersistableRecord & FetchableRecord & Sendable>(_ type: T.Type, id: String) throws {
         _ = try writer.write { try type.deleteOne($0, key: id) }
     }

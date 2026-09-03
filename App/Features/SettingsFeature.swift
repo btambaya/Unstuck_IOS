@@ -19,11 +19,14 @@ struct SettingsView: View {
     @State private var exportURL: URL?
 
     /// Deep-link a section on first appearance (the guided tour presents
-    /// Settings open on Notifications / Interface — the iOS analogue of the
-    /// web `?section=` seed).
+    /// Settings open on Notifications / Interface; the assistant's
+    /// open_screen lands on People / Areas — the iOS analogue of the web
+    /// `?section=` seed).
     private let initialSection: String?
     @State private var showNotificationsSection = false
     @State private var showInterfaceSection = false
+    @State private var showPeopleSection = false
+    @State private var showAreasSection = false
 
     init(section: String? = nil) {
         self.initialSection = section
@@ -68,10 +71,14 @@ struct SettingsView: View {
             // the NavigationLink rows above — same destinations, different entry.
             .navigationDestination(isPresented: $showNotificationsSection) { NotificationSettingsView() }
             .navigationDestination(isPresented: $showInterfaceSection) { InterfaceSettingsView() }
+            .navigationDestination(isPresented: $showPeopleSection) { ConnectionsView() }
+            .navigationDestination(isPresented: $showAreasSection) { TagsAreasView() }
             .onAppear {
                 switch initialSection {
                 case "Notifications": showNotificationsSection = true
                 case "Interface": showInterfaceSection = true
+                case "People": showPeopleSection = true
+                case "Areas", "Areas & tags": showAreasSection = true
                 default: break
                 }
             }

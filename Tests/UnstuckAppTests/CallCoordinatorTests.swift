@@ -6,7 +6,12 @@
 //   busy (focus live) / stale (anchor gone) / outside-hours receipt rules,
 //   snooze (call-level) → outcome snoozed + hang-up, user hang-up → done,
 //   invalid payload → report then .failed, DND-filtered report → missed,
-//   mute forwarded, late launcher attach, provider reset.
+//   mute forwarded, late launcher attach, provider reset,
+//   a DUPLICATE push (same callId) is a state no-op,
+//   ONE end transaction + ONE outcome however many things end the call
+//   (the CXEndCallAction completes ASYNCHRONOUSLY, like CallKit),
+//   nobody signed in → dropped silently,
+//   the outcome reporter persists, flushes in order and retries.
 
 import XCTest
 import UnstuckSync
@@ -20,29 +25,43 @@ final class FakeCallProvider: CallProviding {
     var incoming: [Incoming] = []
     var ended: [(uuid: UUID, reason: CallEndedReason)] = []
     var configured = 0
-    private var completions: [UUID: @MainActor (Error?) -> Void] = [:]
+    private var completions: [UUID: [@MainActor (Error?) -> Void]] = [:]
 
     func reportIncoming(uuid: UUID, callerName: String, completion: @escaping @MainActor (Error?) -> Void) {
         incoming.append(Incoming(uuid: uuid, callerName: callerName))
-        completions[uuid] = completion
+        completions[uuid, default: []].append(completion)
     }
     func reportEnded(uuid: UUID, reason: CallEndedReason) { ended.append((uuid, reason)) }
     func configureAudioSession() { configured += 1 }
-    /// Simulate CallKit finishing reportNewIncomingCall (nil = presented).
-    func complete(_ uuid: UUID, error: Error?) { completions[uuid]?(error) }
+    /// Simulate CallKit finishing the LATEST reportNewIncomingCall for `uuid`
+    /// (nil = presented).
+    func complete(_ uuid: UUID, error: Error?) { completions[uuid]?.last?(error) }
 }
 
+/// Like CallKit: `CXCallController.request` returns at once and the
+/// CXEndCallAction + the completion land LATER (a separate main-queue hop).
+/// `flush()` delivers everything queued, in order — so the tests exercise the
+/// window between "asked CallKit to end" and "CallKit ended it".
 @MainActor
 final class FakeCallController: CallControlling {
     weak var coordinator: CallCoordinator?
     var requested: [UUID] = []
     var failNext = false
-    /// Like CallKit: the CXEndCallAction lands back in the provider delegate.
+    private var pending: [@MainActor () -> Void] = []
+    var pendingCount: Int { pending.count }
+
     func requestEnd(uuid: UUID, completion: @escaping @MainActor (Error?) -> Void) {
         requested.append(uuid)
-        if failNext { failNext = false; completion(NSError(domain: "cx", code: 1)); return }
-        _ = coordinator?.performEnd(uuid: uuid)
-        completion(nil)
+        let fail = failNext
+        failNext = false
+        pending.append { [weak self] in
+            if fail { completion(NSError(domain: "cx", code: 1)); return }
+            _ = self?.coordinator?.performEnd(uuid: uuid)
+            completion(nil)
+        }
+    }
+    func flush() {
+        while !pending.isEmpty { pending.removeFirst()() }
     }
 }
 
@@ -68,19 +87,21 @@ final class FakeNotifier: CallNotifier {
 
 @MainActor
 final class FakeReporter: CallOutcomeReporting {
-    struct Report: Equatable { let callId: String; let outcome: CallOutcome; let snooze: Int?; let notes: [String]? }
+    struct Report: Equatable { let callId: String; let callKitId: UUID?; let outcome: CallOutcome; let snooze: Int?; let notes: [String]? }
     var reports: [Report] = []
-    func report(callId: String, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?) {
-        reports.append(Report(callId: callId, outcome: outcome, snooze: snoozeMinutes, notes: outcomeNotes))
+    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?) {
+        reports.append(Report(callId: callId, callKitId: callKitId, outcome: outcome, snooze: snoozeMinutes, notes: outcomeNotes))
     }
     var outcomes: [CallOutcome] { reports.map(\.outcome) }
 }
 
 @MainActor
 final class FakeEnvironment: CallEnvironment {
+    var signedIn = true
     var focusLive = false
     var anchorLive = true
     var withinHours = true
+    var isSignedIn: Bool { signedIn }
     var isFocusSessionLive: Bool { focusLive }
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool { anchorLive }
     func isWithinCallHours(_ date: Date) -> Bool { withinHours }
@@ -179,6 +200,50 @@ final class CallCoordinatorTests: XCTestCase {
         sut.reportIncoming(payload())
         XCTAssertFalse(sut.performAnswer(uuid: UUID()))
         XCTAssertEqual(sut.active?.phase, .ringing)
+    }
+
+    func testEveryReportCarriesTheCallKitId() {
+        answerAndActivate()
+        XCTAssertTrue(sut.performEnd(uuid: uuid))
+        XCTAssertEqual(reporter.reports.map(\.callKitId), [uuid, uuid])
+        XCTAssertEqual(reporter.reports.map(\.callId), [Self.callId, Self.callId])
+    }
+
+    // MARK: - duplicate push (same callId ⇒ same UUID)
+
+    func testDuplicatePushWhileRingingIsAStateNoOp() {
+        sut.reportIncoming(payload())
+        let timer = clock.pending[0]
+        sut.reportIncoming(payload())   // APNs retried / the server re-sent
+        XCTAssertEqual(provider.incoming.count, 2, "Apple rule: a report per push")
+        XCTAssertEqual(sut.active?.phase, .ringing)
+        XCTAssertEqual(clock.pending.count, 1, "the SAME ring timer, not a fresh 30 s")
+        XCTAssertTrue(clock.pending[0] === timer)
+        XCTAssertTrue(provider.ended.isEmpty)
+        XCTAssertTrue(reporter.reports.isEmpty)
+        XCTAssertTrue(notifier.posted.isEmpty)
+        // CallKit answers the second report with callUUIDAlreadyExists — swallowed.
+        provider.complete(uuid, error: NSError(domain: "CXErrorDomainIncomingCall", code: 2))
+        XCTAssertEqual(sut.active?.phase, .ringing, "not treated as missed")
+        XCTAssertTrue(reporter.reports.isEmpty)
+        XCTAssertTrue(notifier.posted.isEmpty)
+        // Still answerable, exactly once.
+        XCTAssertTrue(sut.performAnswer(uuid: uuid))
+        XCTAssertEqual(reporter.outcomes, [.answered])
+    }
+
+    func testDuplicatePushWhileAnsweredLeavesTheLauncherUntouched() {
+        answerAndActivate()
+        sut.reportIncoming(payload())
+        provider.complete(uuid, error: NSError(domain: "CXErrorDomainIncomingCall", code: 2))
+        XCTAssertEqual(provider.incoming.count, 2)
+        XCTAssertEqual(sut.active?.phase, .active)
+        XCTAssertEqual(sut.active?.launcherRunning, true)
+        XCTAssertEqual(launcher.started.count, 1, "no restart")
+        XCTAssertEqual(launcher.stops, 0)
+        XCTAssertEqual(reporter.outcomes, [.answered], "no busy / missed for the duplicate")
+        XCTAssertTrue(provider.ended.isEmpty)
+        XCTAssertTrue(notifier.posted.isEmpty)
     }
 
     // MARK: - unanswered
@@ -301,7 +366,39 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(provider.ended.last?.uuid, UUID(uuidString: second.callId))
         XCTAssertEqual(provider.ended.last?.reason, .answeredElsewhere)
         XCTAssertEqual(reporter.reports.last?.outcome, .busy)
+        XCTAssertEqual(reporter.reports.last?.callKitId, UUID(uuidString: second.callId))
         XCTAssertEqual(sut.active?.session.callId, Self.callId, "first call untouched")
+    }
+
+    // MARK: - nobody signed in (reactive sign-out left the token registered)
+
+    func testSignedOutDeviceDropsTheCallSilently() {
+        env.signedIn = false
+        sut.reportIncoming(payload())
+        XCTAssertEqual(provider.incoming.count, 1, "still reported (Apple rule)")
+        XCTAssertEqual(provider.ended.map(\.reason), [.failed])
+        XCTAssertNil(sut.active)
+        XCTAssertTrue(reporter.reports.isEmpty, "no JWT to report with")
+        XCTAssertTrue(notifier.posted.isEmpty, "never the previous account's notes")
+        XCTAssertTrue(clock.pending.isEmpty)
+        XCTAssertFalse(sut.performAnswer(uuid: uuid))
+
+        sut.handleFallbackTap(payload())
+        XCTAssertNil(sut.pendingFallback)
+        XCTAssertTrue(reporter.reports.isEmpty)
+    }
+
+    func testSignedOutTeardownIsSilent() {
+        answerAndActivate()
+        sut.signedOut()
+        XCTAssertEqual(launcher.stops, 1)
+        XCTAssertEqual(provider.ended.map(\.reason), [.failed])
+        XCTAssertNil(sut.active)
+        XCTAssertEqual(reporter.outcomes, [.answered], "nothing reported on the way out")
+        XCTAssertTrue(notifier.posted.isEmpty)
+        XCTAssertTrue(clock.pending.isEmpty)
+        // A late CXEndCallAction for the torn-down call is harmless.
+        XCTAssertFalse(sut.performEnd(uuid: uuid))
     }
 
     // MARK: - ending
@@ -324,14 +421,23 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertTrue(clock.pending.isEmpty)
     }
 
+    /// The CXEndCallAction is ASYNC: between snoozeActiveCall and CallKit's
+    /// action the call is still up with `pendingEnd` set; nothing is reported
+    /// until the action lands, then exactly once.
     func testSnoozeReportsSnoozedWithMinutesAndHangsUp() {
         answerAndActivate()
         let result = sut.snoozeActiveCall(minutes: 10)
         XCTAssertTrue(result.hasPrefix("ok:"), result)
         XCTAssertTrue(result.contains("10 minutes"))
         XCTAssertEqual(controller.requested, [uuid])
+        XCTAssertEqual(sut.active?.pendingEnd, .snoozed(minutes: 10))
+        XCTAssertEqual(launcher.stops, 0, "the launcher keeps talking until CallKit ends the call")
+        XCTAssertEqual(reporter.outcomes, [.answered], "nothing reported before the action lands")
+
+        controller.flush()
         XCTAssertEqual(launcher.stops, 1)
-        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, outcome: .snoozed, snooze: 10, notes: nil))
+        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, callKitId: uuid, outcome: .snoozed, snooze: 10, notes: nil))
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
         XCTAssertNil(sut.active)
     }
 
@@ -341,13 +447,51 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(sut.snoozeActiveCall(minutes: 10), "error: no call is active", "not while ringing")
         XCTAssertTrue(sut.performAnswer(uuid: uuid)); sut.audioSessionDidActivate()
         _ = sut.snoozeActiveCall(minutes: 999)
+        controller.flush()
         XCTAssertEqual(reporter.reports.last?.snooze, 180)
+    }
+
+    /// The race the launcher used to lose: snooze_call → the coordinator's
+    /// hang-up is in flight, and the launcher's session also ends (the model
+    /// says goodbye, the socket closes) BEFORE CallKit's CXEndCallAction
+    /// lands. One end transaction, one outcome — never two.
+    func testSnoozeThenLauncherEndingIsOneEndAndOneOutcome() {
+        answerAndActivate()
+        _ = sut.snoozeActiveCall(minutes: 10)
+        XCTAssertEqual(controller.requested.count, 1)
+        launcher.end(.hungUp)                       // launcher confirms on its own, mid-flight
+        XCTAssertEqual(controller.requested.count, 1, "no second CXEndCallAction")
+        XCTAssertEqual(sut.active?.pendingEnd, .snoozed(minutes: 10), "the snooze wins, not the later hang-up")
+        controller.flush()
+        XCTAssertEqual(controller.requested.count, 1)
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
+        XCTAssertEqual(reporter.reports.last?.snooze, 10)
+        XCTAssertEqual(launcher.stops, 0, "the launcher already stopped itself — no double stop")
+        XCTAssertNil(sut.active)
+        // A straggler CXEndCallAction after the fact is ignored, not re-reported.
+        XCTAssertFalse(sut.performEnd(uuid: uuid))
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
+    }
+
+    func testDoubleSnoozeIsOneEndTransaction() {
+        answerAndActivate()
+        let a = sut.snoozeActiveCall(minutes: 10)
+        let b = sut.snoozeActiveCall(minutes: 25)
+        XCTAssertTrue(a.hasPrefix("ok:"))
+        XCTAssertTrue(b.hasPrefix("ok:"))
+        XCTAssertTrue(b.contains("10 minutes"), "the second snooze repeats the first, it can't change it")
+        XCTAssertEqual(controller.requested.count, 1)
+        controller.flush()
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
+        XCTAssertEqual(reporter.reports.last?.snooze, 10)
     }
 
     func testLauncherEndingItselfHangsUpAndReportsDone() {
         answerAndActivate()
         launcher.end(.hungUp)
         XCTAssertEqual(controller.requested, [uuid])
+        XCTAssertEqual(reporter.outcomes, [.answered], "reported when CallKit ends it, not before")
+        controller.flush()
         XCTAssertEqual(reporter.outcomes, [.answered, .done])
         XCTAssertEqual(launcher.stops, 0, "launcher already stopped itself — no double stop")
         XCTAssertNil(sut.active)
@@ -356,6 +500,7 @@ final class CallCoordinatorTests: XCTestCase {
     func testLauncherFailureNotifiesWithNotes() {
         answerAndActivate()
         launcher.end(.failed("socket closed"))
+        controller.flush()
         XCTAssertEqual(reporter.reports.last?.outcome, .done)
         XCTAssertEqual(reporter.reports.last?.notes, ["voice failed: socket closed"])
         XCTAssertEqual(notifier.posted.count, 1)
@@ -367,6 +512,7 @@ final class CallCoordinatorTests: XCTestCase {
         answerAndActivate()
         controller.failNext = true
         launcher.end(.hungUp)
+        controller.flush()
         XCTAssertEqual(provider.ended.map(\.reason), [.remoteEnded])
         XCTAssertEqual(reporter.outcomes, [.answered, .done])
         XCTAssertNil(sut.active)
@@ -427,6 +573,7 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertTrue(late.performAnswer(uuid: uuid))
         late.audioSessionDidActivate()
         clock.fireAll()
+        controller.flush()
         XCTAssertNil(late.active)
         XCTAssertEqual(reporter.outcomes, [.answered, .done])
         XCTAssertEqual(reporter.reports.last?.notes, ["voice failed: voice unavailable"])
@@ -442,6 +589,8 @@ final class CallCoordinatorTests: XCTestCase {
         noop.reportIncoming(payload())
         XCTAssertTrue(noop.performAnswer(uuid: uuid))
         noop.audioSessionDidActivate()
+        XCTAssertEqual(controller.requested.count, 1)
+        controller.flush()
         XCTAssertNil(noop.active)
         XCTAssertEqual(reporter.outcomes, [.answered, .done])
         XCTAssertEqual(notifier.posted.count, 1)
@@ -457,5 +606,112 @@ final class CallCoordinatorTests: XCTestCase {
         sut.onFallbackAnswer = { got = $0 }
         XCTAssertEqual(got?.callId, Self.callId)
         XCTAssertNil(sut.pendingFallback)
+    }
+}
+
+// MARK: - CallsOutcomeReporter (persisted, ordered, retried)
+
+@MainActor
+final class CallsOutcomeReporterTests: XCTestCase {
+    /// Records sends; throws for the first `failures` calls.
+    @MainActor
+    final class Recorder {
+        var sent: [CallsOutcomeReporter.Item] = []
+        var attempts = 0
+        var failures: Int
+        init(failures: Int = 0) { self.failures = failures }
+        func sender() -> CallsOutcomeReporter.Sender {
+            { [self] item in
+                await MainActor.run { self.attempts += 1 }
+                let fail = await MainActor.run { () -> Bool in
+                    if self.failures > 0 { self.failures -= 1; return true }
+                    return false
+                }
+                if fail { throw NSError(domain: "net", code: 1) }
+                await MainActor.run { self.sent.append(item) }
+            }
+        }
+    }
+
+    @MainActor
+    final class SleepLog {
+        var delays: [TimeInterval] = []
+        func sleeper() -> @Sendable (TimeInterval) async -> Void {
+            { [self] s in await MainActor.run { self.delays.append(s) } }
+        }
+    }
+
+    private var suite: UserDefaults!
+    private var suiteName = ""
+    private let uuid = UUID(uuidString: "0f1e2d3c-4b5a-4697-8877-665544332211")!
+
+    override func setUp() {
+        super.setUp()
+        suiteName = "CallsOutcomeReporterTests.\(UUID().uuidString)"
+        suite = UserDefaults(suiteName: suiteName)
+    }
+
+    override func tearDown() {
+        suite.removePersistentDomain(forName: suiteName)
+        super.tearDown()
+    }
+
+    private func settle(_ r: CallsOutcomeReporter) async {
+        while let t = r.flushTask { await t.value }
+    }
+
+    func testQueuedBeforeAttachIsPersistedAndFlushedInOrder() async {
+        let first = CallsOutcomeReporter(defaults: suite, sleep: { _ in })
+        first.report(callId: "c1", callKitId: uuid, outcome: .answered, snoozeMinutes: nil, outcomeNotes: nil)
+        first.report(callId: "c1", callKitId: uuid, outcome: .done, snoozeMinutes: nil, outcomeNotes: ["voice failed: x"])
+        XCTAssertEqual(first.queue.count, 2, "no client yet → held")
+        XCTAssertNotNil(suite.data(forKey: CallsOutcomeReporter.queueKey), "persisted the moment it's queued")
+
+        // A relaunch: the queue comes back from disk and flushes once attached.
+        let relaunch = CallsOutcomeReporter(defaults: suite, sleep: { _ in })
+        XCTAssertEqual(relaunch.queue.map(\.outcome), [.answered, .done])
+        let rec = Recorder()
+        relaunch.attach(send: rec.sender())
+        await settle(relaunch)
+        XCTAssertEqual(rec.sent.map(\.outcome), [.answered, .done], "in order")
+        XCTAssertEqual(rec.sent.first?.callKitId, uuid.uuidString.lowercased())
+        XCTAssertEqual(rec.sent.last?.notes, ["voice failed: x"])
+        XCTAssertTrue(relaunch.queue.isEmpty)
+        XCTAssertNil(suite.data(forKey: CallsOutcomeReporter.queueKey), "drained → nothing on disk")
+    }
+
+    func testRetriesWithBackoffThenSucceeds() async {
+        let log = SleepLog()
+        let r = CallsOutcomeReporter(defaults: suite, sleep: log.sleeper())
+        let rec = Recorder(failures: 2)
+        r.attach(send: rec.sender())
+        r.report(callId: "c1", callKitId: uuid, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        r.report(callId: "c2", callKitId: nil, outcome: .snoozed, snoozeMinutes: 10, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(rec.attempts, 4, "2 failures + success for c1, then c2")
+        XCTAssertEqual(log.delays, [2, 5], "backoff between attempts")
+        XCTAssertEqual(rec.sent.map(\.callId), ["c1", "c2"], "c2 waits for c1 — never reordered")
+        XCTAssertEqual(rec.sent.last?.snooze, 10)
+        XCTAssertTrue(r.queue.isEmpty)
+    }
+
+    func testAfterThreeFailuresTheItemIsReEnqueuedAndRetriedLater() async {
+        let log = SleepLog()
+        let r = CallsOutcomeReporter(defaults: suite, sleep: log.sleeper())
+        let rec = Recorder(failures: 3)
+        r.attach(send: rec.sender())
+        r.report(callId: "c1", callKitId: uuid, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+        await settle(r)
+        // First flush gave up after 3 attempts — still queued + on disk.
+        XCTAssertEqual(rec.attempts, 3)
+        XCTAssertEqual(r.queue.count, 1, "re-enqueued, never dropped")
+        XCTAssertNotNil(suite.data(forKey: CallsOutcomeReporter.queueKey))
+        // The deferred retry (retryLater) succeeds on the 4th attempt.
+        let deadline = Date().addingTimeInterval(5)
+        while r.queue.count == 1, Date() < deadline { await Task.yield(); await settle(r) }
+        XCTAssertEqual(rec.attempts, 4)
+        XCTAssertEqual(rec.sent.map(\.callId), ["c1"])
+        XCTAssertEqual(log.delays, [2, 5, 15], "2 s / 5 s between the three attempts, 15 s before the re-enqueued item is retried")
+        XCTAssertTrue(r.queue.isEmpty)
     }
 }

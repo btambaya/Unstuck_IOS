@@ -1,8 +1,10 @@
 // Unit tests for the get-to-know-you interview state machine (InterviewMachine)
 // — the pure half of App/Features/Interview.swift: step order, what each
-// answer saves, the auto-done rule (≥3 facts, never while open), resume after
-// a mid-way collapse, skip, and the never-re-asks-once-done flag. Each test
-// uses a throwaway UserDefaults suite so nothing touches the device defaults.
+// answer saves, the people-answer splitting, the auto-done rule (≥3 facts,
+// never while open, never while parked), resume after a mid-way collapse /
+// "Skip for now", the "I'm done" finisher, and the auto-open gate that waits
+// for the server hydrate. Each test uses a throwaway UserDefaults suite so
+// nothing touches the device defaults.
 
 import XCTest
 import UnstuckCore
@@ -32,7 +34,8 @@ final class InterviewTests: XCTestCase {
 
     func testScriptOrderAndCategories() {
         XCTAssertEqual(INTERVIEW_QUESTIONS.map(\.key), ["rhythm", "people", "work", "nogo", "nudge"])
-        XCTAssertEqual(INTERVIEW_QUESTIONS.map(\.category), [.rhythm, .person, .constraint, .constraint, .preference])
+        XCTAssertEqual(INTERVIEW_QUESTIONS.map(\.category), [.rhythm, .person, .context, .constraint, .preference],
+                       "work days are `context` like the web — `constraint` here duplicated the fact across devices")
         XCTAssertTrue(INTERVIEW_QUESTIONS[1].splitNames, "names are one person fact each")
         XCTAssertTrue(INTERVIEW_QUESTIONS.allSatisfy { !$0.chips.isEmpty }, "every step is tap-answerable")
     }
@@ -78,6 +81,38 @@ final class InterviewTests: XCTestCase {
         XCTAssertEqual(m.step, 2)
     }
 
+    // MARK: people splitting (C6)
+
+    func testADescriptorWithACommaIsOnePersonFact() {
+        XCTAssertEqual(InterviewMachine.splitPeople("Maleek — son, 9"), ["Maleek — son, 9"])
+        XCTAssertEqual(InterviewMachine.splitPeople("Maleek - son, 9"), ["Maleek - son, 9"])
+        XCTAssertEqual(InterviewMachine.splitPeople("Zara – daughter, turning 8"), ["Zara – daughter, turning 8"])
+    }
+
+    func testPlainNamesSplitOnCommas() {
+        XCTAssertEqual(InterviewMachine.splitPeople("Maleek, Sam"), ["Maleek", "Sam"])
+        XCTAssertEqual(InterviewMachine.splitPeople("Mary-Jane, Sam"), ["Mary-Jane", "Sam"],
+                       "a hyphen inside a name is not a descriptor dash")
+    }
+
+    func testPiecesWithoutALetterAreDropped() {
+        XCTAssertEqual(InterviewMachine.splitPeople("Maleek, 9"), ["Maleek"])
+        XCTAssertEqual(InterviewMachine.splitPeople("9, , 42"), [])
+    }
+
+    func testOneFactPerName() {
+        XCTAssertEqual(InterviewMachine.splitPeople("Maleek, maleek, Sam"), ["Maleek", "Sam"])
+    }
+
+    func testPeopleAnswerStoresEachSplitPiece() {
+        let (m, saved) = make()
+        m.skipQuestion()                                   // → people
+        m.answerFree("Maleek — son, 9")
+        XCTAssertEqual(saved().map(\.1), ["Maleek — son, 9"], "the comma is part of the description")
+        XCTAssertEqual(saved().first?.0, .person)
+        XCTAssertEqual(m.step, 2)
+    }
+
     func testFreeTextUsesThePrefixOnConstraintSteps() {
         let (m, saved) = make()
         m.skipQuestion(); m.skipQuestion(); m.skipQuestion()   // → nogo
@@ -85,6 +120,15 @@ final class InterviewTests: XCTestCase {
         m.answerFree("during school runs")
         XCTAssertEqual(saved().last?.0, .constraint)
         XCTAssertEqual(saved().last?.1, "Never schedule: during school runs")
+    }
+
+    func testWorkFreeTextIsAContextFact() {
+        let (m, saved) = make()
+        m.skipQuestion(); m.skipQuestion()                 // → work
+        XCTAssertEqual(m.current?.key, "work")
+        m.answerFree("four days, Fridays off")
+        XCTAssertEqual(saved().last?.0, .context)
+        XCTAssertEqual(saved().last?.1, "Work: four days, Fridays off")
     }
 
     func testEmptyFreeTextIsANoOp() {
@@ -128,13 +172,30 @@ final class InterviewTests: XCTestCase {
         XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: InterviewMachine.isDone(d)))
     }
 
-    func testSkipForNowIsFinal() {
+    func testSkipForNowParksItAndResumes() {
         let d = freshDefaults()
         let (m, saved) = make(d)
+        m.answer(chip: chip(m, "Morning"))
         m.skip()
+        XCTAssertFalse(m.finished, "\"Skip for now\" is not the finisher (that's \"I'm done\", web parity)")
+        XCTAssertFalse(InterviewMachine.isDone(d), "the pill stays — the way back in")
+        XCTAssertTrue(InterviewMachine.hasResumeStep(d), "the step is persisted")
+        XCTAssertEqual(saved().count, 1, "what was answered stays saved")
+        let (resumed, _) = make(d)
+        XCTAssertEqual(resumed.step, 1, "re-opening resumes where they left off")
+        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: false,
+                                                       hasResumeStep: InterviewMachine.hasResumeStep(d)),
+                       "parked ≠ pop back open on the next launch — that's the nag it exists to avoid")
+    }
+
+    func testImDoneFinishesFromAnyStep() {
+        let d = freshDefaults()
+        let (m, _) = make(d)
+        m.skipQuestion()
+        m.finish()                                         // the header's "I'm done"
         XCTAssertTrue(m.finished)
-        XCTAssertTrue(InterviewMachine.isDone(d), "skip = done: a nudge that keeps coming back reads as nagging")
-        XCTAssertTrue(saved().isEmpty)
+        XCTAssertTrue(InterviewMachine.isDone(d))
+        XCTAssertFalse(InterviewMachine.hasResumeStep(d))
     }
 
     func testCollapseMidWayIsResumable() {
@@ -187,10 +248,79 @@ final class InterviewTests: XCTestCase {
         XCTAssertFalse(InterviewMachine.shouldAutoComplete(factCount: 3, isOpen: false, done: true))
     }
 
+    func testAutoDoneNeverWhileAResumeStepIsParked() {
+        XCTAssertFalse(InterviewMachine.shouldAutoComplete(factCount: 3, isOpen: false, done: false, hasResumeStep: true),
+                       "those ≥3 facts are its OWN hidden-mid-way answers — completing here skipped the rituals picker")
+        XCTAssertTrue(InterviewMachine.shouldAutoComplete(factCount: 3, isOpen: false, done: false, hasResumeStep: false),
+                      "facts from elsewhere with nothing parked: stand down")
+    }
+
+    func testHiddenMidWayWithThreeAnswersStillReachesThePickerAfterRelaunch() {
+        let d = freshDefaults()
+        let (m, saved) = make(d)
+        m.answer(chip: chip(m, "Morning"))
+        m.answerFree("Maleek")
+        m.answer(chip: chip(m, "Shifts"))
+        XCTAssertEqual(saved().count, 3)
+        m.collapse()
+        // Relaunch: the card sees 3 facts and a parked step → must NOT auto-complete.
+        XCTAssertFalse(InterviewMachine.shouldAutoComplete(factCount: 3, isOpen: false, done: InterviewMachine.isDone(d),
+                                                           hasResumeStep: InterviewMachine.hasResumeStep(d)))
+        let (again, _) = make(d)
+        XCTAssertEqual(again.step, 3)
+        again.skipQuestion(); again.skipQuestion()
+        XCTAssertTrue(again.isPicker, "the rituals picker is reachable")
+        again.finish()
+        XCTAssertTrue(InterviewMachine.isDone(d))
+        XCTAssertFalse(InterviewMachine.hasResumeStep(d))
+    }
+
     func testAutoOpenOnlyWithNothingLearnedAnywhere() {
         XCTAssertTrue(InterviewMachine.shouldAutoOpen(factCount: 0, done: false))
         XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 1, done: false),
                        "facts from another device / chat: the pill nudges instead of the panel opening itself")
         XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: true))
+        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: false, hasResumeStep: true))
+    }
+
+    // MARK: auto-open gate (C1 — waits for the server hydrate)
+
+    func testNoAutoOpenWhileNotHydratedEvenWithZeroLocalFacts() {
+        var g = InterviewAutoOpenGate()
+        XCTAssertFalse(g.evaluate(hydrated: false, factsLoaded: true, factCount: 0, done: false),
+                       "the first local GRDB emission is empty on a fresh install whose facts live on the web")
+        XCTAssertFalse(g.evaluate(hydrated: false, factsLoaded: true, factCount: 0, done: false))
+        XCTAssertFalse(g.decided, "still undecided — nothing has been ruled out")
+    }
+
+    func testNoAutoOpenBeforeTheLocalFactsAreRead() {
+        var g = InterviewAutoOpenGate()
+        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: false, factCount: 0, done: false))
+        XCTAssertFalse(g.decided)
+    }
+
+    func testOpensOnceAfterHydrateWithZeroFacts() {
+        var g = InterviewAutoOpenGate()
+        XCTAssertFalse(g.evaluate(hydrated: false, factsLoaded: true, factCount: 0, done: false))
+        XCTAssertTrue(g.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false), "hydrate landed, nothing anywhere")
+        XCTAssertTrue(g.decided)
+        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false), "decides exactly once")
+    }
+
+    func testNeverOpensWhenHydrateBringsFacts() {
+        var g = InterviewAutoOpenGate()
+        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: true, factCount: 3, done: false))
+        XCTAssertTrue(g.decided, "decided: the pill (not the panel) is the nudge from here")
+        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false),
+                       "a later empty emission (forget everything) must not pop the interview open")
+        var one = InterviewAutoOpenGate()
+        XCTAssertFalse(one.evaluate(hydrated: true, factsLoaded: true, factCount: 1, done: false))
+    }
+
+    func testGateHonoursDoneAndParked() {
+        var done = InterviewAutoOpenGate()
+        XCTAssertFalse(done.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: true))
+        var parked = InterviewAutoOpenGate()
+        XCTAssertFalse(parked.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false, hasResumeStep: true))
     }
 }

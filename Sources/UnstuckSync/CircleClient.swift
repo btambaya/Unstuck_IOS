@@ -122,9 +122,16 @@ public struct CircleClient: Sendable {
             params: TaskShareParams(p_task_id: taskId, p_user: user, p_level: level.rawValue)).execute()
     }
 
-    /// Revoke a share. RPC: task_unshare(p_id). Best-effort.
-    public func unshareTask(shareId: String) async {
-        _ = try? await client.rpc("task_unshare", params: IdParams(p_id: shareId)).execute()
+    /// Revoke a share. RPC: task_unshare(p_id). Returns whether the server
+    /// accepted the revoke — the assistant's `unshare_task` must not report
+    /// "stopped sharing" over a failed RPC (the share sheet stays best-effort
+    /// and refetches).
+    @discardableResult
+    public func unshareTask(shareId: String) async -> Bool {
+        do {
+            _ = try await client.rpc("task_unshare", params: IdParams(p_id: shareId)).execute()
+            return true
+        } catch { return false }
     }
 
     /// The shares on a single task I own — drives the share sheet.

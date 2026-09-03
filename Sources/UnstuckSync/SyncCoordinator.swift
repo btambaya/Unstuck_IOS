@@ -92,6 +92,13 @@ public actor SyncCoordinator {
         flushKick = nil
     }
 
+    /// Fires after EVERY `profile_facts` hydrate completes (success, failure or
+    /// offline) — the app's `profileFactsHydrated` signal. Set before `start()`
+    /// so the first sign-in hydrate is observed.
+    public func setOnProfileFactsHydrated(_ hook: @escaping @Sendable () -> Void) async {
+        await hydrator.setOnProfileFactsHydrated(hook)
+    }
+
     /// Manual best-effort sync (flush outbox → hydrate) for the foreground
     /// (scenePhase .active) + BG-refresh triggers. No-op when signed out.
     /// Mirrors Android SyncCoordinator.syncNow().

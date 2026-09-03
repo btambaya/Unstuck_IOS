@@ -36,7 +36,12 @@ final class CallKitProvider: NSObject, CallProviding {
         if Bundle.main.url(forResource: "ring", withExtension: "caf") != nil {
             config.ringtoneSound = "ring.caf"
         }
-        if let icon = UIImage(named: "AppIcon")?.pngData() {
+        // The in-call / lock-screen badge: CallKit uses the image as an ALPHA
+        // MASK (template), so this is the Orbit mark — ring + dot — as opaque
+        // white on transparent (App/Assets.xcassets/CallKitIcon.imageset,
+        // rendered from the canonical unstuck/public/brand/mark.svg). An app
+        // icon (opaque PNG) here shows as a black square.
+        if let icon = UIImage(named: "CallKitIcon")?.pngData() {
             config.iconTemplateImageData = icon
         }
         provider = CXProvider(configuration: config)

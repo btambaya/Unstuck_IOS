@@ -6,6 +6,7 @@
 // reads to the signed-in user.
 
 import Foundation
+import GRDB
 import UnstuckCore
 import UnstuckData
 
@@ -109,22 +110,56 @@ public actor Hydrator {
     /// A local row the server superseded also drops its queued upsert op, so
     /// a stale offline edit can't clobber the newer server state on the next
     /// flush (the same trap pruneStaleTaskOps closes for tasks).
+    ///
+    /// The local read, the stale-op cancels, the replace and the local-only
+    /// pushes run in ONE write transaction: a fact saved on another thread
+    /// while this ran used to land between the read and the replace and get
+    /// deleted (its queued op cancelled with it). Now it lands either before
+    /// (merged, LWW) or after (untouched).
     public func hydrateProfileFacts() async {
+        // Fires on success AND failure/offline — "hydrated once" is what the
+        // surfaces wait on before treating an empty local store as "never met".
+        defer { onProfileFactsHydrated?() }
         do {
             let remote = try await gateway.fetchAllTolerant(ProfileFactRow.self, table: "profile_facts").map { $0.model() }
-            let local = try db.fetchAllProfileFacts()
-            let merge = SyncDecision.mergeHydratedProfileFacts(remote: remote, local: local)
-            for id in merge.staleLocalIds {
-                try? box.cancelPendingUpserts(table: "profile_facts", rowId: id)
-            }
-            try db.replaceAll(ProfileFact.self, with: merge.merged)
             let now = ProfileFactsService.isoNow()
-            for f in merge.pushLocalOnly {
-                try? ProfileFactPush.enqueue(f, box: box, nowISO: now)
+            let afterLocalRead = afterProfileFactsLocalRead
+            try db.replaceAllAtomically(ProfileFact.self) { db, local in
+                afterLocalRead?()
+                let merge = SyncDecision.mergeHydratedProfileFacts(remote: remote, local: local)
+                let seenUpdatedAt = Dictionary(local.map { ($0.id, $0.updatedAt) }, uniquingKeysWith: { a, _ in a })
+                for id in merge.staleLocalIds {
+                    // Cancel only when the row is still the one the merge judged
+                    // stale. Inside this transaction that always holds; the check
+                    // keeps the cancel safe if the read and the cancel are ever
+                    // split into separate transactions again.
+                    guard try ProfileFact.fetchOne(db, key: id)?.updatedAt == seenUpdatedAt[id] else { continue }
+                    try? OutboxStore.cancelPendingUpserts(in: db, table: "profile_facts", rowId: id)
+                }
+                for f in merge.pushLocalOnly {
+                    try? ProfileFactPush.enqueue(f, in: db, nowISO: now)
+                }
+                return merge.merged
             }
         } catch {
             print("[hydrate] profile_facts failed, leaving local intact: \(error)")
         }
+    }
+
+    /// Completion hook for `hydrateProfileFacts` — called once per run, on
+    /// success OR failure (offline included). The app flips its
+    /// "profile facts hydrated once" flag from here.
+    private var onProfileFactsHydrated: (@Sendable () -> Void)?
+    public func setOnProfileFactsHydrated(_ hook: @escaping @Sendable () -> Void) {
+        onProfileFactsHydrated = hook
+    }
+
+    /// Test seam: runs INSIDE the profile_facts merge transaction, right after
+    /// the local read — lets a test race a concurrent save against the merge
+    /// and prove it can't land in between. Never set in production.
+    private var afterProfileFactsLocalRead: (@Sendable () -> Void)?
+    func setAfterProfileFactsLocalRead(_ hook: (@Sendable () -> Void)?) {
+        afterProfileFactsLocalRead = hook
     }
 
     /// Collections + their membership. RLS returns own AND shared-with-me rows;

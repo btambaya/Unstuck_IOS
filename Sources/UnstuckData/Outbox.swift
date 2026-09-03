@@ -48,9 +48,20 @@ public struct OutboxStore: Sendable {
     @discardableResult
     public func enqueue(table: String, rowId: String, kind: OutboxKind,
                         payload: String? = nil, dependsOn: String? = nil, nowISO: String) throws -> OutboxOp {
+        try db.writer.write {
+            try Self.enqueue(in: $0, table: table, rowId: rowId, kind: kind, payload: payload, dependsOn: dependsOn, nowISO: nowISO)
+        }
+    }
+
+    /// Enqueue on an OPEN connection — for callers already inside a write
+    /// transaction (the hydrate merge), where a fresh `writer.write` would
+    /// be a re-entrant call. Same op shape as `enqueue(table:…)`.
+    @discardableResult
+    public static func enqueue(in db: Database, table: String, rowId: String, kind: OutboxKind,
+                               payload: String? = nil, dependsOn: String? = nil, nowISO: String) throws -> OutboxOp {
         var op = OutboxOp(tableName: table, rowId: rowId, kind: kind,
                           payload: payload, dependsOn: dependsOn, createdAt: nowISO)
-        try db.writer.write { try op.insert($0) }
+        try op.insert(db)
         return op
     }
 
@@ -80,13 +91,16 @@ public struct OutboxStore: Sendable {
     /// `dependsOn`) can't flush AFTER the delete and resurrect the row
     /// server-side (spec 02-sync-engine §1.6/§1.8).
     public func cancelPendingUpserts(table: String, rowId: String) throws {
-        _ = try db.writer.write { db in
-            try OutboxOp
-                .filter(Column("tableName") == table)
-                .filter(Column("rowId") == rowId)
-                .filter(Column("kind") == OutboxKind.upsert.rawValue)
-                .deleteAll(db)
-        }
+        try db.writer.write { try Self.cancelPendingUpserts(in: $0, table: table, rowId: rowId) }
+    }
+
+    /// Same, on an OPEN connection (see `enqueue(in:…)`).
+    public static func cancelPendingUpserts(in db: Database, table: String, rowId: String) throws {
+        _ = try OutboxOp
+            .filter(Column("tableName") == table)
+            .filter(Column("rowId") == rowId)
+            .filter(Column("kind") == OutboxKind.upsert.rawValue)
+            .deleteAll(db)
     }
 
     public func bumpAttempts(_ opSeq: Int64) throws {

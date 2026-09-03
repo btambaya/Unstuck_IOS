@@ -20,7 +20,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         t.done = false
         t.completedAt = nil
         t.updatedAt = now()
-        api.upsertTask(t)
+        await api.upsertTask(t)
         scratch.newTasks[t.id] = t
         return "ok: reopened \"\(t.name)\" id=\(t.id)"
 
@@ -73,7 +73,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let today = api.todayIso()
         let live = api.getBlocks().filter { $0.taskId == t.id && !$0.done && !$0.skipped && $0.date >= today }
         if live.isEmpty { return "error: \"\(t.name)\" has no upcoming slot to remove" }
-        for b in live { api.deleteBlock(b.id) }
+        for b in live { await api.deleteBlock(b.id) }
         return "ok: unscheduled \"\(t.name)\" (task kept, \(live.count) slot\(live.count == 1 ? "" : "s") removed)"
 
     case "skip_occurrence":
@@ -83,7 +83,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             return "error: \"\(t.name)\" has nothing on \(date) to skip"
         }
         b.skipped = true
-        api.upsertBlock(b)
+        await api.upsertBlock(b)
         return "ok: skipped \"\(t.name)\" on \(date) (the task and its other days stay)"
 
     case "complete_occurrence":
@@ -93,11 +93,11 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             return "error: \"\(t.name)\" has nothing on \(date)"
         }
         b.done = true
-        api.upsertBlock(b)
+        await api.upsertBlock(b)
         if t.recurrence == nil {
             t.done = true
             t.updatedAt = now()
-            api.upsertTask(t)
+            await api.upsertTask(t)
             scratch.newTasks[t.id] = t
         }
         return "ok: marked \"\(t.name)\" done for \(date)\(t.recurrence != nil ? " (series continues)" : "")"
@@ -114,17 +114,19 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         }
         let t = TaskItem(id: newUUID(), name: nm, estimateMin: dur, totalFocused: 0, done: false, priority: .medium,
                          tags: [], objectives: [], comments: [], later: false, createdAt: now(), updatedAt: now())
-        api.upsertTask(t)
+        await api.upsertTask(t)
         scratch.newTasks[t.id] = t
-        api.upsertBlock(CalBlock(id: newUUID(), taskId: t.id, taskName: nm, startTime: startTime, durationMinutes: dur, date: date, kind: .task))
+        await api.upsertBlock(CalBlock(id: newUUID(), taskId: t.id, taskName: nm, startTime: startTime, durationMinutes: dur, date: date, kind: .task))
         return "ok: blocked \"\(nm)\" \(date) \(startTime) for \(dur)m id=\(t.id)"
 
     case "carry_to_tomorrow":
         let today = api.todayIso()
         let tomorrow = LocalDate.addDays(today, 1)
         let wanted = args.strList("taskIds")
+        // Task blocks only (web: `b.taskId && …`) — a block with no task has
+        // nothing to carry and nothing to bump.
         let todays = api.getBlocks().filter { b in
-            b.date == today && !b.done && !b.skipped && isTaskBlock(b)
+            b.taskId != nil && b.date == today && !b.done && !b.skipped && isTaskBlock(b)
                 && (wanted == nil || wanted!.contains(b.taskId ?? ""))
         }
         if todays.isEmpty { return "error: nothing left on today to carry" }
@@ -134,8 +136,8 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             let tomorrowTaken = api.getBlocks().contains { $0.taskId == b.taskId && $0.date == tomorrow && !$0.skipped }
             var next = b
             if tomorrowTaken { next.skipped = true } else { next.date = tomorrow }
-            api.upsertBlock(next)
-            if let t { api.upsertTask(bumpMoveCount(t, nowISO: now())) }
+            await api.upsertBlock(next)
+            if let t { await api.upsertTask(bumpMoveCount(t, nowISO: now())) }
             names.append(t?.name ?? b.taskName)
         }
         return "ok: carried \(names.count) to \(tomorrow) — \(names.map { "\"\($0)\"" }.joined(separator: ", "))"
@@ -186,7 +188,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let live = api.getLiveFocus()
         let c = Capture(id: newUUID(), taskId: t?.id, sessionId: (live?.sessionStart != nil) ? live?.id : nil,
                         tag: tag, body: String(body.prefix(500)), at: now())
-        api.upsertCapture(c)
+        await api.upsertCapture(c)
         return "ok: captured id=\(c.id) [\(tag.rawValue)] \"\(c.body)\"\(t.map { " on \"\($0.name)\"" } ?? "")"
 
     case "get_captures":
@@ -210,9 +212,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let made = TaskItem(id: newId, name: name.isEmpty ? "Untitled task" : name, estimateMin: 25, totalFocused: 0, done: false,
                             priority: .medium, tags: ["from-capture", c.tag.rawValue], objectives: [], comments: [],
                             lifeArea: "Work", createdAt: now(), updatedAt: now())
-        api.upsertTask(made)
+        await api.upsertTask(made)
         c.taskId = c.taskId ?? newId
-        api.upsertCapture(c)
+        await api.upsertCapture(c)
         api.archiveCapture(c.id, archived: true)
         scratch.newTasks[made.id] = made
         return "ok: promoted capture to task id=\(newId) name=\"\(c.body)\""
@@ -226,7 +228,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     case "delete_capture":
         let id = args.str("captureId")
         guard let c = api.getCaptures().first(where: { $0.id == id }) else { return "error: capture not found" }
-        api.removeCapture(c.id)
+        await api.removeCapture(c.id)
         return "ok: deleted capture \"\(c.body)\""
 
     // ── LISTS ──
@@ -284,7 +286,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     case "create_area":
         guard let nm = args.str("name") else { return "error: name required" }
         if api.getAreaRows().contains(where: { $0.name.lowercased() == nm.lowercased() }) { return "error: area \"\(nm)\" already exists" }
-        api.addArea(name: nm, color: args.str("color"))
+        await api.addArea(name: nm, color: args.str("color"))
         return "ok: created area \"\(nm)\""
 
     case "rename_area":
@@ -294,7 +296,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             return "error: no area named \"\(from ?? "")\" — areas: \(api.getAreas().joined(separator: ", "))"
         }
         guard let to else { return "error: newName required" }
-        api.updateArea(row.id, name: to, color: nil)
+        await api.updateArea(row.id, name: to, color: nil)
         return "ok: renamed area \"\(from ?? "")\" → \"\(to)\" (tasks updated)"
 
     case "delete_area":
@@ -302,12 +304,12 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard let row = api.getAreaRows().first(where: { $0.name.lowercased() == (from ?? "").lowercased() }) else {
             return "error: no area named \"\(from ?? "")\""
         }
-        api.removeArea(row.id)
+        await api.removeArea(row.id)
         return "ok: deleted area \"\(from ?? "")\" (its tasks keep everything else)"
 
     case "create_tag":
         guard let nm = args.str("name") else { return "error: name required" }
-        api.addTag(name: nm)
+        await api.addTag(name: nm)
         return "ok: tag \"\(nm)\" ready"
 
     case "rename_tag":
@@ -317,7 +319,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             return "error: no tag named \"\(from ?? "")\""
         }
         guard let to else { return "error: newName required" }
-        api.updateTag(row.id, name: to)
+        await api.updateTag(row.id, name: to)
         return "ok: renamed tag \"\(from ?? "")\" → \"\(to)\""
 
     case "delete_tag":
@@ -325,7 +327,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard let row = api.getTagRows().first(where: { $0.name.lowercased() == (from ?? "").lowercased() }) else {
             return "error: no tag named \"\(from ?? "")\""
         }
-        api.removeTag(row.id)
+        await api.removeTag(row.id)
         return "ok: deleted tag \"\(from ?? "")\" (removed from tasks)"
 
     // ── PEOPLE ──
@@ -339,7 +341,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             let why = who.isEmpty ? "say who" : (hits.isEmpty ? "nobody matches \"\(who)\"" : "more than one person matches \"\(who)\"")
             return "error: \(why) — shared with: \(shares.map { "\($0.recipientName) (\($0.level))" }.joined(separator: ", "))"
         }
-        do { try await api.unshareTask(shareId: hits[0].shareId) } catch { return "error: \(error.localizedDescription)" }
+        // The revoke is a server RPC: "stopped sharing" over a failed call
+        // would leave the person with access while the user believes otherwise.
+        do { try await api.unshareTask(shareId: hits[0].shareId) } catch { return "error: couldn't revoke the share — try again" }
         return "ok: stopped sharing \"\(t.name)\" with \(hits[0].recipientName)"
 
     // ── SETTINGS ──

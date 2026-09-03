@@ -12,8 +12,12 @@
 //                  deleted after the first reply)
 //   tools        = the VOICE_TOOLS schemas filtered to CallScript.callTools,
 //                  plus the call-level snooze_call {minutes: integer, default 10}
-//   runTool      = snooze_call → CallCoordinator.snoozeActiveCall (hangs up,
-//                  outcome `snoozed`), then the launcher ends `.snoozed`;
+//   runTool      = snooze_call → CallCoordinator.snoozeActiveCall — the ONE
+//                  source of truth: the coordinator hangs up (CXEndCallAction →
+//                  performEnd → launcher.stop() + outcome `snoozed`); the
+//                  launcher returns the tool result and does NOT end itself
+//                  (ending here too raced a second CXEndCallAction + a second
+//                  outcome report);
 //                  every other call tool → AssistantModel.runVoiceTool (the
 //                  same executor as Talk; update_call lands in CallTools)
 //
@@ -22,8 +26,8 @@
 //
 // END CONTRACT: `onEnded` fires at most once, on the main actor, when the
 // conversation ends on its own (transport dropped → .failed / clean close →
-// .hungUp / snooze → .snoozed) and NEVER after `stop()`. A protocol-level
-// `error` event does not end the call (the model keeps talking).
+// .hungUp) and NEVER after `stop()`. A protocol-level `error` event does not
+// end the call (the model keeps talking). A snooze never fires `onEnded`.
 //
 // Built over `CallRealtimeSession` + `Deps` so it runs in XCTest with no
 // socket, no AVFoundation and no AppModel (RealtimeCallVoiceLauncherTests).
@@ -284,12 +288,10 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
     private func runCallTool(_ name: String, _ argsJSON: String, generation gen: Int) async -> String {
         guard let deps, active?.generation == gen else { return "error: the call has ended" }
         if name == "snooze_call" {
-            let m = Self.snoozeMinutes(argsJSON)
-            // The coordinator hangs the call up itself (→ stop()); ending here
-            // too covers a coordinator that didn't, and is a no-op after stop().
-            let result = deps.snooze(m)
-            if result.hasPrefix("ok") { finish(.snoozed(minutes: Self.clampSnooze(m)), generation: gen) }
-            return result
+            // The coordinator hangs the call up (async CXEndCallAction →
+            // performEnd → our stop()) and reports `snoozed` ONCE. Never
+            // `finish` here: that fired onEnded → a second endActiveCall.
+            return deps.snooze(Self.snoozeMinutes(argsJSON))
         }
         guard CallScript.callTools.contains(name) else { return "error: \(name) isn't available during a call" }
         return await deps.runAppTool(name, argsJSON)

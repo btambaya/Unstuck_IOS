@@ -128,6 +128,7 @@ struct CallSession: Equatable, Sendable {
         return Int((s.timeIntervalSince(now) / 60).rounded())
     }
 
+    // Configured once, never mutated → thread-safe (see the note in CallsClient).
     nonisolated(unsafe) private static let isoFractional: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f
     }()
