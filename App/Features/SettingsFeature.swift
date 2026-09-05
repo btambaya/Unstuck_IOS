@@ -452,6 +452,11 @@ private struct AccessibilitySettingsView: View {
 private struct InterfaceSettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
+    /// Voice hold-to-talk (VoiceRealtimeClient.holdToTalkKey): the Talk screen
+    /// reads it at connect time — turn_detection null, mic open only while the
+    /// button is held. A device-level preference, so UserDefaults, not the
+    /// synced SettingsState.
+    @AppStorage(VoiceRealtimeClient.holdToTalkKey) private var voiceHoldToTalk = false
     var body: some View {
         @Bindable var settings = model.settings
         SettingsScaffold(eyebrow: "Settings · Interface", title: "How things look.") {
@@ -478,10 +483,21 @@ private struct InterfaceSettingsView: View {
                 // the ✦ launcher, the panel and voice entirely, and open-
                 // assistant deep links are ignored.
                 ToggleRow(label: "AI Assistant", isOn: $settings.assistantEnabled)
+                if settings.assistantEnabled {
+                    CardDivider()
+                    // Barge-in fallback for noisy rooms / open speakers: the mic
+                    // opens only while the Talk screen's button is held.
+                    ToggleRow(label: "Voice: hold to talk", isOn: $voiceHoldToTalk)
+                }
             }
             Text("Turn the AI Assistant off to remove it completely — no launcher, no panel, no voice. Nothing is sent to the model unless you ask it something.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
                 .padding(.top, 10)
+            if settings.assistantEnabled {
+                Text("Hold to talk turns off automatic listening in Talk: press and hold the button while you speak and release to send — handy in a noisy room or on speaker. Calls from Unstuck always listen automatically.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                    .padding(.top, 6)
+            }
         }
     }
 }

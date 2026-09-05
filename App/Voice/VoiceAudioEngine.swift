@@ -7,9 +7,16 @@
 // the AVAudioSession `.voiceChat` mode — the OS uses the playback as the echo
 // reference, so the loudspeaker route is far less echo-prone than Android's
 // manual setup. We therefore run FULL-DUPLEX (mic stays open while the model
-// speaks) and rely on the server VAD (+ the manual Interrupt) for barge-in. If
-// real-device testing shows residual self-triggering on the built-in speaker,
-// gate `onFrame` on `!isPlaying` for a half-duplex fallback (see note below).
+// speaks) and rely on the server VAD (+ the manual Interrupt) for barge-in.
+//
+// BARGE-IN SUPPORT (App/Voice/BargeIn.swift owns the logic; this file only
+// executes it): an RMS NOISE GATE runs in the capture tap right after the
+// 16 kHz conversion — floor-calibrated, hysteresis, 300 ms pre-roll, digital
+// silence while closed — and reports open/close through `onGateChange`;
+// playback can be DUCKED (`setPlaybackGain`) while the state machine decides
+// whether a sound was speech; and `onPlaybackDrained` fires when the last
+// scheduled buffer has actually been heard (so the UI knows "speaking" ended
+// and the Interrupt button covers the buffered tail).
 //
 // AUDIO SESSION OWNERSHIP (the classic silent-call bug): in Talk mode the
 // engine configures + activates the shared AVAudioSession and deactivates it
@@ -98,6 +105,21 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private var pending = Data()
     private static let frameBytes = Int(inRate / 10) * 2   // 100ms mono pcm16 = 3200 bytes
 
+    // Barge-in plumbing (see the file header).
+    var onGateChange: (@Sendable (_ open: Bool) -> Void)?
+    var onPlaybackDrained: (@Sendable () -> Void)?
+    /// Owned by the capture tap thread; context/recalibration requests are
+    /// handed over under `lock` and applied at the next buffer.
+    private var gate = RMSGate()
+    private var gateContextPending: GateContext?
+    private var recalibratePending = false
+    /// Buffers scheduled but not yet played back, tagged with a generation so
+    /// the completion handlers a flush/shutdown fires (or late ones from a
+    /// stopped player) don't count against the next reply's tail.
+    private var outstanding = 0
+    private var playGeneration = 0
+    private var gainRamp = 0
+
     /// `.app` (default) keeps Talk mode's behaviour; `.callKit` for a
     /// CallKit-managed call (see the file header).
     init(sessionOwnership: VoiceAudioSessionOwnership = .app,
@@ -146,6 +168,17 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         // Hardware AEC: route both directions through the voice-processing AU.
         // Best-effort — older devices / simulators may reject it.
         try? engine.inputNode.setVoiceProcessingEnabled(true)
+        if engine.inputNode.isVoiceProcessingEnabled {
+            engine.inputNode.isVoiceProcessingAGCEnabled = true
+            // We duck the model ourselves (BargeIn); tell the system not to
+            // fight it by ducking "other audio" (which is us) on its own.
+            engine.inputNode.voiceProcessingOtherAudioDuckingConfiguration =
+                .init(enableAdvancedDucking: false, duckingLevel: .min)
+        }
+        // 20 ms IO buffers: the gate decides per 20 ms sub-frame, and a
+        // barge-in should cut within a few of them. A preference, not an
+        // activation — safe under CallKit ownership too.
+        try? AVAudioSession.sharedInstance().setPreferredIOBufferDuration(0.02)
 
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: playFormat)
@@ -176,24 +209,39 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         captureConverter = AVAudioConverter(from: hwFormat, to: captureFormat)
 
         // Tap the mic at the hardware format; convert each buffer to 16k Int16,
-        // accumulate into 100ms frames, hand each frame to the uploader.
+        // run it through the RMS gate (live audio / pre-roll / digital silence
+        // / nothing during calibration), accumulate into 100ms frames, hand
+        // each frame to the uploader.
         input.installTap(onBus: 0, bufferSize: 2048, format: hwFormat) { [weak self] buffer, _ in
             guard let self, let converter = self.captureConverter else { return }
-            guard let frame = self.convertToCapture(buffer, converter) else { return }
+            guard let samples = self.convertToCapture(buffer, converter) else { return }
             self.lock.lock()
-            self.pending.append(frame)
+            if self.recalibratePending { self.recalibratePending = false; self.gate.recalibrate() }
+            if let ctx = self.gateContextPending { self.gateContextPending = nil; self.gate.context = ctx }
+            let gated = self.gate.push(samples)
+            self.pending.append(gated.pcm)
             var out: [Data] = []
             while self.pending.count >= Self.frameBytes {
                 out.append(self.pending.prefix(Self.frameBytes))
                 self.pending.removeFirst(Self.frameBytes)
             }
             self.lock.unlock()
+            if gated.opened { self.onGateChange?(true) }
             for f in out { onFrame(f) }
+            if gated.closed { self.onGateChange?(false) }
         }
     }
 
-    /// Convert one captured buffer (hardware format) → 16k mono Int16 bytes.
-    private func convertToCapture(_ buffer: AVAudioPCMBuffer, _ converter: AVAudioConverter) -> Data? {
+    func setGateContext(_ ctx: GateContext) {
+        lock.lock(); gateContextPending = ctx; lock.unlock()
+    }
+
+    func recalibrateGate() {
+        lock.lock(); recalibratePending = true; lock.unlock()
+    }
+
+    /// Convert one captured buffer (hardware format) → 16k mono Int16 samples.
+    private func convertToCapture(_ buffer: AVAudioPCMBuffer, _ converter: AVAudioConverter) -> [Int16]? {
         let ratio = captureFormat.sampleRate / buffer.format.sampleRate
         let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 256
         guard let outBuf = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: capacity) else { return nil }
@@ -205,7 +253,7 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         }
         if err != nil || outBuf.frameLength == 0 { return nil }
         guard let ch = outBuf.int16ChannelData else { return nil }
-        return Data(bytes: ch[0], count: Int(outBuf.frameLength) * 2)
+        return Array(UnsafeBufferPointer(start: ch[0], count: Int(outBuf.frameLength)))
     }
 
     func enqueue(_ pcm: Data) {
@@ -216,7 +264,47 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         guard started else { return }
         if !player.isPlaying { player.play() }
-        player.scheduleBuffer(buffer, completionHandler: nil)
+        outstanding += 1
+        let gen = playGeneration
+        // `.dataPlayedBack` = the buffer has been HEARD (not merely consumed by
+        // the mixer), so the last one's completion is the playback_drained event.
+        player.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            self?.bufferPlayed(generation: gen)
+        }
+    }
+
+    private func bufferPlayed(generation: Int) {
+        lock.lock()
+        guard generation == playGeneration, outstanding > 0 else { lock.unlock(); return }
+        outstanding -= 1
+        let drained = outstanding == 0
+        lock.unlock()
+        if drained { onPlaybackDrained?() }
+    }
+
+    /// Duck (0.25 = −12 dB) / restore playback with a short linear ramp: 20 ms
+    /// down (a duck must be fast), 50 ms up. `player.volume` is the mixer
+    /// input gain — immediate and independent of the system's own ducking.
+    func setPlaybackGain(_ gain: Float) {
+        let target = max(0, min(1, gain))
+        lock.lock()
+        gainRamp += 1
+        let ramp = gainRamp
+        let from = player.volume
+        lock.unlock()
+        let steps = 4
+        let totalMs = target < from ? 20 : 50
+        for i in 1...steps {
+            let v = from + (target - from) * Float(i) / Float(steps)
+            let delay = DispatchTimeInterval.milliseconds(totalMs * i / steps)
+            DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.lock.lock()
+                let live = self.gainRamp == ramp
+                self.lock.unlock()
+                if live { self.player.volume = v }
+            }
+        }
     }
 
     /// 24k mono PCM16 little-endian → a Float32 AVAudioPCMBuffer for the player.
@@ -242,6 +330,14 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         // clearing it here would discard ~100ms of the user's just-spoken audio
         // that triggered the barge-in (Android's flushPlayback touches only
         // playback). Capture state is cleared on teardown, not here.
+        // Bump the generation BEFORE stop(): stop() may run the dropped
+        // buffers' completion handlers synchronously, and they must not fire
+        // onPlaybackDrained (the caller already knows) or count against the
+        // next reply — and they take `lock`, so it can't be held across stop().
+        lock.lock()
+        playGeneration += 1
+        outstanding = 0
+        lock.unlock()
         player.stop()                 // drops scheduled buffers
         player.play()                 // ready for the next response
     }
@@ -256,6 +352,9 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         lock.lock()
         let wasStarted = started
         started = false
+        playGeneration += 1
+        outstanding = 0
+        gainRamp += 1
         lock.unlock()
         guard wasStarted else { return }
         engine.inputNode.removeTap(onBus: 0)

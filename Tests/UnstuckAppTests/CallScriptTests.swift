@@ -37,29 +37,29 @@ final class CallScriptTests: XCTestCase {
         let s = session(firstAction: "open the thread")
         XCTAssertEqual(
             CallScript.opening(s),
-            "Hi Ahmad — you asked me to call so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday; Send the deck. Your first step was: open the thread. Want to tick any off, add something, start the timer, or should I call back in ten?")
+            "Hi Ahmad — you asked me to ring so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday; Send the deck. Your first step was: open the thread. Start the timer, or ring you back in ten?")
     }
 
     func testOpeningWithoutNameOrNotesOrTaskOffersOnlyWhatApplies() {
         // No notes to tick off, no task to time: the old four-way menu named
-        // both. Now: a note prompt + the call-back, and no "you didn't leave
-        // any notes" filler.
+        // both. Now: one plain question, and no "you didn't leave any notes"
+        // filler.
         let s = session(name: nil, notes: [], taskId: nil)
         XCTAssertEqual(
             CallScript.opening(s),
-            "Hi — you asked me to call so you'd speak to James. Anything you want me to note down, or should I call back in ten?")
+            "Hi — you asked me to ring so you'd speak to James. Anything you want me to note?")
     }
 
     func testOpeningRendersTheLabelByShape() {
         // A verb-phrase label (what the prompt asks for) is framed "so you'd …";
         // a noun (a name, "the dentist", a task title) is framed "about …" —
-        // never "call about speak to James".
-        XCTAssertTrue(CallScript.opening(session(label: "speak to James")).hasPrefix("Hi Ahmad — you asked me to call so you'd speak to James."))
-        XCTAssertTrue(CallScript.opening(session(label: "James")).hasPrefix("Hi Ahmad — you asked me to call about James."))
-        XCTAssertTrue(CallScript.opening(session(label: "the dentist")).hasPrefix("Hi Ahmad — you asked me to call about the dentist."))
-        XCTAssertTrue(CallScript.opening(session(label: "Dentist appointment")).hasPrefix("Hi Ahmad — you asked me to call about Dentist appointment."))
-        XCTAssertTrue(CallScript.opening(session(label: "to ring the bank")).hasPrefix("Hi Ahmad — you asked me to call so you'd ring the bank."))
-        XCTAssertFalse(CallScript.opening(session(label: "speak to James")).contains("call about speak"))
+        // never "ring about speak to James".
+        XCTAssertTrue(CallScript.opening(session(label: "James")).hasPrefix("Hi Ahmad — you asked me to ring about James."))
+        XCTAssertTrue(CallScript.opening(session(label: "the dentist")).hasPrefix("Hi Ahmad — you asked me to ring about the dentist."))
+        XCTAssertTrue(CallScript.opening(session(label: "Dentist appointment")).hasPrefix("Hi Ahmad — you asked me to ring about Dentist appointment."))
+        XCTAssertTrue(CallScript.opening(session(label: "speak to James")).hasPrefix("Hi Ahmad — you asked me to ring so you'd speak to James."))
+        XCTAssertTrue(CallScript.opening(session(label: "to ring the bank")).hasPrefix("Hi Ahmad — you asked me to ring so you'd ring the bank."))
+        XCTAssertFalse(CallScript.opening(session(label: "speak to James")).contains("ring about speak"))
     }
 
     func testLabelShapeAndReasonPhrase() {
@@ -75,23 +75,26 @@ final class CallScriptTests: XCTestCase {
         XCTAssertEqual(CallScript.reasonPhrase("James"), "about James")
     }
 
-    func testOfferSentenceNamesOnlyWhatApplies() {
-        XCTAssertEqual(CallScript.offerSentence(hasTask: true, hasNotes: true),
-                       "Want to tick any off, add something, start the timer, or should I call back in ten?")
-        XCTAssertEqual(CallScript.offerSentence(hasTask: true, hasNotes: false),
-                       "Want to start the timer, or should I call back in ten?")
-        XCTAssertEqual(CallScript.offerSentence(hasTask: false, hasNotes: true),
-                       "Want to tick any off, add something, or should I call back in ten?")
-        XCTAssertEqual(CallScript.offerSentence(hasTask: false, hasNotes: false),
-                       "Anything you want me to note down, or should I call back in ten?")
-        // Notes-only (no task) never offers a timer; task-only never "tick any off".
+    func testOfferSentenceIsOneQuestionChosenByWhatApplies() {
+        // One short question, never a menu: the timer/ring-back only when a
+        // task is attached; "anything to add" only when there are notes.
+        XCTAssertEqual(CallScript.offerSentence(hasTask: true, hasNotes: true), "Start the timer, or ring you back in ten?")
+        XCTAssertEqual(CallScript.offerSentence(hasTask: true, hasNotes: false), "Start the timer, or ring you back in ten?")
+        XCTAssertEqual(CallScript.offerSentence(hasTask: false, hasNotes: true), "Anything to add?")
+        XCTAssertEqual(CallScript.offerSentence(hasTask: false, hasNotes: false), "Anything you want me to note?")
+        // Notes-only (no task) never offers a timer; task-only never mentions notes.
         let notesOnly = CallScript.opening(session(notes: ["A"], taskId: nil))
         XCTAssertFalse(notesOnly.contains("timer"))
         XCTAssertTrue(notesOnly.contains("You wanted to remember: A."))
+        XCTAssertTrue(notesOnly.hasSuffix("Anything to add?"))
         let taskOnly = CallScript.opening(session(notes: [], taskId: "t1"))
         XCTAssertFalse(taskOnly.contains("tick any off"))
         XCTAssertFalse(taskOnly.contains("notes"))
-        XCTAssertTrue(taskOnly.contains("start the timer"))
+        XCTAssertTrue(taskOnly.contains("Start the timer"))
+        // Every closing is exactly one question — one question mark, no menu.
+        for (t, n) in [(true, true), (true, false), (false, true), (false, false)] {
+            XCTAssertEqual(CallScript.offerSentence(hasTask: t, hasNotes: n).filter { $0 == "?" }.count, 1)
+        }
     }
 
     func testOpeningUsesFirstNameOnly() {
@@ -125,6 +128,8 @@ final class CallScriptTests: XCTestCase {
         XCTAssertTrue(i.contains("verbatim"))
         XCTAssertTrue(i.contains("Never claim an action happened without its tool result"))
         XCTAssertTrue(i.contains("English"))
+        XCTAssertTrue(i.contains("times the way people say them"))
+        XCTAssertTrue(i.contains("say bye"))
         for t in ["complete_task", "add_capture", "schedule_task", "start_focus", "update_call", "snooze_call"] {
             XCTAssertTrue(i.contains(t), t)
         }

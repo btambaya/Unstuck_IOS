@@ -167,6 +167,11 @@ enum AssistantHarness {
                     let last = working.count - 1
                     var closing = content.trimmingCharacters(in: .whitespacesAndNewlines)
                     if corrected && writeToolSucceeded { closing = stripSelfCorrection(closing) }
+                    // Deterministic register polish ("Done —", "Let me know…",
+                    // raw 2026-09-05 / 14:00) on the model's FINAL text only —
+                    // AFTER the fabrication guard saw the raw claim, never on
+                    // the hidden bounce, never on voice (naturalness, 2026-09-06).
+                    if !closing.isEmpty { closing = polishReply(closing) }
                     if closing.isEmpty {
                         closing = !receipts.isEmpty
                             ? "\(receipts[0].label)\(receipts.count > 1 ? " — and \(receipts.count - 1) more below" : "")."

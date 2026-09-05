@@ -131,7 +131,9 @@ final class AssistantHarnessTests: XCTestCase {
     func testATruthfulClaimAfterAWriteToolIsNotBounced() async {
         let transport = ScriptedTransport([call("create_task", #"{"name":"Milk"}"#), text("Done — added \"Milk\".")])
         let outcome = await runTurn("add milk", transport)
-        XCTAssertEqual(outcome, .reply("Done — added \"Milk\"."))
+        // Not bounced (the tool ran) — and the committed text is polished:
+        // the "Done —" tic goes, the quoted name is untouched.
+        XCTAssertEqual(outcome, .reply("Added \"Milk\"."))
         XCTAssertEqual(transport.asks.count, 2)
     }
 

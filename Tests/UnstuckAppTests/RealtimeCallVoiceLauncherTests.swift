@@ -110,7 +110,7 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         XCTAssertTrue(c.instructions.hasSuffix(CallScript.instructions(s, now: Self.now)))
         XCTAssertTrue(c.instructions.contains("THIS IS A PHONE CALL"))
         XCTAssertEqual(c.opening, CallScript.opening(s, now: Self.now))
-        XCTAssertTrue(c.opening.hasPrefix("Hi Ahmad — you asked me to call so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday."))
+        XCTAssertTrue(c.opening.hasPrefix("Hi Ahmad — you asked me to ring so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday."))
         // The primer carries the opening verbatim and is what goes on the wire as the opening.
         XCTAssertTrue(c.primer.contains("\"\(c.opening)\""))
         XCTAssertTrue(c.primer.contains("EXACTLY"))

@@ -11,12 +11,12 @@
 // schemas to `callTools`, adding the call-level `snooze_call`.
 //
 // THE LABEL'S SHAPE. The assistant prompt asks for the call label as a VERB
-// phrase ("speak to James" — prompt.ts CALLS), but a model — or the task-
-// anchored default (the task's name) — may hand over a noun ("James", "the
-// dentist", "Dentist appointment"). Splicing either into one frame reads
-// wrong for the other ("you asked me to call about speak to James"), so the
-// opening renders by shape: a verb phrase → "you asked me to call so you'd
-// speak to James", anything else → "you asked me to call about James".
+// phrase ("speak to James" — prompt.ts request_call), but a model — or the
+// task-anchored default (the task's name) — may hand over a noun ("James",
+// "the dentist", "Dentist appointment"). Splicing either into one frame reads
+// wrong for the other ("you asked me to ring about speak to James"), so the
+// opening renders by shape: a verb phrase → "you asked me to ring so you'd
+// speak to James", anything else → "you asked me to ring about James".
 
 import Foundation
 
@@ -28,16 +28,16 @@ enum CallScript {
     static let callTools = ["complete_task", "add_capture", "schedule_task", "start_focus", "update_call", "snooze_call"]
 
     /// The verbatim first utterance:
-    /// "Hi <name> — you asked me to call so you'd <verb label> | about <noun label>.
+    /// "Hi <name> — you asked me to ring about <noun label> | so you'd <verb label>.
     ///  [You wanted to remember: <A>; <B>; <C>.] [It starts in N minutes.]
-    ///  [Your first step was: …] <offer>"
-    /// where the offer names only what applies (`offerSentence`): notes to
-    /// tick off / add to, a timer only when a task is attached, and the
-    /// call-back always.
+    ///  [Your first step was: …] <closing question>"
+    /// where the closing question is ONE short question chosen by what
+    /// applies (`offerSentence`): a task → the timer or a ring-back; notes
+    /// only → anything to add; neither → anything to note. Never a menu.
     static func opening(_ s: CallSession, now: Date = Date()) -> String {
         var parts: [String] = []
         let greeting = s.preferredName.map { "Hi \($0) — " } ?? "Hi — "
-        parts.append(greeting + "you asked me to call \(reasonPhrase(s.label)).")
+        parts.append(greeting + "you asked me to ring \(reasonPhrase(s.label)).")
         if let notes = notesSentence(s.notes) { parts.append(notes) }
         if let line = startLine(s, now: now) { parts.append(line) }
         if let fa = s.firstAction { parts.append("Your first step was: \(fa).") }
@@ -82,8 +82,8 @@ enum CallScript {
         return leadingVerbs.contains(word) ? .verbPhrase : .nounPhrase
     }
 
-    /// "so you'd speak to James" / "about James" — the phrase after "you
-    /// asked me to call". A leading "to " is folded into the frame.
+    /// "about James" / "so you'd speak to James" — the phrase after "you
+    /// asked me to ring". A leading "to " is folded into the frame.
     static func reasonPhrase(_ label: String) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
         switch labelShape(trimmed) {
@@ -106,15 +106,14 @@ enum CallScript {
         return "You wanted to remember: " + clean.joined(separator: "; ") + "."
     }
 
-    /// The closing offer, naming only what applies: notes can be ticked off /
-    /// added to only when there are notes, the timer only when a task is
-    /// attached, the call-back always.
+    /// The closing question — one short question, never a menu: a task
+    /// attached → the timer or a ring-back; notes only → anything to add;
+    /// neither → anything to note.
     static func offerSentence(hasTask: Bool, hasNotes: Bool) -> String {
         switch (hasTask, hasNotes) {
-        case (true, true): return "Want to tick any off, add something, start the timer, or should I call back in ten?"
-        case (true, false): return "Want to start the timer, or should I call back in ten?"
-        case (false, true): return "Want to tick any off, add something, or should I call back in ten?"
-        case (false, false): return "Anything you want me to note down, or should I call back in ten?"
+        case (true, _): return "Start the timer, or ring you back in ten?"
+        case (false, true): return "Anything to add?"
+        case (false, false): return "Anything you want me to note?"
         }
     }
 
@@ -152,7 +151,7 @@ enum CallScript {
         1. Open by saying EXACTLY this, verbatim, before anything else — read the notes word for word, do not summarise or reorder them:
         "\(opening(s, now: now))"
         2. Then act ONLY through tools: complete_task ticks a task off, add_capture notes something they say, schedule_task moves it, start_focus starts the timer, update_call changes these notes for later, snooze_call ("call me back in ten") calls back later — say the minutes. Never claim an action happened without its tool result; if a tool errors, say so plainly.
-        3. One or two sentences per turn, one question at a time. When they're done, say goodbye — they hang up from the call screen.
+        3. One or two sentences a turn, one question at a time, times the way people say them. When they're done, say bye — they hang up from the screen.
         Call context:
         \(ctx.joined(separator: "\n"))
         """

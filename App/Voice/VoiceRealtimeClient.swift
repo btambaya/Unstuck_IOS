@@ -5,12 +5,15 @@
 // Android client) — the wire protocol is identical:
 //
 //   session.update {modalities, instructions, input/output_audio_format:pcm16,
-//                   turn_detection:server_vad, tools, tool_choice}
+//                   turn_detection:{server_vad, threshold, prefix_padding_ms,
+//                   silence_duration_ms} per ROUTE PROFILE (or null for
+//                   hold-to-talk), tools, tool_choice}  — re-sent on route change
 //   client → conversation.item.create {PRIMER}  + response.create   (opening)
 //   client → input_audio_buffer.append {audio: base64}
 //   server → response.audio.delta {delta: base64}           (24k speech)
 //          → response.audio_transcript.delta {delta}          (captions)
-//          → input_audio_buffer.speech_started                (→ barge-in)
+//          → input_audio_buffer.speech_started/stopped        (→ barge-in)
+//   client → response.cancel                                 (confirmed barge-in)
 //          → response.function_call_arguments.done {name, call_id, arguments}
 //          → response.output_item.done {item: function_call}  (same, other shape)
 //   client → conversation.item.create {function_call_output, call_id, output}
@@ -20,6 +23,15 @@
 // Plus the voice integrity guard: a spoken "I've added it" with no tool call
 // behind it in that response gets one hidden corrective (3 per session).
 //
+// BARGE-IN (App/Voice/BargeIn.swift — pure, tested): the client only feeds
+// events (speech_started/stopped, response ids, gate open/close from the
+// audio engine, playback drained, the Interrupt button, route changes, the
+// confirm-timer tick) into `BargeInController` under the lock and executes
+// the commands it returns outside it — duck −12 dB, confirm, then either
+// response.cancel + flush + mute stale deltas, or restore. Audio/transcript
+// deltas are dropped for a cancelled response id even after a new response
+// is created. "active response" protocol errors are benign.
+//
 // Transport is URLSessionWebSocketTask (Foundation). The audio engine is behind
 // the VoiceAudioIO seam so this file compiles independently of the AVAudioEngine
 // implementation.
@@ -28,6 +40,7 @@
 // scoped `withLock` is async-safe; its bare lock()/unlock() are `noasync`
 // under Swift 6, and the tool-result path runs inside a Task).
 
+import AVFoundation
 import Foundation
 import UnstuckCore
 
@@ -42,6 +55,16 @@ protocol VoiceAudioIO: AnyObject {
     func enqueue(_ pcm: Data)
     /// Barge-in: drop queued audio + cut current playback immediately.
     func flushPlayback()
+    /// Playback gain, linear (0.25 = −12 dB duck, 1 = unity), short ramp.
+    func setPlaybackGain(_ gain: Float)
+    /// The capture gate's context (margin / adaptation freeze / hold-to-talk).
+    func setGateContext(_ ctx: GateContext)
+    /// Re-measure the noise floor (route change).
+    func recalibrateGate()
+    /// The capture gate opened (true) / closed (false). Off the main thread.
+    var onGateChange: (@Sendable (_ open: Bool) -> Void)? { get set }
+    /// The last scheduled playback buffer finished playing. Off the main thread.
+    var onPlaybackDrained: (@Sendable () -> Void)? { get set }
     /// Tear everything down (joins capture/playback, restores the audio session).
     func shutdown()
 }
@@ -107,7 +130,15 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// synthetic user item the user never sees, deleted after the first reply.
     private let opening: String
     private let tools: [[String: Any]]    // tool schemas (OpenAI/DashScope shape)
-    private let audio: VoiceAudioIO
+    private var audio: VoiceAudioIO
+    /// Monotonic seconds for the barge-in confirm timer (injectable for tests).
+    private let now: @Sendable () -> TimeInterval
+    /// Where playback comes out — decides the barge-in profile. Read at open
+    /// and on every AVAudioSession route change; `initialRoute` overrides the
+    /// first read (tests / a caller that already knows).
+    private let routeProvider: @Sendable () -> VoiceRoute
+    private let initialRoute: VoiceRoute?
+    private var routeObserver: (any NSObjectProtocol)?
     // Args are passed as the raw JSON STRING (Sendable) — `[String: Any]` can't
     // cross the Task boundary under Swift 6; the executor parses it.
     private let runTool: @Sendable (_ name: String, _ argsJSON: String) async -> String
@@ -135,16 +166,15 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private let lock = NSLock()
     private var _open = false
     private var _stopped = false
-    // After a barge-in / manual interrupt we drop still-in-flight audio from the
-    // cancelled response until the next response starts (response.created).
-    private var _muted = false
+    /// The barge-in state machine (muted / responseActive / cancelled id /
+    /// playbackQueued / gate / profile all live here). Mutated ONLY under
+    /// `lock`; its commands run outside it.
+    private var _bargeIn: BargeInController
     /// The user muted the MIC (CallKit's mute button → the launcher): captured
     /// frames are dropped before upload, so the server VAD hears silence.
     private var _micMuted = false
-    // Whether a model response is currently being generated. Guards
-    // response.cancel so we never cancel when nothing is active — DashScope
-    // rejects that with "Conversation has no active response".
-    private var _responseActive = false
+    /// Last seen AVAudioSession port set (see observeRoute).
+    private var _routeFingerprint = ""
     // Guards against double error-reporting from the receive loop AND the
     // didCompleteWithError delegate for the same failed connection.
     private var _reportedError = false
@@ -160,13 +190,30 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// Callable from async contexts (NSLock's bare lock()/unlock() are not).
     private func withLock<T>(_ body: () -> T) -> T { lock.withLock(body) }
 
+    /// Settings key for the hold-to-talk fallback (spec §8). Talk mode passes
+    /// `holdToTalk: VoiceRealtimeClient.holdToTalkPreferred`; a CallKit call
+    /// never does (there is no press UI on the lock screen).
+    static let holdToTalkKey = "unstuck.voice.holdToTalk"
+    static var holdToTalkPreferred: Bool { UserDefaults.standard.bool(forKey: holdToTalkKey) }
+
+    /// `holdToTalk`: turn_detection null; the caller drives `pttDown()` /
+    /// `pttUp()` (default false — server VAD). `initialRoute`: skip the
+    /// AVAudioSession read for the first profile. `now`: monotonic clock.
     init(proxyURL: String, token: String, model: String, instructions: String, opening: String,
          tools: [[String: Any]], audio: VoiceAudioIO,
          runTool: @escaping @Sendable (_ name: String, _ argsJSON: String) async -> String,
          onState: @escaping @Sendable (VoiceState) -> Void,
          onCaption: @escaping @Sendable (_ role: String, _ text: String, _ done: Bool) -> Void,
-         onError: @escaping @Sendable (String) -> Void) {
+         onError: @escaping @Sendable (String) -> Void,
+         holdToTalk: Bool = false,
+         initialRoute: VoiceRoute? = nil,
+         routeProvider: @escaping @Sendable () -> VoiceRoute = { VoiceRoute(portType: AVAudioSession.sharedInstance().currentRoute.outputs.first?.portType.rawValue) },
+         now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.proxyURL = proxyURL
+        self.now = now
+        self.routeProvider = routeProvider
+        self.initialRoute = initialRoute
+        self._bargeIn = BargeInController(profile: .forRoute(initialRoute ?? .speaker), holdToTalk: holdToTalk)
         self.token = token
         self.model = model
         self.instructions = instructions
@@ -228,21 +275,119 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         first.cont?.cancel()
         first.socket?.cancel(with: .goingAway, reason: nil)
         session.invalidateAndCancel()   // release the session + its op queue + the delegate retain
+        stopObservingRoute()
         audio.shutdown()
         onState(.closed)
     }
 
-    /// Manual interrupt: cut playback now, tell the server to stop generating,
-    /// and reopen the mic. Stale audio from the cancelled response is dropped
-    /// until the next response begins. A cancelled reply is never scored as a claim.
+    /// Manual interrupt = HARD cancel (never ducks): cut playback now, tell the
+    /// server to stop generating (only if a response is active — DashScope
+    /// errors "Conversation has no active response" otherwise), and reopen the
+    /// mic. Stale audio/captions from the cancelled response are dropped until
+    /// the next response begins. A cancelled reply is never scored as a claim.
+    /// No-op while nothing is generating or queued.
     func interrupt() {
         guard withLock({ _open }) else { return }
-        let active: Bool = withLock { _muted = true; _guard.bargeIn(); return _responseActive }
-        audio.flushPlayback()
-        // Only cancel when a response is actually generating — cancelling with
-        // nothing active makes DashScope error "Conversation has no active response".
-        if active { send(["type": "response.cancel"]) }
-        onState(.listening)
+        dispatch(.interruptPressed)
+    }
+
+    /// Hold-to-talk (`holdToTalk: true` only): the orb went down — cancels a
+    /// playing reply and opens the gate; nothing is appended while released.
+    func pttDown() {
+        guard withLock({ _open }) else { return }
+        dispatch(.pttDown)
+    }
+
+    /// Hold-to-talk: the orb was released — commit the buffer + ask for a reply.
+    func pttUp() {
+        guard withLock({ _open }) else { return }
+        dispatch(.pttUp)
+    }
+
+    // MARK: barge-in
+
+    /// Feed one event to the state machine under the lock, then execute what
+    /// it asks for outside it. A CANCEL (any command list carrying
+    /// flushPlayback) also resets the integrity guard's transcript.
+    private func dispatch(_ event: BargeInEvent) {
+        let t = now()
+        let cmds: [BargeInCommand] = withLock {
+            let c = _bargeIn.handle(event, now: t)
+            if c.contains(.flushPlayback) { _guard.bargeIn() }
+            return c
+        }
+        execute(cmds)
+    }
+
+    private func execute(_ cmds: [BargeInCommand]) {
+        for c in cmds {
+            switch c {
+            case .duck: audio.setPlaybackGain(0.25)
+            case .restore: audio.setPlaybackGain(1)
+            case .flushPlayback: audio.flushPlayback()
+            case .sendCancel: send(["type": "response.cancel"])
+            case .commitAndRespond:
+                send(["type": "input_audio_buffer.commit"])
+                send(["type": "response.create"])
+            case .startConfirmTimer(let ms):
+                // Stale ticks are harmless: the controller checks the elapsed
+                // time against the CURRENT duck, so a timer from an earlier
+                // episode never confirms a later one early.
+                Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
+                    guard let self, self.withLock({ self._open }) else { return }
+                    self.dispatch(.tick)
+                }
+            case .updateTurnDetection:
+                // session.update is allowed mid-session; re-send the whole
+                // thing (instructions/tools unchanged) so a backend that
+                // replaces rather than merges keeps them.
+                send(sessionUpdate())
+            case .updateGate(let ctx): audio.setGateContext(ctx)
+            case .clearCaption:
+                // A completed EMPTY user caption = "new turn": the screen
+                // clears the streaming reply and keeps the last user line.
+                onCaption("user", "", true)
+            case .uiState(let s): onState(s)
+            }
+        }
+    }
+
+    /// Re-profile on every AVAudioSession route change (speaker ↔ receiver /
+    /// headset — including CallKit's mid-call speaker toggle): new
+    /// turn_detection if the profile changed, and a fresh gate floor either way.
+    private func observeRoute() {
+        guard routeObserver == nil else { return }
+        withLock { _routeFingerprint = Self.routeFingerprint() }
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { [weak self] _ in
+            guard let self, self.withLock({ self._open }) else { return }
+            // The notification also fires for category/override changes with
+            // the SAME ports; only a real port change (speaker ↔ receiver,
+            // headset in/out — a different mic too) costs a 500 ms recalibration.
+            let fp = Self.routeFingerprint()
+            let changed: Bool = self.withLock {
+                guard fp != self._routeFingerprint else { return false }
+                self._routeFingerprint = fp
+                return true
+            }
+            guard changed else { return }
+            let route = self.routeProvider()
+            self.audio.recalibrateGate()
+            self.dispatch(.routeChanged(route))
+        }
+    }
+
+    /// Input + output port types of the current route, for change detection.
+    private static func routeFingerprint() -> String {
+        let r = AVAudioSession.sharedInstance().currentRoute
+        return r.inputs.map(\.portType.rawValue).joined(separator: ",") + "|"
+            + r.outputs.map(\.portType.rawValue).joined(separator: ",")
+    }
+
+    private func stopObservingRoute() {
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+        routeObserver = nil
     }
 
     /// Mute/unmute the mic upload (CallKit's mute button → the launcher). The
@@ -255,7 +400,14 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     // MARK: socket
 
     private func onOpen() {
-        withLock { _open = true }
+        // Profile for the route we're actually on BEFORE the first
+        // session.update (a CallKit call on the receiver → low-echo).
+        let route = initialRoute ?? routeProvider()
+        let gateCtx: GateContext = withLock {
+            _open = true
+            _ = _bargeIn.handle(.routeChanged(route), now: now())
+            return _bargeIn.initialGateContext()
+        }
         send(sessionUpdate())
         // Personal-assistant opening (Ahmad, 2026-08-29): the assistant speaks
         // FIRST. DashScope 400s a response.create with NO user element in the
@@ -267,12 +419,19 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
               "item": ["id": Self.primerItemId, "type": "message", "role": "user",
                        "content": [["type": "input_text", "text": opening]]]])
         send(["type": "response.create"])
+        audio.onPlaybackDrained = { [weak self] in self?.dispatch(.playbackDrained) }
+        audio.onGateChange = { [weak self] open in self?.dispatch(open ? .gateOpen : .gateClose) }
+        audio.setGateContext(gateCtx)
         audio.startPlayback()
+        // The gate decides what reaches the socket: live audio (after its
+        // 300 ms pre-roll) while open, digital silence while closed, nothing
+        // during its 500 ms floor calibration or in hold-to-talk while released.
         audio.startCapture { [weak self] frame in
             guard let self, self.withLock({ self._open && !self._micMuted }) else { return }
             self.send(["type": "input_audio_buffer.append",
                        "audio": frame.base64EncodedString()])
         }
+        observeRoute()
         onState(.listening)
     }
 
@@ -301,6 +460,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             return true
         }
         guard first else { return }
+        stopObservingRoute()
         audio.shutdown()
         if let error {
             onError(error)
@@ -315,31 +475,45 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         guard let data = text.data(using: .utf8),
               let ev = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let type = ev["type"] as? String else { return }
+        let response = ev["response"] as? [String: Any]
+        let responseId = (ev["response_id"] as? String) ?? (response?["id"] as? String)
         switch type {
         case "input_audio_buffer.speech_started":
-            // Barge-in: MUTE until the next response starts — the cancelled
-            // reply's in-flight audio deltas kept arriving and played over the
-            // user. response.created flips muted back off for the new reply.
-            withLock { _muted = true; _guard.bargeIn() }
-            audio.flushPlayback(); onState(.listening)
+            // The server VAD heard something. While the model is audible this
+            // DUCKS (−12 dB) and starts the confirm timer; the state machine
+            // turns it into response.cancel + flush + mute (a real barge-in)
+            // or a restore (a blip that speech_stopped ends first).
+            dispatch(.speechStarted)
+        case "input_audio_buffer.speech_stopped":
+            dispatch(.speechStopped)
         case "response.created":
-            withLock { _muted = false; _responseActive = true; _guard.responseCreated() }
-            // The model heard the user and is reasoning — surface a distinct
-            // "Thinking" state until the first audio delta.
-            onState(.thinking)
+            withLock { _guard.responseCreated() }
+            // The model heard the user and is reasoning — "Thinking" until the
+            // first audio delta (or an immediate cancel if this reply is the
+            // one the server made from a false-start blip).
+            dispatch(.responseCreated(id: responseId))
         case "response.audio.delta":
-            if withLock({ _muted }) { return }   // stale audio from a cancelled response
+            // Stale audio from a cancelled response (even after a NEW response
+            // was created) is dropped by id; muted drops everything until the
+            // next response starts.
+            guard withLock({ _bargeIn.shouldEnqueueAudio(id: responseId) }) else { return }
             if let b64 = ev["delta"] as? String, let pcm = Data(base64Encoded: b64) {
-                audio.enqueue(pcm); onState(.speaking)
+                audio.enqueue(pcm)
+                dispatch(.audioDelta(id: responseId))
             }
         case "response.audio_transcript.delta":
+            // Captions for a cancelled reply never leak through (same id rule).
+            guard withLock({ _bargeIn.acceptsTranscript(id: responseId) }) else { return }
             if let d = ev["delta"] as? String {
                 withLock { _guard.transcriptDelta(d) }
                 onCaption("assistant", d, false)
             }
         case "response.audio_transcript.done":
             onCaption("assistant", "", true)
+        case "conversation.item.input_audio_transcription.delta":
+            dispatch(.transcription)   // confirm accelerator only — may never arrive
         case "conversation.item.input_audio_transcription.completed":
+            dispatch(.transcription)
             if let t = ev["transcript"] as? String { onCaption("user", t, true) }
         case "response.audio.done", "response.done":
             // First response finished → the opening primer has served its
@@ -347,7 +521,6 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // interruption. Best effort: a backend without item.delete just
             // leaves it (the primer text also says "once only").
             let deletePrimer: Bool = withLock {
-                _responseActive = false
                 let d = !_primerDeleted
                 _primerDeleted = true
                 return d
@@ -358,11 +531,14 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             if type == "response.done" {
                 // A cancelled/incomplete response (barge-in) is not a claim:
                 // never score it, and never inject a corrective mid-utterance.
-                let status = (ev["response"] as? [String: Any])?["status"] as? String
+                let status = response?["status"] as? String
                 if status == nil || status == "completed" { checkFabrication() }
                 else { withLock { _guard.responseCancelled() } }
+                // responseActive stays true until response.DONE (audio.done
+                // can precede function calls): the UI stays "speaking" while
+                // the buffered tail plays, then playback_drained → listening.
+                dispatch(.responseDone(id: responseId, status: status))
             }
-            onState(.listening)
         case "response.function_call_arguments.done":
             handleToolCall(name: ev["name"] as? String, callId: ev["call_id"] as? String, arguments: ev["arguments"] as? String)
         case "response.output_item.done":
@@ -382,10 +558,16 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             let evId = (ev["event_id"] as? String) ?? (errObj?["event_id"] as? String)
             if evId == Self.primerDeleteEvent || (m?.contains(Self.primerItemId) ?? false) { return }
             // Benign realtime-protocol hiccups — cancelling/creating a response
-            // that is (or isn't) active — are NON-fatal; Android tolerates them.
+            // that is (or isn't) active ("no active response" / "already has an
+            // active response") — are NON-fatal: resync and keep listening.
             if let m, m.lowercased().contains("active response") {
-                withLock { _responseActive = false }
-                onState(.listening); return
+                dispatch(.benignActiveResponseError); return
+            }
+            // Hold-to-talk: a tap too short to capture anything makes the
+            // commit fail ("buffer too small" / "buffer is empty"). Not an
+            // error state — just keep listening for the next press.
+            if let m, withLock({ _bargeIn.holdToTalk }), m.lowercased().contains("buffer") {
+                onState(withLock { _bargeIn.uiStateNow }); return
             }
             if let m, !m.isEmpty { onError(String(m.prefix(160))) }
             onState(.error)
@@ -464,7 +646,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 "instructions": instructions,
                 "input_audio_format": "pcm16",
                 "output_audio_format": "pcm16",
-                "turn_detection": ["type": "server_vad"],
+                // Per route profile (BargeInProfile); NSNull for hold-to-talk.
+                "turn_detection": TurnDetection.json(withLock { _bargeIn.turnDetection }),
                 "tools": tools,
                 "tool_choice": "auto",
             ],

@@ -448,13 +448,12 @@ struct InterviewFlowView: View {
         .accessibilityLabel("Getting to know you")
     }
 
-    // The agent's FIRST words to a new user: it introduces itself before it
-    // asks anything, and discloses what happens to the answers.
+    // The agent's FIRST words to a new user: one plain line (no permission
+    // request, no tagline — mirrors the web interview.tsx greeting verbatim),
+    // then the small-print disclosure of what happens to the answers.
     private var greeting: some View {
         VStack(alignment: .leading, spacing: 6) {
-            (Text("Hey\(firstName.map { " \($0)" } ?? "") — I’m your assistant here. Before we get started, can I get to know you a little? It makes everything I do actually ")
-                + Text("yours").italic()
-                + Text(". Skip anything you like."))
+            Text("Hey\(firstName.map { " \($0)" } ?? ""). A few quick questions so I can plan around your actual life — skip any you like.")
                 .font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
                 .lineSpacing(3)
             Text("I’ll remember what you tell me; it stays yours — see What Unstuck knows in Settings to view or delete any of it. Facts are shared with our AI provider (which doesn’t train on them) so I can help.")

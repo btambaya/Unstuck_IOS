@@ -981,10 +981,10 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     func testVoiceOpeningBranchesOnWhatItKnows() {
-        XCTAssertTrue(buildVoiceOpening(api).contains("you have NEVER met this person"))
-        XCTAssertTrue(buildVoiceOpening(api).contains("Say hello to Maya by name"))
+        XCTAssertTrue(buildVoiceOpening(api).contains("you have never met this person"))
+        XCTAssertTrue(buildVoiceOpening(api).contains("Hey Maya — before we start"))
         api.facts = [fact("f1", "Sam — partner")]
-        XCTAssertTrue(buildVoiceOpening(api).contains("Greet Maya by name in ONE short sentence"))
+        XCTAssertTrue(buildVoiceOpening(api).contains("One short hello using \"Maya\""))
         api.facts.append(ProfileFact(id: "n", category: .preference, fact: "Don't use their name in replies", source: .chat, createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
         XCTAssertTrue(buildVoiceOpening(api).contains("WITHOUT any name"))
         let instructions = buildVoiceInstructions(api)

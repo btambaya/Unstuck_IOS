@@ -39,6 +39,13 @@ final class VoiceSessionModel {
     var note: String?
     /// The call this screen is running (fallback B), nil for a plain Talk.
     private(set) var callSession: CallSession?
+    /// Hold-to-talk (Settings "Voice: hold to talk", UserDefaults
+    /// `unstuck.voice.holdToTalk`): turn_detection null, the mic only opens
+    /// while the button is held and the turn commits on release. Read at
+    /// connect time so a mid-session toggle applies to the next session.
+    private(set) var holdToTalk = false
+    /// Hold-to-talk: the button is currently down (drives the state label).
+    private(set) var pttPressed = false
 
     private let model: AppModel
     /// One engine per connection: a stopped client shuts its engine down, and
@@ -125,6 +132,8 @@ final class VoiceSessionModel {
                 self.state = .error
             }
         }
+        holdToTalk = VoiceRealtimeClient.holdToTalkPreferred
+        pttPressed = false
         let rc = VoiceRealtimeClient(
             proxyURL: proxyURL, token: token, model: modelId,
             instructions: instructions, opening: opening, tools: tools, audio: engine,
@@ -146,16 +155,38 @@ final class VoiceSessionModel {
                     }
                 }
             },
-            onError: { [weak self] msg in Task { @MainActor in self?.note = msg } })
+            onError: { [weak self] msg in Task { @MainActor in self?.note = msg } },
+            holdToTalk: holdToTalk)
         client = rc
         observeInterruptions()
         rc.start()
     }
 
+    /// Manual Interrupt = a HARD cancel (never ducks). Meaningful only while
+    /// the model is responding or playing — `canInterrupt`.
     func interrupt() {
         // Barge-in starts a fresh turn — drop the stale caption + user echo.
         caption = ""; userTranscript = ""
         client?.interrupt()
+    }
+
+    /// The model is generating or its audio is still playing — the Interrupt
+    /// button's enablement (BargeInController.modelBusy as the UI sees it).
+    var canInterrupt: Bool { state == .speaking || state == .thinking }
+
+    /// Hold-to-talk: press — cancels a playing reply and opens the mic.
+    func pttDown() {
+        guard holdToTalk, !pttPressed else { return }
+        pttPressed = true
+        caption = ""; userTranscript = ""
+        client?.pttDown()
+    }
+
+    /// Hold-to-talk: release — commits the buffer and asks for the reply.
+    func pttUp() {
+        guard pttPressed else { return }
+        pttPressed = false
+        client?.pttUp()
     }
 
     func end() {
@@ -262,9 +293,12 @@ struct VoiceModeScreen: View {
     }
 
     private func center(_ session: VoiceSessionModel) -> some View {
-        // "Thinking" is interruptible too — the model is generating a response,
-        // so a tap should barge in / cancel just like during speech.
-        let live = session.state == .speaking || session.state == .listening || session.state == .thinking
+        // The orb pulses while the session is live; a tap / the Interrupt
+        // button barge in only while the model is responding ("Thinking", a
+        // response is generating) or playing ("Speaking") — the hard cancel
+        // is a no-op while we're merely listening, so it is disabled then.
+        let live = session.isLive && session.state != .connecting
+        let canInterrupt = session.canInterrupt
         let orbColor: Color
         switch session.state {
         case .speaking: orbColor = theme.palette.coral
@@ -274,7 +308,7 @@ struct VoiceModeScreen: View {
         return VStack(spacing: 24) {
             PulsingOrb(active: live,
                        color: orbColor,
-                       onTap: live ? { session.interrupt() } : nil)
+                       onTap: canInterrupt ? { session.interrupt() } : nil)
             if let call = session.callSession {
                 Text("Unstuck · \(call.label)")
                     .font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink3)
@@ -298,12 +332,23 @@ struct VoiceModeScreen: View {
                     .multilineTextAlignment(.center)
             }
             if live {
-                Button { session.interrupt() } label: {
-                    Text("Interrupt")
-                        .font(UFont.sans(15, .semibold)).foregroundStyle(theme.palette.ink)
-                        .padding(.horizontal, 24).padding(.vertical, 12)
-                        .background(theme.palette.bg2, in: Capsule())
-                }.buttonStyle(.plain)
+                HStack(spacing: 12) {
+                    Button { session.interrupt() } label: {
+                        Text("Interrupt")
+                            .font(UFont.sans(15, .semibold)).foregroundStyle(theme.palette.ink)
+                            .padding(.horizontal, 24).padding(.vertical, 12)
+                            .background(theme.palette.bg2, in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canInterrupt)
+                    .opacity(canInterrupt ? 1 : 0.4)
+                    .accessibilityHint(canInterrupt ? "Stops the assistant mid-reply" : "Available while the assistant is speaking")
+                    if session.holdToTalk {
+                        HoldToTalkButton(pressed: session.pttPressed,
+                                         onDown: { session.pttDown() },
+                                         onUp: { session.pttUp() })
+                    }
+                }
             }
         }
         .padding(.horizontal, 32)
@@ -312,12 +357,56 @@ struct VoiceModeScreen: View {
     private func stateLabel(_ s: VoiceSessionModel) -> String {
         switch s.state {
         case .connecting: return "Connecting…"
-        case .listening: return "Listening…"
+        case .listening:
+            // Hold-to-talk: the mic is closed until the button is held.
+            if s.holdToTalk { return s.pttPressed ? "Listening…" : "Hold the button to talk" }
+            return "Listening…"
         case .thinking: return "Thinking…"
         case .speaking: return "Speaking…"
         case .error: return s.note ?? "Something went wrong."
         case .closed: return "Ended"
         }
+    }
+}
+
+/// Hold-to-talk: a press-and-hold capsule. The mic opens on touch-down and
+/// the turn commits on release (VoiceRealtimeClient.pttDown / pttUp). A
+/// zero-distance DragGesture is the reliable press/release pair in SwiftUI;
+/// `onDown` is fired once per press (the model guards re-entry too).
+private struct HoldToTalkButton: View {
+    @Environment(\.uTheme) private var theme
+    let pressed: Bool
+    let onDown: () -> Void
+    let onUp: () -> Void
+    @State private var down = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: pressed ? "mic.fill" : "mic")
+            Text(pressed ? "Release to send" : "Hold to talk")
+        }
+        .font(UFont.sans(15, .semibold))
+        .foregroundStyle(pressed ? Color.white : theme.palette.ink)
+        .padding(.horizontal, 20).padding(.vertical, 12)
+        .background(pressed ? theme.palette.primary : theme.palette.bg2, in: Capsule())
+        .scaleEffect(pressed ? 1.04 : 1)
+        .animation(.easeOut(duration: 0.12), value: pressed)
+        .contentShape(Capsule())
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { _ in
+                    guard !down else { return }
+                    down = true
+                    onDown()
+                }
+                .onEnded { _ in
+                    down = false
+                    onUp()
+                }
+        )
+        .accessibilityLabel("Hold to talk")
+        .accessibilityHint("Press and hold while you speak; release to send")
+        .accessibilityAddTraits(.isButton)
     }
 }
 

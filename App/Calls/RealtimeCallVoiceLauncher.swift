@@ -362,11 +362,18 @@ extension RealtimeCallVoiceLauncher.Deps {
             makeSession: { [weak model] config in
                 guard let model, let token = model.voiceAccessToken, !token.isEmpty else { return nil }
                 let audio = VoiceAudioEngine(sessionOwnership: .callKit)
+                // A CallKit call plays through the handset receiver (or a
+                // headset) unless the user flips it to speaker — the low-echo
+                // barge-in profile from the first session.update, without
+                // reading AVAudioSession before CallKit has settled the route;
+                // later route changes still re-profile through routeProvider.
+                // Never hold-to-talk: there is no press UI on the lock screen.
                 let client = VoiceRealtimeClient(
                     proxyURL: model.voiceProxyURL, token: token, model: model.voiceModel,
                     instructions: config.instructions, opening: config.primer, tools: config.tools,
                     audio: audio, runTool: config.runTool,
-                    onState: { _ in }, onCaption: { _, _, _ in }, onError: { _ in })
+                    onState: { _ in }, onCaption: { _, _, _ in }, onError: { _ in },
+                    holdToTalk: false, initialRoute: .lowEcho)
                 client.onTransportEnded = config.onTransportEnded
                 // Mic acquisition failed (engine.start()) — the call can't
                 // proceed; degrade to the "here's what it was about" notification.
