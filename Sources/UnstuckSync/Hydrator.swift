@@ -1,9 +1,11 @@
 // Hydrator — pulls every synced table and replaces the local store
 // (server-canonical). Per-table error isolation: a table whose fetch
 // fails is left intact rather than blanked (mirrors hydrate.ts's
-// `if (res.ok) replace(...)`). cal_blocks additionally preserves locally
-// cached Google external blocks across the replace. RLS auto-scopes
-// reads to the signed-in user.
+// `if (res.ok) replace(...)`). Every table preserves rows that still have
+// a queued upsert op (spec 02-sync-engine §1.3 localPending) — an offline
+// edit must not vanish / revert off the UI until its flush lands — and
+// cal_blocks additionally preserves locally cached Google external blocks
+// across the replace. RLS auto-scopes reads to the signed-in user.
 
 import Foundation
 import GRDB
@@ -22,41 +24,62 @@ public actor Hydrator {
         self.box = OutboxStore(db)
     }
 
-    /// Drop queued `tasks` upsert ops the server already supersedes (its row is
-    /// STRICTLY newer by updatedAt). Run BEFORE the flush: without it, a stale
-    /// local op — e.g. an old `done=false` edit still sitting in the outbox —
-    /// re-pushes and clobbers a newer server change (a completion made on the
-    /// WEB), which the following hydrate then faithfully pulls back as not-done.
-    /// This is the load-bearing fix for "completed on web, didn't reflect on the
-    /// phone". Only reads the server when task ops are actually queued, so it's
-    /// free in the common empty-outbox case. (Genuine offline edits — whose op is
-    /// newer than the server — survive and flush normally.)
+    /// Reconcile queued `tasks` upsert ops with the server BEFORE the flush.
+    /// Without it, a stale local op — e.g. an old `done=false` edit still
+    /// sitting in the outbox — re-pushes and clobbers a newer server change (a
+    /// completion made on the WEB), which the following hydrate then pulls
+    /// back as not-done. This is the load-bearing fix for "completed on web,
+    /// didn't reflect on the phone".
+    ///
+    /// Skew-safe: the op carries the BASE (`baseUpdatedAt` — the server-stamped
+    /// `updated_at` this device last saw for the row), so the question "did
+    /// the server move underneath this edit?" compares server clock with
+    /// server clock. When it did, the op is NOT dropped: the local diff (op vs
+    /// base) is 3-way merged onto the server row, the local row updated to
+    /// match, and the op re-based — a rename made offline lands on top of the
+    /// web completion instead of losing either. Only a LEGACY op (no base,
+    /// enqueued by an older build) still falls back to the device-clock
+    /// compare, with a skew margin. Reads the server only when task ops are
+    /// actually queued, so it's free in the common empty-outbox case.
     public func pruneStaleTaskOps() async {
         let ops = (try? box.pending()) ?? []
-        let taskOps = ops.filter { $0.tableName == "tasks" && $0.kind == .upsert }
+        let taskOps = ops.filter { $0.tableName == "tasks" && $0.kind == .upsert && !$0.isQuarantined }
         guard !taskOps.isEmpty else { return }
         // Per-row tolerant: one un-decodable server task must not make the whole
         // prune a no-op (which would let stale local ops re-push and clobber).
         guard let serverRows = try? await gateway.fetchAllTolerant(TaskRow.self, table: "tasks") else { return }
-        var serverUpdatedAt: [String: String] = [:]
-        for r in serverRows { serverUpdatedAt[r.id] = r.updatedAt }
+        var serverById: [String: TaskRow] = [:]
+        for r in serverRows { serverById[r.id] = r }
         for op in taskOps {
             guard let seq = op.opSeq, let data = op.payload?.data(using: .utf8),
                   let row = try? decoder.decode(TaskRow.self, from: data),
-                  let serverTime = serverUpdatedAt[op.rowId] else { continue }
+                  let server = serverById[op.rowId] else { continue }
             // Compare INSTANTS, not ISO strings: PostgREST emits microseconds +
-            // "+00:00" while local ops use millis + "Z", which don't sort
-            // lexicographically as they sort chronologically — a raw `>` could
-            // keep a stale op and let it clobber a newer server row (the
-            // "completed on web didn't reflect on phone" regression). Mirrors
-            // RealtimeMirror.incomingTaskWins. If either side won't parse, fall
-            // back conservatively and DON'T prune (keep the op — it flushes and
-            // the server's own conflict resolution decides).
-            guard let serverMs = Time.parseMillis(serverTime),
-                  let localMs = Time.parseMillis(row.updatedAt) else { continue }
-            if serverMs > localMs {
-                print("[outbox] pruning stale tasks op \(op.rowId) — server is newer")
+            // "+00:00" while local ops use millis + "Z". If the server stamp
+            // won't parse, DON'T prune (keep the op — it flushes and the server's
+            // own conflict resolution decides).
+            guard let serverMs = Time.parseMillis(server.updatedAt) else { continue }
+            let baseMs = op.baseUpdatedAt.flatMap(Time.parseMillis)
+            switch SyncDecision.staleTaskOpDecision(serverUpdatedAtMs: serverMs, baseUpdatedAtMs: baseMs,
+                                                    opUpdatedAtMs: Time.parseMillis(row.updatedAt)) {
+            case .keep:
+                continue
+            case .prune:
+                print("[outbox] pruning legacy stale tasks op \(op.rowId) — server is newer")
                 try? box.markDone(seq)
+            case .conflict:
+                guard let base = op.basePayload?.data(using: .utf8),
+                      let serverData = try? JSONEncoder().encode(server),
+                      let merged = SyncDecision.threeWayMergeRow(op: data, base: base, server: serverData),
+                      let mergedRow = try? decoder.decode(TaskRow.self, from: merged),
+                      let mergedJSON = String(data: merged, encoding: .utf8) else { continue }
+                print("[outbox] merging tasks op \(op.rowId) onto a newer server row (3-way)")
+                // Re-base on the server version we merged against; the local row
+                // follows so the UI shows the server's changes to the fields this
+                // device didn't touch.
+                try? box.replacePayload(seq, payload: mergedJSON, baseUpdatedAt: server.updatedAt,
+                                        basePayload: String(data: serverData, encoding: .utf8))
+                try? db.save(mergedRow.model())
             }
         }
     }
@@ -87,16 +110,92 @@ public actor Hydrator {
     }
 
     private func performHydrate(userId: String) async {
-        await replace("tasks", TaskRow.self) { try self.db.replaceAll(TaskItem.self, with: $0.map { $0.model() }) }
-        await replace("sessions", SessionRow.self) { try self.db.replaceAll(Session.self, with: $0.map { $0.model() }) }
-        await replace("captures", CaptureRow.self) { try self.db.replaceAll(Capture.self, with: $0.map { $0.model() }) }
-        await replace("reason_logs", ReasonLogRow.self) { try self.db.replaceAll(ReasonLog.self, with: $0.map { $0.model() }) }
+        await hydrateTasks()
+        await replacePreservingPending("sessions", SessionRow.self, Session.self)
+        await hydrateCaptures()
+        await replacePreservingPending("reason_logs", ReasonLogRow.self, ReasonLog.self)
         await hydrateCollections(userId: userId)
-        await replace("tags", TagDbRow.self) { try self.db.replaceAll(TagRow.self, with: $0.map { $0.model() }) }
-        await replace("life_areas", LifeAreaDbRow.self) { try self.db.replaceAll(LifeArea.self, with: $0.map { $0.model() }) }
+        await replacePreservingPending("tags", TagDbRow.self, TagRow.self)
+        await replacePreservingPending("life_areas", LifeAreaDbRow.self, LifeArea.self)
         await replace("calendar_connections", CalendarConnectionRow.self) { try self.db.replaceAll(CalendarConnection.self, with: $0.map { $0.model() }) }
         await hydrateCalBlocks()
         await hydrateProfileFacts()
+    }
+
+    /// Ids with a queued (non-quarantined or quarantined — either way un-acked)
+    /// upsert op for `table`, read on the OPEN connection so the decision and
+    /// the replace share one transaction.
+    private static func pendingUpsertIds(in conn: Database, table: String) throws -> Set<String> {
+        Set(try OutboxStore.pending(in: conn).filter { $0.tableName == table && $0.kind == .upsert }.map(\.rowId))
+    }
+
+    /// Server-canonical replace that keeps rows with a pending upsert op
+    /// (spec §1.3 localPending): a row the server doesn't have yet survives;
+    /// one it also has is decided by `resolve` (default: the local intent wins
+    /// — tables without `updatedAt` can't do better; tasks use LWW).
+    private func replacePreservingPending<Row: Decodable & Sendable & ModelConvertible, M>(
+        _ table: String, _ rowType: Row.Type, _ modelType: M.Type,
+        resolve: @escaping (M, M) -> M = { local, _ in local }
+    ) async where Row.Model == M, M: PersistableRecord & FetchableRecord & Sendable & Identifiable, M.ID == String {
+        do {
+            let remote = try await gateway.fetchAllTolerant(Row.self, table: table).map { $0.model() }
+            try db.replaceAllAtomically(M.self) { conn, local in
+                let pending = try Self.pendingUpsertIds(in: conn, table: table)
+                return SyncDecision.mergeHydratedRows(remote: remote, local: local, pendingIds: pending, resolve: resolve)
+            }
+        } catch {
+            print("[hydrate] \(table) failed, leaving local intact: \(error)")
+        }
+    }
+
+    /// Tasks: a row with a pending upsert keeps the LOCAL version when the
+    /// server row hasn't moved since the edit was based (server `updated_at`
+    /// ≤ the op's `baseUpdatedAt` — server clock vs server clock, so a slow
+    /// device clock can't make the server "win" over a genuine offline edit,
+    /// the trap pruneStaleTaskOps also closes); a server row that DID move
+    /// falls back to last-write-wins (the prune's 3-way merge normally
+    /// re-bases the op before this runs). Rows without a pending op are
+    /// server-canonical.
+    private func hydrateTasks() async {
+        do {
+            let remote = try await gateway.fetchAllTolerant(TaskRow.self, table: "tasks").map { $0.model() }
+            try db.replaceAllAtomically(TaskItem.self) { conn, local in
+                let ops = try OutboxStore.pending(in: conn).filter { $0.tableName == "tasks" && $0.kind == .upsert }
+                let pending = Set(ops.map(\.rowId))
+                var baseById: [String: String] = [:]
+                for op in ops { if let base = op.baseUpdatedAt { baseById[op.rowId] = base } }   // last op's base wins
+                return SyncDecision.mergeHydratedRows(remote: remote, local: local, pendingIds: pending) { l, r in
+                    SyncDecision.resolvePendingTask(local: l, remote: r, baseUpdatedAt: baseById[r.id])
+                }
+            }
+        } catch {
+            print("[hydrate] tasks failed, leaving local intact: \(error)")
+        }
+    }
+
+    /// Captures + their archive state (`archived_at`, migration 053). The
+    /// archive table is replaced from the server rows in the SAME transaction
+    /// as the captures — but only when the server rows actually carry the
+    /// column (a pre-053 server must not blank a local archive); rows with a
+    /// pending upsert keep their local state in both tables.
+    private func hydrateCaptures() async {
+        do {
+            let raw = try await gateway.fetchAllRaw(table: "captures")
+            let rows = raw.compactMap { try? decoder.decode(CaptureRow.self, from: $0) }
+            let columnPresent = raw.isEmpty || raw.contains(where: CaptureRow.hasArchivedAtColumn)
+            let remote = rows.map { $0.model() }
+            var serverArchived: [String: String] = [:]
+            for r in rows { if let at = r.archivedAt { serverArchived[r.id] = at } }
+            try db.replaceAllAtomically(Capture.self) { conn, local in
+                let pending = try Self.pendingUpsertIds(in: conn, table: "captures")
+                if columnPresent {
+                    try AppDatabase.replaceCaptureArchive(in: conn, serverArchived: serverArchived, keepLocalIds: pending)
+                }
+                return SyncDecision.mergeHydratedRows(remote: remote, local: local, pendingIds: pending) { l, _ in l }
+            }
+        } catch {
+            print("[hydrate] captures failed, leaving local intact: \(error)")
+        }
     }
 
     /// `profile_facts` — the assistant's cross-device memory. NOT a blanket
@@ -186,17 +285,12 @@ public actor Hydrator {
             }
             // Preserve unsynced optimistic collections (those with a pending
             // collections upsert op in the outbox): a just-created/edited list
-            // isn't in `base` yet, so the replace would wipe it off the UI until
-            // the next flush (spec 02-sync-engine §1.3 localPending — same guard
-            // as hydrateCalBlocks).
-            let serverIds = Set(enriched.map(\.id))
-            let pendingIds = Set(((try? box.pending()) ?? [])
-                .filter { $0.tableName == "collections" && $0.kind == .upsert }
-                .map(\.rowId))
-            let localPending = (try? db.fetchAllCollections())?.filter {
-                pendingIds.contains($0.id) && !serverIds.contains($0.id)
-            } ?? []
-            try db.replaceAll(ItemCollection.self, with: enriched + localPending)
+            // isn't in `enriched` yet, so the replace would wipe it off the UI
+            // until the next flush (spec 02-sync-engine §1.3 localPending).
+            try db.replaceAllAtomically(ItemCollection.self) { conn, local in
+                let pending = try Self.pendingUpsertIds(in: conn, table: "collections")
+                return SyncDecision.mergeHydratedRows(remote: enriched, local: local, pendingIds: pending) { l, _ in l }
+            }
         } catch {
             print("[hydrate] collections failed, leaving local intact: \(error)")
         }
@@ -232,24 +326,32 @@ public actor Hydrator {
             // Per-row tolerant decode (see replace()): a single bad cal_block row
             // mustn't wipe the whole schedule.
             let remote = try await gateway.fetchAllTolerant(CalBlockRow.self, table: "cal_blocks").map { $0.model() }
-            let local = (try? db.fetchAllCalBlocks()) ?? []
-            let localExternal = local.filter { isExternalBlock($0) }
-            let merged = SyncDecision.mergeHydratedCalBlocks(remote: remote, localExternal: localExternal)
-            // Preserve unsynced optimistic TASK blocks (those with a pending
-            // cal_blocks upsert op in the outbox): they're in neither `remote`
-            // nor `localExternal`, so the replace would wipe a just-scheduled
-            // block off the UI until the next flush (spec 02-sync-engine §1.3
-            // localPending). Keep any not already present from the server.
-            let pendingIds = Set(((try? box.pending()) ?? [])
-                .filter { $0.tableName == "cal_blocks" && $0.kind == .upsert }
-                .map(\.rowId))
-            let mergedIds = Set(merged.map(\.id))
-            let localPending = local.filter {
-                pendingIds.contains($0.id) && !mergedIds.contains($0.id) && !isExternalBlock($0)
+            try db.replaceAllAtomically(CalBlock.self) { conn, local in
+                let localExternal = local.filter { isExternalBlock($0) }
+                let merged = SyncDecision.mergeHydratedCalBlocks(remote: remote, localExternal: localExternal)
+                // Preserve unsynced optimistic TASK blocks (those with a pending
+                // cal_blocks upsert op in the outbox): a just-scheduled / just-moved
+                // block must not vanish or snap back until the flush lands (spec
+                // 02-sync-engine §1.3 localPending). The local intent wins.
+                let pending = try Self.pendingUpsertIds(in: conn, table: "cal_blocks")
+                let ownLocal = local.filter { !isExternalBlock($0) }
+                return SyncDecision.mergeHydratedRows(remote: merged, local: ownLocal, pendingIds: pending) { l, _ in l }
             }
-            try db.replaceAll(CalBlock.self, with: merged + localPending)
         } catch {
             print("[hydrate] cal_blocks failed, leaving local intact: \(error)")
         }
     }
 }
+
+/// A DbRowCodec row that converts to its UnstuckCore model — lets the
+/// pending-preserving replace be written once for every table.
+protocol ModelConvertible {
+    associatedtype Model
+    func model() -> Model
+}
+
+extension TaskRow: ModelConvertible {}
+extension SessionRow: ModelConvertible {}
+extension ReasonLogRow: ModelConvertible {}
+extension TagDbRow: ModelConvertible {}
+extension LifeAreaDbRow: ModelConvertible {}

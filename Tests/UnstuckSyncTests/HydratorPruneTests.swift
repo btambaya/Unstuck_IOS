@@ -139,6 +139,93 @@ final class HydratorPruneTests: XCTestCase {
                        "the genuinely-newer offline edit must survive the prune + flush")
     }
 
+    // MARK: - skew-safe prune (the op carries the BASE it was edited on top of)
+
+    /// The finding's scenario: the phone clock is 3 minutes SLOW. The user
+    /// renames the task offline at a device time that is EARLIER than the
+    /// server row's (unchanged) updated_at. The old device-vs-server compare
+    /// pruned the genuine edit silently. With the base recorded, "did the
+    /// server move underneath me?" is server-clock vs server-clock: it didn't
+    /// (base == server), so the op is kept and flushed.
+    func testSlowDeviceClockDoesNotPruneAGenuineOfflineEdit() async throws {
+        let serverStamp = "2026-05-21T10:00:00.123456+00:00"
+        let base = TaskItem(id: "t1", name: "server", estimateMin: 25,
+                            createdAt: "2026-05-21T09:00:00.000Z", updatedAt: serverStamp)
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "renamed-offline", updatedAt: "2026-05-21T09:57:00.000Z"),
+                            nowISO: "2026-05-21T09:57:00.000Z",
+                            baseUpdatedAt: serverStamp,
+                            basePayload: String(data: try JSONEncoder().encode(TaskRow(base)), encoding: .utf8))
+        let read = FakeReadGateway(taskRows: [TaskRow(base)])
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+
+        await hydrator.pruneStaleTaskOps()
+        await flusher.flush(userId: "u1")
+
+        let upserts = await write.upserts
+        XCTAssertEqual(upserts.map(\.name), ["renamed-offline"], "the edit must survive a slow device clock")
+    }
+
+    /// A real conflict: the web COMPLETED the task while the phone renamed it
+    /// offline. Neither edit may be dropped — the op is 3-way merged onto the
+    /// newer server row (rename from the op, done from the server), the local
+    /// row updated, and the merged op flushed.
+    func testConflictIsThreeWayMergedInsteadOfDropped() async throws {
+        let baseStamp = "2026-05-21T10:00:00.000000+00:00"
+        let base = TaskItem(id: "t1", name: "old name", estimateMin: 25,
+                            createdAt: "2026-05-21T09:00:00.000Z", updatedAt: baseStamp)
+        try db.save(TaskItem(id: "t1", name: "new name", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:03:00.000Z"))
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "new name", updatedAt: "2026-05-21T10:03:00.000Z"),
+                            nowISO: "2026-05-21T10:03:00.000Z",
+                            baseUpdatedAt: baseStamp,
+                            basePayload: String(data: try JSONEncoder().encode(TaskRow(base)), encoding: .utf8))
+        var serverRow = TaskItem(id: "t1", name: "old name", estimateMin: 25,
+                                 createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:05:00.000000+00:00")
+        serverRow.done = true
+        serverRow.completedAt = "2026-05-21T10:05:00.000Z"
+        let read = FakeReadGateway(taskRows: [TaskRow(serverRow)])
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+
+        await hydrator.pruneStaleTaskOps()
+        // The op was re-based and rewritten, not dropped.
+        let op = try XCTUnwrap(box.pending().first)
+        XCTAssertEqual(op.baseUpdatedAt, "2026-05-21T10:05:00.000000+00:00")
+        let merged = try JSONDecoder().decode(TaskRow.self, from: XCTUnwrap(op.payload?.data(using: .utf8)))
+        XCTAssertEqual(merged.name, "new name", "the offline rename is kept")
+        XCTAssertTrue(merged.done, "the web completion is kept")
+        XCTAssertEqual(merged.completedAt, "2026-05-21T10:05:00.000Z")
+        // The local row follows the merge so the UI shows both changes.
+        let local = try XCTUnwrap(db.fetchById(TaskItem.self, id: "t1"))
+        XCTAssertEqual(local.name, "new name")
+        XCTAssertTrue(local.done)
+
+        await flusher.flush(userId: "u1")
+        let upserts = await write.upserts
+        XCTAssertEqual(upserts.map(\.name), ["new name"])
+    }
+
+    /// A legacy op (enqueued by an older build, no base) still uses the
+    /// device-clock compare — but with a skew margin: a server row newer by
+    /// less than the allowance is NOT proof the edit is stale.
+    func testLegacyOpWithinTheSkewMarginIsKept() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "offline", updatedAt: "2026-05-21T10:00:00.000Z"),
+                            nowISO: "2026-05-21T10:00:00.000Z")
+        let read = FakeReadGateway(taskRows: [
+            TaskRow(TaskItem(id: "t1", name: "server", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:00:01.500Z"))   // +1.5s
+        ])
+        let hydrator = Hydrator(gateway: read, db: db)
+        await hydrator.pruneStaleTaskOps()
+        XCTAssertEqual(try box.count(), 1, "1.5s of skew must not prune a legacy op")
+    }
+
     func testNewerOfflineEditSurvivesPruneAndFlushes() async throws {
         // The genuine offline case: the queued op (10:10) is NEWER than the
         // server row (10:00). Prune must keep it, and the flush must push it.

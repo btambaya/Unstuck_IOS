@@ -69,13 +69,47 @@ final class AppModel {
         let prev = collectionRPCChains[collectionId]
         collectionRPCChains[collectionId] = Task { await prev?.value; await op() }
     }
-    // Local first-run flag; struggles also sync to user_preferences.
+    // Local first-run flag; struggles also sync to user_preferences. The gate
+    // is ACCOUNT-wide: on sign-in it is reconciled from the server (a non-empty
+    // `adhd_struggles` or a set interview flag ⇒ onboarded elsewhere ⇒ pinned
+    // here without re-running the steps) — see reconcileAccountOnboardingIfNeeded.
     var onboarded = UserDefaults.standard.bool(forKey: "unstuck.onboarded")
-    /// In-memory backing for the device-local archived-capture id set (the
-    /// Inbox triage tray). Persisted to UserDefaults via the `archivedCaptureIds`
-    /// computed property in AppModel+Captures. Stored here because @Observable
-    /// extensions can't add stored properties — observing this drives the Inbox.
-    var archivedCaptureIdsBacking: Set<String> = []
+    /// True once the account's onboarding state is KNOWN for this sign-in:
+    /// the local flag was set, or the server answered (or couldn't within the
+    /// deadline — then the local flag decides). RootView can gate on this to
+    /// avoid a flash of OnboardingView for an existing account on a fresh
+    /// install while the read is in flight.
+    private(set) var onboardingResolved = UserDefaults.standard.bool(forKey: "unstuck.onboarded")
+    /// Per-sign-in guard for the account-onboarding reconcile (set once the
+    /// server ANSWERED; a transport failure leaves it unset so the next
+    /// hydrate hook retries).
+    @ObservationIgnored private var onboardingReconciledFor: String?
+    /// Per-sign-in guard for the server-preferences pull (level / lead /
+    /// rituals). Same retry semantics.
+    @ObservationIgnored private var serverPrefsPulledFor: String?
+    /// Guard for the timezone push — keyed on user + zone, so a re-sign-in
+    /// no-ops but a device that has MOVED pushes the new zone once.
+    @ObservationIgnored private var timezonePushedFor: String?
+    /// Generation counters so a push that succeeds can only clear the
+    /// pending-push flag its own change set.
+    @ObservationIgnored private var notifPrefsPushGen = 0
+    @ObservationIgnored private var ritualsPushGen = 0
+    /// In-memory backing for the archived-capture id set the Inbox triage tray
+    /// reads (`archivedCaptureIds` in AppModel+Captures keeps a UserDefaults
+    /// cache of it). Stored here because @Observable extensions can't add
+    /// stored properties. The set is a CACHE of the local `capture_archive`
+    /// table (server `captures.archived_at`, migration 053): the store →
+    /// set direction runs through `startCaptureArchiveObservation`; the
+    /// UI → store direction (archive / restore taps insert or remove an id)
+    /// runs through this observer, which writes the diff through the
+    /// repository + outbox so the archive reaches the server.
+    var archivedCaptureIdsBacking: Set<String> = [] {
+        didSet { propagateCaptureArchiveChange(from: oldValue, to: archivedCaptureIdsBacking) }
+    }
+    /// Set while the set is being updated FROM the store (observation, the
+    /// sign-out scrub) so the observer above doesn't echo it back as writes.
+    @ObservationIgnored private var captureArchiveWriteThroughSuppressed = false
+    @ObservationIgnored private var captureArchiveObservation: Task<Void, Never>?
 
     /// Last finished focus session, backing the Today "Just now" recap card
     /// (Android RecapState parity). In-memory only — set by finishFocus,
@@ -311,6 +345,7 @@ final class AppModel {
         UserDefaults.standard.set(struggles, forKey: "unstuck.adhdStruggles")
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
+        onboardingResolved = true
 
         // Arm the ONE-TIME guided-tour auto-welcome for accounts that finish
         // onboarding after the tour shipped (it surfaces on the next Today
@@ -381,24 +416,139 @@ final class AppModel {
         Self.canonicalStruggles(UserDefaults.standard.stringArray(forKey: "unstuck.adhdStruggles") ?? [])
     }
 
-    /// Per-launch guard for the one-shot struggles pull below.
-    @ObservationIgnored private var strugglesPulledFor: String?
-
-    /// A fresh install of an existing account has no local struggles while
-    /// the server row does: pull `user_preferences.adhd_struggles` once per
-    /// sign-in when the local store is empty (canonicalised on the way in).
-    /// Driven off the profile-facts hydrate hook, so it runs when the rest of
-    /// the account's memory lands. A transport failure leaves the guard unset
-    /// so the next hydrate retries.
-    private func pullAdhdStrugglesIfNeeded() {
-        guard let coord = coordinator, let uid = coord.auth.currentUserId, strugglesPulledFor != uid else { return }
-        guard canonicalStruggles.isEmpty else { strugglesPulledFor = uid; return }
+    /// Once per sign-in, reconcile the device with the ACCOUNT:
+    ///  • a fresh install of an existing account has no local struggles while
+    ///    the server row does — pull `user_preferences.adhd_struggles`
+    ///    (canonicalised on the way in);
+    ///  • the 5-step onboarding gate is account-wide — a non-empty server
+    ///    struggles list means the account onboarded on another device, so
+    ///    the local flag is pinned instead of re-onboarding (which re-armed
+    ///    the one-time tour and overwrote the server's picks). The interview
+    ///    flag (`applyServerInterviewFlag`) pins it the same way.
+    /// Runs from the auth transition (early, so RootView's gate resolves
+    /// before the full hydrate) AND the profile-facts hydrate hook (retry). A
+    /// transport failure / deadline leaves the guard unset for the retry and
+    /// lets the LOCAL flag decide meanwhile — "unknown" never flips the gate.
+    private func reconcileAccountOnboardingIfNeeded() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId, onboardingReconciledFor != uid else { return }
+        if onboarded && !canonicalStruggles.isEmpty {
+            onboardingReconciledFor = uid
+            onboardingResolved = true
+            return
+        }
+        let prefs = coord.preferences
         Task { [weak self] in
-            guard let raw = try? await coord.preferences.adhdStruggles(userId: uid) else { return }
+            let raw: [String]? = try? await withDeadline(seconds: 6) { try await prefs.adhdStruggles(userId: uid) }
             guard let self, coord.auth.currentUserId == uid else { return }
-            self.strugglesPulledFor = uid
+            guard let raw else {
+                self.onboardingResolved = true   // unknown → the local flag decides; retried next hydrate
+                return
+            }
+            self.onboardingReconciledFor = uid
             let mapped = Self.canonicalStruggles(raw)
-            if !mapped.isEmpty { UserDefaults.standard.set(mapped, forKey: "unstuck.adhdStruggles") }
+            if !mapped.isEmpty {
+                if self.canonicalStruggles.isEmpty { UserDefaults.standard.set(mapped, forKey: "unstuck.adhdStruggles") }
+                self.markOnboardedFromServer()
+            }
+            self.onboardingResolved = true
+        }
+    }
+
+    /// The account already onboarded elsewhere: pin the local gate WITHOUT
+    /// re-arming the one-time tour (that's for accounts finishing the steps
+    /// on this device) and without touching the server's struggles.
+    func markOnboardedFromServer() {
+        onboardingResolved = true
+        guard !onboarded else { return }
+        UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
+        onboarded = true
+    }
+
+    /// Once per sign-in (hydrate hook): the account-wide preferences the
+    /// phone used to write-only or keep device-local — the notification level
+    /// + reminder lead (`notification_preferences`) and the PA ritual toggles
+    /// (`user_preferences.pa_rituals`, migration 053). The server is the
+    /// source of truth: a non-null server value replaces the local cache. The
+    /// one exception is a change made HERE whose push failed (flagged
+    /// pending) — that is re-pushed instead, so an offline toggle isn't
+    /// silently reverted. A transport failure leaves the guard unset so the
+    /// next hydrate retries. Moment dismissals are device-local by design.
+    /// Once per (account, zone): record the device's IANA timezone on the
+    /// account (`set_timezone`, migration 053). The server's reminders, morning
+    /// brief and the owner-local slot shared tasks are bucketed by all read
+    /// `notification_preferences.timezone`; without this an account that only
+    /// ever signs in on the phone stays on the UTC fallback. A transport
+    /// failure leaves the guard unset so the next hydrate retries; a rejected
+    /// zone is remembered (retrying can't help).
+    private func pushTimezoneIfNeeded() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        let tz = TimeZone.current.identifier
+        let stamp = "\(uid)|\(tz)"
+        guard timezonePushedFor != stamp else { return }
+        let prefs = coord.preferences
+        Task { [weak self] in
+            guard (try? await prefs.setTimezone(tz)) != nil else { return }
+            guard let self, coord.auth.currentUserId == uid else { return }
+            self.timezonePushedFor = stamp
+        }
+    }
+
+    private func pullServerPreferencesIfNeeded() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId, serverPrefsPulledFor != uid else { return }
+        let prefs = coord.preferences
+        let paPrefs = self.paPrefs
+        Task { [weak self] in
+            var complete = true
+            // Notification level + lead.
+            if NotificationPrefs.pendingServerPush {
+                let level = NotificationPrefs.level, lead = NotificationPrefs.reminderLeadMin
+                do {
+                    try await prefs.setNotificationLevel(userId: uid, morningBrief: level.morningBrief,
+                                                         pausedCheckin: level.pausedCheckin, level: level.rawValue)
+                    try await prefs.setReminderLead(userId: uid, minutes: lead)
+                    guard coord.auth.currentUserId == uid else { return }
+                    NotificationPrefs.pendingServerPush = false
+                } catch { complete = false }
+            } else {
+                do {
+                    let row = try await prefs.notificationPrefs(userId: uid)
+                    guard let self, coord.auth.currentUserId == uid else { return }
+                    self.applyServerNotificationPrefs(row)
+                } catch { complete = false }
+            }
+            // PA rituals.
+            if paPrefs.isPendingPush {
+                do {
+                    try await prefs.setPaRituals(userId: uid, prefs: paPrefs.rituals)
+                    guard coord.auth.currentUserId == uid else { return }
+                    paPrefs.setPendingPush(false)
+                } catch { complete = false }
+            } else {
+                do {
+                    let server = try await prefs.paRituals(userId: uid)
+                    guard coord.auth.currentUserId == uid else { return }
+                    if let server { paPrefs.applyServerRituals(server) }
+                } catch { complete = false }
+            }
+            guard let self, coord.auth.currentUserId == uid else { return }
+            if complete { self.serverPrefsPulledFor = uid }
+        }
+    }
+
+    /// A ritual toggle made here → `user_preferences.pa_rituals`. Flagged
+    /// pending until the write lands, so an offline toggle survives the next
+    /// hydrate (re-pushed rather than pulled over).
+    private func pushRituals(_ rituals: RitualPrefs) {
+        paPrefs.setPendingPush(true)
+        ritualsPushGen += 1
+        let gen = ritualsPushGen
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        Task { [weak self] in
+            do {
+                try await coord.preferences.setPaRituals(userId: uid, prefs: rituals)
+                guard let self, coord.auth.currentUserId == uid, self.ritualsPushGen == gen else { return }
+                self.paPrefs.setPendingPush(false)
+            } catch {}
         }
     }
 
@@ -428,6 +578,8 @@ final class AppModel {
             interviewFlagPulledFor = uid
             if doneAt != nil {
                 InterviewMachine.markDone()
+                // An account that finished the interview onboarded somewhere.
+                markOnboardedFromServer()
             } else if InterviewMachine.isDone() {
                 Task { try? await prefs.setInterviewDone(userId: uid) }
             }
@@ -491,10 +643,12 @@ final class AppModel {
         refreshLiveSession()
         uiTestWrite = WriteThrough(db: database)
         DemoSeed.seed(database)
+        startCaptureArchiveObservation(database)
         configured = true
         signedIn = true
         profileFactsHydrated = true   // nothing to pull — the seed IS the memory
         onboarded = true
+        onboardingResolved = true
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         // Tour UITest hook: reset the tour to a fresh 'eligible' state so the
         // one-time welcome fires deterministically on this boot.
@@ -542,9 +696,18 @@ final class AppModel {
                 // must never be greeted as a stranger.
                 await self.applyServerInterviewFlag()
                 self.profileFactsHydrated = true
-                self.pullAdhdStrugglesIfNeeded()
+                self.reconcileAccountOnboardingIfNeeded()
+                self.pullServerPreferencesIfNeeded()
+                self.pushTimezoneIfNeeded()
             }
         }
+        // Ritual toggles are account-wide (migration 053) — push every change.
+        paPrefs.onRitualsChanged = { [weak self] rituals in self?.pushRituals(rituals) }
+        // The pre-053 device-local archive set becomes server state ONCE, then
+        // the Inbox's set follows the local archive table (hydrate / realtime /
+        // our own writes / the sign-out wipe).
+        await migrateLegacyCaptureArchiveIfNeeded()
+        startCaptureArchiveObservation(database)
         await coord.start()
         await observeAuth(coord)
 
@@ -749,6 +912,7 @@ final class AppModel {
                     // sign-out, so the next account on this device starts clean.
                     // Idempotent.
                     if self.signedIn && isSignOut { self.scrubDeviceLocalUserContent() }
+                    let becameAuthed = isAuthed && !self.signedIn
                     self.signedIn = isAuthed
                     // Refresh cached identity from the session in hand (no
                     // keychain read). Sign-out passes nil → clears it.
@@ -773,6 +937,17 @@ final class AppModel {
                     // Usage-analytics sign-in ping (not on recovery — that's a
                     // re-auth, not a real login). Throttled to once / 12h / user.
                     if isAuthed, !isRecovery { self.trackLogin() }
+                    // Resolve the account-wide onboarding gate EARLY (a single
+                    // row read) rather than after the whole first hydrate, so
+                    // an existing account on a fresh install isn't shown the
+                    // 5 steps while the server is still being asked.
+                    if becameAuthed {
+                        self.reconcileAccountOnboardingIfNeeded()
+                        // The zone the SERVER schedules this account in — pushed
+                        // at sign-in (not only after a hydrate) so a phone-only
+                        // account is never left on the UTC fallback.
+                        self.pushTimezoneIfNeeded()
+                    }
                     // A circle invite link tapped while signed out stashed its
                     // code — ask (Accept / Not now) now that we're authenticated.
                     if isAuthed { self.promptPendingCircleInviteIfAny() }
@@ -930,12 +1105,19 @@ final class AppModel {
     var write: WriteThrough? { coordinator?.write ?? uiTestWrite }
 
     /// Sign out via the coordinator's spec'd path: drain the outbox
-    /// (bounded), unregister this device's push token while the JWT is
-    /// still valid, then sign out (spec 02 §1.7 signOutAndUnregister).
+    /// (bounded; whatever can't be pushed — offline — is parked under this
+    /// user and restored on their next sign-in, never discarded), unregister
+    /// this device's push token while the JWT is still valid, then sign out
+    /// (spec 02 §1.7 signOutAndUnregister).
     /// Also wipe the device-local notification state (spec 10 §1.8/§1.11):
     /// the log + per-task reminder overrides, every scheduled reminder, and
     /// the pending paused check-in — so the next account on this device
     /// starts clean and never sees the previous user's task names.
+    /// Edits still waiting to reach the server — the Settings sign-out row can
+    /// say "N changes haven't synced yet; they'll sync when you next sign in
+    /// here" (they're parked, not lost).
+    var pendingSyncCount: Int { coordinator?.pendingOutboxCount() ?? 0 }
+
     func signOut() {
         guard let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
@@ -955,9 +1137,39 @@ final class AppModel {
     /// those never route through the button.
     func scrubDeviceLocalUserContent() {
         NotificationLog.shared.clear()
-        NotificationPrefs.clearUserContent()
+        NotificationPrefs.clearUserContent()   // per-task overrides + the cached level / lead
         PausedCheckinScheduler.cancel()
+        // The Inbox archive cache — from the store side (the outbox / archive
+        // table are wiped by the sync clearAll), never as unarchive writes.
+        captureArchiveWriteThroughSuppressed = true
         archivedCaptureIds = []
+        captureArchiveWriteThroughSuppressed = false
+        // Account-scoped flags + prefs the next account must not inherit: the
+        // onboarding gate + struggles (else B skips onboarding under A's picks
+        // and never pulls its own), the call window / lead, dismissed nudges,
+        // blocked collaborators, the usable-minutes cache, the call-outcome
+        // queue (A's reports would be sent — and 404 — under B), the per-user
+        // login-ping throttles, and the hydrate-once guards.
+        let d = UserDefaults.standard
+        for key in ["unstuck.onboarded", "unstuck.adhdStruggles",
+                    "unstuck.dismissedNudges", "unstuck.blockedEmails",
+                    "unstuck.usableMinutesPerDay", "unstuck.usableMinutesWeekend",
+                    CallSettings.windowStartKey, CallSettings.windowEndKey, CallSettings.defaultLeadKey,
+                    "unstuck.calls.outcomeQueue"] {
+            d.removeObject(forKey: key)
+        }
+        for key in d.dictionaryRepresentation().keys where key.hasPrefix("unstuck.loginPing.") {
+            d.removeObject(forKey: key)
+        }
+        onboarded = false
+        onboardingResolved = false
+        onboardingReconciledFor = nil
+        serverPrefsPulledFor = nil
+        timezonePushedFor = nil
+        // The App Group container: the widget / Siri snapshots carry this
+        // account's task + list names, and hands-free Siri writes queued after
+        // the sign-out would otherwise land in the NEXT account on drain.
+        clearAppGroupUserContent()
         // The assistant's memory is personal by definition — wipe the local
         // rows (the server keeps the account's facts; the sync clearAll on the
         // signed-out event covers the same table for reactive sign-outs).
@@ -965,7 +1177,6 @@ final class AppModel {
         // The next account waits for ITS hydrate before an empty memory means
         // "never met" (and re-pulls its struggles).
         profileFactsHydrated = false
-        strugglesPulledFor = nil
         // Push tokens: a reactive sign-out (server revocation, refresh failure)
         // never routes through signOutAndUnregister, so drop the VoIP token +
         // any call in progress best-effort here too — else the previous
@@ -989,6 +1200,86 @@ final class AppModel {
         sharedLedgerDrainTask?.cancel()
         sharedLedgerDrainTask = nil
         pendingSharedFocusLogs = []
+    }
+
+    /// Wipe the App Group container's per-user content (Start-Next widget
+    /// snapshot, the enriched Siri snapshot, the hands-free write queue and
+    /// any stashed Siri prompt / route) and redraw the widget empty.
+    private func clearAppGroupUserContent() {
+        AppGroup.clearUserContent()
+        WidgetCenter.shared.reloadAllTimelines()
+    }
+
+    // MARK: - capture archive (server `captures.archived_at`, migration 053)
+
+    /// Mirror the local `capture_archive` table into the observable set the
+    /// Inbox reads. Store → set only; suppressed so it isn't echoed back.
+    private func startCaptureArchiveObservation(_ database: AppDatabase) {
+        captureArchiveObservation?.cancel()
+        captureArchiveObservation = Task { [weak self] in
+            do {
+                for try await ids in database.observeArchivedCaptureIds() {
+                    guard let self else { return }
+                    self.setArchivedCaptureIdsFromStore(ids)
+                }
+            } catch {}
+        }
+    }
+
+    private func setArchivedCaptureIdsFromStore(_ ids: Set<String>) {
+        guard ids != archivedCaptureIdsBacking else { return }
+        captureArchiveWriteThroughSuppressed = true
+        archivedCaptureIds = ids   // also refreshes the UserDefaults cache
+        captureArchiveWriteThroughSuppressed = false
+    }
+
+    /// The observable set changed from the UI side (archive / restore taps,
+    /// the assistant's archive_capture): write the diff through the
+    /// repository + outbox so `archived_at` reaches the server. A capture that
+    /// no longer exists locally is skipped by the write-through (no op).
+    private func propagateCaptureArchiveChange(from old: Set<String>, to new: Set<String>) {
+        guard !captureArchiveWriteThroughSuppressed, let write else { return }
+        let added = new.subtracting(old), removed = old.subtracting(new)
+        guard !added.isEmpty || !removed.isEmpty else { return }
+        let now = Self.isoNow()
+        Task {
+            for id in added { _ = try? await write.setCaptureArchived(id: id, archivedAt: now, nowISO: now) }
+            for id in removed { _ = try? await write.setCaptureArchived(id: id, archivedAt: nil, nowISO: now) }
+        }
+    }
+
+    /// One-time: the pre-053 device-local archive set (UserDefaults) becomes
+    /// server state — every id whose capture still exists locally is written
+    /// through as `archived_at = now`; ids without a row are dropped. Runs
+    /// before the observation starts so the Inbox never flashes empty.
+    private func migrateLegacyCaptureArchiveIfNeeded() async {
+        let key = "unstuck.captureArchive.migrated"
+        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        guard let write, let db else { return }
+        let legacy = UserDefaults.standard.stringArray(forKey: "unstuck.archivedCaptureIds") ?? []
+        let already = (try? db.archivedCaptureIds()) ?? []
+        let now = Self.isoNow()
+        for id in legacy where !already.contains(id) {
+            _ = try? await write.setCaptureArchived(id: id, archivedAt: now, nowISO: now)
+        }
+        UserDefaults.standard.set(true, forKey: key)
+    }
+
+    /// `set_usable_minutes`: the budget lives on the server
+    /// (`user_preferences.usable_minutes_per_day / _weekend` — the web
+    /// calendar's capacity math reads it), so the server write IS the change;
+    /// the local keys are written only after it lands. Returns the REAL
+    /// outcome so a tool can refuse to claim a save that didn't happen.
+    func setUsableMinutesAwaiting(perDay: Int?, weekend: Int?) async -> Bool {
+        guard perDay != nil || weekend != nil else { return false }
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return false }
+        do {
+            try await coord.preferences.setUsableMinutes(userId: uid, perDay: perDay, weekend: weekend)
+        } catch { return false }
+        let d = UserDefaults.standard
+        if let perDay { d.set(perDay, forKey: "unstuck.usableMinutesPerDay") }
+        if let weekend { d.set(weekend, forKey: "unstuck.usableMinutesWeekend") }
+        return true
     }
 
     func saveTask(_ task: TaskItem) {
@@ -1102,10 +1393,16 @@ final class AppModel {
         NotificationPrefs.level = level
         ReminderScheduler.shared.resync()
         guard NotificationPrefs.level == level else { return false }
+        // Pending until the server has it: the next hydrate re-pushes a
+        // failed write instead of pulling the server's older level over it.
+        NotificationPrefs.pendingServerPush = true
+        notifPrefsPushGen += 1
+        let gen = notifPrefsPushGen
         guard let coord = coordinator, let uid = coord.auth.currentUserId else { return false }
         do {
             try await coord.preferences.setNotificationLevel(
                 userId: uid, morningBrief: level.morningBrief, pausedCheckin: level.pausedCheckin, level: level.rawValue)
+            if notifPrefsPushGen == gen, coord.auth.currentUserId == uid { NotificationPrefs.pendingServerPush = false }
             return true
         } catch { return false }
     }
@@ -1116,8 +1413,15 @@ final class AppModel {
         NotificationPrefs.reminderLeadMin = minutes
         ReminderScheduler.shared.resync()
         guard NotificationPrefs.reminderLeadMin == minutes else { return false }
+        NotificationPrefs.pendingServerPush = true
+        notifPrefsPushGen += 1
+        let gen = notifPrefsPushGen
         guard let coord = coordinator, let uid = coord.auth.currentUserId else { return false }
-        do { try await coord.preferences.setReminderLead(userId: uid, minutes: minutes); return true } catch { return false }
+        do {
+            try await coord.preferences.setReminderLead(userId: uid, minutes: minutes)
+            if notifPrefsPushGen == gen, coord.auth.currentUserId == uid { NotificationPrefs.pendingServerPush = false }
+            return true
+        } catch { return false }
     }
 
     /// Save a task + reconcile its recurrence: materialize future cal_blocks

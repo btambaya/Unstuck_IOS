@@ -39,7 +39,9 @@
 // calls `takePendingSession()` and builds its session from
 // `talkConfiguration(for:)` (instructions / primer / tools / runTool) instead
 // of the plain Talk opening. In that path snooze_call reports the `snoozed`
-// outcome through the calls client and the user ends the screen themselves.
+// outcome through the coordinator's PERSISTED, ordered outcome reporter
+// (CallCoordinator.reportFallbackSnooze — retried, never lost behind a
+// tunnel) and the user ends the screen themselves.
 
 import Foundation
 import Observation
@@ -348,9 +350,12 @@ extension RealtimeCallVoiceLauncher.Deps {
                 return await model.assistant.runVoiceTool(name: name, argsJSON: argsJSON)
             },
             snooze: { CallCoordinator.shared.snoozeActiveCall(minutes: $0) },
+            // Through the persisted reporter: ordered after the tap's
+            // `answered`, retried with backoff, replayed after a kill — a
+            // fire-and-forget request here (no-op with no client attached, lost
+            // on a transient failure) left rows `answered` with no snooze_until.
             reportFallbackSnooze: { callId, minutes in
-                guard let client = CallCoordinator.shared.callsClient else { return }
-                Task { try? await client.outcome(callId: callId, outcome: .snoozed, snoozeMinutes: minutes) }
+                CallCoordinator.shared.reportFallbackSnooze(callId: callId, minutes: minutes)
             },
             sessionWillStart: { [weak model] in model?.assistant.resetVoiceScratch() },
             sessionDidEnd: { [weak model] in model?.assistant.endVoiceSession() },

@@ -4,6 +4,7 @@
 
 import Foundation
 import Supabase
+import UnstuckCore
 
 public struct NotificationsClient: Sendable {
     let client: SupabaseClient
@@ -84,6 +85,66 @@ public struct PreferencesClient: Sendable {
             .execute()
     }
 
+    /// The account's notification level + reminder lead as the server has
+    /// them (`notification_preferences.notification_level` /
+    /// `reminder_lead_min`) — the cross-device source of truth the phone reads
+    /// back on every sign-in hydrate. Nil fields when the row / column is
+    /// absent or null (the caller keeps its local value); throws only on
+    /// transport failure.
+    public func notificationPrefs(userId: String) async throws -> NotificationPrefsRow {
+        struct Row: Decodable { let notification_level: String?; let reminder_lead_min: Int? }
+        let rows: [Row] = try await client.from("notification_preferences")
+            .select("notification_level, reminder_lead_min").eq("user_id", value: userId).limit(1)
+            .execute().value
+        return NotificationPrefsRow(level: rows.first?.notification_level, reminderLeadMin: rows.first?.reminder_lead_min)
+    }
+
+    // MARK: PA rituals (migration 053: `user_preferences.pa_rituals jsonb`)
+
+    /// Which recurring PA moments run, server-backed so a toggle made on one
+    /// device holds everywhere. Nil when the row is absent or the column is
+    /// null (never set on any device yet — the caller keeps its local cache).
+    /// Moment DISMISSALS stay device-local by design (a "not now" on the
+    /// phone shouldn't hide the card on the laptop).
+    public func paRituals(userId: String) async throws -> RitualPrefs? {
+        struct Row: Decodable { let pa_rituals: RitualPrefs? }
+        let rows: [Row] = try await client.from("user_preferences")
+            .select("pa_rituals").eq("user_id", value: userId).limit(1)
+            .execute().value
+        return rows.first?.pa_rituals
+    }
+
+    /// Persist the ritual toggles (`{"morning":bool,"evening":bool,"friday":bool,"sunday":bool}`).
+    public func setPaRituals(userId: String, prefs: RitualPrefs) async throws {
+        struct Row: Encodable { let user_id: String; let pa_rituals: RitualPrefs }
+        _ = try await client.from("user_preferences")
+            .upsert(Row(user_id: userId, pa_rituals: prefs), onConflict: "user_id")
+            .execute()
+    }
+
+    /// Record this device's IANA timezone on the account — RPC
+    /// `set_timezone(p_tz)` (migration 053), which writes
+    /// `notification_preferences.timezone`. Everything the SERVER schedules or
+    /// projects in the user's local day reads that column (reminders, the
+    /// morning brief, and the owner-local slot a recipient's shared tasks are
+    /// bucketed by), so a phone-only account must not be left on the UTC
+    /// fallback. Returns false when the server rejects the zone (nothing
+    /// written); throws only on transport failure.
+    @discardableResult
+    public func setTimezone(_ tz: String) async throws -> Bool {
+        struct Params: Encodable { let p_tz: String }
+        return try await client.rpc("set_timezone", params: Params(p_tz: tz)).execute().value
+    }
+
+    /// The usable-minutes budget as the server has it (nil fields = unset).
+    public func usableMinutes(userId: String) async throws -> (perDay: Int?, weekend: Int?) {
+        struct Row: Decodable { let usable_minutes_per_day: Int?; let usable_minutes_weekend: Int? }
+        let rows: [Row] = try await client.from("user_preferences")
+            .select("usable_minutes_per_day, usable_minutes_weekend").eq("user_id", value: userId).limit(1)
+            .execute().value
+        return (rows.first?.usable_minutes_per_day, rows.first?.usable_minutes_weekend)
+    }
+
     /// Mirror the usable-minutes budget (Settings / the assistant's
     /// `set_usable_minutes`) to user_preferences — upsert on user_id, like the
     /// web `setUsableMinutes`. A nil value is NOT sent (synthesised Encodable
@@ -154,6 +215,16 @@ public struct PreferencesClient: Sendable {
         let rest = afterDot.dropFirst(digits.count)
         let millis = String(digits.prefix(3)).padding(toLength: 3, withPad: "0", startingAt: 0)
         return CallsClient.parseISO(String(t[..<dot]) + "." + millis + String(rest))
+    }
+}
+
+/// `notification_preferences` as read back from the server — nil = unset there.
+public struct NotificationPrefsRow: Sendable, Equatable {
+    public let level: String?
+    public let reminderLeadMin: Int?
+    public init(level: String?, reminderLeadMin: Int?) {
+        self.level = level
+        self.reminderLeadMin = reminderLeadMin
     }
 }
 

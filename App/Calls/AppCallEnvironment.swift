@@ -18,6 +18,10 @@ import UserNotifications
 /// device still holds a VoIP registration (sign-out wipes it via
 /// VoipPushRegistry.unregisterBestEffort, so a queued call that lands after
 /// a sign-out is dropped instead of ringing with the old account's notes).
+/// That proxy is only good enough for the VoIP path: `isSessionKnown` tells
+/// the coordinator when it is the real session, so the alert-tap fallback
+/// (which runs exactly when there is NO VoIP token) waits for AppModel
+/// instead of dropping the tap.
 @MainActor
 final class AppCallEnvironment: CallEnvironment {
     private weak var model: AppModel?
@@ -28,6 +32,8 @@ final class AppCallEnvironment: CallEnvironment {
         if let m = model { return m.signedIn }
         return VoipPushRegistry.storedToken != nil
     }
+
+    var isSessionKnown: Bool { model != nil }
 
     var isFocusSessionLive: Bool {
         if let m = model { return m.liveSession?.sessionStart != nil }
@@ -72,10 +78,17 @@ final class SystemCallNotifier: CallNotifier {
 ///   • the queue flushes IN ORDER (answered before done, never the reverse),
 ///     one send at a time;
 ///   • each item gets `maxAttempts` (3) tries with `backoff` (2 s, 5 s)
-///     between them; after the last failure it stays at the head of the queue
-///     (re-enqueued, not dropped) and the flush retries after `retryLater`
-///     (15 s, then 30 / 60 / 120 s per consecutive failed cycle), on the next
-///     report, or on the next attach.
+///     between them; after the last TRANSIENT failure it stays at the head of
+///     the queue (re-enqueued, not dropped) and the flush retries after
+///     `retryLater` (15 s, then 30 / 60 / 120 s per consecutive failed
+///     cycle), on the next report, or on the next attach;
+///   • a PERMANENT refusal (`CallOutcomeRejected` — 404 the row is gone /
+///     not the caller's, 400 / 422 malformed) drops THAT item at once and the
+///     drain continues: one dead report must never block every later
+///     `missed` / `snoozed` / `done` behind it forever (`dropped` keeps the
+///     tally for diagnostics);
+///   • sign-out discards the queue (`discardAll`) — nothing left in it can be
+///     sent with the next account's JWT.
 /// Injectable sleep + sender so the ordering / retry / persistence rules run
 /// in XCTest without a network (CallCoordinatorTests).
 @MainActor
@@ -104,6 +117,8 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private(set) var flushTask: Task<Void, Never>?
     private var retryTimer: Task<Void, Never>?
     private var failedCycles = 0
+    /// Items the server refused for good (logged, never retried).
+    private(set) var dropped: [(item: Item, error: Error)] = []
 
     init(defaults: UserDefaults = .standard, key: String = CallsOutcomeReporter.queueKey,
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { s in
@@ -138,6 +153,20 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
         flush()
     }
 
+    /// Sign-out: forget everything queued (memory + disk) and stop retrying.
+    /// A drain in flight finishes its current send and finds nothing left.
+    func discardAll() {
+        retryTimer?.cancel(); retryTimer = nil
+        failedCycles = 0
+        queue.removeAll()
+        persist()
+    }
+
+    /// A refusal that no retry can fix (see `CallOutcomeRejected`).
+    static func isPermanent(_ error: Error) -> Bool {
+        error is CallOutcomeRejected
+    }
+
     private func persist() {
         if queue.isEmpty {
             defaults.removeObject(forKey: key)
@@ -160,24 +189,37 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private func drain() async {
         while let head = queue.first, let send {
             var sent = false
+            var rejected: Error?
             for attempt in 0..<Self.maxAttempts {
                 do {
                     try await send(head)
                     sent = true
                     break
                 } catch {
+                    if Self.isPermanent(error) {
+                        rejected = error
+                        break
+                    }
                     if attempt + 1 < Self.maxAttempts {
                         await sleep(Self.backoff[min(attempt, Self.backoff.count - 1)])
                     }
                 }
             }
             if Task.isCancelled { return }
-            guard sent else {
-                // Re-enqueued (still at the head, persisted). Try again later.
-                scheduleRetry()
-                return
+            if let rejected {
+                // The server will answer the same way forever: drop this item
+                // (logged) and carry on with the ones behind it.
+                dropped.append((head, rejected))
+                NSLog("[calls] outcome %@ for %@ rejected for good: %@ — dropped",
+                      head.outcome.rawValue, head.callId, String(describing: rejected))
+            } else {
+                guard sent else {
+                    // Re-enqueued (still at the head, persisted). Try again later.
+                    scheduleRetry()
+                    return
+                }
+                failedCycles = 0
             }
-            failedCycles = 0
             if queue.first == head { queue.removeFirst() }
             persist()
         }
@@ -199,9 +241,12 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
 extension CallCoordinator {
     /// The single AppModel.start() hook: bind the live environment + the calls
     /// client, re-arm PushKit (a previous sign-out may have unregistered it),
-    /// and make sure the VoIP token reaches register-push-token even when
-    /// there's no APNs token (notification permission denied) — PushClient
-    /// treats an empty apnsToken as "none" and rides the VoIP token along.
+    /// keep re-arming it on every LATER sign-in within this launch (sign-out →
+    /// sign-in without a relaunch used to leave the device with no VoIP
+    /// registration, so every call degraded to the alert banner), and make
+    /// sure the VoIP token reaches register-push-token even when there's no
+    /// APNs token (notification permission denied) — PushClient treats an
+    /// empty apnsToken as "none" and rides the VoIP token along.
     func attach(model: AppModel, client: CallsClient) {
         attachedModel = model
         attach(environment: AppCallEnvironment(model: model))
@@ -209,9 +254,20 @@ extension CallCoordinator {
         PushRegistrar.shared.onVoipToken = { [weak model] _ in
             model?.registerPush(PushRegistrar.shared.apnsTokenHex ?? "")
         }
-        if model.signedIn { VoipPushRegistry.shared.rearm() }
+        if model.signedIn { signedIn() }
         if PushRegistrar.shared.voipTokenHex != nil, PushRegistrar.shared.apnsTokenHex == nil {
             model.registerPush("")
+        }
+        // Every transition to authenticated from here on re-arms PushKit; the
+        // fresh token then rides up through onVoipToken → registerPush, so
+        // the recreated device_tokens row carries voip_token for the NEW user.
+        authWatch?.cancel()
+        guard let auth = model.coordinator?.auth else { return }
+        authWatch = Task { [weak self] in
+            for await (event, session) in auth.authStateChanges {
+                guard session != nil, case .signedIn = event else { continue }
+                await MainActor.run { self?.signedIn() }
+            }
         }
     }
 }

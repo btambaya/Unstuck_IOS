@@ -10,6 +10,8 @@
 import XCTest
 import Supabase
 import UnstuckCore
+import UnstuckData
+import UnstuckShared
 import UnstuckSync
 @testable import Unstuck
 
@@ -41,6 +43,7 @@ final class FakeAssistantState: AssistantAppState {
     var struggles: [String] = []
     /// nil → the real rule (viewer can't edit; unknown → false).
     var canEditOverride: Bool?
+    var usableMinutesOK = true
     var notificationSaveOk = true
     var reminderSaveOk = true
     /// false → the revoke RPC "failed" (nothing recorded, shares untouched).
@@ -197,7 +200,7 @@ final class FakeAssistantState: AssistantAppState {
     }
     func removeTag(_ id: String) async { await commit(); tagRows.removeAll { $0.id == id } }
 
-    func setUsableMinutes(weekday: Int?, weekend: Int?) async { prefCalls.append("usable:\(weekday.map(String.init) ?? "-"):\(weekend.map(String.init) ?? "-")") }
+    func setUsableMinutes(weekday: Int?, weekend: Int?) async -> Bool { prefCalls.append("usable:\(weekday.map(String.init) ?? "-"):\(weekend.map(String.init) ?? "-")"); return usableMinutesOK }
     func setNotificationLevel(_ level: String) async -> Bool { prefCalls.append("notif:\(level)"); return notificationSaveOk }
     func setReminderLead(_ minutes: Int) async -> Bool { prefCalls.append("lead:\(minutes)"); return reminderSaveOk }
     func setRitual(_ ritual: String, on: Bool) { prefCalls.append("ritual:\(ritual):\(on)") }
@@ -502,6 +505,31 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertFalse(api.blocks.first { $0.id == "rtd" }!.done)
         XCTAssertFalse(api.tasks[1].done)
         await eq("complete_occurrence", #"{"taskId":"a"}"#, "error: \"Alpha\" has nothing on \(TODAY)")
+    }
+
+    /// A tool that would change NOTHING answers `error: … — nothing changed`
+    /// (web parity, lib/assistant/tools.ts): "ok" would mint a receipt whose
+    /// Undo reverses something the user did earlier, not this turn.
+    func testNoOpWritesRefuseInsteadOfMintingAReceipt() async {
+        api.tasks = [task("a", "Alpha"), task("d", "Delta", done: true)]
+        api.blocks = [block("td", "a", TODAY), block("tm", "a", TOMORROW)]
+
+        await eq("uncomplete_task", #"{"taskId":"a"}"#, "error: \"Alpha\" is already open — nothing changed")
+        await eq("complete_task", #"{"taskId":"d"}"#, "error: \"Delta\" is already done — nothing changed")
+
+        await eq("set_task_later", #"{"taskId":"a","later":true}"#, "ok")
+        await eq("set_task_later", #"{"taskId":"a","later":true}"#, "error: \"Alpha\" is already in Later — nothing changed")
+        await eq("set_task_later", #"{"taskId":"a","later":false}"#, "ok")
+        await eq("set_task_later", #"{"taskId":"a","later":false}"#, "error: \"Alpha\" is not in Later — nothing changed")
+
+        await eq("skip_occurrence", #"{"taskId":"a"}"#, "ok: skipped \"Alpha\" on \(TODAY) (the task and its other days stay)")
+        await eq("skip_occurrence", #"{"taskId":"a"}"#, "error: \"Alpha\" is already skipped on \(TODAY) — nothing changed")
+        await eq("complete_occurrence", #"{"taskId":"a","date":"\#(TOMORROW)"}"#, "ok: marked \"Alpha\" done for \(TOMORROW)")
+        await eq("complete_occurrence", #"{"taskId":"a","date":"\#(TOMORROW)"}"#, "error: \"Alpha\" is already done on \(TOMORROW) — nothing changed")
+
+        // Every refusal is an error → no receipt, so nothing to undo.
+        XCTAssertNil(deriveReceipt(name: "complete_task", args: ReceiptArgs(),
+                                   result: "error: \"Delta\" is already done — nothing changed", tasks: api.tasks))
     }
 
     func testBlockTimeCreatesATaskPlusItsBlockAndRefusesThePast() async {
@@ -878,6 +906,9 @@ final class AssistantToolsTests: XCTestCase {
         await eq("set_usable_minutes", #"{"weekdayMin":90,"weekendMin":240}"#, "ok: usable time set — weekdays 90m — weekends 240m")
         await eq("set_usable_minutes", "{}", "error: give weekdayMin and/or weekendMin")
         await eq("set_usable_minutes", #"{"weekdayMin":10}"#, "error: minutes must be between 15 and 1440")
+        api.usableMinutesOK = false
+        await eq("set_usable_minutes", #"{"weekdayMin":120}"#, "error: could not save usable minutes (offline?)")
+        api.usableMinutesOK = true
         await eq("set_notification_level", #"{"level":"Calm"}"#, "ok: notifications set to calm")
         await eq("set_notification_level", #"{"level":"loud"}"#, "error: level must be calm, balanced, or coach")
         api.notificationSaveOk = false
@@ -891,7 +922,7 @@ final class AssistantToolsTests: XCTestCase {
         await eq("set_ritual", #"{"ritual":"Morning"}"#, "ok: morning moment on")
         await eq("set_ritual", #"{"ritual":"sunday","on":false}"#, "ok: sunday moment off")
         await eq("set_ritual", #"{"ritual":"lunch"}"#, "error: ritual must be morning, evening, friday, or sunday")
-        XCTAssertEqual(api.prefCalls, ["usable:120:-", "usable:90:240", "notif:calm", "notif:coach", "lead:10", "lead:0", "lead:5",
+        XCTAssertEqual(api.prefCalls, ["usable:120:-", "usable:90:240", "usable:120:-", "notif:calm", "notif:coach", "lead:10", "lead:0", "lead:5",
                                        "ritual:morning:true", "ritual:sunday:false"])
     }
 
@@ -967,5 +998,121 @@ final class AssistantToolsTests: XCTestCase {
         let names = Set(VOICE_TOOLS.compactMap { $0["name"] as? String })
         XCTAssertEqual(names.count, 56)
         XCTAssertTrue(names.isSuperset(of: ["request_call", "cancel_call", "update_call", "get_calls"]))
+    }
+}
+
+
+// MARK: - the production seam (AppModelAssistantState over a live AppModel)
+//
+// The FakeAssistantState above covers the executor; these cover the store
+// writes the app actually wires in — the ones the executor contract says
+// "RETURN ONLY AFTER THE LOCAL ROW IS COMMITTED". The XCUITest demo boot
+// (in-memory GRDB + a local-only WriteThrough, no coordinator) is the seam.
+
+@MainActor
+final class AppModelAssistantStateTests: XCTestCase {
+    /// Keeps the model + assistant alive for the test (the state holds them
+    /// `unowned`, exactly as the app does).
+    private struct Live {
+        let model: AppModel
+        let state: AppModelAssistantState
+        let db: AppDatabase
+    }
+
+    private func liveState() throws -> Live {
+        let model = AppModel()
+        model.startUITestMode()
+        let db = try XCTUnwrap(model.db)
+        let state = AppModelAssistantState(model: model, assistant: model.assistant)
+        return Live(model: model, state: state, db: db)
+    }
+
+    /// create_list used to schedule its GRDB upsert in a detached Task, so a
+    /// tool on the returned id in the SAME main-actor job re-fetched a row
+    /// that wasn't there yet and no-op'd while reporting ok. The row must be
+    /// readable the moment the tool returns — no suspension in between.
+    func testCreateListIsCommittedBeforeTheToolReturns() async throws {
+        let live = try liveState()
+        let (state, db) = (live.state, live.db)
+        let scratch = TurnScratch()
+        let created = await runAssistantTool(name: "create_list", args: ToolArgs(json: #"{"name":"Fresh"}"#), api: state, scratch: scratch)
+        XCTAssertTrue(created.hasPrefix("ok: created list id="), created)
+        let id = created.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        XCTAssertEqual(state.getCollections().first { $0.id == id }?.name, "Fresh", "visible to the next read without an await")
+        XCTAssertEqual(try db.fetchById(ItemCollection.self, id: id)?.name, "Fresh")
+        XCTAssertEqual(try OutboxStore(db).pending().filter { $0.tableName == "collections" }.map(\.rowId), [id], "and its outbox op is queued")
+        XCTAssertNil(state.addCollection(name: "   ", color: "indigo"), "a blank name creates nothing (no ok over a no-op)")
+    }
+
+    /// The Inbox archive is server state (`captures.archived_at`, migration
+    /// 053): archiving through the assistant (same path as the Inbox taps —
+    /// the observable set) must reach the local archive table + the outbox,
+    /// and restoring must send an explicit null.
+    func testArchiveCaptureWritesThroughToTheRepositoryAndOutbox() async throws {
+        let live = try liveState()
+        let (state, db) = (live.state, live.db)
+        try db.save(Capture(id: "cap-1", taskId: nil, sessionId: nil, tag: .idea, body: "x", at: "2026-09-01T08:00:00.000Z"))
+        state.archiveCapture("cap-1", archived: true)
+        XCTAssertTrue(state.getArchivedCaptureIds().contains("cap-1"), "the observable set flips immediately")
+
+        // The store write runs behind the set; wait for it.
+        var archivedAt: String?
+        for _ in 0..<60 {
+            archivedAt = try db.captureArchivedAt(id: "cap-1")
+            if archivedAt != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNotNil(archivedAt, "archived_at recorded locally")
+        let op = try XCTUnwrap(OutboxStore(db).pending().last { $0.tableName == "captures" && $0.rowId == "cap-1" })
+        XCTAssertTrue(op.payload?.contains("\"archived_at\":\"") == true, "the queued upsert carries archived_at")
+
+        state.archiveCapture("cap-1", archived: false)
+        XCTAssertFalse(state.getArchivedCaptureIds().contains("cap-1"))
+        for _ in 0..<60 {
+            if try db.captureArchivedAt(id: "cap-1") == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNil(try db.captureArchivedAt(id: "cap-1"))
+        let restore = try XCTUnwrap(OutboxStore(db).pending().last { $0.tableName == "captures" && $0.rowId == "cap-1" })
+        XCTAssertTrue(restore.payload?.contains("\"archived_at\":null") == true, "an unarchive reaches the server as an explicit null")
+    }
+
+    /// Without a coordinator (offline boot) the usable-minutes budget can't
+    /// reach the server, and the server IS the change — so no local cache is
+    /// written and the outcome is false.
+    func testSetUsableMinutesReportsFalseWhenTheServerWriteCannotHappen() async throws {
+        let live = try liveState()
+        let model = live.model
+        UserDefaults.standard.removeObject(forKey: "unstuck.usableMinutesPerDay")
+        let ok = await model.setUsableMinutesAwaiting(perDay: 120, weekend: nil)
+        XCTAssertFalse(ok)
+        XCTAssertNil(UserDefaults.standard.object(forKey: "unstuck.usableMinutesPerDay"), "no cache over a failed write")
+    }
+
+    /// Sign-out scrub: the per-account keys the next account must not inherit.
+    func testScrubWipesEveryAccountScopedKey() throws {
+        let live = try liveState()
+        let model = live.model
+        let d = UserDefaults.standard
+        let keys = ["unstuck.onboarded", "unstuck.adhdStruggles", "unstuck.notificationLevel", "unstuck.reminderLeadMin",
+                    "unstuck.dismissedNudges", "unstuck.blockedEmails", "unstuck.usableMinutesPerDay",
+                    "unstuck.usableMinutesWeekend", "unstuck.calls.windowStart", "unstuck.calls.windowEnd",
+                    "unstuck.calls.defaultLead", "unstuck.calls.outcomeQueue", "unstuck.loginPing.u1",
+                    "reminder.override.t1", "unstuck-pa-rituals", "unstuck.notifPrefs.pendingPush"]
+        for k in keys { d.set("x", forKey: k) }
+        let group = try XCTUnwrap(UserDefaults(suiteName: AppGroup.id))
+        for k in ["startNextSnapshot", "unstuckSnapshot", "siri.writeQueue", "siri.assistantPrompt", "siri.pendingRoute"] {
+            group.set(Data("x".utf8), forKey: k)
+        }
+
+        model.scrubDeviceLocalUserContent()
+
+        for k in keys { XCTAssertNil(d.object(forKey: k), k) }
+        for k in ["startNextSnapshot", "unstuckSnapshot", "siri.writeQueue", "siri.assistantPrompt", "siri.pendingRoute"] {
+            XCTAssertNil(group.object(forKey: k), "App Group \(k)")
+        }
+        XCTAssertFalse(model.onboarded)
+        XCTAssertFalse(model.onboardingResolved)
+        XCTAssertTrue(model.archivedCaptureIds.isEmpty)
     }
 }

@@ -29,6 +29,26 @@ public enum CallOutcome: String, Sendable, Codable, Equatable {
     case answered, declined, missed, busy, snoozed, done, stale
 }
 
+/// call-outcome refused a report FOR GOOD: the row is gone (404 / 410), isn't
+/// the caller's, or the body is malformed (400 / 422) — a 4xx other than
+/// 401 (token refresh), 408 and 429 (try again). Retrying can never succeed,
+/// so the outcome reporter drops the item instead of blocking the queue.
+/// Transport failures, 5xx and auth refreshes stay plain errors (transient).
+public struct CallOutcomeRejected: Error, Equatable, Sendable {
+    public let status: Int
+    public let message: String?
+
+    public init(status: Int, message: String? = nil) {
+        self.status = status
+        self.message = message
+    }
+
+    /// The 4xx family minus the three that mean "later": 401 / 408 / 429.
+    public static func isPermanent(status: Int) -> Bool {
+        (400..<500).contains(status) && ![401, 408, 429].contains(status)
+    }
+}
+
 /// A `call_requests` row as the client reads it (snake_case ↔ camelCase at
 /// this boundary, like DbRowCodec). Tolerant decoding: array columns default
 /// to `[]`, so a row written by another platform without notes still loads.
@@ -55,6 +75,17 @@ public struct CallRequest: Codable, Sendable, Equatable, Identifiable {
     /// ringing right now still "is coming" — get_calls lists it ("· ringing
     /// now") and it counts as a duplicate anchor.
     public static let liveStatuses = ["scheduled", "snoozed", "calling"]
+    /// Rows whose NOTES / LABEL may still change: the live ones plus a call
+    /// that has been ANSWERED and is in progress — "add 'bring the contract'
+    /// to the notes and call me back in 20" edits the row mid-conversation so
+    /// the snoozed call-back reads the new notes. Its TIME may not move (see
+    /// `reschedulableStatuses`).
+    public static let editableStatuses = ["scheduled", "snoozed", "calling", "answered"]
+    /// Rows whose TIME may move. A ringing / answered call is NOT one of them:
+    /// re-arming it to `scheduled` would be overwritten by the phone's own
+    /// outcome report a moment later (missed / done), silently discarding the
+    /// reschedule the tool just confirmed.
+    public static let reschedulableStatuses = ["scheduled", "snoozed"]
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -109,6 +140,11 @@ public struct CallRequest: Codable, Sendable, Equatable, Identifiable {
         return callAtDate
     }
     public var isLive: Bool { Self.liveStatuses.contains(status) }
+    /// Notes / label may still change (live, or answered and in progress).
+    public var isEditable: Bool { Self.editableStatuses.contains(status) }
+    /// The call is ringing or in progress right now: notes/label edits land,
+    /// a time change is refused.
+    public var isInProgress: Bool { status == "calling" || status == "answered" }
 }
 
 public struct CallsClient: Sendable {
@@ -120,6 +156,10 @@ public struct CallsClient: Sendable {
     /// Report how a call ended. `callId` is the id the push carried, verbatim.
     /// `snoozeMinutes` only with `.snoozed`; `outcomeNotes` are free-text lines
     /// the conversation produced (what got ticked off / added).
+    ///
+    /// Throws `CallOutcomeRejected` for a PERMANENT refusal (404 not_found /
+    /// 410 / 400 / 422 …) so the reporter can drop the item; every other
+    /// failure (transport, 5xx, 401 refresh, 429) is rethrown as-is → retry.
     public func outcome(callId: String, outcome: CallOutcome,
                         snoozeMinutes: Int? = nil, outcomeNotes: [String]? = nil,
                         callKitId: String? = nil) async throws {
@@ -130,12 +170,16 @@ public struct CallsClient: Sendable {
             let outcomeNotes: [String]?
             let callKitId: String?
         }
-        try await client.functions.invoke(
-            "call-outcome",
-            options: FunctionInvokeOptions(method: .post, body: Body(
-                callId: callId, outcome: outcome.rawValue,
-                snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes,
-                callKitId: callKitId)))
+        do {
+            try await client.functions.invoke(
+                "call-outcome",
+                options: FunctionInvokeOptions(method: .post, body: Body(
+                    callId: callId, outcome: outcome.rawValue,
+                    snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes,
+                    callKitId: callKitId)))
+        } catch let FunctionsError.httpError(code, data) where CallOutcomeRejected.isPermanent(status: code) {
+            throw CallOutcomeRejected(status: code, message: String(data: data, encoding: .utf8))
+        }
     }
 
     // MARK: - reads
@@ -208,7 +252,14 @@ public struct CallsClient: Sendable {
 
     /// Patch a booked call — only the given fields change. Re-arms a snoozed
     /// row back to `scheduled` when its time is moved. Compare-and-set on the
-    /// row still being live: nil ⇒ nothing was written (it changed underneath).
+    /// row's status: a notes/label-only edit lands on any EDITABLE row (live,
+    /// or answered and in progress — mid-call "change the notes for later");
+    /// a TIME change (callAt / block / lead) lands only on a `scheduled` /
+    /// `snoozed` row — never on one that is ringing or answered, whose status
+    /// the phone's outcome report is about to settle (re-arming it to
+    /// `scheduled` from here would silently lose that reschedule when the
+    /// `missed` / `done` report overwrote it). nil ⇒ nothing was written (it
+    /// changed underneath, or the time change was refused).
     @discardableResult
     public func update(id: String, callAt: Date? = nil, blockId: String?? = nil, leadMin: Int?? = nil,
                        label: String? = nil, notes: [String]? = nil) async throws -> CallRequest? {
@@ -225,10 +276,16 @@ public struct CallsClient: Sendable {
         let rows: [CallRequest] = try await client.from("call_requests")
             .update(patch)
             .eq("id", value: id)
-            .in("status", values: CallRequest.liveStatuses)
+            .in("status", values: Self.statusesAccepting(timeChange: callAt != nil || blockId != nil || leadMin != nil))
             .select()
             .execute().value
         return rows.first
+    }
+
+    /// The compare-and-set status list for an `update`: the reschedulable
+    /// rows when the patch moves the call, the editable rows otherwise.
+    public static func statusesAccepting(timeChange: Bool) -> [String] {
+        timeChange ? CallRequest.reschedulableStatuses : CallRequest.editableStatuses
     }
 
     /// Cancel a booked call (status → cancelled; the row stays for history).

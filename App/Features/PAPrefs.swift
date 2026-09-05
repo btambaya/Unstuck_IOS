@@ -1,11 +1,20 @@
-// Personal-assistant device-local prefs — WHICH recurring PA moments run
-// (`RitualPrefs`) and which moment ids the user has dismissed. Same
-// UserDefaults keys + JSON shapes as the web's localStorage
-// (`unstuck-pa-rituals` = RitualPrefs JSON, `unstuck-pa-dismissed` = [String]),
-// so the two platforms stay describable in one vocabulary. Per-user state:
-// BOTH keys must be wiped by `AppModel.scrubDeviceLocalUserContent()` on
-// sign-out (call `PAPrefsStore.scrub()` there) — leaving them across a
-// sign-out on a shared device leaks one person's setup to the next.
+// Personal-assistant prefs — WHICH recurring PA moments run (`RitualPrefs`)
+// and which moment ids the user has dismissed. Same UserDefaults keys + JSON
+// shapes as the web's localStorage (`unstuck-pa-rituals` = RitualPrefs JSON,
+// `unstuck-pa-dismissed` = [String]), so the two platforms stay describable
+// in one vocabulary.
+//
+// The RITUAL toggles are account-wide: `user_preferences.pa_rituals`
+// (migration 053) is the source of truth — the local key is a cache that
+// wins until the first hydrate, after which the server wins; every toggle
+// here fires `onRitualsChanged` (AppModel pushes it up), and a push that
+// fails is flagged pending so the next hydrate re-pushes instead of pulling
+// the server's older value over it. Moment DISMISSALS stay DEVICE-LOCAL by
+// design: "not now" on the phone must not hide the card on the laptop.
+// Per-user state: every key must be wiped by
+// `AppModel.scrubDeviceLocalUserContent()` on sign-out (`PAPrefsStore.scrub()`)
+// — leaving them across a sign-out on a shared device leaks one person's
+// setup to the next.
 
 import Foundation
 import Observation
@@ -15,8 +24,10 @@ import UnstuckCore
 enum PAPrefsStore {
     static let ritualsKey = "unstuck-pa-rituals"
     static let dismissedKey = "unstuck-pa-dismissed"
+    /// Set while a ritual toggle made here hasn't reached `pa_rituals` yet.
+    static let pendingPushKey = "unstuck-pa-rituals-pending-push"
     /// Every key this store owns — the sign-out wipe removes all of them.
-    static let allKeys = [ritualsKey, dismissedKey]
+    static let allKeys = [ritualsKey, dismissedKey, pendingPushKey]
     /// The web keeps the newest 200 dismissals (gateway-card.tsx).
     static let maxDismissed = 200
 
@@ -55,6 +66,14 @@ enum PAPrefsStore {
         return true
     }
 
+    static func isPendingPush(_ defaults: UserDefaults = .standard) -> Bool {
+        defaults.bool(forKey: pendingPushKey)
+    }
+
+    static func setPendingPush(_ pending: Bool, _ defaults: UserDefaults = .standard) {
+        if pending { defaults.set(true, forKey: pendingPushKey) } else { defaults.removeObject(forKey: pendingPushKey) }
+    }
+
     // MARK: dismissed moment ids
 
     static func getDismissed(_ defaults: UserDefaults = .standard) -> [String] {
@@ -87,6 +106,9 @@ final class PAPrefs {
 
     private(set) var rituals: RitualPrefs
     private(set) var dismissed: [String]
+    /// Fired after every USER change to the rituals (not after a server
+    /// apply) — AppModel wires it to the `pa_rituals` push.
+    @ObservationIgnored var onRitualsChanged: ((RitualPrefs) -> Void)?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -97,12 +119,26 @@ final class PAPrefs {
     func setRitual(_ key: RitualKey, on: Bool) {
         rituals[key] = on
         PAPrefsStore.setRitualPrefs(rituals, defaults)
+        onRitualsChanged?(rituals)
     }
 
     func setRituals(_ prefs: RitualPrefs) {
         rituals = prefs
         PAPrefsStore.setRitualPrefs(prefs, defaults)
+        onRitualsChanged?(rituals)
     }
+
+    /// The account's rituals as the server has them (hydrate): replace the
+    /// cache without firing the push, and clear any pending-push flag — the
+    /// server is the truth from here on.
+    func applyServerRituals(_ prefs: RitualPrefs) {
+        rituals = prefs
+        PAPrefsStore.setRitualPrefs(prefs, defaults)
+        PAPrefsStore.setPendingPush(false, defaults)
+    }
+
+    var isPendingPush: Bool { PAPrefsStore.isPendingPush(defaults) }
+    func setPendingPush(_ pending: Bool) { PAPrefsStore.setPendingPush(pending, defaults) }
 
     /// Record a moment dismissal (idempotent; keeps the newest 200).
     func dismiss(_ momentId: String) {

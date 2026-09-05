@@ -202,6 +202,108 @@ final class SharingModelsTests: XCTestCase {
         XCTAssertNotEqual(planned, bare)
     }
 
+    // MARK: migration 053 — the instant, `later` and `recurrence` on the recipient's models
+
+    func testSharedWithMeDecodes053FieldsFromSnakeAndCamelCase() throws {
+        let snake = try decode(SharedWithMe.self, """
+        {"shareId":"s1","taskId":"t1","ownerName":"Anna","level":"view","title":"Deck","done":false,
+         "next_date":"2026-09-06","next_start_time":"04:30","next_duration_minutes":45,"next_done":false,
+         "next_start_at":"2026-09-05T19:30:00+00:00","later":true,
+         "recurrence":{"kind":"daily","until":null}}
+        """)
+        XCTAssertEqual(snake.nextStartAt, "2026-09-05T19:30:00+00:00")
+        XCTAssertEqual(snake.later, true)
+        XCTAssertEqual(snake.recurrence, .daily(until: nil))
+        let camel = try decode(SharedWithMe.self, """
+        {"shareId":"s1","taskId":"t1","ownerName":"Anna","level":"view","title":"Deck","done":false,
+         "nextStartAt":"2026-09-05T19:30:00Z","later":false}
+        """)
+        XCTAssertEqual(camel.nextStartAt, "2026-09-05T19:30:00Z")
+        XCTAssertEqual(camel.later, false)
+        XCTAssertNil(camel.recurrence)
+    }
+
+    func testSharedWithMeToleratesAPre053ServerNullsAndAMalformedRecurrence() throws {
+        let legacy = try decode(SharedWithMe.self, """
+        {"shareId":"s1","taskId":"t1","ownerName":"Anna","level":"view","title":"Deck","done":false,
+         "next_date":"2026-09-06","next_start_time":"04:30"}
+        """)
+        XCTAssertNil(legacy.nextStartAt)
+        XCTAssertNil(legacy.later)
+        XCTAssertNil(legacy.recurrence)
+        let nulls = try decode(SharedWithMe.self, """
+        {"shareId":"s1","taskId":"t1","ownerName":"Anna","level":"view","title":"Deck","done":false,
+         "next_start_at":null,"later":null,"recurrence":null}
+        """)
+        XCTAssertNil(nulls.nextStartAt)
+        XCTAssertNil(nulls.later)
+        XCTAssertNil(nulls.recurrence)
+        // A recurrence blob this client can't read must not take the row down:
+        // a wrong SHAPE degrades to nil, an unknown KIND to Recurrence's own
+        // never-repeats sentinel (the TaskRow rule).
+        let odd = try decode(SharedWithMe.self, """
+        {"shareId":"s1","taskId":"t1","ownerName":"Anna","level":"view","title":"Deck","done":false,
+         "recurrence":"every full moon"}
+        """)
+        XCTAssertNil(odd.recurrence)
+        XCTAssertEqual(odd.title, "Deck")
+        let unknownKind = try decode(SharedWithMe.self, """
+        {"shareId":"s1","taskId":"t1","ownerName":"Anna","level":"view","title":"Deck","done":false,
+         "recurrence":{"kind":"lunar","phase":3}}
+        """)
+        XCTAssertTrue(Recurrence.isUnknown(unknownKind.recurrence))
+    }
+
+    func testSharedWithMeRoundTripsThe053Fields() throws {
+        let s = SharedWithMe(shareId: "s3", taskId: "t7", ownerName: "Pat", level: .assign,
+                             title: "Ship the deck", done: false,
+                             nextBlockId: "b1", nextDate: "2026-09-06", nextStartTime: "04:30",
+                             nextDurationMinutes: 45, nextDone: false,
+                             nextStartAt: "2026-09-05T19:30:00+00:00", later: true,
+                             recurrence: .weekly(daysOfWeek: [1, 3], until: nil))
+        XCTAssertEqual(try roundTrip(s), s)
+    }
+
+    func testSharedBlockDecodesStartAtFromEitherKeyAndToleratesItsAbsence() throws {
+        let snake = try decode(SharedBlock.self, """
+        {"block_id":"b1","task_id":"t1","share_id":"s1","level":"partner","owner_name":"Anna Lee",
+         "title":"Deck","date":"2026-09-06","start_time":"04:30","duration_minutes":45,
+         "done":false,"skipped":false,"kind":"task","start_at":"2026-09-05T19:30:00+00:00"}
+        """)
+        XCTAssertEqual(snake.startAt, "2026-09-05T19:30:00+00:00")
+        let camel = try decode(SharedBlock.self, """
+        {"blockId":"b2","taskId":"t2","shareId":"s2","level":"view","ownerName":"Bo","title":"Call",
+         "date":"2026-09-07","startTime":"10:00","durationMinutes":25,"startAt":"2026-09-07T09:00:00Z"}
+        """)
+        XCTAssertEqual(camel.startAt, "2026-09-07T09:00:00Z")
+        let legacy = try decode(SharedBlock.self, """
+        {"block_id":"b3","task_id":"t3","share_id":"s3","level":"view","owner_name":"Bo",
+         "title":"x","date":"2026-09-07","start_time":"10:00","duration_minutes":25,"start_at":null}
+        """)
+        XCTAssertNil(legacy.startAt)
+        let b = SharedBlock(blockId: "b1", taskId: "t1", shareId: "s1", level: .assign, ownerName: "Anna",
+                            title: "Deck", date: "2026-09-06", startTime: "04:30", durationMinutes: 45,
+                            startAt: "2026-09-05T19:30:00+00:00")
+        XCTAssertEqual(try roundTrip(b), b)
+    }
+
+    func testSharedTaskDetailCarriesThe053FieldsWithNilDefaults() {
+        let bare = SharedTaskDetail(taskId: "t7", ownerName: "Pat", level: .view, name: "Deck", done: false,
+                                    estimateMin: 45, totalFocused: 0, lifeArea: nil, priority: nil,
+                                    tags: [], objectives: [], dueAt: nil, createdAt: nil)
+        XCTAssertNil(bare.nextStartAt)
+        XCTAssertNil(bare.later)
+        let full = SharedTaskDetail(taskId: "t7", ownerName: "Pat", level: .view, name: "Deck", done: false,
+                                    estimateMin: 45, totalFocused: 0, lifeArea: nil, priority: nil,
+                                    tags: [], objectives: [], dueAt: nil, createdAt: nil,
+                                    nextBlockId: "b1", nextDate: "2026-09-06", nextStartTime: "04:30",
+                                    nextDurationMinutes: 45, nextDone: false,
+                                    nextStartAt: "2026-09-05T19:30:00+00:00", later: true)
+        XCTAssertEqual(full.nextStartAt, "2026-09-05T19:30:00+00:00")
+        XCTAssertEqual(full.later, true)
+        XCTAssertNotEqual(full, bare)
+    }
+
     // The focus action is offered only for the focus-capable levels — the same
     // partner+assign rule log_shared_focus enforces server-side.
     func testSharedFocusActionLabelMatchesGate() {

@@ -311,6 +311,14 @@ struct SharedWithMeRow: Decodable {
     let next_start_time: String?
     let next_duration_minutes: Int?
     let next_done: Bool?
+    /// Migration 053 — the next block's start as an INSTANT (the owner's local
+    /// date + start_time through the owner's notification timezone), the
+    /// owner's `later` flag and `recurrence`. All optional (a pre-053
+    /// projection omits them); a malformed recurrence blob decodes to nil
+    /// instead of failing the row.
+    let next_start_at: String?
+    let later: Bool?
+    let recurrence: Lenient<Recurrence>?
 
     func model() -> SharedWithMe {
         SharedWithMe(shareId: share_id, taskId: task_id, ownerName: owner_name,
@@ -318,13 +326,25 @@ struct SharedWithMeRow: Decodable {
                      done: done == true, completedAt: completed_at,
                      estimateMin: estimate_min, lifeArea: life_area,
                      nextBlockId: next_block_id, nextDate: next_date, nextStartTime: next_start_time,
-                     nextDurationMinutes: next_duration_minutes, nextDone: next_done)
+                     nextDurationMinutes: next_duration_minutes, nextDone: next_done,
+                     nextStartAt: next_start_at, later: later, recurrence: recurrence?.value)
     }
 }
 
-/// One row of shared_task_blocks (migration 052). `date` is a Postgres date →
-/// 'YYYY-MM-DD'; `start_time` the 'HH:MM' text cal_blocks stores; the booleans
-/// are nullable → coalesced false.
+/// A value that decodes to nil instead of throwing when the wire shape is not
+/// what we expect — for optional jsonb projections (`recurrence`) that must
+/// never take a whole row down with them.
+struct Lenient<T: Decodable>: Decodable {
+    let value: T?
+    init(from decoder: Decoder) {
+        value = try? T(from: decoder)
+    }
+}
+
+/// One row of shared_task_blocks (migration 052 / 053). `date` is a Postgres
+/// date → 'YYYY-MM-DD'; `start_time` the 'HH:MM' text cal_blocks stores;
+/// `start_at` (053) the same slot as a timestamptz instant; the booleans are
+/// nullable → coalesced false.
 struct SharedBlockRow: Decodable {
     let block_id: String
     let task_id: String
@@ -338,13 +358,15 @@ struct SharedBlockRow: Decodable {
     let done: Bool?
     let skipped: Bool?
     let kind: String?
+    let start_at: String?
 
     func model() -> SharedBlock {
         SharedBlock(blockId: block_id, taskId: task_id, shareId: share_id,
                     level: ShareLevel(rawValue: level) ?? .view,
                     ownerName: owner_name ?? "Someone", title: title ?? "Untitled task",
                     date: date, startTime: start_time, durationMinutes: duration_minutes ?? 25,
-                    done: done == true, skipped: skipped == true, kind: kind ?? "task")
+                    done: done == true, skipped: skipped == true, kind: kind ?? "task",
+                    startAt: start_at)
     }
 }
 
@@ -382,6 +404,9 @@ struct SharedTaskDetailRow: Decodable {
     let next_start_time: String?
     let next_duration_minutes: Int?
     let next_done: Bool?
+    /// Migration 053 (nil pre-053).
+    let next_start_at: String?
+    let later: Bool?
 
     func model() -> SharedTaskDetail {
         SharedTaskDetail(
@@ -402,6 +427,8 @@ struct SharedTaskDetailRow: Decodable {
             nextDate: next_date,
             nextStartTime: next_start_time,
             nextDurationMinutes: next_duration_minutes,
-            nextDone: next_done)
+            nextDone: next_done,
+            nextStartAt: next_start_at,
+            later: later)
     }
 }

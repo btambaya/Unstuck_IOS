@@ -78,6 +78,11 @@ protocol CallEnvironment: AnyObject {
     /// had a queued call) is dropped at once as `.failed` — no ring, no
     /// notification, no notes from the previous account.
     var isSignedIn: Bool { get }
+    /// Whether `isSignedIn` is the REAL session (AppModel attached) or the
+    /// killed-state proxy (a VoIP registration exists). The VoIP path can act
+    /// on the proxy; the alert-tap fallback (transport B — used exactly when
+    /// there is NO VoIP token) must not, and waits for the real answer.
+    var isSessionKnown: Bool { get }
     /// A focus session is live (started, paused or not) → the call ends as `busy`.
     var isFocusSessionLive: Bool { get }
     /// The task/block the call anchors to still stands. `nil` taskId → true.
@@ -85,6 +90,10 @@ protocol CallEnvironment: AnyObject {
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool
     /// The user's own allowed-hours guard (Settings → Calls from Unstuck).
     func isWithinCallHours(_ date: Date) -> Bool
+}
+
+extension CallEnvironment {
+    var isSessionKnown: Bool { true }
 }
 
 /// A local notification the coordinator wants posted.
@@ -111,10 +120,15 @@ protocol CallOutcomeReporting: AnyObject {
     /// Late-bind the network client (a killed-state launch reports before the
     /// coordinator has one — implementations buffer + flush).
     func attach(client: CallsClient)
+    /// The account signed out: whatever is still queued belongs to a session
+    /// that no longer exists (no JWT to send it with; the next account's
+    /// server would answer not_found) — forget it, on disk too.
+    func discardAll()
 }
 
 extension CallOutcomeReporting {
     func attach(client: CallsClient) {}
+    func discardAll() {}
 }
 
 /// The CXProvider surface the coordinator uses.

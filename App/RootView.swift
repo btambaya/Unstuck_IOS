@@ -15,7 +15,11 @@ struct RootView: View {
                 // A recovery session lands authenticated — let them set a new
                 // password before dropping into the app.
                 SetNewPasswordView()
-            } else if !model.onboarded {
+            } else if model.onboardingResolved && !model.onboarded {
+                // Gated on `onboardingResolved` so an existing account on a
+                // fresh install doesn't flash the 5 steps while the account-wide
+                // read is still in flight (it resolves within seconds, and an
+                // unknown answer falls back to the local flag).
                 OnboardingView()
             } else {
                 MainTabScaffold()

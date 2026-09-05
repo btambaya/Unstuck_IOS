@@ -17,6 +17,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     // ── TASKS ──
     case "uncomplete_task":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        // Already open → error, never "ok: reopened": that receipt's Undo would
+        // COMPLETE a task the user never finished (web parity).
+        if !t.done { return "error: \"\(t.name)\" is already open — nothing changed" }
         t.done = false
         t.completedAt = nil
         t.updatedAt = now()
@@ -82,6 +85,8 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard var b = api.getBlocks().first(where: { $0.taskId == t.id && $0.date == date && !$0.done }) else {
             return "error: \"\(t.name)\" has nothing on \(date) to skip"
         }
+        // Re-skipping is a no-op — say so instead of a second "Skipped" receipt.
+        if b.skipped { return "error: \"\(t.name)\" is already skipped on \(date) — nothing changed" }
         b.skipped = true
         await api.upsertBlock(b)
         return "ok: skipped \"\(t.name)\" on \(date) (the task and its other days stay)"
@@ -92,6 +97,8 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard var b = api.getBlocks().first(where: { $0.taskId == t.id && $0.date == date && !$0.skipped }) else {
             return "error: \"\(t.name)\" has nothing on \(date)"
         }
+        // Already done that day → error, not a second "Done for today" receipt.
+        if b.done { return "error: \"\(t.name)\" is already done on \(date) — nothing changed" }
         b.done = true
         await api.upsertBlock(b)
         if t.recurrence == nil {
@@ -353,8 +360,10 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         if wd == nil && we == nil { return "error: give weekdayMin and/or weekendMin" }
         if let wd, wd < 15 || wd > 1440 { return "error: minutes must be between 15 and 1440" }
         if let we, we < 15 || we > 1440 { return "error: minutes must be between 15 and 1440" }
-        await api.setUsableMinutes(weekday: wd, weekend: we)
-        return "ok: usable time set\(wd.map { " — weekdays \($0)m" } ?? "")\(we.map { " — weekends \($0)m" } ?? "")"
+        let ok = await api.setUsableMinutes(weekday: wd, weekend: we)
+        return ok
+            ? "ok: usable time set\(wd.map { " — weekdays \($0)m" } ?? "")\(we.map { " — weekends \($0)m" } ?? "")"
+            : "error: could not save usable minutes (offline?)"
 
     case "set_notification_level":
         let lvl = (args.str("level") ?? "").lowercased()

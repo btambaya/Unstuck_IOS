@@ -106,9 +106,18 @@ public actor RealtimeMirror {
         await subscribe("cal_blocks", CalBlockRow.self, userId: userId,
                         onUpsert: { [db] in try? db.save($0.model()) },
                         onDelete: { [db] in try? db.deleteById(CalBlock.self, id: $0) })
+        // captures carry their Inbox archive state (`archived_at`, migration
+        // 053) — an archive made on the web must move the row out of this
+        // device's open Inbox too, so the local archive table follows the row.
         await subscribe("captures", CaptureRow.self, userId: userId,
-                        onUpsert: { [db] in try? db.save($0.model()) },
-                        onDelete: { [db] in try? db.deleteById(Capture.self, id: $0) })
+                        onUpsert: { [db] row in
+                            try? db.save(row.model())
+                            try? db.setCaptureArchived(id: row.id, archivedAt: row.archivedAt)
+                        },
+                        onDelete: { [db] in
+                            try? db.deleteById(Capture.self, id: $0)
+                            try? db.setCaptureArchived(id: $0, archivedAt: nil)
+                        })
         await subscribe("reason_logs", ReasonLogRow.self, userId: userId,
                         onUpsert: { [db] in try? db.save($0.model()) },
                         onDelete: { [db] in try? db.deleteById(ReasonLog.self, id: $0) })
@@ -154,10 +163,19 @@ public actor RealtimeMirror {
     /// clobbered by a stale remote echo. Compares parsed dates, not strings.
     /// Applies (returns true) when there's no local row, the local row has no
     /// usable timestamp, or the incoming is at-or-after the local one.
+    ///
+    /// Base-aware: while a queued upsert for the row exists, an incoming row
+    /// stamped at-or-before the op's `baseUpdatedAt` is the SERVER STATE THE
+    /// EDIT WAS MADE ON (a late echo) — it must not overwrite the pending
+    /// local edit even when a slow device clock stamped that edit "earlier".
     static func incomingTaskWins(_ incoming: TaskRow, db: AppDatabase) -> Bool {
+        guard let incomingMs = Time.parseMillis(incoming.updatedAt) else { return true }
+        let pendingBases = ((try? OutboxStore(db).pending()) ?? [])
+            .filter { $0.tableName == "tasks" && $0.kind == .upsert && $0.rowId == incoming.id }
+            .compactMap { $0.baseUpdatedAt.flatMap(Time.parseMillis) }
+        if let base = pendingBases.max(), incomingMs <= base + 1 { return false }
         guard let local = try? db.fetchById(TaskItem.self, id: incoming.id),
-              let localMs = Time.parseMillis(local.updatedAt),
-              let incomingMs = Time.parseMillis(incoming.updatedAt) else { return true }
+              let localMs = Time.parseMillis(local.updatedAt) else { return true }
         return incomingMs >= localMs
     }
 

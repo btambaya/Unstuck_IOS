@@ -101,6 +101,12 @@ enum CallTools {
     /// Compare-and-set miss: the row was cancelled / rang / finished between
     /// the read and the write. Never echo the stale row as `ok:`.
     static let changedUnderneath = "error: that call changed underneath me — get_calls and try again"
+    /// A time change on a call that is ringing / in progress right now: its
+    /// status is about to be settled by the phone's own outcome report, which
+    /// would silently overwrite a re-arm to `scheduled`. Notes and label still
+    /// land (mid-call "change the notes for later"); a new time needs a new
+    /// call — or a snooze.
+    static let inProgress = "error: that call is in progress right now — I can change its notes or label, but not its time; snooze_call or book another with request_call"
 
     /// The production dispatch: snooze → the CallKit coordinator; the rest →
     /// `run` over the attached coordinator's CallsClient + user id.
@@ -207,13 +213,20 @@ enum CallTools {
 
     // MARK: update_call(callId, notes | when | leadMin | label)
 
+    /// Notes / label edits land on any EDITABLE row — live, or ANSWERED and in
+    /// progress: the in-call "add 'bring the contract' to the notes and call
+    /// me back in 20" must edit the row while the conversation is up (the
+    /// phone reports `answered` the moment the call is picked up, so the row
+    /// is never `calling` by the time the model runs the tool). A TIME change
+    /// on a ringing / answered row is refused (`inProgress`): re-arming it to
+    /// `scheduled` would be overwritten by the outcome report a moment later.
     private static func updateCall(_ args: [String: Any], api: AssistantAppState, store: any CallStore,
                                    now: Date, calendar: Calendar) async throws -> String {
         guard let id = CallToolLogic.str(args["callId"]) ?? CallToolLogic.str(args["id"]) else {
             return "error: callId required — use get_calls to find it"
         }
         guard let row = try await store.call(id: id) else { return "error: call not found — use get_calls" }
-        guard row.isLive else { return "error: that call is already \(row.status) — book a new one with request_call" }
+        guard row.isEditable else { return "error: that call is already \(row.status) — book a new one with request_call" }
         // A JSON `null` (NSNull) or an absent key leaves the notes untouched;
         // only a real array/string replaces them.
         let notes: [String]? = CallToolLogic.isPresent(args["notes"]) ? CallToolLogic.notes(args["notes"]) : nil
@@ -223,6 +236,7 @@ enum CallTools {
         guard notes != nil || label != nil || whenRaw != nil || lead != nil else {
             return "error: nothing to change — give notes and/or when"
         }
+        if row.isInProgress, whenRaw != nil || lead != nil { return inProgress }
 
         var callAt: Date?
         var leadPatch: Int?? = nil

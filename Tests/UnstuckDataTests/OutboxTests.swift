@@ -47,9 +47,51 @@ final class OutboxTests: XCTestCase {
 
     func testBumpAttempts() throws {
         let op = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, nowISO: now)
-        try box.bumpAttempts(op.opSeq!)
-        try box.bumpAttempts(op.opSeq!)
+        XCTAssertEqual(try box.bumpAttempts(op.opSeq!), 1)
+        XCTAssertEqual(try box.bumpAttempts(op.opSeq!), 2)
         XCTAssertEqual(try box.pending().first?.attempts, 2)
+        XCTAssertFalse(try XCTUnwrap(box.pending().first).isQuarantined)
+        for _ in 0..<(OutboxStore.quarantineCap - 2) { _ = try box.bumpAttempts(op.opSeq!) }
+        XCTAssertTrue(try XCTUnwrap(box.pending().first).isQuarantined)
+        XCTAssertEqual(try box.quarantinedCount(), 1)
+        XCTAssertEqual(try box.count(), 1, "quarantine keeps the op")
+    }
+
+    func testBaseTravelsWithTheOpAndCanBeRewritten() throws {
+        let op = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, payload: "{\"v\":2}", nowISO: now,
+                                 baseUpdatedAt: "2026-05-21T09:00:00.000Z", basePayload: "{\"v\":1}")
+        XCTAssertEqual(try box.pending().first?.baseUpdatedAt, "2026-05-21T09:00:00.000Z")
+        try box.replacePayload(op.opSeq!, payload: "{\"v\":3}", baseUpdatedAt: "2026-05-21T10:00:00.000Z", basePayload: "{\"v\":2}")
+        let after = try XCTUnwrap(box.pending().first)
+        XCTAssertEqual(after.payload, "{\"v\":3}")
+        XCTAssertEqual(after.baseUpdatedAt, "2026-05-21T10:00:00.000Z")
+        XCTAssertEqual(after.basePayload, "{\"v\":2}")
+    }
+
+    // MARK: - parking (sign-out while offline)
+
+    func testParkMovesEveryOpUnderTheUserAndRestoreBringsOnlyTheirsBack() throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, payload: "{}", nowISO: now,
+                            baseUpdatedAt: "b1", basePayload: "{}")
+        _ = try box.enqueue(table: "cal_blocks", rowId: "b1", kind: .upsert, payload: "{}", dependsOn: "t1", nowISO: now)
+        XCTAssertEqual(try box.park(userId: "u1"), 2)
+        XCTAssertEqual(try box.count(), 0, "the outbox is empty for the next account")
+        XCTAssertEqual(try box.parkedCount(userId: "u1"), 2)
+
+        // Another user signs in: nothing of u1's is replayed.
+        XCTAssertEqual(try box.restoreParked(userId: "u2"), 0)
+        XCTAssertEqual(try box.count(), 0)
+        XCTAssertEqual(try box.parkedCount(), 2)
+
+        // u1 comes back: original order, base + dependsOn intact, parking cleared.
+        _ = try box.enqueue(table: "tasks", rowId: "t9", kind: .delete, nowISO: now)   // queued before the restore
+        XCTAssertEqual(try box.restoreParked(userId: "u1"), 2)
+        let ops = try box.pending()
+        XCTAssertEqual(ops.map(\.rowId), ["t9", "t1", "b1"])
+        XCTAssertEqual(ops[1].baseUpdatedAt, "b1")
+        XCTAssertEqual(ops[2].dependsOn, "t1")
+        XCTAssertEqual(try box.parkedCount(), 0)
+        XCTAssertEqual(try box.nextFlushable().map(\.rowId), ["t9", "t1"], "the dependent still waits for its parent")
     }
 }
 

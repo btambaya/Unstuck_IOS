@@ -24,6 +24,52 @@ private func shared(_ id: String, _ start: String, _ durationMin: Int, date: Str
 
 private typealias Window = SharedBlocksCache.Window
 
+// MARK: - A tapped block's slot (the detail sheet)
+
+final class SharedBlockPlannedLabelTests: XCTestCase {
+    private let london = TimeZone(identifier: "Europe/London")!
+    private let tokyo = TimeZone(identifier: "Asia/Tokyo")!
+
+    func testLabelReadsTheBlockInTheRecipientsZoneWhenItCarriesAnInstant() {
+        // The owner (Tokyo) booked Fri 22 May 00:30 = Thu 21 May 15:30Z.
+        var b = shared("a", "00:30", 45, date: "2026-05-22")
+        b.startAt = "2026-05-21T15:30:00+00:00"
+        XCTAssertEqual(sharedBlockPlannedLabel(b, timeZone: london), "Planned Thu, May 21 · 16:30 · 45m")
+        XCTAssertEqual(sharedBlockPlannedLabel(b, timeZone: tokyo), "Planned Fri, May 22 · 00:30 · 45m")
+        b.done = true
+        XCTAssertEqual(sharedBlockPlannedLabel(b, timeZone: london), "Done Thu, May 21 · 16:30 · 45m")
+    }
+
+    func testLabelFallsBackToTheOwnersTextPre053() {
+        let b = shared("a", "09:00", 30, date: "2026-05-22")
+        XCTAssertNil(b.startAt)
+        XCTAssertEqual(sharedBlockPlannedLabel(b, timeZone: london), "Planned Fri, May 22 · 09:00 · 30m")
+    }
+
+    func testDetailSheetShowsTheTappedBlockNotTheProjectionsNextOne() {
+        // The task's NEXT block is Saturday, but the user tapped Thursday's
+        // (a task with several blocks): the sheet says Thursday.
+        let detail = SharedTaskDetail(taskId: "t1", ownerName: "Anna", level: .view, name: "Deck", done: false,
+                                      estimateMin: 45, totalFocused: 0, lifeArea: nil, priority: nil,
+                                      tags: [], objectives: [], dueAt: nil, createdAt: nil,
+                                      nextBlockId: "sat", nextDate: "2026-05-23", nextStartTime: "04:30",
+                                      nextDurationMinutes: 45, nextDone: false)
+        let tapped = shared("thu", "10:00", 30, date: "2026-05-21")
+        XCTAssertEqual(SharedTaskDetailSheet.plannedLabel(detail: detail, block: tapped, timeZone: london),
+                       "Planned Thu, May 21 · 10:00 · 30m")
+        XCTAssertEqual(SharedTaskDetailSheet.plannedLabel(detail: detail, block: nil, timeZone: london),
+                       "Planned Sat, May 23 · 04:30 · 45m")
+        // A tapped PAST, finished block still says when it was.
+        let past = shared("past", "09:00", 30, date: "2026-05-15", done: true)
+        XCTAssertEqual(SharedTaskDetailSheet.plannedLabel(detail: detail, block: past, timeZone: london),
+                       "Done Fri, May 15 · 09:00 · 30m")
+        // The target the calendar hands the sheet carries the block; the rows don't.
+        XCTAssertEqual(SharedDetailTarget(id: "t1", block: tapped).block?.blockId, "thu")
+        XCTAssertNil(SharedDetailTarget(id: "t1").block)
+        XCTAssertEqual(SharedDetailTarget(id: "t1", block: tapped).id, "t1")
+    }
+}
+
 // MARK: - Window cache
 
 final class SharedBlocksCacheTests: XCTestCase {

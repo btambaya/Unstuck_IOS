@@ -8,11 +8,14 @@
 //    is PRESERVED (never deleted); the screen archives it after promoting, exactly
 //    like Android (`vm.promoteCapture(cap); vm.archiveCapture(cap.id)`).
 //  • archiveCapture / unarchiveCapture — "Done"/"Restore". Archived ids are
-//    DEVICE-LOCAL (UserDefaults Set<String>), NOT a DB column — captures have no
-//    `archived` field. Mirrors Android's SettingsStore archivedCaptureIds (which
-//    is cleared on sign-out, like dismissed nudges).
-//  • discardCapture — delete the capture row (and drop any device-local archived
-//    flag so the set doesn't leak ids), matching Android's deleteCapture.
+//    ACCOUNT state since migration 053 (`captures.archived_at`): the set below
+//    is a CACHE of the local `capture_archive` table, and AppModel's observer
+//    (propagateCaptureArchiveChange) writes every insert/remove through to the
+//    repository + outbox, so the archive follows the account across devices.
+//    The UserDefaults copy is only a pre-hydrate cache (and the pre-053
+//    fallback the one-time migration reads).
+//  • discardCapture — delete the capture row (and drop any archived flag so the
+//    set doesn't leak ids), matching Android's deleteCapture.
 
 import Foundation
 import UnstuckCore
@@ -24,8 +27,10 @@ extension AppModel {
     private static let archivedCaptureIdsKey = "unstuck.archivedCaptureIds"
 
     /// Capture ids the user has archived from the Inbox (triaged without
-    /// deleting). Device-local; survives relaunch; cleared on sign-out so a
-    /// different account on this device starts clean. The Inbox observes this
+    /// deleting). Account state (`captures.archived_at`) cached here + in
+    /// UserDefaults so a relaunch renders before the first hydrate; cleared on
+    /// sign-out so a different account on this device starts clean. Setting it
+    /// writes the diff through to the store (see AppModel's observer). The Inbox observes this
     /// (it's a stored property on the @Observable AppModel) so toggling
     /// archive/restore refreshes the open + archived lists immediately.
     var archivedCaptureIds: Set<String> {
@@ -43,12 +48,14 @@ extension AppModel {
         archivedCaptureIdsBacking = Set(ids)
     }
 
-    /// Archive a capture out of the open inbox ("Done"). Device-local only.
+    /// Archive a capture out of the open inbox ("Done") — written through to
+    /// `captures.archived_at` by AppModel's observer.
     func archiveCapture(_ id: String) {
         archivedCaptureIds.insert(id)
     }
 
-    /// Restore a capture back into the open inbox ("Restore"). Device-local.
+    /// Restore a capture back into the open inbox ("Restore") — clears
+    /// `archived_at` server-side through the same observer.
     func unarchiveCapture(_ id: String) {
         archivedCaptureIds.remove(id)
     }

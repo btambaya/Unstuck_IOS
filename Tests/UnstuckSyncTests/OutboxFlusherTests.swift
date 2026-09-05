@@ -1,6 +1,7 @@
 // Port of the Android OutboxFlusher semantics (spec 02-sync-engine §1.2/
-// §1.4): the FAIL_CAP=5 poison pill + orphan-drop of dependents, the
-// blockedRows per-row ordering after a failure, and the mid-drain
+// §1.4): the rejection-only quarantine cap (transient failures NEVER count —
+// the old poison pill dropped a valid write after five airplane-mode passes),
+// the blockedRows per-row ordering after a failure, and the mid-drain
 // user-switch guard. The fake gateway scripts per-row failures so the
 // drain loop runs against a real GRDB outbox without a network.
 
@@ -12,14 +13,25 @@ import UnstuckData
 /// Scripted SyncGateway stand-in: fails rows on demand, records the order
 /// of successful applies (id + the payload's name for LWW assertions).
 private actor FakeGateway: SyncGatewayProtocol {
+    /// An un-classified error — the flusher must treat it as transient.
     struct Failure: Error {}
+    /// A definite server rejection (PostgREST 4xx / FK / check) — the only
+    /// kind that counts toward the quarantine cap.
+    struct Rejection: Error, ServerRejectionClassifiable { var isServerRejection: Bool { true } }
 
     private(set) var upserts: [(table: String, id: String, name: String?)] = []
     private(set) var deletes: [String] = []
     private var failuresRemaining: [String: Int] = [:]   // rowId → failures left (.max = forever)
+    private var errorFor: [String: Error] = [:]
 
-    func fail(_ rowId: String, times: Int) { failuresRemaining[rowId] = times }
-    func failForever(_ rowId: String) { failuresRemaining[rowId] = .max }
+    func fail(_ rowId: String, times: Int, with error: Error = Failure()) {
+        failuresRemaining[rowId] = times
+        errorFor[rowId] = error
+    }
+    func failForever(_ rowId: String, with error: Error = Failure()) {
+        failuresRemaining[rowId] = .max
+        errorFor[rowId] = error
+    }
 
     private func shouldFail(_ id: String) -> Bool {
         guard let n = failuresRemaining[id], n > 0 else { return false }
@@ -31,12 +43,12 @@ private actor FakeGateway: SyncGatewayProtocol {
         let data = try JSONEncoder().encode(row)
         let obj = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
         let id = obj["id"] as? String ?? ""
-        if shouldFail(id) { throw Failure() }
+        if shouldFail(id) { throw errorFor[id] ?? Failure() }
         upserts.append((table, id, obj["name"] as? String))
     }
 
     func delete(table: String, id: String) async throws {
-        if shouldFail(id) { throw Failure() }
+        if shouldFail(id) { throw errorFor[id] ?? Failure() }
         deletes.append(id)
     }
 }
@@ -81,24 +93,78 @@ final class OutboxFlusherTests: XCTestCase {
         XCTAssertTrue(upserts.isEmpty)
     }
 
-    func testPoisonOpDroppedAtFailCapAndOrphanedDependentsDropped() async throws {
+    // MARK: - transient failures never count; rejections quarantine (never delete)
+
+    /// The CRITICAL data-loss path: airplane mode + the 60s foreground safety
+    /// net = five failed passes in five minutes. The old cap then markDone'd
+    /// the op (and its FK dependents) and the next hydrate wiped the local row.
+    /// An offline / timeout / 5xx failure is NOT a verdict on the op: it must
+    /// stay queued for as many passes as it takes.
+    func testOfflineFailuresNeverCountTowardTheCap() async throws {
+        try db.save(TaskItem(id: "t1", name: "kept", estimateMin: 25, createdAt: now, updatedAt: now))
         _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
                             payload: try taskPayload(id: "t1"), nowISO: now)
         _ = try box.enqueue(table: "cal_blocks", rowId: "b1", kind: .upsert,
                             payload: try blockPayload(id: "b1", taskId: "t1"),
                             dependsOn: "t1", nowISO: now)
-        await gateway.failForever("t1")
-        // 4 failed passes: the op + its held-back dependent stay queued.
-        for pass in 1...4 {
+        await gateway.fail("t1", times: 12, with: URLError(.notConnectedToInternet))
+        for pass in 1...12 {
             await flusher.flush(userId: "u1")
-            XCTAssertEqual(try box.count(), 2, "still queued after pass \(pass)")
+            XCTAssertEqual(try box.count(), 2, "still queued after offline pass \(pass)")
+            XCTAssertEqual(try box.pending().first?.attempts, 0, "offline passes must not be counted")
         }
-        // 5th consecutive failure → poison drop + orphan-drop of the dependent.
+        // Network back: both flush in FK order.
         await flusher.flush(userId: "u1")
         XCTAssertEqual(try box.count(), 0)
-        // The dependent was never pushed (its FK parent never existed server-side).
         let upserts = await gateway.upserts
-        XCTAssertTrue(upserts.isEmpty)
+        XCTAssertEqual(upserts.map(\.id), ["t1", "b1"])
+    }
+
+    func testUnclassifiedAndCancellationErrorsAreTransientToo() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1"), nowISO: now)
+        await gateway.failForever("t1")   // FakeGateway.Failure — no classification → transient
+        for _ in 1...8 { await flusher.flush(userId: "u1") }
+        XCTAssertEqual(try box.count(), 1)
+        XCTAssertEqual(try box.pending().first?.attempts, 0)
+        XCTAssertFalse(try XCTUnwrap(box.pending().first).isQuarantined)
+    }
+
+    func testServerRejectionsQuarantineTheOpButNeverDeleteItOrItsRow() async throws {
+        try db.save(TaskItem(id: "t1", name: "kept", estimateMin: 25, createdAt: now, updatedAt: now))
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1"), nowISO: now)
+        _ = try box.enqueue(table: "cal_blocks", rowId: "b1", kind: .upsert,
+                            payload: try blockPayload(id: "b1", taskId: "t1"),
+                            dependsOn: "t1", nowISO: now)
+        await gateway.failForever("t1", with: FakeGateway.Rejection())
+        for pass in 1...OutboxStore.quarantineCap {
+            await flusher.flush(userId: "u1")
+            XCTAssertEqual(try box.count(), 2, "kept after rejection \(pass)")
+            XCTAssertEqual(try box.pending().first?.attempts, pass, "each rejection is counted (persisted)")
+        }
+        let head = try XCTUnwrap(box.pending().first)
+        XCTAssertTrue(head.isQuarantined)
+        // Further drains skip it (no more sends) and the dependent stays held.
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 2, "quarantined op + its dependent are KEPT, never deleted")
+        XCTAssertEqual(try box.pending().first?.attempts, OutboxStore.quarantineCap, "no send after quarantine")
+        XCTAssertEqual(try box.quarantinedCount(), 1)
+        let upserts = await gateway.upserts
+        XCTAssertTrue(upserts.isEmpty, "the dependent was never pushed ahead of its parent")
+        // The local row survives (hydrate's pending-row preservation keeps it too).
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.name, "kept")
+    }
+
+    func testRejectionCountSurvivesARelaunchOfTheFlusher() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1"), nowISO: now)
+        await gateway.failForever("t1", with: FakeGateway.Rejection())
+        for _ in 1..<OutboxStore.quarantineCap { await flusher.flush(userId: "u1") }
+        // New process: a fresh flusher over the same store continues the count.
+        let relaunched = OutboxFlusher(gateway: gateway, db: db)
+        await relaunched.flush(userId: "u1")
+        XCTAssertTrue(try XCTUnwrap(box.pending().first).isQuarantined)
     }
 
     func testFailedRowBlocksItsLaterOpsAndRetryPreservesSeqOrder() async throws {

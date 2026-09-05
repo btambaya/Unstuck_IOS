@@ -40,10 +40,19 @@ final class ShareModel {
     /// calendar's read-only "shared" layer (shared_task_blocks, migration 052).
     /// A small per-window cache: each calendar surface asks for its visible
     /// range (`loadSharedBlocks`), which fetches only when the window isn't
-    /// already covered; every loaded window is re-read on the shares-changed
-    /// signal / `refresh()`, so a block the owner moves lands here live.
+    /// already covered. The cache is INVALIDATED (every loaded window
+    /// re-read) on the shares-changed signal and on every foreground resync
+    /// (`refresh()`), so an owner-side reschedule / completion shows up the
+    /// next time the app comes back — the realtime channel only carries
+    /// task_shares / trusted_circle rows (an owner moving a cal_block never
+    /// touches those), so without the foreground re-read the dashed block
+    /// stayed at its old slot until a relaunch.
     private(set) var sharedBlocks = SharedBlocksCache()
     @ObservationIgnored private var observer: NSObjectProtocol?
+    @ObservationIgnored private var foregroundObserver: NSObjectProtocol?
+    /// Bumped on every refetch — a cheap "the shared layer changed" signal
+    /// the tests + surfaces can key on.
+    private(set) var revision = 0
     /// Fired after each refresh (badges may have changed) so AppModel can pump
     /// the share-session signal reducer — a session_start that was waiting on
     /// late-resolving badges fires once they land. Set by AppModel.
@@ -63,13 +72,28 @@ final class ShareModel {
                 Task { @MainActor in await self?.refresh() }
             }
         }
+        if foregroundObserver == nil {
+            // Foreground resync: the owner may have rescheduled / finished
+            // while we were in the background (nothing live tells us).
+            foregroundObserver = NotificationCenter.default.addObserver(
+                forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in await self?.refresh() }
+            }
+        }
         Task { await refresh() }
     }
 
     func stop() {
         if let observer { NotificationCenter.default.removeObserver(observer) }
         observer = nil
+        if let foregroundObserver { NotificationCenter.default.removeObserver(foregroundObserver) }
+        foregroundObserver = nil
     }
+
+    /// Drop every cached shared-block window; the next `loadSharedBlocks`
+    /// (or `refresh`) fetches fresh. Used when the layer is known stale.
+    func invalidateSharedBlocks() { sharedBlocks.clear() }
 
     /// Refetch both projections. Tolerant (each RPC returns [] on failure); a nil
     /// client (demo/UITest boot) degrades to empty.
@@ -79,9 +103,12 @@ final class ShareModel {
         async let flat = client.shareBadges()
         sharedWithMe = await swm
         badges = CircleClient.shareBadgesByTask(await flat)
+        revision += 1
         onChange?()
-        // Re-read every calendar window we've served (an owner rescheduling a
-        // shared task must move its block on my calendar without a relaunch).
+        // Invalidate the shared-block cache: re-read every calendar window
+        // we've served, so an owner's reschedule / completion that happened
+        // while we weren't looking (a share change, a foreground) lands on
+        // my calendar without a relaunch.
         for w in sharedBlocks.windows {
             let rows = await client.sharedTaskBlocks(from: w.from, to: w.to)
             sharedBlocks.store(w, blocks: rows)
@@ -472,7 +499,7 @@ struct SharedWithYouGroup: View {
             // Read-only detail — the only window a recipient has into the task
             // (steps, area, estimate, due) + level-appropriate actions (T1/T3).
             .sheet(item: $detailTarget) { target in
-                SharedTaskDetailSheet(taskId: target.id)
+                SharedTaskDetailSheet(taskId: target.id, block: target.block)
             }
         }
     }
@@ -484,7 +511,7 @@ struct SharedWithYouGroup: View {
         // nothing is planned (or against a pre-052 server).
         let slot = sharedSlotLabel(nextDate: s.nextDate, nextStartTime: s.nextStartTime,
                                    nextDurationMinutes: s.nextDurationMinutes, nextDone: s.nextDone,
-                                   todayISO: todayISO)
+                                   nextStartAt: s.nextStartAt, todayISO: todayISO)
         let subtitle = slot.map { "\($0) · from \(shortName(s.ownerName))" } ?? "from \(shortName(s.ownerName))"
         return HStack(spacing: 12) {
             if canComplete {
@@ -528,8 +555,18 @@ struct SharedWithYouGroup: View {
 }
 
 /// Identifiable wrapper so a tapped shared-task id can drive `.sheet(item:)`
-/// (the shared group rows + the calendar's shared blocks).
-struct SharedDetailTarget: Identifiable, Equatable { let id: String }
+/// (the shared group rows + the calendar's shared blocks). A calendar tap
+/// passes the BLOCK it landed on, so the detail's "Planned …" line shows
+/// THAT slot (the one the user is looking at) rather than the projection's
+/// next block — which differs for a task with several blocks, or a past one.
+struct SharedDetailTarget: Identifiable, Equatable {
+    let id: String
+    var block: SharedBlock? = nil
+    init(id: String, block: SharedBlock? = nil) {
+        self.id = id
+        self.block = block
+    }
+}
 
 // MARK: - Shared task read-only detail (T1) + shared focus entry (T3)
 
@@ -544,6 +581,9 @@ struct SharedTaskDetailSheet: View {
     @Environment(\.uTheme) private var theme
     @Environment(\.dismiss) private var dismiss
     let taskId: String
+    /// The calendar block the sheet was opened from, when it was — its slot
+    /// is what the "Planned …" line reads (nil: the projection's next block).
+    var block: SharedBlock? = nil
 
     @State private var detail: SharedTaskDetail?
     @State private var loaded = false
@@ -593,10 +633,10 @@ struct SharedTaskDetailSheet: View {
             Text("from \(shortName(d.ownerName))")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
 
-            // The owner's schedule (migration 052): "Planned Sat, Sep 12 · 04:30
-            // · 45m" — read-only; the recipient never moves the owner's block.
-            if let planned = sharedPlannedLabel(nextDate: d.nextDate, nextStartTime: d.nextStartTime,
-                                                nextDurationMinutes: d.nextDurationMinutes, nextDone: d.nextDone) {
+            // The owner's schedule (migration 052 / 053): "Planned Sat, Sep 12 ·
+            // 04:30 · 45m" in MY zone — read-only; the recipient never moves the
+            // owner's block. Opened from a calendar block → that block's slot.
+            if let planned = Self.plannedLabel(detail: d, block: block) {
                 HStack(spacing: 6) {
                     Image(systemName: "calendar").font(.system(size: 11, weight: .semibold))
                     Text(planned).font(UFont.sans(12.5, .medium))
@@ -645,6 +685,16 @@ struct SharedTaskDetailSheet: View {
             }
         }
         .padding(20)
+    }
+
+    /// The "Planned …" / "Done …" line: the tapped calendar block's slot when
+    /// the sheet was opened from one, else the projection's next block —
+    /// both rendered in the recipient's zone when an instant is available.
+    static func plannedLabel(detail d: SharedTaskDetail, block: SharedBlock?, timeZone: TimeZone = .current) -> String? {
+        if let b = block { return sharedBlockPlannedLabel(b, timeZone: timeZone) }
+        return sharedPlannedLabel(nextDate: d.nextDate, nextStartTime: d.nextStartTime,
+                                  nextDurationMinutes: d.nextDurationMinutes, nextDone: d.nextDone,
+                                  nextStartAt: d.nextStartAt, timeZone: timeZone)
     }
 
     private func metaChips(_ d: SharedTaskDetail) -> [String] {

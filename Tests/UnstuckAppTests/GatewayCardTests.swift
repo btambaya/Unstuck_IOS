@@ -250,6 +250,51 @@ final class GatewayCardTests: XCTestCase {
         XCTAssertNotEqual(GatewayInputs.minute(of: t1), GatewayInputs.minute(of: t2))
     }
 
+    func testMemoRecomputesOnceTheMomentsAreBootstrapped() {
+        // The first body runs BEFORE `.task { bootstrap() }`: moments == nil,
+        // so the derived moment is nil. For a user with nothing dismissed
+        // every other input is identical after bootstrap — the key MUST
+        // differ, else the cached nil moment sticks until the next minute.
+        let memo = GatewayMemo<GatewayInputs, GatewayDerived>()
+        var before = GatewayInputs(tasks: [], blocks: [], sessions: [], facts: [], struggles: [],
+                                   rituals: .defaults, dismissed: [], todayIso: today, minute: 100)
+        before.bootstrapped = false
+        var after = before
+        after.bootstrapped = true
+        XCTAssertNotEqual(before, after)
+        var computes = 0
+        let first = memo.value(for: before) { computes += 1; return GatewayDerived(brief: "b", moment: nil) }
+        XCTAssertNil(first.moment)
+        let second = memo.value(for: after) {
+            computes += 1
+            return GatewayDerived(brief: "b", moment: Moment(id: "m", kind: .ritual, priority: 1, salience: 1, text: "Morning", actions: []))
+        }
+        XCTAssertEqual(second.moment?.id, "m", "post-bootstrap key recomputes — the moment shows at once")
+        XCTAssertEqual(computes, 2)
+        XCTAssertEqual(GatewayInputs(tasks: [], blocks: [], sessions: [], facts: [], struggles: [],
+                                     rituals: .defaults, dismissed: [], todayIso: today, minute: 100).bootstrapped,
+                       true, "the memberwise default is the steady state")
+    }
+
+    // MARK: the account-wide interview flag applied by a LATER hydrate
+
+    func testALaterServerInterviewFlagDropsThePillAndClosesAnOpenPanel() {
+        // Server says done (applied by a foreground syncNow after the sign-in
+        // read timed out): the pill goes and an open panel — a fresh machine
+        // at step 0 for a done account — closes.
+        var r = GatewayInterviewFlag.apply(serverDone: true, done: false, open: true)
+        XCTAssertEqual(r.done, true); XCTAssertEqual(r.open, false)
+        r = GatewayInterviewFlag.apply(serverDone: true, done: false, open: false)
+        XCTAssertEqual(r.done, true); XCTAssertEqual(r.open, false)
+        r = GatewayInterviewFlag.apply(serverDone: true, done: true, open: false)
+        XCTAssertEqual(r.done, true); XCTAssertEqual(r.open, false)
+        // Not done on the server: nothing changes here (the scrub owns un-done).
+        r = GatewayInterviewFlag.apply(serverDone: false, done: false, open: true)
+        XCTAssertEqual(r.done, false); XCTAssertEqual(r.open, true)
+        r = GatewayInterviewFlag.apply(serverDone: false, done: true, open: false)
+        XCTAssertEqual(r.done, true); XCTAssertEqual(r.open, false)
+    }
+
     // MARK: assistant routing helpers (C2)
 
     func testSettingsSectionParsing() {

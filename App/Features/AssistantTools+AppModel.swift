@@ -58,8 +58,21 @@ final class AppModelAssistantState: AssistantAppState {
 
     private func collection(_ id: String) -> ItemCollection? { getCollections().first { $0.id == id } }
 
+    /// Committed to GRDB BEFORE returning (the executor contract): the UI's
+    /// `AppModel.addCollection` schedules its upsert in a detached Task, so a
+    /// later tool in the same turn (add_to_list / rename_list on the id just
+    /// returned) re-fetched a row that wasn't there yet and silently no-op'd
+    /// while reporting `ok:`. Same row shape as the UI path, one transaction
+    /// (row + outbox op), then the debounced flush kick.
     func addCollection(name: String, color: String) -> String? {
-        model.addCollection(name: name, color: color, existing: getCollections())?.id
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let write = model.write else { return nil }
+        let nextOrder = (getCollections().map(\.sortOrder).max() ?? -1) + 1
+        let col = ItemCollection(id: newUUID(), name: trimmed, color: color, subtitle: nil,
+                                 items: [], sortOrder: nextOrder, archived: false)
+        do { try write.upsertCollectionSync(col, nowISO: AppModel.isoNow()) } catch { return nil }
+        if let coord = model.coordinator { Task { await coord.kickFlush() } }
+        return col.id
     }
     func addCollectionItem(collectionId: String, body: String) {
         guard let c = collection(collectionId) else { return }
@@ -229,14 +242,13 @@ final class AppModelAssistantState: AssistantAppState {
 
     // MARK: settings
 
-    func setUsableMinutes(weekday: Int?, weekend: Int?) async {
-        // Local first (the value the brief math reads), server best-effort.
-        let d = UserDefaults.standard
-        if let weekday { d.set(weekday, forKey: "unstuck.usableMinutesPerDay") }
-        if let weekend { d.set(weekend, forKey: "unstuck.usableMinutesWeekend") }
-        // Server mirror (user_preferences.usable_minutes_per_day / _weekend) —
-        // best-effort: the local value is what the brief math reads.
-        try? await model.coordinator?.preferences.setUsableMinutes(perDay: weekday, weekend: weekend)
+    /// The budget lives on the server (`user_preferences.usable_minutes_*` —
+    /// the web calendar's capacity math reads it; nothing on iOS does yet), so
+    /// the server write IS the change: awaited, and the local cache is written
+    /// only after it lands. The REAL outcome is returned so the executor's
+    /// `ok:` can't claim a save that didn't happen (see the tool contract).
+    func setUsableMinutes(weekday: Int?, weekend: Int?) async -> Bool {
+        await model.setUsableMinutesAwaiting(perDay: weekday, weekend: weekend)
     }
     /// The REAL outcome (web parity): the local write read back + the server
     /// mirror awaited — false makes the contract's "could not save" reachable.

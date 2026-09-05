@@ -5,6 +5,7 @@
 // ops under the new user's id (cross-account leak).
 
 import XCTest
+import GRDB
 import UnstuckCore
 @testable import UnstuckData
 
@@ -34,6 +35,35 @@ final class SyncStoreClearAllTests: XCTestCase {
         XCTAssertNil(try db.fetchById(TaskItem.self, id: "old"))
         XCTAssertEqual(try db.fetchById(TaskItem.self, id: "x")?.name, "Second")
         XCTAssertEqual(try db.fetchById(TaskItem.self, id: "y")?.name, "Other")
+    }
+
+    func testClearAllKeepsParkedOpsAndWipesTheCaptureArchive() throws {
+        let box = OutboxStore(db)
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, payload: "{}", nowISO: now)
+        try box.park(userId: "u1")
+        try db.setCaptureArchived(id: "c1", archivedAt: now)
+        XCTAssertEqual(try db.archivedCaptureIds(), ["c1"])
+
+        try db.clearAll()
+
+        XCTAssertEqual(try box.parkedCount(userId: "u1"), 1, "parked ops survive the wipe for their owner's next sign-in")
+        XCTAssertTrue(try db.archivedCaptureIds().isEmpty)
+    }
+
+    func testCaptureArchiveHelpers() throws {
+        try db.setCaptureArchived(id: "c1", archivedAt: now)
+        try db.setCaptureArchived(id: "c2", archivedAt: now)
+        XCTAssertEqual(try db.captureArchivedAt(id: "c1"), now)
+        try db.setCaptureArchived(id: "c1", archivedAt: nil)
+        XCTAssertNil(try db.captureArchivedAt(id: "c1"))
+        XCTAssertEqual(try db.archivedCaptureIds(), ["c2"])
+        // Server-canonical replace: pending ids keep their local state, both ways.
+        try db.writer.write { conn in
+            try AppDatabase.replaceCaptureArchive(in: conn,
+                                                   serverArchived: ["s1": now, "c1": now],   // server: c1 archived
+                                                   keepLocalIds: ["c1", "c2"])               // local says c1 open, c2 archived
+        }
+        XCTAssertEqual(try db.archivedCaptureIds(), ["s1", "c2"])
     }
 
     func testClearAllWipesRecordsOutboxAndLiveSession() throws {

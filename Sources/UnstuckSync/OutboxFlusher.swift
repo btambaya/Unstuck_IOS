@@ -9,11 +9,17 @@
 //  • blockedRows: once an op for a row fails this pass, that row's LATER
 //    ops are skipped — the server converges to the last-enqueued state in
 //    seq order (an older retried upsert can't clobber a newer one).
-//  • poison pill: after FAIL_CAP consecutive same-process failures an op
-//    is dropped, along with the ops that depended on its row (their FK
-//    parent will never exist server-side).
+//  • quarantine (was: poison pill): an op the server REJECTS (PostgREST
+//    4xx — FK / check / unknown column) `OutboxStore.quarantineCap` times is
+//    quarantined — KEPT in the outbox (the local row survives every hydrate
+//    via the pending-row preservation, and a future build / support can
+//    retry it), skipped by every drain, never deleted. Ops that depend on it
+//    stay held back behind it. Offline / timeout / 5xx / auth-refresh
+//    failures are TRANSIENT: they never count — the old cap counted plain
+//    airplane-mode failures and silently dropped valid writes after five.
 
 import Foundation
+import Supabase
 import UnstuckData
 
 public actor OutboxFlusher {
@@ -22,24 +28,14 @@ public actor OutboxFlusher {
     private let db: AppDatabase
     private let decoder = JSONDecoder()
 
-    // Per-op consecutive-failure tally (keyed by outbox seq). In-memory and
-    // resets on app restart, so a transient failure (offline) still gets
-    // full retries next launch; only a genuinely poison op (a payload the
-    // server rejects forever) is dropped after FAIL_CAP failures.
-    private var failCounts: [Int64: Int] = [:]
-    private static let failCap = 5
-
-    // Quarantined (dead-lettered) op seqs: malformed ops we can't even build a
-    // request for — an unknown tableName or a nil/undecodable upsert payload.
-    // These can never succeed by retrying, but they must NOT be markDone'd
-    // (that silently drops the user's local row) and must NOT be retried as if
-    // transiently failing (that would poison-cap a healthy app or spin the
-    // drain). We keep the outbox row, stop sending it, and skip it every pass —
-    // the local row stays put, and hydrate's pending-row preservation still
-    // protects it from a blanking replace. In-memory (resets on relaunch) so a
-    // future build that learns the table/payload can flush it. Mirrors the
-    // idea of a dead-letter queue without a schema change.
-    private var quarantined: Set<Int64> = []
+    // Quarantined (dead-lettered) op seqs for MALFORMED ops: ones we can't even
+    // build a request for — an unknown tableName or a nil/undecodable upsert
+    // payload. These can never succeed by retrying, but they must NOT be
+    // markDone'd (that silently drops the user's local row) and must NOT be
+    // retried as if transiently failing. In-memory (resets on relaunch) so a
+    // future build that learns the table/payload can flush it. Server-rejected
+    // ops use the PERSISTED `attempts` counter instead (OutboxOp.isQuarantined).
+    private var malformed: Set<Int64> = []
 
     public init(gateway: any SyncGatewayProtocol, db: AppDatabase) {
         self.gateway = gateway
@@ -61,11 +57,10 @@ public actor OutboxFlusher {
     // chaining, two of the four overlapping flush triggers (debounced post-write
     // kick / scenePhase syncNow / auth event / sign-out task group) interleave:
     // while one is suspended in `await apply(op)` before markDone, another re-reads
-    // pending() and re-applies the same op + races failCounts (the per-pass
-    // blockedRows set is task-local, defeating last-writer-wins). Android serializes
-    // with a Mutex; we chain through this Task. Chaining (not bail-if-busy) so the
-    // bounded sign-out drain actually completes a pass before clearAll() wipes the
-    // outbox, instead of early-returning.
+    // pending() and re-applies the same op (the per-pass blockedRows set is
+    // task-local, defeating last-writer-wins). Android serializes with a Mutex;
+    // we chain through this Task. Chaining (not bail-if-busy) so the bounded
+    // sign-out drain actually completes a pass before the outbox is parked.
     private var draining: Task<Void, Never>?
 
     public func flush(userId: String) async {
@@ -85,7 +80,7 @@ public actor OutboxFlusher {
     private func drainLoop(userId: String, currentUserId: @Sendable () -> String?) async {
         while true {
             // A cancelled drain (sign-out's 5s timeout, BG-task stop) is normal
-            // control flow, not a failure — abort without burning the poison cap.
+            // control flow, not a failure — abort without counting anything.
             if Task.isCancelled { return }
             // Bail if the signed-in user changed mid-drain (sign-out + sign-in
             // to a different account). RLS already blocks a cross-account
@@ -109,9 +104,10 @@ public actor OutboxFlusher {
             // at session end). A parent present locally with no pending op has been
             // flushed/hydrated, so the FK is satisfied server-side.
             let flushable = all.filter { op in
-                // Skip dead-lettered ops: kept in the outbox (the local row
+                // Skip quarantined ops: kept in the outbox (the local row
                 // survives) but never re-sent, so they don't spin the loop.
-                if let seq = op.opSeq, quarantined.contains(seq) { return false }
+                if op.isQuarantined { return false }
+                if let seq = op.opSeq, malformed.contains(seq) { return false }
                 guard let dep = op.dependsOn else { return true }
                 if pendingRowIds.contains(dep) { return false }
                 guard let parent = Self.dependsOnParentTable(op.tableName) else { return true }
@@ -130,46 +126,41 @@ public actor OutboxFlusher {
                 do {
                     try await apply(op, userId: userId)
                     try box.markDone(seq)
-                    failCounts[seq] = nil
                     progressed = true
-                } catch let malformed as MalformedOpError {
+                } catch let bad as MalformedOpError {
                     // Structurally-invalid op (nil payload / unknown table): it
                     // can never become a request, so dead-letter it — keep the
                     // outbox row (the user's local row is untouched and stays on
                     // the UI via hydrate's pending-row preservation), stop
                     // re-sending it, and don't markDone (the old code's silent
-                    // drop) or burn the poison cap (it isn't a server rejection).
-                    // Block this row's later ops too, preserving per-row order.
-                    print("[outbox] quarantining malformed op \(rowKey): \(malformed.reason)")
-                    quarantined.insert(seq)
+                    // drop). Block this row's later ops too, preserving per-row order.
+                    print("[outbox] quarantining malformed op \(rowKey): \(bad.reason)")
+                    malformed.insert(seq)
                     blockedRows.insert(rowKey)
                 } catch {
-                    // Cancellation (sign-out timeout / BG-task stop / URLSession
-                    // cancelled) is NOT a server rejection — abort the drain
-                    // without touching failCounts/blockedRows, or a repeated
-                    // sign-out on a slow link would poison-drop a valid op + its
-                    // FK dependents. Mirrors Android's `catch CancellationException`.
-                    if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                    switch SyncDecision.classifyFlushFailure(error) {
+                    case .cancelled:
+                        // Sign-out timeout / BG-task stop / URLSession cancelled —
+                        // not a server verdict. Abort the drain untouched.
                         return
-                    }
-                    print("[outbox] \(rowKey) failed: \(error)")
-                    blockedRows.insert(rowKey)
-                    try? box.bumpAttempts(seq)   // persisted for field debugging only
-                    let n = (failCounts[seq] ?? 0) + 1
-                    failCounts[seq] = n
-                    if n >= Self.failCap {
-                        print("[outbox] dropping poison op \(rowKey) after \(n) failures")
-                        try? box.markDone(seq)
-                        failCounts[seq] = nil
-                        progressed = true
-                        // Also drop ops that depended on this row — their FK parent
-                        // will never exist server-side, so flushing them would push
-                        // a dangling reference (or fail forever in turn).
-                        for dep in all where dep.dependsOn == op.rowId {
-                            guard let depSeq = dep.opSeq else { continue }
-                            print("[outbox] dropping orphaned dependent \(dep.tableName):\(dep.rowId)")
-                            try? box.markDone(depSeq)
-                            failCounts[depSeq] = nil
+                    case .transient:
+                        // Offline, timeout, 5xx, JWT refresh in flight: the op is
+                        // fine, the network isn't. Block the row for this pass
+                        // (per-row order) and retry on the next drain. NEVER
+                        // counted — five airplane-mode passes used to drop a
+                        // valid write and its FK dependents for good.
+                        print("[outbox] \(rowKey) transient failure, will retry: \(error)")
+                        blockedRows.insert(rowKey)
+                    case .rejected:
+                        // The server understood and refused these exact bytes.
+                        // Count it (persisted); at the cap the op is quarantined:
+                        // kept, skipped, never deleted — and its dependents stay
+                        // held back behind it rather than being dropped too.
+                        print("[outbox] \(rowKey) rejected by server: \(error)")
+                        blockedRows.insert(rowKey)
+                        let n = (try? box.bumpAttempts(seq)) ?? 0
+                        if n >= OutboxStore.quarantineCap {
+                            print("[outbox] quarantining \(rowKey) after \(n) rejections (kept, no longer sent)")
                         }
                     }
                 }
@@ -180,8 +171,8 @@ public actor OutboxFlusher {
 
     /// A structurally-invalid op the flusher can never turn into a request:
     /// an upsert with a nil payload, or a tableName the apply switch doesn't
-    /// know. NOT a server rejection (so it must not feed the poison cap) and
-    /// NOT success (so the op must not be markDone'd) — it's dead-lettered.
+    /// know. NOT a server rejection (so it must not feed the cap) and NOT
+    /// success (so the op must not be markDone'd) — it's dead-lettered.
     struct MalformedOpError: Error {
         enum Reason { case missingPayload, unknownTable(String) }
         let reason: Reason
@@ -215,5 +206,44 @@ public actor OutboxFlusher {
         // `default: break` (which fell through to markDone, dropping the row).
         default: throw MalformedOpError(reason: .unknownTable(op.tableName))
         }
+    }
+}
+
+// MARK: - supabase-swift error classification
+
+/// PostgREST error body (`{code, message, details, hint}`). The `code` is a
+/// Postgres SQLSTATE or a `PGRSTnnn` code. Definite rejections: integrity /
+/// data / syntax classes (23xxx FK+unique+check, 22xxx bad value, 42xxx
+/// unknown column / permission) and the PostgREST request-shape codes
+/// (PGRST1xx / PGRST2xx — e.g. PGRST204 unknown column). Transient: the JWT
+/// codes (PGRST30x — the SDK refreshes the token), connection / pool errors
+/// (PGRST00x, 08xxx, 53xxx, 57xxx), serialization retries (40001) and any
+/// body without a code (a gateway / edge error page).
+extension PostgrestError: ServerRejectionClassifiable {
+    public var isServerRejection: Bool {
+        guard let code, !code.isEmpty else { return false }
+        if code.hasPrefix("PGRST") {
+            let n = Int(code.dropFirst(5)) ?? 0
+            return (100..<300).contains(n)
+        }
+        guard code.count == 5 else { return false }
+        let cls = code.prefix(2)
+        switch cls {
+        case "22", "23", "42", "P0": return true     // data, integrity, syntax/access, PL/pgSQL raise
+        case "08", "53", "57", "40": return false    // connection, resources, operator intervention, tx retry
+        default: return false
+        }
+    }
+}
+
+/// A non-2xx response whose body wasn't a PostgREST error object. 4xx is the
+/// server refusing the request; 401 / 403 / 408 / 425 / 429 are auth-refresh
+/// / timing / rate-limit shapes that a retry can clear, and 5xx is the
+/// server's problem — all transient.
+extension HTTPError: ServerRejectionClassifiable {
+    public var isServerRejection: Bool {
+        let status = response.statusCode
+        guard (400..<500).contains(status) else { return false }
+        return ![401, 403, 408, 425, 429].contains(status)
     }
 }

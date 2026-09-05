@@ -9,6 +9,7 @@ import Foundation
 import UnstuckCore
 import UnstuckData
 import UnstuckShared
+import UnstuckSync
 import UserNotifications
 
 extension AppModel {
@@ -63,7 +64,10 @@ extension AppModel {
     /// is dropped, never retried forever). Returns true if anything was applied.
     @discardableResult
     func drainSiriWriteQueue() -> Bool {
-        guard write != nil else { return false }   // need an authed writer
+        // Need an authed writer: a queue drained while signed OUT (the writer
+        // still exists between accounts) would land the previous person's
+        // hands-free captures in whoever signs in next.
+        guard signedIn, write != nil else { return false }
         let ops = AppGroup.readWriteQueue()
         guard !ops.isEmpty else { return false }
         let tasks = (try? taskRepo?.all()) ?? []
@@ -358,26 +362,39 @@ extension AppModel {
 
     // MARK: NotificationLevel + reminder lead (spec 10 §1.12)
 
-    /// Change the notification level: re-sync the reminder alarms and
-    /// mirror the level-derived booleans to notification_preferences so
-    /// the cron morning-brief + server paused-checkin cap honour it —
-    /// best-effort, only when the value actually changed.
+    /// Change the notification level (Settings): re-sync the reminder alarms
+    /// and write the level — plus its derived booleans, for the cron
+    /// morning-brief + server paused-checkin cap — through to
+    /// `notification_preferences`, the same columns the web reads back. Only
+    /// when the value actually changed. Same path as the assistant's
+    /// `set_notification_level` (setNotificationLevelAwaiting).
     func setNotificationLevel(_ level: NotificationLevel) {
         guard NotificationPrefs.level != level else { return }
-        NotificationPrefs.level = level
-        ReminderScheduler.shared.resync()
-        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
-        Task {
-            try? await coord.preferences.setNotificationLevel(
-                userId: uid, morningBrief: level.morningBrief, pausedCheckin: level.pausedCheckin)
-        }
+        Task { await setNotificationLevelAwaiting(level) }
     }
 
-    /// Change the global "remind me N min before" lead (0 = Off) and
-    /// re-sync the alarms.
+    /// Change the global "remind me N min before" lead (0 = Off): re-sync the
+    /// alarms and write `reminder_lead_min` through (was: local only, so the
+    /// web and a second device kept a different lead).
     func setReminderLeadMin(_ minutes: Int) {
         guard NotificationPrefs.reminderLeadMin != minutes else { return }
-        NotificationPrefs.reminderLeadMin = minutes
-        ReminderScheduler.shared.resync()
+        Task { await setReminderLeadAwaiting(minutes) }
+    }
+
+    /// The server's level + lead landed (hydrate): the server is the
+    /// account-wide source of truth, so a non-null value replaces the local
+    /// cache; null (never set on any device) keeps the local one. Re-arms the
+    /// alarms when anything changed.
+    func applyServerNotificationPrefs(_ row: NotificationPrefsRow) {
+        var changed = false
+        if let level = NotificationPrefs.level(fromServer: row.level), level != NotificationPrefs.level {
+            NotificationPrefs.level = level
+            changed = true
+        }
+        if let lead = row.reminderLeadMin, lead != NotificationPrefs.reminderLeadMin {
+            NotificationPrefs.reminderLeadMin = lead
+            changed = true
+        }
+        if changed { ReminderScheduler.shared.resync() }
     }
 }

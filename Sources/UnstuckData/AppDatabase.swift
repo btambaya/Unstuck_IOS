@@ -190,6 +190,40 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        // Sync-engine hardening:
+        //  • outbox.baseUpdatedAt / basePayload — the row a task edit was made
+        //    on top of, so the prune compares server clock with server clock
+        //    (skew-proof) and can 3-way merge instead of dropping the op.
+        //  • parked_outbox — un-pushed ops kept across a sign-out, keyed by the
+        //    owning user, restored on THAT user's next sign-in (never replayed
+        //    under anyone else). Survives clearAll.
+        //  • capture_archive — the Inbox archive state (server `captures.
+        //    archived_at`, migration 053) as a local table: the UI's archived
+        //    set is a cache of this, and a row here means "archived_at is set".
+        m.registerMigration("v4_outbox_base_parking_capture_archive") { db in
+            try db.alter(table: "outbox") { t in
+                t.add(column: "baseUpdatedAt", .text)
+                t.add(column: "basePayload", .text)
+            }
+            try db.create(table: "parked_outbox") { t in
+                t.autoIncrementedPrimaryKey("parkSeq")
+                t.column("userId", .text).notNull().indexed()
+                t.column("tableName", .text).notNull()
+                t.column("rowId", .text).notNull()
+                t.column("kind", .text).notNull()
+                t.column("payload", .text)
+                t.column("dependsOn", .text)
+                t.column("attempts", .integer).notNull().defaults(to: 0)
+                t.column("createdAt", .text).notNull()
+                t.column("baseUpdatedAt", .text)
+                t.column("basePayload", .text)
+            }
+            try db.create(table: "capture_archive") { t in
+                t.primaryKey("captureId", .text)
+                t.column("archivedAt", .text).notNull()
+            }
+        }
+
         return m
     }()
 }

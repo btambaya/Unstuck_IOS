@@ -114,7 +114,7 @@ protocol AssistantAppState: AnyObject {
     func updateTag(_ id: String, name: String?) async
     func removeTag(_ id: String) async
     // ── settings ──
-    func setUsableMinutes(weekday: Int?, weekend: Int?) async
+    func setUsableMinutes(weekday: Int?, weekend: Int?) async -> Bool
     func setNotificationLevel(_ level: String) async -> Bool
     func setReminderLead(_ minutes: Int) async -> Bool
     func setRitual(_ ritual: String, on: Bool)
@@ -391,7 +391,13 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
 
     case "set_task_later":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
-        t.later = args.bool("later") ?? true
+        let wantLater = args.bool("later") ?? true
+        // Never ok: for a no-op — the receipt ("Moved to Later") would describe
+        // a change that didn't happen (web parity).
+        let isLater = t.later ?? false
+        if wantLater && isLater { return "error: \"\(t.name)\" is already in Later — nothing changed" }
+        if !wantLater && !isLater { return "error: \"\(t.name)\" is not in Later — nothing changed" }
+        t.later = wantLater
         t.updatedAt = now()
         await api.upsertTask(t)
         scratch.newTasks[t.id] = t
@@ -428,12 +434,13 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
 
     case "complete_task":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
-        if !t.done {
-            t.done = true
-            t.updatedAt = now()
-            await api.upsertTask(t)
-            scratch.newTasks[t.id] = t
-        }
+        // Already done → error, not ok: an "ok: completed" receipt's Undo would
+        // REOPEN something the user finished earlier (web parity).
+        if t.done { return "error: \"\(t.name)\" is already done — nothing changed" }
+        t.done = true
+        t.updatedAt = now()
+        await api.upsertTask(t)
+        scratch.newTasks[t.id] = t
         // id in the result: the receipt's undo must target THIS task.
         return "ok: completed \"\(t.name)\" id=\(t.id)"
 

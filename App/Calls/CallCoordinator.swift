@@ -40,7 +40,8 @@ final class CallCoordinator {
             environment: AppCallEnvironment(model: nil),
             launcher: NoopCallVoiceLauncher(), launcherAttached: false,
             notifier: SystemCallNotifier(), reporter: CallsOutcomeReporter(),
-            clock: SystemCallClock())
+            clock: SystemCallClock(),
+            rearmVoip: { VoipPushRegistry.shared.rearm() })
         provider.coordinator = c
         return c
     }()
@@ -68,6 +69,11 @@ final class CallCoordinator {
     /// Fallback-B: a tapped "call" alert push whose Talk hand-off nobody has
     /// consumed yet (buffered until `onFallbackAnswer` is set).
     private(set) var pendingFallback: CallSession?
+    /// Fallback-B, one step earlier: a tap that landed BEFORE the real session
+    /// was known (a cold launch off the alert — PushAppDelegate fires before
+    /// AppModel.start()). Decided in `attach(environment:)`; never dropped on
+    /// the VoIP-token proxy, which is false exactly when transport B is used.
+    private(set) var deferredFallbackTap: IncomingCallPayload?
     /// Set by the integrator: open Talk with the call payload (fallback B).
     var onFallbackAnswer: ((CallSession) -> Void)? {
         didSet { if let s = pendingFallback, let h = onFallbackAnswer { pendingFallback = nil; h(s) } }
@@ -76,6 +82,9 @@ final class CallCoordinator {
     weak var attachedModel: AppModel?
     /// The calls client once attached (Settings / task editor / tools).
     private(set) var callsClient: CallsClient?
+    /// The auth watcher `attach(model:client:)` installs (re-arms PushKit on
+    /// every sign-in within one launch).
+    var authWatch: Task<Void, Never>?
 
     private let provider: CallProviding
     private let controller: CallControlling
@@ -85,6 +94,8 @@ final class CallCoordinator {
     private let notifier: CallNotifier
     private let reporter: CallOutcomeReporting
     private let clock: CallClock
+    /// Re-register for VoIP pushes (VoipPushRegistry.rearm in production).
+    private let rearmVoip: @MainActor () -> Void
 
     private var ringTimer: CallTimer?
     private var graceTimer: CallTimer?
@@ -93,7 +104,8 @@ final class CallCoordinator {
 
     init(provider: CallProviding, controller: CallControlling, environment: CallEnvironment,
          launcher: CallVoiceLauncher, launcherAttached: Bool = true,
-         notifier: CallNotifier, reporter: CallOutcomeReporting, clock: CallClock) {
+         notifier: CallNotifier, reporter: CallOutcomeReporting, clock: CallClock,
+         rearmVoip: @escaping @MainActor () -> Void = {}) {
         self.provider = provider
         self.controller = controller
         self.environment = environment
@@ -102,11 +114,20 @@ final class CallCoordinator {
         self.notifier = notifier
         self.reporter = reporter
         self.clock = clock
+        self.rearmVoip = rearmVoip
     }
 
     // MARK: - attach (late binding from AppModel / the integrator)
 
-    func attach(environment: CallEnvironment) { self.environment = environment }
+    /// Bind the environment. A fallback tap deferred until the session was
+    /// known is decided now (handed off, or dropped if nobody is signed in).
+    func attach(environment: CallEnvironment) {
+        self.environment = environment
+        if let p = deferredFallbackTap, environment.isSessionKnown {
+            deferredFallbackTap = nil
+            handleFallbackTap(p)
+        }
+    }
 
     func attach(client: CallsClient) {
         callsClient = client
@@ -383,17 +404,44 @@ final class CallCoordinator {
 
     /// Fallback B: the user tapped the time-sensitive "call" alert (or its
     /// Answer action). Hand the session to Talk (via `onFallbackAnswer`), or
-    /// buffer it until set. Dropped when nobody is signed in.
+    /// buffer it until set. Dropped when nobody is signed in — but that is
+    /// decided on the REAL session: the tap foregrounds the app, so when the
+    /// environment only has the killed-state proxy (no AppModel yet) the tap
+    /// is deferred until `attach(environment:)` rather than dropped (the
+    /// proxy — "a VoIP token is stored" — is false precisely when the server
+    /// fell back to the alert transport).
     func handleFallbackTap(_ payload: IncomingCallPayload) {
+        guard environment.isSessionKnown else { deferredFallbackTap = payload; return }
         guard environment.isSignedIn else { return }
         let session = CallSession(payload: payload, receivedAt: clock.now)
         report(session, .answered)
         if let h = onFallbackAnswer { h(session) } else { pendingFallback = session }
     }
 
+    /// Fallback B's "call me back in N": there is no CallKit call to hang up,
+    /// so the `snoozed` outcome is reported straight through the PERSISTED,
+    /// ordered reporter (after the `answered` that the tap queued) — never a
+    /// fire-and-forget request that a tunnel or a 5xx could lose, leaving the
+    /// row `answered` with no snooze_until and the dispatcher never re-ringing.
+    /// Clamped 1…180 like the CallKit snooze.
+    func reportFallbackSnooze(callId: String, minutes: Int) {
+        let m = min(180, max(1, minutes))
+        reporter.report(callId: callId, callKitId: nil, outcome: .snoozed, snoozeMinutes: m, outcomeNotes: nil)
+    }
+
+    /// The account signed in (or switched) within this launch: re-arm PushKit
+    /// so the next booked call rings through CallKit instead of degrading to
+    /// the alert banner — a sign-out dropped the VoIP registration and only
+    /// `attach(model:client:)` (once per launch) used to re-arm it.
+    func signedIn() {
+        rearmVoip()
+    }
+
     /// The account signed out (VoipPushRegistry.unregisterBestEffort): tear
     /// down whatever is up WITHOUT reporting or notifying — the JWT is gone
-    /// and the notes belong to the previous user.
+    /// and the notes belong to the previous user — and forget any outcome
+    /// still queued for it (unsendable now; the next account's server would
+    /// answer not_found for every one of them).
     func signedOut() {
         ringTimer?.cancel(); ringTimer = nil
         graceTimer?.cancel(); graceTimer = nil
@@ -404,6 +452,8 @@ final class CallCoordinator {
         }
         active = nil
         pendingFallback = nil
+        deferredFallbackTap = nil
+        reporter.discardAll()
     }
 }
 

@@ -87,4 +87,149 @@ public enum SyncDecision {
         merged.append(contentsOf: localOnly)
         return ProfileFactsMerge(merged: merged, pushLocalOnly: localOnly, staleLocalIds: stale)
     }
+
+    // MARK: - hydrate: preserve rows with a pending upsert (spec §1.3 localPending)
+
+    /// The server set is canonical, EXCEPT for rows this device still has a
+    /// queued upsert for: those carry an un-acked local intent, so
+    ///  • a pending row the server doesn't have yet survives the replace
+    ///    (else an offline-created task vanishes until the flush), and
+    ///  • a pending row the server ALSO has is decided by `resolve(local,
+    ///    remote)` — last-write-wins on `updatedAt` for tasks, "local intent
+    ///    wins" for tables without a timestamp.
+    /// Output order: remote order, then the local-only pending rows.
+    public static func mergeHydratedRows<T: Identifiable>(
+        remote: [T], local: [T], pendingIds: Set<String>,
+        resolve: (_ local: T, _ remote: T) -> T
+    ) -> [T] where T.ID == String {
+        guard !pendingIds.isEmpty else { return remote }
+        var localById: [String: T] = [:]
+        for l in local where pendingIds.contains(l.id) { localById[l.id] = l }
+        var out: [T] = []
+        var seen = Set<String>()
+        for r in remote {
+            seen.insert(r.id)
+            if let l = localById[r.id] { out.append(resolve(l, r)) } else { out.append(r) }
+        }
+        for l in local where pendingIds.contains(l.id) && !seen.contains(l.id) { out.append(l) }
+        return out
+    }
+
+    /// LWW resolver for rows with an `updatedAt` instant: the strictly-newer
+    /// side wins, ties + unparseable go to the server (cross-device truth).
+    public static func newerWins<T>(_ local: T, _ remote: T, updatedAt: (T) -> String) -> T {
+        guard let l = Time.parseMillis(updatedAt(local)), let r = Time.parseMillis(updatedAt(remote)) else { return remote }
+        return l > r ? local : remote
+    }
+
+    /// Hydrate resolver for a task with a pending upsert: the local row is the
+    /// newest intent as long as the server row hasn't moved past the base the
+    /// edit was made on (`serverUpdatedAt ≤ baseUpdatedAt`, server clocks on
+    /// both sides); once the server has moved, last-write-wins decides.
+    public static func resolvePendingTask(local: TaskItem, remote: TaskItem, baseUpdatedAt: String?) -> TaskItem {
+        if let base = baseUpdatedAt, let b = Time.parseMillis(base), let r = Time.parseMillis(remote.updatedAt), r <= b + 1 {
+            return local
+        }
+        return newerWins(local, remote, updatedAt: \.updatedAt)
+    }
+
+    // MARK: - prune-before-flush: skew-tolerant conflict detection + 3-way merge
+
+    public enum StaleOpDecision: Equatable, Sendable {
+        /// The server row hasn't moved since this device based its edit on it — flush as-is.
+        case keep
+        /// The server row changed underneath the edit — merge the local diff onto it.
+        case conflict
+        /// Legacy op (no base) that a strictly-newer server row supersedes — drop it.
+        case prune
+    }
+
+    /// Skew allowance when comparing a device-clock stamp with a server one
+    /// (the legacy no-base path only).
+    public static let clockSkewMarginMs: Double = 2_000
+
+    /// Decide what to do with a queued `tasks` op given the server row's
+    /// `updated_at`. With a base (`baseUpdatedAtMs`, the server-stamped value
+    /// this device last saw) the comparison is server-clock vs server-clock —
+    /// no skew — and a moved server row is a CONFLICT to merge, never a drop.
+    /// Without a base (an op enqueued by an older build) fall back to the
+    /// device-clock compare, tolerating `clockSkewMarginMs` in the server's
+    /// favour before pruning.
+    public static func staleTaskOpDecision(serverUpdatedAtMs: Double, baseUpdatedAtMs: Double?,
+                                           opUpdatedAtMs: Double?) -> StaleOpDecision {
+        if let base = baseUpdatedAtMs {
+            // A tiny tolerance covers the server re-emitting the same instant
+            // with different sub-millisecond precision.
+            return serverUpdatedAtMs > base + 1 ? .conflict : .keep
+        }
+        guard let op = opUpdatedAtMs else { return .keep }
+        return serverUpdatedAtMs > op + clockSkewMarginMs ? .prune : .keep
+    }
+
+    /// 3-way merge of flat JSON row objects: for every top-level key, the
+    /// LOCAL value is taken where the edit changed it (op ≠ base), otherwise
+    /// the SERVER's value — so a rename made offline lands on top of a
+    /// completion made on the web instead of clobbering it. `ignoreKeys`
+    /// always take the op's value (updated_at). Nil when any input isn't a
+    /// JSON object.
+    public static func threeWayMergeRow(op: Data, base: Data, server: Data,
+                                        ignoreKeys: Set<String> = ["updated_at"]) -> Data? {
+        guard let o = (try? JSONSerialization.jsonObject(with: op)) as? [String: Any],
+              let b = (try? JSONSerialization.jsonObject(with: base)) as? [String: Any],
+              let s = (try? JSONSerialization.jsonObject(with: server)) as? [String: Any] else { return nil }
+        var out: [String: Any] = s
+        let keys = Set(o.keys).union(b.keys).union(s.keys)
+        for key in keys {
+            let ov = o[key] ?? NSNull()
+            let bv = b[key] ?? NSNull()
+            if ignoreKeys.contains(key) || !jsonEqual(ov, bv) {
+                out[key] = o[key] ?? NSNull()
+            } else if s[key] == nil {
+                // Neither side changed it and the server lacks it: keep the op's.
+                out[key] = ov
+            }
+        }
+        return try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+    }
+
+    /// Structural JSON equality over Foundation's bridged values (NSNull /
+    /// NSNumber / NSString / NSArray / NSDictionary all answer `isEqual`).
+    static func jsonEqual(_ a: Any, _ b: Any) -> Bool {
+        (a as AnyObject).isEqual(b as AnyObject)
+    }
+
+    // MARK: - outbox failure classification
+
+    public enum FlushFailure: Equatable, Sendable {
+        /// The request never got a definitive answer (offline, timeout, 5xx,
+        /// JWT refresh, rate limit) — retry later, never count it.
+        case transient
+        /// The server understood the request and refused it (PostgREST 4xx:
+        /// FK / check / unknown column / bad JSON) — retrying the same bytes
+        /// can't succeed; counts toward the quarantine cap.
+        case rejected
+        /// The drain itself was cancelled (sign-out timeout, BG-task stop).
+        case cancelled
+    }
+
+    /// Classify a flush error. Only DEFINITE server rejections count toward
+    /// the quarantine cap; everything ambiguous is transient (retrying costs a
+    /// request, mis-counting cost the user's data).
+    public static func classifyFlushFailure(_ error: Error) -> FlushFailure {
+        if error is CancellationError { return .cancelled }
+        if let url = error as? URLError {
+            return url.code == .cancelled ? .cancelled : .transient
+        }
+        if let rejection = error as? ServerRejectionClassifiable {
+            return rejection.isServerRejection ? .rejected : .transient
+        }
+        return .transient
+    }
+}
+
+/// Errors that know whether they are a definitive server rejection. The
+/// supabase-swift error types conform in OutboxFlusher (PostgrestError by
+/// SQLSTATE / PGRST code class, HTTPError by status); tests conform a fake.
+public protocol ServerRejectionClassifiable: Error {
+    var isServerRejection: Bool { get }
 }

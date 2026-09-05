@@ -7,8 +7,13 @@
 // (spec 02-sync-engine §1.6 — their id/shape isn't ours; the op would
 // fail forever and wedge the outbox), and every delete cancels the row's
 // still-queued upserts so a held-back upsert can't resurrect it (§1.8).
+//
+// Every row save and its outbox op commit in ONE GRDB transaction: with two
+// transactions a kill between them left a local row with no op, which the
+// next hydrate (server-canonical) silently deleted.
 
 import Foundation
+import GRDB
 import UnstuckCore
 import UnstuckData
 
@@ -30,74 +35,147 @@ public actor WriteThrough {
         onEnqueue = hook
     }
 
-    private func enqueue(table: String, rowId: String, kind: OutboxKind,
-                         payload: String? = nil, dependsOn: String? = nil, nowISO: String) throws {
-        try box.enqueue(table: table, rowId: rowId, kind: kind,
-                        payload: payload, dependsOn: dependsOn, nowISO: nowISO)
-        onEnqueue?()
-    }
-
     private func jsonString<R: Encodable>(_ r: R) throws -> String {
         String(data: try encoder.encode(r), encoding: .utf8) ?? "{}"
     }
 
+    /// Row save + outbox op, atomically.
+    private func saveAndEnqueue<R: PersistableRecord>(_ row: R, table: String, rowId: String, payload: String,
+                                                      dependsOn: String? = nil, nowISO: String,
+                                                      baseUpdatedAt: String? = nil, basePayload: String? = nil) throws {
+        try db.transaction { conn in
+            try row.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: table, rowId: rowId, kind: .upsert, payload: payload,
+                                    dependsOn: dependsOn, nowISO: nowISO,
+                                    baseUpdatedAt: baseUpdatedAt, basePayload: basePayload)
+        }
+        onEnqueue?()
+    }
+
+    /// Row delete + cancel its queued upserts + outbox delete op, atomically.
+    private func deleteAndEnqueue<R: PersistableRecord & FetchableRecord>(_ type: R.Type, table: String, id: String,
+                                                                           nowISO: String,
+                                                                           extra: ((Database) throws -> Void)? = nil) throws {
+        try db.transaction { conn in
+            _ = try type.deleteOne(conn, key: id)
+            try extra?(conn)
+            try OutboxStore.cancelPendingUpserts(in: conn, table: table, rowId: id)
+            try OutboxStore.enqueue(in: conn, table: table, rowId: id, kind: .delete, nowISO: nowISO)
+        }
+        onEnqueue?()
+    }
+
+    /// Tasks carry the BASE (the row as this device last saw it) on the op so
+    /// the prune-before-flush can tell "the server moved underneath this edit"
+    /// apart from device-clock skew, and 3-way merge instead of dropping.
     public func upsertTask(_ t: TaskItem, nowISO: String) throws {
-        try db.save(t)
-        try enqueue(table: "tasks", rowId: t.id, kind: .upsert, payload: try jsonString(TaskRow(t)), nowISO: nowISO)
+        let payload = try jsonString(TaskRow(t))
+        try db.transaction { conn in
+            let existing = try TaskItem.fetchOne(conn, key: t.id)
+            let basePayload = try existing.map { try jsonString(TaskRow($0)) }
+            try t.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: "tasks", rowId: t.id, kind: .upsert, payload: payload,
+                                    nowISO: nowISO, baseUpdatedAt: existing?.updatedAt, basePayload: basePayload)
+        }
+        onEnqueue?()
     }
 
     public func upsertCalBlock(_ b: CalBlock, nowISO: String) throws {
-        try db.save(b)
         // External Google events (g_ ids) are mirrored read-only — never push
         // them to our cal_blocks table (the row id/shape isn't ours; it would
         // fail forever and wedge the outbox). Spec 02-sync-engine §1.6.
-        if b.kind == .external || b.id.hasPrefix("g_") { return }
+        if b.kind == .external || b.id.hasPrefix("g_") {
+            try db.save(b)
+            return
+        }
         let dependsOn = b.taskId.flatMap { isUUID($0) ? $0 : nil }   // wait for the parent task op
-        try enqueue(table: "cal_blocks", rowId: b.id, kind: .upsert,
-                    payload: try jsonString(CalBlockRow(b)), dependsOn: dependsOn, nowISO: nowISO)
+        try saveAndEnqueue(b, table: "cal_blocks", rowId: b.id, payload: try jsonString(CalBlockRow(b)),
+                           dependsOn: dependsOn, nowISO: nowISO)
     }
 
     public func upsertSession(_ s: Session, nowISO: String) throws {
-        try db.save(s)
-        try enqueue(table: "sessions", rowId: s.id, kind: .upsert, payload: try jsonString(SessionRow(s)), nowISO: nowISO)
+        try saveAndEnqueue(s, table: "sessions", rowId: s.id, payload: try jsonString(SessionRow(s)), nowISO: nowISO)
     }
 
+    /// The capture row travels with its CURRENT archive state (`archived_at`,
+    /// migration 053) so a re-save can't un-archive it server-side.
     public func upsertCapture(_ c: Capture, nowISO: String) throws {
-        try db.save(c)
-        // Wait for the parent session row to flush first — a capture taken DURING
-        // a session references a session_id (FK) whose `sessions` row is only
-        // written at session end. The OutboxFlusher holds a dependsOn op while the
-        // parent has a pending op OR doesn't exist locally yet (the live-session
-        // case), so the capture can't push ahead, hit the FK, and be poison-dropped.
-        let dependsOn = c.sessionId.flatMap { isUUID($0) ? $0 : nil }
-        try enqueue(table: "captures", rowId: c.id, kind: .upsert,
-                    payload: try jsonString(CaptureRow(c)), dependsOn: dependsOn, nowISO: nowISO)
+        try db.transaction { conn in
+            let archivedAt = try String.fetchOne(conn, sql: "SELECT archivedAt FROM capture_archive WHERE captureId = ?", arguments: [c.id])
+            try c.upsert(conn)
+            // Wait for the parent session row to flush first — a capture taken DURING
+            // a session references a session_id (FK) whose `sessions` row is only
+            // written at session end. The OutboxFlusher holds a dependsOn op while the
+            // parent has a pending op OR doesn't exist locally yet (the live-session
+            // case), so the capture can't push ahead, hit the FK, and be quarantined.
+            let dependsOn = c.sessionId.flatMap { isUUID($0) ? $0 : nil }
+            try OutboxStore.enqueue(in: conn, table: "captures", rowId: c.id, kind: .upsert,
+                                    payload: try jsonString(CaptureRow(c, archivedAt: archivedAt)),
+                                    dependsOn: dependsOn, nowISO: nowISO)
+        }
+        onEnqueue?()
+    }
+
+    /// Archive / restore a capture (Inbox "Done" / "Restore"): the local
+    /// archive table + a captures upsert carrying `archived_at` (server truth,
+    /// migration 053). Returns false — with NO op enqueued — when the capture
+    /// row doesn't exist locally (deleted meanwhile): an upsert would resurrect
+    /// it server-side, and the caller shouldn't report success.
+    @discardableResult
+    public func setCaptureArchived(id: String, archivedAt: String?, nowISO: String) throws -> Bool {
+        let wrote = try db.transaction { conn -> Bool in
+            guard let c = try Capture.fetchOne(conn, key: id) else {
+                try AppDatabase.setCaptureArchived(in: conn, id: id, archivedAt: nil)
+                return false
+            }
+            try AppDatabase.setCaptureArchived(in: conn, id: id, archivedAt: archivedAt)
+            let dependsOn = c.sessionId.flatMap { isUUID($0) ? $0 : nil }
+            try OutboxStore.cancelPendingUpserts(in: conn, table: "captures", rowId: id)
+            try OutboxStore.enqueue(in: conn, table: "captures", rowId: id, kind: .upsert,
+                                    payload: try jsonString(CaptureRow(c, archivedAt: archivedAt)),
+                                    dependsOn: dependsOn, nowISO: nowISO)
+            return true
+        }
+        if wrote { onEnqueue?() }
+        return wrote
     }
 
     public func upsertReasonLog(_ r: ReasonLog, nowISO: String) throws {
-        try db.save(r)
-        try enqueue(table: "reason_logs", rowId: r.id, kind: .upsert, payload: try jsonString(ReasonLogRow(r)), nowISO: nowISO)
+        try saveAndEnqueue(r, table: "reason_logs", rowId: r.id, payload: try jsonString(ReasonLogRow(r)), nowISO: nowISO)
     }
 
     public func upsertCollection(_ c: ItemCollection, nowISO: String) throws {
-        try db.save(c)
-        try enqueue(table: "collections", rowId: c.id, kind: .upsert, payload: try jsonString(CollectionRow(c)), nowISO: nowISO)
+        try saveAndEnqueue(c, table: "collections", rowId: c.id, payload: try jsonString(CollectionRow(c)), nowISO: nowISO)
+    }
+
+    /// Synchronous variant for callers that must have the row committed
+    /// BEFORE returning without an actor hop (the assistant's `create_list`,
+    /// whose protocol is synchronous — a later tool in the same turn reads
+    /// the row straight back). Same single transaction; the flush kick is
+    /// the caller's job (`SyncCoordinator.flushNow`).
+    nonisolated public func upsertCollectionSync(_ c: ItemCollection, nowISO: String) throws {
+        let payload = String(data: try JSONEncoder().encode(CollectionRow(c)), encoding: .utf8) ?? "{}"
+        try db.transaction { conn in
+            try c.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: "collections", rowId: c.id, kind: .upsert, payload: payload, nowISO: nowISO)
+        }
     }
 
     public func upsertTag(_ t: TagRow, nowISO: String) throws {
-        try db.save(t)
-        try enqueue(table: "tags", rowId: t.id, kind: .upsert, payload: try jsonString(TagDbRow(t)), nowISO: nowISO)
+        try saveAndEnqueue(t, table: "tags", rowId: t.id, payload: try jsonString(TagDbRow(t)), nowISO: nowISO)
     }
 
     public func upsertLifeArea(_ a: LifeArea, nowISO: String) throws {
-        try db.save(a)
-        try enqueue(table: "life_areas", rowId: a.id, kind: .upsert, payload: try jsonString(LifeAreaDbRow(a)), nowISO: nowISO)
+        try saveAndEnqueue(a, table: "life_areas", rowId: a.id, payload: try jsonString(LifeAreaDbRow(a)), nowISO: nowISO)
     }
 
     /// Optimistic local save of a profile fact + push (see pushProfileFact).
     public func upsertProfileFact(_ f: ProfileFact, nowISO: String) throws {
-        try db.save(f)
-        try pushProfileFact(id: f.id, nowISO: nowISO)
+        try db.transaction { conn in
+            try f.upsert(conn)
+            try ProfileFactPush.enqueue(f, in: conn, nowISO: nowISO)
+        }
+        onEnqueue?()
     }
 
     /// Enqueue the CURRENT local `profile_facts` row for upsert (the row is
@@ -109,16 +187,22 @@ public actor WriteThrough {
     /// tombstones the server row (the web does an UPDATE; the result is
     /// identical, and this also tombstones a row the server never received).
     public func pushProfileFact(id: String, nowISO: String) throws {
-        guard let f = try db.fetchById(ProfileFact.self, id: id) else { return }
-        try ProfileFactPush.enqueue(f, box: box, nowISO: nowISO)
-        onEnqueue?()
+        let pushed = try db.transaction { conn -> Bool in
+            guard let f = try ProfileFact.fetchOne(conn, key: id) else { return false }
+            try ProfileFactPush.enqueue(f, in: conn, nowISO: nowISO)
+            return true
+        }
+        if pushed { onEnqueue?() }
     }
 
     /// Local delete + enqueue a server delete. The caller is responsible
     /// for the local-row removal of the right type; this records intent.
     public func enqueueDelete(table: String, id: String, nowISO: String) throws {
-        try box.cancelPendingUpserts(table: table, rowId: id)
-        try enqueue(table: table, rowId: id, kind: .delete, nowISO: nowISO)
+        try db.transaction { conn in
+            try OutboxStore.cancelPendingUpserts(in: conn, table: table, rowId: id)
+            try OutboxStore.enqueue(in: conn, table: table, rowId: id, kind: .delete, nowISO: nowISO)
+        }
+        onEnqueue?()
     }
 
     /// Delete a cal_block locally + enqueue the server delete (used by the
@@ -129,51 +213,41 @@ public actor WriteThrough {
     /// dependsOn) flushes ahead of it — which would re-create the block
     /// server-side AFTER the delete (spec §1.8).
     public func deleteCalBlock(id: String, nowISO: String) throws {
-        try db.deleteById(CalBlock.self, id: id)
-        guard !id.hasPrefix("g_") else { return }
-        try box.cancelPendingUpserts(table: "cal_blocks", rowId: id)
-        try enqueue(table: "cal_blocks", rowId: id, kind: .delete, nowISO: nowISO)
+        guard !id.hasPrefix("g_") else {
+            try db.deleteById(CalBlock.self, id: id)
+            return
+        }
+        try deleteAndEnqueue(CalBlock.self, table: "cal_blocks", id: id, nowISO: nowISO)
     }
 
     public func deleteTask(id: String, nowISO: String) throws {
-        try db.deleteById(TaskItem.self, id: id)
-        try box.cancelPendingUpserts(table: "tasks", rowId: id)
-        try enqueue(table: "tasks", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(TaskItem.self, table: "tasks", id: id, nowISO: nowISO)
     }
 
     public func deleteTag(id: String, nowISO: String) throws {
-        try db.deleteById(TagRow.self, id: id)
-        try box.cancelPendingUpserts(table: "tags", rowId: id)
-        try enqueue(table: "tags", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(TagRow.self, table: "tags", id: id, nowISO: nowISO)
     }
 
     public func deleteLifeArea(id: String, nowISO: String) throws {
-        try db.deleteById(LifeArea.self, id: id)
-        try box.cancelPendingUpserts(table: "life_areas", rowId: id)
-        try enqueue(table: "life_areas", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(LifeArea.self, table: "life_areas", id: id, nowISO: nowISO)
     }
 
     public func deleteCollection(id: String, nowISO: String) throws {
-        try db.deleteById(ItemCollection.self, id: id)
-        try box.cancelPendingUpserts(table: "collections", rowId: id)
-        try enqueue(table: "collections", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(ItemCollection.self, table: "collections", id: id, nowISO: nowISO)
     }
 
     public func deleteSession(id: String, nowISO: String) throws {
-        try db.deleteById(Session.self, id: id)
-        try box.cancelPendingUpserts(table: "sessions", rowId: id)
-        try enqueue(table: "sessions", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(Session.self, table: "sessions", id: id, nowISO: nowISO)
     }
 
+    /// A deleted capture takes its archive state with it.
     public func deleteCapture(id: String, nowISO: String) throws {
-        try db.deleteById(Capture.self, id: id)
-        try box.cancelPendingUpserts(table: "captures", rowId: id)
-        try enqueue(table: "captures", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(Capture.self, table: "captures", id: id, nowISO: nowISO) { conn in
+            try AppDatabase.setCaptureArchived(in: conn, id: id, archivedAt: nil)
+        }
     }
 
     public func deleteReasonLog(id: String, nowISO: String) throws {
-        try db.deleteById(ReasonLog.self, id: id)
-        try box.cancelPendingUpserts(table: "reason_logs", rowId: id)
-        try enqueue(table: "reason_logs", rowId: id, kind: .delete, nowISO: nowISO)
+        try deleteAndEnqueue(ReasonLog.self, table: "reason_logs", id: id, nowISO: nowISO)
     }
 }

@@ -48,6 +48,23 @@ final class RealtimeMirrorTests: XCTestCase {
         XCTAssertTrue(RealtimeMirror.incomingTaskWins(same, db: db))
     }
 
+    /// The slow-device-clock trap, realtime edition: the phone (3 min slow)
+    /// edited the row offline ON TOP OF the server's 10:00 state; a late echo
+    /// of that same 10:00 state arrives. LWW alone would apply it (10:00 >
+    /// "09:57") and revert the pending edit off the UI. The queued op's base
+    /// says the echo is the state the edit was made on → skip it.
+    func testEchoOfTheBaseStateDoesNotOverwriteAPendingEdit() throws {
+        try saveLocal(id: "t1", name: "edited-offline", updatedAt: "2026-05-21T09:57:00.000Z")
+        _ = try OutboxStore(db).enqueue(table: "tasks", rowId: "t1", kind: .upsert, payload: "{}",
+                                        nowISO: "2026-05-21T09:57:00.000Z",
+                                        baseUpdatedAt: "2026-05-21T10:00:00.000000+00:00", basePayload: "{}")
+        let echo = incoming(id: "t1", name: "server-base", updatedAt: "2026-05-21T10:00:00.000Z")
+        XCTAssertFalse(RealtimeMirror.incomingTaskWins(echo, db: db))
+        // A row that genuinely moved on the server AFTER the base still applies.
+        let moved = incoming(id: "t1", name: "web-completed", updatedAt: "2026-05-21T10:05:00.000Z")
+        XCTAssertTrue(RealtimeMirror.incomingTaskWins(moved, db: db))
+    }
+
     func testNoLocalRowIsApplied() throws {
         // Nothing local to protect (e.g. an UPDATE arriving before the row
         // hydrated) → apply.

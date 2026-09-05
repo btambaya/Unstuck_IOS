@@ -3,7 +3,10 @@
 // today's win still visible in All, and it lives under Completed from then on)
 // — extended with the schedule-aware placement (migration 052): a shared task
 // sits where the OWNER's next live block puts it (Today / Upcoming / Backlog),
-// honours the active life-area filter, and reads its slot on the row.
+// honours the active life-area filter, and reads its slot on the row — and
+// the CROSS-PLATFORM contract (migration 053): a finished past block is
+// "done-ish" (All only), an area-less share always shows, open rows are
+// chronological, and `next_start_at` places the row in the RECIPIENT's zone.
 
 import XCTest
 @testable import UnstuckCore
@@ -15,9 +18,15 @@ private struct Row: ShareVisibilityItem, Equatable {
     var done: Bool
     var completedAt: String?
     var nextDate: String?
+    var nextStartTime: String?
+    var nextStartAt: String?
     var nextDone: Bool?
+    var later: Bool?
     var lifeArea: String?
 }
+
+private let london = TimeZone(identifier: "Europe/London")!
+private let tokyo = TimeZone(identifier: "Asia/Tokyo")!
 
 /// Today's 09:30 (local) and an hour before today's local midnight — always
 /// "yesterday", DST included.
@@ -102,16 +111,99 @@ final class ShareVisibleInTests: XCTestCase {
                                       .backlog, now: NOW, todayISO: TODAY))
     }
 
-    func testAFinishedPastBlockMeansUnscheduledNotOverdue() {
+    func testAFinishedPastBlockIsDoneIshAllOnlyNeverTodayOrBacklog() {
         // The server falls back to the most recent PAST block only when no live
-        // block exists; if that past block is done, nothing is scheduled.
+        // block exists; if that past block is done, nothing is scheduled — but
+        // it isn't current work either. The cross-platform rule (web / Android
+        // / iOS): All only. It used to sit under Today here while web + Android
+        // put it in Backlog — two devices of one user disagreed.
         XCTAssertNil(sharedPlacementDate(nextDate: "2026-05-15", nextDone: true))
         XCTAssertEqual(sharedPlacementDate(nextDate: "2026-05-15", nextDone: false), "2026-05-15")
         XCTAssertEqual(sharedPlacementDate(nextDate: "2026-05-15", nextDone: nil), "2026-05-15")
         XCTAssertNil(sharedPlacementDate(nextDate: nil, nextDone: nil))
         XCTAssertNil(sharedPlacementDate(nextDate: "", nextDone: nil))
-        XCTAssertTrue(shareVisibleIn(finishedPastBlock, .today, now: NOW, todayISO: TODAY))
+        XCTAssertEqual(shareBucket(finishedPastBlock, todayISO: TODAY), .finishedPast)
+        XCTAssertFalse(shareVisibleIn(finishedPastBlock, .today, now: NOW, todayISO: TODAY))
         XCTAssertFalse(shareVisibleIn(finishedPastBlock, .backlog, now: NOW, todayISO: TODAY))
+        XCTAssertFalse(shareVisibleIn(finishedPastBlock, .upcoming, now: NOW, todayISO: TODAY))
+        XCTAssertTrue(shareVisibleIn(finishedPastBlock, .all, now: NOW, todayISO: TODAY))
+        XCTAssertFalse(shareVisibleIn(finishedPastBlock, .completed, now: NOW, todayISO: TODAY))
+    }
+
+    func testBucketsMirrorTheWebRule() {
+        XCTAssertEqual(shareBucket(scheduledToday, todayISO: TODAY), .today)
+        XCTAssertEqual(shareBucket(scheduledTomorrow, todayISO: TODAY), .upcoming)
+        XCTAssertEqual(shareBucket(overdue, todayISO: TODAY), .overdue)
+        XCTAssertEqual(shareBucket(unscheduled, todayISO: TODAY), .unscheduled)
+        XCTAssertEqual(shareBucket(doneToday, todayISO: TODAY), .done)
+    }
+
+    // MARK: `later` (migration 053) — the owner's Later bucket travels with the share
+
+    func testAParkedShareLeavesTodayAndBacklogLikeTheOwnersOwnLaterTasks() {
+        let parkedNoBlock = Row(id: "p1", done: false, later: true)
+        let parkedOverdue = Row(id: "p2", done: false, nextDate: "2026-05-15", later: true)
+        let parkedToday = Row(id: "p3", done: false, nextDate: TODAY, later: true)
+        let parkedFuture = Row(id: "p4", done: false, nextDate: "2026-05-22", later: true)
+        for r in [parkedNoBlock, parkedOverdue, parkedToday] {
+            XCTAssertEqual(shareBucket(r, todayISO: TODAY), .parked, r.id)
+            XCTAssertFalse(shareVisibleIn(r, .today, now: NOW, todayISO: TODAY), r.id)
+            XCTAssertFalse(shareVisibleIn(r, .backlog, now: NOW, todayISO: TODAY), r.id)
+            XCTAssertFalse(shareVisibleIn(r, .upcoming, now: NOW, todayISO: TODAY), r.id)
+            XCTAssertTrue(shareVisibleIn(r, .all, now: NOW, todayISO: TODAY), r.id)
+        }
+        // A future block still puts it in Upcoming (own-task rule).
+        XCTAssertEqual(shareBucket(parkedFuture, todayISO: TODAY), .upcoming)
+        XCTAssertTrue(shareVisibleIn(parkedFuture, .upcoming, now: NOW, todayISO: TODAY))
+        // `later: false` / nil is the plain rule.
+        XCTAssertEqual(shareBucket(Row(id: "n", done: false, nextDate: TODAY, later: false), todayISO: TODAY), .today)
+    }
+
+    // MARK: `next_start_at` (migration 053) — placed in the RECIPIENT's zone
+
+    func testNextStartAtPlacesTheRowOnTheRecipientsDay() {
+        // The owner (Tokyo) booked Fri 22 May 00:30 local = Thu 21 May 15:30Z.
+        // The projection's next_date says "2026-05-22" — the OWNER's day.
+        let row = Row(id: "x", done: false, nextDate: "2026-05-22", nextStartTime: "00:30",
+                      nextStartAt: "2026-05-21T15:30:00+00:00")
+        // A London recipient (BST) sees 16:30 on Thu 21 May → Today.
+        XCTAssertEqual(shareBucket(row, todayISO: TODAY, timeZone: london), .today)
+        XCTAssertTrue(shareVisibleIn(row, .today, now: NOW, todayISO: TODAY, timeZone: london))
+        XCTAssertFalse(shareVisibleIn(row, .upcoming, now: NOW, todayISO: TODAY, timeZone: london))
+        XCTAssertEqual(sharedPlacementDate(nextDate: row.nextDate, nextStartAt: row.nextStartAt, nextDone: nil,
+                                           timeZone: london), "2026-05-21")
+        // A Tokyo recipient sees the owner's own day → Upcoming.
+        XCTAssertEqual(shareBucket(row, todayISO: TODAY, timeZone: tokyo), .upcoming)
+        // The slot + planned labels read in the recipient's zone too.
+        XCTAssertEqual(sharedSlotLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
+                                       nextStartAt: row.nextStartAt, todayISO: TODAY, timeZone: london),
+                       "Today 16:30 · 45m")
+        XCTAssertEqual(sharedSlotLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
+                                       nextStartAt: row.nextStartAt, todayISO: TODAY, timeZone: tokyo),
+                       "Tomorrow 00:30 · 45m")
+        XCTAssertEqual(sharedPlannedLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
+                                          nextDone: false, nextStartAt: row.nextStartAt, timeZone: london),
+                       "Planned Thu, May 21 · 16:30 · 45m")
+        XCTAssertEqual(sharedPlannedLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
+                                          nextDone: true, nextStartAt: row.nextStartAt, timeZone: london),
+                       "Done Thu, May 21 · 16:30 · 45m")
+    }
+
+    func testNextStartAtFallsBackToTheOwnersTextWhenAbsentOrUnparseable() {
+        // Pre-053 server: no instant → the owner's date/time text, as before.
+        let slot = sharedLocalSlot(nextDate: "2026-05-22", nextStartTime: "00:30", nextStartAt: nil, timeZone: london)
+        XCTAssertEqual(slot?.date, "2026-05-22")
+        XCTAssertEqual(slot?.time, "00:30")
+        // Garbage instant → the same fallback, never a crash or a lost row.
+        let bad = sharedLocalSlot(nextDate: "2026-05-22", nextStartTime: nil, nextStartAt: "not-a-date", timeZone: london)
+        XCTAssertEqual(bad?.date, "2026-05-22")
+        XCTAssertNil(bad?.time)
+        XCTAssertNil(sharedLocalSlot(nextDate: nil, nextStartTime: nil, nextStartAt: nil))
+        // Postgres microseconds are accepted (the ISO parser wants three digits).
+        XCTAssertEqual(sharedInstantMillis("2026-05-21T15:30:00.123456+00:00"),
+                       sharedInstantMillis("2026-05-21T15:30:00.123+00:00"))
+        XCTAssertNotNil(sharedInstantMillis("2026-05-21T15:30:00Z"))
+        XCTAssertNil(sharedInstantMillis("2026-05-21"))
     }
 
     func testAllHoldsEveryOpenShareWhateverItsDate() {
@@ -140,19 +232,35 @@ final class ShareVisibleInTests: XCTestCase {
 
     // MARK: life-area filter
 
-    func testActiveAreaNarrowsEveryMode() {
+    func testActiveAreaNarrowsEveryModeButAnAreaLessShareAlwaysShows() {
         let work = Row(id: "w", done: false, nextDate: TODAY, lifeArea: "Work")
         let home = Row(id: "h", done: false, nextDate: TODAY, lifeArea: "Home")
         let none = Row(id: "n", done: false, nextDate: TODAY, lifeArea: nil)
+        let blank = Row(id: "b", done: false, nextDate: TODAY, lifeArea: "")
         XCTAssertTrue(shareVisibleIn(work, .today, now: NOW, todayISO: TODAY, activeArea: "Work"))
         XCTAssertFalse(shareVisibleIn(home, .today, now: NOW, todayISO: TODAY, activeArea: "Work"))
-        // A pre-052 row (no area) is hidden under an area pill — like Delegated.
-        XCTAssertFalse(shareVisibleIn(none, .today, now: NOW, todayISO: TODAY, activeArea: "Work"))
+        // The web / Android `shareMatchesArea` rule: an area-less share is
+        // ALWAYS shown under an area pill (the owner's vocabulary isn't ours —
+        // it used to vanish here for no visible reason).
+        XCTAssertTrue(shareVisibleIn(none, .today, now: NOW, todayISO: TODAY, activeArea: "Work"))
+        XCTAssertTrue(shareVisibleIn(blank, .today, now: NOW, todayISO: TODAY, activeArea: "Work"))
         // The Unassigned sentinel admits only area-less rows; nil admits all.
         XCTAssertTrue(shareVisibleIn(none, .today, now: NOW, todayISO: TODAY, activeArea: UNASSIGNED_AREA))
         XCTAssertFalse(shareVisibleIn(work, .today, now: NOW, todayISO: TODAY, activeArea: UNASSIGNED_AREA))
         XCTAssertTrue(shareVisibleIn(home, .today, now: NOW, todayISO: TODAY, activeArea: nil))
         XCTAssertTrue(shareVisibleIn(home, .all, now: NOW, todayISO: TODAY, activeArea: ""))
+    }
+
+    func testShareMatchesAreaIsTheWebRule() {
+        XCTAssertTrue(shareMatchesArea(nil, nil))
+        XCTAssertTrue(shareMatchesArea("Work", nil))
+        XCTAssertTrue(shareMatchesArea("Work", ""))
+        XCTAssertTrue(shareMatchesArea("Work", "Work"))
+        XCTAssertFalse(shareMatchesArea("Home", "Work"))
+        XCTAssertTrue(shareMatchesArea(nil, "Work"), "area-less always shows")
+        XCTAssertTrue(shareMatchesArea("", "Work"), "blank counts as area-less")
+        XCTAssertTrue(shareMatchesArea(nil, UNASSIGNED_AREA))
+        XCTAssertFalse(shareMatchesArea("Work", UNASSIGNED_AREA))
     }
 }
 
@@ -179,19 +287,43 @@ final class VisibleSharesTests: XCTestCase {
         XCTAssertTrue(visibleShares([Row](), mode: .all, now: NOW).isEmpty)
     }
 
-    func testSplitsAMixedListAcrossTodayUpcomingBacklog() {
-        let mixed = [scheduledNextMonth, overdue, scheduledToday, unscheduled, scheduledTomorrow, doneToday]
+    func testSplitsAMixedListAcrossTodayUpcomingBacklogInSlotOrder() {
+        // Open rows are CHRONOLOGICAL by the owner's slot (unscheduled last),
+        // not in share order — web / Android parity ("Call bank 09:00" above
+        // "Review PR 16:00" however recently each was shared).
+        let mixed = [scheduledNextMonth, overdue, scheduledToday, unscheduled, scheduledTomorrow, doneToday, finishedPastBlock]
         XCTAssertEqual(visibleShares(mixed, mode: .today, now: NOW, todayISO: TODAY).map(\.id), ["today", "none"])
-        XCTAssertEqual(visibleShares(mixed, mode: .upcoming, now: NOW, todayISO: TODAY).map(\.id), ["later", "tomorrow"])
+        XCTAssertEqual(visibleShares(mixed, mode: .upcoming, now: NOW, todayISO: TODAY).map(\.id), ["tomorrow", "later"])
         XCTAssertEqual(visibleShares(mixed, mode: .backlog, now: NOW, todayISO: TODAY).map(\.id), ["overdue"])
         XCTAssertEqual(visibleShares(mixed, mode: .all, now: NOW, todayISO: TODAY).map(\.id),
-                       ["later", "overdue", "today", "none", "tomorrow", "done"])
+                       ["overdue", "pastdone", "today", "tomorrow", "later", "none", "done"])
+    }
+
+    func testOpenRowsSortByTimeWithinADayAndKeepShareOrderOnTies() {
+        let late = Row(id: "late", done: false, nextDate: TODAY, nextStartTime: "16:00")
+        let early = Row(id: "early", done: false, nextDate: TODAY, nextStartTime: "09:00")
+        let noTime = Row(id: "notime", done: false, nextDate: TODAY)
+        let dupA = Row(id: "dupA", done: false, nextDate: TODAY, nextStartTime: "09:00")
+        XCTAssertEqual(visibleShares([late, early, noTime, dupA], mode: .today, now: NOW, todayISO: TODAY).map(\.id),
+                       ["notime", "early", "dupA", "late"])
+        XCTAssertLessThan(compareShareSlot(early, late), 0)
+        XCTAssertGreaterThan(compareShareSlot(late, early), 0)
+        XCTAssertEqual(compareShareSlot(early, dupA), 0)
+        XCTAssertEqual(compareShareSlot(unscheduled, unscheduled), 0)
+        XCTAssertGreaterThan(compareShareSlot(unscheduled, late), 0, "unscheduled sinks")
+        XCTAssertLessThan(compareShareSlot(late, unscheduled), 0)
+        // The instant wins over the owner's text when both are present.
+        let ownerLate = Row(id: "ol", done: false, nextDate: TODAY, nextStartTime: "23:00",
+                            nextStartAt: "2026-05-21T06:00:00+00:00")
+        XCTAssertLessThan(compareShareSlot(ownerLate, early, timeZone: london), 0, "07:00 London < 09:00")
     }
 
     func testAreaFilterAppliesToTheList() {
-        let rows = [Row(id: "w", done: false, lifeArea: "Work"), Row(id: "h", done: false, lifeArea: "Home")]
-        XCTAssertEqual(visibleShares(rows, mode: .today, now: NOW, todayISO: TODAY, activeArea: "Home").map(\.id), ["h"])
-        XCTAssertEqual(visibleShares(rows, mode: .today, now: NOW, todayISO: TODAY).map(\.id), ["w", "h"])
+        let rows = [Row(id: "w", done: false, lifeArea: "Work"), Row(id: "h", done: false, lifeArea: "Home"),
+                    Row(id: "n", done: false)]
+        XCTAssertEqual(visibleShares(rows, mode: .today, now: NOW, todayISO: TODAY, activeArea: "Home").map(\.id), ["h", "n"])
+        XCTAssertEqual(visibleShares(rows, mode: .today, now: NOW, todayISO: TODAY, activeArea: UNASSIGNED_AREA).map(\.id), ["n"])
+        XCTAssertEqual(visibleShares(rows, mode: .today, now: NOW, todayISO: TODAY).map(\.id), ["w", "h", "n"])
     }
 }
 
@@ -315,6 +447,18 @@ final class SharedWithMeVisibilityTests: XCTestCase {
         XCTAssertEqual(visibleShares([future, today], mode: .upcoming, now: NOW, todayISO: TODAY).map(\.taskId), ["t1"])
         XCTAssertEqual(visibleShares([future, today], mode: .today, now: NOW, todayISO: TODAY, activeArea: "Work").map(\.taskId), [])
         XCTAssertEqual(visibleShares([future, today], mode: .all, now: NOW, todayISO: TODAY, activeArea: "Work").map(\.taskId), ["t1"])
+        // Chronological in All: today's 10:00 before Saturday's 04:30.
+        XCTAssertEqual(visibleShares([future, today], mode: .all, now: NOW, todayISO: TODAY).map(\.taskId), ["t2", "t1"])
+        // The 053 fields ride through the protocol (instant + later).
+        let zoned = SharedWithMe(shareId: "s3", taskId: "t3", ownerName: "Anna", level: .view, title: "Zoned", done: false,
+                                 nextBlockId: "b3", nextDate: "2026-05-22", nextStartTime: "00:30",
+                                 nextDurationMinutes: 30, nextDone: false,
+                                 nextStartAt: "2026-05-21T15:30:00+00:00", later: false)
+        XCTAssertEqual(zoned.nextStartAt, "2026-05-21T15:30:00+00:00")
+        XCTAssertEqual(shareBucket(zoned, todayISO: TODAY, timeZone: london), .today)
+        let parked = SharedWithMe(shareId: "s4", taskId: "t4", ownerName: "Anna", level: .view, title: "Parked", done: false,
+                                  later: true)
+        XCTAssertEqual(shareBucket(parked, todayISO: TODAY), .parked)
         XCTAssertEqual(sharedSlotLabel(nextDate: future.nextDate, nextStartTime: future.nextStartTime,
                                        nextDurationMinutes: future.nextDurationMinutes, nextDone: future.nextDone,
                                        todayISO: TODAY), "Sat 04:30 · 45m")

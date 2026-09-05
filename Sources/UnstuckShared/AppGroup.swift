@@ -236,6 +236,19 @@ public enum AppGroup {
     /// tile updates immediately (the queued op + the app's drain are the source
     /// of truth; this just avoids a stale "still there" flash until the app
     /// reconciles). Drops the task, decrements counts, advances Start-Next.
+    /// Sign-out: drop every per-ACCOUNT value in the container — both
+    /// snapshots (they carry this account's task + list names), the hands-free
+    /// Siri write queue (it would otherwise drain into the NEXT account) and
+    /// the pending route / assistant prompt. The Focus-filter flag is device
+    /// state, not account state, so it stays. Keeping the key list here means
+    /// renaming a key can't silently break the sign-out scrub.
+    public static func clearUserContent() {
+        guard let defaults else { return }
+        for key in [startNextKey, snapshotKey, writeQueueKey, assistantPromptKey, pendingRouteKey] {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
     public static func optimisticComplete(taskId: String) {
         var snap = readSnapshot()
         let wasToday = snap.tasks.first { $0.id == taskId }?.today ?? false

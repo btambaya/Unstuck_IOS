@@ -243,19 +243,29 @@ struct CaptureRow: Codable, Sendable {
     var tag: CaptureTag
     var body: String
     var at: String
+    /// Inbox archive state (server migration 053: `archived_at timestamptz
+    /// null`; set = archived, null = open). The server is the source of truth
+    /// for the archive; the Capture model itself has no such field, so it
+    /// travels alongside (local `capture_archive` table). Decodes as nil when
+    /// the column is absent (a pre-053 server) — see `hasArchivedAtColumn`.
+    var archivedAt: String?
 
     enum CodingKeys: String, CodingKey {
         case id
         case taskId = "task_id"
         case sessionId = "session_id"
         case tag, body, at
+        case archivedAt = "archived_at"
     }
 
-    init(_ c: Capture) {
+    init(_ c: Capture, archivedAt: String? = nil) {
         id = c.id; taskId = uuidOrNull(c.taskId); sessionId = uuidOrNull(c.sessionId)
         tag = c.tag; body = c.body; at = c.at
+        self.archivedAt = archivedAt
     }
 
+    /// Explicit `archived_at` (null clears — an unarchive must reach the
+    /// server as null, not be omitted).
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
@@ -264,10 +274,19 @@ struct CaptureRow: Codable, Sendable {
         try c.encode(tag, forKey: .tag)
         try c.encode(body, forKey: .body)
         try c.encode(at, forKey: .at)
+        try c.encode(archivedAt, forKey: .archivedAt)
     }
 
     func model() -> Capture {
         Capture(id: id, taskId: taskId, sessionId: sessionId, tag: tag, body: body, at: at)
+    }
+
+    /// Whether a raw server row JSON carries the `archived_at` key at all —
+    /// distinguishes "open" (key present, null) from "column not deployed"
+    /// (key absent), so a pre-053 server can't blank the local archive.
+    static func hasArchivedAtColumn(_ raw: Data) -> Bool {
+        guard let obj = (try? JSONSerialization.jsonObject(with: raw)) as? [String: Any] else { return false }
+        return obj.keys.contains("archived_at")
     }
 }
 

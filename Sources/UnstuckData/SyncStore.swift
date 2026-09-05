@@ -124,17 +124,92 @@ public extension AppDatabase {
     }
 
     /// Wipe EVERYTHING for a user change / sign-out: the synced tables PLUS
-    /// the local-only outbox + live_session (spec 02-sync-engine §1.7/§2.2
-    /// clearAll). Leaving the outbox behind would let the next sign-in stamp
-    /// the previous user's queued ops with the new user's id (cross-account
-    /// leak); the pre-signout drain in SyncCoordinator.signOutAndUnregister
-    /// gives pending edits their chance to flush first.
+    /// the local-only outbox + live_session + capture archive (spec
+    /// 02-sync-engine §1.7/§2.2 clearAll). Leaving the outbox behind would let
+    /// the next sign-in stamp the previous user's queued ops with the new
+    /// user's id (cross-account leak); the pre-signout drain in
+    /// SyncCoordinator.signOutAndUnregister gives pending edits their chance
+    /// to flush first, and whatever still couldn't flush is PARKED under the
+    /// signing-out user (`parked_outbox`, deliberately NOT wiped here) for
+    /// that user's next sign-in.
     func clearAll() throws {
         let tables = ["tasks", "sessions", "cal_blocks", "captures", "reason_logs",
                       "collections", "tags", "life_areas", "calendar_connections",
-                      "profile_facts", "outbox", "live_session"]
+                      "profile_facts", "outbox", "live_session", "capture_archive"]
         try writer.write { db in
             for t in tables { try db.execute(sql: "DELETE FROM \(t)") }
         }
+    }
+
+    // MARK: - capture archive (server `captures.archived_at`, migration 053)
+
+    /// Capture ids currently archived (`archived_at` set) — the Inbox's
+    /// archived set is a cache of this.
+    func archivedCaptureIds() throws -> Set<String> {
+        try writer.read { db in
+            Set(try String.fetchAll(db, sql: "SELECT captureId FROM capture_archive"))
+        }
+    }
+
+    /// Live view of the archived-capture id set — the Inbox's observable
+    /// cache follows THIS (hydrate, realtime, our own write-through and the
+    /// sign-out wipe all land here), never the other way round.
+    func observeArchivedCaptureIds() -> AsyncValueObservation<Set<String>> {
+        ValueObservation.tracking { db in
+            Set(try String.fetchAll(db, sql: "SELECT captureId FROM capture_archive"))
+        }.values(in: writer)
+    }
+
+    /// The archive state for one capture: its `archived_at`, or nil when open.
+    func captureArchivedAt(id: String) throws -> String? {
+        try writer.read { db in
+            try String.fetchOne(db, sql: "SELECT archivedAt FROM capture_archive WHERE captureId = ?", arguments: [id])
+        }
+    }
+
+    /// Set / clear one capture's archive state. `archivedAt` nil = open.
+    func setCaptureArchived(id: String, archivedAt: String?) throws {
+        try writer.write { db in try Self.setCaptureArchived(in: db, id: id, archivedAt: archivedAt) }
+    }
+
+    /// Same, on an OPEN connection (WriteThrough commits it with the outbox op).
+    static func setCaptureArchived(in db: Database, id: String, archivedAt: String?) throws {
+        if let archivedAt {
+            try db.execute(sql: "INSERT OR REPLACE INTO capture_archive (captureId, archivedAt) VALUES (?, ?)",
+                           arguments: [id, archivedAt])
+        } else {
+            try db.execute(sql: "DELETE FROM capture_archive WHERE captureId = ?", arguments: [id])
+        }
+    }
+
+    /// Server-canonical replace of the archive state (hydrate): `byId` maps
+    /// capture id → archived_at for every archived server row. Ids with a
+    /// pending captures upsert keep their LOCAL state (the op carries the
+    /// user's newer intent). Runs in the same transaction as the captures
+    /// replace when called from `replaceAllAtomically`'s body.
+    static func replaceCaptureArchive(in db: Database, serverArchived byId: [String: String], keepLocalIds: Set<String>) throws {
+        let localRows = try Row.fetchAll(db, sql: "SELECT captureId, archivedAt FROM capture_archive")
+        var next: [String: String] = byId
+        for row in localRows {
+            let id: String = row["captureId"]
+            if keepLocalIds.contains(id) { next[id] = row["archivedAt"] }
+        }
+        for id in keepLocalIds where byId[id] != nil && !localRows.contains(where: { ($0["captureId"] as String) == id }) {
+            next[id] = nil   // pending local state says "open" — keep it open
+        }
+        try db.execute(sql: "DELETE FROM capture_archive")
+        for (id, at) in next {
+            try db.execute(sql: "INSERT INTO capture_archive (captureId, archivedAt) VALUES (?, ?)", arguments: [id, at])
+        }
+    }
+
+    // MARK: - generic transaction seam
+
+    /// One write transaction for callers that must commit several things
+    /// together (WriteThrough: the row save + the outbox op — a crash between
+    /// two separate transactions left a local row with no op, which the next
+    /// hydrate silently deleted).
+    func transaction<T>(_ body: (Database) throws -> T) throws -> T {
+        try writer.write(body)
     }
 }

@@ -105,6 +105,16 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
     /// Whether that block is done (only ever true for a PAST block — a live
     /// block is by definition not done).
     public var nextDone: Bool?
+    /// That block's start as an ISO INSTANT (migration 053): the owner's
+    /// local date + start_time converted through the owner's timezone, so a
+    /// recipient in another zone places it on THEIR calendar day. nil pre-053
+    /// / unscheduled.
+    public var nextStartAt: String?
+    /// The owner parked the task in Later (migration 053). nil pre-053.
+    public var later: Bool?
+    /// The owner's recurrence (migration 053), so a recipient can apply the
+    /// own-task bucketing rules. nil pre-053 / not recurring / unreadable.
+    public var recurrence: Recurrence?
 
     public var id: String { shareId }
 
@@ -112,7 +122,8 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
                 title: String, done: Bool, completedAt: String? = nil,
                 estimateMin: Int? = nil, lifeArea: String? = nil,
                 nextBlockId: String? = nil, nextDate: String? = nil, nextStartTime: String? = nil,
-                nextDurationMinutes: Int? = nil, nextDone: Bool? = nil) {
+                nextDurationMinutes: Int? = nil, nextDone: Bool? = nil,
+                nextStartAt: String? = nil, later: Bool? = nil, recurrence: Recurrence? = nil) {
         self.shareId = shareId
         self.taskId = taskId
         self.ownerName = ownerName
@@ -127,15 +138,21 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
         self.nextStartTime = nextStartTime
         self.nextDurationMinutes = nextDurationMinutes
         self.nextDone = nextDone
+        self.nextStartAt = nextStartAt
+        self.later = later
+        self.recurrence = recurrence
     }
 
     // Hand-written Codable so the optional projections are FORGIVING: each key
-    // may be absent entirely (pre-049 / pre-052 RPC), null, or arrive in either
-    // the camelCase shape we encode or the raw snake_case the RPC projects.
-    // Every original (required) field keeps its synthesized strictness.
+    // may be absent entirely (pre-049 / pre-052 / pre-053 RPC), null, or arrive
+    // in either the camelCase shape we encode or the raw snake_case the RPC
+    // projects. Every original (required) field keeps its synthesized
+    // strictness; an unreadable `recurrence` blob degrades to nil rather than
+    // dropping the whole row.
     private enum CodingKeys: String, CodingKey {
         case shareId, taskId, ownerName, level, title, done, completedAt
         case estimateMin, lifeArea, nextBlockId, nextDate, nextStartTime, nextDurationMinutes, nextDone
+        case nextStartAt, later, recurrence
         case completedAtSnake = "completed_at"
         case estimateMinSnake = "estimate_min"
         case lifeAreaSnake = "life_area"
@@ -144,6 +161,7 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
         case nextStartTimeSnake = "next_start_time"
         case nextDurationMinutesSnake = "next_duration_minutes"
         case nextDoneSnake = "next_done"
+        case nextStartAtSnake = "next_start_at"
     }
 
     public init(from decoder: Decoder) throws {
@@ -165,6 +183,9 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
         nextStartTime = try either(String.self, .nextStartTime, .nextStartTimeSnake)
         nextDurationMinutes = try either(Int.self, .nextDurationMinutes, .nextDurationMinutesSnake)
         nextDone = try either(Bool.self, .nextDone, .nextDoneSnake)
+        nextStartAt = try either(String.self, .nextStartAt, .nextStartAtSnake)
+        later = try c.decodeIfPresent(Bool.self, forKey: .later)
+        recurrence = (try? c.decodeIfPresent(Recurrence.self, forKey: .recurrence)) ?? nil
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -183,6 +204,9 @@ public struct SharedWithMe: Codable, Equatable, Sendable, Identifiable {
         try c.encodeIfPresent(nextStartTime, forKey: .nextStartTime)
         try c.encodeIfPresent(nextDurationMinutes, forKey: .nextDurationMinutes)
         try c.encodeIfPresent(nextDone, forKey: .nextDone)
+        try c.encodeIfPresent(nextStartAt, forKey: .nextStartAt)
+        try c.encodeIfPresent(later, forKey: .later)
+        try c.encodeIfPresent(recurrence, forKey: .recurrence)
     }
 }
 
@@ -208,12 +232,16 @@ public struct SharedBlock: Codable, Equatable, Sendable, Identifiable {
     public var skipped: Bool
     /// The block kind ("task" | "time" | …) — never "external".
     public var kind: String
+    /// The block's start as an ISO INSTANT (migration 053) — `date` +
+    /// `startTime` through the OWNER's timezone — so a recipient in another
+    /// zone can read the slot in theirs. nil pre-053.
+    public var startAt: String?
 
     public var id: String { blockId }
 
     public init(blockId: String, taskId: String, shareId: String, level: ShareLevel, ownerName: String,
                 title: String, date: String, startTime: String, durationMinutes: Int,
-                done: Bool = false, skipped: Bool = false, kind: String = "task") {
+                done: Bool = false, skipped: Bool = false, kind: String = "task", startAt: String? = nil) {
         self.blockId = blockId
         self.taskId = taskId
         self.shareId = shareId
@@ -226,19 +254,22 @@ public struct SharedBlock: Codable, Equatable, Sendable, Identifiable {
         self.done = done
         self.skipped = skipped
         self.kind = kind
+        self.startAt = startAt
     }
 
     // Forgiving Codable: accepts the camelCase shape we encode OR the raw
     // snake_case RPC row; nullable booleans coalesce to false; a missing kind
-    // defaults to "task".
+    // defaults to "task"; a missing start_at (pre-053) is nil.
     private enum CodingKeys: String, CodingKey {
         case blockId, taskId, shareId, level, ownerName, title, date, startTime, durationMinutes, done, skipped, kind
+        case startAt
         case blockIdSnake = "block_id"
         case taskIdSnake = "task_id"
         case shareIdSnake = "share_id"
         case ownerNameSnake = "owner_name"
         case startTimeSnake = "start_time"
         case durationMinutesSnake = "duration_minutes"
+        case startAtSnake = "start_at"
     }
 
     public init(from decoder: Decoder) throws {
@@ -259,6 +290,8 @@ public struct SharedBlock: Codable, Equatable, Sendable, Identifiable {
         done = try c.decodeIfPresent(Bool.self, forKey: .done) ?? false
         skipped = try c.decodeIfPresent(Bool.self, forKey: .skipped) ?? false
         kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "task"
+        startAt = try c.decodeIfPresent(String.self, forKey: .startAt)
+            ?? c.decodeIfPresent(String.self, forKey: .startAtSnake)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -275,6 +308,7 @@ public struct SharedBlock: Codable, Equatable, Sendable, Identifiable {
         try c.encode(done, forKey: .done)
         try c.encode(skipped, forKey: .skipped)
         try c.encode(kind, forKey: .kind)
+        try c.encodeIfPresent(startAt, forKey: .startAt)
     }
 }
 
@@ -307,6 +341,11 @@ public struct SharedTaskDetail: Equatable, Sendable, Identifiable {
     public var nextStartTime: String?
     public var nextDurationMinutes: Int?
     public var nextDone: Bool?
+    /// That block's start as an ISO instant (migration 053; recipient-zone
+    /// rendering). nil pre-053 / unscheduled.
+    public var nextStartAt: String?
+    /// The owner parked it in Later (migration 053). nil pre-053.
+    public var later: Bool?
 
     public var id: String { taskId }
 
@@ -314,7 +353,8 @@ public struct SharedTaskDetail: Equatable, Sendable, Identifiable {
                 estimateMin: Int, totalFocused: Int, lifeArea: String?, priority: Priority?,
                 tags: [String], objectives: [Objective], dueAt: String?, createdAt: String?,
                 nextBlockId: String? = nil, nextDate: String? = nil, nextStartTime: String? = nil,
-                nextDurationMinutes: Int? = nil, nextDone: Bool? = nil) {
+                nextDurationMinutes: Int? = nil, nextDone: Bool? = nil,
+                nextStartAt: String? = nil, later: Bool? = nil) {
         self.taskId = taskId
         self.ownerName = ownerName
         self.level = level
@@ -333,6 +373,8 @@ public struct SharedTaskDetail: Equatable, Sendable, Identifiable {
         self.nextStartTime = nextStartTime
         self.nextDurationMinutes = nextDurationMinutes
         self.nextDone = nextDone
+        self.nextStartAt = nextStartAt
+        self.later = later
     }
 }
 

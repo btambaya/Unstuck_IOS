@@ -5,10 +5,13 @@
 // then subscribes to realtime. On sign-out it tears down realtime and
 // clears the local cache INCLUDING the outbox + live session (shared-
 // device privacy — a kept outbox would be replayed under the next user's
-// id). `prevUserId` (UserDefaults; App Group later) distinguishes a
-// same-user reload from a user switch. Mid-session sync runs through
-// syncNow() (scenePhase .active / BG refresh) and a debounced post-write
-// flush kick (spec 02-sync-engine §5).
+// id) — but any op that could NOT be drained first (offline sign-out) is
+// PARKED under the signing-out user first and restored on that user's
+// next sign-in, so an offline sign-out never discards un-pushed edits.
+// `prevUserId` (UserDefaults; App Group later) distinguishes a same-user
+// reload from a user switch. Mid-session sync runs through syncNow()
+// (scenePhase .active / BG refresh) and a debounced post-write flush kick
+// (spec 02-sync-engine §5).
 
 import Foundation
 import Supabase
@@ -173,6 +176,31 @@ public actor SyncCoordinator {
         await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
     }
 
+    /// The realtime self-heal path: identical to syncNow() minus the calendar
+    /// pull (the reconnect has nothing to do with Google).
+    private func resyncAfterReconnect(userId uid: String) async {
+        guard auth.currentUserId == uid else { return }
+        let auth = self.auth
+        await hydrator.pruneStaleTaskOps()
+        await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
+        await hydrator.hydrate(userId: uid)
+        kickFlushIfOutboxPending()
+    }
+
+    /// Schedule the debounced post-write flush from OUTSIDE the WriteThrough
+    /// hook — for writers that commit through the synchronous WriteThrough
+    /// path (`upsertCollectionSync`), which can't reach the actor's hook.
+    public func kickFlush() {
+        scheduleDebouncedFlush()
+    }
+
+    /// Ops still waiting to reach the server (quarantined ones included) —
+    /// the Settings sign-out row reads this to say "N changes haven't synced
+    /// yet" before the user leaves. Whatever can't drain is parked, never lost.
+    public nonisolated func pendingOutboxCount() -> Int {
+        (try? OutboxStore(db).count()) ?? 0
+    }
+
     private func scheduleDebouncedFlush() {
         flushKick?.cancel()
         flushKick = Task { [weak self] in
@@ -183,8 +211,9 @@ public actor SyncCoordinator {
     }
 
     /// Sign out, but first: (1) drain queued offline writes (bounded 5s,
-    /// guarded on the live user) — the signedOut branch clearAll() wipes the
-    /// outbox, so un-flushed edits would otherwise be lost forever; (2)
+    /// guarded on the live user) — whatever still can't be pushed (offline)
+    /// is PARKED under this user by the signedOut branch before clearAll()
+    /// wipes the outbox, and restored on their next sign-in; (2)
     /// delete this device's push-token rows WHILE the JWT is still valid
     /// (RLS: user_id = auth.uid()) so the previous user's morning briefs /
     /// pushes never reach whoever signs in next on this device. Mirrors
@@ -222,9 +251,20 @@ public actor SyncCoordinator {
             // would clearAll a same-user re-auth's pending edits).
             let prev = UserDefaults.standard.string(forKey: prevUserKey)?.lowercased()
             if SyncDecision.shouldWipeCache(event: syncEvent, prevUserId: prev, currentUserId: uid) {
+                // A user switch without an observed sign-out (session replaced
+                // in place): the previous user's un-pushed ops are parked for
+                // them, never wiped and never replayed under the new user.
+                if let prev, prev != uid { _ = try? OutboxStore(db).park(userId: prev) }
                 try? db.clearAll()
             }
             UserDefaults.standard.set(uid, forKey: prevUserKey)
+            // Ops parked at THIS user's last sign-out (offline sign-out) rejoin
+            // the queue — appended after anything already pending, original
+            // order — and flush below like any other offline edit. Other users'
+            // parked ops stay parked.
+            if let restored = try? OutboxStore(db).restoreParked(userId: uid), restored > 0 {
+                print("[sync] restored \(restored) parked op(s) for \(uid)")
+            }
             // Prune stale task ops (server already newer) so they can't clobber
             // another platform's change, then push offline edits, pull
             // server-canonical, and mirror live. Guard the drain on the LIVE user
@@ -237,12 +277,17 @@ public actor SyncCoordinator {
             let hydrator = self.hydrator
             await realtime.subscribeAll(userId: uid, onMembersChanged: {
                 await hydrator.hydrateCollections(userId: uid)
-            }, onResync: {
+            }, onResync: { [weak self] in
                 // Realtime self-heal backfill (socket reconnect / channel
                 // rebuild): a full server-canonical pull catches anything the
                 // dropped connection missed. The REST hydrate is the reliable
-                // source of truth around which realtime self-heals.
-                await hydrator.hydrate(userId: uid)
+                // source of truth around which realtime self-heals. Same
+                // prune → flush → hydrate → kick sequence as syncNow(): the
+                // socket usually reconnects BEFORE any other trigger fires when
+                // the network returns, and a bare hydrate here would show the
+                // server's stale rows over queued offline edits until the next
+                // safety-net tick.
+                await self?.resyncAfterReconnect(userId: uid)
             })
             // Live sharing signal (RPC-backed projections refetch on the post).
             await collab.start(userId: uid)
@@ -251,6 +296,15 @@ public actor SyncCoordinator {
         case .signedOut:
             await realtime.unsubscribeAll()
             await collab.stop()
+            // Whatever the bounded pre-sign-out drain could NOT push (offline /
+            // slow link / a reactive revocation that never drained at all) is
+            // parked under the user who owned it — restored on THEIR next
+            // sign-in, never replayed under anyone else — instead of being
+            // wiped with the cache. `prevUserKey` still names that user here.
+            if let owner = UserDefaults.standard.string(forKey: prevUserKey)?.lowercased() {
+                let parked = (try? OutboxStore(db).park(userId: owner)) ?? 0
+                if parked > 0 { print("[sync] parked \(parked) un-pushed op(s) for \(owner)") }
+            }
             try? db.clearAll()
             UserDefaults.standard.removeObject(forKey: prevUserKey)
 

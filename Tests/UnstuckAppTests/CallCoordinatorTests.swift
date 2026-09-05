@@ -89,19 +89,25 @@ final class FakeNotifier: CallNotifier {
 final class FakeReporter: CallOutcomeReporting {
     struct Report: Equatable { let callId: String; let callKitId: UUID?; let outcome: CallOutcome; let snooze: Int?; let notes: [String]? }
     var reports: [Report] = []
+    var discards = 0
     func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?) {
         reports.append(Report(callId: callId, callKitId: callKitId, outcome: outcome, snooze: snoozeMinutes, notes: outcomeNotes))
     }
+    func discardAll() { discards += 1 }
     var outcomes: [CallOutcome] { reports.map(\.outcome) }
 }
 
 @MainActor
 final class FakeEnvironment: CallEnvironment {
     var signedIn = true
+    /// false = the killed-state proxy (no AppModel yet) — `isSignedIn` is
+    /// then only "a VoIP token is stored".
+    var sessionKnown = true
     var focusLive = false
     var anchorLive = true
     var withinHours = true
     var isSignedIn: Bool { signedIn }
+    var isSessionKnown: Bool { sessionKnown }
     var isFocusSessionLive: Bool { focusLive }
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool { anchorLive }
     func isWithinCallHours(_ date: Date) -> Bool { withinHours }
@@ -395,10 +401,81 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(provider.ended.map(\.reason), [.failed])
         XCTAssertNil(sut.active)
         XCTAssertEqual(reporter.outcomes, [.answered], "nothing reported on the way out")
+        XCTAssertEqual(reporter.discards, 1, "whatever is still queued belongs to the old session — dropped, on disk too")
         XCTAssertTrue(notifier.posted.isEmpty)
         XCTAssertTrue(clock.pending.isEmpty)
         // A late CXEndCallAction for the torn-down call is harmless.
         XCTAssertFalse(sut.performEnd(uuid: uuid))
+    }
+
+    // MARK: - sign-in within one launch re-arms PushKit
+
+    func testSignedInRearmsVoip() {
+        var rearms = 0
+        let c = CallCoordinator(provider: provider, controller: controller, environment: env,
+                                launcher: launcher, launcherAttached: true,
+                                notifier: notifier, reporter: reporter, clock: clock,
+                                rearmVoip: { rearms += 1 })
+        c.signedIn()
+        c.signedIn()
+        XCTAssertEqual(rearms, 2, "every sign-in transition re-arms (rearm itself is a no-op while registered)")
+        XCTAssertNil(c.authWatch, "no auth watch until attach(model:client:)")
+    }
+
+    // MARK: - fallback B (alert tap) on a killed-state launch
+
+    func testFallbackTapBeforeTheSessionIsKnownIsDeferredNotDropped() {
+        // PushAppDelegate fires before AppModel.start(): the environment only
+        // has the killed-state proxy, which is FALSE precisely when the server
+        // used the alert transport (no VoIP token). The tap must wait.
+        env.sessionKnown = false
+        env.signedIn = false
+        sut.handleFallbackTap(payload())
+        XCTAssertNotNil(sut.deferredFallbackTap)
+        XCTAssertNil(sut.pendingFallback)
+        XCTAssertTrue(reporter.reports.isEmpty, "nothing decided yet")
+        // The real session arrives (attach(model:) → attach(environment:)).
+        let real = FakeEnvironment()
+        real.signedIn = true
+        sut.attach(environment: real)
+        XCTAssertNil(sut.deferredFallbackTap)
+        XCTAssertEqual(reporter.outcomes, [.answered])
+        XCTAssertEqual(sut.pendingFallback?.callId, Self.callId, "handed to Talk (buffered until the handler is set)")
+    }
+
+    func testDeferredFallbackTapIsDroppedWhenTheRealSessionIsSignedOut() {
+        env.sessionKnown = false
+        sut.handleFallbackTap(payload())
+        XCTAssertNotNil(sut.deferredFallbackTap)
+        let real = FakeEnvironment()
+        real.signedIn = false
+        sut.attach(environment: real)
+        XCTAssertNil(sut.deferredFallbackTap)
+        XCTAssertNil(sut.pendingFallback)
+        XCTAssertTrue(reporter.reports.isEmpty, "nobody signed in → dropped, silently")
+    }
+
+    func testAttachWithAStillUnknownSessionKeepsTheDeferredTap() {
+        env.sessionKnown = false
+        sut.handleFallbackTap(payload())
+        let stillProxy = FakeEnvironment()
+        stillProxy.sessionKnown = false
+        sut.attach(environment: stillProxy)
+        XCTAssertNotNil(sut.deferredFallbackTap)
+        XCTAssertTrue(reporter.reports.isEmpty)
+        sut.signedOut()
+        XCTAssertNil(sut.deferredFallbackTap, "sign-out forgets it")
+    }
+
+    func testFallbackSnoozeGoesThroughThePersistedReporterClamped() {
+        sut.handleFallbackTap(payload())
+        sut.reportFallbackSnooze(callId: Self.callId, minutes: 15)
+        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, callKitId: nil, outcome: .snoozed, snooze: 15, notes: nil))
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed], "ordered after the tap's answered")
+        sut.reportFallbackSnooze(callId: Self.callId, minutes: 0)
+        XCTAssertEqual(reporter.reports.last?.snooze, 1)
+        sut.reportFallbackSnooze(callId: Self.callId, minutes: 999)
+        XCTAssertEqual(reporter.reports.last?.snooze, 180)
     }
 
     // MARK: - ending
@@ -613,16 +690,21 @@ final class CallCoordinatorTests: XCTestCase {
 
 @MainActor
 final class CallsOutcomeReporterTests: XCTestCase {
-    /// Records sends; throws for the first `failures` calls.
+    /// Records sends; throws (transient) for the first `failures` calls, and
+    /// answers a PERMANENT `CallOutcomeRejected` for any callId in `rejected`.
     @MainActor
     final class Recorder {
         var sent: [CallsOutcomeReporter.Item] = []
         var attempts = 0
         var failures: Int
-        init(failures: Int = 0) { self.failures = failures }
+        var rejected: [String: Int] = [:]
+        init(failures: Int = 0, rejected: [String: Int] = [:]) { self.failures = failures; self.rejected = rejected }
         func sender() -> CallsOutcomeReporter.Sender {
             { [self] item in
                 await MainActor.run { self.attempts += 1 }
+                if let code = await MainActor.run(body: { self.rejected[item.callId] }) {
+                    throw CallOutcomeRejected(status: code, message: "not_found")
+                }
                 let fail = await MainActor.run { () -> Bool in
                     if self.failures > 0 { self.failures -= 1; return true }
                     return false
@@ -693,6 +775,60 @@ final class CallsOutcomeReporterTests: XCTestCase {
         XCTAssertEqual(rec.sent.map(\.callId), ["c1", "c2"], "c2 waits for c1 — never reordered")
         XCTAssertEqual(rec.sent.last?.snooze, 10)
         XCTAssertTrue(r.queue.isEmpty)
+    }
+
+    func testAPermanentRejectionDropsThatItemAndTheDrainContinues() async {
+        // A 404 for a callId (row deleted server-side, or another account's
+        // report) used to sit at the head forever, holding every later
+        // outcome hostage. Now it is dropped (logged) at once — no backoff —
+        // and the next items land.
+        let log = SleepLog()
+        let r = CallsOutcomeReporter(defaults: suite, sleep: log.sleeper())
+        let rec = Recorder(rejected: ["dead": 404])
+        r.attach(send: rec.sender())
+        r.report(callId: "dead", callKitId: uuid, outcome: .answered, snoozeMinutes: nil, outcomeNotes: nil)
+        r.report(callId: "c2", callKitId: nil, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        r.report(callId: "c3", callKitId: nil, outcome: .snoozed, snoozeMinutes: 20, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(rec.sent.map(\.callId), ["c2", "c3"], "the dead item is gone, the rest flushed in order")
+        XCTAssertEqual(rec.attempts, 3, "no retries for a permanent refusal")
+        XCTAssertTrue(log.delays.isEmpty, "no backoff either")
+        XCTAssertTrue(r.queue.isEmpty)
+        XCTAssertNil(suite.data(forKey: CallsOutcomeReporter.queueKey))
+        XCTAssertEqual(r.dropped.map(\.item.callId), ["dead"])
+        XCTAssertEqual((r.dropped.first?.error as? CallOutcomeRejected)?.status, 404)
+    }
+
+    func testATransientFailureStillRetriesAfterADroppedItem() async {
+        let log = SleepLog()
+        let r = CallsOutcomeReporter(defaults: suite, sleep: log.sleeper())
+        let rec = Recorder(failures: 1, rejected: ["dead": 422])
+        r.attach(send: rec.sender())
+        r.report(callId: "dead", callKitId: nil, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+        r.report(callId: "c2", callKitId: nil, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(rec.sent.map(\.callId), ["c2"])
+        XCTAssertEqual(rec.attempts, 3, "dead ×1, c2 fails once then lands")
+        XCTAssertEqual(log.delays, [2])
+    }
+
+    func testDiscardAllForgetsTheQueueInMemoryAndOnDisk() async {
+        let r = CallsOutcomeReporter(defaults: suite, sleep: { _ in })
+        r.report(callId: "c1", callKitId: uuid, outcome: .answered, snoozeMinutes: nil, outcomeNotes: nil)
+        r.report(callId: "c1", callKitId: uuid, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+        XCTAssertEqual(r.queue.count, 2)
+        XCTAssertNotNil(suite.data(forKey: CallsOutcomeReporter.queueKey))
+        r.discardAll()
+        XCTAssertTrue(r.queue.isEmpty)
+        XCTAssertNil(suite.data(forKey: CallsOutcomeReporter.queueKey), "nothing carries into the next account")
+        // A relaunch finds nothing to replay.
+        XCTAssertTrue(CallsOutcomeReporter(defaults: suite, sleep: { _ in }).queue.isEmpty)
+        // A later report on the new session still flows.
+        let rec = Recorder()
+        r.attach(send: rec.sender())
+        r.report(callId: "new", callKitId: nil, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(rec.sent.map(\.callId), ["new"])
     }
 
     func testAfterThreeFailuresTheItemIsReEnqueuedAndRetriedLater() async {

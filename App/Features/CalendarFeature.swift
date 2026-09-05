@@ -477,7 +477,7 @@ private struct WeekView: View {
                             // can't even be passed to it).
                             SharedWeekBlock(block: sb)
                                 .frame(width: w, height: h)
-                                .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId) }
+                                .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId, block: sb) }
                                 .offset(off)
                         }
                     }
@@ -681,7 +681,7 @@ private struct MonthView: View {
         .contentShape(Rectangle())
         // A shared day opens the (first) shared task — read-only; a plain day
         // has no tap (the month grid is a heatmap, not a scheduler).
-        .onTapGesture { if let first = sharedHere.first { sharedDetail = SharedDetailTarget(id: first.taskId) } }
+        .onTapGesture { if let first = sharedHere.first { sharedDetail = SharedDetailTarget(id: first.taskId, block: first) } }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(monthCellLabel(day: day, focusedSec: v, marks: marks, isToday: isToday))
     }
@@ -912,7 +912,7 @@ struct DayGridView: View {
                     SharedBlockCard(block: sb, width: max(20, laneW - 3),
                                     height: max(24, CGFloat(sb.durationMinutes) / 60 * pxPerHour))
                         .offset(x: x, y: yFor(startTime: sb.startTime))
-                        .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId) }
+                        .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId, block: sb) }
                 }
             }
             // NOW line on today's grid.

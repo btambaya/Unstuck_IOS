@@ -161,6 +161,13 @@ struct GatewayInputs: Equatable {
     var dismissed: Set<String>
     var todayIso: String
     var minute: Int
+    /// Whether the moment bookkeeping exists yet (`moments != nil`). The
+    /// derived value depends on it (no moment before bootstrap), so it MUST
+    /// be in the key: the first body runs before `.task { bootstrap() }`, and
+    /// for a user with nothing dismissed every other input is byte-identical
+    /// after bootstrap — the cached `moment: nil` used to stick until the
+    /// next minute tick.
+    var bootstrapped: Bool = true
 
     static func minute(of now: Date) -> Int { Int(now.timeIntervalSince1970 / 60) }
 }
@@ -168,6 +175,17 @@ struct GatewayInputs: Equatable {
 struct GatewayDerived {
     var brief: String
     var moment: Moment?
+}
+
+/// How a re-read of the persisted interview flag settles the card's state:
+/// "done" only ever moves towards done here (a local un-done is the scrub's
+/// job, which resets the whole card), and a done account never keeps the
+/// panel open — someone who finished elsewhere is not asked again at 1/7.
+enum GatewayInterviewFlag {
+    static func apply(serverDone: Bool, done: Bool, open: Bool) -> (done: Bool, open: Bool) {
+        guard serverDone else { return (done, open) }
+        return (true, false)
+    }
 }
 
 // MARK: - the card
@@ -215,10 +233,19 @@ struct GatewayCard: View {
                     while !Task.isCancelled {
                         try? await Task.sleep(for: .seconds(60))
                         clock += 1
+                        refreshInterviewFlag()
                     }
                 }
                 .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                     clock += 1
+                    refreshInterviewFlag()
+                    // The foreground syncNow re-applies the account's interview
+                    // flag a few seconds after this fires — look again once it
+                    // has had time to land (AppModel exposes no observable for it).
+                    Task {
+                        try? await Task.sleep(for: .seconds(10))
+                        refreshInterviewFlag()
+                    }
                 }
                 .onChange(of: facts.count) { _, n in factsChanged(count: n) }
                 .onChange(of: model.profileFactsHydrated) { _, _ in maybeAutoOpen() }
@@ -405,6 +432,18 @@ struct GatewayCard: View {
         interviewDone = InterviewMachine.isDone()
     }
 
+    /// Re-read the account-wide interview flag. A LATER hydrate can pin it
+    /// (the sign-in read timed out offline, then a foreground syncNow
+    /// succeeded after the user finished the interview on the web): the pill
+    /// must go, and an open panel — a fresh machine at step 0 for an account
+    /// that is done — closes. `GatewayInterviewFlag.apply` is the pure rule.
+    private func refreshInterviewFlag() {
+        let next = GatewayInterviewFlag.apply(serverDone: InterviewMachine.isDone(),
+                                              done: interviewDone, open: interviewOpen)
+        if next.done != interviewDone { interviewDone = next.done }
+        if next.open != interviewOpen { interviewOpen = next.open }
+    }
+
     /// Live facts off the store (the assistant's saves, a hydrate from another
     /// device, a Settings forget all land here). The auto-open decision waits
     /// for the first value AND the server hydrate — deciding on the first
@@ -477,7 +516,8 @@ struct GatewayCard: View {
         let key = GatewayInputs(
             tasks: vm.all, blocks: vm.blocks, sessions: vm.sessions, facts: facts,
             struggles: model.canonicalStruggles, rituals: model.paPrefs.rituals,
-            dismissed: moments?.dismissed ?? [], todayIso: today, minute: GatewayInputs.minute(of: now))
+            dismissed: moments?.dismissed ?? [], todayIso: today, minute: GatewayInputs.minute(of: now),
+            bootstrapped: moments != nil)
         return memo.value(for: key) {
             GatewayDerived(brief: composeBriefLine(now: now, todayIso: today),
                            moment: moments == nil ? nil : currentMoment(now: now, key: key))

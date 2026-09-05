@@ -37,14 +37,61 @@ final class CallScriptTests: XCTestCase {
         let s = session(firstAction: "open the thread")
         XCTAssertEqual(
             CallScript.opening(s),
-            "Hi Ahmad — you asked me to call about speak to James. Your notes: Ask about the invoice; Confirm Friday; Send the deck. Your first step was: open the thread. Want to tick any off, add something, start a timer, or should I call back in ten?")
+            "Hi Ahmad — you asked me to call so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday; Send the deck. Your first step was: open the thread. Want to tick any off, add something, start the timer, or should I call back in ten?")
     }
 
-    func testOpeningWithoutNameOrNotes() {
+    func testOpeningWithoutNameOrNotesOrTaskOffersOnlyWhatApplies() {
+        // No notes to tick off, no task to time: the old four-way menu named
+        // both. Now: a note prompt + the call-back, and no "you didn't leave
+        // any notes" filler.
         let s = session(name: nil, notes: [], taskId: nil)
         XCTAssertEqual(
             CallScript.opening(s),
-            "Hi — you asked me to call about speak to James. You didn't leave any notes. Want to tick any off, add something, start a timer, or should I call back in ten?")
+            "Hi — you asked me to call so you'd speak to James. Anything you want me to note down, or should I call back in ten?")
+    }
+
+    func testOpeningRendersTheLabelByShape() {
+        // A verb-phrase label (what the prompt asks for) is framed "so you'd …";
+        // a noun (a name, "the dentist", a task title) is framed "about …" —
+        // never "call about speak to James".
+        XCTAssertTrue(CallScript.opening(session(label: "speak to James")).hasPrefix("Hi Ahmad — you asked me to call so you'd speak to James."))
+        XCTAssertTrue(CallScript.opening(session(label: "James")).hasPrefix("Hi Ahmad — you asked me to call about James."))
+        XCTAssertTrue(CallScript.opening(session(label: "the dentist")).hasPrefix("Hi Ahmad — you asked me to call about the dentist."))
+        XCTAssertTrue(CallScript.opening(session(label: "Dentist appointment")).hasPrefix("Hi Ahmad — you asked me to call about Dentist appointment."))
+        XCTAssertTrue(CallScript.opening(session(label: "to ring the bank")).hasPrefix("Hi Ahmad — you asked me to call so you'd ring the bank."))
+        XCTAssertFalse(CallScript.opening(session(label: "speak to James")).contains("call about speak"))
+    }
+
+    func testLabelShapeAndReasonPhrase() {
+        XCTAssertEqual(CallScript.labelShape("speak to James"), .verbPhrase)
+        XCTAssertEqual(CallScript.labelShape("Chase the invoice"), .verbPhrase)
+        XCTAssertEqual(CallScript.labelShape("to call mum"), .verbPhrase)
+        XCTAssertEqual(CallScript.labelShape("James"), .nounPhrase)
+        XCTAssertEqual(CallScript.labelShape("the dentist"), .nounPhrase)
+        XCTAssertEqual(CallScript.labelShape("Q3 planning"), .nounPhrase)
+        XCTAssertEqual(CallScript.labelShape(""), .nounPhrase)
+        XCTAssertEqual(CallScript.reasonPhrase("  speak to James "), "so you'd speak to James")
+        XCTAssertEqual(CallScript.reasonPhrase("To ring the bank"), "so you'd ring the bank")
+        XCTAssertEqual(CallScript.reasonPhrase("James"), "about James")
+    }
+
+    func testOfferSentenceNamesOnlyWhatApplies() {
+        XCTAssertEqual(CallScript.offerSentence(hasTask: true, hasNotes: true),
+                       "Want to tick any off, add something, start the timer, or should I call back in ten?")
+        XCTAssertEqual(CallScript.offerSentence(hasTask: true, hasNotes: false),
+                       "Want to start the timer, or should I call back in ten?")
+        XCTAssertEqual(CallScript.offerSentence(hasTask: false, hasNotes: true),
+                       "Want to tick any off, add something, or should I call back in ten?")
+        XCTAssertEqual(CallScript.offerSentence(hasTask: false, hasNotes: false),
+                       "Anything you want me to note down, or should I call back in ten?")
+        // Notes-only (no task) never offers a timer; task-only never "tick any off".
+        let notesOnly = CallScript.opening(session(notes: ["A"], taskId: nil))
+        XCTAssertFalse(notesOnly.contains("timer"))
+        XCTAssertTrue(notesOnly.contains("You wanted to remember: A."))
+        let taskOnly = CallScript.opening(session(notes: [], taskId: "t1"))
+        XCTAssertFalse(taskOnly.contains("tick any off"))
+        XCTAssertFalse(taskOnly.contains("notes"))
+        XCTAssertTrue(taskOnly.contains("start the timer"))
     }
 
     func testOpeningUsesFirstNameOnly() {
@@ -63,9 +110,10 @@ final class CallScriptTests: XCTestCase {
         XCTAssertNil(CallScript.startLine(session(), now: now))
     }
 
-    func testNotesSentenceTrimsAndDropsBlanks() {
-        XCTAssertEqual(CallScript.notesSentence([" A ", "", "B"]), "Your notes: A; B.")
-        XCTAssertEqual(CallScript.notesSentence([]), "You didn't leave any notes.")
+    func testNotesSentenceTrimsAndDropsBlanksAndIsNilWhenEmpty() {
+        XCTAssertEqual(CallScript.notesSentence([" A ", "", "B"]), "You wanted to remember: A; B.")
+        XCTAssertNil(CallScript.notesSentence([]))
+        XCTAssertNil(CallScript.notesSentence(["  ", ""]))
     }
 
     // MARK: instructions + tools
@@ -449,6 +497,72 @@ final class CallToolsTests: XCTestCase {
         await expect("cancel_call", ["callId": "r1"], "error: that call is already cancelled")
         await expect("cancel_call", ["callId": "zzz"], "error: call not found — use get_calls")
         await expect("cancel_call", [:], "error: callId required — use get_calls to find it")
+    }
+
+    // MARK: update_call mid-call (answered / calling rows)
+
+    func testUpdateCallEditsNotesAndLabelOnAnAnsweredCall() async {
+        // The phone reports `answered` the moment the call is picked up, so
+        // by the time the model runs update_call the row is 'answered' — the
+        // in-call "add 'bring the contract' to the notes" must still land.
+        store.rows = [CallRequest(id: "r1", callAt: CallsClient.iso(date(2026, 9, 2, 14, 55)), label: "dentist",
+                                  notes: ["bring the form"], status: "answered")]
+        let r = await run("update_call", ["callId": "r1", "notes": ["bring the form", "bring the contract"]])
+        XCTAssertEqual(r, "ok: updated call \"dentist\" — 2026-09-02 14:55, 2 notes id=r1")
+        XCTAssertEqual(store.patches.count, 1)
+        XCTAssertEqual(store.patches[0].notes, ["bring the form", "bring the contract"])
+        XCTAssertNil(store.patches[0].callAt)
+        XCTAssertEqual(store.rows[0].status, "answered", "a notes edit never touches the status")
+        // Label too — and on a ringing ('calling') row.
+        store.rows[0].status = "calling"
+        let l = await run("update_call", ["callId": "r1", "label": "dentist appt"])
+        XCTAssertEqual(l, "ok: updated call \"dentist appt\" — 2026-09-02 14:55, 2 notes id=r1")
+        XCTAssertEqual(store.rows[0].status, "calling")
+    }
+
+    func testUpdateCallRefusesATimeChangeWhileRingingOrAnswered() async {
+        // Re-arming a ringing/answered row to 'scheduled' would be overwritten
+        // by the phone's own outcome report (missed / done) a moment later —
+        // the reschedule the tool just confirmed would silently vanish.
+        for status in ["calling", "answered"] {
+            store.rows = [CallRequest(id: "r1", taskId: "t1", blockId: "b1", callAt: CallsClient.iso(date(2026, 9, 2, 14, 55)),
+                                      leadMin: 5, label: "x", status: status)]
+            store.patches = []
+            await expect("update_call", ["callId": "r1", "when": "2026-09-02 17:00"], CallTools.inProgress)
+            await expect("update_call", ["callId": "r1", "leadMin": 10], CallTools.inProgress)
+            XCTAssertTrue(store.patches.isEmpty, status)
+            XCTAssertEqual(store.rows[0].status, status)
+        }
+        XCTAssertEqual(CallTools.inProgress, "error: that call is in progress right now — I can change its notes or label, but not its time; snooze_call or book another with request_call")
+        // Finished rows are not editable at all.
+        store.rows = [CallRequest(id: "r1", callAt: CallsClient.iso(date(2026, 9, 2, 14, 55)), label: "x", status: "done")]
+        await expect("update_call", ["callId": "r1", "notes": ["A"]], "error: that call is already done — book a new one with request_call")
+    }
+
+    func testCallRequestStatusContract() {
+        func row(_ status: String) -> CallRequest {
+            CallRequest(id: "r", callAt: CallsClient.iso(date(2026, 9, 2, 14, 55)), label: "x", status: status)
+        }
+        XCTAssertEqual(CallRequest.liveStatuses, ["scheduled", "snoozed", "calling"])
+        XCTAssertEqual(CallRequest.editableStatuses, ["scheduled", "snoozed", "calling", "answered"])
+        XCTAssertEqual(CallRequest.reschedulableStatuses, ["scheduled", "snoozed"])
+        XCTAssertTrue(row("answered").isEditable && row("answered").isInProgress && !row("answered").isLive)
+        XCTAssertTrue(row("calling").isEditable && row("calling").isInProgress && row("calling").isLive)
+        XCTAssertTrue(row("scheduled").isEditable && !row("scheduled").isInProgress)
+        XCTAssertFalse(row("done").isEditable || row("cancelled").isEditable || row("missed").isEditable)
+        // The compare-and-set list CallsClient.update sends: a time change
+        // never matches a 'calling' row (so it can't flip it back to
+        // 'scheduled'); a notes/label edit matches answered too.
+        XCTAssertEqual(CallsClient.statusesAccepting(timeChange: true), ["scheduled", "snoozed"])
+        XCTAssertEqual(CallsClient.statusesAccepting(timeChange: false), ["scheduled", "snoozed", "calling", "answered"])
+    }
+
+    func testCallOutcomeRejectedClassifiesPermanentStatuses() {
+        for code in [400, 403, 404, 410, 422] { XCTAssertTrue(CallOutcomeRejected.isPermanent(status: code), "\(code)") }
+        for code in [401, 408, 429, 500, 502, 503, 200] { XCTAssertFalse(CallOutcomeRejected.isPermanent(status: code), "\(code)") }
+        let e = CallOutcomeRejected(status: 404, message: "not_found")
+        XCTAssertTrue(CallsOutcomeReporter.isPermanent(e))
+        XCTAssertFalse(CallsOutcomeReporter.isPermanent(NSError(domain: "net", code: -1009)))
     }
 
     // MARK: get_calls

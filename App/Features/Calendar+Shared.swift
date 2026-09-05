@@ -246,6 +246,18 @@ func monthDayMarks(own: [CalBlock], shared: [SharedBlock]) -> MonthDayMarks {
                   shared: shared.filter { !$0.skipped }.count)
 }
 
+// MARK: - A block's slot, in words
+
+/// The "Planned Sat, Sep 12 · 04:30 · 45m" / "Done …" line for ONE shared
+/// block — what the detail sheet shows when it was opened from a calendar
+/// tap (that block, not the projection's next one). Rendered in the
+/// recipient's zone when the row carries `startAt` (migration 053); a pre-053
+/// row reads the owner's date/time text.
+func sharedBlockPlannedLabel(_ b: SharedBlock, timeZone: TimeZone = .current) -> String? {
+    sharedPlannedLabel(nextDate: b.date, nextStartTime: b.startTime, nextDurationMinutes: b.durationMinutes,
+                       nextDone: b.done, nextStartAt: b.startAt, timeZone: timeZone)
+}
+
 // MARK: - Shared block views (read-only)
 
 /// A shared block on the Day grid — dashed primary outline, a soft fill, the
