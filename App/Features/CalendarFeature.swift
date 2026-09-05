@@ -2,8 +2,10 @@
 // Day/Week/Month segmented control, a Google connect/sync bar, and per-mode
 // grids (a draggable Day hour grid with a NOW line + unscheduled tray, a
 // Monday-anchored Week rollup + 7-column hour grid, and a Month focus-density
-// heatmap). Block-time creation, drag-to-schedule, and Google two-way sync
-// preserved from the prior iOS slice. Live store via GRDB.
+// heatmap + per-day planned marks). Block-time creation, drag-to-schedule, and
+// Google two-way sync preserved from the prior iOS slice. Live store via GRDB.
+// Tasks shared WITH me render as read-only blocks at the owner's slot on every
+// mode (Calendar+Shared.swift) — never draggable/editable from here.
 
 import SwiftUI
 import UnstuckCore
@@ -184,14 +186,20 @@ struct CalendarView: View {
             NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin,
                          prefillDate: at.date, prefillTime: at.time)
         }
-        // No bubble on Calendar (Android gates it off `tab == "calendar"`): it
-        // sits bottom-trailing over the drag-to-schedule gesture area.
+        // The assistant ✦ launcher, like every other tab. The grids pad their
+        // content 96pt at the bottom (and the Day tray's chip row scrolls past
+        // it) so it never covers the last hour rows or a drop target.
+        .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
             showSettings = false; showPalette = false; createAt = nil
         }
         .task {
+            // Subscribe the share state to the live shares-changed signal (+ an
+            // initial fetch) — the Calendar may be the first tab to need the
+            // shared layer after launch. Idempotent on the subscribe.
+            model.shareState.start()
             guard vm == nil, let db = model.db, let taskRepo = model.taskRepo else { return }
             let m = CalendarModel(taskRepo, Repository<CalendarConnection>(db, orderColumn: "connectedAt"))
             vm = m; await m.observe()
@@ -306,6 +314,7 @@ private struct CalendarSyncBar: View {
 // MARK: - Week view (Monday-anchored rollup + 7-column hour grid)
 
 private struct WeekView: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     let vm: CalendarModel
     /// Tap an empty slot → create a task prefilled at that day + snapped time.
@@ -313,6 +322,8 @@ private struct WeekView: View {
     @State private var weekOffset = 0
     /// Tap a task block → reschedule/resize/unschedule (same sheet as the Day grid).
     @State private var editingBlock: CalBlock?
+    /// Tap a SHARED block → the read-only shared-task detail (never the edit sheet).
+    @State private var sharedDetail: SharedDetailTarget?
 
     private let wStart = 0
     private let wEnd = 24
@@ -413,6 +424,16 @@ private struct WeekView: View {
         .sheet(item: $editingBlock) { block in
             CalBlockEditSheet(vm: vm, block: block)
         }
+        // Tap a shared block → its read-only detail.
+        .sheet(item: $sharedDetail) { target in
+            SharedTaskDetailSheet(taskId: target.id)
+        }
+        // Load the shared layer for the visible week (cached per window;
+        // re-read on the shares-changed signal by ShareModel).
+        .task(id: weekOffset) {
+            let w = CalWindow.week(offset: weekOffset)
+            await model.shareState.loadSharedBlocks(from: w.from, to: w.to)
+        }
     }
 
     private func dayColumn(_ iso: String) -> some View {
@@ -432,20 +453,33 @@ private struct WeekView: View {
                 .onTapGesture { location in
                     onCreateAt(iso, snappedTime(location.y))
                 }
-                let laid = vm.laidBlocks(on: iso)
-                ForEach(laid, id: \.block.id) { item in
-                    let b = item.block
-                    let top = minutesOf(b.startTime) - wStart * 60
+                // Own + shared blocks in one lane pass (side-by-side on overlap).
+                let laid = dayLanes(vm, iso: iso, shared: model.shareState.sharedBlocks(on: iso))
+                ForEach(laid, id: \.item.id) { laidItem in
+                    let top = laidItem.startMin - wStart * 60
                     if top >= 0 && top <= (wEnd - wStart) * 60 {
-                        let laneW = item.lanes > 1 ? geo.size.width / CGFloat(item.lanes) : geo.size.width
-                        weekBlock(b)
-                            .frame(width: max(5, laneW - 1),
-                                   height: max(13, CGFloat(b.durationMinutes) / 60 * wHour))
-                            // Task blocks open the edit sheet; external/placeholder
-                            // blocks just swallow the tap so it doesn't fall through
-                            // to the create-task gesture underneath.
-                            .onTapGesture { if isTaskBlock(b) { editingBlock = b } }
-                            .offset(x: laneW * CGFloat(item.lane), y: wHour * CGFloat(top) / 60)
+                        let laneW = laidItem.lanes > 1 ? geo.size.width / CGFloat(laidItem.lanes) : geo.size.width
+                        let w = max(5, laneW - 1)
+                        let h = max(13, CGFloat(laidItem.item.durationMinutes) / 60 * wHour)
+                        let off = CGSize(width: laneW * CGFloat(laidItem.lane), height: wHour * CGFloat(top) / 60)
+                        switch laidItem.item {
+                        case .own(let b):
+                            weekBlock(b)
+                                .frame(width: w, height: h)
+                                // Task blocks open the edit sheet; external/placeholder
+                                // blocks just swallow the tap so it doesn't fall through
+                                // to the create-task gesture underneath.
+                                .onTapGesture { if isTaskBlock(b) { editingBlock = b } }
+                                .offset(off)
+                        case .shared(let sb):
+                            // READ-ONLY: tap → the shared-task detail. Never the
+                            // edit sheet (it takes a CalBlock — a shared block
+                            // can't even be passed to it).
+                            SharedWeekBlock(block: sb)
+                                .frame(width: w, height: h)
+                                .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId) }
+                                .offset(off)
+                        }
                     }
                 }
             }
@@ -505,12 +539,15 @@ private struct WeekView: View {
     }
 }
 
-// MARK: - Month view (focus-density heatmap)
+// MARK: - Month view (focus-density heatmap + planned / shared marks)
 
 private struct MonthView: View {
+    @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     let vm: CalendarModel
     @State private var ym = Date()
+    /// Tap a day with a shared block → the first one's read-only detail.
+    @State private var sharedDetail: SharedDetailTarget?
 
     private let dows = ["M", "T", "W", "T", "F", "S", "S"]
 
@@ -530,6 +567,7 @@ private struct MonthView: View {
         let maxV = max(1, byDay.values.max() ?? 1)
         let todayISO = Clock.todayISO()
         let weeks = stride(from: 0, to: cells.count, by: 7).map { Array(cells[$0..<min($0 + 7, cells.count)]) }
+        let monthWindow = CalWindow.month(containing: firstOfMonth)
 
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
@@ -558,8 +596,22 @@ private struct MonthView: View {
                 }
                 .padding(.top, 8)
 
-                Text("Focus density").font(UFont.mono(10, .medium)).foregroundStyle(theme.palette.ink3)
-                    .padding(.top, 2).padding(.bottom, 10)
+                // Legend: the fill is focus density; the marks under the day
+                // number are MY planned blocks (dots) + anything shared (ring).
+                HStack(spacing: 10) {
+                    Text("Focus density").font(UFont.mono(10, .medium))
+                    HStack(spacing: 3) {
+                        Circle().fill(theme.palette.ink3).frame(width: 3.5, height: 3.5)
+                        Text("planned").font(UFont.mono(10, .medium))
+                    }
+                    HStack(spacing: 3) {
+                        Circle().strokeBorder(theme.palette.primaryDeep, style: StrokeStyle(lineWidth: 1, dash: [1.5, 1]))
+                            .frame(width: 5, height: 5)
+                        Text("shared").font(UFont.mono(10, .medium))
+                    }
+                }
+                .foregroundStyle(theme.palette.ink3)
+                .padding(.top, 2).padding(.bottom, 10)
 
                 // Weekday header
                 HStack(spacing: 4) {
@@ -592,6 +644,15 @@ private struct MonthView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, 96)
         }
+        // Tap a day carrying a shared block → its read-only detail.
+        .sheet(item: $sharedDetail) { target in
+            SharedTaskDetailSheet(taskId: target.id)
+        }
+        // Load the shared layer for the visible month (≤ 31 days, under the
+        // server's 62-day cap; cached per window).
+        .task(id: monthWindow) {
+            await model.shareState.loadSharedBlocks(from: monthWindow.from, to: monthWindow.to)
+        }
     }
 
     private func monthCell(_ d: Date, byDay: [String: Int], maxV: Int, todayISO: String) -> some View {
@@ -604,12 +665,33 @@ private struct MonthView: View {
         let fill: Color = isToday ? theme.palette.coral
             : (v == 0 ? theme.palette.bg2 : lerpColor(theme.palette.bg2, theme.palette.primary, 0.2 + 0.6 * t))
         let textColor: Color = (isToday || t > 0.5) ? theme.palette.bg : theme.palette.ink2
+        // Planned marks — MY task blocks that day (from the cached
+        // blocksByDate) + shared ones — separate from the focus-density fill.
+        let sharedHere = model.shareState.sharedBlocks(on: iso)
+        let marks = monthDayMarks(own: vm.blocks(on: iso), shared: sharedHere)
         return ZStack {
             RoundedRectangle(cornerRadius: 7, style: .continuous).fill(fill)
-            Text("\(day)").font(UFont.sans(11, .semibold)).foregroundStyle(textColor)
+            VStack(spacing: 2) {
+                Text("\(day)").font(UFont.sans(11, .semibold)).foregroundStyle(textColor)
+                if !marks.isEmpty { MonthMarksRow(marks: marks, tint: textColor) }
+            }
         }
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
+        // A shared day opens the (first) shared task — read-only; a plain day
+        // has no tap (the month grid is a heatmap, not a scheduler).
+        .onTapGesture { if let first = sharedHere.first { sharedDetail = SharedDetailTarget(id: first.taskId) } }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(monthCellLabel(day: day, focusedSec: v, marks: marks, isToday: isToday))
+    }
+
+    private func monthCellLabel(day: Int, focusedSec: Int, marks: MonthDayMarks, isToday: Bool) -> String {
+        var parts = [isToday ? "Today, \(day)" : "\(day)"]
+        if marks.planned > 0 { parts.append("\(marks.planned) planned") }
+        if marks.shared > 0 { parts.append("\(marks.shared) shared") }
+        if focusedSec > 0 { parts.append("\(focusedSec / 60) minutes focused") }
+        return parts.joined(separator: ", ")
     }
 
     private func monthLabel(_ d: Date) -> String {
@@ -639,35 +721,12 @@ struct LaidBlock {
 }
 
 /// Greedy interval colouring — mirrors the Android layoutLanes / web calendar.
+/// The pass itself is the generic `layoutLanes(_:startTime:durationMinutes:)`
+/// (Calendar+Shared.swift), which the merged own+shared layout also uses.
 func layoutLanes(_ blocks: [CalBlock]) -> [LaidBlock] {
-    func parse(_ s: String) -> Int {
-        let p = s.split(separator: ":").compactMap { Int($0) }
-        return (p.first ?? 0) * 60 + (p.count > 1 ? p[1] : 0)
+    layoutLanes(blocks, startTime: \.startTime, durationMinutes: \.durationMinutes).map {
+        LaidBlock(block: $0.item, startMin: $0.startMin, endMin: $0.endMin, lane: $0.lane, lanes: $0.lanes)
     }
-    var laid = blocks.map { b -> LaidBlock in
-        let s = parse(b.startTime)
-        return LaidBlock(block: b, startMin: s, endMin: s + max(1, b.durationMinutes))
-    }.sorted { ($0.startMin, $0.endMin) < ($1.startMin, $1.endMin) }
-
-    var i = 0
-    while i < laid.count {
-        var clusterEnd = laid[i].endMin
-        var j = i + 1
-        while j < laid.count && laid[j].startMin < clusterEnd {
-            clusterEnd = max(clusterEnd, laid[j].endMin); j += 1
-        }
-        var laneEnd: [Int] = []
-        for k in i..<j {
-            if let lane = laneEnd.firstIndex(where: { $0 <= laid[k].startMin }) {
-                laid[k].lane = lane; laneEnd[lane] = laid[k].endMin
-            } else {
-                laid[k].lane = laneEnd.count; laneEnd.append(laid[k].endMin)
-            }
-        }
-        for k in i..<j { laid[k].lanes = laneEnd.count }
-        i = j
-    }
-    return laid
 }
 
 // MARK: - Day grid (draggable hour grid + NOW line + unscheduled tray)
@@ -686,6 +745,8 @@ struct DayGridView: View {
     @State private var now = Date()
     /// Tap a task block → the reschedule/resize/unschedule sheet.
     @State private var editingBlock: CalBlock?
+    /// Tap a SHARED block → the read-only shared-task detail (never the edit sheet).
+    @State private var sharedDetail: SharedDetailTarget?
 
     private let firstHour = 0
     private let lastHour = 24
@@ -702,6 +763,9 @@ struct DayGridView: View {
                 ScrollView {
                     GeometryReader { geo in grid(width: geo.size.width) }
                         .frame(height: gridHeight)
+                    // Let the last hour rows scroll clear of the tray + the
+                    // floating assistant launcher.
+                    Color.clear.frame(height: 96)
                 }
                 .onAppear { scrollToNow(proxy) }
                 .onChange(of: date) { _, _ in scrollToNow(proxy) }
@@ -721,6 +785,16 @@ struct DayGridView: View {
         // Tap a task block → reschedule / resize / unschedule.
         .sheet(item: $editingBlock) { block in
             CalBlockEditSheet(vm: vm, block: block)
+        }
+        // Tap a shared block → its read-only detail.
+        .sheet(item: $sharedDetail) { target in
+            SharedTaskDetailSheet(taskId: target.id)
+        }
+        // Load the shared layer for the week around the viewed day (one RPC
+        // per week window, cached; re-read on the shares-changed signal).
+        .task(id: iso) {
+            let w = CalWindow.week(containing: iso)
+            await model.shareState.loadSharedBlocks(from: w.from, to: w.to)
         }
     }
 
@@ -774,7 +848,9 @@ struct DayGridView: View {
                             .draggable("task:\(task.id)")
                     }
                 }
-                .padding(.horizontal, 12).padding(.bottom, 12)
+                // Trailing room so the last chip can scroll out from under
+                // the floating assistant launcher (bottom-trailing, 46pt).
+                .padding(.leading, 12).padding(.trailing, 76).padding(.bottom, 12)
             }
         }
         .padding(.bottom, 84)   // clear the floating bottom nav
@@ -804,26 +880,39 @@ struct DayGridView: View {
                 guard location.x >= 64 else { return }
                 onCreateAt(iso, snappedTime(location.y))
             }
-            // Blocks for the day, positioned by start time, lane-split on overlap.
-            // Only TASK blocks are draggable — external/Google + placeholder
-            // blocks are display-only (they mirror the remote calendar; moving
-            // one would enqueue a non-UUID g_ row Postgres rejects forever, and
-            // only changes local state that reverts on the next sync). Mirrors
-            // the Android DayGrid gating.
-            ForEach(vm.laidBlocks(on: iso), id: \.block.id) { item in
-                let b = item.block
+            // Blocks for the day, positioned by start time, lane-split on overlap
+            // — my own AND the shared layer in one lane pass. Only my own TASK
+            // blocks are draggable/editable (CalLaneItem.isEditable) —
+            // external/Google + placeholder blocks are display-only (they mirror
+            // the remote calendar; moving one would enqueue a non-UUID g_ row
+            // Postgres rejects forever, and only changes local state that
+            // reverts on the next sync), and SHARED blocks are the owner's
+            // (tap → read-only detail; never drag / edit / delete). Mirrors the
+            // Android DayGrid gating.
+            ForEach(dayLanes(vm, iso: iso, shared: model.shareState.sharedBlocks(on: iso)), id: \.item.id) { item in
                 let laneW = item.lanes > 1 ? (width - 82) / CGFloat(item.lanes) : (width - 82)
-                let card = blockCard(b, width: max(20, laneW - 3))
-                    .offset(x: 70 + laneW * CGFloat(item.lane), y: yFor(b))
-                if isTaskBlock(b) {
-                    // Tap to edit (reschedule/resize/unschedule) + drag to move.
-                    card
-                        .onTapGesture { editingBlock = b }
-                        .draggable("block:\(b.id)")
-                } else {
-                    // External/placeholder blocks are display-only — swallow the tap
-                    // so it doesn't fall through to the grid's create handler.
-                    card.onTapGesture { }
+                let x = 70 + laneW * CGFloat(item.lane)
+                switch item.item {
+                case .own(let b):
+                    let card = blockCard(b, width: max(20, laneW - 3))
+                        .offset(x: x, y: yFor(b))
+                    if item.item.isEditable {
+                        // Tap to edit (reschedule/resize/unschedule) + drag to move.
+                        card
+                            .onTapGesture { editingBlock = b }
+                            .draggable("block:\(b.id)")
+                    } else {
+                        // External/placeholder blocks are display-only — swallow the tap
+                        // so it doesn't fall through to the grid's create handler.
+                        card.onTapGesture { }
+                    }
+                case .shared(let sb):
+                    // Read-only: tap opens the shared-task detail; NO .draggable,
+                    // NO context menu, NO edit sheet.
+                    SharedBlockCard(block: sb, width: max(20, laneW - 3),
+                                    height: max(24, CGFloat(sb.durationMinutes) / 60 * pxPerHour))
+                        .offset(x: x, y: yFor(startTime: sb.startTime))
+                        .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId) }
                 }
             }
             // NOW line on today's grid.
@@ -876,12 +965,18 @@ struct DayGridView: View {
         }
     }
 
-    private func yFor(_ block: CalBlock) -> CGFloat {
-        CGFloat(minutesOf(block.startTime) - firstHour * 60) / 60 * pxPerHour
+    private func yFor(_ block: CalBlock) -> CGFloat { yFor(startTime: block.startTime) }
+    private func yFor(startTime: String) -> CGFloat {
+        CGFloat(minutesOf(startTime) - firstHour * 60) / 60 * pxPerHour
     }
 
+    /// Drop handler — accepts ONLY my own payloads: "task:<id>" (schedule from
+    /// the tray) and "block:<id>" (move my own block; resolved against
+    /// vm.blocks, so a shared block id — which lives in ShareModel, never in
+    /// vm.blocks — can't match). Shared blocks are never made `.draggable`, so
+    /// no "shared:" payload exists; anything else is refused.
     private func handleDrop(_ items: [String], _ location: CGPoint) -> Bool {
-        guard let payload = items.first else { return false }
+        guard let payload = items.first, !payload.hasPrefix("shared:") else { return false }
         let minutesFromTop = Double(location.y) / Double(pxPerHour) * 60
         let snapped = max(0, (minutesFromTop / 15).rounded() * 15)
         let total = firstHour * 60 + Int(snapped)
@@ -927,8 +1022,10 @@ struct DayGridView: View {
 /// Tap a scheduled task block → reschedule (free-slot chips), resize (duration
 /// chips), or unschedule. Mirrors the Android CalBlockEditSheet (and the web
 /// cal-block-edit-modal). External/Google blocks never reach here — the day
-/// grid only opens this for task blocks. The model is @Observable, so the live
-/// block follows sequential edits without manual refresh.
+/// grid only opens this for task blocks — and SHARED blocks (someone else's
+/// schedule, `SharedBlock`) can't even be passed in: they open the read-only
+/// SharedTaskDetailSheet instead. The model is @Observable, so the live block
+/// follows sequential edits without manual refresh.
 struct CalBlockEditSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme

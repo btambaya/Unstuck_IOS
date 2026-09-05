@@ -541,17 +541,20 @@ struct TodayView: View {
             if let liveTask, let live = model.liveSession {
                 liveSessionCard(liveTask, live)
             }
-            // Company + delegation sit atop the Today list (not the Backlog view),
-            // 1:1 with the web today-list. Each renders nothing when empty.
+            // Company sits atop the list, placed like your own tasks: Today
+            // shows shares scheduled today / unscheduled, Backlog the overdue
+            // ones — by the owner's next block (migration 052). Honours the
+            // active area pill like the rows + Delegated do. Renders nothing
+            // when empty; a completed share leaves Today at once.
+            SharedWithYouGroup(items: model.shareState.sharedWithMe,
+                               mode: backlogActive ? .backlog : .today,
+                               activeArea: areaFilter,
+                               makeCoFocus: { model.makeCoFocusModel(taskId: $0) },
+                               suppressPresenceTaskId: liveId) { taskId, done in
+                Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
+            }
+            // Delegation stays a Today-only group, 1:1 with the web today-list.
             if !backlogActive {
-                // Today mode: a completed share leaves this list at once, the
-                // same as your own completed tasks.
-                SharedWithYouGroup(items: model.shareState.sharedWithMe,
-                                   mode: .today,
-                                   makeCoFocus: { model.makeCoFocusModel(taskId: $0) },
-                                   suppressPresenceTaskId: liveId) { taskId, done in
-                    Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
-                }
                 DelegatedGroup(tasks: vm.all, assignedOut: assignedOut, activeArea: areaFilter,
                                now: Date().timeIntervalSince1970 * 1000) { t in
                     model.router.detailTask = t
@@ -564,14 +567,19 @@ struct TodayView: View {
         // today/finish steps spotlight the list section instead.
         .tourTarget(.todayList)
         // Per-view empty note — only when nothing else is on screen (the live
-        // card counts as content), and only inside Backlog or an area filter
-        // (matches Android's displayRows.isEmpty && liveTask == null gate).
-        if rows.isEmpty && liveTask == nil && (backlogActive || areaFilter != nil) {
+        // card counts as content, and so do shared rows — "Nothing in Work
+        // right now" under five shared rows was the bug), and only inside
+        // Backlog or an area filter (matches Android's displayRows.isEmpty &&
+        // liveTask == null gate).
+        let sharedShown = visibleShares(model.shareState.sharedWithMe,
+                                        mode: backlogActive ? .backlog : .today,
+                                        todayISO: Clock.todayISO(), activeArea: areaFilter).count
+        if rows.isEmpty && liveTask == nil && sharedShown == 0 && (backlogActive || areaFilter != nil) {
             Text(backlogActive ? "Backlog's clear — nothing waiting."
                  : "Nothing in \(areaFilter ?? "") right now.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                 .padding(.horizontal, 18).padding(.vertical, 28)
-        } else if rows.isEmpty && liveTask == nil {
+        } else if rows.isEmpty && liveTask == nil && sharedShown == 0 {
             // Plain Today with nothing scheduled (no live card) — keep the
             // existing prompt rather than a silent blank.
             Text("Nothing scheduled. Tap + to add.")

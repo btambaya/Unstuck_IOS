@@ -36,6 +36,13 @@ final class ShareModel {
     var sharedWithMe: [SharedWithMe] = []
     /// My OUTGOING shares, grouped by task id (drives row badges + delegation).
     var badges: [String: [ShareBadge]] = [:]
+    /// The OWNER-scheduled blocks of tasks shared with me, by date — the
+    /// calendar's read-only "shared" layer (shared_task_blocks, migration 052).
+    /// A small per-window cache: each calendar surface asks for its visible
+    /// range (`loadSharedBlocks`), which fetches only when the window isn't
+    /// already covered; every loaded window is re-read on the shares-changed
+    /// signal / `refresh()`, so a block the owner moves lands here live.
+    private(set) var sharedBlocks = SharedBlocksCache()
     @ObservationIgnored private var observer: NSObjectProtocol?
     /// Fired after each refresh (badges may have changed) so AppModel can pump
     /// the share-session signal reducer — a session_start that was waiting on
@@ -67,13 +74,34 @@ final class ShareModel {
     /// Refetch both projections. Tolerant (each RPC returns [] on failure); a nil
     /// client (demo/UITest boot) degrades to empty.
     func refresh() async {
-        guard let client else { sharedWithMe = []; badges = [:]; onChange?(); return }
+        guard let client else { sharedWithMe = []; badges = [:]; sharedBlocks.clear(); onChange?(); return }
         async let swm = client.tasksSharedWithMe()
         async let flat = client.shareBadges()
         sharedWithMe = await swm
         badges = CircleClient.shareBadgesByTask(await flat)
         onChange?()
+        // Re-read every calendar window we've served (an owner rescheduling a
+        // shared task must move its block on my calendar without a relaunch).
+        for w in sharedBlocks.windows {
+            let rows = await client.sharedTaskBlocks(from: w.from, to: w.to)
+            sharedBlocks.store(w, blocks: rows)
+        }
     }
+
+    /// Make sure the shared-block layer covers [from, to] ('YYYY-MM-DD',
+    /// inclusive; ≤ 62 days — the server's cap). No-op when an already-loaded
+    /// window covers it; otherwise ONE RPC, stored under that window. A nil
+    /// client (demo/UITest boot) leaves the layer empty.
+    func loadSharedBlocks(from: String, to: String) async {
+        let w = SharedBlocksCache.Window(from: from, to: to)
+        guard let client, !sharedBlocks.covers(w) else { return }
+        let rows = await client.sharedTaskBlocks(from: from, to: to)
+        sharedBlocks.store(w, blocks: rows)
+    }
+
+    /// Shared blocks on a day (skipped ones dropped, sorted by start) — O(1)
+    /// once the window is loaded; [] before that / with no shares.
+    func sharedBlocks(on iso: String) -> [SharedBlock] { sharedBlocks.blocks(on: iso) }
 
     /// taskId → assignee name for tasks shared at 'assign' (the Delegated group).
     var assignedOut: [String: String] { UnstuckCore.assignedOutMap(badges) }
@@ -399,10 +427,14 @@ struct ShareSheet: View {
 struct SharedWithYouGroup: View {
     @Environment(\.uTheme) private var theme
     let items: [SharedWithMe]
-    /// Which list this group is sitting in — decides where a COMPLETED share
-    /// belongs (gone from Today, today's win still in All, and it lives under
-    /// Completed from then on), exactly like the user's own tasks.
+    /// Which list this group is sitting in — decides where a share belongs:
+    /// placed by the owner's next live block (Today / Upcoming / Backlog), and
+    /// once COMPLETED gone from Today, today's win still in All, and under
+    /// Completed from then on — exactly like the user's own tasks.
     var mode: ShareViewMode = .all
+    /// When set, only show shares in this life area (mirrors the list filter
+    /// + DelegatedGroup). nil = no filter.
+    var activeArea: String? = nil
     /// Builds a co-focus presence model for a partner-row taskId (nil on the
     /// demo/UITest boot → the presence indicator is simply omitted).
     var makeCoFocus: ((String) -> CoFocusModel)? = nil
@@ -418,9 +450,12 @@ struct SharedWithYouGroup: View {
     @State private var detailTarget: SharedDetailTarget?
 
     var body: some View {
-        // A completed shared task follows the same rules as your own completed
-        // tasks — SharedTaskVisibility (port of lib/shared-task-visibility.ts).
-        let visible = visibleShares(items, mode: mode, now: Date().timeIntervalSince1970 * 1000)
+        // A shared task follows the same placement + completion rules as your
+        // own tasks — SharedTaskVisibility (port of lib/shared-task-visibility.ts,
+        // placed by the owner's next block since migration 052).
+        let today = Clock.todayISO()
+        let visible = visibleShares(items, mode: mode, now: Date().timeIntervalSince1970 * 1000,
+                                    todayISO: today, activeArea: activeArea)
         // Keep the container alive while the detail sheet is open even if its
         // row just filtered out (completing the last share from inside the
         // sheet) — tearing the host down would yank the sheet away mid-read.
@@ -430,7 +465,7 @@ struct SharedWithYouGroup: View {
             VStack(alignment: .leading, spacing: 6) {
                 if !visible.isEmpty {
                     GroupHeader(mode == .completed ? "Shared with you · completed" : "Shared with you")
-                    ForEach(visible) { s in row(s) }
+                    ForEach(visible) { s in row(s, todayISO: today) }
                 }
             }
             .padding(.bottom, 8)
@@ -442,8 +477,15 @@ struct SharedWithYouGroup: View {
         }
     }
 
-    private func row(_ s: SharedWithMe) -> some View {
+    private func row(_ s: SharedWithMe, todayISO: String) -> some View {
         let canComplete = levelCanComplete(s.level)
+        // The owner's slot, in words — "Sat 04:30 · 45m · from Anna" — so a
+        // shared task reads like your own scheduled row; just "from Anna" when
+        // nothing is planned (or against a pre-052 server).
+        let slot = sharedSlotLabel(nextDate: s.nextDate, nextStartTime: s.nextStartTime,
+                                   nextDurationMinutes: s.nextDurationMinutes, nextDone: s.nextDone,
+                                   todayISO: todayISO)
+        let subtitle = slot.map { "\($0) · from \(shortName(s.ownerName))" } ?? "from \(shortName(s.ownerName))"
         return HStack(spacing: 12) {
             if canComplete {
                 Button { onToggle(s.taskId, !s.done) } label: {
@@ -460,7 +502,7 @@ struct SharedWithYouGroup: View {
                 Text(s.title).font(UFont.sans(14, .medium))
                     .strikethrough(s.done)
                     .foregroundStyle(s.done ? theme.palette.ink3 : theme.palette.ink).lineLimit(1)
-                Text("from \(shortName(s.ownerName))").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                Text(subtitle).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).lineLimit(1)
                 // Live co-focus: on a PARTNER row, show "focusing now" when the
                 // owner is present + a "Sit with them" toggle (mirrors web
                 // PartnerPresence). Only when a presence factory is available.
@@ -485,8 +527,9 @@ struct SharedWithYouGroup: View {
     }
 }
 
-/// Identifiable wrapper so a tapped shared-task id can drive `.sheet(item:)`.
-private struct SharedDetailTarget: Identifiable, Equatable { let id: String }
+/// Identifiable wrapper so a tapped shared-task id can drive `.sheet(item:)`
+/// (the shared group rows + the calendar's shared blocks).
+struct SharedDetailTarget: Identifiable, Equatable { let id: String }
 
 // MARK: - Shared task read-only detail (T1) + shared focus entry (T3)
 
@@ -549,6 +592,18 @@ struct SharedTaskDetailSheet: View {
             }
             Text("from \(shortName(d.ownerName))")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+
+            // The owner's schedule (migration 052): "Planned Sat, Sep 12 · 04:30
+            // · 45m" — read-only; the recipient never moves the owner's block.
+            if let planned = sharedPlannedLabel(nextDate: d.nextDate, nextStartTime: d.nextStartTime,
+                                                nextDurationMinutes: d.nextDurationMinutes, nextDone: d.nextDone) {
+                HStack(spacing: 6) {
+                    Image(systemName: "calendar").font(.system(size: 11, weight: .semibold))
+                    Text(planned).font(UFont.sans(12.5, .medium))
+                }
+                .foregroundStyle(theme.palette.primaryDeep)
+                .accessibilityElement(children: .combine)
+            }
 
             // Meta chips: life area · estimate · due (a short, fixed set).
             HStack(spacing: 6) {

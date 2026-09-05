@@ -422,8 +422,14 @@ struct GatewayCard: View {
     }
 
     private func maybeAutoOpen() {
+        // Re-read the flag: the sign-in hydrate pins it from the ACCOUNT
+        // (user_preferences.assistant_interview_done_at) right before
+        // profileFactsHydrated flips — after bootstrap() read it. Someone who
+        // finished on the web must never be greeted as a stranger here.
+        let done = InterviewMachine.isDone()
+        if done != interviewDone { interviewDone = done }
         if autoOpen.evaluate(hydrated: model.profileFactsHydrated, factsLoaded: factsLoaded,
-                             factCount: facts.count, done: interviewDone,
+                             factCount: facts.count, done: done,
                              hasResumeStep: InterviewMachine.hasResumeStep()) {
             openInterview()
         }
@@ -432,24 +438,35 @@ struct GatewayCard: View {
     private func factsChanged(count: Int) {
         // Facts that arrive from ELSEWHERE while the panel is open but untouched
         // (a second device's hydrate landing a beat after first open): close
-        // it — the user has clearly been here before.
-        if interviewOpen, let interview, interview.isFirstStep, interview.noted.isEmpty, count >= 3 {
+        // it — the user has clearly been here before. One fact is enough
+        // (web parity): on the first step with nothing noted, none is its own.
+        if interviewOpen, let interview, interview.isFirstStep, interview.noted.isEmpty, count >= 1 {
             interviewOpen = false
         }
         guard InterviewMachine.shouldAutoComplete(factCount: count, isOpen: interviewOpen, done: interviewDone,
-                                                  hasResumeStep: InterviewMachine.hasResumeStep())
+                                                  parkedStep: InterviewMachine.parkedStep())
         else { return }
         InterviewMachine.markDone()
+        model.pushInterviewDone()   // account-wide: no other device re-asks
         interviewDone = true
     }
 
     private func openInterview() {
         if interview == nil {
-            interview = InterviewMachine(save: { [model] category, fact in
-                model.profileFacts?.save(category: category, fact: fact, source: .interview, whenIso: nil)
-            })
+            interview = InterviewMachine(
+                save: { [model] category, fact in
+                    // nil = the local write failed: the machine keeps the step
+                    // and says so — no "✓ Noted" over a dropped save.
+                    model.profileFacts?.save(category: category, fact: fact, source: .interview, whenIso: nil) != nil
+                },
+                onDone: { [model] in model.pushInterviewDone() })
         }
         interviewOpen = true
+        // Persist the step NOW: the auto-open gate is per-process, so without
+        // it a user with 0 facts got the panel at 1/N on every cold launch.
+        // From the next launch the pill is the way in (the server done-flag
+        // short-circuits all of this for anyone already onboarded).
+        interview?.markInProgress()
     }
 
     private func todayIso() -> String { Clock.todayISO() }

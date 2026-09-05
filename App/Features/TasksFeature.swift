@@ -314,16 +314,20 @@ struct TasksView: View {
         // the web task-list-pane filter.
         let assignedOut = model.shareState.assignedOut
         let rows = vm.view == .completed ? vm.visible : vm.visible.filter { assignedOut[$0.id] == nil }
-        // "Shared with you" sits atop All / Today AND Completed — a finished
-        // share has to land under Completed like every other task (the view
-        // picks the mode). Delegation stays an All/Today-only group.
-        let showShared = vm.view == .all || vm.view == .today || vm.view == .completed
+        // "Shared with you" sits atop Backlog / All / Today / Upcoming AND
+        // Completed — a share is placed by the owner's next block exactly like
+        // your own tasks (the view picks the mode), and a finished one lands
+        // under Completed. Later / Recurring never mount it. Delegation stays
+        // an All/Today-only group. Today is area-agnostic here, like the rows
+        // + Delegated (the area pill bites on the other tabs).
+        let showShared = vm.view != .later && vm.view != .recurring
         let showDelegated = vm.view == .all || vm.view == .today
         ScrollView {
             LazyVStack(spacing: 6) {
                 if showShared {
                     SharedWithYouGroup(items: model.shareState.sharedWithMe,
                                        mode: ShareViewMode(vm.view),
+                                       activeArea: vm.view == .today ? nil : vm.activeArea,
                                        makeCoFocus: { model.makeCoFocusModel(taskId: $0) }) { taskId, done in
                         Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
                     }

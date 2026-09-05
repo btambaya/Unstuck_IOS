@@ -146,6 +146,89 @@ final class CircleClientTests: XCTestCase {
         XCTAssertEqual(d.createdAt, "2026-06-11T09:00:00.000Z")
     }
 
+    func testSharedWithMeRowCarriesTheScheduleAndToleratesItsAbsence() throws {
+        // 052 row: estimate/area + the owner's next block.
+        let json = """
+        {"share_id":"s7","task_id":"t11","owner_name":"Anna","level":"view","title":"Deck","done":false,
+         "completed_at":null,"estimate_min":45,"life_area":"Work","next_block_id":"b1",
+         "next_date":"2026-09-06","next_start_time":"04:30","next_duration_minutes":45,"next_done":false}
+        """
+        let s = try decode(SharedWithMeRow.self, json).model()
+        XCTAssertEqual(s.estimateMin, 45)
+        XCTAssertEqual(s.lifeArea, "Work")
+        XCTAssertEqual(s.nextBlockId, "b1")
+        XCTAssertEqual(s.nextDate, "2026-09-06")
+        XCTAssertEqual(s.nextStartTime, "04:30")
+        XCTAssertEqual(s.nextDurationMinutes, 45)
+        XCTAssertEqual(s.nextDone, false)
+
+        // Pre-052 projection: the columns don't exist at all → nil, no throw.
+        let legacy = """
+        {"share_id":"s8","task_id":"t12","owner_name":"Anna","level":"view","title":"Deck","done":false}
+        """
+        let l = try decode(SharedWithMeRow.self, legacy).model()
+        XCTAssertNil(l.estimateMin)
+        XCTAssertNil(l.nextDate)
+        XCTAssertNil(l.nextDone)
+    }
+
+    func testSharedBlockRowMapping() throws {
+        let json = """
+        {"block_id":"b1","task_id":"t1","share_id":"s1","level":"partner","owner_name":"Anna Lee",
+         "title":"Deck","date":"2026-09-06","start_time":"04:30","duration_minutes":45,
+         "done":false,"skipped":null,"kind":"task"}
+        """
+        let b = try decode(SharedBlockRow.self, json).model()
+        XCTAssertEqual(b.blockId, "b1")
+        XCTAssertEqual(b.taskId, "t1")
+        XCTAssertEqual(b.shareId, "s1")
+        XCTAssertEqual(b.level, .partner)
+        XCTAssertEqual(b.ownerName, "Anna Lee")
+        XCTAssertEqual(b.title, "Deck")
+        XCTAssertEqual(b.date, "2026-09-06")
+        XCTAssertEqual(b.startTime, "04:30")
+        XCTAssertEqual(b.durationMinutes, 45)
+        XCTAssertFalse(b.done)
+        XCTAssertFalse(b.skipped)
+        XCTAssertEqual(b.kind, "task")
+
+        // Sparse row → calm defaults.
+        let sparse = """
+        {"block_id":"b2","task_id":"t2","share_id":"s2","level":"weird","owner_name":null,"title":null,
+         "date":"2026-09-07","start_time":"10:00","duration_minutes":null,"done":null,"skipped":true,"kind":null}
+        """
+        let sb = try decode(SharedBlockRow.self, sparse).model()
+        XCTAssertEqual(sb.level, .view)
+        XCTAssertEqual(sb.ownerName, "Someone")
+        XCTAssertEqual(sb.title, "Untitled task")
+        XCTAssertEqual(sb.durationMinutes, 25)
+        XCTAssertTrue(sb.skipped)
+        XCTAssertEqual(sb.kind, "task")
+    }
+
+    func testSharedBlocksParamKeys() throws {
+        let obj = try encodedObject(SharedBlocksParams(p_from: "2026-09-01", p_to: "2026-09-30"))
+        XCTAssertEqual(Set(obj.keys), ["p_from", "p_to"])
+        XCTAssertEqual(obj["p_from"]?.stringValue, "2026-09-01")
+        XCTAssertEqual(obj["p_to"]?.stringValue, "2026-09-30")
+    }
+
+    func testSharedTaskDetailRowCarriesTheNextBlock() throws {
+        let json = """
+        {"task_id":"t8","owner_name":"Anna","level":"view","name":"Deck","done":false,
+         "estimate_min":45,"total_focused":0,"life_area":"Work","priority":null,
+         "tags":[],"objectives":[],"due_at":null,"created_at":null,
+         "next_block_id":"b1","next_date":"2026-09-06","next_start_time":"04:30",
+         "next_duration_minutes":45,"next_done":false}
+        """
+        let d = try decode(SharedTaskDetailRow.self, json).model()
+        XCTAssertEqual(d.nextBlockId, "b1")
+        XCTAssertEqual(d.nextDate, "2026-09-06")
+        XCTAssertEqual(d.nextStartTime, "04:30")
+        XCTAssertEqual(d.nextDurationMinutes, 45)
+        XCTAssertEqual(d.nextDone, false)
+    }
+
     func testSharedTaskDetailRowTolerantDefaults() throws {
         // Sparse row (nulls / missing optionals) must decode to calm defaults,
         // never crash — the recipient still gets a usable detail.
@@ -166,6 +249,10 @@ final class CircleClientTests: XCTestCase {
         XCTAssertTrue(d.tags.isEmpty)
         XCTAssertTrue(d.objectives.isEmpty)
         XCTAssertNil(d.dueAt)
+        // Pre-052 row: no next_* columns at all → nil.
+        XCTAssertNil(d.nextBlockId)
+        XCTAssertNil(d.nextDate)
+        XCTAssertNil(d.nextDone)
     }
 
     func testLogSharedFocusParamKeysAndValues() throws {

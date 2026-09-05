@@ -402,6 +402,50 @@ final class AppModel {
         }
     }
 
+    // MARK: - interview flag (cross-device, migration 052)
+
+    /// The user whose `assistant_interview_done_at` has been reconciled this
+    /// sign-in. Nil until a read SUCCEEDS — offline / timed out / the column
+    /// not deployed yet all leave it unset so the next hydrate retries. Reset
+    /// on sign-out (scrubDeviceLocalUserContent).
+    @ObservationIgnored private var interviewFlagPulledFor: String?
+
+    /// Reconcile the device's interview flag with the ACCOUNT's
+    /// (`user_preferences.assistant_interview_done_at`): server done ⇒ pin the
+    /// local flag, so the gateway's gate never auto-opens for someone who
+    /// finished on the web (prod tester, 2026-09-05); local done but server
+    /// not ⇒ push it up (a finish made offline, or before migration 052
+    /// existed). Once per sign-in, bounded so an unreachable server can't
+    /// stall the "hydrated" flip — the gate then falls back to the fact
+    /// count, as before. Best-effort: never throws, never touches the local
+    /// flag on an unknown answer.
+    private func applyServerInterviewFlag() async {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId, interviewFlagPulledFor != uid else { return }
+        let prefs = coord.preferences
+        do {
+            let doneAt = try await withDeadline(seconds: 6) { try await prefs.interviewDoneAt(userId: uid) }
+            guard coord.auth.currentUserId == uid else { return }   // account changed mid-flight
+            interviewFlagPulledFor = uid
+            if doneAt != nil {
+                InterviewMachine.markDone()
+            } else if InterviewMachine.isDone() {
+                Task { try? await prefs.setInterviewDone(userId: uid) }
+            }
+        } catch {
+            // Offline, timed out, or the column isn't there yet (42703):
+            // unknown ≠ "not done" — leave the local flag alone, retry next hydrate.
+        }
+    }
+
+    /// The interview finished on THIS device (any finisher, reaching the
+    /// picker, or the ≥1-fact auto-done): mirror it to the account so no other
+    /// device re-asks. The local flag is the machine's job; this is the
+    /// best-effort push (a failure is re-pushed by the next sign-in hydrate).
+    func pushInterviewDone() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        Task { try? await coord.preferences.setInterviewDone(userId: uid) }
+    }
+
     // MARK: - voice (realtime "Talk" mode config)
 
     /// The CF Worker proxy URL (wss://…workers.dev) from Info.plist
@@ -492,6 +536,11 @@ final class AppModel {
         await coord.setOnProfileFactsHydrated { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                // The account's interview flag lands BEFORE "hydrated" flips:
+                // the gateway's auto-open gate decides on that flip, and an
+                // already-onboarded user (done on the web, few synced facts)
+                // must never be greeted as a stranger.
+                await self.applyServerInterviewFlag()
                 self.profileFactsHydrated = true
                 self.pullAdhdStrugglesIfNeeded()
             }
@@ -928,6 +977,9 @@ final class AppModel {
         // this device is greeted, not silently skipped.
         paPrefs.scrub()
         InterviewMachine.resetDone()
+        // The server flag re-applies on the next sign-in's hydrate — for
+        // WHOEVER signs in next, so forget which account was reconciled.
+        interviewFlagPulledFor = nil
         _assistant?.clear()
         AssistantModel.scrubPersisted()
         Task { await ReminderScheduler.shared.cancelAll() }
@@ -1282,5 +1334,26 @@ final class AppModel {
         let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("unstuck.sqlite").path
+    }
+}
+
+// MARK: - deadline helper
+
+private struct DeadlineExceeded: Error {}
+
+/// Race `op` against a deadline; the loser is cancelled. For the sign-in reads
+/// that gate UI (the interview flag) so a hung request can't hold a
+/// "hydrated" flip hostage.
+private func withDeadline<T: Sendable>(seconds: Double,
+                                       _ op: @escaping @Sendable () async throws -> T) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await op() }
+        group.addTask {
+            try await Task.sleep(for: .seconds(seconds))
+            throw DeadlineExceeded()
+        }
+        defer { group.cancelAll() }
+        guard let first = try await group.next() else { throw DeadlineExceeded() }
+        return first
     }
 }

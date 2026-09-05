@@ -111,6 +111,50 @@ public struct PreferencesClient: Sendable {
         }
         try await setUsableMinutes(userId: uid, perDay: perDay, weekend: weekend)
     }
+
+    // MARK: interview flag (migration 052)
+
+    /// Mirror "the get-to-know-you interview is done" to the ACCOUNT —
+    /// `user_preferences.assistant_interview_done_at` — so no other device
+    /// re-asks (the web writes the same column). Upsert on user_id like the
+    /// other prefs writers (a bare UPDATE on a missing row is a silent no-op).
+    /// Throws while the column doesn't exist yet (PGRST204) — callers are
+    /// best-effort and the next sign-in hydrate re-pushes.
+    public func setInterviewDone(userId: String, at date: Date = Date()) async throws {
+        struct Row: Encodable { let user_id: String; let assistant_interview_done_at: String }
+        _ = try await client.from("user_preferences")
+            .upsert(Row(user_id: userId, assistant_interview_done_at: CallsClient.iso(date)), onConflict: "user_id")
+            .execute()
+    }
+
+    /// When the account finished the interview (on any platform), or nil when
+    /// it hasn't / the row is absent. Throws on transport failure AND while
+    /// the column doesn't exist yet (42703) — callers treat both as "unknown,
+    /// retry later", never as "not done".
+    public func interviewDoneAt(userId: String) async throws -> Date? {
+        struct Row: Decodable { let assistant_interview_done_at: String? }
+        let rows: [Row] = try await client.from("user_preferences")
+            .select("assistant_interview_done_at").eq("user_id", value: userId).limit(1)
+            .execute().value
+        return rows.first?.assistant_interview_done_at.flatMap(Self.parseTimestamp)
+    }
+
+    /// A Postgres `timestamptz` as PostgREST emits it — `+00:00` offset and
+    /// up to SIX fractional digits (`now()` keeps microseconds), which
+    /// ISO8601DateFormatter refuses: normalise the fraction to milliseconds
+    /// and retry. Nil for empty / unparseable.
+    public static func parseTimestamp(_ s: String) -> Date? {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return nil }
+        if let d = CallsClient.parseISO(t) { return d }
+        guard let dot = t.firstIndex(of: ".") else { return nil }
+        let afterDot = t[t.index(after: dot)...]
+        let digits = afterDot.prefix { $0.isNumber }
+        guard !digits.isEmpty else { return nil }
+        let rest = afterDot.dropFirst(digits.count)
+        let millis = String(digits.prefix(3)).padding(toLength: 3, withPad: "0", startingAt: 0)
+        return CallsClient.parseISO(String(t[..<dot]) + "." + millis + String(rest))
+    }
 }
 
 public enum PreferencesClientError: Error, Sendable, Equatable {

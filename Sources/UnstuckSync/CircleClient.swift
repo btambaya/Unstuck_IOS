@@ -154,6 +154,20 @@ public struct CircleClient: Sendable {
         } catch { return [] }
     }
 
+    /// Every block (any share level) of every task shared with me, dated within
+    /// [from, to] inclusive ('YYYY-MM-DD') — the recipient calendar's read-only
+    /// layer. RPC: shared_task_blocks(p_from, p_to) (migration 052). The server
+    /// caps the window at 62 days (`range_too_wide`) and never projects external
+    /// blocks. Tolerant → [] on any failure (incl. a pre-052 server where the
+    /// function doesn't exist yet).
+    public func sharedTaskBlocks(from: String, to: String) async -> [SharedBlock] {
+        do {
+            let rows: [SharedBlockRow] = try await client.rpc(
+                "shared_task_blocks", params: SharedBlocksParams(p_from: from, p_to: to)).execute().value
+            return rows.map { $0.model() }
+        } catch { return [] }
+    }
+
     /// Complete/uncomplete a task shared with me (partner or assign only; the RPC
     /// rejects view). RPC: shared_task_set_done(p_task_id, p_done). Throws on the
     /// server's `not_allowed`, matching the web hook.
@@ -241,6 +255,7 @@ struct TaskIdParams: Encodable { let p_task_id: String }
 struct TaskShareParams: Encodable { let p_task_id: String; let p_user: String; let p_level: String }
 struct SetDoneParams: Encodable { let p_task_id: String; let p_done: Bool }
 struct LogSharedFocusParams: Encodable { let p_task_id: String; let p_actual_sec: Int; let p_session_id: String }
+struct SharedBlocksParams: Encodable { let p_from: String; let p_to: String }
 
 // Edge-fn bodies: camelCase, matching what the web sends + the functions read.
 struct InviteBody: Encodable { let email: String? }
@@ -286,11 +301,50 @@ struct SharedWithMeRow: Decodable {
     /// Migration 049. Optional (decodeIfPresent) so an un-migrated projection —
     /// which omits the column entirely — still decodes.
     let completed_at: String?
+    /// Migration 052 — the owner's estimate/area + NEXT block. All optional for
+    /// the same reason (a pre-052 projection omits every one of them), and the
+    /// `next_*` set is null whenever nothing is scheduled.
+    let estimate_min: Int?
+    let life_area: String?
+    let next_block_id: String?
+    let next_date: String?
+    let next_start_time: String?
+    let next_duration_minutes: Int?
+    let next_done: Bool?
 
     func model() -> SharedWithMe {
         SharedWithMe(shareId: share_id, taskId: task_id, ownerName: owner_name,
                      level: ShareLevel(rawValue: level) ?? .view, title: title,
-                     done: done == true, completedAt: completed_at)
+                     done: done == true, completedAt: completed_at,
+                     estimateMin: estimate_min, lifeArea: life_area,
+                     nextBlockId: next_block_id, nextDate: next_date, nextStartTime: next_start_time,
+                     nextDurationMinutes: next_duration_minutes, nextDone: next_done)
+    }
+}
+
+/// One row of shared_task_blocks (migration 052). `date` is a Postgres date →
+/// 'YYYY-MM-DD'; `start_time` the 'HH:MM' text cal_blocks stores; the booleans
+/// are nullable → coalesced false.
+struct SharedBlockRow: Decodable {
+    let block_id: String
+    let task_id: String
+    let share_id: String
+    let level: String
+    let owner_name: String?
+    let title: String?
+    let date: String
+    let start_time: String
+    let duration_minutes: Int?
+    let done: Bool?
+    let skipped: Bool?
+    let kind: String?
+
+    func model() -> SharedBlock {
+        SharedBlock(blockId: block_id, taskId: task_id, shareId: share_id,
+                    level: ShareLevel(rawValue: level) ?? .view,
+                    ownerName: owner_name ?? "Someone", title: title ?? "Untitled task",
+                    date: date, startTime: start_time, durationMinutes: duration_minutes ?? 25,
+                    done: done == true, skipped: skipped == true, kind: kind ?? "task")
     }
 }
 
@@ -322,6 +376,12 @@ struct SharedTaskDetailRow: Decodable {
     let objectives: [Objective]?
     let due_at: String?
     let created_at: String?
+    /// Migration 052 — the owner's NEXT block (nil pre-052 / unscheduled).
+    let next_block_id: String?
+    let next_date: String?
+    let next_start_time: String?
+    let next_duration_minutes: Int?
+    let next_done: Bool?
 
     func model() -> SharedTaskDetail {
         SharedTaskDetail(
@@ -337,6 +397,11 @@ struct SharedTaskDetailRow: Decodable {
             tags: tags ?? [],
             objectives: objectives ?? [],
             dueAt: due_at,
-            createdAt: created_at)
+            createdAt: created_at,
+            nextBlockId: next_block_id,
+            nextDate: next_date,
+            nextStartTime: next_start_time,
+            nextDurationMinutes: next_duration_minutes,
+            nextDone: next_done)
     }
 }

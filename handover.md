@@ -3,7 +3,32 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-03, latest) — review round (3 independent reviewers → 49 findings → all fixed) + TestFlight 1.1.0 (34)
+## Where things stand (2026-09-05, latest) — tester round: shared tasks by schedule, interview parity, launcher on Calendar (1.1.0 build 35)
+
+Zubair's TestFlight report on build 34: shared tasks all under Today, none on the calendar, month
+shows nothing scheduled, interview re-asks at 1/5, no ✦ on Calendar, web asks 7 questions vs 5.
+
+- **Shared tasks** — root cause was the data model: `tasks_shared_with_me()` carried no schedule and
+  `cal_blocks` is owner-only. Migration 052 (web repo) now returns the owner's NEXT live block
+  (`next_block_id/date/start_time/duration_minutes/done` + `estimate_min`, `life_area`) and a
+  `shared_task_blocks(p_from, p_to)` range RPC (≤62 days). iOS rule set (same as web + Android): a
+  shared task behaves like your own — Today only when the owner's block is today or the task is
+  undated; Upcoming/Backlog by date; the group respects the life-area pill; rows show the slot.
+  Day/Week/Month render read-only "shared" blocks (dashed, owner name; never drag/resize/edit/
+  delete; tap → shared-task sheet with "Planned …"). Month gets per-day marks (● own planned,
+  dashed ring = shared) beside the focus density. Fetch/cache: `ShareModel.sharedBlocks`
+  (`Calendar+Shared.swift`), one RPC per Mon–Sun/month window, refreshed on shares-changed.
+- **Interview** — now the web's 7 questions (rhythm, work, people, fixed, commitments, nogo, nudge)
+  + rituals picker; "done" mirrored to `user_preferences.assistant_interview_done_at` and applied
+  BEFORE the auto-open gate decides (`AppModel.applyServerInterviewFlag`), so a user onboarded on
+  the web is never re-asked; the panel auto-opens once per device then shows the pill; a failed
+  save keeps the step and says so ("Couldn't save that — try again"); per-question Skip + header
+  "I'm done" + chevron to park (no "Skip for now").
+- **Assistant launcher** on the Calendar tab (day grid padded so it never covers the last hours).
+
+Tests: packages 810, app bundle 401 (all green).
+
+## Where things stand (2026-09-03) — review round (3 independent reviewers → 49 findings → all fixed) + TestFlight 1.1.0 (34)
 
 Three independent reviews (harness/contract/data; CallKit/PushKit/voice; surfaces/parity) of the
 2026-09-02 build-out produced 25 + 8 + 16 findings; every one is fixed and covered by tests
