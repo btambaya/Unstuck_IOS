@@ -150,6 +150,21 @@ final class AssistantThreadTests: XCTestCase {
         XCTAssertFalse(json.contains("\"receipts\":"), "an empty receipts list must not be persisted")
     }
 
+    // MARK: recovery — two upstream rejections in a row offer a fresh thread
+
+    func testTwoUpstreamFailuresInARowOfferAFreshThreadAndAnyOtherOutcomeResets() {
+        var streak = 0
+        streak = AssistantModel.upstreamStreak(after: "upstream", previous: streak)
+        XCTAssertEqual(streak, 1)
+        XCTAssertFalse(AssistantModel.offersFreshThread(streak: streak))
+        streak = AssistantModel.upstreamStreak(after: "upstream", previous: streak)
+        XCTAssertEqual(streak, 2)
+        XCTAssertTrue(AssistantModel.offersFreshThread(streak: streak))
+        // A different failure between them is not the poisoned-thread signature.
+        XCTAssertEqual(AssistantModel.upstreamStreak(after: "network", previous: 1), 0)
+        XCTAssertEqual(AssistantModel.upstreamStreak(after: "rate_limited", previous: 5), 0)
+    }
+
     // MARK: day dividers
 
     func testDayLabels() {

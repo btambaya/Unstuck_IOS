@@ -88,6 +88,34 @@ enum AssistantHarness {
         "I got partway through — \(n) thing\(n == 1 ? "" : "s") went through (receipts below). Tell me what's still missing."
     }
 
+    // MARK: tool-call hygiene
+
+    /// A tool call's `function.arguments` as it is PERSISTED and replayed:
+    /// anything that does not parse to a JSON object becomes "{}". DashScope
+    /// rejects the WHOLE request (400 InvalidParameter: "function.arguments …
+    /// must be in JSON format") when any replayed assistant tool_call carries
+    /// an empty string or JSON cut off by finish_reason=length — clients
+    /// persisted those turns verbatim, so ONE bad call poisoned every later
+    /// turn of the thread (2026-09-06, iOS builds 39/40). A valid object is
+    /// returned untouched, so the model-facing history is otherwise identical.
+    /// Execution still sees the raw string (the truncated-args hint keys on it).
+    nonisolated static func argumentsAsObjectJSON(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !s.isEmpty, let data = s.data(using: .utf8),
+              let parsed = try? JSONSerialization.jsonObject(with: data),
+              parsed is [String: Any] else { return "{}" }
+        return raw
+    }
+
+    /// The calls as they go into the thread (see `argumentsAsObjectJSON`).
+    nonisolated static func normalisedForHistory(_ calls: [ToolCall]) -> [ToolCall] {
+        calls.map { call in
+            var c = call
+            c.function.arguments = argumentsAsObjectJSON(call.function.arguments)
+            return c
+        }
+    }
+
     struct Deps {
         let transport: AssistantTransport
         let api: AssistantAppState
@@ -154,8 +182,13 @@ enum AssistantHarness {
                     continue
                 }
 
+                // The thread (persisted + replayed) carries NORMALISED tool
+                // calls — a non-object `arguments` string would 400 every
+                // later request (see argumentsAsObjectJSON); execution below
+                // still runs on the raw reply so the truncated-args hint fires.
                 working.append(AssistantTurn(
-                    ChatMessage(role: "assistant", content: reply.content, toolCalls: reply.toolCalls.isEmpty ? nil : reply.toolCalls),
+                    ChatMessage(role: "assistant", content: reply.content,
+                                toolCalls: reply.toolCalls.isEmpty ? nil : normalisedForHistory(reply.toolCalls)),
                     at: deps.now()))
                 if reply.finishReason == "length" {
                     working.append(AssistantTurn(ChatMessage(role: "user", content: cutOffHint), hidden: true))

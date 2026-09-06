@@ -61,11 +61,25 @@ struct AssistantSheet: View {
             // error off the model (which survives close/reopen). A live region so
             // VoiceOver announces failures.
             if let message = note ?? assistant.error.map(assistantFriendlyError) {
-                Text(message)
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 20).padding(.vertical, 4)
-                    .accessibilityAddTraits(.updatesFrequently)
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    Text(message)
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                        .accessibilityAddTraits(.updatesFrequently)
+                    // Two upstream rejections in a row: the thread itself is
+                    // the likely cause (a poisoned replayed tool_call,
+                    // 2026-09-06) — offer the way out right where it hurts.
+                    if note == nil && assistant.offersFreshThread {
+                        Button("Start a fresh thread") {
+                            assistant.clear()
+                            input = ""
+                            showChips = true
+                        }
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
+                        .buttonStyle(.plain)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20).padding(.vertical, 4)
             }
 
             inputBar

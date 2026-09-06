@@ -107,6 +107,17 @@ final class AssistantModel {
     private(set) var sending = false
     /// Error code of the last failed turn (nil = none); survives sheet reopen.
     private(set) var error: String?
+    /// Consecutive turns the upstream rejected (`upstream`). Two in a row on
+    /// one thread is the poisoned-history signature (a persisted tool_call
+    /// with non-object arguments made DashScope 400 every later turn,
+    /// 2026-09-06): the sheet then offers "Start a fresh thread" next to the
+    /// error. Reset by a good turn or clear().
+    private(set) var upstreamStreak = 0
+    var offersFreshThread: Bool { Self.offersFreshThread(streak: upstreamStreak) }
+    nonisolated static func upstreamStreak(after code: String, previous: Int) -> Int {
+        code == "upstream" ? previous + 1 : 0
+    }
+    nonisolated static func offersFreshThread(streak: Int) -> Bool { streak >= 2 }
     /// The most recent completed assistant reply text + a monotonic tick, so the
     /// chat's "read aloud" toggle can speak each new reply exactly once.
     private(set) var lastReply: String?
@@ -197,8 +208,10 @@ final class AssistantModel {
             case .reply(let reply):
                 self.lastReply = reply
                 self.lastReplyTick += 1
+                self.upstreamStreak = 0
             case .error(let code):
                 self.error = code
+                self.upstreamStreak = Self.upstreamStreak(after: code, previous: self.upstreamStreak)
             case .cancelled:
                 break
             }
@@ -268,6 +281,7 @@ final class AssistantModel {
         turnTask = nil
         sending = false
         error = nil
+        upstreamStreak = 0
         queued.removeAll()
         turns.removeAll()
         pendingShares.removeAll()
@@ -561,7 +575,14 @@ final class AssistantModel {
         let d = UserDefaults.standard
         if let data = d.data(forKey: Self.threadKey),
            let loaded = try? JSONDecoder().decode([AssistantTurn].self, from: data) {
-            turns = loaded
+            // Scrub a thread persisted BEFORE the hygiene landed: a tool_call
+            // with non-object arguments 400s every request that replays it.
+            turns = loaded.map { t in
+                guard let calls = t.message.toolCalls, !calls.isEmpty else { return t }
+                var t = t
+                t.message.toolCalls = AssistantHarness.normalisedForHistory(calls)
+                return t
+            }
             return
         }
         if let data = d.data(forKey: Self.legacyHistoryKey),

@@ -220,6 +220,44 @@ final class AssistantHarnessTests: XCTestCase {
         XCTAssertEqual(api.tasks.count, 0)
     }
 
+    // MARK: tool-call hygiene (DashScope 400s on a replayed non-object `arguments`, 2026-09-06)
+
+    func testEmptyOrTruncatedToolArgumentsArePersistedAndReplayedAsAnEmptyObject() async {
+        let transport = ScriptedTransport([
+            call("create_task", "", id: "c1"),
+            call("create_tasks", #"{"tasks":[{"name":"a"},{"name":"b"#, id: "c2"),
+            call("create_task", #"{"name":"A"}"#, id: "c3"),
+            text("Added A."),
+        ])
+        _ = await runTurn("dump", transport)
+        let persistedArgs = finalThread.compactMap { $0.message.toolCalls?.first?.function.arguments }
+        XCTAssertEqual(persistedArgs, ["{}", "{}", #"{"name":"A"}"#])
+        // The model-facing history carries the same normalised calls (ids intact)…
+        XCTAssertEqual(transport.asks[3].compactMap { $0.toolCalls?.first?.function.arguments }, ["{}", "{}", #"{"name":"A"}"#])
+        XCTAssertEqual(transport.asks[3].compactMap { $0.toolCalls?.first?.id }, ["c1", "c2", "c3"])
+        // …while execution still saw the RAW strings: the truncated call got
+        // the split hint, the empty one the tool's own error, the valid one ran.
+        let results = finalThread.filter { $0.role == "tool" }.map(\.text)
+        XCTAssertEqual(results.count, 3)
+        XCTAssertTrue(results[0].hasPrefix("error"))
+        XCTAssertNotEqual(results[0], AssistantHarness.truncatedArgsResult)
+        XCTAssertEqual(results[1], AssistantHarness.truncatedArgsResult)
+        XCTAssertTrue(results[2].hasPrefix("ok"))
+        XCTAssertEqual(api.tasks.count, 1)
+    }
+
+    func testArgumentsAsObjectJSONKeepsObjectsVerbatimAndReplacesEverythingElse() {
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON(""), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON("   \n"), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON(#"{"tasks":[{"name":"a"},{"name":"b"#), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON("[]"), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON("\"x\""), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON("null"), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON("{}"), "{}")
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON(#"{"name":"A","when":null}"#), #"{"name":"A","when":null}"#)
+        XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON(#" {"name":"A"} "#), #" {"name":"A"} "#)
+    }
+
     func testFinishReasonLengthAddsTheHiddenCutOffHint() async {
         let transport = ScriptedTransport([call("create_task", #"{"name":"A"}"#, finishReason: "length"), text("Added A.")])
         _ = await runTurn("add a", transport)
