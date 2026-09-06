@@ -54,7 +54,18 @@ final class AppModel {
     /// returns `?code=…` with NO `type=recovery` and the SDK emits only
     /// `.signedIn` (never `.passwordRecovery`), so the only reliable signal is
     /// the exchanged session's JWT `amr` claim — see `isRecoverySession`.
+    /// Consumed ONLY by a `.signedIn` whose token differs from the one in hand
+    /// when the probe was armed (`recoveryProbeArmedToken`) — i.e. the code
+    /// exchange. The stored-session `.initialSession` every new subscription
+    /// receives (and any refresh) must not spend it: with a session stored and
+    /// the app killed, the reset link was classified against the OLD token and
+    /// the set-new-password screen never appeared.
     private var pendingRecoveryProbe = false
+    @ObservationIgnored private var recoveryProbeArmedToken: String?
+    /// An `auth-callback` URL that arrived BEFORE `start()` built the
+    /// coordinator (a cold launch off the reset / magic link): stashed here and
+    /// replayed at the end of `start()` instead of being dropped.
+    @ObservationIgnored private var pendingAuthCallbackURL: URL?
     /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
     var uiTestWrite: WriteThrough?
     // Per-collection serial RPC queue. The optimistic local write happens
@@ -124,6 +135,17 @@ final class AppModel {
         var endedBy: String? = nil
     }
     var lastRecap: RecapState?
+
+    /// Google calendar health from the last pull (SyncCoordinator): which
+    /// connections need a fresh consent, the last server-side reason, and any
+    /// 429 back-off. `calendarNeedsReauth` (AppModel+CalendarControls) is the
+    /// UI's "Reconnect Google" gate.
+    var calendarSyncStatus: SyncCoordinator.CalendarSyncStatus?
+
+    /// A shared-list edit the server REFUSED (RLS / a revoked share / a bad
+    /// RPC): the optimistic row was rolled back to the server's copy and this
+    /// says so — the Lists surface shows it once, then clears it.
+    var collectionSyncError: String?
 
     // MARK: - one true shared session (partner co-focus v2)
     // Stored state for AppModel+SharedSession (extensions can't add storage).
@@ -621,14 +643,49 @@ final class AppModel {
         Task { try? await n.sessionRecap(taskName: taskName, away: away) }
     }
 
-    /// Coordinate the paused-too-long cap; calls back (main actor) with
-    /// whether the local notification should fire.
-    func requestPausedCheckin(_ completion: @escaping @MainActor (Bool) -> Void) {
-        guard let n = coordinator?.notifications else { completion(true); return }
-        Task {
-            let allowed = (try? await n.pausedCheckin()) ?? true
-            await MainActor.run { completion(allowed) }
+    // The paused check-in's cap coordination lives in AppModel+FocusControls
+    // (armPausedCheckin / cancelPausedCheckin / peek / consume): the budget is
+    // claimed when the nag FIRES, not when the session is paused.
+
+    // MARK: - wake-window calibration (server `wake_window_history`)
+
+    /// Record the day's FIRST foreground as this account's wake signal — one
+    /// row per local day (`calibrate_wake_windows` medians them into the
+    /// morning-brief window). Idempotent per (user, day): the sample of the
+    /// first foreground is stashed so a failed write retries with the SAME
+    /// time later in the day, never a later one. Called on every foreground
+    /// sync + launch.
+    func recordWakeWindowIfNeeded(now: Date = Date()) {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        let d = UserDefaults.standard
+        let doneKey = "unstuck.wakeWindow.lastDate.\(uid)"
+        let pendingKey = "unstuck.wakeWindow.pending.\(uid)"
+        let pending = d.dictionary(forKey: pendingKey).flatMap { dict -> WakeWindowSample? in
+            guard let date = dict["date"] as? String, let time = dict["time"] as? String,
+                  let wd = dict["weekday"] as? Int else { return nil }
+            return WakeWindowSample(localDate: date, firstInputLocal: time, weekday: wd)
         }
+        guard let sample = Self.wakeWindowSampleToSend(
+            lastRecordedDate: d.string(forKey: doneKey), pending: pending, now: WakeWindowSample(now: now))
+        else { return }
+        d.set(["date": sample.localDate, "time": sample.firstInputLocal, "weekday": sample.weekday], forKey: pendingKey)
+        Task {
+            do {
+                try await coord.notifications.recordWakeWindow(userId: uid, sample: sample)
+                d.set(sample.localDate, forKey: doneKey)
+                d.removeObject(forKey: pendingKey)
+            } catch {}   // offline: the stashed first-input sample is retried on the next foreground
+        }
+    }
+
+    /// Pure: which sample (if any) to send. Nothing once today is recorded;
+    /// else today's stashed first-input sample when one exists (a retry must
+    /// not report a LATER time as the day's first input); else `now`.
+    nonisolated static func wakeWindowSampleToSend(lastRecordedDate: String?, pending: WakeWindowSample?,
+                                                   now: WakeWindowSample) -> WakeWindowSample? {
+        if lastRecordedDate == now.localDate { return nil }
+        if let pending, pending.localDate == now.localDate { return pending }
+        return now
     }
 
     #if DEBUG
@@ -701,6 +758,16 @@ final class AppModel {
                 self.pushTimezoneIfNeeded()
             }
         }
+        // Google calendar health → UI ("Reconnect Google" when a refresh token
+        // died; quiet while backing off a 429).
+        await coord.setOnCalendarStatus { [weak self] status in
+            Task { @MainActor in self?.calendarSyncStatus = status }
+        }
+        // A shared-list RPC the server refused (dropped by the outbox): roll
+        // the optimistic row back to the server's copy + say so once.
+        await coord.setOnCollectionRPCRejected { [weak self] collectionId, fn, error in
+            Task { @MainActor in self?.handleCollectionRPCRejected(collectionId: collectionId, fn: fn, error: error) }
+        }
         // Ritual toggles are account-wide (migration 053) — push every change.
         paPrefs.onRitualsChanged = { [weak self] rituals in self?.pushRituals(rituals) }
         // The pre-053 device-local archive set becomes server state ONCE, then
@@ -745,8 +812,20 @@ final class AppModel {
         refreshLiveSession()
         reapStaleLiveActivities()
         // Retry shared-focus accruals that couldn't reach the server before a
-        // kill (the offline-finish pending ledger — idempotent per sessionId).
+        // kill (the offline-finish pending ledger — idempotent per sessionId),
+        // after un-parking any this user parked at an offline sign-out.
+        if let uid = coord.auth.currentUserId { restoreParkedSharedFocusLedger(userId: uid) }
         drainPendingSharedFocusLedger()
+        // A paused check-in that fired while the app was dead claims its
+        // budget slot now; today's first foreground feeds wake calibration.
+        settlePausedCheckinBudgetIfFired()
+        recordWakeWindowIfNeeded()
+        // An auth-callback link that landed before the coordinator existed
+        // (cold launch off a reset / magic link) is exchanged now.
+        if let url = pendingAuthCallbackURL {
+            pendingAuthCallbackURL = nil
+            handleDeepLink(url)
+        }
 
         // Apply any hands-free writes a Siri intent queued while the app was
         // closed, refresh the App-Group snapshot (Siri reads "how many left /
@@ -772,6 +851,11 @@ final class AppModel {
         // Retry any shared-focus accrual stranded by an offline finish
         // (pending ledger — idempotent per sessionId).
         drainPendingSharedFocusLedger()
+        // A paused check-in that fired while we were away claims its push
+        // budget slot now (budget is settled at FIRE time on every platform).
+        settlePausedCheckinBudgetIfFired()
+        // Today's first foreground → wake-window calibration (once per day).
+        recordWakeWindowIfNeeded()
         // Foreground re-exchange for a live partner-shared session (Rejoin
         // reconciliation v2): un-park a `.disconnected` socket (supabase-swift
         // handleClose never auto-reconnects), force a real re-join when the
@@ -906,6 +990,7 @@ final class AppModel {
                 // .initialSession with no session must NOT scrub — that wrongly
                 // wiped device-local data on a flaky connection.
                 let isSignOut: Bool = { if case .signedOut = event { return true }; return false }()
+                let isSignedInEvent: Bool = { if case .signedIn = event { return true }; return false }()
                 await MainActor.run {
                     guard let self else { return }
                     // Scrub device-local personal content only on a genuine
@@ -920,10 +1005,15 @@ final class AppModel {
                     self.cachedEmail = AuthService.email(from: session)
                     self.cachedUserId = AuthService.userId(from: session)
                     self.cachedHasPassword = AuthService.hasPassword(from: session)
-                    // PKCE: classify the just-exchanged session via `amr` once.
+                    // PKCE: classify the just-EXCHANGED session via `amr` once —
+                    // only a .signedIn carrying a token the probe hasn't seen
+                    // (never the stored-session .initialSession / a refresh).
                     var isRecovery = isRecoveryEvent
-                    if isAuthed, self.pendingRecoveryProbe {
+                    if isAuthed, self.pendingRecoveryProbe,
+                       Self.shouldConsumeRecoveryProbe(isSignedInEvent: isSignedInEvent,
+                                                       armedToken: self.recoveryProbeArmedToken, token: token) {
                         self.pendingRecoveryProbe = false   // one-shot
+                        self.recoveryProbeArmedToken = nil
                         if let token, Self.isRecoverySession(token) { isRecovery = true }
                     }
                     if isRecovery { self.pendingPasswordRecovery = true }
@@ -947,6 +1037,14 @@ final class AppModel {
                         // at sign-in (not only after a hydrate) so a phone-only
                         // account is never left on the UTC fallback.
                         self.pushTimezoneIfNeeded()
+                        // Shared-focus accruals parked at THIS user's last
+                        // (offline) sign-out rejoin the queue and drain now —
+                        // the web's USER_LEDGER_KEYS rule.
+                        if let uid = AuthService.userId(from: session) {
+                            self.restoreParkedSharedFocusLedger(userId: uid)
+                            self.drainPendingSharedFocusLedger()
+                        }
+                        self.recordWakeWindowIfNeeded()
                     }
                     // A circle invite link tapped while signed out stashed its
                     // code — ask (Accept / Not now) now that we're authenticated.
@@ -979,9 +1077,19 @@ final class AppModel {
         }
     }
 
+    /// Pure: the armed recovery probe is spent only by a `.signedIn` (the PKCE
+    /// code exchange) whose access token is not the one that was already in
+    /// hand when the callback link armed it. `.initialSession` replays of a
+    /// stored session, `.tokenRefreshed` and `.userUpdated` never qualify.
+    nonisolated static func shouldConsumeRecoveryProbe(isSignedInEvent: Bool, armedToken: String?,
+                                                       token: String?) -> Bool {
+        guard isSignedInEvent, let token, !token.isEmpty else { return false }
+        return token != armedToken
+    }
+
     /// Finish password recovery: the user has set a new password, drop the flag
     /// so RootView leaves the set-new-password screen for the app.
-    func consumeRecovery() { pendingPasswordRecovery = false; pendingRecoveryProbe = false }
+    func consumeRecovery() { pendingPasswordRecovery = false; pendingRecoveryProbe = false; recoveryProbeArmedToken = nil }
 
     /// A pending trusted-circle invite code from a tapped invite LINK
     /// (unstucknow.io/circle/join?code=…), held until we're signed in so the
@@ -1075,15 +1183,21 @@ final class AppModel {
         // else (unstuck://task/…, /focus/…, /today, capture) routes to the
         // matching surface (spec 10 §1.7 push-tap deep links).
         if url.host == "auth-callback" {
-            // Arm the one-shot recovery probe for the session this callback is
-            // about to exchange — observeAuth then classifies it via the JWT `amr`
-            // (PKCE recovery carries no type=recovery in the URL). The implicit
-            // flow's type=recovery is kept as an early belt-and-suspenders flag.
-            pendingRecoveryProbe = true
+            // The implicit flow's type=recovery is an early belt-and-suspenders
+            // flag (PKCE recovery carries no type=recovery in the URL).
             if url.absoluteString.range(of: "type=recovery", options: .caseInsensitive) != nil {
                 pendingPasswordRecovery = true
             }
-            guard let coord = coordinator else { return }
+            // A cold launch off the link: the coordinator doesn't exist yet —
+            // stash the URL and replay it at the end of start() (like
+            // pendingCircleCode) instead of dropping the exchange.
+            guard let coord = coordinator else { pendingAuthCallbackURL = url; return }
+            // Arm the one-shot recovery probe for the session this callback is
+            // about to exchange, remembering the token ALREADY in hand so only
+            // the exchanged (different) token can spend it — observeAuth then
+            // classifies that session via the JWT `amr`.
+            pendingRecoveryProbe = true
+            recoveryProbeArmedToken = coord.auth.accessToken
             Task { _ = await coord.auth.handleCallback(url: url) }
             return
         }
@@ -1121,8 +1235,19 @@ final class AppModel {
     func signOut() {
         guard let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
-        scrubDeviceLocalUserContent()
+        let uid = coord.auth.currentUserId ?? cachedUserId
         Task {
+            // DRAIN BEFORE SCRUB (web parity): the scrub below wipes the App
+            // Group (Siri's hands-free write queue) and the shared-focus ledger,
+            // so first fold the queued Siri writes into the outbox (drained by
+            // signOutAndUnregister) and give the pending shared-focus accruals a
+            // bounded shot at the server WHILE the JWT is still valid. Whatever
+            // still can't land is PARKED under this user and replayed on their
+            // next sign-in here — never discarded (the web's USER_LEDGER_KEYS).
+            _ = drainSiriWriteQueue()
+            await drainPendingSharedFocusLedgerBounded(seconds: 5)
+            if let uid { parkPendingSharedFocusLedger(userId: uid) }
+            scrubDeviceLocalUserContent()
             await ReminderScheduler.shared.cancelAll()
             await coord.signOutAndUnregister(deviceId: deviceId)
         }
@@ -1138,7 +1263,7 @@ final class AppModel {
     func scrubDeviceLocalUserContent() {
         NotificationLog.shared.clear()
         NotificationPrefs.clearUserContent()   // per-task overrides + the cached level / lead
-        PausedCheckinScheduler.cancel()
+        PausedCheckinBudget.disarm()           // no budget settlement — the JWT is going away
         // The Inbox archive cache — from the store side (the outbox / archive
         // table are wiped by the sync clearAll), never as unarchive writes.
         captureArchiveWriteThroughSuppressed = true
@@ -1158,7 +1283,8 @@ final class AppModel {
                     "unstuck.calls.outcomeQueue"] {
             d.removeObject(forKey: key)
         }
-        for key in d.dictionaryRepresentation().keys where key.hasPrefix("unstuck.loginPing.") {
+        for key in d.dictionaryRepresentation().keys
+        where key.hasPrefix("unstuck.loginPing.") || key.hasPrefix("unstuck.wakeWindow.") {
             d.removeObject(forKey: key)
         }
         onboarded = false
@@ -1194,12 +1320,21 @@ final class AppModel {
         _assistant?.clear()
         AssistantModel.scrubPersisted()
         Task { await ReminderScheduler.shared.cancelAll() }
-        // One-true-shared-session: drop the signed-out account's pending ledger
-        // accruals and stop any in-flight drain — the NEXT account on this
-        // device must never post the previous account's shared-focus records.
+        // One-true-shared-session: stop any in-flight drain and PARK the
+        // signed-out account's pending ledger accruals under that account —
+        // the NEXT account on this device must never post the previous
+        // account's shared-focus records, and the previous account must not
+        // lose them either (replayed on THEIR next sign-in here). The Sign-out
+        // button parks after its bounded drain; this also covers the reactive
+        // path (server revocation / refresh failure), where `cachedUserId`
+        // still names the account being signed out. Unknown owner → dropped.
         sharedLedgerDrainTask?.cancel()
         sharedLedgerDrainTask = nil
-        pendingSharedFocusLogs = []
+        if let owner = cachedUserId ?? coordinator?.auth.currentUserId {
+            parkPendingSharedFocusLedger(userId: owner)
+        } else {
+            pendingSharedFocusLogs = []
+        }
     }
 
     /// Wipe the App Group container's per-user content (Start-Next widget
@@ -1305,7 +1440,13 @@ final class AppModel {
     @discardableResult
     func deleteTaskAwaiting(_ id: String) async -> Bool {
         guard let write = coordinator?.write else { return false }
-        do { try await write.deleteTask(id: id, nowISO: Self.isoNow()); return true } catch { return false }
+        // Read the row BEFORE the delete: a task promoted from a shared
+        // collection item leaves that item ticked with nothing behind it unless
+        // we un-tick it for the other members.
+        let promoted = (try? taskRepo?.fetch(id: id)) ?? nil
+        do { try await write.deleteTask(id: id, nowISO: Self.isoNow()) } catch { return false }
+        if let promoted { notifyTaskReopenedIfShared(promoted) }
+        return true
     }
 
     func saveTagAwaiting(_ tag: TagRow) async {
@@ -1478,26 +1619,56 @@ final class AppModel {
         Task { await saveBlockAwaiting(block) }
     }
 
+    /// The connection a pushed block's Google event lives on: the one it is
+    /// STAMPED with (`externalConnectionId`, set at INSERT), else the first
+    /// connection for a legacy un-stamped block.
+    private func googleConnection(for block: CalBlock) -> CalendarConnection? {
+        guard let database = db else { return nil }
+        if let id = block.externalConnectionId, !id.isEmpty,
+           let stamped = (try? database.fetchById(CalendarConnection.self, id: id)) ?? nil {
+            return stamped
+        }
+        return (try? database.firstCalendarConnection()) ?? nil
+    }
+
     /// The Google half of saveBlock — task blocks only (the caller gates).
+    /// Stamps `externalConnectionId` with the connection the event was
+    /// INSERTED on (the server's /disconnect cleanup and its event-id nulling
+    /// select pushed rows by that column — un-stamped rows made both a
+    /// no-op), and on a PATCH that answers 404 `event_gone` (deleted in
+    /// Google) clears the stale id and falls through to a fresh INSERT.
     private func mirrorBlockToGoogle(_ block: CalBlock) async {
-        guard let write = coordinator?.write, let calendar = coordinator?.calendar, let database = db,
-              let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
+        guard let write = coordinator?.write, let calendar = coordinator?.calendar,
+              let conn = googleConnection(for: block) else { return }
         let range = blockToIsoRange(block)
         // Always write task blocks to the user's PRIMARY calendar —
         // selectedCalendarIds can include read-only/subscribed calendars
         // (which 403 on insert). "primary" is Google's alias for the
         // main, always-writable calendar (Android pushBlockUpsert).
         let calId = "primary"
+        var next = block
         if let eventId = block.externalEventId {
-            try? await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
-                                           summary: block.taskName, start: range.start, end: range.end)
-        } else if let newId = try? await calendar.insertEvent(
-            connectionId: conn.id, calendarId: calId,
-            summary: block.taskName, start: range.start, end: range.end) {
-            var updated = block
-            updated.externalEventId = newId
-            try? await write.upsertCalBlock(updated, nowISO: Self.isoNow())
+            do {
+                try await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
+                                              summary: block.taskName, start: range.start, end: range.end)
+                // A legacy row pushed before stamping: record the connection now.
+                if block.externalConnectionId == nil {
+                    next.externalConnectionId = conn.id
+                    try? await write.upsertCalBlock(next, nowISO: Self.isoNow())
+                }
+                return
+            } catch CalendarSyncError.eventGone {
+                next.externalEventId = nil   // gone in Google → re-create below
+            } catch {
+                return   // offline / transient: the next save retries the PATCH
+            }
         }
+        guard let newId = try? await calendar.insertEvent(
+            connectionId: conn.id, calendarId: calId,
+            summary: block.taskName, start: range.start, end: range.end) else { return }
+        next.externalEventId = newId
+        next.externalConnectionId = conn.id
+        try? await write.upsertCalBlock(next, nowISO: Self.isoNow())
     }
 
     /// Delete a block locally + on Google (if it was pushed). External g_
@@ -1511,8 +1682,9 @@ final class AppModel {
     private func deleteGoogleEvent(for block: CalBlock) async {
         guard let eventId = block.externalEventId, !isExternalBlock(block),
               let calendar = coordinator?.calendar,
-              let database = db, let conn = (try? database.firstCalendarConnection()) ?? nil else { return }
-        // Task blocks are inserted on "primary" — delete there too.
+              let conn = googleConnection(for: block) else { return }
+        // Task blocks are inserted on "primary" — delete there too, on the
+        // connection the block is stamped with.
         try? await calendar.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: "primary")
     }
 
@@ -1594,8 +1766,14 @@ final class AppModel {
     /// Manual "Sync now" pull — the reconciled [-7d, +30d] Google pull
     /// (own-event + all-day filters, deletion reconcile) lives on the
     /// coordinator, which also runs it from the sign-in pipeline + syncNow.
+    /// An EXPLICIT pull ("Sync now", the post-connect refresh): forget the
+    /// last verdict + any 429 back-off first — a fresh consent must clear
+    /// "Reconnect Google" as soon as the server's `needs_reauth` is clear (the
+    /// pull re-reads the flag, so a still-dead token simply re-flags itself).
     func pullGoogleCalendar() async {
         guard let coord = coordinator else { return }
+        await coord.resetCalendarStatus()
+        calendarSyncStatus = nil
         await coord.pullCalendar()
     }
 

@@ -103,6 +103,19 @@ public func sharedSessionAdoptable(_ msg: SharedSessionMsg, now: EpochMillis) ->
     return age >= -sharedSessionMaxSkewMs && age < sharedSessionMaxAgeMs
 }
 
+/// The `sessionStart` an ADOPTER stores locally for a partner-posted state
+/// (the join-or-mint JOIN and every applied remote snapshot): the partner's
+/// start, clamped so it is never in OUR future. A partner whose clock runs
+/// ahead (adoptable within `sharedSessionMaxSkewMs`) would otherwise inflate
+/// the local elapsed once the skew passes, or freeze the ring at 00:00 until
+/// then; a partner whose clock runs BEHIND is harmless (their start is simply
+/// in our past, so it is kept verbatim). Display-only — the wire state keeps
+/// the minter's value, so the LWW bookkeeping is untouched. Web parity:
+/// `clampAdoptedSessionStartMs` in lib/shared-session.ts.
+public func clampAdoptedSessionStartMs(_ sessionStartMs: EpochMillis, now: EpochMillis) -> EpochMillis {
+    min(sessionStartMs, now)
+}
+
 /// `(rev, atMs)` strict ordering — rev first, sender wall clock as tiebreak.
 public func sharedSessionNewer(rev: Int, atMs: Double, thanRev: Int, thanAtMs: Double) -> Bool {
     if rev != thanRev { return rev > thanRev }

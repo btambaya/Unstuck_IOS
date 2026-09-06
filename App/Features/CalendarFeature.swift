@@ -260,15 +260,33 @@ private struct CalendarSyncBar: View {
                             .background(theme.palette.bg2, in: Capsule())
                     }.buttonStyle(.plain).disabled(busy)
                 } else {
-                    Text(busy ? "Syncing…" : vm.connections.map { "Synced · \($0.accountEmail)" }.joined(separator: ", "))
-                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    Text(busy ? "Syncing…"
+                         : (model.calendarNeedsReauth
+                            ? "Google needs to be reconnected"
+                            : vm.connections.map { "Synced · \($0.accountEmail)" }.joined(separator: ", ")))
+                        .font(UFont.sans(12))
+                        .foregroundStyle(model.calendarNeedsReauth && !busy ? theme.palette.red : theme.palette.ink3)
                         .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                    Button { sync() } label: {
-                        Text("Sync now")
-                            .font(UFont.sans(12, .medium))
-                            .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                    }.buttonStyle(.plain).disabled(busy)
+                    // The refresh token is dead (401 / invalid_grant, or the
+                    // server's needs_reauth flag): "Sync now" can only fail, so
+                    // offer the re-consent instead — the ordinary connect flow
+                    // over the SAME account (the server returns the same
+                    // connection id and clears the flag).
+                    if model.calendarNeedsReauth {
+                        Button { connect() } label: {
+                            Text("Reconnect Google")
+                                .font(UFont.sans(12, .semibold))
+                                .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                        }.buttonStyle(.plain).disabled(busy)
+                    } else {
+                        Button { sync() } label: {
+                            Text("Sync now")
+                                .font(UFont.sans(12, .medium))
+                                .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                        }.buttonStyle(.plain).disabled(busy)
+                    }
                     // Destructive — confirm first (it drops all synced events).
                     Button { confirmDisconnect = true } label: {
                         Text("Disconnect")
@@ -278,8 +296,8 @@ private struct CalendarSyncBar: View {
                 }
             }
             .padding(.horizontal, 18).padding(.vertical, 4)
-            if let error {
-                Text(error).font(UFont.sans(11)).foregroundStyle(theme.palette.red)
+            if let caption = error ?? (model.calendarNeedsReauth ? model.calendarLastError : nil) {
+                Text(caption).font(UFont.sans(11)).foregroundStyle(theme.palette.red)
                     .padding(.horizontal, 18).padding(.bottom, 6)
             }
         }
@@ -304,7 +322,9 @@ private struct CalendarSyncBar: View {
             let result = await controller.connect()
             busy = false
             switch result {
-            case .success: await model.pullGoogleCalendar()
+            // Drop the stale needs-reauth verdict + back-off BEFORE the pull,
+            // so a re-consent flips the bar back to "Synced" immediately.
+            case .success: model.calendarDidReconnect()
             case .failure(let err): error = "Couldn't connect. \(err.localizedDescription)"
             }
         }

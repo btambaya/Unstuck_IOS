@@ -131,8 +131,14 @@ public struct AuthService: Sendable {
         catch { return .error(friendly(error)) }
     }
 
-    public func signOut() async {
-        try? await client.auth.signOut()
+    /// The ordinary Sign out row signs out THIS device only. The SDK default
+    /// is `.global`, which revoked every session on the account — the other
+    /// devices then took a reactive sign-out that destroyed their in-progress
+    /// focus session. A "sign out everywhere" action would pass `.global`.
+    public static let signOutScope: SignOutScope = .local
+
+    public func signOut(scope: SignOutScope = AuthService.signOutScope) async {
+        try? await client.auth.signOut(scope: scope)
     }
 
     /// Lowercased to match the server: Foundation's UUID.uuidString is

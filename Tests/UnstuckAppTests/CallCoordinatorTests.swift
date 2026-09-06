@@ -467,6 +467,45 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertNil(sut.deferredFallbackTap, "sign-out forgets it")
     }
 
+    // MARK: - unstuck://call/<id> (the bell's Recent row / a re-tapped alert)
+
+    func testDeepLinkResumesARingingOrActiveCall() {
+        sut.reportIncoming(payload())
+        XCTAssertTrue(sut.resumeFromDeepLink(callId: Self.callId), "ringing: CallKit already owns it")
+        XCTAssertTrue(sut.performAnswer(uuid: uuid))
+        sut.audioSessionDidActivate()
+        XCTAssertTrue(sut.resumeFromDeepLink(callId: Self.callId), "active: Talk is up")
+        XCTAssertFalse(sut.resumeFromDeepLink(callId: "some-other-call"), "not ours → the app resolves the row")
+    }
+
+    func testDeepLinkHandsABufferedFallbackTapToALateHandler() {
+        // The alert tap ran before Talk attached its handler: the session is
+        // buffered. The deep link finds it and, once a handler exists, hands
+        // it over instead of landing on Today.
+        sut.handleFallbackTap(payload())
+        XCTAssertNotNil(sut.pendingFallback)
+        XCTAssertTrue(sut.resumeFromDeepLink(callId: Self.callId))
+        XCTAssertNotNil(sut.pendingFallback, "still buffered: no handler yet")
+        var handed: [String] = []
+        sut.onFallbackAnswer = { handed.append($0.callId) }
+        XCTAssertEqual(handed, [Self.callId], "the handler's didSet delivers the buffered session")
+        XCTAssertNil(sut.pendingFallback)
+    }
+
+    func testDeepLinkKnowsADeferredFallbackTap() {
+        env.sessionKnown = false
+        sut.handleFallbackTap(payload())
+        XCTAssertTrue(sut.resumeFromDeepLink(callId: Self.callId), "decided by attach(environment:) — not Today")
+        XCTAssertFalse(sut.resumeFromDeepLink(callId: "other"))
+    }
+
+    func testDeepLinkForAFinishedCallIsNotHeldHere() {
+        answerAndActivate()
+        XCTAssertTrue(sut.performEnd(uuid: uuid))
+        controller.flush()
+        XCTAssertFalse(sut.resumeFromDeepLink(callId: Self.callId), "over → the app opens the receipt / task")
+    }
+
     func testFallbackSnoozeGoesThroughThePersistedReporterClamped() {
         sut.handleFallbackTap(payload())
         sut.reportFallbackSnooze(callId: Self.callId, minutes: 15)

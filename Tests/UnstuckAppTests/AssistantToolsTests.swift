@@ -76,6 +76,13 @@ final class FakeAssistantState: AssistantAppState {
         if let i = tasks.firstIndex(where: { $0.id == t.id }) { tasks[i] = t } else { tasks.append(t) }
     }
     func removeTask(_ id: String) async { await commit(); tasks.removeAll { $0.id == id } }
+    /// `collection_task_done` `reopen` sends, as "collectionId:itemId" — only
+    /// for a loop-promoted task (the real hook is a no-op otherwise).
+    var reopenedShared: [String] = []
+    func notifyTaskReopenedIfShared(_ t: TaskItem) {
+        guard let cid = t.sourceCollectionId, let iid = t.sourceItemId else { return }
+        reopenedShared.append("\(cid):\(iid)")
+    }
     func upsertBlock(_ b: CalBlock) async {
         await commit()
         if let i = blocks.firstIndex(where: { $0.id == b.id }) { blocks[i] = b } else { blocks.append(b) }
@@ -362,6 +369,64 @@ final class AssistantToolsTests: XCTestCase {
         let before = snapshot(api.tasks)
         await eq("uncomplete_task", #"{"taskId":"nope"}"#, "error: task not found")
         XCTAssertEqual(snapshot(api.tasks), before)
+        XCTAssertEqual(api.reopenedShared, [], "a plain task has no shared-list row to un-tick")
+    }
+
+    /// A loop-promoted shared-list task reopened through the assistant must
+    /// un-tick the collection row for the other members (the UI's un-complete
+    /// sends collection-task-done `reopen`); a bare upsert left it ticked.
+    func testUncompleteTaskReopensTheSharedListRowForALoopPromotedTask() async {
+        var promoted = task("p", "Buy milk", done: true, completedAt: "2026-09-01T12:00:00Z")
+        promoted.sourceCollectionId = "c1"
+        promoted.sourceItemId = "i1"
+        api.tasks = [promoted, task("b", "Plain", done: true)]
+        await eq("uncomplete_task", #"{"taskId":"p"}"#, "ok: reopened \"Buy milk\" id=p")
+        XCTAssertFalse(api.tasks[0].done)
+        XCTAssertEqual(api.reopenedShared, ["c1:i1"], "the reopen reaches the shared list exactly once")
+        // Already open → error AND no reopen send (nothing changed).
+        await eq("uncomplete_task", #"{"taskId":"p"}"#, "error: \"Buy milk\" is already open — nothing changed")
+        XCTAssertEqual(api.reopenedShared, ["c1:i1"])
+        // A task that isn't promoted from a shared list never sends.
+        await eq("uncomplete_task", #"{"taskId":"b"}"#, "ok: reopened \"Plain\" id=b")
+        XCTAssertEqual(api.reopenedShared, ["c1:i1"])
+    }
+
+    /// Undoing a "Completed" receipt is the assistant's OTHER un-complete path
+    /// — same contract: the shared row is un-ticked for a loop-promoted task
+    /// that the store still had done, and only then (a task the user already
+    /// reopened by hand sent its own reopen through the UI).
+    func testUndoOfCompleteReopensTheSharedListRowOnlyWhenTheTaskWasStillDone() async {
+        var promoted = task("p", "Buy milk", done: true, completedAt: "2026-09-01T12:00:00Z")
+        promoted.sourceCollectionId = "c1"
+        promoted.sourceItemId = "i1"
+        var reopenedByHand = task("q", "Call bank", done: false)
+        reopenedByHand.sourceCollectionId = "c1"
+        reopenedByHand.sourceItemId = "i2"
+        api.tasks = [promoted, reopenedByHand, task("b", "Plain", done: true)]
+        let now = "2026-09-02T09:00:00.000Z"
+
+        let single = planReceiptUndo(.uncompleteTask(id: "p"), tasks: api.tasks, nowISO: now)!
+        let ok = await AssistantModel.applyLocalUndo(single, api: api)
+        XCTAssertTrue(ok)
+        XCTAssertFalse(api.tasks[0].done)
+        XCTAssertNil(api.tasks[0].completedAt)
+        XCTAssertEqual(api.reopenedShared, ["c1:i1"])
+
+        // Bulk undo (complete_tasks): the still-done promoted task sends, the
+        // hand-reopened one and the plain one don't.
+        api.tasks[0].done = true
+        let bulk = planReceiptUndo(.uncompleteTasks(ids: ["p", "q", "b"]), tasks: api.tasks, nowISO: now)!
+        let bulkOk = await AssistantModel.applyLocalUndo(bulk, api: api)
+        XCTAssertTrue(bulkOk)
+        XCTAssertEqual(api.tasks.map(\.done), [false, false, false])
+        XCTAssertEqual(api.reopenedShared, ["c1:i1", "c1:i1"])
+
+        // Undo of an uncomplete (→ done again) never sends a reopen.
+        let redo = planReceiptUndo(.completeTask(id: "p"), tasks: api.tasks, nowISO: now)!
+        let redoOk = await AssistantModel.applyLocalUndo(redo, api: api)
+        XCTAssertTrue(redoOk)
+        XCTAssertTrue(api.tasks[0].done)
+        XCTAssertEqual(api.reopenedShared, ["c1:i1", "c1:i1"])
     }
 
     func testSetLaterAndRecurrence() async {

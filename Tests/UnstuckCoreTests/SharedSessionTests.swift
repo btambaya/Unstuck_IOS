@@ -694,3 +694,38 @@ final class DivergenceGraceExpiryTests: XCTestCase {
                                              tries: sharedSessionGraceMaxTries), .clearAndAnnounce)
     }
 }
+
+// MARK: - adopted start clamp
+
+/// An adopter stores the partner's `sessionStartMs` clamped to its OWN clock:
+/// never in the future (a partner clock running ahead would inflate our
+/// elapsed / freeze the ring at 00:00), verbatim when in the past. Applied by
+/// the JOIN (`FocusTimer.adopt`) and every applied remote snapshot.
+final class ClampAdoptedSessionStartTests: XCTestCase {
+    func testFutureStartIsClampedToNow() {
+        XCTAssertEqual(clampAdoptedSessionStartMs(T0 + 90_000, now: T0), T0)
+    }
+
+    func testStartWithinTheSkewWindowIsStillClamped() {
+        // Adoptable (≤ 2 min ahead) does not mean displayable as-is.
+        XCTAssertEqual(clampAdoptedSessionStartMs(T0 + sharedSessionMaxSkewMs, now: T0), T0)
+        XCTAssertEqual(clampAdoptedSessionStartMs(T0 + 1, now: T0), T0)
+    }
+
+    func testPastStartIsKeptVerbatim() {
+        XCTAssertEqual(clampAdoptedSessionStartMs(T0 - 5 * 60_000, now: T0), T0 - 5 * 60_000)
+    }
+
+    func testStartEqualToNowIsUnchanged() {
+        XCTAssertEqual(clampAdoptedSessionStartMs(T0, now: T0), T0)
+    }
+
+    func testAdoptClampsSoElapsedNeverRendersNegative() {
+        let ahead = state(id: "s-partner", start: T0 + 60_000, rev: 3, at: T0 + 60_000)
+        let live = FocusTimer.adopt(.empty, taskId: "t1", state: ahead, now: T0)
+        XCTAssertEqual(live.sessionStart, T0)
+        XCTAssertEqual(FocusTimer.elapsedSec(live, now: T0), 0)
+        XCTAssertEqual(FocusTimer.elapsedSec(live, now: T0 + 30_000), 30, "counts from OUR now, not the skewed start")
+        XCTAssertEqual(live.lastAppliedRev, 3, "the LWW bookkeeping keeps the wire's rev")
+    }
+}

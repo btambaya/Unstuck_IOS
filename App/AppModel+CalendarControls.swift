@@ -40,6 +40,26 @@ extension AppModel {
         }
     }
 
+    // MARK: - Google health (CalendarSyncBar · "Reconnect Google")
+
+    /// True when a connected Google account's refresh token is dead (401 /
+    /// invalid_grant on the last pull, or the server's `needs_reauth` flag):
+    /// the sync bar should offer "Reconnect Google" (the normal connect flow
+    /// re-consents the same account) instead of silently showing stale
+    /// meetings. Its events are never deletion-reconciled meanwhile.
+    var calendarNeedsReauth: Bool { calendarSyncStatus?.needsReauth ?? false }
+
+    /// The server's last reason (e.g. `invalid_grant`), for the bar's caption.
+    var calendarLastError: String? { calendarSyncStatus?.lastError }
+
+    /// After a successful (re)connect: drop the stale verdict + any back-off so
+    /// the next pull runs immediately.
+    func calendarDidReconnect() {
+        calendarSyncStatus = nil
+        guard let coord = coordinator else { return }
+        Task { await coord.resetCalendarStatus(); await coord.pullCalendar() }
+    }
+
     // MARK: - Google disconnect (CalendarSyncBar · destructive)
 
     /// Disconnect ALL connected Google accounts: revoke each server-side via the
@@ -66,6 +86,8 @@ extension AppModel {
                     try? await write.deleteCalBlock(id: b.id, nowISO: now)
                 }
             }
+            await self.coordinator?.resetCalendarStatus()
+            self.calendarSyncStatus = nil
         }
     }
 }

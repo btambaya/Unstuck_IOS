@@ -17,15 +17,75 @@ public struct NotificationsClient: Sendable {
             options: FunctionInvokeOptions(method: .post, body: Body(taskName: taskName, away: away)))
     }
 
-    /// Returns whether a paused-checkin notification is allowed (cap +
-    /// preference). Defaults to true if the server can't be reached.
-    public func pausedCheckin() async throws -> Bool {
-        struct Empty: Encodable {}
-        struct Response: Decodable { let allowed: Bool? }
+    /// How `send-paused-checkin` treats the shared daily push budget.
+    /// `.peek` asks "would a paused check-in be allowed right now?" (mute /
+    /// preference / remaining cap) WITHOUT claiming a slot — used at pause
+    /// time, when the local ~14-min nag is merely scheduled; `.consume` claims
+    /// the slot (`try_consume_push_budget`) — used once the nag has actually
+    /// fired, so a quick pause/resume never burns the cap (web/Android claim
+    /// at fire time too). `.consume` is the function's legacy default shape.
+    public enum PausedCheckinMode: String, Sendable { case peek, consume }
+
+    /// Whether a paused-checkin notification is allowed (cap + preference).
+    /// Throws on transport failure AND on a malformed 2xx body (no `allowed`)
+    /// so the caller's offline default is a deliberate choice, not a decode
+    /// accident — see AppModel.peekPausedCheckinAllowed.
+    public func pausedCheckin(mode: PausedCheckinMode = .consume) async throws -> Bool {
+        struct Body: Encodable { let mode: String }
+        struct Response: Decodable { let allowed: Bool?; let error: String? }
         let response: Response = try await client.functions.invoke(
             "send-paused-checkin",
-            options: FunctionInvokeOptions(method: .post, body: Empty()))
-        return response.allowed ?? false
+            options: FunctionInvokeOptions(method: .post, body: Body(mode: mode.rawValue)))
+        guard let allowed = response.allowed else {
+            throw PausedCheckinResponseError(reason: response.error ?? "missing `allowed`")
+        }
+        return allowed
+    }
+
+    /// A 2xx `send-paused-checkin` reply without a usable verdict.
+    public struct PausedCheckinResponseError: Error, Sendable { public let reason: String }
+
+    // MARK: wake-window calibration (migration 015 `wake_window_history`)
+
+    /// Record the day's FIRST app input (foreground) for `calibrate_wake_windows`
+    /// — one row per (user, local date); a repeat for the same day is IGNORED
+    /// (the earliest input is the wake signal). Until every client wrote this,
+    /// the auto wake-window mode medianed an empty table and pinned everyone's
+    /// morning brief to the 08:00 fallback.
+    public func recordWakeWindow(userId: String, sample: WakeWindowSample) async throws {
+        struct Row: Encodable {
+            let user_id: String
+            let local_date: String
+            let first_input_local: String
+            let weekday: Int
+        }
+        _ = try await client.from("wake_window_history")
+            .upsert(Row(user_id: userId, local_date: sample.localDate,
+                        first_input_local: sample.firstInputLocal, weekday: sample.weekday),
+                    onConflict: "user_id,local_date", ignoreDuplicates: true)
+            .execute()
+    }
+}
+
+/// One wake-window observation: the local date, the local HH:MM of the first
+/// input, and the weekday (0 = Sunday … 6 = Saturday — the server's
+/// `calibrate_wake_windows` convention). Pure — built from a `Date` + calendar.
+public struct WakeWindowSample: Equatable, Sendable {
+    public let localDate: String
+    public let firstInputLocal: String
+    public let weekday: Int
+
+    public init(localDate: String, firstInputLocal: String, weekday: Int) {
+        self.localDate = localDate
+        self.firstInputLocal = firstInputLocal
+        self.weekday = weekday
+    }
+
+    public init(now: Date, calendar: Foundation.Calendar = .current) {
+        let c = calendar.dateComponents([.year, .month, .day, .hour, .minute, .weekday], from: now)
+        localDate = String(format: "%04d-%02d-%02d", c.year ?? 1970, c.month ?? 1, c.day ?? 1)
+        firstInputLocal = String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
+        weekday = max(0, (c.weekday ?? 1) - 1)   // Foundation: 1 = Sunday
     }
 }
 

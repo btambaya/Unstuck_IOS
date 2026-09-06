@@ -34,6 +34,10 @@ final class FocusModel {
     /// live-session cache (the Today LiveSessionCard reads that cache, not the
     /// store, on each 1s tick). Set by FocusView, which holds the AppModel.
     var onPersist: (@MainActor () -> Void)?
+    /// Settles the paused check-in's push budget when its local notification
+    /// has already FIRED by the time the session leaves the paused state
+    /// (AppModel.consumePausedCheckinBudget). Set by FocusView; nil in tests.
+    var onConsumePausedCheckin: (@MainActor () -> Void)?
 
     init(task: TaskItem, store: LiveSessionStore?,
          defaultTreatment: FocusTreatment = .ambient,
@@ -67,11 +71,26 @@ final class FocusModel {
                                        priorAccumulatedSec: prior,
                                        now: Self.now(),
                                        occurrenceBlockId: occurrence?.blockId)
+        } else if let existing, Self.reopensExistingSession(existing, focusId: focusId,
+                                                              occurrenceBlockId: occurrence?.blockId) {
+            // RE-ENTRY: a live session for this same task/occurrence is adopted
+            // AS-IS — a paused one STAYS paused (Android parity: re-opening the
+            // Focus screen never resumes). FocusTimer.start's same-task branch
+            // would `resume` here, which for a partner co-focus session
+            // persisted + broadcast a rev+1 resume nobody pressed (silently
+            // undoing the partner's pause), and for a solo "Save for later"
+            // session restarted the clock on a mere tap of the Today card.
+            // Resume stays an explicit gesture (Resume button / Today card).
+            session = existing
         } else {
-            // Resume-aware MINT: start() continues a paused session for the same
-            // task. priorAccumulatedSec seeds the displayed timer so reopening
-            // after "Just finish" continues from the accumulated total, not 0
-            // (Android parity).
+            // MINT: a fresh session (nothing live, or another task) —
+            // priorAccumulatedSec seeds the displayed timer so reopening after
+            // "Just finish" continues from the accumulated total, not 0 (Android
+            // parity). Another occurrence of the SAME template also lands here
+            // (reopensExistingSession keys on the occurrence block id): there
+            // FocusTimer.start's same-task branch continues the live session —
+            // resumed if paused — RE-POINTED at today's occurrence, so "Mark
+            // complete" ticks today's block rather than the day it was minted on.
             session = FocusTimer.start(existing ?? .empty, taskId: focusId, estimateMin: task.estimateMin,
                                        priorAccumulatedSec: prior, now: Self.now(),
                                        occurrenceBlockId: occurrence?.blockId)
@@ -90,23 +109,34 @@ final class FocusModel {
         // The session estimate (extend-aware / adopted), not the task default —
         // an adopted session must show the partner's current estimate.
         LiveActivityController.shared.start(taskName: task.name, sessionStartMs: live.sessionStart ?? Self.now(), estimateMin: live.sessionEstimateMin)
-        // start() hardcodes paused:false. Reopening a PAUSED session (resumed via
-        // start()) would otherwise show a running Dynamic Island timer until the
+        // The Live Activity's start() assumes running. Re-entering a PAUSED
+        // session would otherwise show a running Dynamic Island timer until the
         // next transition — immediately reflect the paused state.
         if live.paused {
             LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? Self.now(), paused: true, estimateMin: live.sessionEstimateMin)
         }
     }
 
+    /// True when `existing` is the LIVE session for this very focus target
+    /// (same task/template AND the same occurrence block) — the case where the
+    /// screen re-attaches to it unchanged rather than minting or resuming.
+    nonisolated static func reopensExistingSession(_ existing: LiveSession, focusId: String,
+                                                   occurrenceBlockId: String?) -> Bool {
+        existing.sessionStart != nil && existing.taskId == focusId
+            && existing.occurrenceBlockId == occurrenceBlockId
+    }
+
     func pause() {
         live = FocusTimer.pause(live, now: Self.now()); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: true, estimateMin: live.sessionEstimateMin)
-        PausedCheckinScheduler.schedule(taskName: task.name)
+        // The local ~14-min nag is armed here; the daily push budget is
+        // settled when it actually FIRES (AppModel.armPausedCheckin), not now.
+        PausedCheckinBudget.arm(taskName: task.name)
     }
     func resume() {
         live = FocusTimer.resume(live, now: Self.now()); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: false, estimateMin: live.sessionEstimateMin)
-        PausedCheckinScheduler.cancel()
+        PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
     }
 
     /// Re-read the store after a REMOTE control was applied (AppModel's
@@ -134,7 +164,7 @@ final class FocusModel {
         live = FocusTimer.done(live)
         persist()
         LiveActivityController.shared.end()
-        PausedCheckinScheduler.cancel()
+        PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
         return (session, elapsed)
     }
 
@@ -142,7 +172,7 @@ final class FocusModel {
         live = FocusTimer.cancel(live)
         persist()
         LiveActivityController.shared.end()
-        PausedCheckinScheduler.cancel()
+        PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
     }
 
     var treatment: FocusTreatment { live.treatment }
@@ -276,6 +306,7 @@ struct FocusView: View {
                 // transition (start/pause/resume/finish/cancel) so Today's
                 // LiveSessionCard reflects it without re-reading the store.
                 newFM.onPersist = { [weak model] in model?.refreshLiveSession() }
+                newFM.onConsumePausedCheckin = { [weak model] in model?.consumePausedCheckinBudget() }
                 fm = newFM
                 // The init's persist() ran before onPersist was wired — seed once.
                 model.refreshLiveSession()
@@ -875,11 +906,12 @@ struct FocusView: View {
         coordinateCheckin()
     }
 
-    /// FocusModel.pause() pre-schedules the local paused-too-long notif; ask
-    /// the server whether the daily cap allows it, and cancel if not.
+    /// FocusModel.pause() pre-schedules the local paused-too-long notif; PEEK
+    /// the daily cap / mute (nothing consumed — the budget is claimed only if
+    /// the nag actually fires) and cancel the local notif when disallowed.
     private func coordinateCheckin() {
-        model.requestPausedCheckin { allowed in
-            if !allowed { PausedCheckinScheduler.cancel() }
+        model.peekPausedCheckinAllowed { allowed in
+            if !allowed { PausedCheckinBudget.disarm() }
         }
     }
 

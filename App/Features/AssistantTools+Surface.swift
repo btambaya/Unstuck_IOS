@@ -24,6 +24,10 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         t.completedAt = nil
         t.updatedAt = now()
         await api.upsertTask(t)
+        // A loop-promoted shared-list task: un-tick the collection row for the
+        // other members too (the UI's un-complete sends `reopen`; a bare
+        // upsert would leave the shared row ticked with an open task behind it).
+        api.notifyTaskReopenedIfShared(t)
         scratch.newTasks[t.id] = t
         return "ok: reopened \"\(t.name)\" id=\(t.id)"
 

@@ -125,8 +125,15 @@ public actor Hydrator {
     /// Ids with a queued (non-quarantined or quarantined — either way un-acked)
     /// upsert op for `table`, read on the OPEN connection so the decision and
     /// the replace share one transaction.
+    /// `.rpc` counts as pending too: a collection whose item edit is still a
+    /// queued `collection_*` RPC (a transient failure held it back) must not be
+    /// reverted to the server's older copy by a hydrate that runs while the op
+    /// is still in the outbox. A flush normally precedes the hydrate, so this
+    /// closes a narrow race rather than an everyday path.
     private static func pendingUpsertIds(in conn: Database, table: String) throws -> Set<String> {
-        Set(try OutboxStore.pending(in: conn).filter { $0.tableName == table && $0.kind == .upsert }.map(\.rowId))
+        Set(try OutboxStore.pending(in: conn)
+            .filter { $0.tableName == table && ($0.kind == .upsert || $0.kind == .rpc) }
+            .map(\.rowId))
     }
 
     /// Server-canonical replace that keeps rows with a pending upsert op

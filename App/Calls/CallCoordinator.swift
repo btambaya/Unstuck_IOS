@@ -418,6 +418,22 @@ final class CallCoordinator {
         if let h = onFallbackAnswer { h(session) } else { pendingFallback = session }
     }
 
+    /// `unstuck://call/<id>` route hook (AppModel.openCall): true when this
+    /// coordinator already holds the call — ringing / answered (Talk is, or is
+    /// about to be, up), a fallback tap buffered for a launcher that isn't
+    /// attached yet (handed off now when it is), or one deferred until the
+    /// session is known (decided by `attach(environment:)`). The server stamps
+    /// the payload's `callId` with the call_requests row id, so the ids match.
+    func resumeFromDeepLink(callId: String) -> Bool {
+        if let cur = active, cur.session.callId == callId { return true }
+        if let p = pendingFallback, p.callId == callId {
+            if let h = onFallbackAnswer { pendingFallback = nil; h(p) }
+            return true
+        }
+        if let d = deferredFallbackTap, d.callId == callId { return true }
+        return false
+    }
+
     /// Fallback B's "call me back in N": there is no CallKit call to hang up,
     /// so the `snoozed` outcome is reported straight through the PERSISTED,
     /// ordered reporter (after the `answered` that the tap queued) — never a

@@ -39,6 +39,18 @@ final class OutboxTests: XCTestCase {
         XCTAssertEqual(try box.nextFlushable().map(\.rowId), ["t1", "t2"])
     }
 
+    func testCancelPendingUpsertsAlsoDropsRPCOpsButKeepsDeletes() throws {
+        // Deleting a shared list must cancel its queued item RPCs (they'd fire
+        // on a list that no longer exists) — but never a queued delete.
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .upsert, payload: "{}", nowISO: now)
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc, payload: "{}", nowISO: now)
+        _ = try box.enqueue(table: "collections", rowId: "c2", kind: .rpc, payload: "{}", nowISO: now)
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .delete, nowISO: now)
+        try box.cancelPendingUpserts(table: "collections", rowId: "c1")
+        let left = try box.pending()
+        XCTAssertEqual(left.map { "\($0.rowId):\($0.kind.rawValue)" }, ["c2:rpc", "c1:delete"])
+    }
+
     func testMarkDoneRemoves() throws {
         let op = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, nowISO: now)
         try box.markDone(op.opSeq!)

@@ -148,6 +148,22 @@ public actor WriteThrough {
         try saveAndEnqueue(c, table: "collections", rowId: c.id, payload: try jsonString(CollectionRow(c)), nowISO: nowISO)
     }
 
+    /// A SHARED collection's item mutation: the optimistic local row (already
+    /// transformed) + an `rpc` outbox op carrying the atomic server-side
+    /// mutation, in ONE transaction — so it is retried offline like every
+    /// other edit instead of the old fire-and-forget RPC whose failure left
+    /// the optimistic row to be silently deleted by the next echo/hydrate.
+    /// Ordered per row by the outbox seq (replaces the per-collection chain).
+    public func applyCollectionRPC(_ c: ItemCollection, rpc: CollectionRPC, nowISO: String) throws {
+        let payload = try OutboxRPCPayload(fn: rpc.fn, paramsJSON: rpc.paramsJSON).encoded()
+        try db.transaction { conn in
+            try c.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: "collections", rowId: c.id, kind: .rpc,
+                                    payload: payload, nowISO: nowISO)
+        }
+        onEnqueue?()
+    }
+
     /// Synchronous variant for callers that must have the row committed
     /// BEFORE returning without an actor hop (the assistant's `create_list`,
     /// whose protocol is synchronous — a later tool in the same turn reads

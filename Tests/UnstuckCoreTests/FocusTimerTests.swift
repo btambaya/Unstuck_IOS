@@ -205,3 +205,89 @@ final class FocusTimerPriorAccumulatedTests: XCTestCase {
         XCTAssertEqual(FocusTimer.deriveState(live, now: T0 + 60 * 60_000, overrunGraceSec: grace("Never")), .running)
     }
 }
+
+/// Recurring occurrences: the session runs on the TEMPLATE task, so a start on
+/// a different day's block matches on taskId. Same-task starts continue the
+/// session (resume if paused / no-op if running) and RE-POINT it at the
+/// occurrence being started — "Mark complete" ticks `occurrenceBlockId`, so
+/// silently keeping Monday's block completed the wrong day (web/Android parity).
+final class FocusTimerOccurrenceRepointTests: XCTestCase {
+    private func paused(on occurrence: String) -> LiveSession {
+        let live = FocusTimer.start(.empty, taskId: "tpl", estimateMin: 30, priorAccumulatedSec: 120,
+                                    now: T0, occurrenceBlockId: occurrence, newId: { "s-mon" })
+        return FocusTimer.pause(live, now: T0 + 5 * 60_000)
+    }
+
+    func testSameTaskSameOccurrencePausedResumesInPlace() {
+        let live = paused(on: "mon")
+        let now = T0 + 20 * 60_000
+        let next = FocusTimer.start(live, taskId: "tpl", estimateMin: 30, now: now, occurrenceBlockId: "mon")
+        XCTAssertEqual(next.id, "s-mon", "the same session — not a mint")
+        XCTAssertEqual(next.occurrenceBlockId, "mon")
+        XCTAssertFalse(next.paused)
+        XCTAssertEqual(FocusTimer.elapsedSec(next, now: now), 300, "elapsed carries over the pause gap")
+        XCTAssertEqual(next.sessionEstimateMin, 30)
+        XCTAssertEqual(next.priorAccumulatedSec, 120)
+    }
+
+    func testSameTaskSameOccurrenceRunningIsANoOp() {
+        let live = FocusTimer.start(.empty, taskId: "tpl", estimateMin: 30, now: T0, occurrenceBlockId: "mon")
+        let next = FocusTimer.start(live, taskId: "tpl", estimateMin: 25, now: T0 + 2 * 60_000, occurrenceBlockId: "mon")
+        XCTAssertEqual(next, live, "a double Start never resets the clock, the estimate, or the occurrence")
+    }
+
+    func testSameTaskDifferentOccurrencePausedResumesAndRepoints() {
+        let live = paused(on: "mon")
+        let now = T0 + 24 * 3_600_000
+        let next = FocusTimer.start(live, taskId: "tpl", estimateMin: 30, now: now, occurrenceBlockId: "tue")
+        XCTAssertEqual(next.id, "s-mon", "continuity: the paused session is resumed, not replaced")
+        XCTAssertEqual(next.occurrenceBlockId, "tue", "…but attached to TODAY's block")
+        XCTAssertFalse(next.paused)
+        XCTAssertNil(next.pausedAt)
+        XCTAssertEqual(FocusTimer.elapsedSec(next, now: now), 300, "the clock continues untouched")
+        XCTAssertEqual(next.sessionEstimateMin, 30)
+        XCTAssertEqual(next.priorAccumulatedSec, 120)
+    }
+
+    func testSameTaskDifferentOccurrenceRunningRepointsWithoutTouchingTheClock() {
+        let live = FocusTimer.start(.empty, taskId: "tpl", estimateMin: 30, now: T0, occurrenceBlockId: "mon", newId: { "s-mon" })
+        let now = T0 + 3 * 60_000
+        let next = FocusTimer.start(live, taskId: "tpl", estimateMin: 45, now: now, occurrenceBlockId: "tue")
+        XCTAssertEqual(next.id, "s-mon")
+        XCTAssertEqual(next.occurrenceBlockId, "tue")
+        XCTAssertEqual(next.sessionStart, live.sessionStart)
+        XCTAssertEqual(next.sessionEstimateMin, 30, "the running session's estimate wins over the new start's")
+        XCTAssertFalse(next.paused)
+        var expected = live
+        expected.occurrenceBlockId = "tue"
+        XCTAssertEqual(next, expected, "the ONLY change is the occurrence")
+    }
+
+    func testSameTaskWithoutAnOccurrenceKeepsTheCurrentOne() {
+        // Starting the template itself (no block) must not detach a session
+        // from the occurrence it was minted on — web parity (`occ &&`).
+        let live = paused(on: "mon")
+        let now = T0 + 10 * 60_000
+        let next = FocusTimer.start(live, taskId: "tpl", estimateMin: 30, now: now, occurrenceBlockId: nil)
+        XCTAssertEqual(next.id, "s-mon")
+        XCTAssertEqual(next.occurrenceBlockId, "mon")
+        XCTAssertFalse(next.paused)
+    }
+
+    func testDifferentTaskStartsANewSessionOnItsOwnOccurrence() {
+        let live = paused(on: "mon")
+        let now = T0 + 10 * 60_000
+        let next = FocusTimer.start(live, taskId: "other", estimateMin: 15, priorAccumulatedSec: 0,
+                                    now: now, occurrenceBlockId: "other-tue", newId: { "s-new" })
+        XCTAssertEqual(next.id, "s-new", "a different task mints a fresh session")
+        XCTAssertEqual(next.taskId, "other")
+        XCTAssertEqual(next.occurrenceBlockId, "other-tue")
+        XCTAssertEqual(next.sessionStart, now)
+        XCTAssertEqual(FocusTimer.elapsedSec(next, now: now), 0)
+        XCTAssertEqual(next.sessionEstimateMin, 15)
+        XCTAssertEqual(next.priorAccumulatedSec, 0)
+        // And a different task WITHOUT an occurrence carries none over.
+        let plain = FocusTimer.start(live, taskId: "plain", estimateMin: 25, now: now, newId: { "s-plain" })
+        XCTAssertNil(plain.occurrenceBlockId)
+    }
+}

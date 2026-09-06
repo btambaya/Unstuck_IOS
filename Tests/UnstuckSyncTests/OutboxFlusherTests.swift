@@ -51,6 +51,20 @@ private actor FakeGateway: SyncGatewayProtocol {
         if shouldFail(id) { throw errorFor[id] ?? Failure() }
         deletes.append(id)
     }
+
+    /// RPC ops are keyed by their function name for failure scripting.
+    private(set) var rpcs: [(fn: String, params: String)] = []
+    func rpc(fn: String, paramsJSON: String) async throws {
+        if shouldFail(fn) { throw errorFor[fn] ?? Failure() }
+        rpcs.append((fn, paramsJSON))
+    }
+}
+
+/// A gateway that predates RPC ops (protocol default): every rpc op is a
+/// definite rejection, never a retry loop.
+private actor LegacyGateway: SyncGatewayProtocol {
+    func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {}
+    func delete(table: String, id: String) async throws {}
 }
 
 final class OutboxFlusherTests: XCTestCase {
@@ -280,5 +294,102 @@ final class OutboxFlusherTests: XCTestCase {
         XCTAssertEqual(try box.count(), 1)
         upserts = await gateway.upserts
         XCTAssertEqual(upserts.map(\.id), ["good"])
+    }
+
+    // MARK: - `rpc` ops (shared-collection item mutations)
+
+    private func rpcPayload(fn: String = "collection_add_item") throws -> String {
+        try OutboxRPCPayload(fn: fn, paramsJSON: #"{"p_collection_id":"c1","p_item":{"id":"i1","body":"Milk","at":"\(now)"}}"#).encoded()
+    }
+
+    func testRPCOpIsSentAndDequeued() async throws {
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc, payload: try rpcPayload(), nowISO: now)
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0)
+        let rpcs = await gateway.rpcs
+        XCTAssertEqual(rpcs.map(\.fn), ["collection_add_item"])
+        XCTAssertTrue(rpcs[0].params.contains(#""id":"i1""#), "the descriptor's params reach the gateway verbatim")
+    }
+
+    func testRPCTransientFailureRetriesWithoutCounting() async throws {
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc, payload: try rpcPayload(), nowISO: now)
+        await gateway.fail("collection_add_item", times: 3, with: URLError(.notConnectedToInternet))
+        for _ in 1...3 {
+            await flusher.flush(userId: "u1")
+            XCTAssertEqual(try box.count(), 1, "offline: the item edit stays queued (the old fire-and-forget lost it)")
+            XCTAssertEqual(try box.pending().first?.attempts, 0)
+        }
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0)
+        let rpcs = await gateway.rpcs
+        XCTAssertEqual(rpcs.count, 1)
+    }
+
+    func testRPCServerRefusalIsTerminalDroppedAndReported() async throws {
+        // RLS no-op / revoked share: the same bytes can never succeed — the op
+        // is dropped on the FIRST strike and the app is told which row to roll
+        // back (never five silent retries, never a quarantined zombie).
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc, payload: try rpcPayload(), nowISO: now)
+        // A later op for the same row must still flush (it doesn't depend on the refused one).
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc,
+                            payload: try rpcPayload(fn: "collection_set_item_flag"), nowISO: now)
+        await gateway.failForever("collection_add_item", with: FakeGateway.Rejection())
+        actor Sink { var rejected: [(String, String, String)] = []; func add(_ t: String, _ r: String, _ f: String) { rejected.append((t, r, f)) } }
+        let sink = Sink()
+        await flusher.setOnRPCRejected { table, rowId, fn, _ in Task { await sink.add(table, rowId, fn) } }
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0, "refused op dropped; the later op flushed")
+        let rpcs = await gateway.rpcs
+        XCTAssertEqual(rpcs.map(\.fn), ["collection_set_item_flag"])
+        // The hook fires asynchronously off the actor — give it a beat.
+        for _ in 0..<50 where await sink.rejected.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        let rejected = await sink.rejected
+        XCTAssertEqual(rejected.count, 1)
+        XCTAssertEqual(rejected.first?.0, "collections")
+        XCTAssertEqual(rejected.first?.1, "c1")
+        XCTAssertEqual(rejected.first?.2, "collection_add_item")
+    }
+
+    func testRPCOpAgainstAGatewayWithoutRPCIsARejectionNotARetryLoop() async throws {
+        let legacy = OutboxFlusher(gateway: LegacyGateway(), db: db)
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc, payload: try rpcPayload(), nowISO: now)
+        await legacy.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0, "RPCUnsupportedError is a definite rejection → dropped, not spun forever")
+    }
+
+    func testRPCOpWithoutAPayloadIsQuarantined() async throws {
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc, payload: nil, nowISO: now)
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 1, "malformed: kept, never sent, never dropped")
+        let rpcs = await gateway.rpcs
+        XCTAssertTrue(rpcs.isEmpty)
+    }
+
+    func testRPCBooleanFalseReturnIsARefusalDroppedAndReportedNotRetried() async throws {
+        // Migration 056: the item RPCs answer 200 + `false` when the write did
+        // nothing (RLS / unknown item). The gateway surfaces that as
+        // RPCRefusedError — a definite rejection: dropped on the first strike,
+        // never counted or retried, and the app is told to roll the row back.
+        _ = try box.enqueue(table: "collections", rowId: "c1", kind: .rpc,
+                            payload: try rpcPayload(fn: "collection_set_item_flag"), nowISO: now)
+        await gateway.failForever("collection_set_item_flag", with: RPCRefusedError(fn: "collection_set_item_flag"))
+        actor Sink {
+            var rejected: [(fn: String, error: Error)] = []
+            func add(_ fn: String, _ e: Error) { rejected.append((fn, e)) }
+        }
+        let sink = Sink()
+        await flusher.setOnRPCRejected { _, _, fn, error in Task { await sink.add(fn, error) } }
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0, "a `false` is terminal — dropped, not left to spin")
+        let rpcs = await gateway.rpcs
+        XCTAssertTrue(rpcs.isEmpty, "never reached the recorder: the fake refused it")
+        for _ in 0..<50 where await sink.rejected.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        let rejected = await sink.rejected
+        XCTAssertEqual(rejected.count, 1)
+        XCTAssertEqual(rejected.first?.fn, "collection_set_item_flag")
+        XCTAssertTrue(rejected.first?.error is RPCRefusedError, "the app sees WHY: \(String(describing: rejected.first?.error))")
+        // A second drain finds nothing to resend.
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0)
     }
 }

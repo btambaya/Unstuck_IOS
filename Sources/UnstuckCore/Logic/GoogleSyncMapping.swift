@@ -68,12 +68,19 @@ public struct CalendarPullPlan: Equatable, Sendable {
 /// - skip events the app itself pushed (a task block's externalEventId) —
 ///   the originating task block already represents them, otherwise a
 ///   duplicate g_ block sits next to it (and double-counts in findFreeSlots);
-/// - skip all-day events (date-only start, no 'T') — they'd collapse to
-///   15-min 00:00 slivers stacked on the time grid;
+/// - skip all-day events — the server flags them `allDay: true`
+///   (`allDayEventIds`); a date-only start (no 'T') is honoured too. They'd
+///   collapse to 15-min 00:00 slivers stacked on the time grid;
 /// - drop in-window EXTERNAL blocks Google no longer returns (deleted or
-///   moved in Google); `fromYmd...toYmd` are the date-only pull bounds.
+///   moved in Google); `fromYmd...toYmd` are the date-only pull bounds —
+///   EXCEPT blocks belonging to a connection the server could not read this
+///   pull (`failedConnectionIds`, from `/events`' `failures`): a revoked
+///   token / 429 / 5xx used to come back as `events: []` and every client
+///   then "deleted" all the user's meetings. When any connection failed,
+///   blocks of unknown provenance (no connection id) are kept as well.
 public func reconcileCalendarPull(
-    events: [ExternalEvent], localBlocks: [CalBlock], fromYmd: String, toYmd: String
+    events: [ExternalEvent], localBlocks: [CalBlock], fromYmd: String, toYmd: String,
+    allDayEventIds: Set<String> = [], failedConnectionIds: Set<String> = []
 ) -> CalendarPullPlan {
     let ownEventIds = Set(localBlocks
         .filter { blockKind($0) == .task }
@@ -81,11 +88,17 @@ public func reconcileCalendarPull(
         .filter { !$0.isEmpty })
     let toUpsert = events
         .filter { !ownEventIds.contains($0.id) }
-        .filter { $0.start.contains("T") }
+        .filter { !allDayEventIds.contains($0.id) && $0.start.contains("T") }
+        .filter { !failedConnectionIds.contains($0.connectionId) }
         .map { externalEventToBlock($0, calendarId: $0.calendarId) }
     let keep = Set(toUpsert.map(\.id))
     let toDelete = localBlocks
         .filter { isExternalBlock($0) && $0.date >= fromYmd && $0.date <= toYmd && !keep.contains($0.id) }
+        .filter { b in
+            guard !failedConnectionIds.isEmpty else { return true }
+            guard let conn = b.externalConnectionId, !conn.isEmpty else { return false }
+            return !failedConnectionIds.contains(conn)
+        }
         .map(\.id)
     return CalendarPullPlan(toUpsert: toUpsert, toDelete: toDelete)
 }

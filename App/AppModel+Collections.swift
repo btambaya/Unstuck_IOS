@@ -111,22 +111,53 @@ extension AppModel {
         }
     }
 
-    /// Item-array change. Shared → optimistic local write (no outbox — the RPC is
-    /// the server write) + the atomic item RPC. `rpc` receives the resulting row.
+    /// Item-array change. Shared → optimistic local write + the atomic item RPC
+    /// queued through the OUTBOX as an `rpc` op (one transaction with the row
+    /// save): it retries offline / on a 5xx like every other edit, and a
+    /// server REFUSAL rolls the row back to the server's copy with a visible
+    /// error (`handleCollectionRPCRejected`). The old fire-and-forget RPC left
+    /// a failed write's optimistic row to be silently deleted by the next
+    /// echo / hydrate. `rpc` receives the resulting row and returns the
+    /// descriptor (idempotent by item id, so a replay is a no-op).
     private func mutateCollectionItem(
         _ id: String,
         _ transform: (ItemCollection) -> ItemCollection,
-        rpc: @escaping @Sendable (CollectionShareClient, ItemCollection) async -> Void
+        rpc: (ItemCollection) -> CollectionRPC
     ) {
         guard let coord = coordinator, let db, let latest = try? db.fetchById(ItemCollection.self, id: id) else { return }
         let next = transform(latest)
         if isShared(latest) {
-            try? db.save(next)
-            let share = coord.share
-            enqueueCollectionRPC(id) { await rpc(share, next) }
+            let descriptor = rpc(next)
+            let write = coord.write
+            let now = Self.isoNow()
+            Task { try? await write.applyCollectionRPC(next, rpc: descriptor, nowISO: now) }
         } else {
             Task { try? await coord.write.upsertCollection(next, nowISO: Self.isoNow()) }
         }
+    }
+
+    /// The outbox dropped a refused shared-list RPC (terminal): re-pull the
+    /// server's copy of the list (rolls the optimistic row back) and say so
+    /// once on the Lists surface — never a silent no-op.
+    func handleCollectionRPCRejected(collectionId: String, fn: String, error: Error) {
+        let name = ((try? db?.fetchById(ItemCollection.self, id: collectionId)) ?? nil)?.name
+        collectionSyncError = Self.collectionRPCRejectionMessage(fn: fn, listName: name)
+        Task { await coordinator?.rehydrateCollections() }
+    }
+
+    /// Pure: the one-line explanation for a refused shared-list edit.
+    nonisolated static func collectionRPCRejectionMessage(fn: String, listName: String?) -> String {
+        let what: String
+        switch fn {
+        case "collection_add_item": what = "add that item to"
+        case "collection_remove_item": what = "remove that item from"
+        case "collection_update_item": what = "edit that item on"
+        case "collection_set_item_flag": what = "update that item on"
+        case "collection_set_item_promotion": what = "mark that item on"
+        default: what = "change"
+        }
+        let list = listName.map { "\u{201C}\($0)\u{201D}" } ?? "the shared list"
+        return "Couldn\u{2019}t \(what) \(list) \u{2014} the change was undone. You may no longer have access."
     }
 
     // MARK: - collection CRUD
@@ -169,34 +200,34 @@ extension AppModel {
         guard !text.isEmpty else { return }
         let item = CollectionItem(id: newUUID(), body: text, at: Self.isoNow())
         mutateCollectionItem(col.id, { var c = $0; c.items.append(item); return c },
-            rpc: { share, _ in await share.addItem(collectionId: col.id, id: item.id, body: item.body, at: item.at) })
+            rpc: { _ in CollectionRPC.addItem(collectionId: col.id, id: item.id, body: item.body, at: item.at) })
     }
     func updateCollectionItemBody(_ col: ItemCollection, itemId: String, body: String) {
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         mutateCollectionItem(col.id,
             { c in var n = c; if let i = n.items.firstIndex(where: { $0.id == itemId }) { n.items[i].body = text }; return n },
-            rpc: { share, _ in await share.updateItem(collectionId: col.id, itemId: itemId, body: text) })
+            rpc: { _ in CollectionRPC.updateItem(collectionId: col.id, itemId: itemId, body: text) })
     }
     func toggleCollectionItemPin(_ col: ItemCollection, itemId: String) {
         mutateCollectionItem(col.id,
             { c in var n = c; if let i = n.items.firstIndex(where: { $0.id == itemId }) { n.items[i].pinned = !(n.items[i].pinned ?? false) }; return n },
-            rpc: { share, next in
+            rpc: { next in
                 let v = next.items.first { $0.id == itemId }?.pinned ?? false
-                await share.setItemFlag(collectionId: col.id, itemId: itemId, flag: "pinned", value: v)
+                return CollectionRPC.setItemFlag(collectionId: col.id, itemId: itemId, flag: "pinned", value: v)
             })
     }
     func toggleCollectionItemDone(_ col: ItemCollection, itemId: String) {
         mutateCollectionItem(col.id,
             { c in var n = c; if let i = n.items.firstIndex(where: { $0.id == itemId }) { n.items[i].done = !(n.items[i].done ?? false) }; return n },
-            rpc: { share, next in
+            rpc: { next in
                 let v = next.items.first { $0.id == itemId }?.done ?? false
-                await share.setItemFlag(collectionId: col.id, itemId: itemId, flag: "done", value: v)
+                return CollectionRPC.setItemFlag(collectionId: col.id, itemId: itemId, flag: "done", value: v)
             })
     }
     func removeCollectionItem(_ col: ItemCollection, itemId: String) {
         mutateCollectionItem(col.id,
             { c in var n = c; n.items.removeAll { $0.id == itemId }; return n },
-            rpc: { share, _ in await share.removeItem(collectionId: col.id, itemId: itemId) })
+            rpc: { _ in CollectionRPC.removeItem(collectionId: col.id, itemId: itemId) })
     }
 
     // MARK: - move-to-task accountability
@@ -218,7 +249,7 @@ extension AppModel {
                 }
                 return n
             },
-            rpc: { share, _ in await share.setItemPromotion(collectionId: col.id, itemId: itemId, assignee: assignee, done: done, dueAt: dueAt) })
+            rpc: { _ in CollectionRPC.setItemPromotion(collectionId: col.id, itemId: itemId, assignee: assignee, done: done, dueAt: dueAt) })
     }
 
     /// Turn a collection item into a task. LOOP on a shared list links the task
@@ -285,10 +316,13 @@ extension AppModel {
         flipped.done.toggle()
         let stamped = applyCompletion(flipped, prior: task, nowISO: Self.isoNow())
         saveTask(stamped)
-        if flipped.done && !task.done, let cid = task.sourceCollectionId, let iid = task.sourceItemId {
+        if let cid = task.sourceCollectionId, let iid = task.sourceItemId, flipped.done != task.done {
             let share = coordinator?.share
             let by = currentUserName ?? "Someone"
-            Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by) }
+            // Un-completing has to travel too: the shared row stays ticked
+            // forever otherwise, with a task behind it that is no longer done.
+            let action: CollectionShareClient.TaskDoneAction = flipped.done ? .done : .reopen
+            Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by, action: action) }
         }
     }
 
@@ -333,10 +367,22 @@ extension AppModel {
     /// Fire the shared-item completion notification after a Focus session that
     /// marked the task done (mirrors finishFocus's taskDone hook).
     func notifyTaskDoneIfShared(_ task: TaskItem) {
+        notifySharedItem(task, action: .done)
+    }
+
+    /// The task behind a promoted shared item is gone (deleted) or no longer
+    /// done → un-tick the collection row for everyone. Server-side the reopen
+    /// is allowed for the assignee/owner, and for any editor once no user holds
+    /// a linked task, so delete-then-reopen works in either order.
+    func notifyTaskReopenedIfShared(_ task: TaskItem) {
+        notifySharedItem(task, action: .reopen)
+    }
+
+    private func notifySharedItem(_ task: TaskItem, action: CollectionShareClient.TaskDoneAction) {
         guard let cid = task.sourceCollectionId, let iid = task.sourceItemId else { return }
         let share = coordinator?.share
         let by = currentUserName ?? "Someone"
-        Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by) }
+        Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by, action: action) }
     }
 
     /// Before starting Focus on `newTaskId`, finalize a still-in-flight session
@@ -559,12 +605,22 @@ extension AppModel {
 
     // MARK: - sharing (edge-function backed)
 
+    /// Share with an email. On success the OWNER's local row is marked shared
+    /// AT ONCE (`members` from the function's membership rows, else the added
+    /// user) and the collections are re-hydrated — the owner's client used to
+    /// keep `members == nil` until the next full hydrate, so `isShared` stayed
+    /// false and its next item edit shipped the whole `items` JSONB, clobbering
+    /// the member's atomic RPC edits.
     func shareCollection(_ collectionId: String, email: String, role: String) async -> ShareOutcome {
-        guard let share = coordinator?.share else { return .error }
-        return await share.share(collectionId: collectionId, email: email, role: role)
+        guard let coord = coordinator else { return .error }
+        let result = await coord.share.shareDetailed(collectionId: collectionId, email: email, role: role)
+        if result.outcome == .ok { applyLocalMembers(collectionId, joined: result.memberUserIds) }
+        if result.outcome == .ok || result.outcome == .invited { await coord.rehydrateCollections() }
+        return result.outcome
     }
     func unshareCollection(_ collectionId: String, userId: String) async {
         await coordinator?.share.unshare(collectionId: collectionId, userId: userId)
+        await coordinator?.rehydrateCollections()
     }
     func cancelCollectionInvite(_ collectionId: String, email: String) async {
         await coordinator?.share.cancelInvite(collectionId: collectionId, email: email)
@@ -577,10 +633,38 @@ extension AppModel {
         Task {
             await share.leave(collectionId: collectionId)
             try? db.deleteById(ItemCollection.self, id: collectionId)  // lose access → drop locally
+            await coord.rehydrateCollections()
         }
     }
+    /// The share sheet's roster. Listing is also how the owner LEARNS a mailed
+    /// invitee has claimed their invite (signed up): the joined ids are synced
+    /// onto the local row so `isShared` flips without a full hydrate.
     func listCollectionMembers(_ collectionId: String) async -> [CollectionMemberInfo] {
-        await coordinator?.share.listMembers(collectionId: collectionId) ?? []
+        let members = await coordinator?.share.listMembers(collectionId: collectionId) ?? []
+        applyLocalMembers(collectionId, joined: CollectionShareClient.joinedUserIds(members))
+        return members
+    }
+
+    /// Merge joined member ids onto the local row (union with what's known;
+    /// the hydrate is the authority for removals). Owner rows only — a member's
+    /// own role/members come from the hydrate.
+    private func applyLocalMembers(_ collectionId: String, joined: [String]) {
+        guard let db, let latest = try? db.fetchById(ItemCollection.self, id: collectionId),
+              isOwner(latest) else { return }
+        let uid = cachedUserId
+        let merged = Self.mergedMembers(existing: latest.members, joined: joined, ownerId: uid)
+        guard merged != (latest.members ?? []) else { return }
+        var next = latest
+        next.members = merged
+        if next.myRole == nil, next.ownerId == nil || next.ownerId == uid { next.myRole = "owner" }
+        try? db.save(next)
+    }
+
+    /// Pure: existing ∪ joined, the owner never listed as a member, order kept.
+    nonisolated static func mergedMembers(existing: [String]?, joined: [String], ownerId: String?) -> [String] {
+        var out = existing ?? []
+        for id in joined where !id.isEmpty && id != ownerId && !out.contains(id) { out.append(id) }
+        return out
     }
 
     // MARK: - trusted circle (People / Connections)

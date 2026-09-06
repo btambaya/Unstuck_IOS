@@ -102,6 +102,29 @@ public actor SyncCoordinator {
         await hydrator.setOnProfileFactsHydrated(hook)
     }
 
+    // MARK: - shared collections (outbox `rpc` ops)
+
+    /// A shared-list item RPC the server REFUSED (RLS / a revoked share / a
+    /// bad call): the outbox dropped it (terminal) and the app must roll the
+    /// optimistic row back to the server's copy with a visible error —
+    /// `(collectionId, fn, error)`.
+    public func setOnCollectionRPCRejected(_ hook: @escaping @Sendable (_ collectionId: String, _ fn: String, _ error: Error) -> Void) async {
+        await flusher.setOnRPCRejected { table, rowId, fn, error in
+            guard table == "collections" else { return }
+            hook(rowId, fn, error)
+        }
+    }
+
+    /// Re-pull collections + membership from the server (RLS-scoped) — after
+    /// a share / unshare / leave / invite claim so the OWNER's client learns
+    /// the list is shared (members[] / myRole) at once instead of after the
+    /// next full hydrate, and to roll an optimistic row back after a refused
+    /// RPC. No-op when signed out.
+    public func rehydrateCollections() async {
+        guard let uid = auth.currentUserId else { return }
+        await hydrator.hydrateCollections(userId: uid)
+    }
+
     /// Manual best-effort sync (flush outbox → hydrate) for the foreground
     /// (scenePhase .active) + BG-refresh triggers. No-op when signed out.
     /// Mirrors Android SyncCoordinator.syncNow().
@@ -127,14 +150,52 @@ public actor SyncCoordinator {
         scheduleDebouncedFlush()
     }
 
+    // MARK: - Google calendar pull
+
+    /// The connected calendars' health after the last pull — what the UI
+    /// needs to offer "Reconnect Google" (a dead refresh token) and to stay
+    /// quiet while backing off a 429.
+    public struct CalendarSyncStatus: Sendable, Equatable {
+        public var needsReauthConnectionIds: Set<String> = []
+        public var lastError: String?
+        public var backoffUntil: Date?
+        public init(needsReauthConnectionIds: Set<String> = [], lastError: String? = nil, backoffUntil: Date? = nil) {
+            self.needsReauthConnectionIds = needsReauthConnectionIds
+            self.lastError = lastError
+            self.backoffUntil = backoffUntil
+        }
+        public var needsReauth: Bool { !needsReauthConnectionIds.isEmpty }
+    }
+
+    /// Google rate-limited us (429): pull again no sooner than this.
+    private var calendarBackoffUntil: Date?
+    private var onCalendarStatus: (@Sendable (CalendarSyncStatus) -> Void)?
+    public private(set) var calendarStatus = CalendarSyncStatus()
+
+    /// Observe calendar health changes (the app mirrors them into UI state).
+    public func setOnCalendarStatus(_ hook: @escaping @Sendable (CalendarSyncStatus) -> Void) {
+        onCalendarStatus = hook
+    }
+
+    /// How long a 429 silences the pull.
+    static let calendarRateLimitBackoff: TimeInterval = 15 * 60
+
     /// Pull external Google events for [-7d, +30d] and reconcile them into
     /// local EXTERNAL g_ blocks — port of Android SyncCoordinator.pullCalendar.
     /// The own-event + all-day filters and the keep-set deletion reconcile
     /// live in reconcileCalendarPull (UnstuckCore). Best-effort: no-op when
-    /// signed out, without a connection, or on any network failure.
+    /// signed out, without a connection, on any network failure, or while
+    /// backing off a 429. A connection the server could not read (revoked
+    /// token / 429 / 5xx — `failures`) is EXCLUDED from the deletion
+    /// reconcile: its meetings stay until a successful pull says otherwise,
+    /// and a 401 / invalid_grant flags it for "Reconnect Google".
     public func pullCalendar() async {
         guard auth.currentUserId != nil else { return }
-        guard let conns = try? await calendar.listConnections(), !conns.isEmpty else { return }
+        if let until = calendarBackoffUntil, until > Date() { return }
+        guard let statuses = try? await calendar.listConnectionStatuses(), !statuses.isEmpty else { return }
+        var status = CalendarSyncStatus(
+            needsReauthConnectionIds: Set(statuses.filter(\.needsReauth).map(\.connection.id)),
+            lastError: statuses.compactMap(\.lastError).first)
         let cal = Foundation.Calendar.current
         let today = cal.startOfDay(for: Date())
         guard let fromDate = cal.date(byAdding: .day, value: -7, to: today),
@@ -144,14 +205,51 @@ public actor SyncCoordinator {
         // a bare YYYY-MM-DD is rejected (400) and silently yields zero events.
         // Send full instants; reconcile locally with the date-only bounds.
         let f = ISO8601DateFormatter()
-        guard let events = try? await calendar.pullEvents(
-            from: f.string(from: fromDate), to: f.string(from: toExclusive)) else { return }
+        let pull: CalendarClient.CalendarPull
+        do {
+            pull = try await calendar.pullEvents(from: f.string(from: fromDate), to: f.string(from: toExclusive))
+        } catch CalendarSyncError.rateLimited {
+            calendarBackoffUntil = Date().addingTimeInterval(Self.calendarRateLimitBackoff)
+            status.backoffUntil = calendarBackoffUntil
+            publishCalendarStatus(status)
+            return
+        } catch CalendarSyncError.needsReauth {
+            status.needsReauthConnectionIds.formUnion(statuses.map(\.connection.id))
+            publishCalendarStatus(status)
+            return
+        } catch {
+            return   // offline / 5xx: nothing to reconcile, nothing to delete
+        }
+        for failure in pull.failures where failure.needsReauth {
+            status.needsReauthConnectionIds.insert(failure.connectionId)
+            if status.lastError == nil { status.lastError = failure.reason }
+        }
+        if pull.failures.contains(where: \.rateLimited) {
+            calendarBackoffUntil = Date().addingTimeInterval(Self.calendarRateLimitBackoff)
+            status.backoffUntil = calendarBackoffUntil
+        }
+        let failed = Set(pull.failures.map(\.connectionId))
         let local = (try? db.fetchAllCalBlocks()) ?? []
-        let plan = reconcileCalendarPull(events: events, localBlocks: local,
-                                         fromYmd: Clock.dateISO(fromDate), toYmd: Clock.dateISO(toDate))
+        let plan = reconcileCalendarPull(events: pull.events, localBlocks: local,
+                                         fromYmd: Clock.dateISO(fromDate), toYmd: Clock.dateISO(toDate),
+                                         allDayEventIds: pull.allDayEventIds, failedConnectionIds: failed)
         let now = Self.isoNow()
         for b in plan.toUpsert { try? await write.upsertCalBlock(b, nowISO: now) }
         for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
+        publishCalendarStatus(status)
+    }
+
+    private func publishCalendarStatus(_ status: CalendarSyncStatus) {
+        guard status != calendarStatus else { return }
+        calendarStatus = status
+        onCalendarStatus?(status)
+    }
+
+    /// The user re-consented (or disconnected): forget the stale verdicts so
+    /// the next pull starts clean.
+    public func resetCalendarStatus() {
+        calendarBackoffUntil = nil
+        publishCalendarStatus(CalendarSyncStatus())
     }
 
     private static func isoNow() -> String {

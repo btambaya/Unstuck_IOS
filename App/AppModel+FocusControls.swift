@@ -35,10 +35,93 @@ extension AppModel {
             sessionStartMs: paused.sessionStart ?? 0, paused: true,
             estimateMin: paused.sessionEstimateMin)
         let taskName = ((try? taskRepo?.fetch(id: paused.taskId)) ?? nil)?.name ?? "your task"
-        PausedCheckinScheduler.schedule(taskName: taskName)
-        requestPausedCheckin { allowed in
-            if !allowed { PausedCheckinScheduler.cancel() }
+        armPausedCheckin(taskName: taskName)
+    }
+
+    // MARK: - paused check-in: budget at FIRE time (web / Android parity)
+
+    /// Arm the local ~14-min "did you step away?" nag and PEEK the shared daily
+    /// push cap (mute / preference / remaining slots) — nothing is consumed
+    /// yet. Cancelled when the server says no. The budget slot is claimed only
+    /// once the nag has actually fired (`consumePausedCheckinBudget`), exactly
+    /// when web and Android claim it: a quick pause/resume used to burn one of
+    /// the 3 daily slots per pause, silently suppressing the afternoon recap
+    /// and later genuine check-ins on EVERY device.
+    func armPausedCheckin(taskName: String) {
+        PausedCheckinBudget.arm(taskName: taskName)
+        peekPausedCheckinAllowed { allowed in
+            if !allowed { PausedCheckinBudget.disarm() }
         }
+    }
+
+    /// The session left the paused state (resume / end / cancel / a remote
+    /// resume): settle the budget for a nag that already FIRED, drop a still
+    /// pending one un-consumed.
+    func cancelPausedCheckin() {
+        PausedCheckinBudget.cancel(consume: { [weak self] in self?.consumePausedCheckinBudget() })
+    }
+
+    /// Foreground / relaunch: a nag that fired while the app was away claims
+    /// its slot now (the phone can't run code at local-notification fire time).
+    func settlePausedCheckinBudgetIfFired() {
+        guard PausedCheckinBudget.hasFired() else { return }
+        PausedCheckinBudget.clearMarker()
+        consumePausedCheckinBudget()
+    }
+
+    /// Ask (main actor) whether a paused check-in may fire — the PEEK mode of
+    /// send-paused-checkin. Offline / transport failure → `true` DELIBERATELY:
+    /// the local nag is still worth having with no server, and nothing was
+    /// consumed; the claim happens at fire time and simply fails closed if the
+    /// server is still unreachable then.
+    func peekPausedCheckinAllowed(_ completion: @escaping @MainActor (Bool) -> Void) {
+        guard let n = coordinator?.notifications else { completion(true); return }
+        Task {
+            let allowed = (try? await n.pausedCheckin(mode: .peek)) ?? true
+            await MainActor.run { completion(allowed) }
+        }
+    }
+
+    /// Claim the day's paused-check-in slot (`try_consume_push_budget`). Best-
+    /// effort, fire-and-forget: the notification is already on the lock screen.
+    func consumePausedCheckinBudget() {
+        guard let n = coordinator?.notifications else { return }
+        Task { _ = try? await n.pausedCheckin(mode: .consume) }
+    }
+
+    // MARK: - programmatic start (assistant `start_focus`): join-or-mint
+
+    /// Start focus on `taskId` the way the Focus SCREEN does — join-or-mint
+    /// (one true shared session): finalize a displaced session, PROBE the
+    /// co-focus channel for a partner's in-flight session and ADOPT it (its
+    /// id / start / paused / estimate, prior accumulation 0 so both rings show
+    /// the same clock), else MINT. The assistant's `start_focus` used to call
+    /// FocusTimer.start directly, minting a SECOND sessionId on a task the
+    /// partner was already running — every partner control was then dropped
+    /// (sessionId mismatch) and the two clocks finalized separately.
+    func startFocusJoinOrMint(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) async {
+        guard let store = liveStore else { return }
+        let task = (try? taskRepo?.fetch(id: taskId)) ?? nil
+        let partnerShared = shareState.badges[taskId]?.contains { $0.level == .partner } ?? false
+        finalizeDisplacedFocus(forNewTaskId: taskId)
+        let adopted = await probeSharedSession(taskId: taskId, partnerShared: partnerShared)
+        let existing: LiveSession? = (try? store.get()) ?? nil
+        let now = Date().timeIntervalSince1970 * 1000
+        var session: LiveSession
+        if let adopted {
+            finalizeDisplacedForAdoption(adopted, taskId: taskId)
+            session = FocusTimer.adopt(existing ?? .empty, taskId: taskId, state: adopted,
+                                       priorAccumulatedSec: 0, now: now, occurrenceBlockId: occurrenceBlockId)
+        } else {
+            session = FocusTimer.start(existing ?? .empty, taskId: taskId,
+                                       estimateMin: estimateMin ?? task?.estimateMin,
+                                       priorAccumulatedSec: partnerShared ? 0 : task?.totalFocused,
+                                       now: now, occurrenceBlockId: occurrenceBlockId)
+        }
+        let isFresh = existing?.sessionStart == nil || existing?.taskId != taskId
+        if isFresh { session = FocusTimer.setTreatment(session, settings.defaultTreatment) }
+        try? store.set(session)
+        refreshLiveSession()
     }
 
     /// Reap focus Live Activities left dangling by a kill/crash mid-session.
@@ -88,6 +171,55 @@ extension AppModel {
         LiveActivityController.shared.update(
             sessionStartMs: resumed.sessionStart ?? 0, paused: false,
             estimateMin: resumed.sessionEstimateMin)
+        cancelPausedCheckin()
+    }
+}
+
+/// The paused check-in's local notification + its FIRE-TIME marker. iOS can't
+/// run code when a local notification is delivered, so the marker (the
+/// instant it was scheduled to fire, UserDefaults) is what tells a later
+/// resume / end / foreground whether the nag actually reached the lock screen
+/// — and therefore whether the shared daily push budget must be claimed
+/// (`consume`) or nothing happened (`disarm`). Pure over an injected clock +
+/// defaults so the decision is unit-tested.
+enum PausedCheckinBudget {
+    static let fireAtKey = "unstuck.pausedCheckin.fireAt"
+    /// Must match PausedCheckinScheduler's trigger interval.
+    static let delay: TimeInterval = 14 * 60
+
+    /// Schedule the local nag and remember when it fires. Nothing is armed on
+    /// the Calm level (the scheduler posts nothing there, so nothing can fire).
+    static func arm(taskName: String, now: Date = Date(), defaults: UserDefaults = .standard) {
+        guard NotificationPrefs.level.pausedCheckin else { return }
+        PausedCheckinScheduler.schedule(taskName: taskName)
+        defaults.set(now.timeIntervalSince1970 + delay, forKey: fireAtKey)
+    }
+
+    /// Drop the pending nag WITHOUT settling (cap said no / sign-out).
+    static func disarm(defaults: UserDefaults = .standard) {
         PausedCheckinScheduler.cancel()
+        clearMarker(defaults: defaults)
+    }
+
+    /// The session left the paused state: a nag that already FIRED claims its
+    /// budget slot via `consume`; a still-pending one is dropped un-consumed.
+    static func cancel(consume: (() -> Void)?, now: Date = Date(), defaults: UserDefaults = .standard) {
+        if hasFired(now: now, defaults: defaults) { consume?() }
+        disarm(defaults: defaults)
+    }
+
+    static func hasFired(now: Date = Date(), defaults: UserDefaults = .standard) -> Bool {
+        Self.fired(fireAt: defaults.object(forKey: fireAtKey) as? Double, now: now.timeIntervalSince1970)
+    }
+
+    static func clearMarker(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: fireAtKey)
+    }
+
+    /// Pure: an armed marker whose fire instant has passed means the nag was
+    /// delivered (local notifications fire even with the app killed).
+    nonisolated static func fired(fireAt: Double?, now: Double) -> Bool {
+        guard let fireAt, fireAt > 0 else { return false }
+        return now >= fireAt
     }
 }

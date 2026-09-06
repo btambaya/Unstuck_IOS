@@ -71,6 +71,16 @@ struct ListsView: View {
             .sheet(isPresented: $showNew) { newCollectionSheet }
             .assistantLauncher()
         }
+        // A shared-list edit the server refused: the outbox dropped it and the
+        // row was rolled back to the server's copy — say so once (never a
+        // silent vanish on the next echo).
+        .alert("Change undone", isPresented: Binding(
+            get: { model.collectionSyncError != nil },
+            set: { if !$0 { model.collectionSyncError = nil } })) {
+            Button("OK", role: .cancel) { model.collectionSyncError = nil }
+        } message: {
+            Text(model.collectionSyncError ?? "")
+        }
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in

@@ -53,6 +53,12 @@ protocol AssistantAppState: AnyObject {
     // ── tasks + blocks ──
     func upsertTask(_ t: TaskItem) async
     func removeTask(_ id: String) async
+    /// A task that just went done → open is a loop-promoted shared-list item
+    /// (`sourceCollectionId` + `sourceItemId` set): un-tick the collection row
+    /// for the other members (collection-task-done `reopen`) — the same hook
+    /// the UI's un-complete path fires, or the shared row stays ticked forever
+    /// with an open task behind it. No-op for any other task.
+    func notifyTaskReopenedIfShared(_ t: TaskItem)
     func upsertBlock(_ b: CalBlock) async
     func deleteBlock(_ id: String) async
     // ── lists ──

@@ -67,6 +67,15 @@ public enum FocusTimer {
     /// - same task + paused → resume (shift sessionStart by the pause gap)
     /// - same task + running → no-op (don't reset on a double Start)
     /// - otherwise → fresh session seeded with `priorAccumulatedSec`
+    ///
+    /// RECURRING OCCURRENCE (`occurrenceBlockId`): the session runs on the
+    /// TEMPLATE task, so a session left over from an earlier occurrence
+    /// (Monday's "Daily review") matches today's start on `taskId`. Both
+    /// same-task branches keep the clock/estimate untouched but RE-POINT the
+    /// session at the occurrence being started: "Mark complete" ticks
+    /// `live.occurrenceBlockId`, and silently keeping Monday's block there
+    /// completed the wrong day and left today's pending. A start without an
+    /// occurrence keeps the current one (web + Android parity).
     public static func start(
         _ cur: LiveSession,
         taskId: String,
@@ -76,15 +85,9 @@ public enum FocusTimer {
         occurrenceBlockId: String? = nil,
         newId: () -> String = newUUID
     ) -> LiveSession {
-        // Re-entering the SAME occurrence (same template + same day's block) keeps
-        // its state; a different occurrence of the same template starts fresh.
-        if cur.sessionStart != nil, cur.taskId == taskId,
-           cur.occurrenceBlockId == occurrenceBlockId, cur.paused {
-            return resume(cur, now: now)
-        }
-        if cur.sessionStart != nil, cur.taskId == taskId,
-           cur.occurrenceBlockId == occurrenceBlockId, !cur.paused {
-            return cur
+        if cur.sessionStart != nil, cur.taskId == taskId {
+            let continued = cur.paused ? resume(cur, now: now) : cur
+            return repointOccurrence(continued, to: occurrenceBlockId)
         }
         var next = cur
         next.id = newId()
@@ -111,6 +114,16 @@ public enum FocusTimer {
         return next
     }
 
+    /// Attach a continuing same-task session to the occurrence being started
+    /// when it differs from the one it was minted on; a nil occurrence (the
+    /// template itself, or a non-recurring task) leaves it alone.
+    static func repointOccurrence(_ live: LiveSession, to occurrenceBlockId: String?) -> LiveSession {
+        guard let occ = occurrenceBlockId, occ != live.occurrenceBlockId else { return live }
+        var next = live
+        next.occurrenceBlockId = occ
+        return next
+    }
+
     /// ADOPT an in-flight shared session from the co-focus channel — the JOIN
     /// half of join-or-mint (one true shared session). Bypasses the mint: the
     /// id / start / paused / pausedAt / estimate come from the broadcast state,
@@ -133,7 +146,7 @@ public enum FocusTimer {
         var next = cur
         next.id = state.sessionId
         next.taskId = taskId
-        next.sessionStart = min(state.sessionStartMs, now)
+        next.sessionStart = clampAdoptedSessionStartMs(state.sessionStartMs, now: now)
         next.paused = state.paused
         next.pausedAt = state.pausedAtMs
         next.sessionEstimateMin = state.estimateMin

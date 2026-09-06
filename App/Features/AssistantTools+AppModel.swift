@@ -50,6 +50,8 @@ final class AppModelAssistantState: AssistantAppState {
 
     func upsertTask(_ t: TaskItem) async { await model.saveTaskAwaiting(t) }
     func removeTask(_ id: String) async { await model.deleteTaskAwaiting(id) }
+    /// The UI's un-complete hook (AppModel.toggleDone → `.reopen`), best-effort.
+    func notifyTaskReopenedIfShared(_ t: TaskItem) { model.notifyTaskReopenedIfShared(t) }
     func upsertBlock(_ b: CalBlock) async { await model.saveBlockAwaiting(b) }
     /// `unschedule` reconciles Google for a pushed task block, then deletes.
     func deleteBlock(_ id: String) async { await model.unscheduleAwaiting(id) }
@@ -152,19 +154,15 @@ final class AppModelAssistantState: AssistantAppState {
 
     func getLiveFocus() -> LiveSession? { (try? model.liveStore?.get()) ?? nil }
 
+    /// JOIN-OR-MINT, exactly like the Focus screen: minting here directly used
+    /// to create a SECOND sessionId on a task a partner was already running, so
+    /// every partner control was dropped (sessionId mismatch) and the two
+    /// clocks finalized separately. `startFocusJoinOrMint` finalizes a
+    /// displaced session, probes the co-focus channel and ADOPTS a partner's
+    /// in-flight session when there is one, else mints. It is resume-aware, so
+    /// re-entering the same occurrence never restarts the clock.
     func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) {
-        guard let store = model.liveStore else { return }
-        let existing: LiveSession? = (try? store.get()) ?? nil
-        let task = getTasks().first { $0.id == taskId }
-        var session = FocusTimer.start(existing ?? .empty, taskId: taskId, estimateMin: estimateMin ?? task?.estimateMin,
-                                       priorAccumulatedSec: task?.totalFocused,
-                                       now: Date().timeIntervalSince1970 * 1000, occurrenceBlockId: occurrenceBlockId)
-        let isFresh = existing?.sessionStart == nil || existing?.taskId != taskId
-        if isFresh { session = FocusTimer.setTreatment(session, model.settings.defaultTreatment) }
-        try? store.set(session)
-        model.refreshLiveSession()
-        // The Focus screen (opened by navigate("focus")) adopts this session —
-        // FocusTimer.start is resume-aware, so it never restarts the clock.
+        Task { await model.startFocusJoinOrMint(taskId: taskId, estimateMin: estimateMin, occurrenceBlockId: occurrenceBlockId) }
     }
     func pauseFocus() { model.pauseFocus() }
     func resumeFocus() { model.resumeFocus() }

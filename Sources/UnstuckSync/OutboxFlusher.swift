@@ -37,10 +37,21 @@ public actor OutboxFlusher {
     // ops use the PERSISTED `attempts` counter instead (OutboxOp.isQuarantined).
     private var malformed: Set<Int64> = []
 
+    /// An `rpc` op the server REFUSED: `(tableName, rowId, fn, error)`. The
+    /// op is dropped (terminal — the same bytes can never succeed) and the
+    /// app rolls the optimistic row back to the server's copy with a visible
+    /// error (AppModel via SyncCoordinator).
+    public typealias RPCRejectedHook = @Sendable (_ table: String, _ rowId: String, _ fn: String, _ error: Error) -> Void
+    private var onRPCRejected: RPCRejectedHook?
+
     public init(gateway: any SyncGatewayProtocol, db: AppDatabase) {
         self.gateway = gateway
         self.box = OutboxStore(db)
         self.db = db
+    }
+
+    public func setOnRPCRejected(_ hook: RPCRejectedHook?) {
+        onRPCRejected = hook
     }
 
     /// The FK-parent table a child table's `dependsOn` rowId lives in:
@@ -151,6 +162,19 @@ public actor OutboxFlusher {
                         // valid write and its FK dependents for good.
                         print("[outbox] \(rowKey) transient failure, will retry: \(error)")
                         blockedRows.insert(rowKey)
+                    case .rejected where op.kind == .rpc:
+                        // A refused RPC is terminal on the first strike: drop it
+                        // and tell the app, which rolls the optimistic row back to
+                        // the server's copy and shows why. Later ops for the row
+                        // still flush (they don't depend on this one landing).
+                        // "Refused" is a PostgREST 4xx AND a 200 whose body is
+                        // `false` (`RPCRefusedError` — the boolean item RPCs say
+                        // "nothing happened"): both can only repeat on a replay.
+                        let fn = OutboxRPCPayload.decode(op.payload)?.fn ?? "?"
+                        print("[outbox] \(rowKey) rpc \(fn) rejected by server, dropping: \(error)")
+                        try? box.markDone(seq)
+                        progressed = true
+                        onRPCRejected?(op.tableName, op.rowId, fn, error)
                     case .rejected:
                         // The server understood and refused these exact bytes.
                         // Count it (persisted); at the cap the op is quarantined:
@@ -181,6 +205,13 @@ public actor OutboxFlusher {
     private func apply(_ op: OutboxOp, userId: String) async throws {
         if op.kind == .delete {
             try await gateway.delete(table: op.tableName, id: op.rowId)
+            return
+        }
+        if op.kind == .rpc {
+            guard let rpc = OutboxRPCPayload.decode(op.payload) else {
+                throw MalformedOpError(reason: .missingPayload)
+            }
+            try await gateway.rpc(fn: rpc.fn, paramsJSON: rpc.paramsJSON)
             return
         }
         // A nil/empty upsert payload can never be sent. Surface it so the drain

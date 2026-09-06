@@ -374,21 +374,7 @@ final class AssistantModel {
         else { return false }
         let key = Self.undoKey(turnId, index)
         undoFailures[key] = nil
-        // Undoing a "Created" mirrors the executor's delete_task: the task AND
-        // its calendar blocks — ghost blocks were a confirmed flow bug.
-        func removeTaskAndBlocks(_ id: String) async {
-            for b in api.getBlocks() where b.taskId == id { await api.deleteBlock(b.id) }
-            await api.removeTask(id)
-        }
         switch action {
-        case .deleteTask(let id): await removeTaskAndBlocks(id)
-        case .deleteTasks(let ids): for id in ids { await removeTaskAndBlocks(id) }
-        case .restoreTask(let task): await api.upsertTask(task)
-        case .restoreTasks(let tasks): for t in tasks { await api.upsertTask(t) }
-        case .completeTask(let task): await api.upsertTask(task)
-        case .forgetFact(let id):
-            guard api.removeProfileFact(id) else { return false }
-        case .deleteCapture(let id): await api.removeCapture(id)
         case .cancelCall(let id):
             // Network write: the receipt flips to undone only once the server
             // accepted the cancel; meanwhile it reads "cancelling…". A failure
@@ -400,8 +386,47 @@ final class AssistantModel {
                 undoFailures[key] = "Couldn't cancel the call — check your connection and try again."
                 return false
             }
+        default:
+            guard await Self.applyLocalUndo(action, api: api) else { return false }
         }
         markUndone(turnId: turnId, index: index)
+        return true
+    }
+
+    /// The store half of an undo — every action but `cancelCall` (a network
+    /// write with its own in-flight bookkeeping). Runs against the
+    /// `AssistantAppState` seam so it is testable on the in-memory fake.
+    /// Returns false when nothing could be undone (the fact is already gone).
+    static func applyLocalUndo(_ action: ReceiptUndoAction, api: AssistantAppState) async -> Bool {
+        // Undoing a "Created" mirrors the executor's delete_task: the task AND
+        // its calendar blocks — ghost blocks were a confirmed flow bug.
+        func removeTaskAndBlocks(_ id: String) async {
+            for b in api.getBlocks() where b.taskId == id { await api.deleteBlock(b.id) }
+            await api.removeTask(id)
+        }
+        // Undoing a "Completed" reopens the task — for a loop-promoted shared
+        // list item that has to reach the other members (collection-task-done
+        // `reopen`) exactly as the UI's un-complete does; a bare upsert left the
+        // shared row ticked. Only when the store still had it done: the user
+        // may have reopened it by hand in between, and that path already sent it.
+        func restore(_ task: TaskItem) async {
+            let wasDone = api.getTasks().first { $0.id == task.id }?.done ?? false
+            await api.upsertTask(task)
+            if wasDone, !task.done { api.notifyTaskReopenedIfShared(task) }
+        }
+        switch action {
+        case .deleteTask(let id): await removeTaskAndBlocks(id)
+        case .deleteTasks(let ids): for id in ids { await removeTaskAndBlocks(id) }
+        case .restoreTask(let task): await restore(task)
+        case .restoreTasks(let tasks): for t in tasks { await restore(t) }
+        case .completeTask(let task): await api.upsertTask(task)
+        case .forgetFact(let id):
+            guard api.removeProfileFact(id) else { return false }
+        case .deleteCapture(let id): await api.removeCapture(id)
+        case .cancelCall:
+            // Handled by undoReceipt (needs the instance's in-flight state).
+            return false
+        }
         return true
     }
 

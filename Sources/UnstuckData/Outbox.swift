@@ -23,6 +23,36 @@ import GRDB
 
 public enum OutboxKind: String, Codable, Sendable {
     case upsert, delete
+    /// A server-side RPC (a shared collection's atomic item mutation —
+    /// `collection_add_item` etc.). `payload` is an `OutboxRPCPayload`;
+    /// `tableName`/`rowId` name the row it mutates so per-row ordering and
+    /// the pending-row preservation apply. Retried on transient failure like
+    /// any op; a server REJECTION is terminal on the first strike (the same
+    /// bytes can never succeed) — the flusher drops it and reports it so the
+    /// optimistic local row is rolled back with a visible error.
+    case rpc
+}
+
+/// The payload of an `OutboxKind.rpc` op: the function name and its
+/// parameters as a JSON object string (kept as text so this module stays free
+/// of the transport's JSON type; the gateway decodes it when sending).
+public struct OutboxRPCPayload: Codable, Equatable, Sendable {
+    public var fn: String
+    public var paramsJSON: String
+
+    public init(fn: String, paramsJSON: String) {
+        self.fn = fn
+        self.paramsJSON = paramsJSON
+    }
+
+    public func encoded() throws -> String {
+        String(data: try JSONEncoder().encode(self), encoding: .utf8) ?? "{}"
+    }
+
+    public static func decode(_ payload: String?) -> OutboxRPCPayload? {
+        guard let data = payload?.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(OutboxRPCPayload.self, from: data)
+    }
 }
 
 public struct OutboxOp: Codable, Equatable, Sendable, FetchableRecord, MutablePersistableRecord {
@@ -150,10 +180,11 @@ public struct OutboxStore: Sendable {
         _ = try db.writer.write { try OutboxOp.deleteOne($0, key: opSeq) }
     }
 
-    /// Drop any queued upsert ops for a row about to be deleted, so a
-    /// held-back upsert (e.g. a cal_block waiting on its parent task via
-    /// `dependsOn`) can't flush AFTER the delete and resurrect the row
-    /// server-side (spec 02-sync-engine §1.6/§1.8).
+    /// Drop any queued upsert (and rpc-mutation) ops for a row about to be
+    /// deleted, so a held-back upsert (e.g. a cal_block waiting on its parent
+    /// task via `dependsOn`) can't flush AFTER the delete and resurrect the
+    /// row server-side (spec 02-sync-engine §1.6/§1.8), and a shared-list item
+    /// RPC doesn't fire on a list that no longer exists.
     public func cancelPendingUpserts(table: String, rowId: String) throws {
         try db.writer.write { try Self.cancelPendingUpserts(in: $0, table: table, rowId: rowId) }
     }
@@ -163,7 +194,7 @@ public struct OutboxStore: Sendable {
         _ = try OutboxOp
             .filter(Column("tableName") == table)
             .filter(Column("rowId") == rowId)
-            .filter(Column("kind") == OutboxKind.upsert.rawValue)
+            .filter(Column("kind") != OutboxKind.delete.rawValue)
             .deleteAll(db)
     }
 

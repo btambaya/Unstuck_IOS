@@ -377,8 +377,16 @@ extension AppModel {
                                      resetRevFloor: Bool = false) {
         let wasPaused = cur.paused
         let prevEstimate = cur.sessionEstimateMin
+        // The partner's start is stored CLAMPED to our clock (never in our
+        // future — `now` floored to whole ms): a partner clock running ahead
+        // would otherwise inflate our elapsed / freeze the ring at 00:00 until
+        // the skew passed. Display-only: the (rev, atMs) bookkeeping is the
+        // wire's. Same rule as the JOIN (`FocusTimer.adopt`) and the web's
+        // `clampAdoptedSessionStartMs`.
+        let now = (Date().timeIntervalSince1970 * 1000).rounded(.down)
+        let sessionStart = clampAdoptedSessionStartMs(inc.sessionStartMs, now: now)
         var next = cur
-        next.sessionStart = inc.sessionStartMs
+        next.sessionStart = sessionStart
         next.paused = inc.paused
         next.pausedAt = inc.pausedAtMs
         next.sessionEstimateMin = inc.estimateMin
@@ -390,8 +398,14 @@ extension AppModel {
         }
         next.divergedOffline = nil
         // Pre-seed the echo detector: the refresh below must see this state as
-        // already-on-the-wire (we applied it; we don't own it).
-        lastSharedBroadcast = inc
+        // already-on-the-wire (we applied it; we don't own it). The baseline
+        // carries the STORED (clamped) start, exactly as the adoption seed
+        // does — the detector compares against the stored value, and a
+        // clamped start must not read as a local control (a spurious rev+1
+        // broadcast would shift the shared clock for the partner).
+        var baseline = inc
+        baseline.sessionStartMs = sessionStart.rounded()
+        lastSharedBroadcast = baseline
         try? liveStore?.set(next)
         refreshLiveSession()
 
@@ -399,9 +413,9 @@ extension AppModel {
         // reflects pause/resume/extend; a remote RESUME clears our pending
         // paused check-in; a remote PAUSE must NOT arm the local pause nag or
         // open the pause-reason sheet (the acting device owns those).
-        LiveActivityController.shared.update(sessionStartMs: inc.sessionStartMs,
+        LiveActivityController.shared.update(sessionStartMs: sessionStart,
                                              paused: inc.paused, estimateMin: inc.estimateMin)
-        if wasPaused, !inc.paused { PausedCheckinScheduler.cancel() }
+        if wasPaused, !inc.paused { cancelPausedCheckin() }
 
         if inc.paused != wasPaused {
             setSharedAttribution(inc.paused ? "\(by) paused" : "\(by) resumed",
@@ -711,6 +725,65 @@ extension AppModel {
             } else if let data = try? JSONEncoder().encode(newValue) {
                 UserDefaults.standard.set(data, forKey: Self.pendingSharedFocusKey)
             }
+        }
+    }
+
+    // MARK: parking across sign-out (the web's USER_LEDGER_KEYS rule)
+
+    /// Where a signed-out user's un-landed accruals wait for THEIR next sign-in.
+    nonisolated static func parkedSharedFocusKey(userId: String) -> String {
+        "unstuck.pendingSharedFocusLedger::\(userId)"
+    }
+
+    /// Move the pending queue into this user's parking slot (merged with
+    /// anything already parked there, deduped by sessionId) and clear it.
+    func parkPendingSharedFocusLedger(userId: String, defaults: UserDefaults = .standard) {
+        let queue = pendingSharedFocusLogs
+        guard !queue.isEmpty else { return }
+        Self.parkSharedFocusLedger(queue, userId: userId, in: defaults)
+        pendingSharedFocusLogs = []
+    }
+
+    /// Re-enqueue what this user parked (before anything already pending,
+    /// deduped by sessionId — a record that landed but lost its response is
+    /// a server-side no-op) and drop the parking slot.
+    func restoreParkedSharedFocusLedger(userId: String, defaults: UserDefaults = .standard) {
+        let merged = Self.restoreParkedSharedFocusLedger(userId: userId, current: pendingSharedFocusLogs, in: defaults)
+        if merged != pendingSharedFocusLogs { pendingSharedFocusLogs = merged }
+    }
+
+    nonisolated static func parkSharedFocusLedger(_ queue: [PendingSharedFocusLog], userId: String,
+                                                  in defaults: UserDefaults) {
+        let key = parkedSharedFocusKey(userId: userId)
+        var parked = defaults.data(forKey: key)
+            .flatMap { try? JSONDecoder().decode([PendingSharedFocusLog].self, from: $0) } ?? []
+        for rec in queue where !parked.contains(where: { $0.sessionId == rec.sessionId }) { parked.append(rec) }
+        if let data = try? JSONEncoder().encode(parked) { defaults.set(data, forKey: key) }
+    }
+
+    nonisolated static func restoreParkedSharedFocusLedger(userId: String, current: [PendingSharedFocusLog],
+                                                           in defaults: UserDefaults) -> [PendingSharedFocusLog] {
+        let key = parkedSharedFocusKey(userId: userId)
+        guard let data = defaults.data(forKey: key),
+              let parked = try? JSONDecoder().decode([PendingSharedFocusLog].self, from: data) else { return current }
+        defaults.removeObject(forKey: key)
+        var out = parked
+        for rec in current where !out.contains(where: { $0.sessionId == rec.sessionId }) { out.append(rec) }
+        return out
+    }
+
+    /// Sign-out's bounded drain: give the pending accruals up to `seconds`
+    /// to reach the server while the JWT is still valid; whatever remains is
+    /// parked by the caller. Never throws, never blocks past the bound.
+    func drainPendingSharedFocusLedgerBounded(seconds: Double) async {
+        guard !pendingSharedFocusLogs.isEmpty else { return }
+        drainPendingSharedFocusLedger()
+        guard let drain = sharedLedgerDrainTask else { return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await drain.value }
+            group.addTask { try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000)) }
+            _ = await group.next()   // whichever finishes first: drain or timeout
+            group.cancelAll()
         }
     }
 

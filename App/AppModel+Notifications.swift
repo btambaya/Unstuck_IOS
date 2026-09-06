@@ -185,6 +185,13 @@ extension AppModel {
             router.select(.lists)       // a shared collection
             return
         }
+        if link.hasPrefix("unstuck://call/") {
+            // "Unstuck is calling" — stamped by send-call on the APNs fallback
+            // alert (no VoIP token) and kept in the bell's Recent list. Used to
+            // fall through every prefix check and land on Today.
+            openCall(id: String(link.dropFirst("unstuck://call/".count)))
+            return
+        }
         // Assistant `open_screen` modal targets (AppModel+Routing.openScreen)
         // — router-presented sheets, so they take the dismiss-then-present
         // guard above like every other modal link.
@@ -209,6 +216,39 @@ extension AppModel {
             return
         }
         router.select(.today)           // unstuck://today, /recap, /brief
+    }
+
+    /// `unstuck://call/<call_requests.id>`: a call that is ringing / in
+    /// progress / buffered on the CallCoordinator resumes there (Talk
+    /// take-over); a request the server is ringing RIGHT NOW is handed to the
+    /// same fallback path a tap on the alert takes; a finished (or stale) call
+    /// opens the receipt where it lives — the anchored task's "Call me"
+    /// section — else the assistant (the conversation that books calls and
+    /// answers "what was that call about?"). Never a silent Today.
+    func openCall(id: String) {
+        guard !id.isEmpty else { router.select(.today); return }
+        if CallCoordinator.shared.resumeFromDeepLink(callId: id) { return }
+        guard let calls = coordinator?.calls else { router.select(.today); return }
+        Task {
+            let req = try? await calls.get(id: id)
+            routeResolvedCall(req)
+        }
+    }
+
+    /// The tail of `openCall` once the row is known (nil = not found / offline).
+    func routeResolvedCall(_ req: CallRequest?) {
+        if let req, req.status == "calling" {
+            // Still ringing on the server: take it now, like the alert's Answer.
+            let payload = IncomingCallPayload(callId: req.id, label: req.label, notes: req.notes,
+                                              taskId: req.taskId, blockId: req.blockId)
+            CallCoordinator.shared.handleFallbackTap(payload)
+            return
+        }
+        if let taskId = req?.taskId, let task = (try? taskRepo?.fetch(id: taskId)) ?? nil {
+            routeDeepLink("unstuck://task/\(task.id)")
+            return
+        }
+        if assistantEnabled { openAssistant() } else { router.select(.today) }
     }
 
     /// True when a link opens a modal (sheet/cover) — those collide with an
@@ -239,8 +279,11 @@ extension AppModel {
         case .resumeSession:
             resumeLiveSessionFromNotification()
         case .snoozeCheckin(let taskName):
-            // Snooze == re-arm the same ~14-min check (spec 10 §1.6).
-            PausedCheckinScheduler.schedule(taskName: taskName)
+            // Snooze == re-arm the same ~14-min check (spec 10 §1.6). The nag
+            // that was snoozed HAS fired — settle its budget slot first, then
+            // arm (and peek the cap for) the next one.
+            cancelPausedCheckin()
+            armPausedCheckin(taskName: taskName)
         case .endSession:
             await endLiveSessionFromNotification()
         }
@@ -303,7 +346,7 @@ extension AppModel {
     /// Focus screen (if later reopened) re-reads the store, so the session
     /// keeps counting true focus time.
     private func resumeLiveSessionFromNotification() {
-        PausedCheckinScheduler.cancel()
+        cancelPausedCheckin()   // the nag fired (that's what was tapped) → claims its slot
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.paused else { return }
         let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(resumed)
@@ -320,7 +363,7 @@ extension AppModel {
     /// channel may be down while backgrounded, in which case the partner
     /// converges via the ledger + stale-reap.
     private func endLiveSessionFromNotification() async {
-        PausedCheckinScheduler.cancel()
+        cancelPausedCheckin()
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.sessionStart != nil else { return }
         let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(nil)
