@@ -38,6 +38,61 @@ extension AppModel {
         armPausedCheckin(taskName: taskName)
     }
 
+    // MARK: - sign-out finalize (Android parity)
+
+    /// Finalize whatever focus session is live at sign-out — the account is
+    /// going away, so:
+    ///  • the pending paused check-in is dropped (no budget settlement — the
+    ///    JWT is on its way out);
+    ///  • an OWN session (no `sharedFocusLevel`) is finished the way the
+    ///    displaced-session path finishes one: Session row + totalFocused (or
+    ///    the exactly-once shared ledger for a partner-shared task), no recap,
+    ///    never marked done; the store is cleared and the cache refreshed
+    ///    (which also broadcasts `ended` on a partner channel);
+    ///  • a PARTNER/recipient session (`sharedFocusLevel` set) is not ours to
+    ///    finalize — it may still be running on the owner's side and the
+    ///    sync sign-out wipes the local row; only its Live Activity ends;
+    ///  • the Live Activity ALWAYS ends (also with no session — an orphan
+    ///    rebound on launch), so the previous account's task name never
+    ///    survives on the lock screen / Dynamic Island.
+    /// Returns the ledger accrual still to land (partner-shared own task) so
+    /// the caller can attempt it with the JWT (button) or queue it (reactive)
+    /// BEFORE the pending ledger is parked under this user. Idempotent.
+    @discardableResult
+    func finalizeLiveSessionForSignOut() -> PendingSharedFocusLog? {
+        PausedCheckinBudget.disarm()
+        defer { LiveActivityController.shared.end() }
+        guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.sessionStart != nil else { return nil }
+        guard cur.sharedFocusLevel == nil else { return nil }   // a recipient's session — not ours
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        let elapsed = FocusTimer.elapsedSec(cur, now: nowMs)
+        try? liveStore.set(nil)
+        refreshLiveSession()
+        let sessionId = cur.id ?? newUUID()
+        guard let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else {
+            // Row gone (deleted elsewhere mid-session): keep the minutes in
+            // insights under a generic name, as the notification-end path does.
+            saveSession(Session(id: sessionId, taskId: cur.taskId, taskName: "Focus session",
+                                estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+            return nil
+        }
+        saveSession(Session(id: sessionId, taskId: task.id, taskName: task.name,
+                            estimateMin: task.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+        if accruesViaSharedLedger(cur, taskId: task.id) {
+            // Partner-shared own task: the exactly-once ledger (same session id
+            // as the partner's finalize) — capped like every resurrected path.
+            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
+            guard capped > 0 else { return nil }
+            return PendingSharedFocusLog(sessionId: sessionId, taskId: task.id,
+                                         sec: capped, estimateMin: cur.sessionEstimateMin)
+        }
+        var bumped = task
+        bumped.totalFocused += elapsed
+        bumped.updatedAt = Self.isoNow()
+        saveTask(bumped)
+        return nil
+    }
+
     // MARK: - paused check-in: budget at FIRE time (web / Android parity)
 
     /// Arm the local ~14-min "did you step away?" nag and PEEK the shared daily

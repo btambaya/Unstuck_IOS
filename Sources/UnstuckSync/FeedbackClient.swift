@@ -51,4 +51,25 @@ public struct FeedbackClient: Sendable {
             return false
         }
     }
+
+    /// Page support about a just-inserted `report` / `bug` row: POST
+    /// `{SUPABASE_URL}/functions/v1/report-notify` with the user's JWT and
+    /// `{feedbackId}`. The function re-reads the row under the service role
+    /// (ownership-checked against auth.uid()) and emails support@ — nothing
+    /// sensitive travels from the client but the id. Fire-and-forget by
+    /// design: the feedback row is already durable; a failed notify is a
+    /// delivery gap for support, not a lost report, so the caller never
+    /// blocks on it or reports it as a send failure.
+    public func notifySupport(feedbackId: String) async -> Bool {
+        struct Body: Encodable { let feedbackId: String }
+        guard client.auth.currentSession != nil else { return false }
+        do {
+            try await client.functions.invoke(
+                "report-notify",
+                options: FunctionInvokeOptions(method: .post, body: Body(feedbackId: feedbackId)))
+            return true
+        } catch {
+            return false
+        }
+    }
 }

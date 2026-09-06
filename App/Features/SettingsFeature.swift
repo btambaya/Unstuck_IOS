@@ -326,6 +326,10 @@ private struct SettingTapRow: View {
     let label: String
     let value: String?
     var destructive = false
+    /// Locked out for now (the guided tour holds the screen): the row still
+    /// reads, but it can't be tapped and looks inert. Belt-and-braces behind
+    /// the tour's hit-test lockdown — see AppModel.tourRunning.
+    var locked = false
     var onTap: (() -> Void)?
 
     var body: some View {
@@ -347,7 +351,8 @@ private struct SettingTapRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(onTap == nil)
+        .disabled(onTap == nil || locked)
+        .opacity(locked ? 0.45 : 1)
     }
 }
 
@@ -527,14 +532,22 @@ private struct AccountSettingsView: View {
                 SettingTapRow(label: model.hasPassword ? "Change password" : "Add a password",
                               value: "Update your sign-in password") { showPassword = true }
                 CardDivider()
-                SettingTapRow(label: "Export everything", value: "A full JSON snapshot of your data.") {
+                // The account-danger rows are LOCKED while the guided tour is
+                // running (round 4): the tour's hit-test lockdown already
+                // scopes the settings exemption to the pushed section, and
+                // this is the belt-and-braces the contract asks for — a
+                // sign-out / delete / export mid-tour used to leave the
+                // running lockdown live over AuthView.
+                SettingTapRow(label: "Export everything", value: "A full JSON snapshot of your data.",
+                              locked: model.tourRunning) {
                     exportURL = model.makeExportFile()
                 }
                 CardDivider()
                 // Guided product tour — resume an UNFINISHED run at its saved
                 // step; a finished or fresh tour RESTARTS at the welcome card
                 // (the web's Settings → Account → Product tour semantics).
-                SettingTapRow(label: "Product tour", value: "Replay the guided walkthrough") {
+                SettingTapRow(label: "Product tour", value: "Replay the guided walkthrough",
+                              locked: model.tourRunning) {
                     model.tour.openExplicit()
                 }
                 CardDivider()
@@ -545,9 +558,10 @@ private struct AccountSettingsView: View {
                 }
                 CardDivider()
                 SettingTapRow(label: "Delete my account", value: "Permanently removes your data",
-                              destructive: true) { showDelete = true }
+                              destructive: true, locked: model.tourRunning) { showDelete = true }
                 CardDivider()
-                SettingTapRow(label: "Sign out", value: "End this session", destructive: true) {
+                SettingTapRow(label: "Sign out", value: "End this session",
+                              destructive: true, locked: model.tourRunning) {
                     model.signOut(); dismiss()
                 }
             }

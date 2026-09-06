@@ -164,6 +164,16 @@ final class TourModel {
         // uikitPresentationActive) — never the raw unobservable property.
         ctx.presentationActive = app.router.hasActivePresentation || uikitPresentationActive
         ctx.surfaceExempt = currentStep.surfaceInteractive
+        // Round 4: the settings exemption is scoped to the PUSHED section —
+        // resolved live from the app window's navigation stack at hit-test
+        // time (the section pops back to the root the moment the user taps
+        // Back, and the rect must follow instantly, not on a poll tick). Nil
+        // while nothing is pushed → the rule fails closed to panel-only, so
+        // the root list (Sign out / Delete account / Export) is never reachable.
+        ctx.surfaceScoped = currentStep.surfaceScoped
+        if ctx.surfaceScoped && ctx.presentationActive {
+            ctx.surfaceRect = Self.pushedSettingsSectionRect(in: TourWindowHandle.shared.appWindow)
+        }
         return tourClaims(point: point, ctx: ctx)
     }
 
@@ -187,7 +197,6 @@ final class TourModel {
     /// Read persisted state once (first render of the overlay root).
     func bootIfNeeded() {
         guard phase == .boot else { return }
-        startPresentationWatch()
         let s = store.load()
         if let m = s.mode { mode = m }
         if let mm = s.mediaMode { mediaMode = mm }
@@ -195,9 +204,9 @@ final class TourModel {
         if let i = s.index { index = i }
         chipEligible = tourChipEligible(s)
         switch tourInitialPhase(s) {
-        case .hidden: phase = .dismissed
-        case .paused: phase = .paused
-        case .welcome: phase = .welcome
+        case .hidden: setPhase(.dismissed)
+        case .paused: setPhase(.paused)
+        case .welcome: setPhase(.welcome)
         }
     }
 
@@ -213,12 +222,12 @@ final class TourModel {
             index = min(saved, steps.count - 1)
             store.save { $0.paused = false; $0.done = false }
             chipEligible = false
-            phase = .running
+            setPhase(.running)
             applyCurrentStep()
             startPolling()
         case .welcome:
             goHome()
-            phase = .welcome
+            setPhase(.welcome)
         }
     }
 
@@ -236,7 +245,7 @@ final class TourModel {
         }
         chipEligible = false
         explicitOpen = false
-        phase = .running
+        setPhase(.running)
         applyCurrentStep()
         startPolling()
     }
@@ -246,7 +255,7 @@ final class TourModel {
         store.save { $0.done = true; $0.started = true }
         chipEligible = false
         explicitOpen = false
-        phase = .done
+        setPhase(.done)
         app.openAssistant()
     }
 
@@ -255,7 +264,7 @@ final class TourModel {
         store.save { $0.done = true; $0.started = true }
         chipEligible = false
         explicitOpen = false
-        phase = .done
+        setPhase(.done)
     }
 
     // MARK: paused card + resume chip
@@ -264,7 +273,7 @@ final class TourModel {
         store.save { $0.paused = false }
         chipEligible = false
         explicitOpen = false
-        phase = .running
+        setPhase(.running)
         applyCurrentStep()
         startPolling()
     }
@@ -274,7 +283,7 @@ final class TourModel {
         store.save { $0.index = 0; $0.paused = false }
         chipEligible = false
         explicitOpen = false
-        phase = .running
+        setPhase(.running)
         applyCurrentStep()
         startPolling()
     }
@@ -283,7 +292,7 @@ final class TourModel {
         store.save { $0.done = true; $0.paused = false }
         chipEligible = false
         explicitOpen = false
-        phase = .done
+        setPhase(.done)
     }
 
     /// The floating chip resumes the run exactly where it paused.
@@ -317,7 +326,7 @@ final class TourModel {
         if index >= steps.count - 1 {
             store.save { $0.done = true; $0.paused = false }
             chipEligible = false
-            phase = .done
+            setPhase(.done)
             teardownRunning()
             return
         }
@@ -353,7 +362,7 @@ final class TourModel {
         confirmingPause = false
         let saved = store.save { [index, mode] in $0.paused = true; $0.index = index; $0.mode = mode }
         chipEligible = tourChipEligible(saved)
-        phase = .dismissed
+        setPhase(.dismissed)
         teardownRunning()
     }
 
@@ -362,7 +371,7 @@ final class TourModel {
         guard phase == .running else { return }
         store.save { $0.done = true; $0.paused = false }
         chipEligible = false
-        phase = .done
+        setPhase(.done)
         teardownRunning()
     }
 
@@ -511,12 +520,70 @@ final class TourModel {
         app.router.dismissTourPresentations()
     }
 
+    /// Sign-out (AppModel.scrubDeviceLocalUserContent / signOut): stop
+    /// everything this run owns — the target + presentation polls, audio, a
+    /// pending step presentation, the key-window grab, the VoiceOver lock —
+    /// and leave the app fully passable. The persisted state is wiped by the
+    /// caller (TourStore.clear) and the model itself is dropped (`_tour = nil`),
+    /// so the next account boots a fresh tour. Idempotent; never touches the
+    /// store (a paused run of the signed-out account is gone by design —
+    /// Android clears TourStateStore the same way).
+    func teardownForSignOut() {
+        pollTask?.cancel(); pollTask = nil
+        navTask?.cancel(); navTask = nil
+        presentationWatchTask?.cancel(); presentationWatchTask = nil
+        audio.stop()
+        targetRect = nil
+        explicitOpen = false
+        chipEligible = false
+        confirmingPause = false
+        if askFieldFocused { TourWindowHandle.shared.restoreAppKey() }
+        askFieldFocused = false
+        phase = .done
+        TourWindowHandle.shared.setAccessibilityLock(false)
+    }
+
+    /// The ONE phase setter: every transition also (re)decides whether the
+    /// UIKit-presentation watch must run and whether VoiceOver is locked to
+    /// the tour window. Keeping both here means no entry/exit path can leave
+    /// a poll or the lock behind.
+    private func setPhase(_ next: Phase) {
+        phase = next
+        syncPresentationWatch()
+    }
+
+    /// The presentation watch is only meaningful while the tour is on screen
+    /// or about to be (welcome / paused card gating, the running claim). It
+    /// used to start on the first overlay render and run for the life of the
+    /// process — for EVERY user, including those whose tour finished long
+    /// ago — waking the main actor 4×/s and polling a stale window after
+    /// sign-out. Now it runs exactly while it matters and is cancelled
+    /// everywhere else (done / dismissed / boot).
+    private func syncPresentationWatch() {
+        switch phase {
+        case .welcome, .paused, .running:
+            if presentationWatchTask == nil { startPresentationWatch() }
+        case .boot, .dismissed, .done:
+            presentationWatchTask?.cancel()
+            presentationWatchTask = nil
+        }
+    }
+
+    /// VoiceOver must not reach the app content under the scrim while the
+    /// tour owns the screen (round-4 a11y): the tour window is marked modal
+    /// (VoiceOver ignores its sibling windows) AND the app window's elements
+    /// are hidden — belt and braces, since a UIKit-presented sheet in the app
+    /// window is otherwise still traversable. Held while running or while a
+    /// card is actually on screen; released the moment neither is true (the
+    /// paused chip leaves the app fully usable).
+    var accessibilityLockHeld: Bool { phase == .running || cardVisible }
+
     /// Poll the app window's UIKit presentation state into observable model
-    /// state for the model's lifetime (250ms, matching the target poll). The
+    /// state while the tour is live (250ms, matching the target poll). The
     /// property itself is unobservable, and BOTH the card render and the
     /// hit-test claim depend on it — polling one shared value is what keeps
     /// "claims ⊆ rendered" true when an alert appears or dismisses without
-    /// any SwiftUI-visible state change.
+    /// any SwiftUI-visible state change. Lifecycle: syncPresentationWatch.
     private func startPresentationWatch() {
         presentationWatchTask?.cancel()
         presentationWatchTask = Task { [weak self] in
@@ -528,6 +595,44 @@ final class TourModel {
                 try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
+    }
+
+    /// The pushed settings section's content rect (screen coordinates) for the
+    /// scoped settings exemption — nil when the Settings sheet isn't up, when
+    /// its navigation stack is still at the ROOT (the list with Sign out /
+    /// Delete account / Export), or when the UIKit stack can't be read (the
+    /// claim then fails closed to panel-only). The navigation bar is cut off
+    /// the top (Back stays claimed) and the leading edge is claimed so the
+    /// interactive-pop gesture can't reach the root either.
+    private static func pushedSettingsSectionRect(in window: UIWindow?) -> CGRect? {
+        guard let presented = window?.rootViewController?.presentedViewController,
+              let nav = firstNavigationController(in: presented),
+              nav.viewControllers.count > 1,
+              let content = nav.topViewController?.view, let contentWindow = content.window
+        else { return nil }
+        var rect = contentWindow.convert(content.convert(content.bounds, to: nil),
+                                         to: contentWindow.screen.coordinateSpace)
+        let bar = nav.navigationBar
+        if let barWindow = bar.window, !bar.isHidden {
+            let barRect = barWindow.convert(bar.convert(bar.bounds, to: nil), to: barWindow.screen.coordinateSpace)
+            if barRect.maxY > rect.minY {
+                let cut = barRect.maxY - rect.minY
+                rect.origin.y += cut
+                rect.size.height -= cut
+            }
+        }
+        let popEdge: CGFloat = 24
+        rect.origin.x += popEdge
+        rect.size.width -= popEdge
+        return rect.width > 0 && rect.height > 0 ? rect : nil
+    }
+
+    private static func firstNavigationController(in vc: UIViewController) -> UINavigationController? {
+        if let nav = vc as? UINavigationController { return nav }
+        for child in vc.children {
+            if let nav = firstNavigationController(in: child) { return nav }
+        }
+        return nil
     }
 
     private func startPolling() {
@@ -580,7 +685,14 @@ struct TourRootView: View {
                 EmptyView()
             }
         }
+        // One traversal group for VoiceOver: the tour's controls are read as
+        // a unit, and while the lock is held nothing under the scrim (the app
+        // window) is reachable — TourWindowHandle.setAccessibilityLock.
+        .accessibilityElement(children: .contain)
         .task { tour.bootIfNeeded() }
+        .onChange(of: tour.accessibilityLockHeld, initial: true) { _, held in
+            TourWindowHandle.shared.setAccessibilityLock(held)
+        }
     }
 
     private func runningLayer(_ tour: TourModel) -> some View {
@@ -974,6 +1086,35 @@ final class TourWindowHandle {
     var claimsPoint: ((CGPoint) -> Bool)?
     func makeTourKey() { tourWindow?.makeKey() }
     func restoreAppKey() { appWindow?.makeKey() }
+
+    /// Round-4 a11y: while the tour owns the screen, VoiceOver must not reach
+    /// the app content under the scrim. The tour window becomes MODAL for
+    /// accessibility (its sibling windows are ignored) and the app window's
+    /// elements are hidden outright (a UIKit-presented sheet in the app
+    /// window would otherwise stay traversable). Idempotent; a screen-change
+    /// notification moves the cursor onto the tour when the lock engages.
+    private(set) var accessibilityLockHeld = false
+    func setAccessibilityLock(_ held: Bool) {
+        guard held != accessibilityLockHeld else { return }
+        accessibilityLockHeld = held
+        tourWindow?.accessibilityViewIsModal = held
+        appWindow?.accessibilityElementsHidden = held
+        UIAccessibility.post(notification: .screenChanged, argument: nil)
+    }
+
+    /// The overlay window is going away (the signed-in scaffold unmounted):
+    /// drop every handle that pointed into it and release the app window's
+    /// accessibility lock so nothing stays hidden for the next screen.
+    func detach(window: UIWindow) {
+        guard tourWindow === window else { return }
+        setAccessibilityLock(false)
+        claimsPoint = nil
+        tourWindow = nil
+        appWindow = nil
+        panelAnchorView = nil
+        chipAnchorView = nil
+        cardAnchorView = nil
+    }
 }
 
 /// Invisible UIKit reader that registers itself into a TourWindowHandle slot
@@ -1099,5 +1240,18 @@ struct TourWindowMounter: UIViewRepresentable {
         default: .unspecified
         }
         context.coordinator.window?.overrideUserInterfaceStyle = style
+    }
+
+    /// The signed-in scaffold unmounted (sign-out): hide + release the
+    /// overlay window. A visible UIWindow is retained by its scene, so
+    /// without this every sign-out/sign-in cycle stacked another always-on-
+    /// top tour window (each still rendering a TourRootView against the
+    /// model) and the previous account's lock could linger over AuthView.
+    static func dismantleUIView(_ uiView: MounterView, coordinator: Coordinator) {
+        guard let win = coordinator.window else { return }
+        TourWindowHandle.shared.detach(window: win)
+        win.isHidden = true
+        win.rootViewController = nil
+        coordinator.window = nil
     }
 }

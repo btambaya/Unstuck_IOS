@@ -756,6 +756,13 @@ final class AppModel {
                 self.reconcileAccountOnboardingIfNeeded()
                 self.pullServerPreferencesIfNeeded()
                 self.pushTimezoneIfNeeded()
+                // Hands-free ops whose target wasn't in the local store before
+                // this hydrate (a widget "Done" on a task pulled just now) are
+                // retried the moment the store is faithful, then flushed.
+                if self.drainSiriWriteQueue() {
+                    self.refreshWidgetSnapshot()
+                    self.syncNow()
+                }
             }
         }
         // Google calendar health → UI ("Reconnect Google" when a refresh token
@@ -929,7 +936,11 @@ final class AppModel {
         let pending = nonTemplates.filter { !$0.done && !($0.later ?? false) && !excludeIds.contains($0.id) }
         let overdue = visibleTasks(view: .backlog, tasks: tasks, blocks: blocks,
                                    now: now, activeArea: nil, slipMode: true).filter { !$0.done }
-        let taskRefs = pending.prefix(50).map {
+        // Relevance BEFORE the cap (today → due soonest → most recently
+        // touched): the cap decides which tasks Siri can resolve at all, and
+        // created-at order made the NEWEST tasks — the ones a user names —
+        // unresolvable past 50 open tasks.
+        let taskRefs = siriTaskOrder(pending, todayIds: todayIds).prefix(50).map {
             UnstuckSnapshot.TaskRef(id: $0.id, name: $0.name, today: todayIds.contains($0.id))
         }
         let colRefs = collections.filter { $0.archived != true }.map {
@@ -1244,6 +1255,22 @@ final class AppModel {
             // bounded shot at the server WHILE the JWT is still valid. Whatever
             // still can't land is PARKED under this user and replayed on their
             // next sign-in here — never discarded (the web's USER_LEDGER_KEYS).
+            //
+            // A running focus session is finalized FIRST (Android parity): its
+            // Session row + focus time are this user's — the sync sign-out's
+            // clearAll would otherwise drop the live_session row and the
+            // minutes with it — and its Live Activity ends now, so the lock
+            // screen / Dynamic Island never keep counting under a task name
+            // after the account is gone. A ledger accrual (partner-shared
+            // task) is attempted while the JWT is still valid; a failure lands
+            // in the pending ledger, which the park below carries over.
+            // Also stops the guided tour so its lockdown never survives into
+            // AuthView / the next account (the store itself is wiped by the scrub).
+            _tour?.teardownForSignOut()
+            if let accrual = finalizeLiveSessionForSignOut() {
+                await logSharedFocusDurable(taskId: accrual.taskId, actualSec: accrual.sec,
+                                            estimateMin: accrual.estimateMin, sessionId: accrual.sessionId)
+            }
             _ = drainSiriWriteQueue()
             await drainPendingSharedFocusLedgerBounded(seconds: 5)
             if let uid { parkPendingSharedFocusLedger(userId: uid) }
@@ -1253,6 +1280,12 @@ final class AppModel {
         }
     }
 
+    /// The guided tour is mid-run (its lockdown owns the screen). Settings
+    /// reads this to keep the account danger rows (Sign out / Delete account /
+    /// Export) disabled while the tour runs — a sign-out mid-tour used to leave
+    /// the running lockdown live over AuthView.
+    var tourRunning: Bool { _tour?.phase == .running }
+
     /// Wipe device-local personal content (notification log + per-task reminder
     /// overrides, the pending paused check-in, the Inbox archive set, the
     /// assistant chat) so the next account on this device starts clean and never
@@ -1261,6 +1294,23 @@ final class AppModel {
     /// (server revocation, refresh failure, password-change-elsewhere), since
     /// those never route through the button.
     func scrubDeviceLocalUserContent() {
+        // A live focus session still in the store (the REACTIVE path — the
+        // Sign-out button finalized before reaching here, so this is a no-op
+        // there): finalize the own session + end its Live Activity. The JWT is
+        // already gone on this path, so a ledger accrual goes straight into the
+        // pending ledger — parked under this user at the tail of this scrub.
+        if let accrual = finalizeLiveSessionForSignOut() {
+            var queue = pendingSharedFocusLogs.filter { $0.sessionId != accrual.sessionId }
+            queue.append(accrual)
+            pendingSharedFocusLogs = queue
+        }
+        // The guided tour: stop a running/offered tour (lockdown, audio,
+        // polls, the accessibility lock) and forget its state, so the next
+        // account gets its own one-time welcome instead of A's resume card,
+        // and a sign-out mid-tour never leaves the lockdown over AuthView.
+        _tour?.teardownForSignOut()
+        _tour = nil
+        TourStore.clear()
         NotificationLog.shared.clear()
         NotificationPrefs.clearUserContent()   // per-task overrides + the cached level / lead
         PausedCheckinBudget.disarm()           // no budget settlement — the JWT is going away

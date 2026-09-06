@@ -55,13 +55,22 @@ extension AppModel {
         routeDeepLink(route)
     }
 
-    /// Apply any hands-free writes a Siri intent queued while the app was closed
-    /// (create task / complete / add-to-list / capture). Runs through the SAME
-    /// validated mutators the UI uses — addTask/toggleDone/addCollectionItem/
-    /// saveCapture — so each op flows into the normal outbox (no duplicated row
-    /// logic). Called on launch / scenePhase=.active / background-entry /
-    /// BG-refresh. Every op is marked processed (best-effort: a vanished target
-    /// is dropped, never retried forever). Returns true if anything was applied.
+    /// Apply any hands-free writes a Siri intent / the widget queued while the
+    /// app was closed (create task / complete / add-to-list / capture). Runs
+    /// through the SAME validated mutators the UI uses — addTask / toggleDone /
+    /// setOccurrenceDone / addCollectionItem / saveCapture — so each op flows
+    /// into the normal outbox (no duplicated row logic). Called on launch /
+    /// scenePhase=.active / background-entry / BG-refresh / after the first
+    /// hydrate of a sign-in.
+    ///
+    /// Targeted ops (complete / add-to-list) resolve against the local store:
+    /// a completion id is looked up in the raw task rows AND the projected
+    /// recurring occurrences (the widget's Start-Next tile carries an
+    /// occurrence's cal_block id whenever a recurring task is scheduled today —
+    /// a raw-row-only lookup silently dropped those, while the tile had already
+    /// advanced). A target that can't be found is dropped ONLY once the store
+    /// is hydrated for this sign-in; before that the op stays queued for the
+    /// next drain (`handsFreeWriteMayDrop`). Returns true if anything was applied.
     @discardableResult
     func drainSiriWriteQueue() -> Bool {
         // Need an authed writer: a queue drained while signed OUT (the writer
@@ -71,33 +80,56 @@ extension AppModel {
         let ops = AppGroup.readWriteQueue()
         guard !ops.isEmpty else { return false }
         let tasks = (try? taskRepo?.all()) ?? []
+        let blocks = (try? db?.fetchAllCalBlocks()) ?? []
         let collections = (try? db?.fetchAllCollections()) ?? []
+        // "Hydrated" = the first full hydrate pass of this sign-in has run
+        // (profile facts are the LAST table in that pass; the flag also flips
+        // on an offline failure, so an offline relaunch — whose local rows
+        // are already this account's — never strands the queue).
+        let hydrated = profileFactsHydrated
         var processed = Set<String>()
+        var applied = false
         for op in ops {
+            var targetFound = true
             switch op.kind {
             case .createTask:
                 if let name = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
                     addTask(name: name, estimateMin: op.estimateMin ?? 25)
+                    applied = true
                 }
             case .completeTask:
-                if let tid = op.taskId, let t = tasks.first(where: { $0.id == tid }), !t.done {
-                    toggleDone(t)
+                switch op.taskId.flatMap({ resolveHandsFreeCompletion(id: $0, tasks: tasks, blocks: blocks) }) {
+                case .task(let t):
+                    if !t.done { toggleDone(t); applied = true }
+                case .occurrence(let block):
+                    if !block.done { setOccurrenceDone(block, done: true); applied = true }
+                case nil:
+                    targetFound = false
                 }
             case .addToList:
                 if let cid = op.collectionId,
-                   let body = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty,
-                   let col = collections.first(where: { $0.id == cid }) {
-                    addCollectionItem(col, body: body)
+                   let body = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty {
+                    if let col = collections.first(where: { $0.id == cid }) {
+                        addCollectionItem(col, body: body)
+                        applied = true
+                    } else {
+                        targetFound = false
+                    }
                 }
             case .capture:
                 if let body = op.text?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty {
                     saveCapture(Capture(id: newUUID(), tag: .idea, body: body, at: Self.isoNow()))
+                    applied = true
                 }
             }
-            processed.insert(op.id)
+            // An unresolved target before the first hydrate is "not pulled
+            // yet", not "gone" — leave the op queued for the next drain.
+            if handsFreeWriteMayDrop(targetFound: targetFound, storeHydrated: hydrated) {
+                processed.insert(op.id)
+            }
         }
         AppGroup.removeWrites(ids: processed)
-        return !processed.isEmpty
+        return applied
     }
 
     /// Route an `unstuck://` link (push tap, notification-center row, or

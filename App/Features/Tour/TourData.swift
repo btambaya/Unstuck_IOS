@@ -62,6 +62,14 @@ struct TourStore: @unchecked Sendable {
         }
         return next
     }
+
+    /// Forget the run entirely (sign-out): the tour is per account — the
+    /// next person on this device must get their own one-time welcome, never
+    /// the previous account's resume card / step index (Android clears
+    /// TourStateStore at sign-out; the web key is in SYNCED_LOCAL_KEYS).
+    func clear() { defaults.removeObject(forKey: Self.key) }
+
+    static func clear(defaults: UserDefaults = .standard) { TourStore(defaults: defaults).clear() }
 }
 
 // MARK: - step data
@@ -133,6 +141,15 @@ struct TourStep: Identifiable, Sendable {
     /// exemption. Web (inert <main>) and Android (settings-scoped) already
     /// lock these.
     var surfaceInteractive: Bool { cutoutInteractive || opensAssistant || view == .settings }
+
+    /// Round 4: the settings exemption is SCOPED to the section the step
+    /// pushed (Notifications / Interface) — never the whole Settings sheet.
+    /// With the blanket sheet exemption a tester could tap Back to the root
+    /// and hit Sign out / Delete account / Export mid-tour (sign-out left the
+    /// running lockdown live over AuthView). Only points inside the pushed
+    /// section's content pass through; the nav bar, the root list and the
+    /// pop-gesture edge stay claimed (tourClaims: `surfaceRect` / `surfaceScoped`).
+    var surfaceScoped: Bool { view == .settings }
 }
 
 /// The step script — copy ported VERBATIM from web tour-data.ts.
@@ -467,6 +484,16 @@ struct TourClaimContext: Equatable, Sendable {
     /// presented sheet is display-only and the tour swallows it (round 3 —
     /// the task-detail sheet was fully editable mid-tour).
     var surfaceExempt = false
+    /// Round 4: the exemption is SCOPED (settings steps — TourStep.surfaceScoped):
+    /// only points inside `surfaceRect` pass through; everything else on the
+    /// presented sheet (nav bar Back, the root list with Sign out / Delete
+    /// account / Export, the pop-gesture edge) is claimed. A scoped step with
+    /// NO resolved rect (section not pushed yet / popped back to the root /
+    /// the UIKit stack couldn't be read) fails CLOSED: panel-only.
+    var surfaceScoped = false
+    /// The permitted region of the presented surface, screen coordinates
+    /// (the pushed settings section's content, below the navigation bar).
+    var surfaceRect: CGRect? = nil
 }
 
 /// Which screen points the tour overlay window OWNS (handles or swallows) vs.
@@ -488,14 +515,23 @@ struct TourClaimContext: Equatable, Sendable {
 ///    the sheet IS the step). On every other step (task detail, inbox,
 ///    insights) the presented sheet is display-only: claimed and swallowed
 ///    (round 3 — the task-detail sheet was live and real edits got through);
-///  • no-target steps claim everything except the panel.
+///  • no-target steps claim everything except the panel;
+///  • (round 4) a SCOPED exemption (settings steps) passes through ONLY the
+///    pushed section's content (`surfaceRect`) — the sheet's nav bar / root
+///    list (Sign out, Delete account, Export) stay claimed — and fails closed
+///    (panel-only) while that region is unknown.
 func tourClaims(point: CGPoint, ctx: TourClaimContext) -> Bool {
     if ctx.cardVisible { return true }
     if ctx.chipVisible { return ctx.chipFrame.insetBy(dx: -8, dy: -8).contains(point) }
     guard ctx.running else { return false }
     if ctx.panelFrame.insetBy(dx: -8, dy: -8).contains(point) { return true }
     if ctx.demoStep { return true }
-    if ctx.presentationActive { return !ctx.surfaceExempt }
+    if ctx.presentationActive {
+        guard ctx.surfaceExempt else { return true }
+        guard ctx.surfaceScoped else { return false }
+        guard let r = ctx.surfaceRect, r.width > 0, r.height > 0 else { return true }
+        return !r.contains(point)
+    }
     if ctx.cutoutInteractive,
        let t = ctx.targetRect, t.width > 0, t.height > 0,
        t.insetBy(dx: -tourClaimRingPad, dy: -tourClaimRingPad).contains(point) {

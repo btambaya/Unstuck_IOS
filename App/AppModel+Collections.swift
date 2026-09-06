@@ -304,12 +304,7 @@ extension AppModel {
         // A recurring OCCURRENCE's id is its cal_block id — complete the BLOCK,
         // never the template (which would end the whole series). Mirrors Android.
         if let occ = occurrenceBlockForId(task.id) {
-            var next = occ
-            let nextDone = !occ.done
-            next.done = nextDone
-            next.skipped = false
-            next.completedAt = nextDone ? Self.isoNow() : nil
-            saveBlock(next)
+            setOccurrenceDone(occ, done: !occ.done)
             return
         }
         var flipped = task
@@ -324,6 +319,18 @@ extension AppModel {
             let action: CollectionShareClient.TaskDoneAction = flipped.done ? .done : .reopen
             Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by, action: action) }
         }
+    }
+
+    /// Mark ONE day of a recurring series done / not done: the occurrence's
+    /// cal_block flips (un-skipped, completion-stamped), the template is never
+    /// touched. Shared by the list toggle and the hands-free drain (widget /
+    /// Siri "Done" on an occurrence id).
+    func setOccurrenceDone(_ block: CalBlock, done: Bool) {
+        var next = block
+        next.done = done
+        next.skipped = false
+        next.completedAt = done ? Self.isoNow() : nil
+        saveBlock(next)
     }
 
     /// Resolve a list-row id to the recurring OCCURRENCE cal_block behind it
@@ -705,12 +712,22 @@ extension AppModel {
 
     /// One-way beta feedback with auto-attached context. False on failure
     /// (offline / not configured) so the composer can offer a retry.
+    /// A `report` / `bug` row additionally pages support through the
+    /// `report-notify` edge function (fire-and-forget, AFTER the row is
+    /// durable) so an abuse report is actioned rather than waiting to be
+    /// noticed in the dashboard. The email is server-derived from auth.users
+    /// (migration 057's insert trigger) — the client value is triage context only.
     func sendFeedback(body: String, category: String?, screen: String?) async -> Bool {
         guard let fb = coordinator?.feedback else { return false }
         let device = "\(Self.deviceModelName) · iOS \(UIDevice.current.systemVersion)"
-        return await fb.submit(id: newUUID(), body: body.trimmingCharacters(in: .whitespacesAndNewlines),
-                               category: category, email: currentEmail,
-                               appVersion: Self.appVersion, platform: "ios", device: device, screen: screen)
+        let id = newUUID()
+        let ok = await fb.submit(id: id, body: body.trimmingCharacters(in: .whitespacesAndNewlines),
+                                 category: category, email: currentEmail,
+                                 appVersion: Self.appVersion, platform: "ios", device: device, screen: screen)
+        if ok, feedbackNotifiesSupport(category: category) {
+            Task { _ = await fb.notifySupport(feedbackId: id) }
+        }
+        return ok
     }
 
     // MARK: - Safety (App Store Guideline 1.2 — user-generated/shared content)
