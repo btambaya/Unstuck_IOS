@@ -26,6 +26,64 @@ final class AssistantThreadTests: XCTestCase {
     private func local(_ text: String) -> AssistantTurn {
         AssistantTurn(ChatMessage(role: "assistant", content: text), at: 3, local: true)
     }
+    /// The hidden guard bounce — the display filter keys on `hidden`, not on
+    /// the text (the real string is MainActor-bound on AssistantHarness).
+    private static let corrective = "(integrity check from the app — not the user. …)"
+    /// A model round that asked for a tool — its text is narration, not a reply.
+    private func narration(_ text: String?, tool name: String = "get_lists") -> AssistantTurn {
+        AssistantTurn(ChatMessage(role: "assistant", content: text,
+                                  toolCalls: [ToolCall(id: "c1", type: "function", function: ToolFunction(name: name, arguments: "{}"))]), at: 2)
+    }
+
+    // MARK: display filter (lib/assistant/display.ts parity)
+
+    func testATurnWithTwoToolRoundsAndAFinalReplyRendersOneAssistantBubble() {
+        // The tester's screenshot (2026-09-06): four assistant bubbles for one
+        // question — each round's "I'll get… / Let me try…" narration.
+        let turns = [
+            user("I would like to review what I have in my collections"),
+            narration("I'll get your current collections (lists) for you."),
+            tool("error: unknown tool \"get_collections\" — available: …"),
+            narration("Let me try the correct tool:"),
+            tool("ok: 2 lists:\n- \"ToDo\" [id=l1] — 3 open"),
+            assistant("Two lists: ToDo and Shopping."),
+        ]
+        XCTAssertEqual(AssistantModel.displayTurns(turns).map(\.text),
+                       ["I would like to review what I have in my collections", "Two lists: ToDo and Shopping."])
+        // The persisted thread is untouched — the model still sees its narration.
+        XCTAssertEqual(AssistantModel.modelWindow(turns).count, 6)
+    }
+
+    func testDisplayKeepsLocalLinesAndDropsHiddenBouncesEmptyAndToolTurns() {
+        let turns = [
+            user("hi"),
+            local("Morning, Maya. 3 things on today."),
+            AssistantTurn(ChatMessage(role: "assistant", content: "Added it."), hidden: true),
+            AssistantTurn(ChatMessage(role: "user", content: Self.corrective), hidden: true),
+            narration(nil, tool: "create_task"),
+            tool("ok: created task id=t1 name=\"x\""),
+            assistant("   "),
+            assistant("Created \"x\"."),
+        ]
+        XCTAssertEqual(AssistantModel.displayTurns(turns).map(\.text), ["hi", "Morning, Maya. 3 things on today.", "Created \"x\"."])
+    }
+
+    func testWorkingStatusIsTheLatestNarrationOfTheInFlightTurnOnly() {
+        XCTAssertNil(AssistantModel.workingStatus([user("q")]), "nothing landed yet → Thinking…")
+        let mid = [user("q"), narration("I'll get your lists.\nThen summarise."), tool("ok")]
+        XCTAssertEqual(AssistantModel.workingStatus(mid), "I'll get your lists.")
+        let later = mid + [narration("Let me try the correct tool:"), tool("error: …")]
+        XCTAssertEqual(AssistantModel.workingStatus(later), "Let me try the correct tool:")
+        // A previous turn's narration never leaks into a new turn.
+        XCTAssertNil(AssistantModel.workingStatus(later + [assistant("done"), user("next")]))
+        // A hidden bounce does not end the turn; an empty narration falls through.
+        let bounced = mid + [AssistantTurn(ChatMessage(role: "assistant", content: "I added it"), hidden: true),
+                             AssistantTurn(ChatMessage(role: "user", content: Self.corrective), hidden: true)]
+        XCTAssertEqual(AssistantModel.workingStatus(bounced), "I'll get your lists.")
+        XCTAssertEqual(AssistantModel.workingStatus(bounced + [narration(nil, tool: "create_task"), tool("ok")]), "I'll get your lists.")
+        XCTAssertEqual(AssistantModel.oneLine(String(repeating: "x", count: 100)), String(repeating: "x", count: 79) + "…")
+        XCTAssertNil(AssistantModel.oneLine("  \n "))
+    }
 
     // MARK: model window
 

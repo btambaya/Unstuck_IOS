@@ -68,6 +68,9 @@ struct AssistantTurn: Codable, Equatable, Identifiable {
     var isLocal: Bool { local == true }
     var isHidden: Bool { hidden == true }
     var isPending: Bool { pending == true }
+    /// A model round that asked for tools — its text is narration of the next
+    /// step, never a reply (see `AssistantModel.displayTurns`).
+    var hasToolCalls: Bool { !(message.toolCalls ?? []).isEmpty }
     /// The undoable receipts still on offer for this turn.
     var undoableReceipts: [Receipt] { (receipts ?? []).filter(\.isUndoable) }
 }
@@ -280,17 +283,57 @@ final class AssistantModel {
         UserDefaults.standard.removeObject(forKey: checkinKey)
     }
 
-    /// The visible transcript: user + assistant text bubbles (tool steps,
-    /// hidden guard bounces and empty tool-call turns are hidden), followed by
-    /// the queued sends as faded pending bubbles. Mirrors the web's `messages`
-    /// + `queued`.
+    /// The visible transcript: user bubbles + each turn's FINAL reply (with
+    /// its receipts) + local lines, followed by the queued sends as faded
+    /// pending bubbles. Mirrors the web's `messages` + `queued`.
     var transcript: [AssistantTurn] {
-        let shown = turns.filter { ($0.role == "user" || $0.role == "assistant") && !$0.isHidden && !$0.text.isEmpty }
+        let shown = Self.displayTurns(turns)
         let pending = queued.map { AssistantTurn(ChatMessage(role: "user", content: $0.text), id: $0.id, pending: true) }
         return shown + pending
     }
 
     var hasHistory: Bool { !transcript.isEmpty }
+
+    /// The DISPLAY filter (1:1 with lib/assistant/display.ts). The persisted
+    /// thread keeps every round — the model needs its own tool_calls narration
+    /// and the hidden bounces next request — but a person sees only their
+    /// bubbles, each turn's final reply and the local check-in lines. Hidden:
+    /// tool turns, the guard bounce + the claim it answers, the cut-off hint,
+    /// empty turns, and every assistant round that CARRIES tool_calls — its
+    /// text ("I'll get your lists…", "Let me try the correct tool:") is the
+    /// model narrating its next step. That narration rendered as one bubble
+    /// per round (tester round, 2026-09-06: four bubbles for one question);
+    /// it now only feeds the transient status while the turn runs.
+    nonisolated static func displayTurns(_ turns: [AssistantTurn]) -> [AssistantTurn] {
+        turns.filter {
+            ($0.role == "user" || $0.role == "assistant") && !$0.isHidden && !$0.hasToolCalls
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    /// The in-flight turn's latest narration — the newest assistant round with
+    /// tool_calls since the last visible user turn — as ONE line for the
+    /// typing indicator; nil when there is none yet ("Thinking…"). A hidden
+    /// user turn (the guard bounce / cut-off hint) does not end the turn.
+    nonisolated static func workingStatus(_ turns: [AssistantTurn]) -> String? {
+        for t in turns.reversed() {
+            if t.role == "user" && !t.isHidden { return nil }
+            if t.role == "assistant" && t.hasToolCalls, let line = oneLine(t.text) { return line }
+        }
+        return nil
+    }
+
+    /// First non-empty line, trimmed, capped for a single status row.
+    nonisolated static func oneLine(_ text: String, max: Int = 80) -> String? {
+        guard let first = text.split(separator: "\n", omittingEmptySubsequences: true)
+            .map({ $0.trimmingCharacters(in: .whitespaces) }).first(where: { !$0.isEmpty }) else { return nil }
+        guard first.count > max else { return first }
+        return String(first.prefix(max - 1)).trimmingCharacters(in: .whitespaces) + "…"
+    }
+
+    /// What the typing indicator says: the in-flight turn's narration, only
+    /// while a turn runs — never persisted as a message.
+    var status: String? { sending ? Self.workingStatus(turns) : nil }
 
     /// The per-request model window: the non-local tail, aligned to start at a
     /// user turn so the model never resumes from a dangling tool/assistant turn.

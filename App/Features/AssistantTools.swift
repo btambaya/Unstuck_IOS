@@ -128,7 +128,7 @@ protocol AssistantAppState: AnyObject {
 
 /// Tools that never change anything — a success here must NOT count as "the
 /// assistant acted" for either fabrication guard (text or voice).
-let READ_ONLY_TOOLS: Set<String> = ["get_schedule", "get_tasks", "get_captures", "get_insights", "get_calls"]
+let READ_ONLY_TOOLS: Set<String> = ["get_schedule", "get_tasks", "get_captures", "get_lists", "get_insights", "get_calls"]
 
 /// Entities created THIS turn/session, so a later call (schedule_task after
 /// create_task) can reference them by id before the optimistic write has
@@ -320,7 +320,17 @@ func runAssistantTool(name: String, args: ToolArgs, api: AssistantAppState, scra
     // through THIS executor's state + scratch so a task created this turn
     // resolves; nil for any other name.
     if let r = await runCallTool(name: name, args: args, api: api, scratch: scratch) { return r }
-    return "error: unknown tool \(name)"
+    return unknownToolResult(name)
+}
+
+/// Every tool the executor knows (VOICE_TOOLS mirrors the executor 1:1), so
+/// an unknown-tool result names the real options — the model picks one next
+/// round instead of guessing again (three narrated guesses at a list-reading
+/// tool, tester round 2026-09-06). Same wording on web + Android.
+@MainActor
+func unknownToolResult(_ name: String) -> String {
+    let names = VOICE_TOOLS.compactMap { $0["name"] as? String }.sorted()
+    return "error: unknown tool \"\(name)\" — available: \(names.joined(separator: ", "))"
 }
 
 /// Resolve a task id: scratch map first (the live store lags the optimistic

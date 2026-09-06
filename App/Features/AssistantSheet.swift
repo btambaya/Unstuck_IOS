@@ -197,7 +197,9 @@ struct AssistantSheet: View {
                             onResolved: { assistant.resolveShare(id: pending.id, outcome: $0) })
                     }
 
-                    if assistant.sending { ThinkingRow() }
+                    // The model's per-round narration ("I'll get your lists…")
+                    // shows HERE, transiently — never as a bubble.
+                    if assistant.sending { ThinkingRow(text: assistant.status ?? "Thinking…") }
 
                     if showChips && !assistant.sending {
                         // min-height = the viewport, so aligning its TOP with the
@@ -451,9 +453,11 @@ private struct MessageBubble: View {
 
 private struct ThinkingRow: View {
     @Environment(\.uTheme) private var theme
+    var text: String = "Thinking…"
     var body: some View {
         HStack {
-            Text("Thinking…")
+            Text(text)
+                .lineLimit(1).truncationMode(.tail)
                 .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
                 .padding(.horizontal, 14).padding(.vertical, 10)
                 .background(theme.palette.surface)

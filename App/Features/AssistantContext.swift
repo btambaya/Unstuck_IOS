@@ -298,6 +298,9 @@ func buildVoiceInstructions(_ api: AssistantAppState) -> String {
             "body": p("string", "The thought, verbatim."), "tag": p("string", "follow-up | idea | edit | question | distraction (default idea)."), "taskId": p("string", "Optional task it belongs to."),
         ]),
         fn("get_captures", "List open captures in the inbox.", [], ["tag": p("string", "Optional tag filter.")]),
+        fn("get_lists", "Read the user's lists with their items and ids — use before answering \"what's in my lists\".", [], [
+            "listId": p("string", "Optional list id to read in full."), "includeArchived": p("boolean", "Include archived lists (default false)."),
+        ]),
         fn("promote_capture", "Turn a capture into a task.", ["captureId"], ["captureId": p("string", "Capture id.")]),
         fn("resolve_capture", "Mark a capture handled (leaves the inbox).", ["captureId"], ["captureId": p("string", "Capture id.")]),
         fn("delete_capture", "Delete a capture.", ["captureId"], ["captureId": p("string", "Capture id.")]),

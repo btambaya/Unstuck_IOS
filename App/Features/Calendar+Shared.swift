@@ -6,9 +6,10 @@
 //   • CalLaneItem / mergedLanes — the user's own blocks + shared blocks laid
 //     out side-by-side in the same greedy lane pass, so an owner's 09:00 block
 //     never paints over mine (or vice versa).
-//   • SharedBlockCard / SharedWeekBlock — dashed outline + owner name. NOT
-//     draggable, resizable, deletable, or editable; tap → the shared-task
-//     detail sheet. The guard is structural: a shared block is a different
+//   • SharedBlockCard / SharedWeekBlock — dashed outline, the TASK as the
+//     label and the owner beneath it (UnstuckCore `sharedBlockLabel`: the
+//     sharer is the first thing dropped when space is tight). NOT draggable,
+//     resizable, deletable, or editable; tap → the shared-task detail sheet. The guard is structural: a shared block is a different
 //     type from CalBlock, so it can never reach CalBlockEditSheet, handleDrop,
 //     moveBlock, resizeBlock, or deleteBlock.
 //
@@ -274,7 +275,8 @@ struct SharedBlockCard: View {
             HStack(spacing: 4) {
                 Image(systemName: "person.2.fill").font(.system(size: 9))
                     .foregroundStyle(theme.palette.primaryDeep)
-                Text(block.title).font(UFont.sans(12, .medium)).lineLimit(1)
+                Text(sharedBlockLabel(taskName: block.title, sharer: block.ownerName, compact: true))
+                    .font(UFont.sans(12, .medium)).lineLimit(1)
                     .strikethrough(block.done)
                     .foregroundStyle(block.done ? theme.palette.ink3 : theme.palette.ink)
             }
@@ -296,25 +298,41 @@ struct SharedBlockCard: View {
     }
 }
 
-/// A shared block in a Week column — the compact 8pt variant.
+/// A shared block in a Week column — the compact 8pt variant. The TASK is the
+/// (tail-truncated) line, exactly like my own blocks beside it; the sharer sits
+/// on a 7pt second line only when the block is tall enough for one, so a short
+/// block never trades its title for a name. (It used to read "<sharer> · <task>"
+/// — in a ~45pt column only the sharer survived.)
 struct SharedWeekBlock: View {
     @Environment(\.uTheme) private var theme
     let block: SharedBlock
+    /// The laid-out height — decides whether the sharer line fits.
+    let height: CGFloat
+
+    /// Two 8pt/7pt lines + the 1pt padding need ~21pt; 26pt (≈ 35 min at
+    /// 44pt/h) leaves the second line clear of the clip.
+    static let sharerLineMinHeight: CGFloat = 26
 
     var body: some View {
-        Text("\(shortName(block.ownerName)) · \(block.title)")
-            .font(UFont.sans(8, .medium))
-            .foregroundStyle(block.done ? theme.palette.ink3 : theme.palette.ink)
-            .strikethrough(block.done)
-            .lineLimit(1)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(1)
-            .background(theme.palette.primarySoft.opacity(0.45))
-            .clipShape(RoundedRectangle(cornerRadius: 3))
-            .overlay(RoundedRectangle(cornerRadius: 3)
-                .strokeBorder(theme.palette.primary, style: StrokeStyle(lineWidth: 0.8, dash: [3, 2])))
-            .contentShape(Rectangle())
-            .accessibilityLabel("\(block.title), shared by \(shortName(block.ownerName))")
+        VStack(alignment: .leading, spacing: 0) {
+            Text(sharedBlockLabel(taskName: block.title, sharer: block.ownerName, compact: true))
+                .font(UFont.sans(8, .medium))
+                .foregroundStyle(block.done ? theme.palette.ink3 : theme.palette.ink)
+                .strikethrough(block.done)
+                .lineLimit(1)
+            if height >= Self.sharerLineMinHeight, let who = sharerDisplayName(block.ownerName) {
+                Text(who).font(UFont.mono(7)).foregroundStyle(theme.palette.ink3).lineLimit(1)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(1)
+        .background(theme.palette.primarySoft.opacity(0.45))
+        .clipShape(RoundedRectangle(cornerRadius: 3))
+        .overlay(RoundedRectangle(cornerRadius: 3)
+            .strokeBorder(theme.palette.primary, style: StrokeStyle(lineWidth: 0.8, dash: [3, 2])))
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(block.title), shared by \(shortName(block.ownerName))")
     }
 }
 

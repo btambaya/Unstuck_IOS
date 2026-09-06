@@ -214,6 +214,29 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         }
         return "ok: \(open.count) open capture\(open.count == 1 ? "" : "s"):\n\(lines.isEmpty ? "(inbox empty)" : lines.joined(separator: "\n"))"
 
+    case "get_lists":
+        // READ — the full set (context.lists carries only the first 12
+        // unarchived), one list in full, or the archived ones. There was no
+        // list-reading tool at all: the model guessed names for three rounds
+        // (tester round, 2026-09-06). Result text 1:1 with tools.ts.
+        let wantId = args.str("listId")
+        let one = wantId.flatMap { findList($0, api: api, scratch: scratch) }
+        if wantId != nil && one == nil { return "error: list not found" }
+        let includeArchived = args.bool("includeArchived") ?? false
+        let lists = one.map { [$0] } ?? api.getCollections().filter { includeArchived || $0.archived != true }
+        if lists.isEmpty { return "ok: no lists yet" }
+        let itemCap = one != nil ? 100 : 10
+        var lines: [String] = []
+        for c in lists.prefix(20) {
+            let done = c.items.filter { $0.done == true }.count
+            lines.append("- \"\(c.name)\" [id=\(c.id)] — \(c.items.count - done) open\(done > 0 ? ", \(done) done" : "")\(c.archived == true ? " · archived" : "")")
+            if c.items.isEmpty { lines.append("  (empty)"); continue }
+            for i in c.items.prefix(itemCap) { lines.append("  - \(i.body)\(i.done == true ? " (done)" : "") [id=\(i.id)]") }
+            if c.items.count > itemCap { lines.append("  … and \(c.items.count - itemCap) more — get_lists listId=\(c.id) for all") }
+        }
+        if lists.count > 20 { lines.append("… and \(lists.count - 20) more lists") }
+        return "ok: \(lists.count) list\(lists.count == 1 ? "" : "s"):\n\(lines.joined(separator: "\n"))"
+
     case "promote_capture":
         let id = args.str("captureId")
         guard var c = api.getCaptures().first(where: { $0.id == id }) else { return "error: capture not found" }

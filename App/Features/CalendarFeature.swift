@@ -495,7 +495,7 @@ private struct WeekView: View {
                             // READ-ONLY: tap → the shared-task detail. Never the
                             // edit sheet (it takes a CalBlock — a shared block
                             // can't even be passed to it).
-                            SharedWeekBlock(block: sb)
+                            SharedWeekBlock(block: sb, height: h)
                                 .frame(width: w, height: h)
                                 .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId, block: sb) }
                                 .offset(off)
@@ -589,7 +589,12 @@ private struct MonthView: View {
         let weeks = stride(from: 0, to: cells.count, by: 7).map { Array(cells[$0..<min($0 + 7, cells.count)]) }
         let monthWindow = CalWindow.month(containing: firstOfMonth)
 
-        ScrollView {
+        // The month title + paging, the legend and the weekday row stay PINNED
+        // above the grid (like the Day view's date header) — only the grid
+        // scrolls, so paging months or reading a weekday column never needs a
+        // scroll back up. (Was one ScrollView around everything: the header
+        // scrolled away with the grid.)
+        VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 // Header: month + year, ‹ Today ›
                 HStack(alignment: .center) {
@@ -641,28 +646,36 @@ private struct MonthView: View {
                     }
                 }
                 .padding(.bottom, 4)
+            }
+            .padding(.horizontal, 18)
 
-                // Day grid card
-                Card {
-                    VStack(spacing: 4) {
-                        ForEach(Array(weeks.enumerated()), id: \.offset) { _, week in
-                            HStack(spacing: 4) {
-                                ForEach(0..<7, id: \.self) { i in
-                                    if i < week.count, let d = week[i] {
-                                        monthCell(d, byDay: byDay, maxV: maxV, todayISO: todayISO)
-                                    } else {
-                                        Color.clear.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity)
+            // Day grid card — the only part that scrolls.
+            ScrollView {
+                VStack(spacing: 0) {
+                    Card {
+                        VStack(spacing: 4) {
+                            ForEach(Array(weeks.enumerated()), id: \.offset) { _, week in
+                                HStack(spacing: 4) {
+                                    ForEach(0..<7, id: \.self) { i in
+                                        if i < week.count, let d = week[i] {
+                                            monthCell(d, byDay: byDay, maxV: maxV, todayISO: todayISO)
+                                        } else {
+                                            Color.clear.aspectRatio(1, contentMode: .fit).frame(maxWidth: .infinity)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
 
-                Color.clear.frame(height: 24)
+                    // Clear the floating bottom nav (96pt, like every tab) AND the
+                    // assistant launcher docked above it (46pt + a gap), so the last
+                    // week's Sat/Sun cells scroll fully out from under both.
+                    Color.clear.frame(height: 56)
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 96)
             }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 96)
         }
         // Tap a day carrying a shared block → its read-only detail.
         .sheet(item: $sharedDetail) { target in

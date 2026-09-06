@@ -830,6 +830,27 @@ final class AssistantToolsTests: XCTestCase {
         await eq("get_captures", "{}", "ok: 0 open captures:\n(inbox empty)")
     }
 
+    func testGetLists() async {
+        await eq("get_lists", "{}", "ok: no lists yet")
+        func item(_ id: String, _ body: String, done: Bool? = nil) -> CollectionItem { CollectionItem(id: id, body: body, done: done, at: PAST_CREATED) }
+        let big = (1...12).map { item("i\($0)", "item \($0)") }
+        api.collections = [
+            ItemCollection(id: "l1", name: "Shopping", color: "indigo", items: [item("i1", "milk"), item("i2", "eggs", done: true)], sortOrder: 0),
+            ItemCollection(id: "l2", name: "Old", color: "coral", items: [], sortOrder: 1, archived: true),
+            ItemCollection(id: "l3", name: "Big", color: "green", items: big, sortOrder: 2),
+        ]
+        let ten = big.prefix(10).map { "  - \($0.body) [id=\($0.id)]" }.joined(separator: "\n")
+        await eq("get_lists", "{}",
+                 "ok: 2 lists:\n- \"Shopping\" [id=l1] — 1 open, 1 done\n  - milk [id=i1]\n  - eggs (done) [id=i2]\n"
+                 + "- \"Big\" [id=l3] — 12 open\n\(ten)\n  … and 2 more — get_lists listId=l3 for all")
+        let archived = await run("get_lists", #"{"includeArchived":true}"#)
+        XCTAssertTrue(archived.hasPrefix("ok: 3 lists:\n"), archived)
+        XCTAssertTrue(archived.contains("- \"Old\" [id=l2] — 0 open · archived\n  (empty)"), archived)
+        await eq("get_lists", #"{"listId":"l3"}"#, "ok: 1 list:\n- \"Big\" [id=l3] — 12 open\n" + big.map { "  - \($0.body) [id=\($0.id)]" }.joined(separator: "\n"))
+        await eq("get_lists", #"{"listId":"zz"}"#, "error: list not found")
+        XCTAssertTrue(READ_ONLY_TOOLS.contains("get_lists"), "a read never disarms the fabrication guard")
+    }
+
     func testPromoteResolveDeleteCapture() async {
         api.captures = [capture("c1", "Buy milk"), capture("c2", "Two")]
         let r = await run("promote_capture", #"{"captureId":"c1"}"#)
@@ -1010,7 +1031,9 @@ final class AssistantToolsTests: XCTestCase {
         await prefix("open_screen", #"{"screen":"garage"}"#, "error: unknown screen \"garage\" — try today, tasks")
         await prefix("open_screen", "{}", "error: unknown screen \"\"")
         XCTAssertEqual(api.navigated.count, 5)
-        await eq("nonsense", "{}", "error: unknown tool nonsense")
+        let unknown = await run("nonsense")
+        XCTAssertTrue(unknown.hasPrefix("error: unknown tool \"nonsense\" — available: add_capture, add_to_list, archive_list, "), unknown)
+        XCTAssertTrue(unknown.contains(", get_lists,"), "names every real tool, so the model picks one next round")
     }
 
     // MARK: context shape
@@ -1058,10 +1081,10 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(instructions.contains("You can do EVERYTHING a user can do in Unstuck"))
         XCTAssertTrue(instructions.contains("English ONLY, never Chinese"))
         XCTAssertTrue(instructions.contains("Current app state:\n{"))
-        // 52 app tools + the four call tools (web VOICE_TOOLS parity).
-        XCTAssertEqual(VOICE_TOOLS.count, 56)
+        // 53 app tools + the four call tools (web VOICE_TOOLS parity).
+        XCTAssertEqual(VOICE_TOOLS.count, 57)
         let names = Set(VOICE_TOOLS.compactMap { $0["name"] as? String })
-        XCTAssertEqual(names.count, 56)
+        XCTAssertEqual(names.count, 57)
         XCTAssertTrue(names.isSuperset(of: ["request_call", "cancel_call", "update_call", "get_calls"]))
     }
 }

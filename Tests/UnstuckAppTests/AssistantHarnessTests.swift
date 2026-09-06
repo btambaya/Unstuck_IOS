@@ -75,7 +75,30 @@ final class AssistantHarnessTests: XCTestCase {
     }
 
     private var finalThread: [AssistantTurn] { committed.last ?? [] }
-    private var visible: [AssistantTurn] { finalThread.filter { ($0.role == "user" || $0.role == "assistant") && !$0.isHidden && !$0.text.isEmpty } }
+    /// What the panel would render — the real display filter, not a re-statement of it.
+    private var visible: [AssistantTurn] { AssistantModel.displayTurns(finalThread) }
+
+    // MARK: display — narration rounds never become bubbles
+
+    func testTwoToolRoundsAndAFinalReplyRenderOneAssistantBubble() async {
+        let t = ScriptedTransport([
+            call("get_collections", "{}", content: "I'll get your current collections (lists) for you."),
+            call("get_lists", "{}", content: "Let me try the correct tool:", id: "c2"),
+            text("Your lists are empty so far."),
+        ])
+        let outcome = await runTurn("what's in my lists?", t)
+        XCTAssertEqual(outcome, .reply("Your lists are empty so far."))
+        XCTAssertEqual(visible.map(\.text), ["what's in my lists?", "Your lists are empty so far."])
+        // The narration is persisted for the model (round 3 saw both rounds)…
+        XCTAssertEqual(t.asks[2].filter { !($0.toolCalls ?? []).isEmpty }.map { $0.content ?? "" },
+                       ["I'll get your current collections (lists) for you.", "Let me try the correct tool:"])
+        // …and the first guess got a result that names the real tool.
+        XCTAssertTrue(t.asks[1].last { $0.role == "tool" }?.content?.contains(", get_lists,") == true)
+        // …while mid-flight it is only the typing row's status, per round.
+        XCTAssertEqual(AssistantModel.workingStatus(committed[0]), "I'll get your current collections (lists) for you.")
+        XCTAssertEqual(AssistantModel.workingStatus(committed[1]), "Let me try the correct tool:")
+        XCTAssertEqual(persisted, [false, false, true])
+    }
 
     // MARK: fabrication guard
 
