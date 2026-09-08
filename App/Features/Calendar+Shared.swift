@@ -404,9 +404,12 @@ struct MonthDayPeekSheet: View {
                         .padding(.top, 8)
                     }
                     section("Planned", planned.map { b in
-                        PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
-                                done: b.done, tint: theme.palette.primaryDeep, dashed: false,
-                                action: b.taskId.map { MonthPeekAction.task($0) })
+                        // For a recurring occurrence completion lives on the block;
+                        // for a one-off it lives on the task (same rule as the grids).
+                        let t = vm.tasks.first { $0.id == b.taskId }
+                        return PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
+                                       done: b.done || t?.done == true, tint: theme.palette.primaryDeep, dashed: false,
+                                       action: b.taskId.map { MonthPeekAction.task($0) })
                     })
                     section("Shared with you", shared.map { sb in
                         PeekRow(id: sb.blockId, title: sb.title, meta: "\(slotText(sb.startTime, sb.durationMinutes)) · \(sharerDisplayName(sb.ownerName))",
