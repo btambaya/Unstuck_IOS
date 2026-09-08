@@ -359,3 +359,140 @@ struct MonthMarksRow: View {
         .accessibilityHidden(true)
     }
 }
+
+// MARK: - Month day peek
+
+/// One tapped month day (Identifiable on its 'YYYY-MM-DD').
+struct MonthDayPeek: Identifiable, Equatable { let id: String }
+
+/// What a peek row asked for. The month view acts on it after the sheet has
+/// finished dismissing — SwiftUI silently drops a sheet presented while
+/// another is still going.
+enum MonthPeekAction: Equatable {
+    case task(String)
+    case shared(SharedDetailTarget)
+}
+
+/// Everything on one day, from the month grid: my planned blocks, anything
+/// shared with me, and the tasks due that day that were never scheduled.
+/// Every row leads somewhere — a plain day used to be a dead end while a
+/// shared day opened a sheet (tester, 2026-09-08).
+struct MonthDayPeekSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+    let iso: String
+    let vm: CalendarModel
+    /// Row tapped — the host presents the target after this sheet closes.
+    let onPick: (MonthPeekAction) -> Void
+
+    var body: some View {
+        let own = vm.blocks(on: iso).filter { !$0.skipped }.sorted { $0.startTime < $1.startTime }
+        let planned = own.filter { isTaskBlock($0) }
+        let events = own.filter { !isTaskBlock($0) }
+        let shared = model.shareState.sharedBlocks(on: iso)
+        let empty = planned.isEmpty && events.isEmpty && shared.isEmpty
+
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    if empty {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Nothing on this day.").font(UFont.serifItalic(20)).foregroundStyle(theme.palette.ink)
+                            Text("A clear day is a fine thing.").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+                        }
+                        .padding(.top, 8)
+                    }
+                    section("Planned", planned.map { b in
+                        PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
+                                done: b.done, tint: theme.palette.primaryDeep, dashed: false,
+                                action: b.taskId.map { MonthPeekAction.task($0) })
+                    })
+                    section("Shared with you", shared.map { sb in
+                        PeekRow(id: sb.blockId, title: sb.title, meta: "\(slotText(sb.startTime, sb.durationMinutes)) · \(sharerDisplayName(sb.ownerName))",
+                                done: sb.done, tint: theme.palette.primaryDeep, dashed: true,
+                                action: .shared(SharedDetailTarget(id: sb.taskId, block: sb)))
+                    })
+                    section("In the calendar", events.map { b in
+                        PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
+                                done: false, tint: theme.palette.ink3, dashed: false, action: nil)
+                    })
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 24)
+            }
+            .background(theme.palette.bg)
+            .navigationTitle(dayTitle)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Close") { dismiss() }.font(UFont.sans(15))
+                }
+            }
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    @ViewBuilder
+    private func section(_ label: String, _ rows: [PeekRow]) -> some View {
+        if !rows.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                SectionLabel(label).foregroundStyle(theme.palette.ink3)
+                ForEach(rows) { row in
+                    Button {
+                        guard let a = row.action else { return }
+                        onPick(a)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Circle()
+                                .strokeBorder(row.tint, style: StrokeStyle(lineWidth: row.dashed ? 1 : 4, dash: row.dashed ? [1.5, 1] : []))
+                                .frame(width: 8, height: 8)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.title)
+                                    .font(UFont.sans(15, .medium))
+                                    .foregroundStyle(row.done ? theme.palette.ink3 : theme.palette.ink)
+                                    .strikethrough(row.done, color: theme.palette.ink3)
+                                    .lineLimit(2).multilineTextAlignment(.leading)
+                                Text(row.meta).font(UFont.mono(10)).foregroundStyle(theme.palette.ink3)
+                            }
+                            Spacer(minLength: 6)
+                            if row.action != nil {
+                                Text("›").font(UFont.serifItalic(20)).foregroundStyle(theme.palette.ink4)
+                            }
+                        }
+                        .padding(.vertical, 8).padding(.horizontal, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(theme.palette.bg2))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(row.action == nil)
+                    .accessibilityHint(row.action == nil ? "" : "Opens it")
+                }
+            }
+        }
+    }
+
+    private var dayTitle: String {
+        let f = DateFormatter()
+        f.calendar = Calendar(identifier: .gregorian)
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd"
+        guard let d = f.date(from: iso) else { return iso }
+        return CalFmt.weekdayMonthDay.string(from: d)
+    }
+
+    private func slotText(_ start: String, _ minutes: Int) -> String {
+        minutes >= 60 ? "\(start) · \(minutes / 60)h\(minutes % 60 == 0 ? "" : " \(minutes % 60)m")" : "\(start) · \(minutes)m"
+    }
+
+    struct PeekRow: Identifiable {
+        let id: String
+        let title: String
+        let meta: String
+        let done: Bool
+        let tint: Color
+        let dashed: Bool
+        let action: MonthPeekAction?
+    }
+}

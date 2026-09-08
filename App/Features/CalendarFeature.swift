@@ -17,7 +17,7 @@ import UnstuckDesign
 /// allocate + configure a fresh DateFormatter on every render. DateFormatter is
 /// thread-safe for reading once configured; `nonisolated(unsafe)` documents the
 /// fixed-config, read-only use to the Swift 6 concurrency checker.
-private enum CalFmt {
+enum CalFmt {
     nonisolated(unsafe) static let monthDay: DateFormatter = {
         let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "MMM d"; return f
     }()
@@ -579,6 +579,12 @@ private struct MonthView: View {
     @State private var ym = Date()
     /// Tap a day with a shared block → the first one's read-only detail.
     @State private var sharedDetail: SharedDetailTarget?
+    /// Tap ANY day → everything on it, in a peek sheet (tester, 2026-09-08:
+    /// a shared day opened something and a planned day didn't).
+    @State private var dayPeek: MonthDayPeek?
+    /// What the peek asked for, acted on once it has finished dismissing —
+    /// SwiftUI drops a second sheet presented while the first is still going.
+    @State private var pendingPeek: MonthPeekAction?
 
     private let dows = ["M", "T", "W", "T", "F", "S", "S"]
 
@@ -594,8 +600,18 @@ private struct MonthView: View {
         let cells: [Date?] = Array(repeating: nil, count: lead) + (1...daysInMonth).map { day in
             cal.date(byAdding: .day, value: day - 1, to: firstOfMonth)!
         }
-        let byDay = vm.focusByDay
-        let maxV = max(1, byDay.values.max() ?? 1)
+        // Heat = how BUSY the day is: scheduled minutes (my blocks + shared),
+        // which is readable for days still ahead. It used to be focus density
+        // (minutes actually focused), so every future day rendered empty.
+        let byDay: [String: Int] = cells.reduce(into: [:]) { acc, cell in
+            guard let d = cell else { return }
+            let iso = Clock.dateISO(d)
+            let own = vm.blocks(on: iso).filter { !$0.skipped }.reduce(0) { $0 + $1.durationMinutes }
+            let shr = model.shareState.sharedBlocks(on: iso).filter { !$0.skipped }.reduce(0) { $0 + $1.durationMinutes }
+            if own + shr > 0 { acc[iso] = own + shr }
+        }
+        // A floor so one 8-hour day doesn't flatten a normal week to nothing.
+        let maxV = max(180, byDay.values.max() ?? 0)
         let todayISO = Clock.todayISO()
         let weeks = stride(from: 0, to: cells.count, by: 7).map { Array(cells[$0..<min($0 + 7, cells.count)]) }
         let monthWindow = CalWindow.month(containing: firstOfMonth)
@@ -632,10 +648,10 @@ private struct MonthView: View {
                 }
                 .padding(.top, 8)
 
-                // Legend: the fill is focus density; the marks under the day
+                // Legend: the fill is how busy the day is (scheduled minutes); the marks under the day
                 // number are MY planned blocks (dots) + anything shared (ring).
                 HStack(spacing: 10) {
-                    Text("Focus density").font(UFont.mono(10, .medium))
+                    Text("How busy").font(UFont.mono(10, .medium))
                     HStack(spacing: 3) {
                         Circle().fill(theme.palette.ink3).frame(width: 3.5, height: 3.5)
                         Text("planned").font(UFont.mono(10, .medium))
@@ -688,14 +704,33 @@ private struct MonthView: View {
                 .padding(.bottom, 96)
             }
         }
+        // Tap a day → everything on it; a row then opens the task (mine) or
+        // the read-only shared detail, once this sheet is fully gone.
+        .sheet(item: $dayPeek, onDismiss: flushPeek) { peek in
+            MonthDayPeekSheet(iso: peek.id, vm: vm) { action in
+                pendingPeek = action
+                dayPeek = nil
+            }
+        }
         // Tap a day carrying a shared block → its read-only detail.
         .sheet(item: $sharedDetail) { target in
-            SharedTaskDetailSheet(taskId: target.id)
+            SharedTaskDetailSheet(taskId: target.id, block: target.block)
         }
         // Load the shared layer for the visible month (≤ 31 days, under the
         // server's 62-day cap; cached per window).
         .task(id: monthWindow) {
             await model.shareState.loadSharedBlocks(from: monthWindow.from, to: monthWindow.to)
+        }
+    }
+
+    /// Act on the peek's choice after it has closed: my task opens the editor
+    /// through the router (the Inbox pattern), a shared one its read-only sheet.
+    private func flushPeek() {
+        guard let action = pendingPeek else { return }
+        pendingPeek = nil
+        switch action {
+        case .task(let id): model.routeDeepLink("unstuck://task/\(id)")
+        case .shared(let target): sharedDetail = target
         }
     }
 
@@ -723,9 +758,9 @@ private struct MonthView: View {
         .aspectRatio(1, contentMode: .fit)
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
-        // A shared day opens the (first) shared task — read-only; a plain day
-        // has no tap (the month grid is a heatmap, not a scheduler).
-        .onTapGesture { if let first = sharedHere.first { sharedDetail = SharedDetailTarget(id: first.taskId, block: first) } }
+        // EVERY day opens the same peek — what is on it, and a way into each
+        // item. (Shared days used to open a sheet and planned days did nothing.)
+        .onTapGesture { dayPeek = MonthDayPeek(id: iso) }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(monthCellLabel(day: day, focusedSec: v, marks: marks, isToday: isToday))
     }
@@ -734,7 +769,7 @@ private struct MonthView: View {
         var parts = [isToday ? "Today, \(day)" : "\(day)"]
         if marks.planned > 0 { parts.append("\(marks.planned) planned") }
         if marks.shared > 0 { parts.append("\(marks.shared) shared") }
-        if focusedSec > 0 { parts.append("\(focusedSec / 60) minutes focused") }
+        if focusedSec > 0 { parts.append("\(focusedSec) minutes scheduled") }
         return parts.joined(separator: ", ")
     }
 
