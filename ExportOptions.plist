@@ -4,10 +4,10 @@
   <key>method</key><string>app-store-connect</string>
   <key>teamID</key><string>M9ULD6M5Z3</string>
   <key>signingStyle</key><string>manual</string>
-  <key>signingCertificate</key><string>Apple Distribution: Ahmad Tambaya (M9ULD6M5Z3)</string>
+  <key>signingCertificate</key><string>Apple Distribution: Cyber Safety Alliance Limited (M9ULD6M5Z3)</string>
   <key>uploadSymbols</key><true/>
   <key>provisioningProfiles</key><dict>
-    <key>io.unstucknow.app</key><string>Unstuck App Store</string>
-    <key>io.unstucknow.app.widgets</key><string>Unstuck Widgets App Store</string>
+    <key>io.unstucknow.app</key><string>Unstuck App Store 2026</string>
+    <key>io.unstucknow.app.widgets</key><string>Unstuck Widgets App Store 2026</string>
   </dict>
 </dict></plist>
