@@ -364,7 +364,11 @@ private struct WeekView: View {
         let lightest = flat ? "—" : dayLabels[planned.firstIndex(of: minP) ?? 0]
         let todayISO = Clock.todayISO()
 
-        ScrollView {
+        // The week title + paging, the rollup and the weekday row stay PINNED
+        // above the grid (like Month and the Day view's date header) — only the
+        // hour grid scrolls, so scrolling to an early or late hour never hides
+        // which day a column is (tester, 2026-09-07: "can't see the days").
+        VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 0) {
                 // Header: This week / range + ‹ Today ›
                 HStack(alignment: .center) {
@@ -419,6 +423,12 @@ private struct WeekView: View {
                     }
                 }
 
+            }
+            .padding(.horizontal, 18)
+
+            // Hour grid — the only part that scrolls.
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
                 // Hour grid: time gutter + 7 day columns with positioned blocks.
                 HStack(alignment: .top, spacing: 0) {
                     VStack(spacing: 0) {
@@ -436,9 +446,10 @@ private struct WeekView: View {
                 .padding(.top, 6)
 
                 Color.clear.frame(height: 16)
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 96)
             }
-            .padding(.horizontal, 18)
-            .padding(.bottom, 96)
         }
         // Tap a task block → reschedule / resize / unschedule.
         .sheet(item: $editingBlock) { block in
