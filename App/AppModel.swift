@@ -628,8 +628,11 @@ final class AppModel {
     /// Secrets.xcconfig still works. Blank → voice unconfigured.
     var voiceProxyURL: String {
         let info = Bundle.main.infoDictionary
-        let raw = ((info?["VOICE_PROXY_HOST"] as? String) ?? (info?["VOICE_PROXY_URL"] as? String) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Secrets.xcconfig (untracked) still wins when it sets a full URL; the
+        // committed host is the floor so voice can never ship unconfigured.
+        let secret = (info?["VOICE_PROXY_URL"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let host = (info?["VOICE_PROXY_HOST"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let raw = secret.isEmpty ? host : secret
         if raw.isEmpty { return "" }
         return raw.contains("://") ? raw : "wss://\(raw)"
     }

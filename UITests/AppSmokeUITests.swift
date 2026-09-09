@@ -55,12 +55,26 @@ final class AppSmokeUITests: XCTestCase {
         }
     }
 
+    /// Tapping "Talk" must actually PRESENT the voice screen. Ahmad, 2026-09-09:
+    /// the button was there and tapping it did nothing — the full-screen cover
+    /// was attached to a view inside the sheet and never came up. In the demo
+    /// boot there is no access token, so the screen opens on its "sign in" note;
+    /// that it opens AT ALL is the thing under test.
+    func testTalkOpensTheVoiceScreen() throws {
+        _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
+        usleep(600_000)
+        app.buttons["Assistant"].firstMatch.tap()
+        let talk = app.buttons["Talk"].firstMatch
+        XCTAssertTrue(talk.waitForExistence(timeout: 6), "the Talk button is missing — voice is unconfigured in this build")
+        talk.tap()
+        XCTAssertTrue(app.buttons["Close voice mode"].firstMatch.waitForExistence(timeout: 6),
+                      "tapping Talk did not present the voice screen")
+    }
+
     /// The ✦ launcher → the Assistant panel: the suggestion card it opens on,
     /// the dictation mic, and the ⋯ options menu (which now carries read-aloud
     /// + Clear conversation). Feedback is NO longer here — it moved to
-    /// Settings → Account → "Send feedback". The realtime "Talk" button only
-    /// appears when VOICE_PROXY_URL is configured (not in the demo boot), so we
-    /// don't assert it here.
+    /// Settings → Account → "Send feedback".
     func testAssistantPanel() throws {
         _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
         usleep(600_000)
