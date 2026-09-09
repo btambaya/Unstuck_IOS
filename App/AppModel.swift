@@ -622,11 +622,16 @@ final class AppModel {
 
     // MARK: - voice (realtime "Talk" mode config)
 
-    /// The CF Worker proxy URL (wss://…workers.dev) from Info.plist
-    /// (VOICE_PROXY_URL ← Config/Secrets.xcconfig). Blank → voice unconfigured.
+    /// The CF Worker proxy URL. Info.plist carries the HOST
+    /// (VOICE_PROXY_HOST ← Config.xcconfig) because an xcconfig value is cut at
+    /// "//"; the scheme is added here. A full wss:// URL from an older
+    /// Secrets.xcconfig still works. Blank → voice unconfigured.
     var voiceProxyURL: String {
-        (Bundle.main.infoDictionary?["VOICE_PROXY_URL"] as? String)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let info = Bundle.main.infoDictionary
+        let raw = ((info?["VOICE_PROXY_HOST"] as? String) ?? (info?["VOICE_PROXY_URL"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if raw.isEmpty { return "" }
+        return raw.contains("://") ? raw : "wss://\(raw)"
     }
     /// Gate the Talk button: a non-blank proxy URL (matches Android — no token
     /// check, so Talk stays visible during token-refresh / cold-start) AND the

@@ -6,9 +6,12 @@
 SUPABASE_HOST = uaxfteluwctrlgwmmfzi.supabase.co
 SUPABASE_ANON_KEY =
 
-// Realtime voice proxy (CF Worker → DashScope Qwen-Omni). Blank by default —
-// the real wss://unstuck-voice-proxy.<subdomain>.workers.dev goes in
-// Secrets.xcconfig. voiceConfigured() gates the Talk button on this being set.
-VOICE_PROXY_URL =
+// Realtime voice proxy (CF Worker -> DashScope Qwen-Omni). The HOST only: an
+// xcconfig value is truncated at "//", so the wss:// scheme is added in code
+// (same dodge as SUPABASE_HOST). Public endpoint — the worker authenticates
+// each connection with the user's Supabase token, so this is not a secret.
+// voiceConfigured() gates the Talk button on it being set; it was blank in
+// every shipped build, so Talk never worked on iOS (found 2026-09-09).
+VOICE_PROXY_HOST = unstuck-voice-proxy.justtesting6363.workers.dev
 
 #include? "Secrets.xcconfig"
