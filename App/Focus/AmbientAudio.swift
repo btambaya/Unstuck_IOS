@@ -108,7 +108,11 @@ final class AmbientAudio {
         // system can power down audio). .notifyOthersOnDeactivation lets other
         // apps resume. Matches VoiceAudioEngine.deactivateSession().
         #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        // Never deactivate the shared session under a live voice conversation —
+        // it would silence the call with no error anywhere (audit, 2026-09-11).
+        if !VoiceAudioOwnership.isHeld {
+            try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
+        }
         #endif
     }
 

@@ -55,6 +55,11 @@ final class VoiceSessionModel {
     private var interruption: (any NSObjectProtocol)?
     private var routeChange: (any NSObjectProtocol)?
     private var micGranted = false
+    /// A capture failure is terminal for the session. onOpen()'s `.listening`
+    /// and stop()'s `.closed` land on the main actor AFTER it and used to
+    /// overwrite `.error`, hiding `note` — the label only renders the note in
+    /// the error state, so the real reason never reached the user.
+    private var failed = false
 
     init(model: AppModel) { self.model = model }
 
@@ -62,6 +67,8 @@ final class VoiceSessionModel {
     var isLive: Bool { state == .connecting || state == .listening || state == .thinking || state == .speaking }
 
     func start() {
+        // The three preconditions that silently dead-end Talk, in one line.
+        voiceLog.notice("voice start tokenLen=\(self.model.voiceAccessToken?.count ?? -1, privacy: .public) configured=\(self.model.voiceConfigured, privacy: .public) proxy=\(self.model.voiceProxyURL, privacy: .public)")
         guard let token = model.voiceAccessToken, !token.isEmpty else {
             note = "Please sign in to use voice."; state = .error; return
         }
@@ -70,6 +77,7 @@ final class VoiceSessionModel {
         AVAudioApplication.requestRecordPermission { [weak self] granted in
             Task { @MainActor in
                 guard let self else { return }
+                voiceLog.notice("voice mic permission granted=\(granted, privacy: .public)")
                 guard granted else { self.note = "Microphone access is needed for voice."; self.state = .error; return }
                 self.micGranted = true
                 // A call may have arrived while the permission prompt was up —
@@ -95,6 +103,7 @@ final class VoiceSessionModel {
     }
 
     private func connect(token: String) {
+        failed = false
         let proxyURL = model.voiceProxyURL
         let modelId = model.voiceModel
         let assistant = model.assistant
@@ -127,6 +136,7 @@ final class VoiceSessionModel {
         engine.onCaptureError = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
+                self.failed = true
                 self.client?.stop()
                 self.note = "Couldn't access the microphone — it may be in use by another app."
                 self.state = .error
@@ -138,7 +148,10 @@ final class VoiceSessionModel {
             proxyURL: proxyURL, token: token, model: modelId,
             instructions: instructions, opening: opening, tools: tools, audio: engine,
             runTool: runTool,
-            onState: { [weak self] s in Task { @MainActor in self?.state = s } },
+            onState: { [weak self] s in Task { @MainActor in
+                guard let self, !self.failed else { return }
+                self.state = s
+            } },
             onCaption: { [weak self] role, text, done in
                 Task { @MainActor in
                     guard let self else { return }
@@ -155,7 +168,7 @@ final class VoiceSessionModel {
                     }
                 }
             },
-            onError: { [weak self] msg in Task { @MainActor in self?.note = msg } },
+            onError: { [weak self] msg in voiceLog.error("voice error \(msg, privacy: .public)"); Task { @MainActor in self?.note = msg } },
             holdToTalk: holdToTalk)
         client = rc
         observeInterruptions()
@@ -288,7 +301,13 @@ struct VoiceModeScreen: View {
         // moment we leave .active — the iOS analog of Android's ON_STOP teardown.
         // end() is idempotent (client.stop() guards _stopped; end() nils client).
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { session?.end() }
+            // ONLY a real background (Android's ON_STOP). `.inactive` is a
+            // transient resign-active — the microphone permission alert, Control
+            // Centre, a banner, an incoming call — and ending there killed the
+            // session the user had just started: on a FIRST-EVER Talk the
+            // permission prompt itself tore the session down and left a dead
+            // screen. Audit + tester report, 2026-09-11.
+            if phase == .background { session?.end() }
         }
     }
 

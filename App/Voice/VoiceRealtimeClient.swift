@@ -42,7 +42,16 @@
 
 import AVFoundation
 import Foundation
+import os
 import UnstuckCore
+
+/// Lifecycle logging for realtime voice. Deliberately thin and content-free:
+/// session boundaries, the handshake, and every failure — never a token, a
+/// transcript, or an event payload. Voice can only be diagnosed from a device
+/// (the mic, the route, the socket), so `log stream --predicate 'subsystem ==
+/// "io.unstucknow.app"'` has to be enough to tell transport failures from
+/// audio failures from "never even started".
+let voiceLog = Logger(subsystem: "io.unstucknow.app", category: "voice")
 
 /// The audio side the realtime client drives — implemented by VoiceAudioEngine.
 /// Capture delivers 16 kHz mono PCM16 frames; playback consumes 24 kHz mono PCM16.
@@ -157,8 +166,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     // invalidateAndCancel() in stop(), which also releases the session's queue.
     private lazy var session: URLSession = {
         let cfg = URLSessionConfiguration.default
-        cfg.timeoutIntervalForRequest = 0   // long-lived socket
-        cfg.waitsForConnectivity = true
+        // The socket is long-lived (no idle timeout), but the DIAL must fail:
+        // with waitsForConnectivity a stalled connect yields no delegate call at
+        // all — measured past 100 s — and the screen sits on "Connecting…" for
+        // ever. The watchdog in start() is the backstop for the rest.
+        cfg.timeoutIntervalForRequest = 0
+        cfg.waitsForConnectivity = false
+        cfg.timeoutIntervalForResource = 7 * 24 * 3600
         return URLSession(configuration: cfg, delegate: self, delegateQueue: nil)
     }()
     private var task: URLSessionWebSocketTask?
@@ -238,9 +252,19 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         }
         var req = URLRequest(url: url)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        voiceLog.notice("voice connect host=\(url.host ?? "nil", privacy: .public) model=\(self.model, privacy: .public) tokenLen=\(self.token.count, privacy: .public)")
         let t = session.webSocketTask(with: req)
         task = t
         t.resume()
+        // Nothing in URLSession fails a dial that stalls after the TCP connect,
+        // so a proxy that accepts and never upgrades would hang "Connecting…"
+        // for ever. 15 s, then we say so.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard let self else { return }
+            let stuck = self.withLock { !self._open && !self._stopped }
+            if stuck { self.transportEnded(error: "Couldn't reach the voice server. Check your connection and try again.") }
+        }
         // onOpen() runs in the delegate's didOpenWithProtocol — only after the
         // handshake succeeds — so the mic/playback/"Listening" don't spin up on an
         // unreachable proxy or a rejected token. receiveLoop starts there too.
@@ -249,6 +273,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     // URLSessionWebSocketDelegate: the socket finished its upgrade handshake.
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocol: String?) {
+        voiceLog.notice("voice socket open (subprotocol=\(`protocol` ?? "none", privacy: .public))")
         onOpen()
         receiveLoop()
     }
@@ -259,7 +284,25 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     // remote close (no error) ends the session as `.closed` rather than leaving
     // a dead socket behind a live "Listening…".
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: (any Error)?) {
-        transportEnded(error: error.map { String($0.localizedDescription.prefix(160)) })
+        // The HTTP status is the difference between "the proxy rejected us"
+        // (401 → a bad/expired token) and "we never reached it" — the socket
+        // API only surfaces the generic -1011 for both.
+        let status = (task.response as? HTTPURLResponse)?.statusCode ?? -1
+        if let ns = error as NSError? {
+            voiceLog.error("voice socket failed domain=\(ns.domain, privacy: .public) code=\(ns.code, privacy: .public) http=\(status, privacy: .public)")
+        }
+        // CFNetwork collapses every rejection into -1011 ("bad response from the
+        // server"), which tells the user nothing. The status distinguishes an
+        // expired token from the proxy's concurrent-session cap.
+        let friendly: String?
+        switch status {
+        case 401: friendly = "Your session expired — sign in again to use voice."
+        case 403: friendly = "Voice isn't available on this build."
+        case 429: friendly = "A voice session is already running. Close it and try again in a moment."
+        case let s where s >= 500: friendly = "The voice server is unavailable right now (\(s))."
+        default: friendly = error.map { String($0.localizedDescription.prefix(160)) }
+        }
+        transportEnded(error: friendly)
     }
 
     func stop() {
@@ -454,6 +497,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// `onTransportEnded`. Every failure path (pre-handshake, receive, send,
     /// bad URL) funnels through here so nothing is reported twice.
     private func transportEnded(error: String?) {
+        voiceLog.notice("voice transport ended (\(error ?? "clean close", privacy: .public))")
         let first: Bool = withLock {
             if _stopped || _reportedError { return false }   // our own invalidate / already reported
             _open = false; _reportedError = true

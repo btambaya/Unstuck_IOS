@@ -52,6 +52,18 @@ protocol VoiceAudioSessionControlling: AnyObject, Sendable {
     func setActive(_ active: Bool) throws
 }
 
+/// Whether a realtime voice session (Talk or a call) currently owns the shared
+/// AVAudioSession. Ambient focus audio and the guided tour both end with
+/// `setActive(false, .notifyOthersOnDeactivation)`, which would deactivate the
+/// session under a live conversation: the engine stays "running" with no audio
+/// in or out and no error anywhere. They consult this first. Audit, 2026-09-11.
+enum VoiceAudioOwnership {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var _held = false
+    static var isHeld: Bool { lock.lock(); defer { lock.unlock() }; return _held }
+    static func set(_ held: Bool) { lock.lock(); _held = held; lock.unlock() }
+}
+
 /// The real shared AVAudioSession.
 final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
     func configureVoiceChat(options: AVAudioSession.CategoryOptions) throws {
@@ -59,6 +71,7 @@ final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
     }
     func setActive(_ active: Bool) throws {
         let s = AVAudioSession.sharedInstance()
+        VoiceAudioOwnership.set(active)
         if active {
             try s.setActive(true, options: [])
         } else {
@@ -163,7 +176,7 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private func ensureStarted() -> Bool {
         lock.lock(); defer { lock.unlock() }
         if started { return true }
-        guard activateSession() else { return false }
+        guard activateSession() else { voiceLog.error("voice audio session activation failed"); return false }
 
         // Hardware AEC: route both directions through the voice-processing AU.
         // Best-effort — older devices / simulators may reject it.
@@ -186,7 +199,10 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         _ = engine.inputNode.outputFormat(forBus: 0)
 
         engine.prepare()
-        do { try engine.start() } catch { deactivateSession(); return false }
+        do { try engine.start() } catch {
+            voiceLog.error("voice engine start failed: \(String(describing: error), privacy: .public)")
+            deactivateSession(); return false
+        }
         started = true
         return true
     }
@@ -203,10 +219,21 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         // activated or the engine won't start — almost always the mic being
         // held by another app. Report it (Android bails the same way in
         // startCapture) instead of returning silently into a dead "Listening…".
-        guard ensureStarted() else { onCaptureError?(); return }
+        guard ensureStarted() else { voiceLog.error("voice capture could not start"); onCaptureError?(); return }
         let input = engine.inputNode
         let hwFormat = input.inputFormat(forBus: 0)
         captureConverter = AVAudioConverter(from: hwFormat, to: captureFormat)
+        // The hardware format drives the 16 kHz conversion; a nil converter is
+        // a silent mic, which is otherwise indistinguishable from "not talking".
+        voiceLog.notice("voice capture hw=\(hwFormat.sampleRate, privacy: .public)Hz ch=\(hwFormat.channelCount, privacy: .public) converter=\(self.captureConverter != nil, privacy: .public)")
+        // No converter (or a degenerate hardware format, which makes installTap
+        // raise) means every buffer would be dropped in silence — "Listening…"
+        // over a dead mic. Fail loudly instead. Audit, 2026-09-11.
+        guard captureConverter != nil, hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+            voiceLog.error("voice capture unusable input format — no converter")
+            onCaptureError?()
+            return
+        }
 
         // Tap the mic at the hardware format; convert each buffer to 16k Int16,
         // run it through the RMS gate (live audio / pre-roll / digital silence

@@ -235,7 +235,11 @@ final class TourAudioPlayer {
         let session = AVAudioSession.sharedInstance()
         if !AmbientAudio.shared.isRunning,
            session.category != .playAndRecord, session.category != .record {
-            try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+            // Never deactivate the shared session under a live voice conversation —
+            // it would silence the call with no error anywhere (audit, 2026-09-11).
+            if !VoiceAudioOwnership.isHeld {
+                try? session.setActive(false, options: [.notifyOthersOnDeactivation])
+            }
         }
     }
 

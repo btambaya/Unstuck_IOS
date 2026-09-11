@@ -4,7 +4,23 @@
 // SyncConfig (kept out of source — see .xcconfig / Secrets).
 
 import Foundation
+import os
 import Supabase
+
+#if DEBUG
+/// DEBUG only: pipes the SDK's own log lines into os_log. Without it the Auth
+/// client swallows its storage failures — a keychain read that fails (an
+/// unsigned dev build has no `application-identifier`, so every SecItem call
+/// returns errSecMissingEntitlement −34018) just makes `currentSession` nil,
+/// which reads as "signed out" with no explanation anywhere. Never compiled
+/// into Release: these lines include request URLs.
+struct OSLogSupabaseLogger: SupabaseLogger {
+    static let log = Logger(subsystem: "io.unstucknow.app", category: "supabase")
+    func log(message: SupabaseLogMessage) {
+        Self.log.debug("\(message.description, privacy: .public)")
+    }
+}
+#endif
 
 public struct SyncConfig: Sendable {
     public let url: URL
@@ -39,6 +55,17 @@ public struct SupabaseClientProvider: Sendable {
                     // the user out (and scrubbed device-local data). With true, the
                     // stored session is emitted immediately and the refresh retries
                     // in the background once connectivity returns.
-                    emitLocalSessionAsInitialSession: true)))
+                    emitLocalSessionAsInitialSession: true),
+                global: SupabaseClientOptions.GlobalOptions(logger: Self.debugLogger)))
+    }
+
+    /// DEBUG builds get the SDK's own diagnostics (see OSLogSupabaseLogger); a
+    /// Release build gets none.
+    private static var debugLogger: (any SupabaseLogger)? {
+        #if DEBUG
+        return OSLogSupabaseLogger()
+        #else
+        return nil
+        #endif
     }
 }
