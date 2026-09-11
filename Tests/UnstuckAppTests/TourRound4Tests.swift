@@ -97,6 +97,110 @@ final class TourScopedSurfaceClaimTests: XCTestCase {
     }
 }
 
+/// The a11y half of the lockdown. The invariant under test: the app window is
+/// hidden from VoiceOver EXACTLY while `tourClaims` swallows every app point.
+/// Hiding it on a step that passes a real control through (the ringed assistant
+/// launcher; the section a settings step opens) made those steps followable by
+/// sighted users only — the control simply wasn't in the accessibility tree.
+final class TourAccessibilityHidingTests: XCTestCase {
+    private let ring = CGRect(x: 20, y: 600, width: 360, height: 180)
+
+    private func running(_ mutate: (inout TourClaimContext) -> Void = { _ in }) -> TourClaimContext {
+        var ctx = TourClaimContext()
+        ctx.running = true
+        ctx.panelFrame = CGRect(x: 24, y: 60, width: 342, height: 320)
+        mutate(&ctx)
+        return ctx
+    }
+
+    func testAnOrdinaryStepHidesTheAppWindow() {
+        XCTAssertTrue(tourHidesAppFromAccessibility(ctx: running()))
+    }
+
+    func testADisplayOnlyRingStillHidesTheAppWindow() {
+        // The Start-Next hero is ringed but swallowed, so hiding it is right:
+        // nothing under the scrim is operable by anyone.
+        let ctx = running { $0.targetRect = ring; $0.cutoutInteractive = false }
+        XCTAssertTrue(tourHidesAppFromAccessibility(ctx: ctx))
+        XCTAssertTrue(tourClaims(point: CGPoint(x: 200, y: 690), ctx: ctx), "ring swallowed")
+    }
+
+    func testACutoutInteractiveStepLeavesTheAppWindowReachable() {
+        // The assistant launcher takes real touches here, so VoiceOver must be
+        // able to find it.
+        let ctx = running { $0.targetRect = ring; $0.cutoutInteractive = true }
+        XCTAssertFalse(tourHidesAppFromAccessibility(ctx: ctx))
+        XCTAssertFalse(tourClaims(point: CGPoint(x: 200, y: 690), ctx: ctx), "ring passes through")
+    }
+
+    func testACutoutInteractiveStepWithNoResolvedRingStillHides() {
+        // Nothing is passed through until the anchor resolves — fail closed.
+        let ctx = running { $0.cutoutInteractive = true; $0.targetRect = nil }
+        XCTAssertTrue(tourHidesAppFromAccessibility(ctx: ctx))
+    }
+
+    func testAnInteractiveStepOpenedSurfaceLeavesTheAppWindowReachable() {
+        // Settings → Notifications: the section IS the step, so its controls
+        // have to be in the tree.
+        let ctx = running { $0.presentationActive = true; $0.surfaceExempt = true; $0.surfaceScoped = true }
+        XCTAssertFalse(tourHidesAppFromAccessibility(ctx: ctx))
+    }
+
+    func testADisplayOnlyPresentedSheetStaysHidden() {
+        // Task detail / inbox / insights: presented but swallowed.
+        let ctx = running { $0.presentationActive = true; $0.surfaceExempt = false }
+        XCTAssertTrue(tourHidesAppFromAccessibility(ctx: ctx))
+    }
+
+    func testDemoFocusStepsHideEvenWithAPresentationUp() {
+        // tourClaims puts demoStep above presentationActive; so does this.
+        let ctx = running { $0.demoStep = true; $0.presentationActive = true; $0.surfaceExempt = true }
+        XCTAssertTrue(tourHidesAppFromAccessibility(ctx: ctx))
+    }
+
+    func testTheWelcomeCardHidesEverything() {
+        var ctx = TourClaimContext()
+        ctx.cardVisible = true
+        XCTAssertTrue(tourHidesAppFromAccessibility(ctx: ctx))
+    }
+
+    func testNothingIsHiddenWhileTheTourIsAway() {
+        // Paused (chip only) / hidden: the app is fully usable, so it must be
+        // fully reachable too.
+        var ctx = TourClaimContext()
+        ctx.chipVisible = true
+        XCTAssertFalse(tourHidesAppFromAccessibility(ctx: ctx))
+        XCTAssertFalse(tourHidesAppFromAccessibility(ctx: TourClaimContext()))
+    }
+
+    /// The invariant, stated as a property: whenever the app window is hidden,
+    /// there must be no point the claim passes through to it.
+    func testHidingImpliesEveryPointIsSwallowed() {
+        let probes = (0..<40).map { CGPoint(x: 20 + Double($0 % 8) * 45, y: 40 + Double($0 / 8) * 170) }
+        for cutout in [false, true] {
+            for presented in [false, true] {
+                for exempt in [false, true] {
+                    for demo in [false, true] {
+                        let ctx = running {
+                            $0.targetRect = ring
+                            $0.cutoutInteractive = cutout
+                            $0.presentationActive = presented
+                            $0.surfaceExempt = exempt
+                            $0.demoStep = demo
+                        }
+                        guard tourHidesAppFromAccessibility(ctx: ctx) else { continue }
+                        for p in probes {
+                            XCTAssertTrue(tourClaims(point: p, ctx: ctx),
+                                          "hidden from VoiceOver but \(p) passes touches through "
+                                          + "(cutout:\(cutout) presented:\(presented) exempt:\(exempt) demo:\(demo))")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 final class TourStoreClearTests: XCTestCase {
     private func freshDefaults() -> UserDefaults {
         let name = "test.tour.clear.\(UUID().uuidString)"

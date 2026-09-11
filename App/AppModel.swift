@@ -733,9 +733,15 @@ final class AppModel {
         onboardingResolved = true
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         // Tour UITest hook: reset the tour to a fresh 'eligible' state so the
-        // one-time welcome fires deterministically on this boot.
+        // one-time welcome fires deterministically on this boot. Every OTHER
+        // UITest boot clears it instead: the seed is an in-memory database but
+        // the tour's state lives in UserDefaults and outlives it, so a tour
+        // test that ended mid-run left a "Continue your tour?" card sitting
+        // over the first screen of every later test on that simulator.
         if ProcessInfo.processInfo.environment["UITEST_TOUR"] == "1" {
             TourStore().save { $0 = TourState(eligible: true) }
+        } else {
+            TourStore.clear()
         }
         // Debug hook: jump straight into Focus on launch (crash isolation).
         if ProcessInfo.processInfo.environment["UITEST_FOCUS"] == "1",

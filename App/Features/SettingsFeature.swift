@@ -189,7 +189,14 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 16).padding(.vertical, 14)
             .contentShape(Rectangle())
-        }.buttonStyle(.plain)
+        }
+        .buttonStyle(.plain)
+        // Stable handle for UI tests. Settings is a SHEET over Today, so its
+        // rows share one accessibility tree with whatever is behind them, and
+        // plain labels collide: "Focus" also names the Start-Next hero's
+        // button, which sorts first and is (correctly) not hittable under the
+        // sheet — so a label lookup taps the wrong element and fails.
+        .accessibilityIdentifier("settings-row-\(label)")
     }
 
     /// A tappable row with a label, a subtitle, and a trailing chevron.

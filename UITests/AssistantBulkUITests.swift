@@ -40,7 +40,8 @@ final class AssistantBulkUITests: XCTestCase {
 
     private func nextDay() {
         let b = app.buttons["Next day"].firstMatch
-        if b.waitForExistence(timeout: 6) { b.tap() }
+        XCTAssertTrue(b.waitForExistence(timeout: 6), "the Calendar's 'Next day' control is missing")
+        b.tap()
     }
 
     private func openAssistant() {
@@ -51,11 +52,15 @@ final class AssistantBulkUITests: XCTestCase {
     }
 
     private func send(_ text: String) {
-        let field = app.textViews.firstMatch.exists ? app.textViews.firstMatch : app.textFields.firstMatch
+        // By IDENTIFIER — Today's gateway composer is a TextField too and sits
+        // behind this sheet, so `textFields.firstMatch` picks the wrong one.
+        let field = app.textFields["assistant-input"]
         XCTAssertTrue(field.waitForExistence(timeout: 10), "assistant input missing")
         field.tap()
         field.typeText(text)
-        app.buttons["Send"].firstMatch.tap()
+        let send = app.buttons["Send"].firstMatch
+        XCTAssertTrue(send.waitForExistence(timeout: 5), "assistant Send button missing")
+        send.tap()
     }
 
     /// The whole bulk turn with the sheet open the entire time.
@@ -66,7 +71,7 @@ final class AssistantBulkUITests: XCTestCase {
         // The turn runs three rounds; give it room, then look at the receipts.
         usleep(6_000_000)
         snap("01-after-bulk-turn")
-        XCTAssertTrue(app.buttons["Today"].firstMatch.exists || app.textViews.firstMatch.exists,
+        XCTAssertTrue(app.buttons["Today"].firstMatch.exists || app.textFields["assistant-input"].exists,
                       "the app is gone — the bulk turn took it down")
         // Scroll the thread (50+ receipt rows in a LazyVStack).
         app.swipeUp(); app.swipeUp(); app.swipeDown()
@@ -96,15 +101,15 @@ final class AssistantBulkUITests: XCTestCase {
         nextDay(); usleep(1_500_000); snap("12-calendar-day-tomorrow")
         app.swipeUp(); usleep(400_000); app.swipeDown(); usleep(400_000)
         snap("12b-calendar-day-scrolled")
-        if app.staticTexts["Week"].firstMatch.waitForExistence(timeout: 4) {
-            app.staticTexts["Week"].firstMatch.tap(); usleep(1_500_000); snap("13-calendar-week")
+        // Day / Week / Month are BUTTONS with an explicit accessibilityLabel —
+        // these were written as `staticTexts`, which match nothing, so the
+        // week + month relayout (the whole point of the walk) never ran.
+        for mode in ["Week", "Month", "Day"] {
+            let seg = app.buttons[mode].firstMatch
+            XCTAssertTrue(seg.waitForExistence(timeout: 5), "the Calendar '\(mode)' segment is missing")
+            seg.tap(); usleep(1_500_000)
+            if mode != "Day" { snap(mode == "Week" ? "13-calendar-week" : "14-calendar-month") }
             app.swipeUp(); usleep(400_000); app.swipeDown(); usleep(400_000)
-        }
-        if app.staticTexts["Month"].firstMatch.exists {
-            app.staticTexts["Month"].firstMatch.tap(); usleep(1_200_000); snap("14-calendar-month")
-        }
-        if app.staticTexts["Day"].firstMatch.exists {
-            app.staticTexts["Day"].firstMatch.tap(); usleep(1_200_000)
         }
         app.swipeUp(); app.swipeUp(); app.swipeDown()
         snap("15-calendar-scrolled")

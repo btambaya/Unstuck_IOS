@@ -197,6 +197,11 @@ struct NewTaskSheet: View {
             TextField("What's the next thing on your mind?", text: $name, axis: .vertical)
                 .font(UFont.sans(15))
                 .textFieldStyle(.plain)
+                // Stable handle for UI tests: Today's gateway composer is a
+                // TextField too and sits behind this sheet, so `textFields
+                // .firstMatch` resolves to the wrong one, and the placeholder
+                // stops being reported the moment anything is typed.
+                .accessibilityIdentifier("new-task-name")
                 .padding(.horizontal, 12).padding(.vertical, 10)
                 .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(theme.palette.line2))

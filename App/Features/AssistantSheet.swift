@@ -295,6 +295,10 @@ struct AssistantSheet: View {
                 .padding(.horizontal, 16).padding(.vertical, 12)
                 .background(theme.palette.bg2)
                 .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                // Stable handle for UI tests: Today's gateway composer is a
+                // TextField too and sits behind this sheet, so a bare
+                // `textFields.firstMatch` resolves to the wrong one.
+                .accessibilityIdentifier("assistant-input")
 
             // On-device dictation (STT) into the input field.
             Button(action: toggleMic) {

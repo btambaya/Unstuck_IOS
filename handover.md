@@ -3,7 +3,65 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-05, latest) — tester round: shared tasks by schedule, interview parity, launcher on Calendar (1.1.0 build 35)
+## Where things stand (2026-09-11, latest) — the guided tour's a11y lockdown, and a UI suite that can actually fail
+
+The UI suite was red in three places and quietly hollow in several more. The
+one PRODUCT bug behind it:
+
+- **The tour's round-4 a11y lockdown hid surfaces the tour tells you to use.**
+  `TourWindowHandle.setAccessibilityLock` set `appWindow.accessibilityElements
+  Hidden = true` for the whole run, but `tourClaims` deliberately passes
+  touches THROUGH on two kinds of step — `cutoutInteractive` (the ringed
+  assistant launcher) and `surfaceInteractive` (the Settings → Notifications
+  section a settings step opens). Sighted users could tap those; VoiceOver
+  users could not find them at all, so "the Assistant lives here, bottom-right"
+  and "you set how present it is" were unfollowable without sight. Fixed by
+  splitting the lock in two: modality stays on for the whole run, hiding is now
+  `tourHidesAppFromAccessibility(ctx:)` — a pure function that mirrors
+  `tourClaims` branch for branch and answers "is there ANY pass-through region
+  right now?". `TourAccessibilityHidingTests` pins the invariant, including a
+  property test: wherever the app window is hidden, no probe point passes
+  through. (Shipped in build 39 / commit c255625; not in a tester's hands as an
+  a11y complaint yet, but it was real.)
+
+Everything else was TEST rot, all of it the same shape — **bare label /
+`firstMatch` queries that now collide with the AI gateway card on Today**,
+which added a TextField ("Ask me anything…") and pushed the Start-Next hero
+under the floating bottom nav:
+
+- `app.textFields.firstMatch` inside the new-task sheet resolved to Today's
+  gateway composer BEHIND the sheet (not hittable) — that was the long-standing
+  `testExitWithAskKeyboardUpRestoresAppKeyWindow` failure.
+- `app.staticTexts["Focus"].firstMatch` in Settings resolved to the hero's
+  Focus button behind the sheet, not the Settings row.
+- XCUITest reports elements UNDER the floating bottom nav as `isHittable`, so
+  `testFocus` "tapped Focus" and started nothing for as long as the hero has
+  been below the fold.
+- `app.staticTexts["Week"/"Month"/"Day"]` match nothing (they are Buttons with
+  accessibility labels), `app.staticTexts["Upcoming"]` no longer exists, and
+  "End for now" opens a "How did that land?" sheet first — so the store walk's
+  `03-recap` shot was a picture of the reflection sheet.
+- Tour state lives in UserDefaults and outlives the in-memory seed, so a tour
+  test that ended mid-run left a "Continue your tour?" card over the first
+  screen of every later seeded test. `startUITestMode` now clears it unless
+  `UITEST_TOUR=1`.
+
+Fixes: stable identifiers where a label is ambiguous (`new-task-name`,
+`assistant-input`, `settings-row-<label>`), every `if element.exists { … }` and
+`guard … else { return }` converted to an assertion, and a `scrollIntoReach`
+helper that requires an element to clear the floating nav rather than trusting
+`isHittable`.
+
+**Known, not fixed (product judgement needed):** Today's primary CTA — the
+Start-Next hero's Focus button — now renders below the fold on a fresh launch,
+under the gateway card, and the tour's step 2 rings a target that is mostly
+off-screen. The tour has no scroll-into-view for its target.
+
+- **Tests.** `swift test` 922 green; `-only-testing:UnstuckAppTests` 513 green
+  (was 495); `-only-testing:UnstuckUITests` 15 tests, 1 skipped
+  (`VoiceReproUITests`, needs credentials), 0 failures.
+
+## Where things stand (2026-09-05) — tester round: shared tasks by schedule, interview parity, launcher on Calendar (1.1.0 build 35)
 
 Zubair's TestFlight report on build 34: shared tasks all under Today, none on the calendar, month
 shows nothing scheduled, interview re-asks at 1/5, no ✦ on Calendar, web asks 7 questions vs 5.

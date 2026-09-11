@@ -569,14 +569,39 @@ final class TourModel {
         }
     }
 
-    /// VoiceOver must not reach the app content under the scrim while the
-    /// tour owns the screen (round-4 a11y): the tour window is marked modal
-    /// (VoiceOver ignores its sibling windows) AND the app window's elements
-    /// are hidden — belt and braces, since a UIKit-presented sheet in the app
-    /// window is otherwise still traversable. Held while running or while a
+    /// The tour owns the screen (round-4 a11y): its window is marked MODAL, so
+    /// VoiceOver ignores the sibling app window. Held while running or while a
     /// card is actually on screen; released the moment neither is true (the
     /// paused chip leaves the app fully usable).
     var accessibilityLockHeld: Bool { phase == .running || cardVisible }
+
+    /// The second, narrower half of that lock: the app window's elements are
+    /// hidden OUTRIGHT (belt and braces — a UIKit-presented sheet in the app
+    /// window stays traversable through mere modality).
+    ///
+    /// Modality is unconditional; hiding must MIRROR THE TOUCH CLAIM, or the
+    /// two drift and a VoiceOver user loses exactly the surfaces a step tells
+    /// them to operate. `tourClaims` deliberately passes touches through on
+    /// cutoutInteractive steps (the ringed assistant launcher IS the step) and
+    /// to a step-opened surface on surfaceInteractive steps (the Settings →
+    /// Notifications section IS the step). Blanket-hiding the app window there
+    /// left those steps followable by sighted users only — the launcher and the
+    /// notification controls were simply not in the accessibility tree. So the
+    /// app window stays hidden ONLY while every app point is genuinely
+    /// swallowed; the modal flag keeps the rest of the app out of VoiceOver's
+    /// way whenever something IS passed through.
+    var accessibilityHidingHeld: Bool {
+        guard accessibilityLockHeld else { return false }
+        var ctx = TourClaimContext()
+        ctx.cardVisible = cardVisible
+        ctx.running = phase == .running
+        ctx.demoStep = currentStep.isDemoFocus
+        ctx.presentationActive = app.router.hasActivePresentation || uikitPresentationActive
+        ctx.surfaceExempt = currentStep.surfaceInteractive
+        ctx.cutoutInteractive = currentStep.cutoutInteractive
+        ctx.targetRect = targetRect
+        return tourHidesAppFromAccessibility(ctx: ctx)
+    }
 
     /// Poll the app window's UIKit presentation state into observable model
     /// state while the tour is live (250ms, matching the target poll). The
@@ -691,7 +716,13 @@ struct TourRootView: View {
         .accessibilityElement(children: .contain)
         .task { tour.bootIfNeeded() }
         .onChange(of: tour.accessibilityLockHeld, initial: true) { _, held in
-            TourWindowHandle.shared.setAccessibilityLock(held)
+            TourWindowHandle.shared.setAccessibilityLock(held, hiding: tour.accessibilityHidingHeld)
+        }
+        // The hiding half moves WITHIN a run (step change, a step-opened
+        // surface coming up or going away), so it needs its own observation —
+        // the lock flag itself stays true across all of those.
+        .onChange(of: tour.accessibilityHidingHeld, initial: true) { _, hiding in
+            TourWindowHandle.shared.setAccessibilityLock(tour.accessibilityLockHeld, hiding: hiding)
         }
     }
 
@@ -1093,12 +1124,21 @@ final class TourWindowHandle {
     /// elements are hidden outright (a UIKit-presented sheet in the app
     /// window would otherwise stay traversable). Idempotent; a screen-change
     /// notification moves the cursor onto the tour when the lock engages.
+    ///
+    /// The two halves are set SEPARATELY, because they don't have the same
+    /// scope: modality lasts the whole run, while hiding has to be lifted on
+    /// the steps whose touch policy passes through to a real app control
+    /// (TourModel.accessibilityHidingHeld) — otherwise those steps are
+    /// impossible to follow with VoiceOver.
     private(set) var accessibilityLockHeld = false
-    func setAccessibilityLock(_ held: Bool) {
-        guard held != accessibilityLockHeld else { return }
+    private(set) var accessibilityHidingHeld = false
+    func setAccessibilityLock(_ held: Bool, hiding: Bool? = nil) {
+        let hide = (hiding ?? held) && held
+        guard held != accessibilityLockHeld || hide != accessibilityHidingHeld else { return }
         accessibilityLockHeld = held
+        accessibilityHidingHeld = hide
         tourWindow?.accessibilityViewIsModal = held
-        appWindow?.accessibilityElementsHidden = held
+        appWindow?.accessibilityElementsHidden = hide
         UIAccessibility.post(notification: .screenChanged, argument: nil)
     }
 

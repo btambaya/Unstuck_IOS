@@ -96,31 +96,36 @@ final class TourUITests: XCTestCase {
 
         expectStep("Today narrows it down", shot: "02-today")
         // ROUND-2 LOCKDOWN: a tap outside the panel + spotlight is swallowed.
-        // ROUND-4 A11Y (build 39) went further — the app window's elements are
-        // hidden outright while the tour holds the lock, so the Today header's
-        // avatar is not merely inert, it is UNREACHABLE. That is the stronger
-        // guarantee, and it is what we assert: the element cannot be found, so
-        // neither a tap nor VoiceOver can reach Settings from under the scrim.
+        // ROUND-4 A11Y (build 39) went further — on a step where the touch
+        // layer swallows EVERY app point, the app window's elements are hidden
+        // outright, so the Today header's avatar is not merely inert, it is
+        // UNREACHABLE. That is the stronger guarantee, and it is what we
+        // assert: the element cannot be found, so neither a tap nor VoiceOver
+        // can reach Settings from under the scrim.
         XCTAssertFalse(app.buttons["Account and settings"].firstMatch.exists,
                        "app content must be unreachable while the tour holds the lock")
         XCTAssertFalse(app.navigationBars["Settings"].exists,
                        "Settings must not be open behind the tour")
-        XCTAssertTrue(app.staticTexts["Today narrows it down"].exists,
-                      "blocked tap must not disturb the step")
         snap("02a-lockdown-blocked")
         // ROUND-3 CUTOUT POLICY: on this step the ring is DISPLAY-ONLY — the
-        // SPOTLIGHTED Start-Next hero itself is swallowed too. Its Focus
-        // button mints a real session in normal use; inside the tour the tap
-        // must do NOTHING (no session, step undisturbed).
-        let heroFocus = app.buttons["Focus"].firstMatch
-        XCTAssertTrue(heroFocus.waitForExistence(timeout: 8),
-                      "seeded Today should show the Start-Next hero")
-        heroFocus.tap()
+        // SPOTLIGHTED Start-Next hero is swallowed like everything else, so it
+        // is hidden from the a11y tree too. (Its Focus button mints a real
+        // session in normal use; the end of this test proves it comes back the
+        // moment the tour lets go.)
+        XCTAssertFalse(app.buttons["Focus"].firstMatch.exists,
+                       "a display-only ring must not leave the hero reachable")
+        // The touch layer is the half the a11y tree can't speak for, so probe
+        // it with a RAW coordinate touch — the tab bar, whose position is
+        // fixed and which is unambiguously app content under the scrim.
+        // Tapping "Tasks" must do nothing at all: the step stays put, and the
+        // end-of-test assertions still find Today (a tap that got through
+        // would have left the app on the Tasks tab).
+        app.coordinate(withNormalizedOffset: CGVector(dx: 0.32, dy: 0.925)).tap()
         usleep(900_000)
         XCTAssertFalse(app.staticTexts["FOCUSING"].exists,
-                       "blocked hero tap must not mint a real focus session")
+                       "a swallowed tap must not mint a real focus session")
         XCTAssertTrue(app.staticTexts["Today narrows it down"].exists,
-                      "blocked hero tap must not disturb the step")
+                      "a swallowed tap must not disturb the step")
         snap("02b-cutout-display-only")
         tapPrimary()
         // Opens a real task's detail sheet — the panel must render above it,
@@ -133,6 +138,11 @@ final class TourUITests: XCTestCase {
         // HERE the spotlighted element works — tapping the ringed assistant
         // launcher opens the real Assistant panel.
         expectStep("Ask Unstuck to handle it", shot: "04-assistant")
+        // The a11y lock is SCOPED to the touch policy: where the ring passes
+        // touches through, the ringed control stays in the accessibility tree
+        // too — otherwise this step ("the Assistant lives here, bottom-right")
+        // is followable by sighted users only. Finding the launcher by label
+        // and tapping it is that guarantee.
         app.buttons["Assistant"].firstMatch.tap()
         XCTAssertTrue(app.staticTexts["ASK UNSTUCK TO HANDLE IT"].firstMatch.waitForExistence(timeout: 8),
                       "the spotlighted launcher must open the assistant panel")
@@ -174,6 +184,10 @@ final class TourUITests: XCTestCase {
         // Settings sheet opens on the Notifications section — panel above it,
         // sheet interactive (panel-only claim while it's up).
         expectStep("You set how present it is", shot: "08-notifications")
+        // Same scoping the assistant step relies on: the step-opened Settings
+        // section is passed through by the touch layer, so it must stay in the
+        // a11y tree — "Calm" being findable is what says a VoiceOver user can
+        // actually change the setting this step is about.
         XCTAssertTrue(app.staticTexts["Calm"].firstMatch.waitForExistence(timeout: 8),
                       "settings should be open on the Notifications section")
         tapPrimary()
@@ -186,6 +200,14 @@ final class TourUITests: XCTestCase {
         usleep(800_000)
         XCTAssertFalse(app.staticTexts["You’re ready to begin"].exists)
         XCTAssertFalse(app.staticTexts["FOCUSING"].exists, "demo never minted a session")
+        // The lock let go with the tour: Today's Start-Next hero — the thing
+        // step 2 ringed, and the one element the lockdown hid hardest — is
+        // back in the tree, tab still Today (proof the swallowed tab-bar tap
+        // on step 2 really went nowhere).
+        XCTAssertTrue(app.buttons["Focus"].firstMatch.waitForExistence(timeout: 8),
+                      "seeded Today shows the Start-Next hero once the lock lifts")
+        XCTAssertTrue(app.buttons["Account and settings"].firstMatch.exists,
+                      "the whole app window is reachable again")
         snap("10-done")
     }
 
@@ -251,9 +273,13 @@ final class TourUITests: XCTestCase {
         app.staticTexts["Essential tour"].firstMatch.tap()
         XCTAssertTrue(app.staticTexts["This is Unstuck"].firstMatch.waitForExistence(timeout: 12))
 
-        // Focus the Ask field (tour window becomes key) and type.
+        // Focus the Ask field (tour window becomes key) and type. The app
+        // window is hidden from accessibility on this step, so the tour's own
+        // input is the only text field in the tree — but name it anyway, so
+        // this never silently starts typing into Today's gateway composer.
         app.buttons["Ask a question"].firstMatch.tap()
-        let askField = app.textFields.firstMatch
+        let askField = app.textFields
+            .matching(NSPredicate(format: "placeholderValue BEGINSWITH 'Ask anything'")).firstMatch
         XCTAssertTrue(askField.waitForExistence(timeout: 6), "expected the ask input")
         askField.tap()
         askField.typeText("key window")
@@ -270,11 +296,14 @@ final class TourUITests: XCTestCase {
         app.buttons["New task"].firstMatch.tap()
         XCTAssertTrue(app.staticTexts["What's on your mind?"].firstMatch.waitForExistence(timeout: 8),
                       "new-task sheet should open after the tour exits")
-        // SwiftUI's vertical-axis TextField is backed by a text view; match
-        // whichever element the runtime exposes.
-        let nameView = app.textViews.firstMatch
-        let nameField = nameView.waitForExistence(timeout: 3) ? nameView : app.textFields.firstMatch
-        XCTAssertTrue(nameField.exists, "expected the new-task name input")
+        // Address the sheet's input by IDENTIFIER. `app.textFields.firstMatch`
+        // is wrong here and was the long-standing failure in this test:
+        // Today's gateway composer ("Ask me anything — or hand me your whole
+        // day…") is also a TextField, it sorts first, and from BEHIND the
+        // presented sheet it is of course not hittable — so the tap failed on
+        // an element that had nothing to do with the key-window handback.
+        let nameField = app.textFields["new-task-name"]
+        XCTAssertTrue(nameField.waitForExistence(timeout: 5), "expected the new-task name input")
         nameField.tap()
         nameField.typeText("Buy stamps")
         let typed = (nameField.value as? String) ?? ""

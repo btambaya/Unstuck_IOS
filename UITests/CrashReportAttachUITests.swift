@@ -29,16 +29,20 @@ final class CrashReportAttachUITests: XCTestCase {
         app.buttons["Account and settings"].firstMatch.tap()
         usleep(1_200_000)
 
-        let account = app.staticTexts["Account"].firstMatch
+        // By IDENTIFIER: Settings is a sheet over Today, so a bare label query
+        // can resolve to something behind it.
+        let account = app.buttons["settings-row-Account"].firstMatch
         XCTAssertTrue(account.waitForExistence(timeout: 10), "Settings never opened")
         account.tap()
-        usleep(1_000_000)
+        XCTAssertTrue(app.staticTexts["Your account."].firstMatch.waitForExistence(timeout: 8),
+                      "Settings → Account never opened")
 
         let feedback = app.staticTexts["Send feedback"].firstMatch
         for _ in 0..<12 where !feedback.exists || !feedback.isHittable {
             app.swipeUp(); usleep(300_000)
         }
         XCTAssertTrue(feedback.waitForExistence(timeout: 10), "Account → Send feedback missing")
+        XCTAssertTrue(feedback.isHittable, "Account → Send feedback never scrolled into reach")
         feedback.tap()
         usleep(1_000_000)
 

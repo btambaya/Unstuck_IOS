@@ -540,6 +540,32 @@ func tourClaims(point: CGPoint, ctx: TourClaimContext) -> Bool {
     return true
 }
 
+/// Should the app window be hidden from ACCESSIBILITY while the tour owns the
+/// screen (round-4 lockdown)? The invariant: **never hide from VoiceOver
+/// something the touch layer still accepts touches on.** Hiding the whole app
+/// window is right while `tourClaims` swallows every app point, and wrong the
+/// moment it deliberately passes one through — on those steps the pass-through
+/// control (the ringed assistant launcher; the section a settings step opens)
+/// IS the step, and hiding it leaves the step followable by sighted users only.
+///
+/// Mirrors `tourClaims`' structure deliberately, minus the point: the same
+/// branches, answering "is there ANY pass-through region right now?". Reads
+/// only fields that come from OBSERVABLE model state — never the live UIKit
+/// frames (`panelFrame` / `surfaceRect`), which change without notifying
+/// SwiftUI and would leave the flag stuck at its last value. The scoped
+/// settings exemption therefore lifts hiding as soon as the sheet is up, a
+/// beat before the touch layer resolves the section rect; a11y visibility is
+/// not the boundary that keeps Sign out / Delete account unreachable —
+/// `tourClaims` is, and it still fails closed.
+func tourHidesAppFromAccessibility(ctx: TourClaimContext) -> Bool {
+    if ctx.cardVisible { return true }
+    guard ctx.running else { return false }
+    if ctx.demoStep { return true }
+    if ctx.presentationActive { return !ctx.surfaceExempt }
+    if ctx.cutoutInteractive, let t = ctx.targetRect, t.width > 0, t.height > 0 { return false }
+    return true
+}
+
 // MARK: - panel placement (non-negotiable #1: NEVER cover the spotlight)
 
 enum TourPanelDock: Equatable, Sendable { case top, bottom }
