@@ -97,8 +97,8 @@ final class AppSmokeUITests: XCTestCase {
     func testSettingsSubScreens() throws {
         _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
         usleep(600_000)
-        let avatar = app.buttons["U"].firstMatch
-        guard avatar.waitForExistence(timeout: 4) else { return }
+        let avatar = app.buttons["Account and settings"].firstMatch
+        XCTAssertTrue(avatar.waitForExistence(timeout: 6), "the Today header avatar is missing")
         avatar.tap(); usleep(800_000)
         if app.staticTexts["Focus"].firstMatch.waitForExistence(timeout: 3) {
             app.staticTexts["Focus"].firstMatch.tap(); usleep(700_000); snap("14-settings-focus")
@@ -112,8 +112,9 @@ final class AppSmokeUITests: XCTestCase {
     func testSettingsAndInsights() throws {
         _ = app.buttons["Today"].firstMatch.waitForExistence(timeout: 15)
         usleep(600_000)
-        let avatar = app.buttons["U"].firstMatch
-        if avatar.waitForExistence(timeout: 4) {
+        let avatar = app.buttons["Account and settings"].firstMatch
+        XCTAssertTrue(avatar.waitForExistence(timeout: 6), "the Today header avatar is missing")
+        if true {
             avatar.tap(); usleep(900_000); snap("08-settings")
             let ins = app.staticTexts["Insights"].firstMatch
             if ins.waitForExistence(timeout: 3) {

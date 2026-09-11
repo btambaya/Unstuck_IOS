@@ -96,12 +96,15 @@ final class TourUITests: XCTestCase {
 
         expectStep("Today narrows it down", shot: "02-today")
         // ROUND-2 LOCKDOWN: a tap outside the panel + spotlight is swallowed.
-        // The Today header's avatar normally opens the Settings sheet — while
-        // the tour runs it must do NOTHING.
-        app.buttons["Account and settings"].firstMatch.tap()
-        usleep(800_000)
+        // ROUND-4 A11Y (build 39) went further — the app window's elements are
+        // hidden outright while the tour holds the lock, so the Today header's
+        // avatar is not merely inert, it is UNREACHABLE. That is the stronger
+        // guarantee, and it is what we assert: the element cannot be found, so
+        // neither a tap nor VoiceOver can reach Settings from under the scrim.
+        XCTAssertFalse(app.buttons["Account and settings"].firstMatch.exists,
+                       "app content must be unreachable while the tour holds the lock")
         XCTAssertFalse(app.navigationBars["Settings"].exists,
-                       "blocked tap must not open Settings")
+                       "Settings must not be open behind the tour")
         XCTAssertTrue(app.staticTexts["Today narrows it down"].exists,
                       "blocked tap must not disturb the step")
         snap("02a-lockdown-blocked")
