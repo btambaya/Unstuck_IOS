@@ -152,6 +152,13 @@ final class AssistantModel {
     /// conversation must NOT resurrect the whole thread when it commits.
     @ObservationIgnored private var historyEpoch = 0
 
+    #if DEBUG
+    /// Scripted transport for the XCUITest bulk-turn repro boot
+    /// (UITEST_ASSISTANT_BULK). Never set outside that boot; compiled out of
+    /// Release entirely.
+    @ObservationIgnored var transportOverride: AssistantTransport?
+    #endif
+
     /// Display persistence (the endless thread) + the model window. Both mirror
     /// the web (lib/assistant/use-assistant.ts). `nonisolated` so the pure
     /// `modelWindow` (and its unit tests) can read them off the main actor.
@@ -200,6 +207,7 @@ final class AssistantModel {
         let deps = harnessDeps(base: base, epoch: epoch)
         // The Task inherits this @MainActor isolation, so the loop + the state
         // writes below run on the main actor. It is NOT tied to the sheet.
+        CrashBreadcrumbs.drop("assistant turn start turns:\(base.count)")
         turnTask = Task { [weak self] in
             guard let self else { return }
             let outcome = await AssistantHarness.runTurn(text: text, base: base, deps: deps)
@@ -209,11 +217,13 @@ final class AssistantModel {
                 self.lastReply = reply
                 self.lastReplyTick += 1
                 self.upstreamStreak = 0
+                CrashBreadcrumbs.drop("assistant turn reply")
             case .error(let code):
                 self.error = code
                 self.upstreamStreak = Self.upstreamStreak(after: code, previous: self.upstreamStreak)
+                CrashBreadcrumbs.drop("assistant turn error \(code)")
             case .cancelled:
-                break
+                CrashBreadcrumbs.drop("assistant turn cancelled")
             }
             self.persist()
             self.sending = false
@@ -231,7 +241,11 @@ final class AssistantModel {
     private func harnessDeps(base: [AssistantTurn], epoch: Int) -> AssistantHarness.Deps {
         let api = self.api
         let scratch = TurnScratch()
-        let transport: AssistantTransport = client.map { AssistantClientTransport($0) } ?? NotConfiguredTransport()
+        var transport: AssistantTransport = client.map { AssistantClientTransport($0) } ?? NotConfiguredTransport()
+        #if DEBUG
+        // XCUITest repro boot only (UITEST_ASSISTANT_BULK) — never set in Release.
+        if let scripted = transportOverride { transport = scripted }
+        #endif
         return AssistantHarness.Deps(
             transport: transport,
             api: api,
@@ -616,7 +630,11 @@ final class AssistantModel {
     func runVoiceTool(name: String, argsJSON: String) async -> String {
         let args = ToolArgs(json: argsJSON)
         let scratch = voiceScratch
+        // Crash trail: tool names only, so a fault during a spoken turn is
+        // placed the same way a typed one is.
+        CrashBreadcrumbs.drop("voice.tool.run \(name)")
         let result = await runAssistantTool(name: name, args: args, api: api, scratch: scratch)
+        CrashBreadcrumbs.drop("voice.tool.done \(name) \(result.hasPrefix("error") ? "err" : "ok")")
         if let r = receipt(name: name, args: args, result: result, scratch: scratch) { voiceReceipts.append(r) }
         return result
     }

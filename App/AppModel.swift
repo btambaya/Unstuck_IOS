@@ -223,6 +223,17 @@ final class AppModel {
     /// crash. Seeded on start(), refreshed from the authStateChanges session.
     private(set) var cachedUserId: String?
     private(set) var cachedHasPassword: Bool = true
+    /// The live session's access token, cached from the SAME authStateChanges
+    /// session as the identity above (and refreshed on every `.tokenRefreshed`).
+    /// `voiceAccessToken` reads THIS rather than `auth.currentSession`: that
+    /// accessor is a synchronous keychain read which can fail for reasons that
+    /// have nothing to do with being signed in (an unsigned/dev build has no
+    /// `application-identifier` → errSecMissingEntitlement −34018; a locked
+    /// device; a storage-migration error) — and when it does, realtime voice
+    /// dead-ends on "Please sign in to use voice." while the app is plainly
+    /// signed in (2026-09-11 repro). Not persisted: a cold launch gets it from
+    /// the `.initialSession` event.
+    private(set) var cachedAccessToken: String?
 
     /// Overwrite the cached display name (used right after a successful name
     /// change so Settings/avatar reflect it before the auth `.userUpdated` event
@@ -644,7 +655,13 @@ final class AppModel {
     /// The realtime model id (DashScope Qwen-Omni).
     var voiceModel: String { "qwen3.5-omni-flash-realtime" }
     /// The Supabase access token the proxy validates.
-    var voiceAccessToken: String? { coordinator?.auth.accessToken }
+    /// Prefer the token cached from the auth stream (see `cachedAccessToken`);
+    /// fall back to the stored session only when the cache is cold (e.g. a
+    /// caller that runs before the first authStateChanges event lands).
+    var voiceAccessToken: String? {
+        if let t = cachedAccessToken, !t.isEmpty { return t }
+        return coordinator?.auth.accessToken
+    }
 
     func sendSessionRecap(taskName: String, away: Bool = false) {
         guard let n = coordinator?.notifications else { return }
@@ -724,6 +741,16 @@ final class AppModel {
         if ProcessInfo.processInfo.environment["UITEST_FOCUS"] == "1",
            let t = (try? taskRepo?.fetch(id: "t-proposal")) ?? nil {
             router.beginFocus(t)
+        }
+        // Debug hook: replay the tester-reported BULK calendar turn through the
+        // real assistant (scripted transport, no network) — crash isolation.
+        if ProcessInfo.processInfo.environment["UITEST_ASSISTANT_BULK"] == "1" {
+            AssistantModel.scrubPersisted()
+            assistant.transportOverride = BulkAssistantScript()
+            // A bulk calendar turn also drives the reactive reminder re-sync
+            // (50 new blocks → up to 150 UNNotificationRequests). start() is
+            // what normally arms it; arm it for the repro boot too.
+            startNotifications()
         }
     }
     #endif
@@ -1024,6 +1051,7 @@ final class AppModel {
                     self.cachedEmail = AuthService.email(from: session)
                     self.cachedUserId = AuthService.userId(from: session)
                     self.cachedHasPassword = AuthService.hasPassword(from: session)
+                    self.cachedAccessToken = token
                     // PKCE: classify the just-EXCHANGED session via `amr` once —
                     // only a .signedIn carrying a token the probe hasn't seen
                     // (never the stored-session .initialSession / a refresh).
@@ -1491,13 +1519,13 @@ final class AppModel {
     /// True once the local row + outbox op are committed.
     @discardableResult
     func saveTaskAwaiting(_ task: TaskItem) async -> Bool {
-        guard let write = coordinator?.write else { return false }
+        guard let write else { return false }
         do { try await write.upsertTask(task, nowISO: Self.isoNow()); return true } catch { return false }
     }
 
     @discardableResult
     func deleteTaskAwaiting(_ id: String) async -> Bool {
-        guard let write = coordinator?.write else { return false }
+        guard let write else { return false }
         // Read the row BEFORE the delete: a task promoted from a shared
         // collection item leaves that item ticked with nothing behind it unless
         // we un-tick it for the other members.
@@ -1508,13 +1536,13 @@ final class AppModel {
     }
 
     func saveTagAwaiting(_ tag: TagRow) async {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         try? await write.upsertTag(tag, nowISO: Self.isoNow())
     }
 
     /// `deleteTag`, awaited through the whole cascade.
     func deleteTagAwaiting(_ id: String) async {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         var name: String?
         if let db, let fetched = try? db.fetchById(TagRow.self, id: id) { name = fetched.name }
         let tasks = (try? taskRepo?.all()) ?? []
@@ -1530,19 +1558,19 @@ final class AppModel {
     }
 
     func saveLifeAreaAwaiting(_ area: LifeArea) async {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         try? await write.upsertLifeArea(area, nowISO: Self.isoNow())
     }
 
     func deleteLifeAreaAwaiting(_ id: String) async {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         try? await write.deleteLifeArea(id: id, nowISO: Self.isoNow())
     }
 
     /// `saveBlock`, returning once the local row is committed; the Google
     /// mirror runs behind it exactly as before.
     func saveBlockAwaiting(_ block: CalBlock) async {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
         // Only TASK blocks mirror to Google (spec §1.6): external g_ blocks are
         // read-only mirrors of the remote calendar and must never be
@@ -1555,7 +1583,7 @@ final class AppModel {
     /// event delete (if it was pushed) follows behind — order doesn't matter
     /// to either side, and the executor must not wait on the network.
     func deleteBlockAwaiting(_ block: CalBlock) async {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
         Task { await self.deleteGoogleEvent(for: block) }
     }
@@ -1565,14 +1593,14 @@ final class AppModel {
     func unscheduleAwaiting(_ blockId: String) async {
         if let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == blockId }) {
             await deleteBlockAwaiting(block)
-        } else if let write = coordinator?.write {
+        } else if let write {
             try? await write.deleteCalBlock(id: blockId, nowISO: Self.isoNow())
         }
     }
 
     @discardableResult
     func saveCaptureAwaiting(_ capture: Capture) async -> Bool {
-        guard let write = coordinator?.write else { return false }
+        guard let write else { return false }
         do { try await write.upsertCapture(capture, nowISO: Self.isoNow()); return true } catch { return false }
     }
 

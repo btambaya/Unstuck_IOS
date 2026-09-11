@@ -78,6 +78,17 @@ struct FeedbackSheet: View {
     }
 }
 
+/// What actually gets sent: the user's note, plus the previous session's crash
+/// trail when they left the attach toggle on. This is the ONLY path the trail
+/// ever leaves the device — a report with no trail, or an untoggled one, sends
+/// the note verbatim (a trailing-whitespace-clean body, so the dashboard row
+/// reads the same as it always has).
+func feedbackPayload(note: String, report: String?, attach: Bool) -> String {
+    let text = note.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard attach, let report, !report.isEmpty else { return text }
+    return "\(text)\n\n\(report)"
+}
+
 private enum FeedbackCategory: String, CaseIterable, Identifiable {
     case bug = "Bug", idea = "Idea", praise = "Praise", other = "Other"
     var id: String { rawValue }
@@ -107,6 +118,12 @@ struct FeedbackForm: View {
     @State private var sent = false
     @State private var failed = false
     @SwiftUI.FocusState private var fieldFocused: Bool
+    /// The previous session ended in a crash / main-thread stall: its trail is
+    /// offered here (on by default) so a one-line "it crashed" report finally
+    /// arrives WITH a stack. Tool names + phase markers only — never message
+    /// text (App/Diagnostics/CrashBreadcrumbs.swift).
+    @State private var attachDiagnostics = true
+    private var crashReport: String? { CrashBreadcrumbs.lastReport }
 
     var body: some View {
         ScrollView {
@@ -155,6 +172,21 @@ struct FeedbackForm: View {
             Text("Sent with v\(AppModel.appVersion) · \(screen) · \(AppModel.deviceModelName)")
                 .font(UFont.mono(11)).foregroundStyle(theme.palette.ink4)
 
+            // The last session ended badly — offer its trail, visibly.
+            if crashReport != nil {
+                Toggle(isOn: $attachDiagnostics) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Attach the last crash report")
+                            .font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
+                        Text("Technical only — what the app was doing and where it stopped. No message text.")
+                            .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    }
+                }
+                .tint(theme.palette.coral)
+                .disabled(sending)
+                .accessibilityLabel("Attach the last crash report")
+            }
+
             if failed {
                 Text("Couldn't send — check your connection.")
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.red)
@@ -181,10 +213,13 @@ struct FeedbackForm: View {
         let text = body_.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !sending else { return }
         sending = true; failed = false
+        let attached = (attachDiagnostics ? crashReport : nil)
+        let payload = feedbackPayload(note: text, report: crashReport, attach: attachDiagnostics)
         Task {
-            let ok = await model.sendFeedback(body: text, category: category.apiValue, screen: screen)
+            let ok = await model.sendFeedback(body: payload, category: category.apiValue, screen: screen)
             sending = false
             if ok {
+                if attached != nil { CrashBreadcrumbs.clearLastReport() }
                 sent = true
                 try? await Task.sleep(nanoseconds: 1_100_000_000)
                 onDone()

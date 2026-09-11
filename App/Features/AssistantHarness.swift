@@ -154,6 +154,9 @@ enum AssistantHarness {
 
         for i in 0..<maxIterations {
             if deps.isCancelled() { return .cancelled }
+            // Crash trail: round markers + tool names only, never any content
+            // (App/Diagnostics/CrashBreadcrumbs.swift).
+            CrashBreadcrumbs.drop("assistant round \(i + 1)")
             let ask = await deps.transport.ask(messages: AssistantModel.modelWindow(working), context: deps.context())
             if deps.isCancelled() { return .cancelled }
             switch ask {
@@ -217,9 +220,12 @@ enum AssistantHarness {
                 }
 
                 // Execute each tool call, append its result for the next round.
+                CrashBreadcrumbs.drop("assistant tools \(reply.toolCalls.count)")
                 for call in reply.toolCalls {
                     let args = ToolArgs(json: call.function.arguments)
+                    CrashBreadcrumbs.drop("tool.run \(call.function.name)")
                     var result = await runAssistantTool(name: call.function.name, args: args, api: deps.api, scratch: deps.scratch)
+                    CrashBreadcrumbs.drop("tool.done \(call.function.name) \(result.hasPrefix("error") ? "err" : "ok")")
                     if !result.hasPrefix("error") && !READ_ONLY_TOOLS.contains(call.function.name) { writeToolSucceeded = true }
                     // Truncated tool-call JSON (completion cap) parses to {} —
                     // tell the model WHY so it splits the call instead of flailing.

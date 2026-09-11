@@ -89,6 +89,7 @@ struct AssistantSheet: View {
         .presentationDragIndicator(.visible)
         .fullScreenCover(isPresented: $showVoice) { VoiceModeScreen() }
         .task {
+            CrashBreadcrumbs.drop("assistant sheet open")
             let built = buildAssistantContext(model)
             ctx = built
             // Once per day, greet with a grounded line built from real counts
@@ -107,6 +108,9 @@ struct AssistantSheet: View {
         // On-device dictation streams into the input field via the model bridge.
         .onChange(of: assistant.voiceDraft) { _, v in if assistant.dictating || !v.isEmpty { input = v } }
         .onDisappear {
+            // Crash trail marker: "it crashed after I tried exiting the AI"
+            // (TestFlight, 2026-09-06) — so a fault after this point is placed.
+            CrashBreadcrumbs.drop("assistant sheet close sending:\(assistant.sending)")
             voice.stopListening()
             voice.stopSpeaking()
             assistant.dictating = false

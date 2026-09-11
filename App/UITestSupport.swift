@@ -98,4 +98,50 @@ enum DemoSeed {
                                     ], sortOrder: 1, archived: false))
     }
 }
+
+// MARK: - bulk-turn repro (UITEST_ASSISTANT_BULK)
+//
+// Testers report the app dying "after being asked to add a lot of items to the
+// calendar" (TestFlight 33/34/41). This replays exactly that turn through the
+// REAL AssistantModel / harness / executor / store — no network, no LLM — so
+// the whole app (SwiftUI thread + receipts, calendar relayout, reminder
+// rescheduling, widget snapshots) runs the burst under XCUITest.
+
+import Supabase
+
+@MainActor
+final class BulkAssistantScript: AssistantTransport {
+    /// How many items per round (25 is the executor's create_tasks cap).
+    private let n: Int
+    private var round = 0
+    init(items: Int = 25) { self.n = items }
+
+    private var tomorrow: String { LocalDate.addDays(Clock.todayISO(), 1) }
+
+    func ask(messages: [ChatMessage], context: [String: AnyJSON]) async -> HarnessAsk {
+        round += 1
+        switch round {
+        case 1:
+            // One create_tasks carrying date + startTime per item: each lands a
+            // task AND a calendar block, all on the same day, overlapping.
+            let items = (0..<n).map { i in
+                #"{"name":"Bulk task \#(i + 1)","estimateMin":45,"date":"\#(tomorrow)","startTime":"\#(String(format: "%02d:00", 8 + i % 10))"}"#
+            }.joined(separator: ",")
+            return .ok(HarnessReply(content: "Adding those now.", toolCalls: [
+                ToolCall(id: "bulk-1", type: "function",
+                         function: ToolFunction(name: "create_tasks", arguments: #"{"tasks":[\#(items)]}"#)),
+            ]))
+        case 2:
+            // A second round of block_time calls — 25 tool calls in ONE reply.
+            let calls = (0..<n).map { i in
+                ToolCall(id: "blk-\(i)", type: "function",
+                         function: ToolFunction(name: "block_time",
+                                                arguments: #"{"name":"Commitment \#(i + 1)","date":"\#(tomorrow)","startTime":"\#(String(format: "%02d:30", 8 + i % 10))","durationMin":90}"#))
+            }
+            return .ok(HarnessReply(content: "And the commitments.", toolCalls: calls))
+        default:
+            return .ok(HarnessReply(content: "That's \(n * 2) things on \(tomorrow)."))
+        }
+    }
+}
 #endif

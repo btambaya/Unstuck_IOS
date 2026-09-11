@@ -84,6 +84,12 @@ struct UnstuckApp: App {
     @Environment(\.scenePhase) private var scenePhase
     @State private var model = AppModel()
 
+    init() {
+        // Arm the crash/hang trail before anything else runs, so a fault during
+        // launch is recorded too (App/Diagnostics/CrashBreadcrumbs.swift).
+        CrashBreadcrumbs.install()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()
@@ -106,6 +112,21 @@ struct UnstuckApp: App {
                 }
                 .task {
                     #if DEBUG
+                    // Diagnostics self-test: the ONLY way to regression-test a
+                    // crash reporter is to crash. `UITEST_FORCE_CRASH=signal|
+                    // exception` faults ~2s after launch; the next launch must
+                    // find the trail with a fault line in it. DEBUG only.
+                    if let kind = ProcessInfo.processInfo.environment["UITEST_FORCE_CRASH"] {
+                        Task {
+                            try? await Task.sleep(nanoseconds: 2_000_000_000)
+                            CrashBreadcrumbs.drop("forcing crash \(kind)")
+                            if kind == "exception" {
+                                NSException(name: .genericException, reason: "forced diagnostics self-test", userInfo: nil).raise()
+                            } else {
+                                raise(SIGSEGV)
+                            }
+                        }
+                    }
                     if ProcessInfo.processInfo.environment["UITEST_SEED"] == "1" {
                         model.startUITestMode()
                         return
