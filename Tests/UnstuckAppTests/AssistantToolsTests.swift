@@ -126,6 +126,14 @@ final class FakeAssistantState: AssistantAppState {
         guard let c = collections.first(where: { $0.id == id }) else { return false }
         return c.myRole != "viewer"
     }
+    /// Who "I" am for `ownsCollection`: a row with another ownerId is shared
+    /// WITH me.
+    var myUserId = "me"
+    /// The production rule (AppModel.isOwner): no ownerId = a local/own row.
+    func ownsCollection(_ id: String) -> Bool {
+        guard let c = collections.first(where: { $0.id == id }) else { return false }
+        return c.ownerId == nil || c.ownerId == myUserId
+    }
 
     func getShareCandidates() -> [ShareCandidate] { candidates }
     func stageShare(_ p: PendingShare) { staged.append(p) }
@@ -231,9 +239,10 @@ func block(_ id: String, _ taskId: String, _ date: String, _ startTime: String =
 func capture(_ id: String, _ body: String, at: String = "2026-09-01T08:00:00.000Z", tag: CaptureTag = .idea, taskId: String? = nil) -> Capture {
     Capture(id: id, taskId: taskId, sessionId: nil, tag: tag, body: body, at: at)
 }
-func list(_ id: String, _ name: String, _ items: [(String, String)] = [], myRole: String? = nil, members: [String]? = nil) -> ItemCollection {
+func list(_ id: String, _ name: String, _ items: [(String, String)] = [], myRole: String? = nil,
+          members: [String]? = nil, ownerId: String? = nil) -> ItemCollection {
     ItemCollection(id: id, name: name, color: "indigo", items: items.map { CollectionItem(id: $0.0, body: $0.1, at: PAST_CREATED) },
-                   sortOrder: 0, members: members, myRole: myRole)
+                   sortOrder: 0, ownerId: ownerId, members: members, myRole: myRole)
 }
 func fact(_ id: String, _ text: String) -> ProfileFact {
     ProfileFact(id: id, category: .person, fact: text, source: .chat, createdAt: PAST_CREATED, updatedAt: PAST_CREATED)
@@ -711,10 +720,11 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     func testRenameArchiveDeleteList() async {
-        api.collections = [list("v", "Shared", myRole: "viewer"), list("l1", "Old")]
+        api.collections = [list("v", "Shared", myRole: "viewer", ownerId: "someone-else"), list("l1", "Old")]
         await eq("rename_list", #"{"listId":"l1","name":"New"}"#, "ok: renamed list \"Old\" → \"New\"")
         XCTAssertEqual(api.collections[1].name, "New")
-        await eq("rename_list", #"{"listId":"v","name":"Hijack"}"#, "error: you can't edit \"Shared\"")
+        await eq("rename_list", #"{"listId":"v","name":"Hijack"}"#,
+                 "error: \"Shared\" is shared with you by its owner — only they can rename it. You can still add, edit and tick items.")
         await eq("rename_list", #"{"listId":"l1"}"#, "error: name required")
         await eq("rename_list", #"{"listId":"zz","name":"X"}"#, "error: list not found")
         await eq("archive_list", #"{"listId":"l1"}"#, "ok: archived list \"New\"")
@@ -724,6 +734,32 @@ final class AssistantToolsTests: XCTestCase {
         await eq("delete_list", #"{"listId":"l1"}"#, "ok: deleted list \"New\"")
         XCTAssertEqual(api.collections.map(\.id), ["v"])
         await eq("delete_list", #"{"listId":"zz"}"#, "error: list not found")
+    }
+
+    /// Rename / archive / delete are OWNER-only. An EDITOR on someone else's
+    /// list used to pass the `canEditCollection` gate: the server accepts the
+    /// write and silently discards it (RLS + the metadata lock), so the
+    /// assistant announced a change that snapped back on the next sync. A list
+    /// created in the SAME turn is still ours, so it must stay allowed.
+    func testOwnerOnlyListActionsRefuseAnEditorOnSomeoneElsesList() async {
+        api.collections = [list("e", "Trip plan", [("i1", "Book hotel")], myRole: "editor", ownerId: "owner-1")]
+        await eq("rename_list", #"{"listId":"e","name":"Mine now"}"#,
+                 "error: \"Trip plan\" is shared with you by its owner — only they can rename it. You can still add, edit and tick items.")
+        await eq("archive_list", #"{"listId":"e"}"#,
+                 "error: \"Trip plan\" is shared with you by its owner — only they can archive it. You can still add, edit and tick items.")
+        await eq("archive_list", #"{"listId":"e","archived":false}"#,
+                 "error: \"Trip plan\" is shared with you by its owner — only they can unarchive it. You can still add, edit and tick items.")
+        await eq("delete_list", #"{"listId":"e"}"#,
+                 "error: \"Trip plan\" is shared with you by its owner — only they can delete it. You can still add, edit and tick items.")
+        // Nothing changed, and the list is still there.
+        XCTAssertEqual(api.collections.map(\.name), ["Trip plan"])
+        XCTAssertNil(api.collections[0].archived)
+        // Editing ITEMS on the same list is still allowed (editor rights).
+        await eq("add_to_list", #"{"listId":"e","body":"Pack"}"#, "ok: added to \"Trip plan\"")
+        // A list created this turn has no ownerId yet — still ours to rename.
+        let created = await run("create_list", #"{"name":"Fresh"}"#)
+        let id = created.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        await eq("rename_list", #"{"listId":"\#(id)","name":"Fresher"}"#, "ok: renamed list \"Fresh\" → \"Fresher\"")
     }
 
     func testListItemEditsTicksAndRemoves() async {

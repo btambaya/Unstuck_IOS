@@ -110,6 +110,51 @@ public func occurrenceBlockFor(_ rowId: String, tasks: [TaskItem], blocks: [CalB
     return tasks.contains { $0.id == b.taskId && $0.recurrence != nil } ? b : nil
 }
 
+/// The row a FOCUS deep link (`unstuck://focus/<id>`) must open, given the id
+/// it carries. Every in-app "Start" hands FocusView the ROW the user tapped —
+/// an occurrence row for a repeating series — and FocusView resolves it
+/// (`occurrenceFocusTarget`), so the live session runs on the template and
+/// carries the day's block. A deep link is the one focus entry point that
+/// arrives as a bare id, and BOTH of its senders got that id wrong:
+///
+///  • the starts-now notification's "Start" action carries the block's
+///    `taskId`, which for a recurring series is the hidden TEMPLATE. Opening
+///    the template ran the session with NO occurrence attached, so "Done"
+///    marked the TEMPLATE done — ending the whole series — while today's
+///    occurrence stayed open;
+///  • the assistant's `open_screen: focus` re-opens the live session on its
+///    occurrence ROW id (a cal_block id), which `taskRepo.fetch` could never
+///    resolve, so it silently landed on Today instead of the running session.
+///
+/// The rule (web `resolveFocusTarget`, Android parity): a recurring series is
+/// always focused through an OCCURRENCE row, everything else through its own
+/// task row.
+///  • a task-block id → that block's row (the occurrence for a recurring
+///    template, the plain task otherwise);
+///  • a plain task id → the task;
+///  • a recurring TEMPLATE id → its live occurrence: today's if still open,
+///    else the earliest open future one, else today's (already ticked), else
+///    the template itself when it has no occurrence blocks at all;
+///  • an unknown id → nil (the caller falls back to Today).
+public func focusRowForId(_ id: String, tasks: [TaskItem], blocks: [CalBlock], todayISO: String) -> TaskItem? {
+    guard !id.isEmpty else { return nil }
+    // A block id: the occurrence row for a recurring template, else its task.
+    if let block = blocks.first(where: { $0.id == id && isTaskBlock($0) }) {
+        return taskForBlock(block, tasks: tasks)
+    }
+    guard let task = tasks.first(where: { $0.id == id }) else { return nil }
+    guard task.recurrence != nil else { return task }
+    // A template: pick the day's occurrence so the session carries the block.
+    let mine = blocks
+        .filter { isTaskBlock($0) && $0.taskId == task.id && !$0.skipped }
+        .sorted { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
+    let live = mine.first { $0.date == todayISO && !$0.done }
+        ?? mine.first { $0.date > todayISO && !$0.done }
+        ?? mine.first { $0.date == todayISO }
+    guard let live else { return task }
+    return taskForBlock(live, tasks: tasks) ?? task
+}
+
 /// The row to open when a calendar block is tapped: the per-day OCCURRENCE
 /// (id = block id) when the block belongs to a recurring template, else the
 /// normal task. Lets the detail screen treat it as an occurrence.

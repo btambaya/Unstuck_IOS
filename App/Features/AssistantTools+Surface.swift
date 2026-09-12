@@ -7,6 +7,21 @@
 import Foundation
 import UnstuckCore
 
+/// Refusal for an owner-only list action attempted on a list shared WITH the
+/// user, or nil when it's allowed. Rename / archive / delete are owner-only
+/// both in the UI and server-side (RLS + the metadata lock accept an EDITOR's
+/// write and silently discard it), so gating them on `canEditCollection` made
+/// the assistant report a change that snapped back a second later. A list
+/// created in THIS turn is ours by construction (the local row has no ownerId
+/// until the server echo lands), so it bypasses the check — same as web.
+@MainActor
+private func ownerOnlyRefusal(_ c: ItemCollection, verb: String,
+                              api: AssistantAppState, scratch: TurnScratch) -> String? {
+    if scratch.newLists[c.id] != nil { return nil }
+    if api.ownsCollection(c.id) { return nil }
+    return "error: \"\(c.name)\" is shared with you by its owner — only they can \(verb) it. You can still add, edit and tick items."
+}
+
 // MARK: - dispatcher for the 2026-09-02 tools
 
 @MainActor
@@ -271,20 +286,20 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let nm = args.str("name")
         guard let c else { return "error: list not found" }
         guard let nm else { return "error: name required" }
-        if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
+        if let refusal = ownerOnlyRefusal(c, verb: "rename", api: api, scratch: scratch) { return refusal }
         api.renameCollection(c.id, name: nm)
         return "ok: renamed list \"\(c.name)\" → \"\(nm)\""
 
     case "archive_list":
         guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
-        if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
         let archived = args.bool("archived") ?? true
+        if let refusal = ownerOnlyRefusal(c, verb: archived ? "archive" : "unarchive", api: api, scratch: scratch) { return refusal }
         api.updateCollection(c.id, archived: archived, color: nil)
         return "ok: \(archived ? "archived" : "unarchived") list \"\(c.name)\""
 
     case "delete_list":
         guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
-        if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
+        if let refusal = ownerOnlyRefusal(c, verb: "delete", api: api, scratch: scratch) { return refusal }
         api.removeCollection(c.id)
         scratch.newLists.removeValue(forKey: c.id)
         return "ok: deleted list \"\(c.name)\""

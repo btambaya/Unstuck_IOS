@@ -79,11 +79,14 @@ public func pickTodayHero(
     areaFilter: String? = nil,
     excludeIds: Set<String>? = nil
 ) -> TaskItem? {
-    // Today's open rows (non-template today tasks + today's occurrences), minus
+    // Today's OPEN rows (non-template today tasks + today's occurrences), minus
     // the live-focused task and anything assigned away, narrowed by the active area.
+    // `!done` is explicit: the Today bucket KEEPS a recurring occurrence that was
+    // ticked today (so the win stays visible and can be un-ticked), and the hero
+    // must never offer to start work that is already finished.
     let rows = visibleTasks(view: .today, tasks: tasks, blocks: blocks, now: now,
                             activeArea: nil, slipMode: false)
-        .filter { $0.id != liveTaskId && !(excludeIds?.contains($0.id) ?? false)
+        .filter { !$0.done && $0.id != liveTaskId && !(excludeIds?.contains($0.id) ?? false)
             && matchesArea($0.lifeArea, areaFilter) }
     if rows.isEmpty { return nil }
 

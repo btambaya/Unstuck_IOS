@@ -1586,6 +1586,19 @@ final class AppModel {
     /// mirror runs behind it exactly as before.
     func saveBlockAwaiting(_ block: CalBlock) async {
         guard let write else { return }
+        // Scheduling ends "Later" parking. Done HERE — the one choke point
+        // every scheduling path funnels through (the Schedule sheet, a
+        // calendar/mini-calendar drop, create, loop-promote, the assistant's
+        // schedule_task/bulk tools) — so a parked task that just got a slot
+        // stops being filtered out of every active list while sitting on the
+        // calendar. Mirrors web's clearLaterFlag / Android's scheduleTaskNow.
+        // (Only the block's OWN task is read — a whole-table fetch here would
+        // run once per block in a bulk calendar turn.)
+        let nowISO = Self.isoNow()
+        if let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
+           let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
+            try? await write.upsertTask(unparked, nowISO: nowISO)
+        }
         try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
         // Only TASK blocks mirror to Google (spec §1.6): external g_ blocks are
         // read-only mirrors of the remote calendar and must never be
@@ -1798,8 +1811,15 @@ final class AppModel {
         saveBlock(next)
         guard let taskId = block.taskId, isUUID(taskId), let write = coordinator?.write,
               let repo = taskRepo, let task = (try? repo.fetch(id: taskId)) ?? nil else { return }
-        let bumped = bumpMoveCount(task, nowISO: Self.isoNow())
-        Task { try? await write.upsertTask(bumped, nowISO: Self.isoNow()) }
+        // The bump is a WHOLE-ROW upsert, and `saveBlock` un-parks the owning
+        // task asynchronously — a bump built from the row as it was BEFORE the
+        // un-park raced it and wrote `later: true` straight back (the task then
+        // sat on the calendar while every active list filtered it out).
+        // Compose the two into ONE payload so either order lands correctly.
+        let nowISO = Self.isoNow()
+        let owner = unparkedTaskForBlock(next, tasks: [task], nowISO: nowISO) ?? task
+        let bumped = bumpMoveCount(owner, nowISO: nowISO)
+        Task { try? await write.upsertTask(bumped, nowISO: nowISO) }
     }
 
     /// Schedule a task into the first free slot on `date` (default today).
@@ -1855,7 +1875,12 @@ final class AppModel {
                 moved.date = iso
                 moved.startTime = startTime
                 saveBlock(moved)   // moves the Google event too (PATCH) when pushed
-                let bumped = bumpMoveCount(task, nowISO: now)
+                // Compose the un-park into the bump: the bump is a whole-row
+                // upsert and `saveBlock` un-parks asynchronously, so a bump
+                // built from the pre-un-park row raced it and wrote
+                // `later: true` back over the freshly-scheduled task.
+                let owner = unparkedTaskForBlock(moved, tasks: [task], nowISO: now) ?? task
+                let bumped = bumpMoveCount(owner, nowISO: now)
                 Task { try? await write.upsertTask(bumped, nowISO: now) }
             }
         } else {

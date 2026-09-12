@@ -137,19 +137,54 @@ public struct CollectionShareClient: Sendable {
         } catch { return ShareResult(outcome: .error, memberUserIds: []) }
     }
 
-    /// Remove a joined member (owner-only).
-    public func unshare(collectionId: String, userId: String) async {
-        _ = try? await call(ShareBody(action: "remove", collectionId: collectionId, userId: userId))
+    /// Did the server actually DO the revoke? Every success branch of
+    /// share-collection answers `{ ok: true, … }`; every refusal answers a
+    /// non-2xx with `{ error: '…' }`. The three revoke calls used to be
+    /// `_ = try? await call(…)`, which swallowed a 403 (not the owner / no
+    /// longer a member), a 5xx and an offline failure alike — so the sheet
+    /// told the owner the person had been removed while they kept full access.
+    private func confirmed(_ body: ShareBody) async -> Bool {
+        do {
+            let r = try await call(body)
+            guard Self.revokeConfirmed(ok: r.ok, error: r.error) else {
+                print("[share] \(body.action) refused: \(r.error ?? "no ok in response")")
+                return false
+            }
+            return true
+        } catch {
+            print("[share] \(body.action) failed: \(error)")
+            return false
+        }
     }
 
-    /// Cancel a pending email invite (owner-only).
-    public func cancelInvite(collectionId: String, email: String) async {
-        _ = try? await call(ShareBody(action: "remove", collectionId: collectionId, email: email))
+    /// Pure revoke verdict, exposed for tests: only an explicit `ok: true` with
+    /// no `error` counts. A 4xx/5xx throws before this and is a refusal too.
+    static func revokeConfirmed(ok: Bool?, error: String?) -> Bool {
+        ok == true && (error ?? "").isEmpty
     }
 
-    /// Leave a collection shared WITH me.
-    public func leave(collectionId: String) async {
-        _ = try? await call(ShareBody(action: "leave", collectionId: collectionId))
+    /// Same verdict over a raw response body — the shape the edge function
+    /// actually returns (`{"ok":true,"released":0}` vs `{"error":"forbidden"}`).
+    static func revokeConfirmed(responseJSON: Data) -> Bool {
+        guard let r = try? JSONDecoder().decode(ShareResponse.self, from: responseJSON) else { return false }
+        return revokeConfirmed(ok: r.ok, error: r.error)
+    }
+
+    /// Remove a joined member (owner-only). TRUE only when the server confirmed.
+    public func unshare(collectionId: String, userId: String) async -> Bool {
+        await confirmed(ShareBody(action: "remove", collectionId: collectionId, userId: userId))
+    }
+
+    /// Cancel a pending email invite (owner-only). TRUE only when confirmed.
+    public func cancelInvite(collectionId: String, email: String) async -> Bool {
+        await confirmed(ShareBody(action: "remove", collectionId: collectionId, email: email))
+    }
+
+    /// Leave a collection shared WITH me. TRUE only when the server confirmed —
+    /// dropping the row locally on a refusal looked like it worked and brought
+    /// the list straight back on the next hydrate.
+    public func leave(collectionId: String) async -> Bool {
+        await confirmed(ShareBody(action: "leave", collectionId: collectionId))
     }
 
     /// Joined members + pending invites for the share sheet.

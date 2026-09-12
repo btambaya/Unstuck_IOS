@@ -198,9 +198,25 @@ extension AppModel {
         if link.hasPrefix("unstuck://focus/") {
             // "Start" on the starts-now notification → begin the session +
             // open Focus (FocusModel.init starts the timer).
+            //
+            // RECURRING: resolve the id through `focusRowForId` rather than a
+            // bare task fetch. A reminder carries the block's taskId — the
+            // hidden TEMPLATE for a series — and focusing the template ran the
+            // session with no occurrence attached, so "Done" marked the
+            // template done (ending the series) and left today's occurrence
+            // open. The assistant's re-open sends the OCCURRENCE row id (a
+            // cal_block id), which a task fetch could never resolve, so it
+            // silently landed on Today instead of the live session.
             let id = String(link.dropFirst("unstuck://focus/".count))
-            if let t = (try? taskRepo?.fetch(id: id)) ?? nil { router.beginFocus(t) }
-            else { router.select(.today) }
+            let tasks = (try? taskRepo?.all()) ?? []
+            let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+            if let t = focusRowForId(id, tasks: tasks, blocks: blocks, todayISO: Clock.todayISO()) {
+                router.beginFocus(t)
+            } else if let t = (try? taskRepo?.fetch(id: id)) ?? nil {
+                router.beginFocus(t)
+            } else {
+                router.select(.today)
+            }
             return
         }
         if link.hasPrefix("unstuck://task/") {

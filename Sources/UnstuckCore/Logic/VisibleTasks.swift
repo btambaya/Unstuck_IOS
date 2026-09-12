@@ -92,8 +92,13 @@ public struct VisibleTasksPrep: Sendable {
             isTaskBlock($0) && !$0.skipped && ($0.taskId.map { templateIds.contains($0) } ?? false) && $0.date >= today
         }
         let todayOccIds = Set(occBlocks.filter { $0.date == today }.map { $0.id })
-        var nextPerTemplate: [String: CalBlock] = [:]   // template id -> its earliest FUTURE occurrence block
-        for b in occBlocks where b.date > today {
+        // template id -> its earliest FUTURE, STILL-OPEN occurrence block. Done
+        // occurrences are skipped HERE, not filtered after the pick: choosing
+        // tomorrow's block and only then dropping it for being done removed the
+        // whole series from Upcoming (ticking one future occurrence hid the
+        // daily task) instead of advancing to the next open one.
+        var nextPerTemplate: [String: CalBlock] = [:]
+        for b in occBlocks where b.date > today && !b.done {
             guard let tid = b.taskId else { continue }
             if let cur = nextPerTemplate[tid], cur.date <= b.date { continue }
             nextPerTemplate[tid] = b
@@ -174,7 +179,11 @@ public func visibleTasks(
                 (isCreatedToday(t, now: now) && !upcomingTaskIds.contains(t.id))
             )
         }
-        byView = nt + todayOccurrences.filter { !$0.done }
+        // Today's occurrence STAYS in the bucket once ticked (the same rule the
+        // Today tab's own list uses): dropping it on completion made it vanish
+        // from /tasks entirely — Completed and All never showed occurrence rows
+        // — so the win was invisible and no row was left to un-tick it from.
+        byView = nt + todayOccurrences.filter { !$0.done || isCompletedToday($0, now: now) }
     case .backlog:
         // Open work not actively planned AND sitting ≥ a day: never scheduled, or
         // only ever scheduled in the past (overdue). PLUS one overdue row per
@@ -194,7 +203,10 @@ public func visibleTasks(
     case .later:
         byView = nonTemplates.filter { !$0.done && ($0.later ?? false) == true }
     case .completed:
-        byView = nonTemplates.filter { $0.done }
+        // Occurrence rows carry their own done/completedAt (on the cal_block),
+        // so a ticked recurring occurrence belongs here too — otherwise it
+        // existed in no /tasks view at all.
+        byView = nonTemplates.filter { $0.done } + todayOccurrences.filter { $0.done }
     case .all:
         // The master list of distinct tasks — NO per-day occurrence rows.
         byView = nonTemplates.filter { !$0.done || isCompletedToday($0, now: now) }

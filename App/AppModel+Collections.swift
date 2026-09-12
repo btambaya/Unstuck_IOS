@@ -486,12 +486,19 @@ extension AppModel {
                 doneBlock.completedAt = Self.isoNow()
                 saveBlock(doneBlock)
             }
-        } else if markDone {
+        } else if markDone && focusMayCompleteRow(task) {
             var done = focused
             done.done = true
             landedRow = applyCompletion(done, prior: task, nowISO: Self.isoNow())
             notifyTaskDoneIfShared(task)
         }
+        // markDone on a recurring TEMPLATE with no occurrence attached falls
+        // through deliberately: flipping a template's own `done` ENDS the whole
+        // series (it stops generating and appears in no list), which is never
+        // what "I finished this session" means. It is reachable from the
+        // starts-now notification's "Start" when today's occurrence was ticked
+        // or skipped between the notification and the tap. The time still
+        // accrues on the series; no day is falsely marked off.
         if sharedLedger {
             // Order matters: enqueue the (whole-row) task write DIRECTLY and
             // await it, flush it to the server, THEN fire the RPC — so the
@@ -625,22 +632,37 @@ extension AppModel {
         if result.outcome == .ok || result.outcome == .invited { await coord.rehydrateCollections() }
         return result.outcome
     }
-    func unshareCollection(_ collectionId: String, userId: String) async {
-        await coordinator?.share.unshare(collectionId: collectionId, userId: userId)
-        await coordinator?.rehydrateCollections()
+    /// Revoke a member's access. TRUE only when the SERVER confirmed it — a
+    /// refusal (403 / 5xx / offline) must not be reported as "removed" while
+    /// the member still has the list.
+    @discardableResult
+    func unshareCollection(_ collectionId: String, userId: String) async -> Bool {
+        guard let coord = coordinator else { return false }
+        let ok = await coord.share.unshare(collectionId: collectionId, userId: userId)
+        if ok { await coord.rehydrateCollections() }
+        return ok
     }
-    func cancelCollectionInvite(_ collectionId: String, email: String) async {
-        await coordinator?.share.cancelInvite(collectionId: collectionId, email: email)
+    @discardableResult
+    func cancelCollectionInvite(_ collectionId: String, email: String) async -> Bool {
+        guard let coord = coordinator else { return false }
+        return await coord.share.cancelInvite(collectionId: collectionId, email: email)
     }
-    /// Fire-and-forget (not screen-scoped): the caller pops the screen immediately,
-    /// which would cancel a screen-scoped task before the leave RPC + local drop.
-    func leaveCollection(_ collectionId: String) {
-        guard let coord = coordinator, let db else { return }
+    /// Not screen-scoped (the unstructured Task outlives the screen the caller
+    /// pops), so the leave RPC + local drop always complete. The local row is
+    /// dropped ONLY once the server confirms — dropping it on a refusal looked
+    /// like it worked and brought the list straight back on the next hydrate
+    /// with no explanation. `onResult` carries the verdict back to the UI.
+    func leaveCollection(_ collectionId: String, onResult: (@MainActor (Bool) -> Void)? = nil) {
+        guard let coord = coordinator, let db else { onResult?(false); return }
         let share = coord.share
         Task {
-            await share.leave(collectionId: collectionId)
+            guard await share.leave(collectionId: collectionId) else {
+                onResult?(false)
+                return
+            }
             try? db.deleteById(ItemCollection.self, id: collectionId)  // lose access → drop locally
             await coord.rehydrateCollections()
+            onResult?(true)
         }
     }
     /// The share sheet's roster. Listing is also how the owner LEARNS a mailed
@@ -746,14 +768,20 @@ extension AppModel {
     }
 
     /// Block an abusive collaborator: add to the blocklist + remove them from
-    /// this shared collection (so they lose access immediately).
-    func blockUser(email: String, inCollection collectionId: String, userId: String?) {
+    /// this shared collection (so they lose access immediately). The blocklist
+    /// is device-local and always takes effect; `onRemoveFailed` fires when the
+    /// server refused the REMOVAL, so the UI can say the person still has
+    /// access instead of showing them silently gone.
+    func blockUser(email: String, inCollection collectionId: String, userId: String?,
+                   onRemoveFailed: (@MainActor () -> Void)? = nil) {
         var s = blockedEmails
         s.insert(email.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
         UserDefaults.standard.set(Array(s), forKey: Self.blockedEmailsKey)
         Task {
-            if let userId { await unshareCollection(collectionId, userId: userId) }
-            else { await cancelCollectionInvite(collectionId, email: email) }
+            let ok = userId != nil
+                ? await unshareCollection(collectionId, userId: userId!)
+                : await cancelCollectionInvite(collectionId, email: email)
+            if !ok { onRemoveFailed?() }
         }
     }
 

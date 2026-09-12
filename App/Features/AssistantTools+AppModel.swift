@@ -109,6 +109,12 @@ final class AppModelAssistantState: AssistantAppState {
         guard let c = collection(id) else { return false }
         return model.canEdit(c)
     }
+    /// Owner-only actions (rename / archive / delete) — the same `isOwner` the
+    /// collection screen gates its own buttons on. Unknown → false.
+    func ownsCollection(_ id: String) -> Bool {
+        guard let c = collection(id) else { return false }
+        return model.isOwner(c)
+    }
 
     // MARK: sharing
 

@@ -262,6 +262,10 @@ struct CollectionDetailView: View {
     @State private var revealedId: String?
     @State private var confirmDelete = false
     @State private var showShare = false
+    /// Set when the server REFUSED a "Leave" — the screen stays put and says so
+    /// instead of popping as though access were gone.
+    @State private var leaveFailed = false
+    @State private var leaving = false
     @State private var promoteTarget: CollectionItem?
     @State private var byTimeTarget: CollectionItem?
     @SwiftUI.FocusState private var addFocused: Bool
@@ -302,6 +306,11 @@ struct CollectionDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("This collection and its \(collection?.items.count ?? 0) item(s) are removed.")
+        }
+        .alert("Couldn't leave this list", isPresented: $leaveFailed) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("The server didn't accept it, so you still have access. Check your connection and try again.")
         }
     }
 
@@ -357,10 +366,21 @@ struct CollectionDetailView: View {
                                 }.buttonStyle(.plain)
                             }
                         } else {
-                            Button { model.leaveCollection(col.id); dismiss() } label: {
-                                Text("Leave").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink3)
+                            // Pop only once the SERVER confirms the leave — the
+                            // old immediate dismiss claimed access was gone
+                            // even when the call was refused, and the list
+                            // reappeared on the next hydrate unexplained.
+                            Button {
+                                leaving = true
+                                model.leaveCollection(col.id) { ok in
+                                    leaving = false
+                                    if ok { dismiss() } else { leaveFailed = true }
+                                }
+                            } label: {
+                                Text(leaving ? "Leaving…" : "Leave")
+                                    .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink3)
                                     .padding(.horizontal, 6).padding(.vertical, 4)
-                            }.buttonStyle(.plain)
+                            }.buttonStyle(.plain).disabled(leaving)
                         }
                     }
                 }
@@ -747,7 +767,14 @@ struct CollectionShareView: View {
                 Button { remove(m) } label: { Label("Remove from list", systemImage: "xmark") }
                 Button { reportTarget = m } label: { Label("Report…", systemImage: "flag") }
                 Button(role: .destructive) {
-                    model.blockUser(email: m.email, inCollection: collectionId, userId: m.userId)
+                    let prior = members
+                    // The blocklist is device-local and always sticks; only the
+                    // server-side REMOVAL can be refused — put the row back and
+                    // say so rather than implying they lost access.
+                    model.blockUser(email: m.email, inCollection: collectionId, userId: m.userId) {
+                        members = prior
+                        message = (false, "Blocked \(m.email), but couldn't remove them from this list — try again.")
+                    }
                     members.removeAll { $0.id == m.id }
                 } label: { Label("Block \(m.email)", systemImage: "hand.raised") }
             } label: {
@@ -784,11 +811,22 @@ struct CollectionShareView: View {
         }
     }
 
+    /// Revoke one person's access. The row goes optimistically, but a server
+    /// REFUSAL (403 / 5xx / offline) puts it back and says so — this used to
+    /// ignore the answer entirely, so a failed removal still told the owner the
+    /// person was gone while they kept full access to the list.
     private func remove(_ m: CollectionMemberInfo) {
+        let prior = members
         members.removeAll { $0.id == m.id }   // optimistic
         Task {
-            if m.pending { await model.cancelCollectionInvite(collectionId, email: m.email) }
-            else { await model.unshareCollection(collectionId, userId: m.userId) }
+            let ok = m.pending
+                ? await model.cancelCollectionInvite(collectionId, email: m.email)
+                : await model.unshareCollection(collectionId, userId: m.userId)
+            if !ok {
+                members = prior
+                message = (false, "Couldn't remove \(m.email). They still have access — try again.")
+                return
+            }
             await refresh()
         }
     }

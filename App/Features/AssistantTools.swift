@@ -74,6 +74,12 @@ protocol AssistantAppState: AnyObject {
     func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?)
     func removeCollectionItem(collectionId: String, itemId: String)
     func canEditCollection(_ id: String) -> Bool
+    /// Rename / archive / delete are OWNER-only — in the UI (CollectionsFeature
+    /// gates them on `isOwner`) and server-side (RLS + the metadata lock), where
+    /// an EDITOR's write is accepted and silently discarded. Gating those tools
+    /// on `canEditCollection` let the assistant report a change that reverted a
+    /// second later.
+    func ownsCollection(_ id: String) -> Bool
     // ── sharing ──
     func getShareCandidates() -> [ShareCandidate]
     /// Stage a share for the USER to confirm on screen. Never shares.
