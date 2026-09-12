@@ -14,9 +14,9 @@ import UnstuckCore
 
 /// Compact snapshot of the user's world for the model: today + precomputed
 /// dates, local time + free windows, name preferences, profile facts, tone,
-/// what's been noticed, this week's blocks, areas/tags, open captures, the
-/// circle, a live focus session, ≤60 open tasks (with their NEXT live block)
-/// and ≤12 lists × 25 items.
+/// what's been noticed, this week's blocks, areas/tags, open captures (ids +
+/// tags, no text), how many people are in the circle, a live focus session,
+/// ≤60 open tasks (with their NEXT live block) and ≤12 lists (names + counts).
 @MainActor
 func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [String: AnyJSON] {
     let tasks = api.getTasks()
@@ -85,17 +85,33 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
     ctx["areas"] = .array(api.getAreas().map { .string($0) })
     ctx["tags"] = .array(api.getTags().map { .string($0) })
     // The rest of the app, so the model knows what exists.
+    //
+    // DATA MINIMISATION (privacy audit, 2026-09-12 — ported from web
+    // lib/assistant/tools.ts): this snapshot goes to a third-party model
+    // provider on EVERY turn, so it carries the INVENTORY (what exists, with
+    // ids) and not the CONTENTS. Capture text, list-item text and circle
+    // members' names are fetched only when a request actually needs them —
+    // get_captures / get_lists are read tools the model already has, and
+    // share_task resolves a person by the name the user said (client-side,
+    // against the circle). Keep it that way: adding a body back here re-widens
+    // what leaves the device for a plain "hi", and the published privacy
+    // policy (§9.1) says it doesn't.
     let archived = Set(api.getArchivedCaptureIds())
     ctx["captures"] = .array(api.getCaptures()
         .filter { !archived.contains($0.id) }
         .sorted { $0.at > $1.at }
         .prefix(12)
         .map { c in
-            var o: [String: AnyJSON] = ["id": .string(c.id), "tag": .string(c.tag.rawValue), "body": .string(String(c.body.prefix(120)))]
+            // no body — get_captures reads them
+            var o: [String: AnyJSON] = ["id": .string(c.id), "tag": .string(c.tag.rawValue)]
             if let tid = c.taskId { o["taskId"] = .string(tid) }
             return .object(o)
         })
-    ctx["people"] = .array(api.getCirclePeople().map { .object(["name": .string($0.name), "status": .string($0.status)]) })
+    // Counts, not names: circle members are OTHER people, and the model never
+    // needs their names to stage a share.
+    let circle = api.getCirclePeople()
+    let activePeople = circle.filter { $0.status == "active" }.count
+    ctx["people"] = .object(["active": .integer(activePeople), "pending": .integer(circle.count - activePeople)])
     if let live = api.getLiveFocus(), let start = live.sessionStart {
         let t = tasks.first { $0.id == live.taskId }
         let mins = Int(((now.timeIntervalSince1970 * 1000 - start) / 60000).rounded())
@@ -115,17 +131,18 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
         }
         return .object(o)
     })
-    // Bounded: 12 lists × 25 items keeps a hoarder account's context well
-    // under the request cap without losing anything the model acts on.
+    // Names + counts only — the items themselves (including items another
+    // person wrote in a list shared WITH this user) go to the provider only
+    // when the turn is actually about a list, via get_lists.
     ctx["lists"] = .array(api.getCollections().filter { $0.archived != true }.prefix(12).map { c in
-        .object([
+        var o: [String: AnyJSON] = [
             "id": .string(c.id), "name": .string(c.name),
-            "items": .array(c.items.prefix(25).map { i in
-                var io: [String: AnyJSON] = ["id": .string(i.id), "body": .string(i.body)]
-                if i.done == true { io["done"] = .bool(true) }
-                return .object(io)
-            }),
-        ])
+            "items": .integer(c.items.count),
+            "open": .integer(c.items.filter { $0.done != true }.count),
+        ]
+        // Owned by someone else: read/act on it only when asked.
+        if let role = c.myRole, !role.isEmpty, role != "owner" { o["sharedWithYou"] = .bool(true) }
+        return .object(o)
     })
     return ctx
 }

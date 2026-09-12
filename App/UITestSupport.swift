@@ -145,3 +145,146 @@ final class BulkAssistantScript: AssistantTransport {
     }
 }
 #endif
+
+// MARK: - HEAVY soak seed (UITEST_SEED_HEAVY) — TEMPORARY perf scaffolding
+//
+// A large-account fixture (~800 tasks / 4000 cal_blocks / 1500 sessions /
+// 300 captures / 40 lists × 30 items) for cold-start measurement, written to a
+// PERSISTENT sqlite file in Caches so the second and later launches are true
+// cold starts against a heavy store (the light UITEST_SEED boot stays
+// in-memory). Gated behind `#if DEBUG` AND the UITEST_SEED_HEAVY launch env
+// var, so Release / TestFlight cannot reach it. Not part of any shipping path.
+#if DEBUG
+enum HeavyDemoSeed {
+    static var enabled: Bool { ProcessInfo.processInfo.environment["UITEST_SEED_HEAVY"] == "1" }
+
+    static let tasksN = 800
+    static let blocksN = 4_000
+    static let sessionsN = 1_500
+    static let capturesN = 300
+    static let collectionsN = 40
+    static let itemsPerCollection = 30
+    static let templatesN = 40
+    static let busyDayBlocks = 60
+
+    static func dbPath() -> String {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return dir.appendingPathComponent("unstuck-heavy-soak.sqlite").path
+    }
+
+    private static func isoStamp(_ daysAgo: Double) -> String {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f.string(from: Date().addingTimeInterval(-daysAgo * 86_400))
+    }
+
+    private static func day(_ offset: Int) -> String { LocalDate.addDays(Clock.todayISO(), offset) }
+
+    private static let areaNames = ["Work", "Personal", "Health", "Home", "Family", "Finance", "Learning", "Side project"]
+    private static let tagNames = ["deep-work", "quick", "errand", "admin", "call", "review", "writing", "email",
+                                   "planning", "chore", "reading", "research"]
+
+    /// Seed only when the store is not already heavy — so relaunch #2+ pays no
+    /// seeding cost and measures a real cold start.
+    @discardableResult
+    static func seedIfNeeded(_ db: AppDatabase) -> Bool {
+        let have = (try? TaskRepository(db).all().count) ?? 0
+        guard have < tasksN else { return false }
+        try? db.replaceAll(TaskItem.self, with: tasks())
+        try? db.replaceAll(CalBlock.self, with: blocks())
+        try? db.replaceAll(UnstuckCore.Session.self, with: sessions())
+        try? db.replaceAll(Capture.self, with: captures())
+        try? db.replaceAll(ItemCollection.self, with: collections())
+        try? db.replaceAll(LifeArea.self, with: lifeAreas())
+        try? db.replaceAll(TagRow.self, with: tagRows())
+        return true
+    }
+
+    static func tasks() -> [TaskItem] {
+        (0..<tasksN).map { i in
+            let created = isoStamp(Double(i % 400))
+            let template = i < templatesN
+            return TaskItem(
+                id: "task-\(i)",
+                name: "Heavy task \(i) — \(tagNames[i % tagNames.count]) work item",
+                estimateMin: [10, 15, 25, 30, 45, 60, 90][i % 7],
+                totalFocused: (i * 137) % 5_000,
+                done: !template && i % 5 == 0,
+                tags: [tagNames[i % tagNames.count], tagNames[(i + 3) % tagNames.count]],
+                lifeArea: areaNames[i % areaNames.count],
+                firstPhysicalAction: i % 4 == 0 ? "Open the doc and write one sentence" : nil,
+                moveCount: i % 7,
+                completedAt: (!template && i % 5 == 0) ? isoStamp(Double(i % 30)) : nil,
+                later: i % 11 == 0,
+                recurrence: template ? .weekly(daysOfWeek: [1, 3, 5], until: nil) : nil,
+                createdAt: created, updatedAt: created)
+        }
+    }
+
+    static func blocks() -> [CalBlock] {
+        var out: [CalBlock] = []
+        out.reserveCapacity(blocksN)
+        let spread = blocksN - busyDayBlocks
+        for i in 0..<spread {
+            let offset = (i % 401) - 200
+            let slot = i / 401
+            let startMin = 6 * 60 + slot * 55
+            let taskIdx = (i * 7) % tasksN
+            out.append(CalBlock(
+                id: "blk-\(i)", taskId: "task-\(taskIdx)", taskName: "Heavy task \(taskIdx)",
+                startTime: String(format: "%02d:%02d", startMin / 60, startMin % 60),
+                durationMinutes: [45, 60, 90][i % 3], date: day(offset), kind: .task,
+                done: offset < 0 && i % 3 == 0, skipped: offset < 0 && i % 17 == 0,
+                completedAt: (offset < 0 && i % 3 == 0) ? isoStamp(Double(-offset)) : nil))
+        }
+        for j in 0..<busyDayBlocks {
+            let startMin = 7 * 60 + j * 15
+            let taskIdx = (j * 13) % tasksN
+            out.append(CalBlock(
+                id: "blk-busy-\(j)", taskId: "task-\(taskIdx)", taskName: "Busy block \(j)",
+                startTime: String(format: "%02d:%02d", (startMin / 60) % 24, startMin % 60),
+                durationMinutes: 120, date: day(0), kind: .task))
+        }
+        return out
+    }
+
+    static func sessions() -> [UnstuckCore.Session] {
+        (0..<sessionsN).map { i in
+            UnstuckCore.Session(id: "sess-\(i)", taskId: "task-\(i % tasksN)",
+                                taskName: "Heavy task \(i % tasksN)", tags: [tagNames[i % tagNames.count]],
+                                estimateMin: [15, 25, 45][i % 3], actualSec: 600 + (i * 37) % 4_200,
+                                completedAt: isoStamp(Double(i % 400) + Double(i % 24) / 24.0))
+        }
+    }
+
+    static func captures() -> [Capture] {
+        (0..<capturesN).map { i in
+            Capture(id: "cap-\(i)", taskId: i % 3 == 0 ? "task-\(i % tasksN)" : nil,
+                    sessionId: nil, tag: [CaptureTag.idea, .distraction, .followUp][i % 3],
+                    body: "Captured thought number \(i) with a sentence of context after it.",
+                    at: isoStamp(Double(i % 120) / 4.0))
+        }
+    }
+
+    static func collections() -> [ItemCollection] {
+        (0..<collectionsN).map { c in
+            let items = (0..<itemsPerCollection).map { j in
+                CollectionItem(id: "c\(c)-i\(j)", body: "List \(c) item \(j) — something to pick up",
+                               at: isoStamp(Double(j)))
+            }
+            return ItemCollection(id: "col-\(c)", name: "Heavy list \(c)",
+                                  color: ["green", "indigo", "coral"][c % 3],
+                                  subtitle: nil, items: items, sortOrder: c, archived: false)
+        }
+    }
+
+    static func lifeAreas() -> [LifeArea] {
+        areaNames.enumerated().map { LifeArea(id: "area-\($0.element)", name: $0.element,
+                                              color: ["indigo", "coral", "green"][$0.offset % 3], sortOrder: $0.offset) }
+    }
+
+    static func tagRows() -> [TagRow] {
+        tagNames.enumerated().map { TagRow(id: "tag-\($0.element)", name: $0.element, color: nil, sortOrder: $0.offset) }
+    }
+}
+#endif

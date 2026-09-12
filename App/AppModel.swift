@@ -718,13 +718,20 @@ final class AppModel {
     /// network — for XCUITest. Triggered by the UITEST_SEED launch env var.
     func startUITestMode() {
         guard coordinator == nil, db == nil else { return }
-        guard let database = try? AppDatabase.makeInMemory() else { return }
+        // TEMPORARY perf scaffolding (UITEST_SEED_HEAVY): a heavy account on a
+        // PERSISTENT sqlite file, so relaunch #2+ is a true cold start against
+        // a large store. DEBUG-only + env-gated; the normal demo boot below is
+        // untouched (in-memory + the small DemoSeed).
+        let heavy = HeavyDemoSeed.enabled
+        guard let database = heavy
+                ? (try? AppDatabase.make(path: HeavyDemoSeed.dbPath()))
+                : (try? AppDatabase.makeInMemory()) else { return }
         db = database
         taskRepo = TaskRepository(database)
         liveStore = LiveSessionStore(database)
         refreshLiveSession()
         uiTestWrite = WriteThrough(db: database)
-        DemoSeed.seed(database)
+        if heavy { HeavyDemoSeed.seedIfNeeded(database) } else { DemoSeed.seed(database) }
         startCaptureArchiveObservation(database)
         configured = true
         signedIn = true
