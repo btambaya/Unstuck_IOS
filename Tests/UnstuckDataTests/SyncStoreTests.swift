@@ -37,6 +37,89 @@ final class SyncStoreClearAllTests: XCTestCase {
         XCTAssertEqual(try db.fetchById(TaskItem.self, id: "y")?.name, "Other")
     }
 
+    // The replace writes each row with INSERT OR REPLACE instead of GRDB's
+    // `upsert` (4× cheaper for the same stored result — see
+    // AppDatabase.insertReplacing). These pin the semantics that change would
+    // be able to break: full-fidelity round-trip of every column INCLUDING the
+    // JSON-encoded ones, deletion of rows the server no longer has, an empty
+    // server set blanking the table, and the last-write-wins duplicate above.
+    func testReplaceAllRoundTripsEveryColumn() throws {
+        let task = TaskItem(
+            id: "full", name: "Every column", estimateMin: 45, totalFocused: 900,
+            done: true, tags: ["deep-work", "admin"], lifeArea: "Work", moveCount: 4,
+            completedAt: "2026-05-20T18:30:00.000Z", later: true,
+            recurrence: .weekly(daysOfWeek: [1, 3, 5], until: "2026-12-31"),
+            createdAt: now, updatedAt: now)
+        try db.replaceAll(TaskItem.self, with: [task])
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "full"), task)
+
+        let block = CalBlock(id: "b1", taskId: "full", taskName: "Every column", startTime: "09:15",
+                             durationMinutes: 90, date: "2026-05-21",
+                             externalEventId: "evt", externalConnectionId: "conn", kind: .external,
+                             done: true, skipped: true, completedAt: now)
+        try db.replaceAll(CalBlock.self, with: [block])
+        XCTAssertEqual(try db.fetchAllCalBlocks(), [block])
+    }
+
+    func testReplaceAllDropsRowsTheServerNoLongerHas() throws {
+        try db.save(TaskItem(id: "gone", name: "Deleted on the server", estimateMin: 25,
+                             createdAt: now, updatedAt: now))
+        try db.save(TaskItem(id: "kept", name: "Stale local copy", estimateMin: 25,
+                             createdAt: now, updatedAt: now))
+        try db.replaceAll(TaskItem.self, with: [
+            TaskItem(id: "kept", name: "Server copy", estimateMin: 30, createdAt: now, updatedAt: now),
+            TaskItem(id: "new", name: "Arrived", estimateMin: 10, createdAt: now, updatedAt: now),
+        ])
+        XCTAssertNil(try db.fetchById(TaskItem.self, id: "gone"))
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "kept")?.name, "Server copy")
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "kept")?.estimateMin, 30)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "new")?.name, "Arrived")
+
+        try db.replaceAll(TaskItem.self, with: [])
+        XCTAssertNil(try db.fetchById(TaskItem.self, id: "kept"))
+        XCTAssertNil(try db.fetchById(TaskItem.self, id: "new"))
+    }
+
+    /// `replaceAllAtomically` is the door the real hydrate uses, and it is what
+    /// preserves rows with a pending outbox upsert (spec §1.3 localPending) and
+    /// profile-fact tombstones. The body's decision must land verbatim.
+    func testReplaceAllAtomicallyKeepsWhatTheBodyReturns() throws {
+        try db.save(TaskItem(id: "local-only", name: "Offline edit", estimateMin: 25,
+                             createdAt: now, updatedAt: now))
+        try db.save(TaskItem(id: "both", name: "Local version", estimateMin: 25,
+                             createdAt: now, updatedAt: now))
+        var sawLocal: [String] = []
+        try db.replaceAllAtomically(TaskItem.self) { _, local in
+            sawLocal = local.map(\.id).sorted()
+            // keep the local-only row, take the server's copy of the shared one,
+            // and add a brand-new server row — a duplicate id in the result too.
+            return [
+                local.first { $0.id == "local-only" }!,
+                TaskItem(id: "both", name: "Server version", estimateMin: 30, createdAt: now, updatedAt: now),
+                TaskItem(id: "both", name: "Server version 2", estimateMin: 35, createdAt: now, updatedAt: now),
+                TaskItem(id: "fresh", name: "New", estimateMin: 5, createdAt: now, updatedAt: now),
+            ]
+        }
+        XCTAssertEqual(sawLocal, ["both", "local-only"])
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "local-only")?.name, "Offline edit")
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "both")?.name, "Server version 2")
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "fresh")?.name, "New")
+    }
+
+    /// A tombstoned profile fact (active == false) must survive the replace as
+    /// a tombstone — the hydrate's last-write-wins merge needs the inactive row.
+    func testReplaceAllKeepsProfileFactTombstones() throws {
+        let live = ProfileFact(id: "f1", category: .person, fact: "Nadia is their partner",
+                               source: .chat, createdAt: now, updatedAt: now)
+        var dead = ProfileFact(id: "f2", category: .person, fact: "Removed",
+                               source: .chat, createdAt: now, updatedAt: now)
+        dead.active = false
+        try db.replaceAll(ProfileFact.self, with: [live, dead])
+        let back = try db.fetchAllProfileFacts().sorted { $0.id < $1.id }
+        XCTAssertEqual(back, [live, dead])
+        XCTAssertEqual(back.last?.active, false)
+    }
+
     func testClearAllKeepsParkedOpsAndWipesTheCaptureArchive() throws {
         let box = OutboxStore(db)
         _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, payload: "{}", nowISO: now)

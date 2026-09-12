@@ -25,11 +25,30 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
     let nowHM = api.nowHM()
     let facts = api.getProfileFacts()
 
+    // Task lookup for the `week` rows + the live-focus row below. Built
+    // first-wins so it resolves exactly what `tasks.first { $0.id == id }` did,
+    // without rescanning all 800 tasks per row.
+    var tasksById: [String: TaskItem] = [:]
+    tasksById.reserveCapacity(tasks.count)
+    for t in tasks where tasksById[t.id] == nil { tasksById[t.id] = t }
+
     // Per task, the NEXT LIVE occurrence — first-in-array gave the model an old
     // done block's date as "scheduled" (tester round, 2026-09-01).
+    //
+    // The guard runs BEFORE the sort, not inside the loop after it: sorting all
+    // 4,000 blocks cost 2.6 ms because the comparator concatenates two Strings
+    // per comparison, and the vast majority of those blocks are filtered out a
+    // line later anyway. Same comparator, same first-wins pick, same rows —
+    // filtering preserves relative order, so the ordering the loop sees is
+    // unchanged (pinned against the old implementation in
+    // Tests/UnstuckAppTests/AssistantContextDerivationTests.swift).
     var blocksByTask: [String: CalBlock] = [:]
-    for b in blocks.sorted(by: { ($0.date + $0.startTime) < ($1.date + $1.startTime) }) {
-        guard let tid = b.taskId, !tid.isEmpty, !b.done, !b.skipped, b.date >= today else { continue }
+    let liveTaskBlocks = blocks.filter { b in
+        guard let tid = b.taskId, !tid.isEmpty else { return false }
+        return !b.done && !b.skipped && b.date >= today
+    }
+    for b in liveTaskBlocks.sorted(by: { ($0.date + $0.startTime) < ($1.date + $1.startTime) }) {
+        guard let tid = b.taskId else { continue }
         if blocksByTask[tid] == nil { blocksByTask[tid] = b }
     }
 
@@ -40,7 +59,7 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
         .sorted { ($0.date + $0.startTime) < ($1.date + $1.startTime) }
         .prefix(60)
         .map { b in
-            let t = b.taskId.flatMap { id in tasks.first { $0.id == id } }
+            let t = b.taskId.flatMap { tasksById[$0] }
             var o: [String: AnyJSON] = ["date": .string(b.date)]
             if !b.startTime.isEmpty { o["time"] = .string(b.startTime) }
             o["name"] = .string(!b.taskName.isEmpty ? b.taskName : (t?.name ?? "?"))
@@ -113,7 +132,7 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
     let activePeople = circle.filter { $0.status == "active" }.count
     ctx["people"] = .object(["active": .integer(activePeople), "pending": .integer(circle.count - activePeople)])
     if let live = api.getLiveFocus(), let start = live.sessionStart {
-        let t = tasks.first { $0.id == live.taskId }
+        let t = tasksById[live.taskId]
         let mins = Int(((now.timeIntervalSince1970 * 1000 - start) / 60000).rounded())
         ctx["focus"] = .object([
             "taskId": .string(live.taskId), "task": .string(t?.name ?? "a task"),

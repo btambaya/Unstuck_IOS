@@ -55,6 +55,77 @@ public func daysSinceCreated(_ task: TaskItem, now: EpochMillis) -> Int {
     return Int((diffMs / (24 * 60 * 60 * 1000)).rounded(.down))
 }
 
+/// Everything `visibleTasks` derives from the task + block sets BEFORE it
+/// knows which view is being asked for: the template/occurrence projections
+/// and the scheduled-id sets. It is identical for every view, and building it
+/// is the whole cost of the pass (the per-view step is one filter), so a
+/// caller that needs several views — `TodayModel.recomputeSnapshot` asks for
+/// `.today` AND `.backlog` on every tasks-or-blocks change — builds it once
+/// and hands it to `visibleTasks(view:prep:…)` instead of paying for it twice.
+///
+/// Also pins `today` for the whole batch, so two views computed together can
+/// no longer straddle local midnight and disagree about what "today" is.
+public struct VisibleTasksPrep: Sendable {
+    let tasks: [TaskItem]
+    let today: String
+    let nonTemplates: [TaskItem]
+    let todayOccurrences: [TaskItem]
+    let upcomingOccurrences: [TaskItem]
+    let overdueOccurrences: [TaskItem]
+    let todayTaskIds: Set<String>
+    let upcomingTaskIds: Set<String>
+    let scheduledTaskIds: Set<String>
+    let pastOnlyTaskIds: Set<String>
+
+    public init(tasks: [TaskItem], blocks: [CalBlock]) {
+        let today = Clock.todayISO()
+        self.tasks = tasks
+        self.today = today
+        self.nonTemplates = tasks.filter { !isTemplate($0) }
+        let templateIds = Set(tasks.filter { $0.recurrence != nil }.map { $0.id })
+
+        // Recurring occurrences surface ONLY in Today (the due day) + the single
+        // NEXT upcoming one in Upcoming — never in All / Backlog / Later / Completed
+        // (a repeating task would otherwise list once per horizon date). The template
+        // itself lives only in the Recurring view. occurrence row id == its block id.
+        let occBlocks = blocks.filter {
+            isTaskBlock($0) && !$0.skipped && ($0.taskId.map { templateIds.contains($0) } ?? false) && $0.date >= today
+        }
+        let todayOccIds = Set(occBlocks.filter { $0.date == today }.map { $0.id })
+        var nextPerTemplate: [String: CalBlock] = [:]   // template id -> its earliest FUTURE occurrence block
+        for b in occBlocks where b.date > today {
+            guard let tid = b.taskId else { continue }
+            if let cur = nextPerTemplate[tid], cur.date <= b.date { continue }
+            nextPerTemplate[tid] = b
+        }
+        let nextUpcomingOccIds = Set(nextPerTemplate.values.map { $0.id })
+        let projected = projectOccurrences(tasks, blocks, fromISO: today)
+        self.todayOccurrences = projected.filter { todayOccIds.contains($0.id) }
+        self.upcomingOccurrences = projected.filter { nextUpcomingOccIds.contains($0.id) }
+        // Missed recurring occurrences: one overdue row per template whose most-
+        // recent past occurrence went undone — surfaced in Backlog so a skipped
+        // "every Friday" task doesn't silently vanish until next Friday.
+        self.overdueOccurrences = projectOverdueOccurrences(tasks, blocks, todayISO: today)
+
+        // Non-template task bucketing — over NON-recurring task blocks only (an
+        // occurrence block's taskId is its template, never a row in these buckets).
+        let taskBlocks = blocks.filter { isTaskBlock($0) && !($0.taskId.map { templateIds.contains($0) } ?? false) }
+        let todayTaskIds = Set(taskBlocks.filter { $0.date == today }.compactMap { $0.taskId })
+        let upcomingTaskIds = Set(taskBlocks.filter { $0.date > today }.compactMap { $0.taskId })
+        let scheduledTaskIds = Set(taskBlocks.compactMap { $0.taskId })
+        self.todayTaskIds = todayTaskIds
+        self.upcomingTaskIds = upcomingTaskIds
+        self.scheduledTaskIds = scheduledTaskIds
+        // Tasks whose only task-shaped cal_blocks are dated before today —
+        // planned for a past day but never done. These are "overdue" → Backlog.
+        var pastOnlyTaskIds = Set<String>()
+        for id in scheduledTaskIds where !todayTaskIds.contains(id) && !upcomingTaskIds.contains(id) {
+            pastOnlyTaskIds.insert(id)
+        }
+        self.pastOnlyTaskIds = pastOnlyTaskIds
+    }
+}
+
 public func visibleTasks(
     view: TaskListView,
     tasks: [TaskItem],
@@ -64,45 +135,30 @@ public func visibleTasks(
     activeTag: String? = nil,
     slipMode: Bool
 ) -> [TaskItem] {
-    let today = Clock.todayISO()
-    let nonTemplates = tasks.filter { !isTemplate($0) }
-    let templateIds = Set(tasks.filter { $0.recurrence != nil }.map { $0.id })
+    visibleTasks(view: view, prep: VisibleTasksPrep(tasks: tasks, blocks: blocks),
+                 now: now, activeArea: activeArea, activeTag: activeTag, slipMode: slipMode)
+}
 
-    // Recurring occurrences surface ONLY in Today (the due day) + the single
-    // NEXT upcoming one in Upcoming — never in All / Backlog / Later / Completed
-    // (a repeating task would otherwise list once per horizon date). The template
-    // itself lives only in the Recurring view. occurrence row id == its block id.
-    let occBlocks = blocks.filter {
-        isTaskBlock($0) && !$0.skipped && ($0.taskId.map { templateIds.contains($0) } ?? false) && $0.date >= today
-    }
-    let todayOccIds = Set(occBlocks.filter { $0.date == today }.map { $0.id })
-    var nextPerTemplate: [String: CalBlock] = [:]   // template id -> its earliest FUTURE occurrence block
-    for b in occBlocks where b.date > today {
-        guard let tid = b.taskId else { continue }
-        if let cur = nextPerTemplate[tid], cur.date <= b.date { continue }
-        nextPerTemplate[tid] = b
-    }
-    let nextUpcomingOccIds = Set(nextPerTemplate.values.map { $0.id })
-    let projected = projectOccurrences(tasks, blocks, fromISO: today)
-    let todayOccurrences = projected.filter { todayOccIds.contains($0.id) }
-    let upcomingOccurrences = projected.filter { nextUpcomingOccIds.contains($0.id) }
-    // Missed recurring occurrences: one overdue row per template whose most-
-    // recent past occurrence went undone — surfaced in Backlog so a skipped
-    // "every Friday" task doesn't silently vanish until next Friday.
-    let overdueOccurrences = projectOverdueOccurrences(tasks, blocks, todayISO: today)
-
-    // Non-template task bucketing — over NON-recurring task blocks only (an
-    // occurrence block's taskId is its template, never a row in these buckets).
-    let taskBlocks = blocks.filter { isTaskBlock($0) && !($0.taskId.map { templateIds.contains($0) } ?? false) }
-    let todayTaskIds = Set(taskBlocks.filter { $0.date == today }.compactMap { $0.taskId })
-    let upcomingTaskIds = Set(taskBlocks.filter { $0.date > today }.compactMap { $0.taskId })
-    let scheduledTaskIds = Set(taskBlocks.compactMap { $0.taskId })
-    // Tasks whose only task-shaped cal_blocks are dated before today —
-    // planned for a past day but never done. These are "overdue" → Backlog.
-    var pastOnlyTaskIds = Set<String>()
-    for id in scheduledTaskIds where !todayTaskIds.contains(id) && !upcomingTaskIds.contains(id) {
-        pastOnlyTaskIds.insert(id)
-    }
+/// The same filter, against an already-built `VisibleTasksPrep`. Identical
+/// output to the array-taking overload — it IS the same code, with the shared
+/// half hoisted into `prep`.
+public func visibleTasks(
+    view: TaskListView,
+    prep: VisibleTasksPrep,
+    now: EpochMillis,
+    activeArea: String?,
+    activeTag: String? = nil,
+    slipMode: Bool
+) -> [TaskItem] {
+    let tasks = prep.tasks
+    let nonTemplates = prep.nonTemplates
+    let todayOccurrences = prep.todayOccurrences
+    let upcomingOccurrences = prep.upcomingOccurrences
+    let overdueOccurrences = prep.overdueOccurrences
+    let todayTaskIds = prep.todayTaskIds
+    let upcomingTaskIds = prep.upcomingTaskIds
+    let scheduledTaskIds = prep.scheduledTaskIds
+    let pastOnlyTaskIds = prep.pastOnlyTaskIds
 
     let byView: [TaskItem]
     switch view {

@@ -17,13 +17,39 @@ public extension AppDatabase {
     func replaceAll<T: PersistableRecord & FetchableRecord & Sendable>(_ type: T.Type, with rows: [T]) throws {
         try writer.write { db in
             try type.deleteAll(db)
-            // upsert (not insert): a duplicate id in `rows` — e.g. the server
-            // briefly returns two rows with the same id during a merge — would
-            // make `insert` throw and, because the Hydrator catch swallows it
-            // and "leaves local intact", abort the WHOLE table's hydrate. upsert
-            // resolves the duplicate to last-write-wins instead of failing.
-            for r in rows { try r.upsert(db) }
+            try AppDatabase.insertReplacing(db, rows)
         }
+    }
+
+    /// Write every row with `INSERT OR REPLACE` — the fast equivalent of the
+    /// per-row `upsert` the hydrate's table replaces used to do.
+    ///
+    /// NOT plain `insert`: a duplicate id in `rows` — e.g. the server briefly
+    /// returns two rows with the same id during a merge — would make `insert`
+    /// throw and, because the Hydrator catch swallows it and "leaves local
+    /// intact", abort the WHOLE table's hydrate. `upsert` and `INSERT OR
+    /// REPLACE` both resolve the duplicate to last-write-wins instead of
+    /// failing, so the stored result is the same (SyncStoreTests pins it).
+    ///
+    /// NOT `upsert`: it emits `ON CONFLICT DO UPDATE SET … RETURNING …` and
+    /// decodes the returned row for its insert callbacks — ~4× the cost per
+    /// row, for a result we throw away. Measured on the heavy fixture
+    /// (Release, 4,000 cal_blocks in one transaction): upsert 96.6 ms vs
+    /// INSERT OR REPLACE 23.4 ms. Note the statement COUNT is NOT the problem
+    /// — `deleteAll` is 0.14 ms, and batching the same rows into 160 multi-row
+    /// INSERTs only reaches 12.8 ms, which does not justify hand-maintaining a
+    /// column list per record type beside the Codable encoding.
+    ///
+    /// `REPLACE` deletes a conflicting row before re-inserting it, which would
+    /// matter if these tables had `ON DELETE CASCADE` children or delete
+    /// triggers. The LOCAL schema (AppDatabase.migrator) declares neither — no
+    /// `references`/`REFERENCES` anywhere in it, so `foreignKeysEnabled` has
+    /// nothing to act on here; the FKs the sync engine talks about are the
+    /// SERVER's, enforced by Postgres on push, not by this store. Nothing in
+    /// the app reads a SQLite rowid either, so the only difference from
+    /// `upsert` is the speed. Keep both facts true if you add a local FK.
+    static func insertReplacing<T: PersistableRecord & Sendable>(_ db: Database, _ rows: [T]) throws {
+        for r in rows { try r.insert(db, onConflict: .replace) }
     }
 
     /// Read → decide → replace, in ONE write transaction. `body` receives the
@@ -40,7 +66,7 @@ public extension AppDatabase {
             let local = try T.fetchAll(db)
             let rows = try body(db, local)
             try type.deleteAll(db)
-            for r in rows { try r.upsert(db) }
+            try AppDatabase.insertReplacing(db, rows)
         }
     }
 

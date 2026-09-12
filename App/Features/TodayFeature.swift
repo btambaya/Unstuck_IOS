@@ -101,8 +101,12 @@ final class TodayModel {
         let templateIds = Set(all.filter { $0.recurrence != nil }.map { $0.id })
         occurrenceIds = Set(
             blocks.filter { isTaskBlock($0) && templateIds.contains($0.taskId ?? "") }.map { $0.id })
-        todayBase = visibleTasks(view: .today, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
-        backlogBase = visibleTasks(view: .backlog, tasks: all, blocks: blocks, now: now, activeArea: nil, slipMode: false)
+        // ONE shared prep for both views: the occurrence projections and the
+        // scheduled-id sets are view-independent and are the whole cost of the
+        // pass, so building them twice doubled this recompute for nothing.
+        let prep = VisibleTasksPrep(tasks: all, blocks: blocks)
+        todayBase = visibleTasks(view: .today, prep: prep, now: now, activeArea: nil, slipMode: false)
+        backlogBase = visibleTasks(view: .backlog, prep: prep, now: now, activeArea: nil, slipMode: false)
         backlogCount = backlogBase.count
         // Today's completions kept as struck-through wins until tomorrow, minus
         // anything still open — 1:1 with Android TodayScreen.kt:127-136.

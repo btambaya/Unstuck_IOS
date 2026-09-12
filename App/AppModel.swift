@@ -976,13 +976,15 @@ final class AppModel {
         // Enriched snapshot the Siri "ask" intents read + the App Intent entities
         // resolve against. Counts use the SAME bucketing the UI shows.
         let nonTemplates = tasks.filter { !isTemplate($0) }
-        let todayList = visibleTasks(view: .today, tasks: tasks, blocks: blocks,
+        // One shared prep for the two views below (see VisibleTasksPrep).
+        let visiblePrep = VisibleTasksPrep(tasks: tasks, blocks: blocks)
+        let todayList = visibleTasks(view: .today, prep: visiblePrep,
                                      now: now, activeArea: nil, slipMode: false).filter { !$0.done }
         let todayIds = Set(todayList.map { $0.id })
         // Assigned-away tasks are excluded from the pending list Siri can start
         // focusing on (parity with the Start-Next pick + the today-list filter).
         let pending = nonTemplates.filter { !$0.done && !($0.later ?? false) && !excludeIds.contains($0.id) }
-        let overdue = visibleTasks(view: .backlog, tasks: tasks, blocks: blocks,
+        let overdue = visibleTasks(view: .backlog, prep: visiblePrep,
                                    now: now, activeArea: nil, slipMode: true).filter { !$0.done }
         // Relevance BEFORE the cap (today → due soonest → most recently
         // touched): the cap decides which tasks Siri can resolve at all, and

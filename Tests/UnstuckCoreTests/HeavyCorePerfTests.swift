@@ -128,6 +128,14 @@ final class HeavyCorePerfTests: XCTestCase {
             _ = visibleTasks(view: .today, tasks: tasks, blocks: blocks, now: now, activeArea: nil, slipMode: false)
             _ = visibleTasks(view: .backlog, tasks: tasks, blocks: blocks, now: now, activeArea: nil, slipMode: false)
         }
+        corePerf("visibleTasks ×2 via ONE shared prep (what TodayModel does now)") {
+            let prep = VisibleTasksPrep(tasks: tasks, blocks: blocks)
+            _ = visibleTasks(view: .today, prep: prep, now: now, activeArea: nil, slipMode: false)
+            _ = visibleTasks(view: .backlog, prep: prep, now: now, activeArea: nil, slipMode: false)
+        }
+        corePerf("VisibleTasksPrep build (the shared half)") {
+            _ = VisibleTasksPrep(tasks: tasks, blocks: blocks)
+        }
         corePerf("projectOccurrences") { _ = projectOccurrences(tasks, blocks, fromISO: todayISO) }
         corePerf("projectOverdueOccurrences") { _ = projectOverdueOccurrences(tasks, blocks, todayISO: todayISO) }
         corePerf("overdueOccurrenceDates") { _ = overdueOccurrenceDates(tasks, blocks, todayISO: todayISO) }
