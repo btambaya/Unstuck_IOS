@@ -3,6 +3,57 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
+## Where things stand (2026-09-12, latest) — ONE freshness owner, and a cursor catch-up that is the correctness path
+
+The reason live-sync bugs kept coming back: `postgres_changes` has **no
+replay**, and a channel can report `SUBSCRIBED` while being permanently deaf
+(both proven against production on 2026-09-12). Any client that treats realtime
+as its correctness path drifts out of date at the first network gap, sleep or
+doze — and iOS had *three* half-owners of "am I in step?", none of which could
+see that failure.
+
+What changed:
+
+- **`Sources/UnstuckSync/FreshnessOwner.swift` (new) — the single owner.**
+  Everything now REPORTS to it (`FreshnessSignal`) and nothing else schedules a
+  refresh. Triggers: cold start after hydrate, app becoming visible, network
+  regained (a real `NWPathMonitor` — iOS had none), socket (re)connect, channel
+  (re)subscribe, token refresh, a 60s floor interval while visible, and manual /
+  BG refresh. It coalesces overlapping triggers into ONE in-flight pull, and a
+  pull can never run beside a hydrate because both go through it.
+- **`Sources/UnstuckSync/CatchUpPuller.swift` (new) — cursor catch-up.**
+  Per-table high-water marks (`sync_cursors`, migration `v5`) drive
+  `column >= cursor` page reads instead of a full-table replace: tasks,
+  collections, tags, life_areas, profile_facts on `updated_at`; sessions on
+  `completed_at`; reason_logs on `at`. `cal_blocks` and `captures` have NO
+  monotonic server column, so they keep the full replace (the follow-up is a
+  server migration adding `updated_at` to both). Deletions are invisible to a
+  cursor pull, so a paged `select=id` sweep drops local rows the server no
+  longer has. Nothing ever clobbers a pending local write — tasks/profile_facts
+  reuse the realtime mirror's own LWW guards, the rest skip while the outbox
+  holds an un-acked op — and the cursor only advances over rows the client
+  accepted a verdict on.
+- **Deafness detection that does not trust channel status.** Two rules, both
+  counted in `FreshnessStats`: (a) silence — nothing delivered for 10 minutes
+  while visible and supposedly subscribed; (b) the stronger oracle — a catch-up
+  APPLIED a row older than the 10s grace window, which a healthy channel would
+  have delivered first. Either verdict rebuilds every subscription
+  (`RealtimeMirror.rebuildSubscriptionsNow`).
+- **The cold-launch hole is closed.** `startForegroundSafetyNet` used to
+  early-return while `coordinator` was still nil — the normal cold-launch
+  ordering — leaving a whole session with no periodic pull. Visibility is now
+  remembered in `AppModel.foregroundVisible` and re-applied from `start()`.
+- **Settings are live (migration 063).** `RealtimeMirror` subscribes
+  `notification_preferences` + `user_preferences`; both events and every gap
+  trigger call `AppModel.refreshServerPreferences()`, which clears the
+  once-per-process guards. Notification level, reminder lead, timezone, PA
+  rituals, struggles and the assistant-interview flag now reach the phone
+  WITHOUT a relaunch. `sharing_preferences` is deliberately NOT subscribed —
+  iOS reads no column of it. Moment dismissals stay device-local by design.
+- **Tests:** `Tests/UnstuckSyncTests/CatchUpConvergenceTests.swift` simulates
+  the gap (subscription down → rows written server-side → subscription back,
+  no realtime event ever reported) and asserts convergence in the same process.
+
 ## Where things stand (2026-09-11, latest) — the guided tour's a11y lockdown, and a UI suite that can actually fail
 
 The UI suite was red in three places and quietly hollow in several more. The

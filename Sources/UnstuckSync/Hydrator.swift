@@ -185,7 +185,25 @@ public actor Hydrator {
     /// as the captures — but only when the server rows actually carry the
     /// column (a pre-053 server must not blank a local archive); rows with a
     /// pending upsert keep their local state in both tables.
-    private func hydrateCaptures() async {
+    /// The two tables the SERVER gives no monotonic column for — `cal_blocks`
+    /// has no timestamp at all, and `captures.archived_at` moves without
+    /// `created_at` moving — so a cursor pull cannot see their changes. The
+    /// catch-up falls back to this full server-canonical replace for them,
+    /// which is exactly what every 60s tick already did for all ten tables.
+    /// Adding `updated_at` to those two server tables is the follow-up that
+    /// would make them delta-capable too. False = the fetch failed (local
+    /// left intact).
+    @discardableResult
+    public func hydrateFullReplaceTable(_ name: String) async -> Bool {
+        switch name {
+        case "cal_blocks": return await hydrateCalBlocks()
+        case "captures":   return await hydrateCaptures()
+        default:           return false
+        }
+    }
+
+    @discardableResult
+    private func hydrateCaptures() async -> Bool {
         do {
             let raw = try await gateway.fetchAllRaw(table: "captures")
             let rows = raw.compactMap { try? decoder.decode(CaptureRow.self, from: $0) }
@@ -200,8 +218,10 @@ public actor Hydrator {
                 }
                 return SyncDecision.mergeHydratedRows(remote: remote, local: local, pendingIds: pending) { l, _ in l }
             }
+            return true
         } catch {
             print("[hydrate] captures failed, leaving local intact: \(error)")
+            return false
         }
     }
 
@@ -328,7 +348,8 @@ public actor Hydrator {
         }
     }
 
-    private func hydrateCalBlocks() async {
+    @discardableResult
+    private func hydrateCalBlocks() async -> Bool {
         do {
             // Per-row tolerant decode (see replace()): a single bad cal_block row
             // mustn't wipe the whole schedule.
@@ -344,8 +365,10 @@ public actor Hydrator {
                 let ownLocal = local.filter { !isExternalBlock($0) }
                 return SyncDecision.mergeHydratedRows(remote: merged, local: ownLocal, pendingIds: pending) { l, _ in l }
             }
+            return true
         } catch {
             print("[hydrate] cal_blocks failed, leaving local intact: \(error)")
+            return false
         }
     }
 }

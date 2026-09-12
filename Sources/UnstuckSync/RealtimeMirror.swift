@@ -52,9 +52,37 @@ public actor RealtimeMirror {
     /// heal's own teardown isn't mistaken for a session change.
     private var sessionGeneration = 0
 
+    // MARK: - reporting into the freshness owner
+    //
+    // The mirror no longer decides anything about staleness: it REPORTS. Every
+    // delivered row, every (re)subscribe and every socket connect goes to the
+    // one component that owns "am I in step?" (FreshnessOwner), which is the
+    // only thing allowed to schedule a pull. `onResync` is kept as the seam the
+    // coordinator points at that owner.
+
+    /// Any postgres_changes row of any kind arrived — the liveness evidence the
+    /// deafness detector reads. Channel status is never trusted for this.
+    private var onRealtimeEvent: (@Sendable () -> Void)?
+    /// A channel reached `.subscribed`: a (re)join means everything written
+    /// during the gap was never broadcast to us.
+    private var onChannelsSubscribed: (@Sendable () -> Void)?
+    /// An account-wide preference row changed (notification_preferences /
+    /// user_preferences — both in the publication since migration 063).
+    private var onPreferencesChanged: (@Sendable () -> Void)?
+
     public init(client: SupabaseClient, db: AppDatabase) {
         self.client = client
         self.db = db
+    }
+
+    /// Wire the mirror's reports into the freshness owner. Set once, before
+    /// `subscribeAll`; survives self-heal rebuilds.
+    public func setSignals(onRealtimeEvent: @escaping @Sendable () -> Void,
+                           onChannelsSubscribed: @escaping @Sendable () -> Void,
+                           onPreferencesChanged: @escaping @Sendable () -> Void) {
+        self.onRealtimeEvent = onRealtimeEvent
+        self.onChannelsSubscribed = onChannelsSubscribed
+        self.onPreferencesChanged = onPreferencesChanged
     }
 
     private struct IdOnly: Decodable { let id: String }
@@ -165,6 +193,7 @@ public actor RealtimeMirror {
         // Membership changes for ME — a new share or a revocation. Re-hydrate
         // collections so the freshly-shared list appears / the revoked one drops.
         await subscribeMembers(userId: userId, onChanged: onMembersChanged)
+        await subscribePreferences(userId: userId)
     }
 
     /// Last-write-wins guard for an incoming `tasks` UPDATE. Skip (return
@@ -218,6 +247,7 @@ public actor RealtimeMirror {
         shouldApplyUpdate: @escaping @Sendable (Row) -> Bool = { _ in true }
     ) async {
         let channel = client.channel("unstuck_\(table)_\(userId)")
+        let report = onRealtimeEvent ?? {}
         let filter: RealtimePostgresFilter? = noUserFilter ? nil : .eq("user_id", value: userId)
         // Build streams BEFORE subscribing so no early events are missed.
         let inserts = channel.postgresChange(InsertAction.self, schema: "public", table: table, filter: filter)
@@ -232,6 +262,7 @@ public actor RealtimeMirror {
         streamTasks.append(Task {
             let dec = JSONDecoder()
             for await change in inserts {
+                report()   // liveness: the channel IS delivering
                 do { onUpsert(try change.decodeRecord(as: Row.self, decoder: dec)) }
                 catch { print("[realtime] \(table) INSERT decode failed: \(error)") }
             }
@@ -239,6 +270,7 @@ public actor RealtimeMirror {
         streamTasks.append(Task {
             let dec = JSONDecoder()
             for await change in updates {
+                report()
                 do {
                     let row = try change.decodeRecord(as: Row.self, decoder: dec)
                     if shouldApplyUpdate(row) { onUpsert(row) }
@@ -248,6 +280,7 @@ public actor RealtimeMirror {
         streamTasks.append(Task {
             let dec = JSONDecoder()
             for await change in deletes {
+                report()
                 do { onDelete(try change.decodeOldRecord(as: IdOnly.self, decoder: dec).id) }
                 catch { print("[realtime] \(table) DELETE decode failed: \(error)") }
             }
@@ -263,17 +296,46 @@ public actor RealtimeMirror {
     /// Doesn't mirror rows itself — membership lives in the collection's
     /// members[]/myRole, refreshed by the hydrate.
     private func subscribeMembers(userId: String, onChanged: @escaping @Sendable () async -> Void) async {
-        let channel = client.channel("unstuck_collection_members_\(userId)")
+        let report = onRealtimeEvent ?? {}
+        await subscribeSignal(table: "collection_members", userId: userId) {
+            report()
+            await onChanged()
+        }
+    }
+
+    /// Account-wide PREFERENCE rows. They are keyed by `user_id` and live
+    /// outside the local store, so nothing is mirrored — the event is a signal
+    /// to re-read them. Migration 063 put both tables in `supabase_realtime`
+    /// and set replica identity FULL, so a notification level / lead time /
+    /// timezone / display name / ritual / assistant-interview change made on
+    /// one device now reaches the others without a relaunch. `sharing_
+    /// preferences` is deliberately NOT subscribed: iOS reads no column of it.
+    private func subscribePreferences(userId: String) async {
+        let report = onRealtimeEvent ?? {}
+        let changed = onPreferencesChanged ?? {}
+        for table in ["notification_preferences", "user_preferences"] {
+            await subscribeSignal(table: table, userId: userId) {
+                report()
+                changed()
+            }
+        }
+    }
+
+    /// A signal-only channel: any INSERT/UPDATE/DELETE for this user runs
+    /// `onChanged`. Nothing is mirrored into the local store.
+    private func subscribeSignal(table: String, userId: String,
+                                 onChanged: @escaping @Sendable () async -> Void) async {
+        let channel = client.channel("unstuck_\(table)_\(userId)")
         let filter = RealtimePostgresFilter.eq("user_id", value: userId)
-        let inserts = channel.postgresChange(InsertAction.self, schema: "public", table: "collection_members", filter: filter)
-        let updates = channel.postgresChange(UpdateAction.self, schema: "public", table: "collection_members", filter: filter)
-        let deletes = channel.postgresChange(DeleteAction.self, schema: "public", table: "collection_members", filter: filter)
+        let inserts = channel.postgresChange(InsertAction.self, schema: "public", table: table, filter: filter)
+        let updates = channel.postgresChange(UpdateAction.self, schema: "public", table: table, filter: filter)
+        let deletes = channel.postgresChange(DeleteAction.self, schema: "public", table: table, filter: filter)
         channels.append(channel)
         streamTasks.append(Task { for await _ in inserts { await onChanged() } })
         streamTasks.append(Task { for await _ in updates { await onChanged() } })
         streamTasks.append(Task { for await _ in deletes { await onChanged() } })
-        streamTasks.append(channelStatusObserver(channel, table: "collection_members"))
-        streamTasks.append(Task { await Self.subscribeWithRetry(channel, table: "collection_members") })
+        streamTasks.append(channelStatusObserver(channel, table: table))
+        streamTasks.append(Task { await Self.subscribeWithRetry(channel, table: table) })
     }
 
     /// Subscribe a channel, retrying on failure with capped exponential
@@ -312,6 +374,11 @@ public actor RealtimeMirror {
                 switch status {
                 case .subscribed:
                     wasSubscribed = true
+                    // A (re)join is a gap: nothing written while we were away
+                    // was broadcast. Report it — the freshness owner decides
+                    // whether to pull, and coalesces the ~11 channels' reports
+                    // into one.
+                    await self?.reportSubscribed()
                 case .unsubscribed:
                     if wasSubscribed {
                         wasSubscribed = false
@@ -350,8 +417,12 @@ public actor RealtimeMirror {
     }
 
     private func onSocketReconnected() async {
-        print("[realtime] socket reconnected — backfilling via hydrate")
+        print("[realtime] socket reconnected — reporting the gap to the freshness owner")
         await (onResync ?? {})()
+    }
+
+    private func reportSubscribed() {
+        onChannelsSubscribed?()
     }
 
     /// Coalesced, rate-limited self-heal: rebuild every subscription and
@@ -395,6 +466,20 @@ public actor RealtimeMirror {
             return
         }
         await resync()
+    }
+
+    /// The freshness owner's deafness verdict (silence, or a catch-up that
+    /// found a change realtime never delivered): tear the subscriptions down
+    /// and rejoin. Deliberately does NOT run the resync itself — the owner is
+    /// already pulling, and a rebuild that re-triggers a pull would loop.
+    public func rebuildSubscriptionsNow() async {
+        guard let uid = currentUserId else { return }
+        let members = onMembersChanged ?? {}
+        let resync = onResync ?? {}
+        lastHealAt = Date()
+        healTask?.cancel()
+        healTask = nil
+        await rebuildSubscriptions(userId: uid, onMembersChanged: members, onResync: resync)
     }
 
     public func unsubscribeAll() async {

@@ -14,9 +14,37 @@
 // (spec 02-sync-engine §5).
 
 import Foundation
+import Network
 import Supabase
 import UnstuckCore
 import UnstuckData
+
+/// A closure slot settable from any isolation domain. The app hands the
+/// coordinator its "preferences went stale" hook after construction, but the
+/// freshness owner's actions are built during `init` — this bridges the two.
+final class HookBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hook: (@Sendable () async -> Void)?
+    func set(_ h: (@Sendable () async -> Void)?) { lock.withLock { hook = h } }
+    func call() async {
+        await lock.withLock { hook }?()
+    }
+}
+
+/// A lock-guarded Bool for the NWPathMonitor callback (which runs on its own
+/// queue, outside any actor).
+final class MutableFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Bool
+    init(_ value: Bool) { self.value = value }
+    /// Set and return the PREVIOUS value.
+    func swap(_ new: Bool) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        let old = value
+        value = new
+        return old
+    }
+}
 
 public actor SyncCoordinator {
     // Sendable + immutable → safe to read synchronously from any actor
@@ -39,8 +67,19 @@ public actor SyncCoordinator {
     public nonisolated let assistant: AssistantClient
     /// "Unstuck calls you" (C1): call_requests rows + the call-outcome edge fn.
     public nonisolated let calls: CallsClient
+    /// THE FRESHNESS OWNER — the single component that answers "am I in step?"
+    /// and the only thing allowed to decide a pull is needed. Realtime, the
+    /// app lifecycle, the network monitor and the floor interval all report
+    /// into it; nothing else schedules its own refresh.
+    public nonisolated let freshness: FreshnessOwner
     private let hydrator: Hydrator
+    private let catchUpPuller: CatchUpPuller
     private let realtime: RealtimeMirror
+    /// Set by the app: re-read the account-wide preference rows (they live
+    /// outside the local store, so no cursor pull can carry them).
+    private nonisolated let preferencesHook = HookBox()
+    /// Network-path watch → `.networkRegained`.
+    private var pathMonitor: NWPathMonitor?
     /// Live change-signal for sharing (posts NotificationCenter; the UI refetches
     /// the RPC-backed projections). Recipients can't mirror shared task rows (RLS).
     private let collab: CollabRealtime
@@ -52,7 +91,8 @@ public actor SyncCoordinator {
 
     public init(provider: SupabaseClientProvider, db: AppDatabase) {
         let gateway = SyncGateway(provider.client)
-        self.auth = AuthService(provider.client)
+        let auth = AuthService(provider.client)
+        self.auth = auth
         self.write = WriteThrough(db: db)
         self.calendar = CalendarClient(provider.client)
         self.push = PushClient(provider.client)
@@ -65,11 +105,47 @@ public actor SyncCoordinator {
         self.loginTracker = LoginTrackerClient(provider.client)
         self.assistant = AssistantClient(provider.client)
         self.calls = CallsClient(provider.client)
-        self.hydrator = Hydrator(gateway: gateway, db: db)
-        self.realtime = RealtimeMirror(client: provider.client, db: db)
+        let hydrator = Hydrator(gateway: gateway, db: db)
+        let flusher = OutboxFlusher(gateway: gateway, db: db)
+        let realtime = RealtimeMirror(client: provider.client, db: db)
+        let catchUpPuller = CatchUpPuller(gateway: gateway, db: db,
+                                          fullFallback: { table in
+                                              await hydrator.hydrateFullReplaceTable(table)
+                                          })
+        self.hydrator = hydrator
+        self.flusher = flusher
+        self.realtime = realtime
+        self.catchUpPuller = catchUpPuller
         self.collab = CollabRealtime(client: provider.client)
-        self.flusher = OutboxFlusher(gateway: gateway, db: db)
         self.db = db
+        let prefsHook = self.preferencesHook
+        // Every executor the owner drives is a sub-component built above, so
+        // the whole policy lives in FreshnessOwner and is testable without a
+        // coordinator, a network or a socket.
+        self.freshness = FreshnessOwner(actions: FreshnessOwner.Actions(
+            fullSync: { uid in
+                await hydrator.pruneStaleTaskOps()
+                await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
+                await hydrator.hydrate(userId: uid)
+            },
+            catchUp: { uid, reconcile in
+                // Push before pulling, exactly as the full sync does: a queued
+                // edit must reach the server before we ask what the server has,
+                // or the pull reports our own stale base back at us.
+                await hydrator.pruneStaleTaskOps()
+                await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
+                return await catchUpPuller.catchUp(userId: uid, reconcileDeletions: reconcile)
+            },
+            rebuildSubscriptions: { await realtime.rebuildSubscriptionsNow() },
+            refreshPreferences: { await prefsHook.call() }))
+    }
+
+    /// The app's "re-read the account-wide preference rows" hook. Called by the
+    /// freshness owner on every gap trigger (throttled) and immediately when a
+    /// `notification_preferences` / `user_preferences` realtime event lands, so
+    /// a preference changed on the web reaches this device without a relaunch.
+    public func setOnPreferencesStale(_ hook: @escaping @Sendable () async -> Void) {
+        preferencesHook.set(hook)
     }
 
     /// Begin observing auth-state changes. Call once at app launch.
@@ -80,6 +156,16 @@ public actor SyncCoordinator {
         await write.setOnEnqueue { [weak self] in
             Task { await self?.scheduleDebouncedFlush() }
         }
+        // Realtime REPORTS; the freshness owner decides. A delivered row is
+        // liveness evidence, a (re)subscribe is a gap, a preference-row change
+        // is a stale-preferences signal.
+        let freshness = self.freshness
+        let prefsHook = self.preferencesHook
+        await realtime.setSignals(
+            onRealtimeEvent: { Task { await freshness.report(.realtimeEvent) } },
+            onChannelsSubscribed: { Task { await freshness.report(.channelsSubscribed) } },
+            onPreferencesChanged: { Task { await prefsHook.call() } })
+        startPathMonitor()
         let stream = auth.authStateChanges
         observeTask = Task { [weak self] in
             for await (event, session) in stream {
@@ -88,11 +174,31 @@ public actor SyncCoordinator {
         }
     }
 
+    /// The network coming back is a gap trigger: everything written while we
+    /// were offline was broadcast to a socket that wasn't there. iOS had no
+    /// network-path monitoring at all before this.
+    private func startPathMonitor() {
+        guard pathMonitor == nil else { return }
+        let monitor = NWPathMonitor()
+        pathMonitor = monitor
+        let freshness = self.freshness
+        let previouslySatisfied = MutableFlag(true)
+        monitor.pathUpdateHandler = { path in
+            let satisfied = path.status == .satisfied
+            let was = previouslySatisfied.swap(satisfied)
+            guard satisfied, !was else { return }
+            Task { await freshness.report(.networkRegained) }
+        }
+        monitor.start(queue: DispatchQueue(label: "io.unstucknow.freshness.path"))
+    }
+
     public func stop() {
         observeTask?.cancel()
         observeTask = nil
         flushKick?.cancel()
         flushKick = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
     }
 
     /// Fires after EVERY `profile_facts` hydrate completes (success, failure or
@@ -128,17 +234,36 @@ public actor SyncCoordinator {
     /// Manual best-effort sync (flush outbox → hydrate) for the foreground
     /// (scenePhase .active) + BG-refresh triggers. No-op when signed out.
     /// Mirrors Android SyncCoordinator.syncNow().
+    /// Routed through the freshness owner like every other trigger — it is the
+    /// ONE scheduler, so a foreground, a BG refresh and a floor tick that land
+    /// together collapse into a single pull instead of three overlapping ones.
+    /// Still awaits completion (BackgroundSync needs that) via `awaitIdle`.
     public func syncNow() async {
         guard let uid = auth.currentUserId else { return }
-        let auth = self.auth
-        // Drop stale local task ops the server already superseded BEFORE flushing,
-        // so a queued done=false can't clobber a completion made on another
-        // platform (which the hydrate would then pull back). Then push + pull.
-        await hydrator.pruneStaleTaskOps()
-        await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
-        await hydrator.hydrate(userId: uid)
+        // Bind defensively: a foreground / BG-refresh can land before the auth
+        // observer has processed `initialSession`, and an unbound owner would
+        // silently drop the request. `setUser` is a no-op once bound, and when
+        // it is NOT, the owner correctly runs the full hydrate first.
+        await freshness.setUser(uid)
+        await freshness.report(.manual)
+        await freshness.awaitIdle()
         kickFlushIfOutboxPending()
         await pullCalendar()   // ingest Google events if connected (best-effort)
+    }
+
+    /// Report the app's visibility. This is what arms the floor interval — and
+    /// unlike the old safety net it is safe to call before the engine is ready
+    /// (the owner remembers it), which is why the cold-launch ordering race
+    /// that left a whole session with no periodic pull can't happen again.
+    public func setVisible(_ visible: Bool) async {
+        await freshness.setVisible(visible)
+    }
+
+    /// The freshness owner's view of "am I in step?" — counters, the last
+    /// realtime event, the last successful pull, and how often a channel has
+    /// been caught claiming health while deaf.
+    public func freshnessSnapshot() async -> FreshnessStats {
+        await freshness.snapshot()
     }
 
     /// A hydrate can itself ENQUEUE ops — profile_facts rows the server has
@@ -274,17 +399,6 @@ public actor SyncCoordinator {
         await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
     }
 
-    /// The realtime self-heal path: identical to syncNow() minus the calendar
-    /// pull (the reconnect has nothing to do with Google).
-    private func resyncAfterReconnect(userId uid: String) async {
-        guard auth.currentUserId == uid else { return }
-        let auth = self.auth
-        await hydrator.pruneStaleTaskOps()
-        await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
-        await hydrator.hydrate(userId: uid)
-        kickFlushIfOutboxPending()
-    }
-
     /// Schedule the debounced post-write flush from OUTSIDE the WriteThrough
     /// hook — for writers that commit through the synchronous WriteThrough
     /// path (`upsertCollectionSync`), which can't reach the actor's hook.
@@ -372,26 +486,31 @@ public actor SyncCoordinator {
             await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
             await hydrator.hydrate(userId: uid)
             kickFlushIfOutboxPending()
+            // Hand the session to the freshness owner. `markHydrated` tells it
+            // the cold-start full pull is already done, so from here on the
+            // cheap cursor catch-up is the correctness path.
+            await freshness.setUser(uid)
+            await freshness.markHydrated()
             let hydrator = self.hydrator
+            let freshness = self.freshness
             await realtime.subscribeAll(userId: uid, onMembersChanged: {
                 await hydrator.hydrateCollections(userId: uid)
-            }, onResync: { [weak self] in
-                // Realtime self-heal backfill (socket reconnect / channel
-                // rebuild): a full server-canonical pull catches anything the
-                // dropped connection missed. The REST hydrate is the reliable
-                // source of truth around which realtime self-heals. Same
-                // prune → flush → hydrate → kick sequence as syncNow(): the
-                // socket usually reconnects BEFORE any other trigger fires when
-                // the network returns, and a bare hydrate here would show the
-                // server's stale rows over queued offline edits until the next
-                // safety-net tick.
-                await self?.resyncAfterReconnect(userId: uid)
+            }, onResync: {
+                // A socket reconnect / channel rebuild is a GAP: postgres_changes
+                // has no replay, so everything written while we were away was
+                // never broadcast. Report it — the owner coalesces it with
+                // whatever else is arriving and runs ONE catch-up.
+                await freshness.report(.socketConnected)
             })
             // Live sharing signal (RPC-backed projections refetch on the post).
             await collab.start(userId: uid)
+            // Cold start, after hydrate: seed the cursors and pick up anything
+            // written between the hydrate's reads and the subscriptions landing.
+            await freshness.report(.coldStart)
             await pullCalendar()   // ingest Google events if connected (spec §1.7 step 4, best-effort)
 
         case .signedOut:
+            await freshness.setUser(nil)
             await realtime.unsubscribeAll()
             await collab.stop()
             // Whatever the bounded pre-sign-out drain could NOT push (offline /
@@ -406,8 +525,16 @@ public actor SyncCoordinator {
             try? db.clearAll()
             UserDefaults.standard.removeObject(forKey: prevUserKey)
 
+        case .tokenRefreshed:
+            // The window around a refresh is exactly where a channel re-joins
+            // with a token RLS won't accept and goes permanently deaf while
+            // still reporting SUBSCRIBED (proven 2026-09-12). Treat it as a gap
+            // and catch up; the SDK has already pushed the new token to the
+            // socket by the time this lands.
+            await freshness.report(.tokenRefreshed)
+
         default:
-            break   // tokenRefreshed / passwordRecovery / etc. — no action
+            break   // passwordRecovery / etc. — no action
         }
     }
 }

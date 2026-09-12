@@ -149,6 +149,25 @@ public extension AppDatabase {
         }
     }
 
+    /// Every locally-held primary-key id for a synced table — what the
+    /// catch-up's deletion reconcile compares against the server's surviving
+    /// id set. Unknown tables answer empty (never "delete everything").
+    func localIds(table: String) throws -> Set<String> {
+        try writer.read { db in
+            switch table {
+            case "tasks":        return Set(try String.fetchAll(db, sql: "SELECT id FROM tasks"))
+            case "sessions":     return Set(try String.fetchAll(db, sql: "SELECT id FROM sessions"))
+            case "reason_logs":  return Set(try String.fetchAll(db, sql: "SELECT id FROM reason_logs"))
+            case "collections":  return Set(try String.fetchAll(db, sql: "SELECT id FROM collections"))
+            case "tags":         return Set(try String.fetchAll(db, sql: "SELECT id FROM tags"))
+            case "life_areas":   return Set(try String.fetchAll(db, sql: "SELECT id FROM life_areas"))
+            case "captures":     return Set(try String.fetchAll(db, sql: "SELECT id FROM captures"))
+            case "cal_blocks":   return Set(try String.fetchAll(db, sql: "SELECT id FROM cal_blocks"))
+            default:             return []
+            }
+        }
+    }
+
     /// Wipe EVERYTHING for a user change / sign-out: the synced tables PLUS
     /// the local-only outbox + live_session + capture archive (spec
     /// 02-sync-engine §1.7/§2.2 clearAll). Leaving the outbox behind would let
@@ -159,9 +178,13 @@ public extension AppDatabase {
     /// signing-out user (`parked_outbox`, deliberately NOT wiped here) for
     /// that user's next sign-in.
     func clearAll() throws {
+        // `sync_cursors` goes with them: a wiped table must re-pull from the
+        // start, and a cursor left behind would tell the next catch-up the
+        // device is already in step with rows it no longer holds.
         let tables = ["tasks", "sessions", "cal_blocks", "captures", "reason_logs",
                       "collections", "tags", "life_areas", "calendar_connections",
-                      "profile_facts", "outbox", "live_session", "capture_archive"]
+                      "profile_facts", "outbox", "live_session", "capture_archive",
+                      "sync_cursors"]
         try writer.write { db in
             for t in tables { try db.execute(sql: "DELETE FROM \(t)") }
         }

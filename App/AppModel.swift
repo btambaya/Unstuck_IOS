@@ -526,6 +526,26 @@ final class AppModel {
         }
     }
 
+    /// Re-read every account-wide preference the device caches, ignoring the
+    /// once-per-sign-in guards. Driven by the freshness owner (gap triggers,
+    /// throttled) and by a `notification_preferences` / `user_preferences`
+    /// realtime event. This is what makes a notification level, reminder lead,
+    /// timezone, ritual toggle, struggles list or assistant-interview flag
+    /// changed on another device show up here WITHOUT a relaunch.
+    func refreshServerPreferences() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        serverPrefsPulledFor = nil
+        interviewFlagPulledFor = nil
+        // The onboarding reconcile is idempotent and only ever PINS the local
+        // gate, so re-running it is safe; clearing its guard lets a struggles
+        // list picked on another device land here too.
+        if onboardingReconciledFor == uid { onboardingReconciledFor = nil }
+        pullServerPreferencesIfNeeded()
+        reconcileAccountOnboardingIfNeeded()
+        pushTimezoneIfNeeded()
+        Task { await self.applyServerInterviewFlag() }
+    }
+
     private func pullServerPreferencesIfNeeded() {
         guard let coord = coordinator, let uid = coord.auth.currentUserId, serverPrefsPulledFor != uid else { return }
         let prefs = coord.preferences
@@ -830,7 +850,20 @@ final class AppModel {
         // our own writes / the sign-out wipe).
         await migrateLegacyCaptureArchiveIfNeeded()
         startCaptureArchiveObservation(database)
+        // Account-wide preference rows live outside the local store, so the
+        // cursor catch-up can't carry them: the freshness owner calls this on
+        // every gap trigger, and the realtime mirror calls it the moment a
+        // `notification_preferences` / `user_preferences` row changes. Before
+        // this, every one of them was pulled ONCE per process launch and a
+        // change made on the web could not reach the phone without a relaunch.
+        await coord.setOnPreferencesStale { [weak self] in
+            await MainActor.run { self?.refreshServerPreferences() }
+        }
         await coord.start()
+        // Apply the visibility the scenePhase handler may already have
+        // reported before the coordinator existed (the cold-launch race that
+        // used to leave a session with no periodic pull).
+        setFreshnessVisible(foregroundVisible)
         await observeAuth(coord)
 
         // Register the APNs token (now or when it arrives).
@@ -924,32 +957,37 @@ final class AppModel {
         Task { await coord.syncNow() }
     }
 
-    /// Backing task for the foreground safety-net pull. Observation-ignored:
-    /// it's plumbing, not observable UI state.
-    @ObservationIgnored private var foregroundPullTask: Task<Void, Never>?
+    /// Whether the app is currently foregrounded, as last reported. Read by
+    /// `start()` so a cold launch applies the visibility the scenePhase handler
+    /// may already have reported before the engine existed.
+    @ObservationIgnored private var foregroundVisible = true
 
-    /// Foreground safety-net (spec 02-sync-engine §5): while the app stays
-    /// continuously foregrounded (the user watching this device while editing
-    /// on another), realtime is the only path for remote edits — and realtime
-    /// can silently drop. So run a lightweight ~60s hydrate as a backstop. It's
-    /// the same full REST pull scenePhase .active already does, just repeated.
-    /// Started on .active, cancelled on .inactive/.background. No-op signed out
-    /// or in the UITest boot (no coordinator).
+    /// Foreground safety net (spec 02-sync-engine §5), now a THIN REPORT rather
+    /// than a mechanism of its own: while the app is visible the freshness
+    /// owner runs the floor-interval pull (still 60s) and everything else —
+    /// realtime events, reconnects, the network coming back — reports to the
+    /// same place, so overlapping triggers collapse into one pull instead of
+    /// racing. Kept under the old names because the scenePhase handler calls
+    /// them.
     func startForegroundSafetyNet() {
-        guard coordinator != nil, foregroundPullTask == nil else { return }
-        foregroundPullTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60_000_000_000)   // 60s
-                if Task.isCancelled { return }
-                guard let coord = self?.coordinator else { return }
-                await coord.syncNow()
-            }
-        }
+        setFreshnessVisible(true)
     }
 
     func stopForegroundSafetyNet() {
-        foregroundPullTask?.cancel()
-        foregroundPullTask = nil
+        setFreshnessVisible(false)
+    }
+
+    /// The app's visibility, remembered here so it survives the cold-launch
+    /// ordering that used to lose it: `.active` regularly arrives BEFORE
+    /// `start()` has built the coordinator, and the old safety net simply
+    /// early-returned and never retried — leaving the whole session with no
+    /// periodic pull at all. Now the flag is kept and applied the moment the
+    /// engine exists (start() calls this again), and the freshness owner owns
+    /// the timer.
+    func setFreshnessVisible(_ visible: Bool) {
+        foregroundVisible = visible
+        guard let coord = coordinator else { return }
+        Task { await coord.setVisible(visible) }
     }
 
     /// Recompute + write the Start-Next widget snapshot from the local

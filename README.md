@@ -53,10 +53,22 @@ The sync engine is the port of the Android engine specced in
 hydrate = server-canonical replace-per-table (preserving external
 `g_` blocks + locally-pending optimistic blocks), realtime mirror,
 write-through + outbox for offline mutations (dependency-ordered,
-per-row FIFO, FAIL_CAP poison pill), with sync triggers on auth events,
-foreground (`scenePhase .active`), a debounced post-write kick, and a
-best-effort `BGAppRefreshTask`. Sign-out drains the outbox, unregisters
-the device push token, and clears everything local.
+per-row FIFO, FAIL_CAP poison pill). Sign-out drains the outbox,
+unregisters the device push token, and clears everything local.
+
+**One freshness owner.** Realtime is an optimisation, never the
+correctness path: `postgres_changes` has no replay and a channel can
+report `SUBSCRIBED` while delivering nothing. `UnstuckSync/
+FreshnessOwner.swift` is the single component that answers "am I in
+step?"; realtime, the app lifecycle, an `NWPathMonitor` and a 60s floor
+interval all REPORT to it and nothing else schedules a refresh. It
+coalesces overlapping triggers into one in-flight pull, runs the
+cursor-based catch-up (`CatchUpPuller` + the `sync_cursors` high-water
+marks — a delta read per table plus a paged id sweep for deletions,
+never clobbering a pending local write), keeps the full hydrate for cold
+start, and detects a deaf-but-"healthy" channel two ways (silence, and a
+catch-up finding a change realtime never delivered) — rebuilding the
+subscriptions and counting it in `FreshnessStats`.
 
 ### Name mappings (web → Swift)
 

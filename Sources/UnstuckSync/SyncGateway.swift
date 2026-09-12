@@ -58,6 +58,36 @@ public protocol SyncReadGatewayProtocol: Sendable {
     /// (e.g. a forward-compat shape this build can't parse) instead of having
     /// the whole-array decode of `fetchAll` throw and abort the table refresh.
     func fetchAllRaw(table: String) async throws -> [Data]
+
+    /// The CATCH-UP read: one page of rows whose `column` is at or after
+    /// `atOrAfter`, ordered by `column` ascending, as per-row JSON. A nil
+    /// `atOrAfter` means "from the beginning" — the first pull for a table,
+    /// before this device has a cursor. Inclusive rather than strictly-greater
+    /// so rows sharing a timestamp with a page boundary are never skipped; the
+    /// caller de-duplicates by id.
+    func fetchPageSince(table: String, column: String, atOrAfter: String?, limit: Int) async throws -> [Data]
+
+    /// The DELETION read: just the ids the server still has for this user, one
+    /// page at a time, ordered by id. A hard delete is invisible to a cursor
+    /// pull, so the only way to see one is to ask what still exists.
+    func fetchIdPage(table: String, afterId: String?, limit: Int) async throws -> [String]
+}
+
+public extension SyncReadGatewayProtocol {
+    /// Default for gateways that predate the catch-up (test fakes): no delta
+    /// support → the caller keeps its cursor and falls back to a full pull.
+    func fetchPageSince(table: String, column: String, atOrAfter: String?, limit: Int) async throws -> [Data] {
+        throw CatchUpUnsupportedError(table: table)
+    }
+    func fetchIdPage(table: String, afterId: String?, limit: Int) async throws -> [String] {
+        throw CatchUpUnsupportedError(table: table)
+    }
+}
+
+/// The injected read gateway can't do cursor/id reads (an older test fake).
+public struct CatchUpUnsupportedError: Error, Sendable {
+    public let table: String
+    public init(table: String) { self.table = table }
 }
 
 public extension SyncReadGatewayProtocol {
@@ -90,6 +120,25 @@ public struct SyncGateway: Sendable, SyncGatewayProtocol, SyncReadGatewayProtoco
         let rows: [AnyJSON] = try await client.from(table).select().execute().value
         let encoder = JSONEncoder()
         return try rows.map { try encoder.encode($0) }
+    }
+
+    /// One catch-up page. RLS scopes the read to the signed-in user, exactly
+    /// like the full hydrate — the cursor only narrows it in time.
+    public func fetchPageSince(table: String, column: String, atOrAfter: String?, limit: Int) async throws -> [Data] {
+        var query = client.from(table).select()
+        if let atOrAfter { query = query.gte(column, value: atOrAfter) }
+        let rows: [AnyJSON] = try await query.order(column, ascending: true).limit(limit).execute().value
+        let encoder = JSONEncoder()
+        return try rows.map { try encoder.encode($0) }
+    }
+
+    /// One page of surviving ids, ordered by id so paging is stable.
+    public func fetchIdPage(table: String, afterId: String?, limit: Int) async throws -> [String] {
+        struct IdRow: Decodable { let id: String }
+        var query = client.from(table).select("id")
+        if let afterId { query = query.gt("id", value: afterId) }
+        let rows: [IdRow] = try await query.order("id", ascending: true).limit(limit).execute().value
+        return rows.map(\.id)
     }
 
     public func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {

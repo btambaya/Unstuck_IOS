@@ -224,6 +224,21 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        // Catch-up cursors (the freshness owner's high-water marks): the newest
+        // server stamp this device has ACCEPTED per (user, table), so a catch-up
+        // can ask for `<cursorColumn> > cursor` instead of replacing the whole
+        // table. Keyed by user so a device shared by two accounts can't inherit
+        // the other's position; wiped by clearAll with the rest of the cache,
+        // because a wiped table must re-pull from the start.
+        m.registerMigration("v5_sync_cursors") { db in
+            try db.create(table: "sync_cursors") { t in
+                t.column("userId", .text).notNull()
+                t.column("tableName", .text).notNull()
+                t.column("value", .text).notNull()
+                t.primaryKey(["userId", "tableName"])
+            }
+        }
+
         return m
     }()
 }
