@@ -81,6 +81,16 @@ public actor RealtimeMirror {
         currentUserId = userId
         self.onMembersChanged = onMembersChanged
         self.onResync = onResync
+        // Open the socket ONCE, and wait for it, before any channel subscribes.
+        // subscribeChannels fans ~11 subscribes out into detached Tasks; each one
+        // lazily calls connect(), and on supabase-swift 2.46 those parallel
+        // connects overwrite the socket's single message handler — every phx_join
+        // goes out and no reply is ever read, so the mirror reported no error and
+        // received nothing, ever. iOS live sync has never worked because of this;
+        // only the foreground pull brought remote changes in. CoFocusPresenceClient
+        // already does exactly this (CoFocusPresenceClient.swift:713).
+        // Diagnosis 2026-09-12.
+        await client.realtimeV2.connect()
         await subscribeChannels(userId: userId, onMembersChanged: onMembersChanged)
         observeSocketStatus()
     }
