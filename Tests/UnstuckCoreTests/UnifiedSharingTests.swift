@@ -157,6 +157,160 @@ final class UnifiedSharingTests: XCTestCase {
         XCTAssertEqual(shareShortName("   "), "them")
     }
 
+    // MARK: People card — shared-first order, the collapse rule, Find
+
+    private func person(_ id: String, _ name: String, subtitle: String? = nil, email: String? = nil,
+                        shared: Bool = false) -> SharePersonRow {
+        SharePersonRow(id: id, userId: "u-\(id)", name: name, subtitle: subtitle, email: email,
+                       access: shared ? .edit : nil)
+    }
+
+    /// n people named p1…pn, the first `shared` of them (roster order) holding the item.
+    private func roster(_ n: Int, shared: Int = 0) -> [SharePersonRow] {
+        (1...max(n, 1)).prefix(n).map { i in person("p\(i)", "Person \(i)", shared: i <= shared) }
+    }
+
+    private func layout(_ people: [SharePersonRow], pinned: Set<String>? = nil,
+                        expanded: Bool = false, query: String = "") -> SharePeopleLayout {
+        sharePeopleLayout(people, pinned: pinned ?? Set(people.filter(\.isShared).map(\.id)),
+                          expanded: expanded, query: query)
+    }
+
+    func testSharedPeopleComeFirstAndRosterOrderIsKeptInsideEachHalf() {
+        let people = [person("a", "A"), person("b", "B", shared: true), person("c", "C"),
+                      person("d", "D", shared: true), person("e", "E")]
+        let ordered = sharePeopleOrdered(people, pinned: ["b", "d"])
+        XCTAssertEqual(ordered.map(\.id), ["b", "d", "a", "c", "e"])
+        // Pinning is by id at OPEN time — a share made while the sheet is up
+        // does not reorder (the row must not move under the finger).
+        XCTAssertEqual(sharePeopleOrdered(people, pinned: ["d"]).map(\.id), ["d", "a", "b", "c", "e"])
+        XCTAssertEqual(sharePeopleOrdered(people, pinned: []).map(\.id), ["a", "b", "c", "d", "e"])
+    }
+
+    func testTheCapNeverHidesSomeoneWhoAlreadyHasIt() {
+        let five = layout(roster(7, shared: 5))
+        XCTAssertEqual(five.rows.count, 5, "cap lifts to the number pinned")
+        XCTAssertTrue(five.rows.allSatisfy(\.isShared))
+        XCTAssertEqual(five.hiddenCount, 2)
+        XCTAssertTrue(five.canCollapse)
+        let six = layout(roster(7, shared: 6))
+        XCTAssertEqual(six.rows.count, 7, "cap 6 would hide one row — not worth a disclosure")
+        XCTAssertEqual(six.hiddenCount, 0)
+        XCTAssertFalse(six.canCollapse)
+        let ten = layout(roster(20, shared: 10))
+        XCTAssertEqual(ten.rows.count, 10)
+        XCTAssertEqual(ten.hiddenCount, 10)
+        XCTAssertTrue(ten.rows.allSatisfy(\.isShared))
+    }
+
+    func testHidingExactlyOneRowIsNotWorthADisclosure() {
+        let four = layout(roster(4))
+        XCTAssertEqual(four.rows.count, 4)
+        XCTAssertFalse(four.canCollapse)
+        XCTAssertEqual(four.hiddenCount, 0)
+        let five = layout(roster(5))
+        XCTAssertEqual(five.rows.count, 3)
+        XCTAssertEqual(five.hiddenCount, 2)
+        XCTAssertTrue(five.canCollapse)
+    }
+
+    func testCollapseCasesOneThreeFourFiveSevenTwenty() {
+        XCTAssertEqual(layout(roster(0)).rows.count, 0)
+        XCTAssertFalse(layout(roster(0)).canCollapse)
+        XCTAssertEqual(layout(roster(1)).rows.count, 1)
+        XCTAssertFalse(layout(roster(1)).canCollapse)
+        XCTAssertEqual(layout(roster(3)).rows.count, 3)
+        XCTAssertFalse(layout(roster(3)).canCollapse)
+        XCTAssertEqual(layout(roster(4)).rows.count, 4)
+        XCTAssertFalse(layout(roster(4)).canCollapse)
+        let five = layout(roster(5))
+        XCTAssertEqual((five.rows.count, five.hiddenCount).0, 3)
+        XCTAssertEqual(five.hiddenCount, 2)
+        let seven = layout(roster(7))
+        XCTAssertEqual(seven.rows.count, 3, "Ahmad's screenshot: seven full rows → three + Show 4 more")
+        XCTAssertEqual(seven.hiddenCount, 4)
+        XCTAssertTrue(seven.canCollapse)
+        let sevenTwoShared = layout([person("a", "A"), person("b", "B"), person("c", "C", shared: true),
+                                     person("d", "D"), person("e", "E"), person("f", "F", shared: true),
+                                     person("g", "G")])
+        XCTAssertEqual(sevenTwoShared.rows.map(\.id), ["c", "f", "a"], "both shared first, then roster order")
+        XCTAssertEqual(sevenTwoShared.hiddenCount, 4)
+        let twenty = layout(roster(20, shared: 2))
+        XCTAssertEqual(twenty.rows.count, 3)
+        XCTAssertEqual(twenty.hiddenCount, 17)
+        XCTAssertFalse(twenty.showsSearch, "the Find field only appears expanded")
+    }
+
+    func testExpandedShowsEverythingAndSearchOnlyAppearsAtTen() {
+        let seven = layout(roster(7), expanded: true)
+        XCTAssertEqual(seven.rows.count, 7)
+        XCTAssertEqual(seven.hiddenCount, 0)
+        XCTAssertTrue(seven.canCollapse, "the disclosure stays so it can say Show less")
+        XCTAssertFalse(seven.showsSearch)
+        let nine = layout(roster(9), expanded: true)
+        XCTAssertFalse(nine.showsSearch)
+        let ten = layout(roster(10), expanded: true)
+        XCTAssertTrue(ten.showsSearch)
+        XCTAssertEqual(ten.rows.count, 10)
+        let twenty = layout(roster(20), expanded: true)
+        XCTAssertTrue(twenty.showsSearch)
+        XCTAssertEqual(twenty.rows.count, 20)
+        XCTAssertTrue(twenty.canCollapse)
+        // A pinned set that happens to cover everyone: nothing to collapse.
+        let allShared = layout(roster(4, shared: 4), expanded: true)
+        XCTAssertFalse(allShared.canCollapse)
+    }
+
+    func testSearchLiftsTheCapAndHidesTheDisclosure() {
+        let people = roster(20, shared: 2)
+        let searching = layout(people, expanded: true, query: "Person 1")
+        XCTAssertTrue(searching.showsSearch)
+        XCTAssertFalse(searching.canCollapse)
+        XCTAssertEqual(searching.hiddenCount, 0)
+        // "Person 1" prefixes Person 1, 10…19 — eleven rows, well past the cap of 3.
+        XCTAssertEqual(searching.rows.count, 11)
+        XCTAssertEqual(searching.rows.first?.id, "p1", "shared-first order survives a search")
+        // Whitespace-only is not a search.
+        let blank = layout(people, expanded: true, query: "   ")
+        XCTAssertEqual(blank.rows.count, 20)
+        XCTAssertTrue(blank.canCollapse)
+        // Below the threshold there is no field, so a stray query is ignored.
+        let small = layout(roster(5), expanded: true, query: "zzz")
+        XCTAssertEqual(small.rows.count, 5)
+    }
+
+    func testSearchIsDiacriticAndCaseInsensitiveAndMatchesNameRelationshipAndEmail() {
+        let zoe = person("z", "Zoë Müller", subtitle: "Coach", email: "zoe.m@example.com")
+        XCTAssertTrue(sharePersonMatches(zoe, query: "zoe"))
+        XCTAssertTrue(sharePersonMatches(zoe, query: "ZOË"))
+        XCTAssertTrue(sharePersonMatches(zoe, query: "mul"), "diacritics fold: mül → mul")
+        XCTAssertTrue(sharePersonMatches(zoe, query: "coa"), "the relationship label")
+        XCTAssertTrue(sharePersonMatches(zoe, query: "example"), "the email's domain word")
+        XCTAssertTrue(sharePersonMatches(zoe, query: "zoe mul"), "every term must prefix some word")
+        XCTAssertFalse(sharePersonMatches(zoe, query: "oë"), "prefix-of-word, not substring")
+        XCTAssertFalse(sharePersonMatches(zoe, query: "zoe x"))
+        XCTAssertTrue(sharePersonMatches(zoe, query: ""), "an empty query matches everyone")
+        let plain = person("p", "Zubair")
+        XCTAssertTrue(sharePersonMatches(plain, query: "zu"))
+        XCTAssertFalse(sharePersonMatches(plain, query: "coach"), "no subtitle / email → nothing to match")
+    }
+
+    func testNoMatchReturnsNoRows() {
+        let none = layout(roster(12), expanded: true, query: "nobody")
+        XCTAssertTrue(none.rows.isEmpty)
+        XCTAssertTrue(none.showsSearch, "the field stays so the query can be corrected")
+        XCTAssertFalse(none.canCollapse)
+        XCTAssertEqual(none.hiddenCount, 0)
+    }
+
+    func testDisclosureTitle() {
+        XCTAssertEqual(sharePeopleDisclosureTitle(hiddenCount: 4, expanded: false), "Show 4 more")
+        XCTAssertEqual(sharePeopleDisclosureTitle(hiddenCount: 17, expanded: false), "Show 17 more")
+        XCTAssertEqual(sharePeopleDisclosureTitle(hiddenCount: 0, expanded: true), "Show less")
+        XCTAssertEqual(sharePeopleCollapsedCap, 3)
+        XCTAssertEqual(sharePeopleSearchThreshold, 10)
+    }
+
     // MARK: assistant share_task accepts an email
 
     private func task(_ name: String) -> TaskItem {

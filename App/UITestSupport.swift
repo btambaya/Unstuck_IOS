@@ -288,3 +288,128 @@ enum HeavyDemoSeed {
     }
 }
 #endif
+
+// MARK: - Share screen · People card demo transport (UITEST_SHARE_PEOPLE)
+
+// A scripted `ShareScreenTransport` so the Share screen's People card can be
+// driven and screenshotted on the network-free demo boot, where the live
+// transport has no coordinator and the section is always empty. Gated behind
+// `#if DEBUG` AND the launch env var, like every other UITEST_* hook:
+//
+//   UITEST_SHARE_PEOPLE="<count>,<shared>[,<handed>]"
+//
+// `count` active connections (fixed names, some with a relationship label,
+// one 24-character name + a long label for the accessibility-size check);
+// the LAST `shared` of them, in roster order, already hold the item (so the
+// shared-first ordering is visible: they float above the rest); `handed` = 1
+// makes the last shared person the hand-over holder (level `assign`).
+// Writes mutate the in-memory grants so a tap re-renders the row the way the
+// live screen does. UITEST_SHARE_SLOW=1 adds a 1.5s delay to every write so
+// the busy row can be shot mid-flight.
+#if DEBUG
+@MainActor
+final class DemoShareTransport: ShareScreenTransport {
+    static func fromEnvironment() -> DemoShareTransport? {
+        let env = ProcessInfo.processInfo.environment
+        guard let raw = env["UITEST_SHARE_PEOPLE"] else { return nil }
+        let parts = raw.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard let count = parts.first else { return nil }
+        return DemoShareTransport(count: count, shared: parts.count > 1 ? parts[1] : 0,
+                                  handed: parts.count > 2 ? parts[2] : 0, slow: env["UITEST_SHARE_SLOW"] == "1")
+    }
+
+    private static let names = [
+        "Maya Chen", "Zubair Kazaure", "Zoë Müller", "Nadia Ali", "Tomás Herrera",
+        "Priya Raghunathan-Okafor", "Sam O'Brien", "Léa Dubois", "Kenji Watanabe", "Amara Okafor",
+        "Mateo Rossi", "Ivy Park", "Omar Haddad", "Hana Sato", "Luca Bianchi",
+        "Noor Rahman", "Elias Berg", "Sofia Lindqvist", "Yusuf Demir", "Grace Mwangi",
+    ]
+    private static let labels: [String?] = [
+        "Coach", nil, "Accountability partner", nil, "Brother",
+        "Accountability partner", nil, "Study buddy", nil, "Sister",
+        nil, nil, "Manager", nil, nil,
+        nil, "Coach", nil, nil, nil,
+    ]
+
+    private let circle: [CircleMember]
+    private var shares: [ShareForTask]
+    private var pending: [TaskSharePendingInvite]
+    private var members: [CollectionMemberInfo]
+    private let slow: Bool
+
+    init(count: Int, shared: Int, handed: Int, slow: Bool) {
+        self.slow = slow
+        let n = max(0, count)
+        let roster: [CircleMember] = (0..<n).map { i in
+            let base = Self.names[i % Self.names.count]
+            let name = i < Self.names.count ? base : "\(base) \(i / Self.names.count + 1)"
+            return CircleMember(id: "c\(i)", relationshipLabel: Self.labels[i % Self.labels.count], level: "view",
+                                status: "active", inviteCode: nil, memberUserId: "u\(i)", memberName: name,
+                                createdAt: "2026-09-17T09:00:00Z")
+        }
+        let sharedCount = min(max(0, shared), n)
+        let sharedIndices = Array((n - sharedCount)..<n)
+        circle = roster
+        shares = sharedIndices.enumerated().map { k, i in
+            let level: ShareLevel = (handed > 0 && k == sharedIndices.count - 1) ? .assign : (k % 2 == 0 ? .partner : .view)
+            return ShareForTask(shareId: "s\(i)", recipientUserId: "u\(i)", recipientName: roster[i].memberName ?? "", level: level)
+        }
+        members = sharedIndices.enumerated().map { k, i in
+            CollectionMemberInfo(userId: "u\(i)", email: "\(i)@example.com", role: k % 2 == 0 ? "editor" : "viewer", pending: false)
+        }
+        pending = n > 0 ? [TaskSharePendingInvite(id: "i1", email: "new@example.com", level: .partner)] : []
+    }
+
+    private func delay() async {
+        if slow { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+    }
+
+    func listCircle() async -> [CircleMember] { circle }
+    func taskShares(taskId: String) async -> [ShareForTask] { shares }
+    func taskPendingInvites(taskId: String) async -> [TaskSharePendingInvite] { pending }
+    func shareTask(taskId: String, userId: String, level: ShareLevel) async throws {
+        await delay()
+        shares.removeAll { $0.recipientUserId == userId }
+        let name = circle.first { $0.memberUserId == userId }?.memberName ?? userId
+        shares.append(ShareForTask(shareId: "s-\(userId)", recipientUserId: userId, recipientName: name, level: level))
+    }
+    func unshareTask(shareId: String) async -> Bool {
+        await delay()
+        shares.removeAll { $0.shareId == shareId }
+        return true
+    }
+    func shareTaskByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
+        await delay()
+        pending.append(TaskSharePendingInvite(id: "i-\(email)", email: email, level: level))
+        return .invited
+    }
+    func cancelTaskInvite(taskId: String, inviteId: String) async -> Bool {
+        pending.removeAll { $0.id == inviteId }
+        return true
+    }
+    func taskLink(taskId: String, level: ShareLevel) async -> ShareLinkOutcome {
+        .ok(url: "https://unstucknow.io/circle/join?code=demo")
+    }
+    func notifyTaskShare(taskId: String, recipientId: String) async {}
+    func collectionMembers(collectionId: String) async -> [CollectionMemberInfo] { members }
+    func shareCollection(collectionId: String, email: String?, userId: String?, role: String) async -> ShareOutcome {
+        await delay()
+        if let userId {
+            members.removeAll { $0.userId == userId }
+            members.append(CollectionMemberInfo(userId: userId, email: email ?? "", role: role, pending: false))
+            return .ok
+        }
+        return .accepted
+    }
+    func unshareCollection(collectionId: String, userId: String) async -> Bool {
+        await delay()
+        members.removeAll { $0.userId == userId }
+        return true
+    }
+    func cancelCollectionInvite(collectionId: String, email: String) async -> Bool { true }
+    func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome {
+        .ok(url: "https://unstucknow.io/circle/join?code=demo")
+    }
+    func isBlocked(_ email: String) -> Bool { false }
+}
+#endif

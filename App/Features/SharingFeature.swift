@@ -493,7 +493,7 @@ struct SharedTaskDetailSheet: View {
                         .font(.system(size: 12, weight: .semibold))
                     Text(d.done ? "Reopen" : "Complete").font(UFont.sans(13, .semibold))
                 }
-                .foregroundStyle(d.done ? theme.palette.ink2 : .white)
+                .foregroundStyle(d.done ? theme.palette.ink2 : theme.palette.bg)
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .background(d.done ? AnyShapeStyle(theme.palette.bg2) : AnyShapeStyle(theme.palette.primary), in: Capsule())
             }.buttonStyle(.plain)
@@ -930,7 +930,7 @@ struct PartnerPresence: View {
                                 Text(sitting ? "Sitting with them" : "Sit with them")
                                     .font(UFont.sans(11, .bold))
                             }
-                            .foregroundStyle(sitting ? .white : theme.palette.primaryDeep)
+                            .foregroundStyle(sitting ? theme.palette.bg : theme.palette.primaryDeep)
                             .padding(.horizontal, 10).padding(.vertical, 3)
                             .background(sitting ? theme.palette.primary : theme.palette.primarySoft, in: Capsule())
                         }.buttonStyle(.plain)

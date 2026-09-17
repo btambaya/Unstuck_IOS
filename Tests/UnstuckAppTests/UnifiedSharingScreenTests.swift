@@ -383,6 +383,51 @@ final class ShareScreenModelTests: XCTestCase {
         XCTAssertTrue(handOverExplainer.contains("you keep view"))
     }
 
+    // MARK: People card — pinned at open (order + collapse are the pure layout's job)
+
+    func testPinnedIdsAreFixedByTheFirstLoadAndSurviveAReload() async {
+        fake.taskSharesById["t1"] = [ShareForTask(shareId: "s1", recipientUserId: "u2", recipientName: "Zubair", level: .view)]
+        let vm = taskModel()
+        XCTAssertTrue(vm.pinnedIds.isEmpty, "nothing is pinned before the first load")
+        await vm.load()
+        XCTAssertEqual(vm.pinnedIds, ["c2"], "the row id of who already held it at open")
+        await vm.tap(vm.people[0])   // share with Maya — perform() reloads
+        XCTAssertEqual(vm.people[0].access, .edit)
+        XCTAssertEqual(vm.pinnedIds, ["c2"], "a share made while the sheet is open does NOT pin")
+        XCTAssertEqual(vm.people.map(\.userId), ["u1", "u2"], "vm.people keeps roster order")
+        let layout = sharePeopleLayout(vm.people, pinned: vm.pinnedIds, expanded: false, query: "")
+        XCTAssertEqual(layout.rows.map(\.userId), ["u2", "u1"], "Zubair (pinned) first; Maya stays where she was")
+        await vm.setAccess(vm.people[1], nil)   // remove Zubair
+        XCTAssertNil(vm.people[1].access)
+        XCTAssertEqual(vm.pinnedIds, ["c2"], "frozen — never recomputed, even after a remove")
+    }
+
+    func testPinningWaitsForTheFirstNonEmptyLoad() async {
+        let circle = fake.circle
+        fake.circle = []
+        fake.taskSharesById["t1"] = [ShareForTask(shareId: "s1", recipientUserId: "u1", recipientName: "Maya Chen", level: .partner)]
+        let vm = taskModel()
+        await vm.load()
+        XCTAssertEqual(vm.people.count, 1, "a grant outside the roster is still a person")
+        XCTAssertEqual(vm.pinnedIds, ["grant:u1"])
+        fake.circle = circle
+        await vm.load()
+        XCTAssertEqual(vm.pinnedIds, ["grant:u1"], "the first non-empty load fixed it; the roster arriving later does not re-pin")
+    }
+
+    func testHandOverModePinsOnlyTheHolder() async {
+        fake.taskSharesById["t1"] = [
+            ShareForTask(shareId: "s1", recipientUserId: "u1", recipientName: "Maya Chen", level: .partner),
+            ShareForTask(shareId: "s2", recipientUserId: "u2", recipientName: "Zubair", level: .assign),
+        ]
+        let vm = taskModel(mode: .handOver)
+        await vm.load()
+        XCTAssertEqual(vm.pinnedIds, ["c2"], "an edit grant is not a hand-over")
+        let share = taskModel(mode: .share)
+        await share.load()
+        XCTAssertEqual(share.pinnedIds, ["c1", "c2"], "share mode pins every grant, the hand-over included")
+    }
+
     // MARK: live refresh
 
     func testTheCollabSignalsReloadTheScreen() async {

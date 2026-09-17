@@ -20,6 +20,8 @@ struct NewTaskSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
+    /// The share picker's monogram disc (same as the Share screen's).
+    @ScaledMetric(relativeTo: .body) private var monogramSize: CGFloat = 22
 
     let defaultEstimate: Int
     /// Optional prefill (e.g. tapping an empty calendar slot): a date and/or
@@ -348,10 +350,16 @@ struct NewTaskSheet: View {
         let current = shareLevels[userId]
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 10) {
+                // The Share screen's monogram: the selected / unselected chip
+                // pair on a circle — filled once a level is picked, never the
+                // accent (the app spends accent on eyebrows + text links only).
                 Text(String((m.memberName ?? "?").prefix(1)).uppercased())
-                    .font(UFont.sans(13, .semibold)).foregroundStyle(.white)
-                    .frame(width: 30, height: 30)
-                    .background(theme.palette.primary, in: Circle())
+                    .font(UFont.sans(10, .semibold))
+                    .foregroundStyle(current != nil ? theme.palette.bg : theme.palette.ink2)
+                    .frame(width: monogramSize, height: monogramSize)
+                    .background(current != nil ? theme.palette.ink : theme.palette.bg2, in: Circle())
+                    .overlay(Circle().stroke(current != nil ? Color.clear : theme.palette.line2))
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(m.memberName ?? "Member").font(UFont.sans(14, .semibold))
                         .foregroundStyle(theme.palette.ink).lineLimit(1)
@@ -370,7 +378,7 @@ struct NewTaskSheet: View {
                     } label: {
                         Text(opt.label)
                             .font(UFont.sans(11, .semibold))
-                            .foregroundStyle(selected ? .white : theme.palette.ink2)
+                            .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 5)
                             .background(selected ? theme.palette.coralDeep : Color.clear, in: Capsule())
@@ -422,7 +430,7 @@ struct NewTaskSheet: View {
                 HStack(spacing: 8) {
                     if let link = r.link {
                         Button { copy(link) } label: {
-                            Text("Copy link").font(UFont.sans(13, .semibold)).foregroundStyle(.white)
+                            Text("Copy link").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
                                 .padding(.horizontal, 14).padding(.vertical, 8)
                                 .background(theme.palette.ink, in: Capsule())
                         }.buttonStyle(.plain)
@@ -448,7 +456,7 @@ struct NewTaskSheet: View {
                 HStack(spacing: 8) {
                     Button { generateInvite() } label: {
                         Text(inviteEmail.trimmingCharacters(in: .whitespaces).isEmpty ? "Generate link" : "Send invite")
-                            .font(UFont.sans(13, .semibold)).foregroundStyle(.white)
+                            .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
                             .padding(.horizontal, 14).padding(.vertical, 8)
                             .background(theme.palette.ink, in: Capsule())
                     }.buttonStyle(.plain)

@@ -224,6 +224,82 @@ private func firstNonEmptyName(_ candidates: [String?]) -> String {
     return "Someone"
 }
 
+// MARK: - People section · collapse + order (the Share screen's card)
+
+/// Rows shown before "Show N more" hides the rest. Mirrored by the Android
+/// and web Share screens — change all three together or they collapse
+/// differently.
+public let sharePeopleCollapsedCap = 3
+/// From this many people up, the EXPANDED list gets a Find field.
+public let sharePeopleSearchThreshold = 10
+
+/// What the People card renders for one (people, pinned, expanded, query).
+public struct SharePeopleLayout: Equatable, Sendable {
+    public var rows: [SharePersonRow]
+    /// 0 when expanded, searching, or nothing is hidden.
+    public var hiddenCount: Int
+    /// expanded && count ≥ `sharePeopleSearchThreshold`.
+    public var showsSearch: Bool
+    /// Whether the "Show N more / Show less" row exists at all.
+    public var canCollapse: Bool
+
+    public init(rows: [SharePersonRow], hiddenCount: Int, showsSearch: Bool, canCollapse: Bool) {
+        self.rows = rows
+        self.hiddenCount = hiddenCount
+        self.showsSearch = showsSearch
+        self.canCollapse = canCollapse
+    }
+}
+
+/// Shared-first, roster order preserved inside each half. `pinned` = the ids
+/// that already held the item when the screen OPENED, so a row never moves
+/// under the finger after a tap.
+public func sharePeopleOrdered(_ people: [SharePersonRow], pinned: Set<String>) -> [SharePersonRow] {
+    people.filter { pinned.contains($0.id) } + people.filter { !pinned.contains($0.id) }
+}
+
+/// Diacritic- and case-insensitive prefix-of-word over name, relationship and
+/// email. Every query term must prefix some word.
+public func sharePersonMatches(_ row: SharePersonRow, query: String) -> Bool {
+    let opts: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
+    let terms = query.folding(options: opts, locale: .current).split(whereSeparator: \.isWhitespace)
+    guard !terms.isEmpty else { return true }
+    let words = [row.name, row.subtitle ?? "", row.email ?? ""].joined(separator: " ")
+        .folding(options: opts, locale: .current)
+        .split(whereSeparator: { $0.isWhitespace || $0 == "@" || $0 == "." })
+    return terms.allSatisfy { t in words.contains { $0.hasPrefix(t) } }
+}
+
+/// THE COLLAPSE RULE.
+///  • order = pinned first, roster order inside each half
+///  • cap  = max(sharePeopleCollapsedCap, pinned.count) — a person who already
+///           holds the item is NEVER hidden (that is the section's promise)
+///  • hide only when it hides ≥ 2 rows: a "Show 1 more" is worse than the row
+///  • searching lifts the cap entirely and hides the disclosure
+public func sharePeopleLayout(_ people: [SharePersonRow], pinned: Set<String>,
+                              expanded: Bool, query: String) -> SharePeopleLayout {
+    let ordered = sharePeopleOrdered(people, pinned: pinned)
+    let showsSearch = expanded && ordered.count >= sharePeopleSearchThreshold
+    let trimmed = query.trimmingCharacters(in: .whitespaces)
+    if showsSearch, !trimmed.isEmpty {
+        return .init(rows: ordered.filter { sharePersonMatches($0, query: trimmed) },
+                     hiddenCount: 0, showsSearch: true, canCollapse: false)
+    }
+    let cap = max(sharePeopleCollapsedCap, pinned.intersection(Set(ordered.map(\.id))).count)
+    let canCollapse = ordered.count > cap + 1
+    guard canCollapse, !expanded else {
+        return .init(rows: ordered, hiddenCount: 0, showsSearch: showsSearch, canCollapse: canCollapse)
+    }
+    return .init(rows: Array(ordered.prefix(cap)), hiddenCount: ordered.count - cap,
+                 showsSearch: false, canCollapse: true)
+}
+
+/// "Show 4 more" / "Show less". No "· N already shared" suffix exists, because
+/// with the max() cap a hidden row can never be a shared one.
+public func sharePeopleDisclosureTitle(hiddenCount: Int, expanded: Bool) -> String {
+    expanded ? "Show less" : "Show \(hiddenCount) more"
+}
+
 /// A successful outcome, in the vocabulary of §2 — rendered by `shareResultLine`.
 public enum ShareResult: Equatable, Sendable {
     /// An existing account got the item right away.

@@ -645,7 +645,13 @@ extension AppModel {
     /// "Hand over to…" people picker). Bound to the live transport; a nil
     /// coordinator (demo / UITest boot) degrades to empty, inert sections.
     func makeShareScreenModel(target: ShareTarget, mode: ShareScreenModel.Mode = .share) -> ShareScreenModel {
-        ShareScreenModel(target: target, mode: mode, transport: LiveShareTransport(model: self))
+        #if DEBUG
+        // UITEST_SHARE_PEOPLE — a scripted roster for the People card shots.
+        if let demo = DemoShareTransport.fromEnvironment() {
+            return ShareScreenModel(target: target, mode: mode, transport: demo)
+        }
+        #endif
+        return ShareScreenModel(target: target, mode: mode, transport: LiveShareTransport(model: self))
     }
 
     /// Report a person you shared a task or list with (App Store 1.2 safety) —

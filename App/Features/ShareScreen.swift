@@ -4,9 +4,13 @@
 // with a single surface and a single vocabulary:
 //
 //   Share · <item name>            [Can edit | Can view]   (default Can edit)
-//   PEOPLE        everyone you are connected to — one tap shares at the
-//                 chosen grade; already-shared people show their grade and
-//                 open a picker (Can edit / Can view / Remove).
+//   PEOPLE        everyone you are connected to, in ONE card — one tap on a
+//                 row shares at the chosen grade; already-shared people sit
+//                 first, show their grade and open a picker (Can edit / Can
+//                 view / Remove). Past three rows the card collapses behind
+//                 "Show N more" (someone who already has it is never hidden);
+//                 expanded lists of ten or more get a Find field. The pure
+//                 rule is `sharePeopleLayout` (UnifiedSharing.swift).
 //   SOMEONE NEW   email + Share — an existing account is shared with at once
 //                 (the server pushes them), anyone else gets an invite email
 //                 that is claimed when they sign up. Pending invites listed.
@@ -200,6 +204,14 @@ final class ShareScreenModel {
     private(set) var error: String?
     /// The last join link minted (the view hands it to the system share sheet).
     private(set) var lastLink: String?
+    /// The ids that already held the item when this screen opened. Fixed by
+    /// the FIRST load and never recomputed, so a row you just shared changes
+    /// its monogram and its trailing word IN PLACE and only floats to the top
+    /// the next time the sheet is opened. In hand-over mode only a hand-over
+    /// pins. The view orders + collapses with `sharePeopleLayout`; `people`
+    /// itself keeps roster order.
+    private(set) var pinnedIds: Set<String> = []
+    @ObservationIgnored private var pinned = false
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
     @ObservationIgnored private var circle: [CircleMember] = []
 
@@ -260,6 +272,10 @@ final class ShareScreenModel {
             }
         }
         loading = false
+        if !pinned, !people.isEmpty {
+            pinned = true
+            pinnedIds = Set(people.filter { mode == .handOver ? $0.handedOver : $0.isShared }.map(\.id))
+        }
     }
 
     // MARK: people
@@ -459,12 +475,22 @@ struct ShareScreen: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var typeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// The monogram disc — scaled with the body text so the letter never
+    /// overflows its circle at accessibility sizes.
+    @ScaledMetric(relativeTo: .body) private var monogramSize: CGFloat = 22
     let target: ShareTarget
     var mode: ShareScreenModel.Mode = .share
 
     @State private var vm: ShareScreenModel?
     @State private var linkToShare: ShareLinkItem?
     @State private var reportTarget: SharePersonRow?
+    /// People card state — lives on the sheet, so it survives every reload
+    /// (the list never snaps shut under the finger) and resets on the next
+    /// presentation (the tidy collapsed card is the default every time).
+    @State private var peopleExpanded = false
+    @State private var peopleQuery = ""
 
     var body: some View {
         NavigationStack {
@@ -490,6 +516,7 @@ struct ShareScreen: View {
                 }
                 .padding(20)
             }
+            .scrollDismissesKeyboard(.interactively)
             .background(theme.palette.bg.ignoresSafeArea())
             .navigationTitle(mode == .share ? "Share" : "Hand over")
             .navigationBarTitleDisplayMode(.inline)
@@ -553,10 +580,22 @@ struct ShareScreen: View {
 
     // MARK: people
 
+    /// The People card. Rows abut inside ONE 12pt surface card (the Share
+    /// screen's own card radius — `linkSection` / `pendingRow`), divided by
+    /// `CardDivider`. Order + collapse + search are the pure
+    /// `sharePeopleLayout`; only `peopleExpanded` / `peopleQuery` are local.
+    /// No accent token is used anywhere in the section: the monogram carries
+    /// the shared / not-shared state with the app's selected / unselected chip
+    /// pair (`ink`-on-`bg` vs `bg2` / `ink2` / `line2`), so the card looks the
+    /// same under every accent, in light and dark.
     @ViewBuilder
     private func peopleSection(_ vm: ShareScreenModel) -> some View {
+        let count = vm.people.count
+        let noun = mode == .share ? "People" : "Hand over to"
+        let layout = sharePeopleLayout(vm.people, pinned: vm.pinnedIds, expanded: peopleExpanded, query: peopleQuery)
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel("People")
+            SectionLabel(count == 0 ? noun : "\(noun) · \(count)")
+                .accessibilityLabel("\(noun), \(count)")
             if vm.loading && vm.people.isEmpty {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
             } else if vm.people.isEmpty {
@@ -566,87 +605,245 @@ struct ShareScreen: View {
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                VStack(spacing: 8) {
-                    ForEach(vm.people) { row in personRow(vm, row) }
+                if layout.showsSearch { peopleSearch }
+                if layout.rows.isEmpty {
+                    Text("No one matches “\(peopleQuery.trimmingCharacters(in: .whitespaces))”.")
+                        .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(layout.rows.enumerated()), id: \.element.id) { idx, row in
+                            if idx > 0 { CardDivider() }
+                            personRow(vm, row)
+                        }
+                        if layout.canCollapse {
+                            CardDivider()
+                            disclosureRow(hiddenCount: layout.hiddenCount)
+                                .opacity(vm.busyId != nil ? 0.6 : 1)   // dims with the sibling rows
+                        }
+                    }
+                    .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line))
+                    .accessibilityElement(children: .contain)
                 }
             }
         }
     }
 
+    /// One 44pt row. The WHOLE row is the control (a Button that shares /
+    /// hands over, or the Menu for someone who already has it) — semantics
+    /// identical to the old per-row pill: a busy row is inert, the hand-over
+    /// holder's row is inert (a state, not a dimmed control), every other row
+    /// dims while a write is in flight.
     private func personRow(_ vm: ShareScreenModel, _ row: SharePersonRow) -> some View {
         let busy = vm.busyId == row.id
-        return HStack(spacing: 10) {
-            Text(String(row.name.prefix(1)).uppercased())
-                .font(UFont.sans(13, .semibold)).foregroundStyle(.white)
-                .frame(width: 30, height: 30)
-                .background(theme.palette.primary, in: Circle())
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(row.name).font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink).lineLimit(1)
-                if let sub = row.subtitle ?? row.email {
-                    Text(sub).font(UFont.sans(11)).foregroundStyle(theme.palette.ink3).lineLimit(1)
-                }
-            }
-            Spacer(minLength: 8)
+        return Group {
             if busy {
-                ProgressView().controlSize(.small)
+                personRowContent(vm, row, busy: true)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(row.name), working")
+                    .accessibilityAddTraits(.updatesFrequently)
+            } else if mode == .handOver, row.handedOver {
+                // The holder is a STATE, not a dimmed control: plain content
+                // (a disabled Button would grey the whole row, monogram included).
+                personRowContent(vm, row, busy: false)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("\(row.name), already handed over")
             } else if mode == .handOver {
-                pill(row.handedOver ? "Handed over" : "Hand over", filled: !row.handedOver) {
-                    Task { await vm.tap(row) }
-                }
-                .disabled(row.handedOver)
-                .accessibilityLabel(row.handedOver ? "\(row.name), already handed over" : "Hand over to \(row.name)")
+                Button { Task { await vm.tap(row) } } label: { personRowContent(vm, row, busy: false) }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Hand over to \(row.name)")
             } else if row.isShared {
-                Menu {
-                    ForEach(ShareAccess.allCases, id: \.self) { a in
-                        Button {
-                            Task { await vm.setAccess(row, a) }
-                        } label: {
-                            if row.access == a { Label(a.label, systemImage: "checkmark") } else { Text(a.label) }
-                        }
-                    }
-                    Divider()
-                    if row.email != nil || target.kind == .task {
-                        Button { reportTarget = row } label: { Label("Report…", systemImage: "flag") }
-                    }
-                    if case .collection(let cid, _) = target, let email = row.email {
-                        Button(role: .destructive) {
-                            model.blockUser(email: email, inCollection: cid, userId: row.userId)
-                            Task { await vm.load() }
-                        } label: { Label("Block \(email)", systemImage: "hand.raised") }
-                    }
-                    Button(role: .destructive) {
-                        Task { await vm.setAccess(row, nil) }
-                    } label: { Label(row.handedOver ? "Take it back" : "Remove", systemImage: "xmark") }
-                } label: {
-                    HStack(spacing: 4) {
-                        Text(row.statusLabel ?? "Shared").font(UFont.sans(12, .semibold))
-                        Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
-                    }
-                    .foregroundStyle(theme.palette.primaryDeep)
-                    .padding(.horizontal, 11).padding(.vertical, 6)
-                    .background(theme.palette.primarySoft, in: Capsule())
-                }
-                .accessibilityLabel("\(row.name), \(row.statusLabel ?? "shared"). Change access")
+                Menu { accessMenu(vm, row) } label: { personRowContent(vm, row, busy: false) }
+                    .buttonStyle(.plain)
+                    .disabled(vm.busyId != nil)   // a second tap must not open the menu mid-write
+                    .accessibilityLabel("\(row.name), \(row.statusLabel ?? "shared"). Change access")
+                    .accessibilityHint("Report or remove them")
             } else {
-                pill("Share", filled: true) { Task { await vm.tap(row) } }
+                Button { Task { await vm.tap(row) } } label: { personRowContent(vm, row, busy: false) }
+                    .buttonStyle(.plain)
                     .accessibilityLabel("Share with \(row.name), \(vm.access.label)")
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line))
         .opacity(vm.busyId != nil && !busy ? 0.6 : 1)
     }
 
-    private func pill(_ title: String, filled: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title).font(UFont.sans(12, .semibold))
-                .foregroundStyle(filled ? .white : theme.palette.ink2)
-                .padding(.horizontal, 13).padding(.vertical, 6)
-                .background(filled ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+    /// monogram · name · relationship … trailing word. At accessibility text
+    /// sizes the row becomes two lines (monogram · VStack{name, trailing}) with
+    /// wrapping texts — the `waitingRowLineLimit` idiom from People.
+    private func personRowContent(_ vm: ShareScreenModel, _ row: SharePersonRow, busy: Bool) -> some View {
+        let ax = typeSize.isAccessibilitySize
+        let on = mode == .handOver ? row.handedOver : row.isShared
+        return HStack(alignment: ax ? .top : .center, spacing: 10) {
+            monogram(row, on: on)
+            if ax {
+                VStack(alignment: .leading, spacing: 4) {
+                    nameLine(row, ax: true)
+                    trailing(vm, row, busy: busy)
+                }
+            } else {
+                nameLine(row, ax: false)
+                Spacer(minLength: 8)
+                trailing(vm, row, busy: busy)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, ax ? 12 : 0)
+        .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+        .contentShape(Rectangle())
+    }
+
+    /// The selected / unselected chip pair on a circle: filled `ink` with a
+    /// `bg` letter when they hold the item, `bg2` / `ink2` with a `line2` ring
+    /// when not. Colour is never the only signal — the trailing word says the
+    /// same thing.
+    private func monogram(_ row: SharePersonRow, on: Bool) -> some View {
+        Text(String(row.name.prefix(1)).uppercased())
+            .font(UFont.sans(10, .semibold))
+            .foregroundStyle(on ? theme.palette.bg : theme.palette.ink2)
+            .frame(width: monogramSize, height: monogramSize)
+            .background(on ? theme.palette.ink : theme.palette.bg2, in: Circle())
+            .overlay(Circle().stroke(on ? Color.clear : theme.palette.line2))
+            .accessibilityHidden(true)
+    }
+
+    /// Name + the relationship label ("· Coach"). The email is NOT shown on
+    /// the row: it only exists for a legacy list member, it is long, and it
+    /// already appears in the menu's "Block <email>" and in the report
+    /// dialog. One line at normal sizes — `layoutPriority(1)` (the OUTERMOST
+    /// modifier, or the HStack never sees it) makes the label truncate first.
+    /// At accessibility sizes the two STACK: side by side, a full-width name
+    /// left the label one character wide, wrapping letter by letter.
+    @ViewBuilder
+    private func nameLine(_ row: SharePersonRow, ax: Bool) -> some View {
+        if ax {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.name).font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let sub = row.subtitle {
+                    Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        } else {
+            HStack(spacing: 6) {
+                Text(row.name).font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                if let sub = row.subtitle {
+                    Text("· \(sub)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .lineLimit(1)
+                }
+            }
+        }
+    }
+
+    /// Exactly one of: the action word ("Share" / "Hand over", `ink`
+    /// semibold), the state word ("Can edit" / "Can view" / "Handed over",
+    /// `ink2` + a chevron because it opens the menu), the disabled hand-over
+    /// state (`ink3`), or the busy spinner. Every Text / Image sets its own
+    /// foreground: a Menu label otherwise inherits the accent tint.
+    @ViewBuilder
+    private func trailing(_ vm: ShareScreenModel, _ row: SharePersonRow, busy: Bool) -> some View {
+        if busy {
+            ProgressView().controlSize(.small).tint(theme.palette.ink2)
+        } else if mode == .handOver {
+            if row.handedOver {
+                Text(row.statusLabel ?? "Handed over").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Hand over").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } else if row.isShared {
+            HStack(spacing: 4) {
+                Text(row.statusLabel ?? "Shared").font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(theme.palette.ink3)
+            }
+        } else {
+            Text("Share").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The picker for someone who already has the item: Can edit ✓ / Can
+    /// view / Report… / Block <email> (lists) / Remove or "Take it back".
+    /// System menus own their colours — not restyled.
+    @ViewBuilder
+    private func accessMenu(_ vm: ShareScreenModel, _ row: SharePersonRow) -> some View {
+        ForEach(ShareAccess.allCases, id: \.self) { a in
+            Button {
+                Task { await vm.setAccess(row, a) }
+            } label: {
+                if row.access == a { Label(a.label, systemImage: "checkmark") } else { Text(a.label) }
+            }
+        }
+        Divider()
+        if row.email != nil || target.kind == .task {
+            Button { reportTarget = row } label: { Label("Report…", systemImage: "flag") }
+        }
+        if case .collection(let cid, _) = target, let email = row.email {
+            Button(role: .destructive) {
+                model.blockUser(email: email, inCollection: cid, userId: row.userId)
+                Task { await vm.load() }
+            } label: { Label("Block \(email)", systemImage: "hand.raised") }
+        }
+        Button(role: .destructive) {
+            Task { await vm.setAccess(row, nil) }
+        } label: { Label(row.handedOver ? "Take it back" : "Remove", systemImage: "xmark") }
+    }
+
+    /// "Show N more ⌄" / "Show less ⌃" — the last row of the same card.
+    /// Collapsing clears any Find query so the tidy card comes back whole.
+    private func disclosureRow(hiddenCount: Int) -> some View {
+        Button {
+            withAnimation(reduceMotion ? nil : .snappy(duration: 0.22)) { peopleExpanded.toggle() }
+            if !peopleExpanded { peopleQuery = "" }
+        } label: {
+            HStack(spacing: 6) {
+                Text(sharePeopleDisclosureTitle(hiddenCount: hiddenCount, expanded: peopleExpanded))
+                    .font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Image(systemName: peopleExpanded ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(theme.palette.ink3)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(peopleExpanded ? "Show fewer people" : "Show \(hiddenCount) more people")
+        .accessibilityValue(peopleExpanded ? "Expanded" : "Collapsed")
+    }
+
+    /// The Find field — the unselected chip capsule stretched to a field.
+    /// Only when EXPANDED with ten or more people, and never auto-focused:
+    /// the default collapsed view must not put a second text field 40pt
+    /// above the "Someone new" email field.
+    private var peopleSearch: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(theme.palette.ink3)
+            TextField("Find someone", text: $peopleQuery)
+                .font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
+                .textInputAutocapitalization(.never).autocorrectionDisabled().submitLabel(.search)
+                .accessibilityLabel("Find a person")
+            if !peopleQuery.isEmpty {
+                Button { peopleQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 14)).foregroundStyle(theme.palette.ink3)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+            }
+        }
+        .padding(.leading, 12).padding(.trailing, peopleQuery.isEmpty ? 12 : 0)
+        .frame(minHeight: 44)
+        .background(theme.palette.bg2, in: Capsule())
+        .overlay(Capsule().stroke(theme.palette.line2))
     }
 
     // MARK: someone new
@@ -664,9 +861,12 @@ struct ShareScreen: View {
                     .onSubmit { Task { await vm.shareWithEmail() } }
                     .accessibilityLabel("Email address")
                 Button { Task { await vm.shareWithEmail() } } label: {
-                    Text(busy ? "Sharing…" : "Share").font(UFont.sans(13, .semibold)).foregroundStyle(.white)
+                    // `bg` on `ink` (the app's filled-chip pair) — a literal
+                    // white on dark `ink` (L 0.96) was invisible in dark mode.
+                    Text(busy ? "Sharing…" : "Share").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 14).padding(.vertical, 9)
                         .background(theme.palette.ink, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                        .frame(minHeight: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(busy || vm.email.trimmingCharacters(in: .whitespaces).isEmpty)
