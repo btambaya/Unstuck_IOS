@@ -308,9 +308,9 @@ final class ShareScreenModel {
                 case .invited:
                     return .invited(email: row.email ?? row.name)
                 case .invalid where row.email == nil:
-                    // The deployed `share-collection add` resolves emails only and
-                    // the roster carries none for a connection (contract gap,
-                    // reported in handover.md) — say what to do instead.
+                    // `share-collection add` now takes `{userId}` (v22, verified
+                    // live 2026-09-17), so this is only the fallback for an older
+                    // deployment that resolves emails only — say what to do then.
                     throw ShareActionError(.listNeedsEmail)
                 default:
                     throw ShareActionError(ShareFailure(reason: outcome.failureReason))
@@ -341,6 +341,9 @@ final class ShareScreenModel {
     /// the server's honest answer.
     func shareWithEmail() async {
         guard busyId == nil else { return }
+        // Put the keyboard away first: it covers the result line, and the
+        // answer to "did that work?" is the whole point of the screen.
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         let addr = normalizedShareEmail(email)
         error = nil
         guard isEmailLike(addr) else { error = ShareFailure.invalidEmail.message; return }
@@ -470,12 +473,17 @@ struct ShareScreen: View {
                     header
                     if let vm {
                         if mode == .share { accessControl(vm) }
+                        // The honest line lives HIGH on the screen. It used to
+                        // be the last row — below the fold and, after a
+                        // "Someone new" share, behind the keyboard — so the one
+                        // answer §2 promises ("Shared with …" / "Invite sent
+                        // to …") was invisible in the commonest path.
+                        feedback(vm)
                         peopleSection(vm)
                         if mode == .share {
                             someoneNewSection(vm)
                             linkSection(vm)
                         }
-                        feedback(vm)
                     } else {
                         ProgressView().frame(maxWidth: .infinity).padding(.top, 24)
                     }
@@ -537,7 +545,7 @@ struct ShareScreen: View {
             }
             .pickerStyle(.segmented)
             .accessibilityLabel("Access level")
-            Text(vm.access.blurb)
+            Text(vm.access.blurb(for: target.kind))
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 .fixedSize(horizontal: false, vertical: true)
         }

@@ -115,6 +115,74 @@ honestly until they do):
   than 21 days as slipping, so the "slipping" view grew from 1 to 6 rows once
   the calendar passed that date. The stamp is now relative to today.
 
+### Independent LIVE verification (2026-09-17, simulator vs PROD)
+
+An independent pass drove the real app on the "iPhone 17" simulator, signed
+in as the demo account against prod, with a throwaway second account, and
+walked every §2/§4 path (screenshots per step). **The screen works**: the
+Today/Tasks row "Share…", the editor's labelled Share + "Hand over to…", the
+collection card + detail, People / Someone new / Share a link, the pending
+invite rows, Settings → People (a pending invite WITH an email shows the
+address; link-only invites correctly say "Invite pending"), NewTaskSheet's
+Off / Can edit / Can view, the recipient's "Shared with you", and the
+`unstuck://task/<id>` push deep link opening the read-only Shared-task sheet
+for a task that is not in the local store. Backend rows matched every time
+(`task_shares` partner/assign, `task_invites`, both `trusted_circle`
+directions, `pending_task_id` on the link row). Dark mode renders; AX XXXL
+reflows without clipping; no crashes; no share-related console errors.
+
+**Three defects were found live and fixed here:**
+
+1. **The honest line was invisible.** `feedback` was the LAST row of the
+   scroll, so after a "Someone new" share it sat below the fold *and* behind
+   the keyboard — the one answer §2 promises ("Shared with …" / "Invite sent
+   to …") never reached the user in the commonest path. It now renders
+   directly under the access control, and `shareWithEmail()` resigns first
+   responder before the round trip.
+2. **The recipient still read the storage level.** "Shared with you" rows and
+   the Shared-task sheet showed `partner` / `watching` — §2 says ONE
+   vocabulary. `shareStatusLabel` now says "can edit" / "can view" / "yours",
+   and `shareLevelLabel` "can edit" / "can view" / "handed over".
+3. **A list was described as a task.** The access blurb under Can edit/Can
+   view read "They can start, complete and focus on it with you." on a
+   collection. `ShareAccess.blurb(for:)` is kind-aware now ("They can add,
+   tick off and edit everything on the list." / "They can see the list and
+   everything on it."); the bare `blurb` stays task wording for NewTaskSheet.
+
+**Contract gap (1) in the list above is CLOSED**: the deployed
+`share-collection` v22 accepts `{action:'add', collectionId, userId, role}`
+and answers `{ok, status:'shared', userId, displayName, role, members:N}`;
+a People tap on a LIST was verified end-to-end ("✓ Shared with Verify — they
+can edit."). The `.listNeedsEmail` branch is kept only as the fallback for an
+older deployment. Gaps (2)–(4) stand as written.
+
+Still not exercised: a real push tap (simulator can't receive APNs — the deep
+link was driven with `simctl openurl` instead), the `invite_claimed` sender
+notification, and a link REDEEM from a second device.
+
+Counts after the fixes: `swift test` → **999 green** (2 skipped);
+`-only-testing:UnstuckAppTests` → **570 green** — *on a freshly installed app
+container*.
+
+**`UnstuckAppTests` is only green on a clean container (pre-existing, repros
+at HEAD).** Run the suite twice in a row and the second run fails
+`CrashBreadcrumbsTests.testNoReportIsOfferedAfterACleanRun` and, with it,
+`AppModelAssistantStateTests.testArchiveCaptureWritesThroughToTheRepository
+AndOutbox`. Root cause (confirmed, not guessed): the 570-test host blocks the
+main thread for longer than `CrashBreadcrumbs.stallSeconds` (4 s), so the
+stall detector appends a real `MAINSTALL` breadcrumb; the NEXT run's
+`install()` reads it, `lastReport` is non-nil and the "a clean run offers
+nothing" assertion fails — and the same starvation makes the archive test's
+3-second poll for the async capture write time out. Both are test-host
+artefacts, not product faults. Workaround until someone fixes the isolation:
+`xcrun simctl uninstall <sim> io.unstucknow.app` before the suite.
+
+Observation while diagnosing that (NOT changed here, no evidence it bites in
+practice): `AppModel.propagateCaptureArchiveChange` fires one unstructured
+`Task` per change, and Swift does not order two of those — a fast "Done" then
+"Restore" could in principle reach the store in reverse. Worth a chained
+write if anyone ever sees a restored capture come back archived.
+
 ## Where things stand (2026-09-17) — Talk had no audio on a real iPhone: the engine stopped itself 100 ms in (1.1.0 build 52)
 
 Ahmad's report: tap Talk, the greeting's TEXT appears, nothing is heard, and

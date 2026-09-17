@@ -30,6 +30,21 @@ final class UnifiedSharingTests: XCTestCase {
         XCTAssertEqual(ShareAccess(collectionRole: "owner-ish"), .edit, "the server coerces unknown roles to editor")
     }
 
+    /// A list is never started or focused: the task blurb read as nonsense
+    /// under a collection's name on the Share screen.
+    func testTheAccessBlurbSpeaksAboutTheKindOfItem() {
+        XCTAssertEqual(ShareAccess.edit.blurb(for: .task), ShareAccess.edit.blurb,
+                       "the bare blurb stays the task wording (NewTaskSheet)")
+        for access in ShareAccess.allCases {
+            let task = access.blurb(for: .task)
+            let list = access.blurb(for: .collection)
+            XCTAssertNotEqual(task, list)
+            XCTAssertFalse(list.contains("focus"), "a list is not focused: \(list)")
+            XCTAssertFalse(list.contains("start"), "a list is not started: \(list)")
+            XCTAssertTrue(list.contains("list"), "the list blurb should name the list: \(list)")
+        }
+    }
+
     // MARK: People composition
 
     private func member(_ id: String, uid: String?, name: String?, status: String = "active", label: String? = nil) -> CircleMember {

@@ -414,12 +414,15 @@ public func levelCanComplete(_ level: ShareLevel) -> Bool {
 }
 
 /// The quiet chip on a "shared with you" row, from the RECIPIENT's side.
+/// Unified sharing v1 (spec §2, "One vocabulary"): the recipient reads the
+/// SAME words the sender picked — "can edit" / "can view" — not the storage
+/// levels (`partner` / `watching`) the old sheet leaked.
 public func shareStatusLabel(_ level: ShareLevel, done: Bool) -> String {
     if done { return "done" }
     switch level {
-    case .view: return "watching"
-    case .assign: return "yours"
-    case .partner: return "partner"
+    case .view: return ShareAccess.view.label.lowercased()      // "can view"
+    case .assign: return "yours"                                 // handed over to them
+    case .partner: return ShareAccess.edit.label.lowercased()    // "can edit"
     }
 }
 
@@ -430,12 +433,13 @@ public func sharedFocusActionLabel(_ level: ShareLevel) -> String {
     level == .partner ? "Focus with them" : "Focus"
 }
 
-/// The chip on the OWNER's own task row / "shared with" line — the level granted.
+/// The chip on the OWNER's own task row / "shared with" line — the level
+/// granted, in the one vocabulary (matches `SharePersonRow.statusLabel`).
 public func shareLevelLabel(_ level: ShareLevel) -> String {
     switch level {
-    case .view: return "view"
-    case .assign: return "assigned"
-    case .partner: return "partner"
+    case .view: return ShareAccess.view.label.lowercased()    // "can view"
+    case .assign: return "handed over"
+    case .partner: return ShareAccess.edit.label.lowercased() // "can edit"
     }
 }
 

@@ -28,18 +28,24 @@ final class ShareLevelsTests: XCTestCase {
         XCTAssertEqual(shareStatusLabel(.assign, done: true), "done")
     }
 
-    func testNotDoneLabelsReflectTheLevel() {
-        XCTAssertEqual(shareStatusLabel(.view, done: false), "watching")
-        XCTAssertEqual(shareStatusLabel(.partner, done: false), "partner")
+    /// Unified sharing v1 §2: the recipient reads the SENDER's words, never
+    /// the storage level ("partner" / "watching" leaked the backend).
+    func testNotDoneLabelsSpeakTheOneVocabulary() {
+        XCTAssertEqual(shareStatusLabel(.view, done: false), "can view")
+        XCTAssertEqual(shareStatusLabel(.partner, done: false), "can edit")
         XCTAssertEqual(shareStatusLabel(.assign, done: false), "yours")
+        // and never the raw levels again
+        for level in ShareLevel.allCases {
+            XCTAssertNotEqual(shareStatusLabel(level, done: false), level.rawValue)
+        }
     }
 
     // MARK: shareLevelLabel (owner side)
 
     func testMapsEachLevelToItsGrantedWord() {
-        XCTAssertEqual(shareLevelLabel(.view), "view")
-        XCTAssertEqual(shareLevelLabel(.partner), "partner")
-        XCTAssertEqual(shareLevelLabel(.assign), "assigned")
+        XCTAssertEqual(shareLevelLabel(.view), "can view")
+        XCTAssertEqual(shareLevelLabel(.partner), "can edit")
+        XCTAssertEqual(shareLevelLabel(.assign), "handed over")
     }
 
     // MARK: assignedOutMap / assignedOutIds (delegation derivation)

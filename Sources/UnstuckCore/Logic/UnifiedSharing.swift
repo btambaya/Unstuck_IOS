@@ -37,11 +37,20 @@ public enum ShareAccess: String, Codable, Sendable, CaseIterable, Equatable {
         }
     }
 
-    /// What it means, in one line (the explainer under the control).
-    public var blurb: String {
-        switch self {
-        case .edit: return "They can start, complete and focus on it with you."
-        case .view: return "They see it and hear when you start and finish."
+    /// What it means, in one line (the explainer under the control). Task
+    /// wording; `blurb(for:)` is the kind-aware one.
+    public var blurb: String { blurb(for: .task) }
+
+    /// What the grade means for THIS kind of item. A list is never "started"
+    /// or "focused", so the task wording read as nonsense on a list's Share
+    /// screen ("They can start, complete and focus on it with you." under
+    /// "Lisbon trip").
+    public func blurb(for kind: ShareItemKind) -> String {
+        switch (kind, self) {
+        case (.task, .edit): return "They can start, complete and focus on it with you."
+        case (.task, .view): return "They see it and hear when you start and finish."
+        case (.collection, .edit): return "They can add, tick off and edit everything on the list."
+        case (.collection, .view): return "They can see the list and everything on it."
         }
     }
 

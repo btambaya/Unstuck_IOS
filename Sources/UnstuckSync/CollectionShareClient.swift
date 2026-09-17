@@ -27,7 +27,7 @@ public enum ShareOutcome: Sendable, Equatable {
     case selfError   // tried to share with my own email
     case blocked     // the server's blocked-users mechanism refused
     case rateLimited // the per-user limiter refused (429)
-    case invalid     // 400 bad_request (no / malformed email — e.g. a by-userId add the fn can't take)
+    case invalid     // 400 bad_request (no / malformed email, or an id an older deployment can't resolve)
     case error       // unrecoverable
 
     /// The server reason code this outcome corresponds to (for the shared
@@ -157,8 +157,10 @@ public struct CollectionShareClient: Sendable {
 
     /// Share by email OR by user id (a connection tapped in the People section
     /// — the roster knows no emails). `userId` is sent as `userId` on the
-    /// `add` body; a server that only resolves emails answers `bad_request`,
-    /// which surfaces as `.error` (contract gap reported in handover.md).
+    /// `add` body; `share-collection` v22 resolves it and answers
+    /// `{ok, status:'shared', userId, displayName}` (verified live 2026-09-17).
+    /// An older deployment that resolves emails only answers `bad_request`,
+    /// which surfaces as `.invalid` → "enter their email below".
     public func shareDetailed(collectionId: String, email: String?, userId: String?, role: String) async -> ShareResult {
         let body = ShareBody(action: "add", collectionId: collectionId,
                              email: email.map(normalizedShareEmail).flatMap { $0.isEmpty ? nil : $0 },
