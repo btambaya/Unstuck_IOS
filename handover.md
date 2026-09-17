@@ -34,7 +34,39 @@ IO unit, so every sim run had passed.
   start); the AVAudio half is validated on the device via the syslog lines
   `voice engine restarting after configuration change #1 hw=48000Hz` and the
   absence of `Cannot play yet`.
-- Ship: build 52 uploaded; on-device retest pending Ahmad.
+- Ship: build 52 — Ahmad's retest on the device: heard, understood, replied.
+
+**Then (build 53): the reply was cut by any noise.** Same device, same session
+log: the engine restarted exactly once and stayed up, so this was the barge-in
+state machine. Its confirm was the TIMER ALONE: a server `speech_started`
+while the model speaks ducks the reply and starts a 300 ms confirm, and the
+only escape was the server's `speech_stopped` — which the server sends after
+`silence_duration_ms` (600) of silence, so it can never arrive inside the
+window. Every VAD blip on the loudspeaker (a tap, a chair, a cough) cancelled
+the reply. Web and Android carry the identical rule (`tick → cancel`), just
+less exposed (browser AEC, quieter setups).
+
+- **`App/Voice/BargeIn.swift`**: the controller now tracks `serverSpeaking`
+  (like the web client) and a confirm needs evidence from BOTH sides — the
+  server is inside a speech segment AND the local gate is still open (sound
+  that lasted the whole window). Otherwise it is a blip: restore, and if the
+  server is still in its segment, `suppressNextResponse` (it will commit and
+  reply to the blip; that reply is cancelled on creation, as the
+  speech_stopped path already did). A gate-only duck the server never called
+  speech restores without suppression (nothing was committed). Immediate
+  cancels (gate duck + server agrees; transcription) are unchanged.
+  `RMSGate.Output.levelDb` carries the sub-frame level for the log.
+- Diagnostics (content-free, a handful of lines per session): `voice gate
+  open|close level=…dB floor=…dB margin=…dB` from the engine, and `voice
+  barge-in <event> → duck,timer300 [state gate= server=]` from the client for
+  speech_started/stopped, gate open/close, interrupt, and any decisive tick.
+  With the USB syslog these say exactly what interrupted a reply and why.
+- Tests: `BargeInTests` 2/2b/2c rewritten around the two-sided confirm; 13
+  and 14 now have the mic agree before the confirm they assert.
+- TODO after device validation: port the same confirm rule to web
+  `lib/voice/bargein.ts` (`tick`) and Android `core/logic/BargeIn.kt`
+  (`onTick`) + their tests, so the three stay in lock-step.
+- Ship: build 53 uploaded; on-device retest pending Ahmad.
 
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 

@@ -354,12 +354,40 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// flushPlayback) also resets the integrity guard's transcript.
     private func dispatch(_ event: BargeInEvent) {
         let t = now()
-        let cmds: [BargeInCommand] = withLock {
+        let (cmds, stateAfter): ([BargeInCommand], String) = withLock {
             let c = _bargeIn.handle(event, now: t)
             if c.contains(.flushPlayback) { _guard.bargeIn() }
-            return c
+            return (c, "\(_bargeIn.state) gate=\(_bargeIn.gateOpen) server=\(_bargeIn.serverSpeaking)")
+        }
+        // The barge-in decisions, content-free: which event, what it decided.
+        // Ducks/restores/cancels are a handful per session; routine events
+        // (audio deltas, ticks that decided nothing) stay out of the log.
+        let decisive = cmds.contains { c in
+            switch c { case .duck, .restore, .sendCancel, .flushPlayback: return true; default: return false }
+        }
+        switch event {
+        case .speechStarted, .speechStopped, .transcription, .interruptPressed, .gateOpen, .gateClose:
+            voiceLog.notice("voice barge-in \(String(describing: event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]")
+        default:
+            if decisive { voiceLog.notice("voice barge-in \(String(describing: event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]") }
         }
         execute(cmds)
+    }
+
+    /// Command kinds only (no payloads) for the log line above.
+    private static func describe(_ cmds: [BargeInCommand]) -> String {
+        let kinds: [String] = cmds.compactMap { c in
+            switch c {
+            case .duck: return "duck"
+            case .restore: return "restore"
+            case .sendCancel: return "cancel"
+            case .flushPlayback: return "flush"
+            case .startConfirmTimer(let ms): return "timer\(ms)"
+            case .uiState(let s): return "ui:\(s)"
+            default: return nil
+            }
+        }
+        return kinds.isEmpty ? "-" : kinds.joined(separator: ",")
     }
 
     private func execute(_ cmds: [BargeInCommand]) {

@@ -329,6 +329,7 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
             if self.recalibratePending { self.recalibratePending = false; self.gate.recalibrate() }
             if let ctx = self.gateContextPending { self.gateContextPending = nil; self.gate.context = ctx }
             let gated = self.gate.push(samples)
+            let floor = self.gate.floorDb, margin = self.gate.context.marginDb
             self.pending.append(gated.pcm)
             var out: [Data] = []
             while self.pending.count >= Self.frameBytes {
@@ -336,6 +337,11 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
                 self.pending.removeFirst(Self.frameBytes)
             }
             self.lock.unlock()
+            // Levels only — never audio. A few lines per session; they are
+            // what tells a false barge-in from a real one on a device.
+            if gated.opened || gated.closed {
+                voiceLog.notice("voice gate \(gated.opened ? "open" : "close", privacy: .public) level=\(Int(gated.levelDb), privacy: .public)dB floor=\(Int(floor), privacy: .public)dB margin=\(Int(margin), privacy: .public)dB")
+            }
             if gated.opened { self.onGateChange?(true) }
             for f in out { onFrame(f) }
             if gated.closed { self.onGateChange?(false) }

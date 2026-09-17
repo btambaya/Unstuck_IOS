@@ -38,11 +38,15 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"), "audio keeps flowing (ducked) until confirmed")
     }
 
-    // MARK: 2 — confirm timer elapses → exactly one cancel + flush + mute + restore
+    // MARK: 2 — confirm needs BOTH the server's segment and a mic still above
+    // the gate; the timer alone is a blip → restore (+ suppress what the
+    // server will reply to). Ahmad's iPhone, 2026-09-17.
 
-    func test2_confirmWithoutSpeechStoppedCancels() {
+    func test2_confirmWithSustainedMicEnergyCancels() {
         var c = speaking()
         _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.gateOpen, now: 1.05)          // the mic agrees, and stays open
+        XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server), "gate opening while ducked is bookkeeping only")
         XCTAssertEqual(core(c.handle(.tick, now: 1.2)), [], "before confirmMs nothing happens")
         let out = core(c.handle(.tick, now: 1.3))
         XCTAssertEqual(count(out, .sendCancel), 1)
@@ -56,6 +60,46 @@ final class BargeInTests: XCTestCase {
         // A second tick (stale timer) is a no-op.
         XCTAssertEqual(core(c.handle(.tick, now: 1.6)), [])
         XCTAssertEqual(count(c.handle(.tick, now: 2), .sendCancel), 0)
+    }
+
+    func test2b_serverBlipWithNoMicEnergyAtConfirmRestoresAndSuppresses() {
+        // The loudspeaker case that cut every reply: the server VAD fired on
+        // a tap, the gate had already closed again (or never opened), and
+        // speech_stopped cannot arrive inside the window (600 ms of silence
+        // first). The timer must NOT cancel.
+        var c = speaking()
+        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.gateOpen, now: 1.02)
+        _ = c.handle(.gateClose, now: 1.25)         // the tap ended; server still in its segment
+        XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server), "a server duck waits for the tick")
+        let out = core(c.handle(.tick, now: 1.3))
+        XCTAssertEqual(out, [.restore])
+        XCTAssertEqual(count(out, .sendCancel), 0)
+        XCTAssertEqual(c.state, .speaking)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"), "the reply keeps playing")
+        XCTAssertTrue(c.suppressNextResponse, "the server will still reply to the blip — that reply is cancelled on creation")
+        XCTAssertEqual(c.falseBargeIns, 1)
+        _ = c.handle(.speechStopped, now: 1.9)
+        let created = core(c.handle(.responseCreated(id: "r2"), now: 2.0))
+        XCTAssertEqual(created, [.sendCancel, .uiState(.listening)])
+        XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"))
+    }
+
+    func test2c_gateOnlyDuckWithNoServerAgreementRestoresWithoutSuppression() {
+        // Sustained mic energy the server never called speech (a fan, a
+        // loud room): nothing was committed server-side, so restore and
+        // suppress nothing.
+        var c = speaking()
+        _ = c.handle(.gateOpen, now: 1.0)
+        XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .gate))
+        let out = core(c.handle(.tick, now: 1.3))
+        XCTAssertEqual(out, [.restore])
+        XCTAssertFalse(c.suppressNextResponse)
+        XCTAssertEqual(c.state, .speaking)
+        XCTAssertTrue(c.gateOpen, "the gate is still open; a later speech_started re-ducks and can then confirm")
+        _ = c.handle(.speechStarted, now: 2.0)
+        XCTAssertEqual(c.state, .ducked(since: 2.0, trigger: .server))
+        XCTAssertEqual(count(core(c.handle(.tick, now: 2.3)), .sendCancel), 1, "gate + server agree at confirm → real talk-over")
     }
 
     // MARK: 3 — speech_stopped inside confirm → restore, suppress the blip's reply
@@ -398,6 +442,7 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.responseCreated(id: "r1"), now: 2)
         XCTAssertEqual(c.uiStateNow, .thinking)
         XCTAssertEqual(core(c.handle(.speechStarted, now: 2.5)), [.duck, .startConfirmTimer(ms: 300)])
+        _ = c.handle(.gateOpen, now: 2.55)           // the mic agrees (confirm needs both sides)
         let out = core(c.handle(.tick, now: 2.8))
         XCTAssertEqual(count(out, .sendCancel), 1)
         XCTAssertEqual(c.state, .idle)
@@ -408,6 +453,7 @@ final class BargeInTests: XCTestCase {
     func test14_responseDoneAndDrainedWhileDucked() {
         var c = speaking()
         _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.gateOpen, now: 1.02)           // the mic agrees (confirm needs both sides)
         // Generation finished mid-duck: still speaking (tail queued), still ducked.
         let done = core(c.handle(.responseDone(id: "r1", status: "completed"), now: 1.05))
         XCTAssertEqual(done, [.uiState(.speaking)])

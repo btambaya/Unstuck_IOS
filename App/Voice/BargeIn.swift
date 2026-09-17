@@ -187,6 +187,8 @@ struct BargeInController: Sendable {
     private(set) var playbackQueued = false
     private(set) var gateOpen = false
     private(set) var gateOpenSince: TimeInterval?
+    /// The server VAD is inside a speech segment (speech_started … stopped).
+    private(set) var serverSpeaking = false
     /// The server saw a blip and WILL create a reply for it — cancel that one
     /// the moment it is created.
     private(set) var suppressNextResponse = false
@@ -301,6 +303,7 @@ struct BargeInController: Sendable {
             }
 
         case .speechStarted:
+            serverSpeaking = true
             switch state {
             case .speaking where modelBusy:
                 out += duck(now: now, trigger: .server)
@@ -312,6 +315,7 @@ struct BargeInController: Sendable {
             }
 
         case .speechStopped:
+            serverSpeaking = false
             if case .ducked(_, let trigger) = state, trigger == .server {
                 // The server saw a blip and WILL commit + reply to it.
                 suppressNextResponse = true
@@ -326,7 +330,23 @@ struct BargeInController: Sendable {
             // and 2.8 − 2.5 is a hair under 0.3.
             if case .ducked(let since, _) = state,
                Int(((now - since) * 1000).rounded()) >= profile.confirmMs {
-                out += cancel()
+                // CONFIRM needs evidence from both sides: the server VAD is
+                // inside a speech segment AND the mic is still above the
+                // gate — sound that lasted the whole confirm window. The
+                // timer alone confirmed nothing: the server's speech_stopped
+                // can only arrive after silence_duration_ms (600) of silence,
+                // i.e. never inside a 300 ms window, so every VAD blip on a
+                // loudspeaker — a tap, a chair, a cough — cancelled the reply
+                // (Ahmad's iPhone, 2026-09-17: "interrupted by any noise").
+                if gateOpen && serverSpeaking {
+                    out += cancel()
+                } else {
+                    // A blip. If the server is still in its segment it WILL
+                    // commit + reply to it — suppress that reply, as the
+                    // speech_stopped path does. Nothing committed otherwise.
+                    if serverSpeaking { suppressNextResponse = true }
+                    out += restoreToSpeaking()
+                }
             }
 
         case .interruptPressed:
@@ -456,6 +476,8 @@ struct RMSGate: Sendable {
         var closed = false
         /// Sub-frames that were emitted as digital silence.
         var silenceFrames = 0
+        /// dBFS of the last processed sub-frame (diagnostics only).
+        var levelDb: Float = -90
     }
 
     var context = GateContext()
@@ -508,6 +530,7 @@ struct RMSGate: Sendable {
 
     private mutating func process(_ frame: ArraySlice<Int16>, into out: inout Output) {
         let db = Self.rmsDb(frame)
+        out.levelDb = db
         let bytes = Data(bytes: Array(frame), count: frame.count * 2)
 
         // Calibration: the first 500 ms, median (robust to a cough).
