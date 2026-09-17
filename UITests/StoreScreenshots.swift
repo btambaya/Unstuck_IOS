@@ -113,6 +113,17 @@ final class StoreScreenshots: XCTestCase {
         expect(groceries, "the seeded 'Groceries' list is missing")
         groceries.tap(); usleep(900_000)
         expect(app.staticTexts["Milk"].firstMatch, "the collection detail did not open")
+        // The detail auto-focuses its add-item field on open (rapid entry), so
+        // the software keyboard covers the lower half of the screen. Open the
+        // title's inline rename and submit it unchanged: that path clears the
+        // focus state explicitly. (A flick on the short list doesn't start a
+        // scroll, so scroll-dismiss can't be relied on.) The store shot is the
+        // list, not the keyboard.
+        if app.keyboards.count > 0 {
+            app.staticTexts["Groceries"].firstMatch.tap(); usleep(500_000)
+            app.typeText("\n"); usleep(800_000)
+            XCTAssertEqual(app.keyboards.count, 0, "the keyboard is still covering the collection")
+        }
         save("06-collections")
 
         // Captures (tray icon on the Today header)
