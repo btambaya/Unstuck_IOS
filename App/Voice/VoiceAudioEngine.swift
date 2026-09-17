@@ -159,6 +159,11 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private var outstanding = 0
     private var playGeneration = 0
     private var gainRamp = 0
+    /// Diagnostics: when the queue last ran dry, and how many buffers played
+    /// since it last refilled — the device log's answer to "did the audio
+    /// itself have gaps?" (`voice playback queued gapMs=…` / `drained`).
+    private var lastDrainedAt: TimeInterval?
+    private var playedSinceQueued = 0
 
     /// `.app` (default) keeps Talk mode's behaviour; `.callKit` for a
     /// CallKit-managed call (see the file header).
@@ -205,9 +210,18 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         if started { return true }
         guard activateSession() else { voiceLog.error("voice audio session activation failed"); return false }
 
-        // Hardware AEC: route both directions through the voice-processing AU.
+        // Hardware AEC/NS/AGC only where the echo path needs it. On the
+        // BUILT-IN SPEAKER the profile is half-duplex (the upload is muted for
+        // the whole reply), so the echo canceller buys nothing there — and its
+        // double-talk suppressor costs a lot: it attenuates OUR playback
+        // whenever the mic hears loud near-end sound (device, 2026-09-17: a
+        // hand on the table made the reply "break up like a laggy call" with
+        // the client doing nothing at all). Receiver / earphones / Bluetooth
+        // keep it: they run full-duplex and the earpiece leaks.
         // Best-effort — older devices / simulators may reject it.
-        try? engine.inputNode.setVoiceProcessingEnabled(true)
+        let route = VoiceRoute(portType: AVAudioSession.sharedInstance().currentRoute.outputs.first?.portType.rawValue)
+        if Self.wantsVoiceProcessing(for: route) { try? engine.inputNode.setVoiceProcessingEnabled(true) }
+        voiceLog.notice("voice engine route=\(String(describing: route), privacy: .public) voiceProcessing=\(self.engine.inputNode.isVoiceProcessingEnabled, privacy: .public)")
         if engine.inputNode.isVoiceProcessingEnabled {
             engine.inputNode.isVoiceProcessingAGCEnabled = true
             // We duck the model ourselves (BargeIn); tell the system not to
@@ -234,6 +248,10 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         observeConfigurationChanges()
         return true
     }
+
+    /// Voice processing is worth its double-talk suppressor everywhere except
+    /// the loudspeaker, where the profile is half-duplex anyway.
+    static func wantsVoiceProcessing(for route: VoiceRoute) -> Bool { route != .speaker }
 
     // MARK: configuration changes (see the file header)
 
@@ -387,6 +405,12 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         guard started else { return }
         if !player.isPlaying { player.play() }
         outstanding += 1
+        if outstanding == 1 {
+            let now = ProcessInfo.processInfo.systemUptime
+            let gap = lastDrainedAt.map { Int(((now - $0) * 1000).rounded()) } ?? -1
+            playedSinceQueued = 0
+            voiceLog.notice("voice playback queued gapMs=\(gap, privacy: .public)")
+        }
         let gen = playGeneration
         // `.dataPlayedBack` = the buffer has been HEARD (not merely consumed by
         // the mixer), so the last one's completion is the playback_drained event.
@@ -399,7 +423,12 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         lock.lock()
         guard generation == playGeneration, outstanding > 0 else { lock.unlock(); return }
         outstanding -= 1
+        playedSinceQueued += 1
         let drained = outstanding == 0
+        if drained {
+            lastDrainedAt = ProcessInfo.processInfo.systemUptime
+            voiceLog.notice("voice playback drained played=\(self.playedSinceQueued, privacy: .public)")
+        }
         lock.unlock()
         if drained { onPlaybackDrained?() }
     }

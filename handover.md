@@ -96,7 +96,32 @@ which is why it never showed there.
 - Tests: 5/5b (transcription with/without the mic), 11/15 updated for the
   forced-closed context, 16 (half-duplex: controller + gate incl. pre-roll
   discard + reopen). 45 voice tests green.
-- Ship: build 54 uploaded; on-device retest pending Ahmad.
+- Ship: build 54 — Ahmad: no self-tripping any more; the reply completed —
+  but under table noise it "broke up like a laggy call".
+
+**Then (build 55): the break-up was iOS's own voice processor.** The log for
+that reply shows the client doing NOTHING — no duck, no gate open, no
+restart, no player error — and the audio server flat. What attenuates the
+speaker under loud near-end sound with nobody asking is the voice-processing
+unit's double-talk suppressor (what a speakerphone call does when you talk
+over the far end). On the loudspeaker we are half-duplex now, so its echo
+canceller buys nothing there.
+- **`VoiceAudioEngine.wantsVoiceProcessing(for:)`**: voice processing is
+  enabled on every route EXCEPT the built-in speaker (receiver / earphones /
+  Bluetooth keep AEC/NS/AGC: they run full-duplex and the earpiece leaks).
+  Logged at start: `voice engine route=… voiceProcessing=…`. A mid-session
+  route change keeps the setting chosen at start (documented gap: speaker →
+  headphones runs without AEC, harmless; headphones → speaker keeps VP and
+  the suppressor with it — half-duplex still prevents self-tripping).
+- **`GateContext.forcedClosed` now spans `modelBusy`** (response.created →
+  drained), not just `playbackQueued`: the queue runs dry for a moment at the
+  start of a reply and between bursts (14:21:09 in the log), and each gap let
+  the gate open on noise and duck the next words to −12 dB.
+- **Playback-queue diagnostics**: `voice playback queued gapMs=…` /
+  `voice playback drained played=…` — the log's answer to "did the audio
+  itself have gaps?" if any break-up remains.
+- Tests: 46 voice tests green (new: the route rule; 15/16 for the wider mute).
+- Ship: build 55 uploaded; on-device retest pending Ahmad.
 
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 

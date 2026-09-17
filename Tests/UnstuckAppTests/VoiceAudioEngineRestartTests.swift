@@ -39,6 +39,16 @@ final class VoiceAudioEngineRestartTests: XCTestCase {
         XCTAssertFalse(p.allowRestart(now: 6.5))
     }
 
+    func testVoiceProcessingIsSkippedOnlyOnTheLoudspeaker() {
+        // Half-duplex there makes the echo canceller pointless, and its
+        // double-talk suppressor chops our playback under near-end noise.
+        XCTAssertFalse(VoiceAudioEngine.wantsVoiceProcessing(for: .speaker))
+        XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: .lowEcho))
+        XCTAssertFalse(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: nil)), "no port info = the built-in speaker")
+        XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: "Receiver")))
+        XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: "BluetoothHFP")))
+    }
+
     func testAnEngineThatNeverStartedIgnoresConfigurationChangesAndShutsDownCleanly() {
         // Nothing is observed until the engine actually runs, so a stray
         // notification before start() must be a no-op: no restart, no capture

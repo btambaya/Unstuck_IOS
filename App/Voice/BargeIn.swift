@@ -69,9 +69,9 @@ struct BargeInProfile: Sendable, Equatable {
     /// with voice processing's echo cancellation on and the gate open, the
     /// server VAD heard the reply's own echo, transcribed it, cancelled the
     /// reply, and then ANSWERED the echo as if it were the user. Talk-over
-    /// stays available on low-echo routes (earphones / Bluetooth) and while
-    /// the model is only thinking (nothing is playing yet); the Interrupt
-    /// button cuts a playing reply on the loudspeaker.
+    /// stays available on low-echo routes (earphones / Bluetooth); on the
+    /// loudspeaker the Interrupt button cuts a reply, from response.created
+    /// until its audio has drained.
     let halfDuplexWhilePlaying: Bool
 
     static let lowEcho = BargeInProfile(route: .lowEcho, threshold: 0.5, confirmMs: 200, marginIdle: 6, marginPlaying: 6, halfDuplexWhilePlaying: false)
@@ -227,7 +227,12 @@ struct BargeInController: Sendable {
                     freezeAdaptation: playbackQueued || responseActive,
                     forcedOpen: state == .hold,
                     emitSilenceWhenClosed: !holdToTalk,
-                    forcedClosed: profile.halfDuplexWhilePlaying && playbackQueued && state != .hold)
+                    // The whole reply, not just while audio is queued: the
+                    // queue runs dry for a moment at the start of a reply
+                    // (device log 2026-09-17, 14:21:09) and between bursts,
+                    // and each gap let the gate open on room noise and duck
+                    // the next words to −12 dB.
+                    forcedClosed: profile.halfDuplexWhilePlaying && modelBusy && state != .hold)
     }
 
     /// True while the model is (or is about to be) audible — the Interrupt

@@ -499,7 +499,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(initial, GateContext(marginDb: 6, freezeAdaptation: false, forcedOpen: false, emitSilenceWhenClosed: true))
         // response.created freezes adaptation (residual echo is about to start).
         let created = c.handle(.responseCreated(id: "r1"), now: 0)
-        XCTAssertTrue(created.contains(.updateGate(GateContext(marginDb: 6, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true))))
+        XCTAssertTrue(created.contains(.updateGate(GateContext(marginDb: 6, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true, forcedClosed: true))))
         // First audio: +9 dB margin on the loudspeaker — and half-duplex.
         let delta = c.handle(.audioDelta(id: "r1"), now: 0.1)
         XCTAssertTrue(delta.contains(.updateGate(GateContext(marginDb: 9, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true, forcedClosed: true))))
@@ -518,7 +518,7 @@ final class BargeInTests: XCTestCase {
         // Controller: forced closed exactly while audio is queued on the speaker.
         var c = BargeInController(profile: .speaker)
         _ = c.handle(.responseCreated(id: "r1"), now: 0)
-        XCTAssertFalse(c.gateContext.forcedClosed, "thinking: nothing plays yet, talk-over allowed")
+        XCTAssertTrue(c.gateContext.forcedClosed, "muted from response.created: the queue runs dry between bursts and at the start")
         _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
         XCTAssertTrue(c.gateContext.forcedClosed)
         _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1)
