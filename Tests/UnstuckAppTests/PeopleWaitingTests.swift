@@ -6,6 +6,7 @@
 // server without the RPC, and the collab signals refresh the section.
 
 import XCTest
+import SwiftUI
 import UnstuckCore
 import UnstuckSync
 @testable import Unstuck
@@ -147,6 +148,24 @@ final class PeopleWaitingTests: XCTestCase {
         XCTAssertEqual(fake.removed, ["c1"])
         XCTAssertTrue(vm.roster.isEmpty)
         XCTAssertEqual(vm.waiting.count, 3, "the invites are untouched")
+    }
+
+    // MARK: accessibility sizes
+
+    /// Found live on the iPhone 17 simulator at AX XXXL: both row texts were
+    /// pinned to one line, so the address truncated to "unified-…" and what the
+    /// invite is for to "Write the projec…" — the whole content of the row, and
+    /// the grade the one vocabulary promises, gone. At accessibility sizes the
+    /// rows wrap instead; the compact single line stays everywhere else.
+    func testWaitingRowsWrapAtAccessibilitySizesInsteadOfTruncating() {
+        for size in DynamicTypeSize.allCases where !size.isAccessibilitySize {
+            XCTAssertEqual(waitingRowLineLimit(size), 1, "\(size) should keep the compact one-line row")
+        }
+        for size in DynamicTypeSize.allCases where size.isAccessibilitySize {
+            XCTAssertNil(waitingRowLineLimit(size), "\(size) must wrap, not truncate the address / the label")
+        }
+        XCTAssertEqual(waitingRowLineLimit(.large), 1)
+        XCTAssertNil(waitingRowLineLimit(.accessibility5), "AX XXXL — the size this was found at")
     }
 
     // MARK: live refresh

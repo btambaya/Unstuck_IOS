@@ -148,11 +148,28 @@ honestly until they do):
   labels, cancel per kind removes the row + calls the RPC with kind/id,
   refused cancel, dedupe with roster rows, pre-RPC roster, signal refresh).
   Counts: `swift test` → **1021 green** (2 skipped); `-only-testing:
-  UnstuckAppTests` → **578 green** on a fresh container. NOT bumped / archived.
-  Still to do once the backend lands: a simulator run of Settings → People
-  against prod (send a task invite from a Share screen → it appears under
-  Waiting to join → Cancel → gone; a pending "Add someone" email invite is
-  listed ONCE, under Waiting to join, with Copy link).
+  UnstuckAppTests` → **579 green** on a fresh container. NOT bumped / archived.
+- **LIVE-VERIFIED against prod (2026-09-17), RPCs deployed.** An independent
+  pass drove the real app on the "iPhone 17" simulator signed in as the demo
+  account: a task's Share screen → an unknown address ("Can edit"), a list's →
+  another ("Can view"), "Add someone" here → a third. Settings → People listed
+  all three under **Waiting to join**, ONE row each, reading exactly
+  "Write the project update · can edit" / "Groceries · can view" /
+  "your people" (the circle row carrying the roster's Copy link, and the
+  roster count NOT growing — the dedupe path works live). Cancel → the row
+  goes and the prod row is deleted (`task_invites` / `collection_invites` /
+  `trusted_circle` re-queried each time), the other invites survive; the
+  confirmation says what it takes away by name. Dark mode renders; VoiceOver
+  reads "Cancel invite to <address>" per row. Screens:
+  `30-people-waiting.png`, `31-people-after-cancel.png`.
+  **One defect found live and fixed here:** at AX XXXL both row texts were
+  pinned to `lineLimit(1)`, so the address truncated to "unified-…" and what
+  the invite is for to "Write the projec…" — the entire content of the row,
+  and the grade the one vocabulary promises, unreadable (and the rows
+  indistinguishable from each other). They now WRAP at accessibility sizes
+  (`waitingRowLineLimit`, unit-tested in `PeopleWaitingTests`); the compact
+  one-line row is unchanged everywhere else. Note the ROSTER's rows keep the
+  old one-line rule (pre-existing, not touched here).
 - **Known pre-existing flake fixed in passing:** `AssistantToolsTests.
   testGetTasksViewsAreDistinctAndFiltersNarrow` — every seeded task carried
   the fixed `PAST_CREATED` stamp, and `isSlipping` treats anything older

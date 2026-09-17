@@ -303,6 +303,16 @@ private struct RosterSection: View {
 
 // MARK: - Waiting to join (every invite I sent, whichever screen sent it)
 
+/// How many lines a Waiting-to-join row's two texts get. One each at normal
+/// sizes (the compact row the rest of Settings uses); at an ACCESSIBILITY size
+/// they wrap instead — found live at AX XXXL, where the one-line rule truncated
+/// the address to "unified-…" and what the invite is for to "Write the projec…",
+/// which is the entire content of the row: you could not tell the invites apart
+/// or read the grade ("· can edit" / "· can view") the one vocabulary promises.
+func waitingRowLineLimit(_ size: DynamicTypeSize) -> Int? {
+    size.isAccessibilitySize ? nil : 1
+}
+
 /// Unified sharing v1 §2 "One place for people": the email invites that are
 /// still unclaimed — a task's ("Draft the deck · can edit"), a list's
 /// ("Groceries · can view") and "Add someone"'s ("your people") — one row
@@ -311,6 +321,7 @@ private struct RosterSection: View {
 /// the roster keeps showing its pending rows exactly as before.
 private struct WaitingSection: View {
     @Environment(\.uTheme) private var theme
+    @Environment(\.dynamicTypeSize) private var typeSize
     let vm: CircleModel
     @State private var copiedId: String?
     @State private var cancelTarget: PendingInvite?
@@ -356,10 +367,12 @@ private struct WaitingSection: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(p.email.isEmpty ? "Invite pending" : p.email)
                     .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                    .lineLimit(1)
+                    .lineLimit(waitingRowLineLimit(typeSize))
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(pendingInviteLabel(p))
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                    .lineLimit(1)
+                    .lineLimit(waitingRowLineLimit(typeSize))
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
             if let code = p.inviteCode {
