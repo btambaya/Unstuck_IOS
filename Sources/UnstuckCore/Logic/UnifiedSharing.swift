@@ -10,6 +10,9 @@
 //     — they can edit." vs "Invite sent to x@y — waiting for them to sign
 //     up." vs "Link copied — …").
 //   • ShareFailure — the server's reason codes → what the user reads.
+//   • pendingInviteLabel / composePeopleSections — Settings → People's
+//     "Waiting to join" list (§2 "One place for people"): every email invite
+//     I sent, whichever screen sent it, each shown once.
 //
 // Pure + Sendable so the screen model, the assistant's confirm card and the
 // unit tests share one source of truth for copy and mapping.
@@ -351,3 +354,94 @@ public func shareShortName(_ raw: String) -> String {
 
 /// The one-line explainer on the Hand-over picker (§2).
 public let handOverExplainer = "It becomes their task to do — you keep view and hear when it's done."
+
+// MARK: - Settings → People · "Waiting to join" (§2 "One place for people")
+
+/// What a pending invite is for, in the ONE vocabulary — the subtitle of a
+/// Waiting-to-join row: "Draft the deck · can edit", "Groceries · can view",
+/// "your people". A missing item name degrades to "a task" / "a list"; an
+/// unknown grade drops the suffix rather than inventing one.
+public func pendingInviteLabel(_ p: PendingInvite) -> String {
+    switch p.kind {
+    case .circle:
+        return "your people"
+    case .task:
+        let name = nonBlank(p.itemName) ?? "a task"
+        let grade: String?
+        switch (p.access ?? "").lowercased() {
+        case "partner": grade = "can edit"
+        case "view": grade = "can view"
+        case "assign": grade = "handed over"
+        default: grade = nil
+        }
+        return grade.map { "\(name) · \($0)" } ?? name
+    case .collection:
+        let name = nonBlank(p.itemName) ?? "a list"
+        let grade: String?
+        switch (p.access ?? "").lowercased() {
+        case "editor": grade = "can edit"
+        case "viewer": grade = "can view"
+        default: grade = nil
+        }
+        return grade.map { "\(name) · \($0)" } ?? name
+    }
+}
+
+/// The two lists Settings → People renders from one `circle_list()` and one
+/// `my_pending_invites()`.
+public struct PeopleSections: Equatable, Sendable {
+    /// Active connections + the pending roster rows the RPC did NOT report
+    /// (link-only invites, or every pending row on a server without the RPC).
+    public var roster: [CircleMember]
+    /// Every outstanding invite, RPC order (createdAt desc), each listed once.
+    public var waiting: [PendingInvite]
+    public init(roster: [CircleMember], waiting: [PendingInvite]) {
+        self.roster = roster
+        self.waiting = waiting
+    }
+}
+
+/// Compose the People screen. A circle invite the RPC reports (kind `circle`)
+/// REPLACES its roster pending row — matched by `trusted_circle.id`, or, as a
+/// belt-and-braces second key, by the invited address — so the same invite is
+/// never shown twice; the roster row's `invite_code` is carried onto the
+/// waiting row so "Copy link" still works. Anything the RPC does not know
+/// stays in the roster exactly as before, which is what keeps the screen
+/// whole on a server where `my_pending_invites` does not exist yet (the
+/// transport answers `[]`). Duplicate RPC rows collapse to the first.
+public func composePeopleSections(circle: [CircleMember], pending: [PendingInvite]) -> PeopleSections {
+    // Waiting: RPC order, deduped by `kind:inviteId`, circle rows enriched
+    // with the roster's join code.
+    let pendingCircleById: [String: CircleMember] = Dictionary(
+        circle.filter { $0.status == "invited" }.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    let pendingCircleByEmail: [String: CircleMember] = Dictionary(
+        circle.filter { $0.status == "invited" }.compactMap { m in
+            nonBlank(m.inviteeEmail).map { ($0.lowercased(), m) }
+        }, uniquingKeysWith: { a, _ in a })
+    var seen = Set<String>()
+    var waiting: [PendingInvite] = []
+    var replacedRosterIds = Set<String>()
+    for var p in pending {
+        guard !seen.contains(p.id) else { continue }
+        seen.insert(p.id)
+        if p.kind == .circle {
+            let match = pendingCircleById[p.inviteId]
+                ?? nonBlank(p.email).flatMap { pendingCircleByEmail[$0.lowercased()] }
+            if let match {
+                replacedRosterIds.insert(match.id)
+                if p.inviteCode == nil { p.inviteCode = match.inviteCode }
+                if p.email.isEmpty, let e = nonBlank(match.inviteeEmail) { p.email = e }
+            }
+        }
+        waiting.append(p)
+    }
+    let roster = circle.filter { !($0.status == "invited" && replacedRosterIds.contains($0.id)) }
+    return PeopleSections(roster: roster, waiting: waiting)
+}
+
+/// Trimmed, or nil when blank / absent.
+private func nonBlank(_ s: String?) -> String? {
+    guard let s else { return nil }
+    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    return t.isEmpty ? nil : t
+}

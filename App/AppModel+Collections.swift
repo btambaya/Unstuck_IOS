@@ -726,11 +726,12 @@ extension AppModel {
 
     // MARK: - trusted circle (People / Connections)
 
-    /// Build a live circle roster view-model bound to the shared CircleClient.
-    /// Nil client (unconfigured / demo boot) degrades to an empty, read-only
-    /// roster — mirrors the web `useCircle` no-`sb` guard.
+    /// Build a live circle roster view-model over the shared CircleClient
+    /// (through the PeopleTransport seam). Nil client (unconfigured / demo
+    /// boot) degrades to an empty, read-only roster — mirrors the web
+    /// `useCircle` no-`sb` guard.
     func makeCircleModel() -> CircleModel {
-        CircleModel(client: coordinator?.circle)
+        CircleModel(transport: LivePeopleTransport(client: coordinator?.circle))
     }
 
     // MARK: - co-focus presence (M5)

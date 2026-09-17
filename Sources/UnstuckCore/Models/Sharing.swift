@@ -59,6 +59,59 @@ public struct CircleMember: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// What a pending invite is for — `my_pending_invites().kind` (unified
+/// sharing v1, spec §2 "One place for people"). The decoder drops rows whose
+/// kind it does not know, so a future kind never breaks the People screen.
+public enum PendingInviteKind: String, Codable, Sendable, Equatable, CaseIterable {
+    /// A `task_invites` row (an email share of a task from the Share screen).
+    case task
+    /// A `collection_invites` row (an email share of a list).
+    case collection
+    /// A `trusted_circle` row I own, `status = 'invited'` WITH an address
+    /// (the "Add someone" email invite) — link-only invites are not here.
+    case circle
+}
+
+/// One invite I sent that nobody has claimed yet — the Settings → People
+/// "Waiting to join" row. One shape for all three sources so the screen lists
+/// every outstanding email invite in ONE place, whichever screen sent it.
+public struct PendingInvite: Codable, Equatable, Sendable, Identifiable {
+    public var kind: PendingInviteKind
+    /// The row key `cancel_pending_invite(p_kind, p_id)` takes: `task_invites.id`,
+    /// the `collection_invites` key, or `trusted_circle.id`.
+    public var inviteId: String
+    /// The task / collection id (nil for a circle invite).
+    public var itemId: String?
+    /// The task title / list name (nil for a circle invite; may be missing).
+    public var itemName: String?
+    /// The address the invite went to ("" when the projection omitted it).
+    public var email: String
+    /// Task: "view" | "partner" | "assign"; list: "editor" | "viewer"; circle: nil.
+    /// Kept as a String — an unknown grade degrades in the label, never fails.
+    public var access: String?
+    public var createdAt: String?
+    /// The join code of a circle invite, carried over from the roster row
+    /// (`circle_list().invite_code`) so "Copy link" survives the move into
+    /// Waiting to join. nil straight off the RPC.
+    public var inviteCode: String?
+
+    /// `kind:inviteId` — a task invite and a circle invite can never collide
+    /// in one list even if their underlying ids happened to match.
+    public var id: String { "\(kind.rawValue):\(inviteId)" }
+
+    public init(kind: PendingInviteKind, inviteId: String, itemId: String? = nil, itemName: String? = nil,
+                email: String, access: String? = nil, createdAt: String? = nil, inviteCode: String? = nil) {
+        self.kind = kind
+        self.inviteId = inviteId
+        self.itemId = itemId
+        self.itemName = itemName
+        self.email = email
+        self.access = access
+        self.createdAt = createdAt
+        self.inviteCode = inviteCode
+    }
+}
+
 /// One share ON a task I own — drives the share sheet's current state.
 /// Mirrors web `ShareForTask`.
 public struct ShareForTask: Codable, Equatable, Sendable, Identifiable {

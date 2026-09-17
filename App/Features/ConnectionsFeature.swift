@@ -6,9 +6,18 @@
 // screen is where you add / remove people and re-copy pending invite links.
 //
 // State comes from the CircleClient's SECURITY DEFINER RPCs. CircleModel mirrors
-// the web `useCircle` hook: it holds the roster + refetches on the live
-// `unstuckCollabCircleChanged` signal (so a friend accepting your invite, or a
-// shared collection connecting you, updates the list without a manual reload).
+// the web `useCircle` hook: it holds the roster + refetches on the live collab
+// signals (so a friend accepting your invite, or a shared collection connecting
+// you, updates the list without a manual reload).
+//
+// Unified sharing v1 (spec §2 "One place for people"): the screen ALSO lists
+// every email invite you sent from anywhere — a task's Share screen
+// (`task_invites`), a list's (`collection_invites`) or "Add someone" here
+// (`trusted_circle` invited-with-address) — under "Waiting to join", from ONE
+// RPC (`my_pending_invites()`), each with a Cancel (`cancel_pending_invite`).
+// The model talks to the backend through PeopleTransport (a seam, like
+// ShareScreenTransport) so it is unit-tested with a fake; LivePeopleTransport
+// wires it to CircleClient via AppModel.makeCircleModel().
 
 import SwiftUI
 import UIKit
@@ -16,48 +25,116 @@ import UnstuckCore
 import UnstuckDesign
 import UnstuckSync
 
-/// Live trusted-circle roster + mutations, bound to the shared CircleClient.
-/// @MainActor @Observable so SwiftUI tracks `members` / `loading` directly —
-/// the iOS analogue of the web `useCircle()` hook.
+// MARK: - transport seam
+
+/// Everything the People screen does over the network, behind one protocol
+/// so CircleModel is unit-tested with a fake. Reads are tolerant (empty on
+/// failure); the cancel reports what the SERVER did.
 @MainActor
-@Observable
-final class CircleModel {
+protocol PeopleTransport: AnyObject {
+    /// `circle_list()` — active connections + pending circle invites.
+    func listCircle() async -> [CircleMember]
+    /// `circle-invite` edge fn — an email is emailed / added; blank → a link.
+    func invite(email: String?) async -> CircleInviteResult
+    /// `circle_redeem(p_code)` — join someone else's circle.
+    func redeem(code: String) async -> CircleRedeemResult
+    /// `circle_remove(p_id)` — a member, or a pending roster row.
+    func removeMember(id: String) async
+    /// `my_pending_invites()` — every invite I sent, all kinds (tolerant → []).
+    func myPendingInvites() async -> [PendingInvite]
+    /// `cancel_pending_invite(p_kind, p_id)` — true only when a row was deleted.
+    func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool
+}
+
+/// The live seam over the shared CircleClient. A nil client (unconfigured /
+/// demo boot, signed out) degrades to empty reads + `not_configured` —
+/// mirrors the web `useCircle` no-`sb` guard.
+@MainActor
+final class LivePeopleTransport: PeopleTransport {
     private let client: CircleClient?
-    var members: [CircleMember] = []
-    var loading = true
-    @ObservationIgnored private var observer: NSObjectProtocol?
 
     init(client: CircleClient?) { self.client = client }
 
-    /// Start observing the live circle-changed signal + do the first fetch.
+    func listCircle() async -> [CircleMember] { await client?.listCircle() ?? [] }
+    func invite(email: String?) async -> CircleInviteResult {
+        guard let client else { return CircleInviteResult(ok: false, error: "not_configured") }
+        return await client.invite(email: email)
+    }
+    func redeem(code: String) async -> CircleRedeemResult {
+        guard let client else { return CircleRedeemResult(ok: false, error: "not_configured") }
+        return await client.redeem(code: code)
+    }
+    func removeMember(id: String) async { await client?.removeMember(id: id) }
+    func myPendingInvites() async -> [PendingInvite] { await client?.myPendingInvites() ?? [] }
+    func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool {
+        await client?.cancelPendingInvite(kind: kind, id: id) ?? false
+    }
+}
+
+// MARK: - model
+
+/// Live trusted-circle roster + every pending invite I sent + mutations.
+/// @MainActor @Observable so SwiftUI tracks `roster` / `waiting` / `loading`
+/// directly — the iOS analogue of the web `useCircle()` hook.
+@MainActor
+@Observable
+final class CircleModel {
+    @ObservationIgnored private let transport: any PeopleTransport
+    /// Everything `circle_list()` returned (active + pending) — the source for
+    /// pickers elsewhere (NewTaskSheet reads the active ones).
+    var members: [CircleMember] = []
+    /// The rows the People list shows: `members` minus the pending circle
+    /// invites that are listed under Waiting to join (never twice).
+    private(set) var roster: [CircleMember] = []
+    /// Waiting to join — every invite I sent that is still unclaimed, from
+    /// `my_pending_invites()`, newest first, composed with the roster.
+    private(set) var waiting: [PendingInvite] = []
+    var loading = true
+    /// The line under Waiting to join after a refused cancel.
+    private(set) var waitingError: String?
+    @ObservationIgnored private var observers: [NSObjectProtocol] = []
+
+    init(transport: any PeopleTransport) { self.transport = transport }
+
+    /// Start observing the live collab signals (a connection of mine changed /
+    /// went active, a share row changed) + foreground, and do the first fetch.
     /// Idempotent (guards a double-subscribe when the view re-appears).
     func start() {
-        if observer == nil {
-            observer = NotificationCenter.default.addObserver(
-                forName: .unstuckCollabCircleChanged, object: nil, queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor in await self?.refresh() }
+        if observers.isEmpty {
+            let names: [Notification.Name] = [
+                .unstuckCollabCircleChanged, .unstuckCollabSharesChanged, .unstuckCollabConnectionActivated,
+                UIApplication.willEnterForegroundNotification,
+            ]
+            for name in names {
+                observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                    Task { @MainActor in await self?.refresh() }
+                })
             }
         }
         Task { await refresh() }
     }
 
     func stop() {
-        if let observer { NotificationCenter.default.removeObserver(observer) }
-        observer = nil
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        observers.removeAll()
     }
 
+    /// Re-read the roster + the pending invites and compose the two lists.
     func refresh() async {
-        guard let client else { loading = false; return }
-        members = await client.listCircle()
+        let circle = await transport.listCircle()
+        let pending = await transport.myPendingInvites()
+        members = circle
+        let sections = composePeopleSections(circle: circle, pending: pending)
+        roster = sections.roster
+        waiting = sections.waiting
         loading = false
     }
 
     /// Invite by email (we email them) or blank → a shareable link. Refetches
-    /// after (an existing account is added to the roster immediately).
+    /// after (an existing account is added to the roster immediately; a new
+    /// address lands under Waiting to join).
     func invite(email: String?) async -> CircleInviteResult {
-        guard let client else { return CircleInviteResult(ok: false, error: "not_configured") }
-        let r = await client.invite(email: email)
+        let r = await transport.invite(email: email)
         await refresh()
         return r
     }
@@ -65,24 +142,43 @@ final class CircleModel {
     /// Redeem someone else's invite code → join their circle. Refetch only on
     /// success (a failed redeem leaves your own roster unchanged).
     func redeem(code: String) async -> CircleRedeemResult {
-        guard let client else { return CircleRedeemResult(ok: false, error: "not_configured") }
-        let r = await client.redeem(code: code)
+        let r = await transport.redeem(code: code)
         if r.ok { await refresh() }
         return r
     }
 
-    /// Remove someone (or cancel a pending invite). Server-side this also drops
-    /// the task shares for the pair. Optimistic + refetch.
+    /// Remove someone (or cancel a pending roster row). Server-side this also
+    /// drops the task shares for the pair. Optimistic + refetch.
     func remove(id: String) async {
         members.removeAll { $0.id == id }
-        await client?.removeMember(id: id)
+        roster.removeAll { $0.id == id }
+        await transport.removeMember(id: id)
         await refresh()
+    }
+
+    /// Cancel a Waiting-to-join invite (`cancel_pending_invite`). Optimistic —
+    /// the row leaves at once — then the refetch shows the server's truth: a
+    /// refused cancel brings the row back with a line saying so. Returns
+    /// whether the server deleted it.
+    @discardableResult
+    func cancelPending(_ p: PendingInvite) async -> Bool {
+        waitingError = nil
+        waiting.removeAll { $0.id == p.id }
+        let ok = await transport.cancelPendingInvite(kind: p.kind, id: p.inviteId)
+        if !ok { waitingError = "Couldn't cancel that invite — try again." }
+        await refresh()
+        return ok
     }
 
     /// People who count toward "connected" — active members + pending invites
     /// (mirrors the web `activeCount`).
     var activeCount: Int {
         members.filter { $0.status == "active" || $0.status == "invited" }.count
+    }
+
+    /// The count on the People label — the rows actually listed there.
+    var rosterCount: Int {
+        roster.filter { $0.status == "active" || $0.status == "invited" }.count
     }
 }
 
@@ -107,6 +203,7 @@ struct ConnectionsView: View {
 
             if let vm {
                 RosterSection(vm: vm)
+                WaitingSection(vm: vm)
                 AddSomeoneSection(vm: vm).padding(.top, 22)
                 RedeemSection(vm: vm).padding(.top, 22)
             } else {
@@ -132,15 +229,17 @@ private struct RosterSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel("People · \(vm.activeCount)")
+            SectionLabel("People · \(vm.rosterCount)")
             if vm.loading {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
-            } else if vm.members.isEmpty {
-                Text("No one yet. Add anyone you want to share with.")
+            } else if vm.roster.isEmpty {
+                Text(vm.waiting.isEmpty
+                     ? "No one yet. Add anyone you want to share with."
+                     : "No one has joined yet — your invites are below.")
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
             } else {
                 SettingsCard {
-                    ForEach(Array(vm.members.enumerated()), id: \.element.id) { idx, m in
+                    ForEach(Array(vm.roster.enumerated()), id: \.element.id) { idx, m in
                         if idx > 0 { CardDivider() }
                         memberRow(m)
                     }
@@ -199,6 +298,99 @@ private struct RosterSection: View {
             .accessibilityLabel(pending ? "Cancel invite" : "Remove \(m.memberName ?? "member")")
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+}
+
+// MARK: - Waiting to join (every invite I sent, whichever screen sent it)
+
+/// Unified sharing v1 §2 "One place for people": the email invites that are
+/// still unclaimed — a task's ("Draft the deck · can edit"), a list's
+/// ("Groceries · can view") and "Add someone"'s ("your people") — one row
+/// each, with Cancel (and Copy link when the invite has a join code). Hidden
+/// while there is nothing waiting; on a server without `my_pending_invites`
+/// the roster keeps showing its pending rows exactly as before.
+private struct WaitingSection: View {
+    @Environment(\.uTheme) private var theme
+    let vm: CircleModel
+    @State private var copiedId: String?
+    @State private var cancelTarget: PendingInvite?
+
+    var body: some View {
+        if !vm.waiting.isEmpty || vm.waitingError != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel("Waiting to join · \(vm.waiting.count)")
+                Text("Invites you've sent that haven't been claimed. They get in the moment they sign up with that address.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                if let err = vm.waitingError {
+                    Text(err).font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                }
+                if !vm.waiting.isEmpty {
+                    SettingsCard {
+                        ForEach(Array(vm.waiting.enumerated()), id: \.element.id) { idx, p in
+                            if idx > 0 { CardDivider() }
+                            inviteRow(p)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 22)
+            .confirmationDialog(
+                "Cancel this invite?",
+                isPresented: Binding(get: { cancelTarget != nil }, set: { if !$0 { cancelTarget = nil } }),
+                titleVisibility: .visible, presenting: cancelTarget
+            ) { p in
+                Button("Cancel invite", role: .destructive) {
+                    Task { await vm.cancelPending(p) }
+                    cancelTarget = nil
+                }
+                Button("Keep it", role: .cancel) { cancelTarget = nil }
+            } message: { p in
+                Text(cancelMessage(p))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func inviteRow(_ p: PendingInvite) -> some View {
+        HStack(spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(p.email.isEmpty ? "Invite pending" : p.email)
+                    .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                    .lineLimit(1)
+                Text(pendingInviteLabel(p))
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if let code = p.inviteCode {
+                Button {
+                    UIPasteboard.general.string = circleInviteLink(code)
+                    copiedId = p.id
+                    Task { try? await Task.sleep(nanoseconds: 1_800_000_000); if copiedId == p.id { copiedId = nil } }
+                } label: {
+                    Text(copiedId == p.id ? "Copied!" : "Copy link")
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                }.buttonStyle(.plain)
+            }
+            Button { cancelTarget = p } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.palette.ink3)
+                    .frame(width: 32, height: 32).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Cancel invite\(p.email.isEmpty ? "" : " to \(p.email)")")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    /// What cancelling takes away, in the row's own words.
+    private func cancelMessage(_ p: PendingInvite) -> String {
+        let who = p.email.isEmpty ? "They" : p.email
+        switch p.kind {
+        case .circle: return "\(who) won't be added to your people when they sign up."
+        case .task: return "\(who) won't get \(p.itemName.map { "“\($0)”" } ?? "the task") when they sign up."
+        case .collection: return "\(who) won't get \(p.itemName.map { "“\($0)”" } ?? "the list") when they sign up."
+        }
     }
 }
 

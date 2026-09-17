@@ -109,6 +109,50 @@ honestly until they do):
   (item-carrying invites) is unused — the Share screen's link comes from
   `share-task link` / `share-collection link`, and NewTaskSheet's inline
   invite has no item yet (the task doesn't exist).
+- **§2 "One place for people" — GAP CLOSED (2026-09-17, last spec gap):**
+  email invites sent from the Share screen (`task_invites` /
+  `collection_invites`) did not appear under Settings → People. People now
+  has a **"Waiting to join"** section listing every unclaimed invite I sent,
+  whichever screen sent it — one row per invite: the address, what it's for
+  in the ONE vocabulary ("Draft the deck · can edit", "Groceries · can view",
+  "your people"), Cancel (confirmation → `cancel_pending_invite`), and Copy
+  link where the invite has a join code. Built against the backend's NEW RPC
+  contract (lands separately; the screen works before and after):
+  `my_pending_invites()` → setof jsonb `{kind: task|collection|circle, id,
+  itemId, itemName, email, access, createdAt}` (only invites the caller sent,
+  createdAt desc) and `cancel_pending_invite(p_kind, p_id)` → boolean (true
+  when a row was deleted). Pieces: `PendingInvite` / `PendingInviteKind`
+  (Core models), pure `pendingInviteLabel` + `composePeopleSections`
+  (Core/Logic/UnifiedSharing.swift — a `circle` row the RPC reports REPLACES
+  its roster pending row, matched by `trusted_circle.id` or by address, the
+  roster's `invite_code` carried over; anything the RPC doesn't know — link-only
+  invites, or every pending row on a pre-RPC server — stays in the roster as
+  before, so nothing is ever listed twice), `CircleClient.myPendingInvites()` /
+  `cancelPendingInvite(kind:id:)` with pure defensive decoders
+  (`decodePendingInvites`: unknown kinds / id-less / malformed / null elements
+  dropped without sinking the list, every field optional, camelCase +
+  snake_case twins, numeric ids; `decodeCancelPendingInvite`: PostgREST's
+  scalar `true`, plus `[true]` / `{ok}` in case the fn is reshaped; a missing
+  RPC = `[]` / `false`, never a pretended success), and the new
+  **`PeopleTransport` seam** in ConnectionsFeature (`LivePeopleTransport` over
+  `CircleClient`; `AppModel.makeCircleModel()` builds it) so `CircleModel` is
+  unit-tested with a fake. `CircleModel` now exposes `roster` (what the People
+  list shows) + `waiting` next to `members` (unchanged — NewTaskSheet's picker
+  source), refreshes on appear, on ALL the collab signals (`CircleChanged` /
+  `SharesChanged` / `ConnectionActivated`) + foreground, and after every
+  cancel (optimistic row removal, then the server's truth; a refused cancel
+  brings the row back with "Couldn't cancel that invite — try again."). Tests:
+  Core `PendingInvitesTests` (labels per kind + degradation, composition /
+  dedupe / pre-RPC), Sync `PendingInvitesClientTests` (decoders, param keys),
+  App `PeopleWaitingTests` (CircleModel over `FakePeopleTransport`: rows +
+  labels, cancel per kind removes the row + calls the RPC with kind/id,
+  refused cancel, dedupe with roster rows, pre-RPC roster, signal refresh).
+  Counts: `swift test` → **1021 green** (2 skipped); `-only-testing:
+  UnstuckAppTests` → **578 green** on a fresh container. NOT bumped / archived.
+  Still to do once the backend lands: a simulator run of Settings → People
+  against prod (send a task invite from a Share screen → it appears under
+  Waiting to join → Cancel → gone; a pending "Add someone" email invite is
+  listed ONCE, under Waiting to join, with Copy link).
 - **Known pre-existing flake fixed in passing:** `AssistantToolsTests.
   testGetTasksViewsAreDistinctAndFiltersNarrow` — every seeded task carried
   the fixed `PAST_CREATED` stamp, and `isSlipping` treats anything older
@@ -1359,10 +1403,10 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --scratch-path .build-int  # 998 tests green, 2 skipped (2026-09-17, unified sharing v1)
+TZ=UTC swift test --scratch-path .build-int  # 1021 tests green, 2 skipped (2026-09-17, unified sharing v1 + People "Waiting to join")
 xcodegen generate && xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app + widget
-# App-layer unit tests (host: Unstuck) — 570 green (2026-09-17):
+# App-layer unit tests (host: Unstuck) — 578 green (2026-09-17), on a FRESH container (uninstall first, see above):
 xcodebuild test -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'platform=iOS Simulator,id=38CF1937-7E51-4CDC-B96D-97928A2D1DF3' -only-testing:UnstuckAppTests
 ```

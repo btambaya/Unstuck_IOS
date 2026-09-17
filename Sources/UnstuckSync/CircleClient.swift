@@ -291,6 +291,60 @@ public struct CircleClient: Sendable {
             options: FunctionInvokeOptions(method: .post,
                 body: ShareNotifyBody(kind: kind, taskId: taskId, recipientId: recipientId)))
     }
+
+    // ── Pending invites — Settings → People "Waiting to join" ───────────────
+    // (unified sharing v1, spec §2 "One place for people")
+
+    /// Every invite I sent that is still waiting: task_invites (`kind: task`),
+    /// collection_invites (`collection`) and my own email circle invites
+    /// (`circle`), newest first. RPC: my_pending_invites() → setof jsonb, each
+    /// `{kind, id, itemId, itemName, email, access, createdAt}`. Tolerant → []
+    /// on any failure — including a server where the RPC is not deployed yet
+    /// (PostgREST 404) — so the People screen simply shows its roster then.
+    public func myPendingInvites() async -> [PendingInvite] {
+        do {
+            let resp = try await client.rpc("my_pending_invites").execute()
+            return Self.decodePendingInvites(resp.data)
+        } catch { return [] }
+    }
+
+    /// Cancel one pending invite I sent. RPC: cancel_pending_invite(p_kind,
+    /// p_id) → boolean. TRUE only when the server says a row was deleted — a
+    /// missing RPC, a foreign row or a refusal all read as false so the UI
+    /// never pretends.
+    @discardableResult
+    public func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool {
+        do {
+            let resp = try await client.rpc(
+                "cancel_pending_invite",
+                params: CancelPendingInviteParams(p_kind: kind.rawValue, p_id: id)).execute()
+            return Self.decodeCancelPendingInvite(resp.data)
+        } catch { return false }
+    }
+
+    /// `my_pending_invites` body → models. Defensive by design (the RPC lands
+    /// separately): the body must be a JSON array; an element that is not an
+    /// object, has an unknown `kind`, or has no `id` is dropped WITHOUT taking
+    /// the rest down; every other field is optional. Accepts the contract's
+    /// camelCase keys and their snake_case twins. Order is preserved.
+    static func decodePendingInvites(_ data: Data) -> [PendingInvite] {
+        guard let rows = try? JSONDecoder().decode([Lenient<PendingInviteRow>].self, from: data) else { return [] }
+        return rows.compactMap { $0.value?.model() }
+    }
+
+    /// `cancel_pending_invite` body → did a row go? PostgREST renders a scalar
+    /// `boolean` as `true` / `false`; `[true]` and `{"ok":true}` are read too in
+    /// case the function is ever reshaped. Anything else is false.
+    static func decodeCancelPendingInvite(_ data: Data) -> Bool {
+        let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        if text == "true" { return true }
+        if let b = try? JSONDecoder().decode(Bool.self, from: data) { return b }
+        if let arr = try? JSONDecoder().decode([Bool].self, from: data) { return arr.first == true }
+        if let obj = try? JSONDecoder().decode([String: Lenient<Bool>].self, from: data) {
+            return obj["ok"]?.value == true || obj["cancel_pending_invite"]?.value == true
+        }
+        return false
+    }
 }
 
 // MARK: - Wire shapes (internal → unit-tested via @testable)
@@ -303,6 +357,57 @@ struct TaskShareParams: Encodable { let p_task_id: String; let p_user: String; l
 struct SetDoneParams: Encodable { let p_task_id: String; let p_done: Bool }
 struct LogSharedFocusParams: Encodable { let p_task_id: String; let p_actual_sec: Int; let p_session_id: String }
 struct SharedBlocksParams: Encodable { let p_from: String; let p_to: String }
+struct CancelPendingInviteParams: Encodable { let p_kind: String; let p_id: String }
+
+/// One `my_pending_invites()` element — the contract's camelCase jsonb
+/// (`itemId`, `itemName`, `createdAt`) with snake_case twins accepted, every
+/// field optional, `id` read as a string OR a number. `model()` is nil when
+/// the kind is unknown or the id is missing (the row can't be cancelled).
+struct PendingInviteRow: Decodable {
+    var kind: String?
+    var id: String?
+    var itemId: String?
+    var itemName: String?
+    var email: String?
+    var access: String?
+    var createdAt: String?
+
+    private enum Keys: String, CodingKey {
+        case kind, id, email, access
+        case itemId, item_id, itemName, item_name, createdAt, created_at
+        case inviteeEmail = "invitee_email", level, role
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: Keys.self)
+        kind = Self.string(c, .kind)
+        id = Self.string(c, .id)
+        itemId = Self.string(c, .itemId) ?? Self.string(c, .item_id)
+        itemName = Self.string(c, .itemName) ?? Self.string(c, .item_name)
+        email = Self.string(c, .email) ?? Self.string(c, .inviteeEmail)
+        access = Self.string(c, .access) ?? Self.string(c, .level) ?? Self.string(c, .role)
+        createdAt = Self.string(c, .createdAt) ?? Self.string(c, .created_at)
+    }
+
+    /// A string, or a number rendered as one; nil for null / absent / other.
+    private static func string(_ c: KeyedDecodingContainer<Keys>, _ key: Keys) -> String? {
+        if let s = try? c.decodeIfPresent(String.self, forKey: key) { return s }
+        if let i = try? c.decodeIfPresent(Int.self, forKey: key) { return String(i) }
+        if let d = try? c.decodeIfPresent(Double.self, forKey: key) { return String(d) }
+        return nil
+    }
+
+    func model() -> PendingInvite? {
+        guard let k = PendingInviteKind(rawValue: (kind ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()),
+              let id = id?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return nil }
+        return PendingInvite(kind: k, inviteId: id,
+                             itemId: itemId.flatMap { $0.isEmpty ? nil : $0 },
+                             itemName: itemName.flatMap { $0.isEmpty ? nil : $0 },
+                             email: (email ?? "").trimmingCharacters(in: .whitespacesAndNewlines),
+                             access: access.flatMap { $0.isEmpty ? nil : $0 },
+                             createdAt: createdAt.flatMap { $0.isEmpty ? nil : $0 })
+    }
+}
 
 // Edge-fn bodies: camelCase, matching what the web sends + the functions read.
 struct InviteBody: Encodable { let email: String? }
