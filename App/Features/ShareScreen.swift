@@ -631,7 +631,7 @@ struct ShareScreen: View {
         Button { showPicker = true } label: {
             HStack(spacing: 10) {
                 Image(systemName: "person.crop.circle.badge.plus")
-                    .font(.system(size: 18, weight: .regular)).foregroundStyle(theme.palette.coral)
+                    .font(.system(size: 18, weight: .regular)).foregroundStyle(theme.palette.ink2)
                     .frame(width: monogramSize, height: monogramSize)
                 Text(mode == .share ? "Choose someone" : "Choose who gets it")
                     .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
@@ -714,16 +714,17 @@ struct ShareScreen: View {
         .contentShape(Rectangle())
     }
 
-    /// Coral (the app's accent: the assistant orb, Focus, the + button) with a
-    /// white letter when they hold the item, `bg2` / `ink2` with a `line2` ring
-    /// when not. Colour is never the only signal — the trailing word says the
+    /// The app's selected / unselected pair: filled `ink` with a `bg` letter
+    /// when they hold the item, `bg2` / `ink2` with a `line2` ring when not
+    /// (Ahmad, 2026-09-17: selection is black-and-white everywhere; coral is
+    /// only the brand accent — the + button, Focus, the orb). Colour is never the only signal — the trailing word says the
     /// same thing.
     private func monogram(_ row: SharePersonRow, on: Bool) -> some View {
         Text(String(row.name.prefix(1)).uppercased())
             .font(UFont.sans(10, .semibold))
-            .foregroundStyle(on ? Color.white : theme.palette.ink2)
+            .foregroundStyle(on ? theme.palette.bg : theme.palette.ink2)
             .frame(width: monogramSize, height: monogramSize)
-            .background(on ? theme.palette.coral : theme.palette.bg2, in: Circle())
+            .background(on ? theme.palette.ink : theme.palette.bg2, in: Circle())
             .overlay(Circle().stroke(on ? Color.clear : theme.palette.line2))
             .accessibilityHidden(true)
     }
@@ -773,25 +774,25 @@ struct ShareScreen: View {
                 Text(row.statusLabel ?? "Handed over").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Hand over").font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
+                Text("Hand over").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 12).padding(.vertical, 6)
-                    .background(theme.palette.coral, in: Capsule())
+                    .background(theme.palette.ink, in: Capsule())
             }
         } else if row.isShared {
             HStack(spacing: 4) {
-                Text(row.statusLabel ?? "Shared").font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
+                Text(row.statusLabel ?? "Shared").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                     .fixedSize(horizontal: false, vertical: true)
                 Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(Color.white)
+                    .foregroundStyle(theme.palette.bg)
             }
             .padding(.horizontal, 11).padding(.vertical, 6)
-            .background(theme.palette.coral, in: Capsule())
+            .background(theme.palette.ink, in: Capsule())
         } else {
-            Text("Share").font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
+            Text("Share").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(theme.palette.coral, in: Capsule())
+                .background(theme.palette.ink, in: Capsule())
         }
     }
 
@@ -843,9 +844,9 @@ struct ShareScreen: View {
                 Button { Task { await vm.shareWithEmail() } } label: {
                     // `bg` on `ink` (the app's filled-chip pair) — a literal
                     // white on dark `ink` (L 0.96) was invisible in dark mode.
-                    Text(busy ? "Sharing…" : "Share").font(UFont.sans(13, .semibold)).foregroundStyle(Color.white)
+                    Text(busy ? "Sharing…" : "Share").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                        .background(theme.palette.ink, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                         .frame(minHeight: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -993,9 +994,9 @@ private struct PeoplePickerSheet: View {
                                     }
                                 }
                                 Spacer(minLength: 8)
-                                Text(action).font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
+                                Text(action).font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                                     .padding(.horizontal, 12).padding(.vertical, 6)
-                                    .background(theme.palette.coral, in: Capsule())
+                                    .background(theme.palette.ink, in: Capsule())
                             }
                             .contentShape(Rectangle())
                         }
