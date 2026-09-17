@@ -13,18 +13,47 @@ import Foundation
 import Supabase
 import UnstuckCore
 
-/// Result of a `circle_redeem` — the RPC returns jsonb {ok, error?, owner_name?}.
+/// Result of a `circle_redeem` — the RPC returns jsonb {ok, error?, owner_name?,
+/// granted?: {task_id?, collection_id?}, already_connected?} (unified sharing
+/// v1: a link can carry an item, granted in the same step).
 public struct CircleRedeemResult: Decodable, Sendable, Equatable {
     public var ok: Bool
     public var error: String?
     public var ownerName: String?
-    enum CodingKeys: String, CodingKey { case ok, error, ownerName = "owner_name" }
+    /// The item the link carried and the server granted (migration 065).
+    public var grantedTaskId: String?
+    public var grantedCollectionId: String?
+    /// The connection already existed; only the item (if any) was new.
+    public var alreadyConnected: Bool?
+    enum CodingKeys: String, CodingKey {
+        case ok, error, ownerName = "owner_name", granted, alreadyConnected = "already_connected"
+    }
+    private enum GrantedKeys: String, CodingKey { case taskId = "task_id", collectionId = "collection_id" }
 
-    public init(ok: Bool, error: String? = nil, ownerName: String? = nil) {
+    public init(ok: Bool, error: String? = nil, ownerName: String? = nil,
+                grantedTaskId: String? = nil, grantedCollectionId: String? = nil, alreadyConnected: Bool? = nil) {
         self.ok = ok
         self.error = error
         self.ownerName = ownerName
+        self.grantedTaskId = grantedTaskId
+        self.grantedCollectionId = grantedCollectionId
+        self.alreadyConnected = alreadyConnected
     }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = try c.decodeIfPresent(Bool.self, forKey: .ok) ?? false
+        error = try c.decodeIfPresent(String.self, forKey: .error)
+        ownerName = try c.decodeIfPresent(String.self, forKey: .ownerName)
+        alreadyConnected = (try? c.decodeIfPresent(Bool.self, forKey: .alreadyConnected)) ?? nil
+        if let g = try? c.nestedContainer(keyedBy: GrantedKeys.self, forKey: .granted) {
+            grantedTaskId = (try? g.decodeIfPresent(String.self, forKey: .taskId)) ?? nil
+            grantedCollectionId = (try? g.decodeIfPresent(String.self, forKey: .collectionId)) ?? nil
+        }
+    }
+
+    /// True when the link carried an item that is now mine to see.
+    public var grantedItem: Bool { grantedTaskId != nil || grantedCollectionId != nil }
 }
 
 /// Outcome of a `circle-invite` edge-fn call. Uniform shape (never reveals
@@ -225,6 +254,24 @@ public struct CircleClient: Sendable {
         } catch { return [] }
     }
 
+    /// The server's reason behind a thrown RPC / edge-fn call, for the shared
+    /// `ShareFailure` copy: a SECURITY DEFINER function's `raise exception
+    /// 'not_in_circle'` arrives as a PostgrestError whose message carries the
+    /// code; a non-2xx edge-fn body carries `{error}` / `{reason}`; anything
+    /// else (offline, timeout) is "network".
+    public static func rpcFailureReason(_ error: Error) -> String {
+        if let pg = error as? PostgrestError {
+            let m = pg.message.lowercased()
+            for code in ["not_in_circle", "not_your_task", "bad_level", "not_allowed", "unauthorized", "not_found", "self", "blocked"]
+            where m.contains(code) { return code }
+            return m.isEmpty ? "network" : m
+        }
+        if case let FunctionsError.httpError(_, data) = error {
+            return TaskShareClient.failureReason(fromBody: data)
+        }
+        return "network"
+    }
+
     /// Group a flat badge list by task id — the taskId → [badges] map the web's
     /// `useShareBadges` exposes for the row badges + delegation/co-focus.
     public static func shareBadgesByTask(_ badges: [ShareBadge]) -> [String: [ShareBadge]] {
@@ -271,11 +318,16 @@ struct CircleMemberRow: Decodable {
     let member_user_id: String?
     let member_name: String?
     let created_at: String
+    /// Unified sharing v1 (migration 065): the pending invite's address, so
+    /// People can show WHO was invited. Optional — absent entirely on a
+    /// pre-065 projection, null for link-only / active rows.
+    let invitee_email: String?
 
     func model() -> CircleMember {
         CircleMember(id: id, relationshipLabel: relationship_label, level: level, status: status,
                      inviteCode: invite_code, memberUserId: member_user_id,
-                     memberName: member_name, createdAt: created_at)
+                     memberName: member_name, createdAt: created_at,
+                     inviteeEmail: invitee_email.flatMap { $0.isEmpty ? nil : $0 })
     }
 }
 

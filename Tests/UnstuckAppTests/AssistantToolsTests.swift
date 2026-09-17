@@ -223,7 +223,15 @@ final class FakeAssistantState: AssistantAppState {
 
 // MARK: - row builders
 
-let PAST_CREATED = "2026-08-25T09:00:00.000Z"
+/// The seeds' "created a while ago" stamp — seven days before TODAY, relative
+/// on purpose: `isSlipping` treats anything older than 21 days as slipping,
+/// so a fixed literal aged every seeded task into the "slipping" view once the
+/// calendar passed it (2026-09-17: "All (6)" where one row was expected).
+let PAST_CREATED: String = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f.string(from: Date().addingTimeInterval(-7 * 24 * 60 * 60))
+}()
 
 func task(_ id: String, _ name: String, estimateMin: Int = 25, done: Bool = false, later: Bool? = nil,
           lifeArea: String? = nil, tags: [String]? = nil, moveCount: Int? = nil, dueAt: String? = nil,

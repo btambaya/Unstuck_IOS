@@ -105,6 +105,10 @@ struct NotificationCenterView: View {
         case "morning_brief": return "Morning brief"
         case "evening_preview": return "Evening preview"
         case "daily_nudge": return "Daily nudge"
+        case "task_share": return "Shared with you"
+        case "collection_share": return "List shared with you"
+        case "invite_claimed": return "Someone joined"
+        case "shared_task_done": return "Shared task done"
         default: return "Notification"
         }
     }

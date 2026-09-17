@@ -159,7 +159,7 @@ private struct RosterSection: View {
             Button("Cancel", role: .cancel) { removeTarget = nil }
         } message: { m in
             Text(m.status == "invited"
-                 ? "Cancels this pending invite."
+                 ? "Cancels this pending invite\(m.inviteeEmail.map { " to \($0)" } ?? "")."
                  : "\(m.memberName ?? "They") will no longer see anything you've shared, and any tasks you shared with them are revoked.")
         }
     }
@@ -169,9 +169,14 @@ private struct RosterSection: View {
         let pending = m.status == "invited"
         HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(pending ? "Invite pending" : (m.memberName ?? "Member"))
+                // A pending invite shows WHO was invited (unified sharing v1:
+                // `circle_list.invitee_email`); link-only invites have no address.
+                Text(pending ? (m.inviteeEmail ?? "Invite pending") : (m.memberName ?? "Member"))
                     .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                Text(m.relationshipLabel ?? (pending ? "waiting to be accepted" : "connected"))
+                    .lineLimit(1)
+                Text(m.relationshipLabel
+                     ?? (pending ? (m.inviteeEmail == nil ? "waiting to be accepted" : "invited · waiting for them to sign up")
+                                 : "connected"))
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
             Spacer()

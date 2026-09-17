@@ -626,11 +626,39 @@ extension AppModel {
     /// false and its next item edit shipped the whole `items` JSONB, clobbering
     /// the member's atomic RPC edits.
     func shareCollection(_ collectionId: String, email: String, role: String) async -> ShareOutcome {
+        await shareCollection(collectionId, email: email, userId: nil, role: role)
+    }
+
+    /// Share by email (Someone new) or by user id (a connection tapped in the
+    /// Share screen's People section — the roster carries no emails).
+    func shareCollection(_ collectionId: String, email: String?, userId: String?, role: String) async -> ShareOutcome {
         guard let coord = coordinator else { return .error }
-        let result = await coord.share.shareDetailed(collectionId: collectionId, email: email, role: role)
-        if result.outcome == .ok { applyLocalMembers(collectionId, joined: result.memberUserIds) }
-        if result.outcome == .ok || result.outcome == .invited { await coord.rehydrateCollections() }
+        let result = await coord.share.shareDetailed(collectionId: collectionId, email: email, userId: userId, role: role)
+        if result.outcome.isSuccess, !result.memberUserIds.isEmpty {
+            applyLocalMembers(collectionId, joined: result.memberUserIds)
+        }
+        if result.outcome.isSuccess { await coord.rehydrateCollections() }
         return result.outcome
+    }
+
+    /// The ONE Share screen's model (tasks + collections; `.handOver` = the
+    /// "Hand over to…" people picker). Bound to the live transport; a nil
+    /// coordinator (demo / UITest boot) degrades to empty, inert sections.
+    func makeShareScreenModel(target: ShareTarget, mode: ShareScreenModel.Mode = .share) -> ShareScreenModel {
+        ShareScreenModel(target: target, mode: mode, transport: LiveShareTransport(model: self))
+    }
+
+    /// Report a person you shared a task or list with (App Store 1.2 safety) —
+    /// same feedback channel as `reportConcern`, with the item named.
+    func reportShareConcern(target: ShareTarget, about who: String, reason: String) async {
+        switch target {
+        case .collection(let id, _):
+            await reportConcern(collectionId: id, about: who, reason: reason)
+        case .task(let id, _):
+            _ = await sendFeedback(
+                body: "⚠️ REPORT — shared task \(id), recipient \(who): \(reason)",
+                category: "report", screen: "shared-task")
+        }
     }
     /// Revoke a member's access. TRUE only when the SERVER confirmed it — a
     /// refusal (403 / 5xx / offline) must not be reported as "removed" while

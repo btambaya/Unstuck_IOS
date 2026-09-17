@@ -10,6 +10,7 @@
 import SwiftUI
 import UnstuckCore
 import UnstuckDesign
+import UnstuckSync
 
 // MARK: - context
 
@@ -330,25 +331,47 @@ struct AssistantReceiptRow: View {
 protocol AssistantSharePerformer {
     func share(taskId: String, user: String, level: ShareLevel) async throws
     func notify(taskId: String, recipientId: String) async
+    /// Unified sharing v1: share with an EMAIL through `share-task add` —
+    /// the server shares at once (existing account) or stores + emails an
+    /// invite, and tells us which. Default: not available (older performers).
+    func shareByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome
 }
 
-/// The live performer — the same RPC + best-effort heads-up the share sheet uses.
+extension AssistantSharePerformer {
+    func shareByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
+        .failed(reason: "not_configured")
+    }
+}
+
+/// The live performer — the same RPC + best-effort heads-up the Share screen uses.
 @MainActor
 struct ShareModelPerformer: AssistantSharePerformer {
     let shares: ShareModel
+    var taskShare: TaskShareClient? = nil
     func share(taskId: String, user: String, level: ShareLevel) async throws {
         try await shares.shareTask(taskId: taskId, user: user, level: level)
     }
     func notify(taskId: String, recipientId: String) async {
         await shares.notifyShare(taskId: taskId, recipientId: recipientId)
     }
+    func shareByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
+        guard let taskShare else { return .failed(reason: "not_configured") }
+        let r = await taskShare.add(taskId: taskId, email: email, level: level)
+        if case .shared = r { await shares.refresh() }
+        return r
+    }
 }
 
 /// Run a staged share. Returns the outcome + a message on failure. The notify
 /// only fires AFTER a successful share (a failed RPC must never look like one).
+/// An email-targeted request takes `performConfirmedEmailShare` instead.
 @MainActor
 func performConfirmedShare(_ pending: PendingShare,
                            using performer: AssistantSharePerformer) async -> (PendingShareOutcome, String?) {
+    if pending.recipientEmail != nil {
+        let (outcome, line) = await performConfirmedEmailShare(pending, using: performer)
+        return (outcome, outcome == .failed ? line : nil)
+    }
     do {
         try await performer.share(taskId: pending.taskId, user: pending.recipientUserId,
                                   level: pending.level)
@@ -357,6 +380,27 @@ func performConfirmedShare(_ pending: PendingShare,
     }
     await performer.notify(taskId: pending.taskId, recipientId: pending.recipientUserId)
     return (.shared, nil)
+}
+
+/// Run a staged EMAIL share (`share-task add`). Returns the outcome + the
+/// honest line for the card: "Shared with Maya — they can edit." / "Invite
+/// sent to x@y — waiting for them to sign up." / the refusal copy. The edge
+/// function notifies the recipient itself, so no client-side notify.
+@MainActor
+func performConfirmedEmailShare(_ pending: PendingShare,
+                                using performer: AssistantSharePerformer) async -> (PendingShareOutcome, String) {
+    let email = pending.recipientEmail ?? pending.recipientName
+    let access = ShareAccess(taskLevel: pending.level)
+    switch await performer.shareByEmail(taskId: pending.taskId, email: email, level: pending.level) {
+    case .shared(_, let displayName):
+        let name = displayName.isEmpty ? email : displayName
+        if let access { return (.shared, shareResultLine(.shared(name: name, access: access))) }
+        return (.shared, shareResultLine(.handedOver(name: name)))
+    case .invited:
+        return (.shared, shareResultLine(.invited(email: email)))
+    case .failed(let reason):
+        return (.failed, ShareFailure(reason: reason).message)
+    }
 }
 
 /// The ONLY place an assistant-prepared share actually happens. The agent
@@ -370,10 +414,18 @@ struct AssistantShareConfirmCard: View {
 
     @State private var busy = false
     @State private var error: String?
+    /// The honest line after an email share (shared now vs invite sent).
+    @State private var note: String?
 
     private var done: Bool { pending.outcome == .shared }
     private var dismissed: Bool { pending.outcome == .dismissed }
     private var failed: Bool { pending.outcome == .failed }
+    private var byEmail: Bool { pending.recipientEmail != nil }
+    /// "can edit" / "can view" / "handed over" — the unified vocabulary (§2).
+    private var grade: String {
+        if let a = ShareAccess(taskLevel: pending.level) { return a.label.lowercased() }
+        return "handed over"
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -384,17 +436,19 @@ struct AssistantShareConfirmCard: View {
             (Text("Share ")
                 + Text("“\(pending.taskName)”").bold()
                 + Text(" with ")
-                + Text(pending.recipientName).bold()
-                + Text(" — \(shareLevelLabel(pending.level))"))
+                + Text(pending.recipientEmail ?? pending.recipientName).bold()
+                + Text(" — \(grade)"))
                 .font(UFont.sans(13.5))
                 .foregroundStyle(theme.palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
 
             if !done && !dismissed {
-                Text("They’ll see this task’s title and whether it’s done. Nothing else is shared.")
+                Text(byEmail
+                     ? "If they have an Unstuck account it’s shared right away; otherwise they get an invite email and it’s theirs when they sign up."
+                     : "They’ll see this task’s title and whether it’s done. Nothing else is shared.")
                     .font(UFont.sans(11.5)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
-                if let message = error ?? (failed ? "Could not share — try again." : nil) {
+                if let message = error ?? (failed ? "Couldn't share — try again." : nil) {
                     Text(message).font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
                 }
                 HStack(spacing: 8) {
@@ -402,8 +456,16 @@ struct AssistantShareConfirmCard: View {
                         guard !busy else { return }
                         busy = true; error = nil
                         Task {
-                            let (outcome, message) = await performConfirmedShare(pending, using: performer)
-                            error = message
+                            let outcome: PendingShareOutcome
+                            if byEmail {
+                                let (o, line) = await performConfirmedEmailShare(pending, using: performer)
+                                outcome = o
+                                if o == .failed { error = line } else { note = line }
+                            } else {
+                                let (o, message) = await performConfirmedShare(pending, using: performer)
+                                outcome = o
+                                error = message
+                            }
                             busy = false
                             onResolved(outcome)
                         }
@@ -430,7 +492,11 @@ struct AssistantShareConfirmCard: View {
             }
 
             if done {
-                Text("Manage or revoke it any time from the task’s share menu.")
+                if let note {
+                    Text(note).font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.greenInk)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Manage or revoke it any time from the task’s Share screen.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
         }

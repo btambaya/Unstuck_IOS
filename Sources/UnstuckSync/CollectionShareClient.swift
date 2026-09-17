@@ -12,14 +12,40 @@
 
 import Foundation
 import Supabase
+import UnstuckCore
 
-/// Result of a `share` attempt — mirrors Android's ShareOutcome enum.
+/// Result of a `share` attempt — mirrors Android's ShareOutcome enum, plus the
+/// unified-sharing refusals the server now names (`blocked`, `rate_limited`).
 public enum ShareOutcome: Sendable, Equatable {
     case ok          // shared with an existing account
     case invited     // no account yet → pending invite + email sent
+    /// The server took it but does not say which of the two happened —
+    /// `share-collection add` deliberately answers `{ok, invited:true}` for
+    /// BOTH branches (no account-enumeration oracle). Success; neutral copy.
+    case accepted
     case notFound    // email/collection invalid
     case selfError   // tried to share with my own email
+    case blocked     // the server's blocked-users mechanism refused
+    case rateLimited // the per-user limiter refused (429)
+    case invalid     // 400 bad_request (no / malformed email — e.g. a by-userId add the fn can't take)
     case error       // unrecoverable
+
+    /// The server reason code this outcome corresponds to (for the shared
+    /// `ShareFailure` copy); nil for the successes.
+    public var failureReason: String? {
+        switch self {
+        case .ok, .invited, .accepted: return nil
+        case .notFound: return "not_found"
+        case .selfError: return "self"
+        case .blocked: return "blocked"
+        case .rateLimited: return "rate_limited"
+        case .invalid: return "bad_request"
+        case .error: return "network"
+        }
+    }
+
+    /// The share landed (whatever the server chose to reveal).
+    public var isSuccess: Bool { failureReason == nil }
 }
 
 /// A member (joined) or pending invite of a shared collection, for the share sheet.
@@ -62,7 +88,7 @@ public struct CollectionShareClient: Sendable {
         var error: String? = nil
     }
 
-    private struct MemberRow: Decodable {
+    struct MemberRow: Decodable {
         var userId: String = ""
         var email: String = ""
         var role: String? = nil
@@ -102,14 +128,22 @@ public struct CollectionShareClient: Sendable {
         }
     }
 
-    private struct ShareAddResponse: Decodable {
+    struct ShareAddResponse: Decodable {
         var ok: Bool? = nil
+        /// Unified sharing v1: "shared" | "invited" — the HONEST answer.
+        var status: String? = nil
+        /// Legacy uniform flag (pre-065 the function answered `invited: true`
+        /// for BOTH branches, which is why iOS always said "Invited …").
         var invited: Bool? = nil
         var userId: String? = nil
         var role: String? = nil
         var email: String? = nil
         var error: String? = nil
-        var members: [MemberRow]? = nil
+        var reason: String? = nil
+        /// The membership rows (the owner could list them anyway). LENIENT: a
+        /// deployment that answers a count (`members: 2`) or nothing must not
+        /// fail the whole decode — the verdict never depends on this field.
+        var members: Lenient<[MemberRow]>? = nil
     }
 
     /// Share with an email. Existing account → member; otherwise pending invite + email.
@@ -118,23 +152,82 @@ public struct CollectionShareClient: Sendable {
     }
 
     public func shareDetailed(collectionId: String, email: String, role: String) async -> ShareResult {
+        await shareDetailed(collectionId: collectionId, email: email, userId: nil, role: role)
+    }
+
+    /// Share by email OR by user id (a connection tapped in the People section
+    /// — the roster knows no emails). `userId` is sent as `userId` on the
+    /// `add` body; a server that only resolves emails answers `bad_request`,
+    /// which surfaces as `.error` (contract gap reported in handover.md).
+    public func shareDetailed(collectionId: String, email: String?, userId: String?, role: String) async -> ShareResult {
+        let body = ShareBody(action: "add", collectionId: collectionId,
+                             email: email.map(normalizedShareEmail).flatMap { $0.isEmpty ? nil : $0 },
+                             userId: userId.flatMap { $0.isEmpty ? nil : $0 }, role: role)
         do {
-            let r: ShareAddResponse = try await client.functions.invoke(
+            let data: Data = try await client.functions.invoke(
                 "share-collection",
-                options: FunctionInvokeOptions(method: .post,
-                    body: ShareBody(action: "add", collectionId: collectionId, email: email, role: role)))
-            let members = (r.members ?? []).map(\.userId).filter { !$0.isEmpty }
-            switch true {
-            case r.error == "not_found": return ShareResult(outcome: .notFound, memberUserIds: members)
-            case r.error == "self": return ShareResult(outcome: .selfError, memberUserIds: members)
-            case r.invited == true: return ShareResult(outcome: .invited, memberUserIds: members)
-            case r.ok == true && r.userId != nil:
-                let added = r.userId ?? ""
-                return ShareResult(outcome: .ok,
-                                   memberUserIds: members.isEmpty ? [added] : members)
+                options: FunctionInvokeOptions(method: .post, body: body)) { data, _ in data }
+            return Self.decodeShareAdd(data)
+        } catch {
+            // A refusal is a non-2xx with `{error}` (429 rate_limited, 403
+            // forbidden …) — read it instead of collapsing everything to .error.
+            if case let FunctionsError.httpError(_, data) = error {
+                return Self.decodeShareAdd(data, thrown: true)
+            }
+            return ShareResult(outcome: .error, memberUserIds: [])
+        }
+    }
+
+    /// Pure `add` verdict, exposed for tests. Order matters and is the fix for
+    /// the "always Invited" bug: an explicit refusal first, then the honest
+    /// `status`, then `ok` + a resolved user, and only THEN the legacy
+    /// `invited` flag — which the old function set on both branches.
+    static func decodeShareAdd(_ data: Data, thrown: Bool = false) -> ShareResult {
+        guard let r = try? JSONDecoder().decode(ShareAddResponse.self, from: data) else {
+            return ShareResult(outcome: .error, memberUserIds: [])
+        }
+        let members = (r.members?.value ?? []).map(\.userId).filter { !$0.isEmpty }
+        let code = (r.error ?? r.reason ?? "").lowercased()
+        if !code.isEmpty || thrown || r.ok == false {
+            switch code {
+            case "not_found": return ShareResult(outcome: .notFound, memberUserIds: members)
+            case "self": return ShareResult(outcome: .selfError, memberUserIds: members)
+            case "blocked": return ShareResult(outcome: .blocked, memberUserIds: members)
+            case "rate_limited", "rate_limit", "too_many_requests": return ShareResult(outcome: .rateLimited, memberUserIds: members)
+            case "bad_request", "invalid_email": return ShareResult(outcome: .invalid, memberUserIds: members)
             default: return ShareResult(outcome: .error, memberUserIds: members)
             }
-        } catch { return ShareResult(outcome: .error, memberUserIds: []) }
+        }
+        switch (r.status ?? "").lowercased() {
+        case "shared":
+            let added = r.userId ?? ""
+            return ShareResult(outcome: .ok, memberUserIds: members.isEmpty && !added.isEmpty ? [added] : members)
+        case "invited":
+            return ShareResult(outcome: .invited, memberUserIds: members)
+        default: break
+        }
+        if r.ok == true, let uid = r.userId, !uid.isEmpty {
+            return ShareResult(outcome: .ok, memberUserIds: members.isEmpty ? [uid] : members)
+        }
+        // The deployed function's uniform answer (`{ok:true, invited:true, …}`
+        // on BOTH branches): it landed; which branch is deliberately unsaid →
+        // `accepted`, never a fabricated "invited".
+        if r.invited == true { return ShareResult(outcome: .accepted, memberUserIds: members) }
+        return ShareResult(outcome: .error, memberUserIds: members)
+    }
+
+    /// A one-shot join link that grants THIS list at `role` on redeem
+    /// (`share-collection link`, unified sharing v1).
+    public func link(collectionId: String, role: String) async -> ShareLinkOutcome {
+        do {
+            let data: Data = try await client.functions.invoke(
+                "share-collection",
+                options: FunctionInvokeOptions(method: .post,
+                    body: ShareBody(action: "link", collectionId: collectionId, role: role))) { data, _ in data }
+            return TaskShareClient.decodeLink(data)
+        } catch {
+            return .failed(reason: TaskShareClient.failureReason(from: error))
+        }
     }
 
     /// Did the server actually DO the revoke? Every success branch of

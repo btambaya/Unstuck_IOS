@@ -39,9 +39,14 @@ public struct CircleMember: Codable, Equatable, Sendable, Identifiable {
     /// Server-resolved display name for active members.
     public var memberName: String?
     public var createdAt: String
+    /// The address a pending invite was sent to (unified sharing v1 —
+    /// `circle_list.invitee_email`). nil for link-only invites, for active
+    /// rows, and against a server that doesn't project the column yet.
+    public var inviteeEmail: String?
 
     public init(id: String, relationshipLabel: String?, level: String, status: String,
-                inviteCode: String?, memberUserId: String?, memberName: String?, createdAt: String) {
+                inviteCode: String?, memberUserId: String?, memberName: String?, createdAt: String,
+                inviteeEmail: String? = nil) {
         self.id = id
         self.relationshipLabel = relationshipLabel
         self.level = level
@@ -50,6 +55,7 @@ public struct CircleMember: Codable, Equatable, Sendable, Identifiable {
         self.memberUserId = memberUserId
         self.memberName = memberName
         self.createdAt = createdAt
+        self.inviteeEmail = inviteeEmail
     }
 }
 

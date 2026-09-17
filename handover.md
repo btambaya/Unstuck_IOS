@@ -3,7 +3,119 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-17, latest) — Talk had no audio on a real iPhone: the engine stopped itself 100 ms in (1.1.0 build 52)
+## Where things stand (2026-09-17, latest) — Unified sharing v1: ONE Share screen for tasks + lists (spec `unstuck/docs/unified-sharing-spec.md` §4)
+
+Testers: "sharing a task or a collection is difficult, too many steps, not
+straightforward." Before: a task could only be shared with an ACTIVE circle
+member (invite → wait → come back → pick a level, two sessions), two share
+UIs with two vocabularies (Off/View/Partner/Assign vs Can edit/Can view), and
+iOS always said "Invited … they'll get access when they sign up" even when the
+person had an account. Now — built against the §3.3 backend contract (the
+`share-task` edge fn + migration 065 land separately; every call degrades
+honestly until they do):
+
+- **`App/Features/ShareScreen.swift`** (new) — `ShareScreen` + `ShareScreenModel`
+  + the `ShareScreenTransport` seam (`LiveShareTransport` = AppModel's
+  clients). Title "Share" + item name; **Can edit / Can view** segmented
+  (default Can edit; tasks → `partner`/`view`, collections → `editor`/`viewer`);
+  sections **People** (every active connection, one tap shares at the chosen
+  grade; a shared person shows "Can edit / Can view / Handed over" and opens
+  a picker: change / Remove / Report… / Block for list members), **Someone
+  new** (email → `share-task add` / `share-collection add`; pending invites
+  listed with cancel), **Share a link** (`share-task link` / `share-collection
+  link` → clipboard + the system share sheet). The line under the button is
+  what the server DID: "Shared with Maya — they can edit." / "Invite sent to
+  x@y — waiting for them to sign up." / "Link copied — whoever opens it gets
+  this task." Refusals shown: "That's you.", "You've blocked that person.",
+  the rate-limit copy, "Only the owner can share this.", "Couldn't share —
+  try again." Refreshes on `unstuckCollabCircleChanged` / `SharesChanged` /
+  the new `unstuckCollabConnectionActivated` + foreground.
+  `.handOver` mode = **"Hand over to…"** (same people picker → `task_share`
+  level `assign`; "It becomes their task to do — you keep view …").
+- **Entry points:** TaskEditor toolbar = a LABELLED "Share" + a ⋯ menu with
+  "Hand over to…" (not for occurrences); Today + Tasks row context menus
+  "Share…" (non-occurrence rows); collection card context menu "Share…"
+  (owner) + the detail's Share button. **Removed:** the old `ShareSheet`
+  (SharingFeature.swift) and `CollectionShareView` (CollectionsFeature.swift).
+  NewTaskSheet's create-time "Share" section keeps the local picks but speaks
+  the new vocabulary (Off / Can edit / Can view — no Assign).
+- **Pure vocabulary + copy:** `Sources/UnstuckCore/Logic/UnifiedSharing.swift`
+  — `ShareAccess` (edit/view ↔ both backends), `composeSharePeople`,
+  `shareResultLine`, `ShareFailure(reason:)` (server codes → copy),
+  `isEmailLike`, `handOverExplainer`.
+- **Transport:** `Sources/UnstuckSync/TaskShareClient.swift` (new; `add` /
+  `remove` / `list` / `link` on `share-task`, `status` decoded honestly, pure
+  decoders) on `SyncCoordinator.taskShare`; `CollectionShareClient.link` +
+  `shareDetailed(email:userId:role:)` + the **decoder fix**: `status` wins,
+  then `ok`+`userId`, and only then the legacy `invited` flag (the old
+  function set it on BOTH branches — hence "always Invited"); `ShareOutcome`
+  gains `.blocked` / `.rateLimited` (a thrown 429/403 body is read, not
+  collapsed to `.error`). `CircleMemberRow.invitee_email` (optional → People
+  shows the address on pending rows; works before and after 065).
+  `CircleClient.rpcFailureReason` maps PostgREST `raise exception` codes.
+- **Realtime:** `CollabRealtime` posts `unstuckCollabConnectionActivated`
+  when a trusted_circle row of mine goes `active` (pure
+  `circleRowWentActive(old:new:)`); shares inserts already post SharesChanged.
+- **Deep links:** `unstuck://task/<id>` whose id is NOT in my store (a task
+  shared WITH me — RLS keeps the row off the device) now opens the
+  read-only `SharedTaskDetailSheet` via `router.sharedDetail` (MainTabScaffold),
+  not Today; pure `AppModel.taskLinkRoute`. `unstuck://collections/<id>` parks
+  `router.openCollectionId`; ListsView pushes the detail once the row exists.
+- **Push kinds:** `invite_claimed` / `circle_invite` join the collab thread;
+  Notification Center labels for task_share / collection_share /
+  invite_claimed / shared_task_done.
+- **Assistant:** `share_task` accepts an email as `person` (staged as
+  `PendingShare.recipientEmail`; the confirm card calls `share-task add` and
+  shows the honest line); the tool description says so.
+- **Tests (new):** Core `UnifiedSharingTests` (mapping, composition, copy,
+  failure mapping, email resolve), Sync `TaskShareClientTests` (decoders,
+  body keys, the collection decoder fix, invitee_email, went-active verdict,
+  rpcFailureReason), App `UnifiedSharingScreenTests` (ShareScreenModel over a
+  fake transport: sections, default grade, per-backend levels, every result
+  line + refusal, hand-over, link, live-signal reload; shared-task deep-link
+  routing on the in-memory AppModel; the assistant email confirm).
+- **Verify:** `TZ=UTC swift test --scratch-path .build-int` → 998 green (2
+  skipped); `xcodegen generate && xcodebuild test … -only-testing:UnstuckAppTests`
+  → green (both counts in "How to verify"); then a simulator run: open any task →
+  "Share" → People / Someone new / Share a link; long-press a row → "Share…";
+  long-press a collection card → "Share…". NOT bumped / archived — a
+  verifier ships after review.
+- **Deployed shapes (aligned 2026-09-17 after the backend's live verify):**
+  `share-task add` → `{ok, status:'shared', userId, displayName, level}` /
+  `{ok, status:'invited', email, level, emailed}` / `{ok:false, reason:'self'}`,
+  HTTP 400 `bad_request` · 403 `forbidden` · 429 `rate_limited` (read from
+  the thrown body); `list` / `remove` → `{ok, members:[…], pending:[{id,
+  email, level, createdAt}]}`; `link` → `{ok, url, expiresAt, level|role}`;
+  `circle_redeem` → `{ok, granted:{task_id?|collection_id?}, owner_name,
+  already_connected?}` (`CircleRedeemResult.grantedTaskId/…` — the accept
+  alert now says where the item landed and pokes the shares signal).
+  `share-collection add` is UNCHANGED and deliberately uniform
+  (`{ok:true, invited:true, members:N}`): decoded as `ShareOutcome.accepted`
+  (the `members` field is lenient — a count never sinks the decode) and the
+  line stays neutral and true: "Shared with x@y — they'll see it as soon as
+  they're in." A `status` field, if it ever appears, is read first.
+- **Contract gaps (reported, handled defensively):** (1) `share-collection
+  add` is email-only and `circle_list` carries no member emails, so a People
+  tap on a LIST sends `{action:'add', collectionId, userId, role}` — the
+  deployed function answers 400 `bad_request` → the screen says "Lists can't
+  be shared by name yet — enter their email below." Either `add` should
+  accept `userId` or `circle_list` should project `member_email`. (2) The
+  spec's "Shared with Maya — she can edit." is rendered as "— they can edit."
+  (no pronoun data). (3) `claim_my_pending_invites()` / `task_pending_invites`
+  / `task_invite_cancel` RPCs are not called directly — the screen reads
+  pending invites through `share-task list` and cancels through `remove
+  {inviteId}` (same data, one transport); the sign-up claim is server-side.
+  (4) `circle-invite`'s optional `taskId/taskLevel` / `collectionId/role`
+  (item-carrying invites) is unused — the Share screen's link comes from
+  `share-task link` / `share-collection link`, and NewTaskSheet's inline
+  invite has no item yet (the task doesn't exist).
+- **Known pre-existing flake fixed in passing:** `AssistantToolsTests.
+  testGetTasksViewsAreDistinctAndFiltersNarrow` — every seeded task carried
+  the fixed `PAST_CREATED` stamp, and `isSlipping` treats anything older
+  than 21 days as slipping, so the "slipping" view grew from 1 to 6 rows once
+  the calendar passed that date. The stamp is now relative to today.
+
+## Where things stand (2026-09-17) — Talk had no audio on a real iPhone: the engine stopped itself 100 ms in (1.1.0 build 52)
 
 Ahmad's report: tap Talk, the greeting's TEXT appears, nothing is heard, and
 speaking never gets a reply. Pinpointed from the phone's own syslog over USB
@@ -1179,7 +1291,10 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --enable-code-coverage     # 250 tests, all green (204 Core + 16 Data + 22 Sync + 8 Design)
+TZ=UTC swift test --scratch-path .build-int  # 998 tests green, 2 skipped (2026-09-17, unified sharing v1)
 xcodegen generate && xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app + widget
+# App-layer unit tests (host: Unstuck) — 570 green (2026-09-17):
+xcodebuild test -project Unstuck.xcodeproj -scheme Unstuck \
+  -destination 'platform=iOS Simulator,id=38CF1937-7E51-4CDC-B96D-97928A2D1DF3' -only-testing:UnstuckAppTests
 ```

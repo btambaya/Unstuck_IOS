@@ -1227,9 +1227,17 @@ final class AppModel {
                 guard let self else { return }
                 if res.ok {
                     let who = res.ownerName.flatMap { $0.isEmpty ? nil : $0 } ?? "them"
-                    self.circleInvitePrompt = .result(ok: true, message:
-                        "You’re now connected with \(who). You’ll find each other under Settings → People, and tasks they share appear in “Shared with you”.")
+                    // Unified sharing v1: the link can carry an item, granted in
+                    // the same step — say so, and point at where it landed.
+                    let landed: String = res.grantedTaskId != nil
+                        ? " The task they shared is in “Shared with you”."
+                        : res.grantedCollectionId != nil ? " The list they shared is under Collections." : ""
+                    let base = res.alreadyConnected == true
+                        ? "You were already connected with \(who)."
+                        : "You’re now connected with \(who). You’ll find each other under Settings → People, and tasks they share appear in “Shared with you”."
+                    self.circleInvitePrompt = .result(ok: true, message: base + landed)
                     NotificationCenter.default.post(name: .unstuckCollabCircleChanged, object: nil)
+                    if res.grantedItem { NotificationCenter.default.post(name: .unstuckCollabSharesChanged, object: nil) }
                 } else {
                     self.circleInvitePrompt = .result(ok: false, message: Self.circleRedeemErrorText(res.error))
                 }

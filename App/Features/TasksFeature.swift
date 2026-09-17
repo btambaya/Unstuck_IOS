@@ -99,6 +99,8 @@ struct TasksView: View {
     @State private var showSettings = false
     @State private var showPalette = false
     @State private var showNotifCenter = false
+    /// The row whose "Share…" context action opened the Share screen.
+    @State private var shareTarget: ShareTarget?
 
     // Tab order mirrors the web TaskListPane / Android: Backlog first (the
     // triage stack), then All / Today / Upcoming / Later / Recurring / Completed.
@@ -114,6 +116,7 @@ struct TasksView: View {
         .sheet(item: $editing) { task in
             TaskEditor(task: task)
         }
+        .sheet(item: $shareTarget) { target in ShareScreen(target: target) }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
@@ -402,6 +405,13 @@ struct TasksView: View {
                             }
                             Button { editing = task } label: {
                                 Label(task.recurrence != nil ? "Edit series" : "Edit", systemImage: "pencil")
+                            }
+                            // "Share…" from the row (unified sharing v1); an
+                            // occurrence row (id = block id) shares from its editor.
+                            if !isOccurrence {
+                                Button { shareTarget = .task(id: task.id, name: task.name) } label: {
+                                    Label("Share…", systemImage: "person.badge.plus")
+                                }
                             }
                         }
                     }

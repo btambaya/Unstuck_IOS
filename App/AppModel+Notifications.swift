@@ -221,16 +221,27 @@ extension AppModel {
         }
         if link.hasPrefix("unstuck://task/") {
             let id = String(link.dropFirst("unstuck://task/".count))
-            if let t = (try? taskRepo?.fetch(id: id)) ?? nil {
-                router.select(.today)
-                router.detailTask = t
-            } else {
-                router.select(.today)   // stale link / task gone
+            router.select(.today)
+            let local = (try? taskRepo?.fetch(id: id)) ?? nil
+            switch Self.taskLinkRoute(id: id, isLocal: local != nil) {
+            case .owner:
+                router.detailTask = local
+            case .shared:
+                // Not in my store ⇒ not my task: a `task_share` / `invite_claimed`
+                // push for a task someone shared WITH me (RLS keeps the row off
+                // my device). Open the recipient's read-only detail; it loads
+                // `shared_task_detail` and says so if the share is gone.
+                router.sharedDetail = SharedDetailTarget(id: id)
+            case .today:
+                break
             }
             return
         }
         if link == "unstuck://collections" || link.hasPrefix("unstuck://collections") {
             router.select(.lists)       // a shared collection
+            // `unstuck://collections/<id>` (share push, unified sharing v1):
+            // park the id; the Collections tab pushes it once the row exists.
+            if let id = Self.collectionLinkId(link) { router.openCollectionId = id }
             return
         }
         if link.hasPrefix("unstuck://call/") {
@@ -297,6 +308,26 @@ extension AppModel {
             return
         }
         if assistantEnabled { openAssistant() } else { router.select(.today) }
+    }
+
+    /// Where `unstuck://task/<id>` lands. Pure (tested): a task in my local
+    /// store is mine → the owner editor; any other non-empty id is a task
+    /// shared WITH me → the shared-task sheet; an empty id → just Today.
+    enum TaskLinkRoute: Equatable { case owner, shared, today }
+    nonisolated static func taskLinkRoute(id: String, isLocal: Bool) -> TaskLinkRoute {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .today }
+        return isLocal ? .owner : .shared
+    }
+
+    /// The `<id>` of `unstuck://collections/<id>` (nil for the bare tab link,
+    /// a trailing slash, or a query-only tail).
+    nonisolated static func collectionLinkId(_ link: String) -> String? {
+        let prefix = "unstuck://collections/"
+        guard link.hasPrefix(prefix) else { return nil }
+        let tail = String(link.dropFirst(prefix.count))
+            .split(whereSeparator: { $0 == "?" || $0 == "#" || $0 == "/" }).first.map(String.init) ?? ""
+        return tail.isEmpty ? nil : tail
     }
 
     /// True when a link opens a modal (sheet/cover) — those collide with an

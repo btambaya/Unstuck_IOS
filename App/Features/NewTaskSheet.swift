@@ -74,9 +74,11 @@ struct NewTaskSheet: View {
 
     private struct InviteOutcome { let added: Bool; let emailed: Bool; let link: String?; let email: String }
 
-    /// nil == "Off"; else the granted level. Mirrors ShareSheet's OPTIONS list.
+    /// nil == "Off"; else the granted level — the unified vocabulary (Can edit
+    /// = partner, Can view = view). "Assign" is no longer a share level here:
+    /// hand a task over from its editor ("Hand over to…") once it exists.
     private let shareOptions: [(value: ShareLevel?, label: String)] = [
-        (nil, "Off"), (.view, "View"), (.partner, "Partner"), (.assign, "Assign"),
+        (nil, "Off"), (.partner, ShareAccess.edit.label), (.view, ShareAccess.view.label),
     ]
 
     // Live data.
@@ -321,7 +323,7 @@ struct NewTaskSheet: View {
 
     private var shareSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel("Share or assign")
+            SectionLabel("Share")
             if !activeMembers.isEmpty {
                 VStack(spacing: 10) {
                     ForEach(activeMembers) { m in shareMemberRow(m) }
@@ -329,8 +331,9 @@ struct NewTaskSheet: View {
             }
             if inviting { invitePanel } else { addSomeoneButton }
             if activeMembers.isEmpty && !inviting {
-                Text("Share this task with someone in your circle.")
+                Text("Share this task with someone you're connected to. You can also share by email or link from the task once it's created.")
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
             } else if !activeMembers.isEmpty {
                 shareExplainer
             }
@@ -485,9 +488,9 @@ struct NewTaskSheet: View {
     }
 
     private var shareExplainer: some View {
-        (Text("View").font(UFont.sans(12, .semibold)) + Text(" — they see it + get pinged when you start & finish. ").font(UFont.sans(12))
-         + Text("Partner").font(UFont.sans(12, .semibold)) + Text(" — either of you can start/complete & focus together. ").font(UFont.sans(12))
-         + Text("Assign").font(UFont.sans(12, .semibold)) + Text(" — it becomes their task; you keep view.").font(UFont.sans(12)))
+        (Text(ShareAccess.edit.label).font(UFont.sans(12, .semibold)) + Text(" — \(ShareAccess.edit.blurb) ").font(UFont.sans(12))
+         + Text(ShareAccess.view.label).font(UFont.sans(12, .semibold)) + Text(" — \(ShareAccess.view.blurb) ").font(UFont.sans(12))
+         + Text("To hand it over entirely, use “Hand over to…” in the task once it's created.").font(UFont.sans(12)))
             .foregroundStyle(theme.palette.ink3)
             .fixedSize(horizontal: false, vertical: true)
     }

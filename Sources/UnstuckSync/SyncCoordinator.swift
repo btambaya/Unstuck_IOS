@@ -59,6 +59,9 @@ public actor SyncCoordinator {
     /// Trusted-circle + per-task sharing transport (RPCs + circle-invite /
     /// share-notify edge fns). Reachable from the app via `coordinator.circle`.
     public nonisolated let circle: CircleClient
+    /// Unified sharing v1: the `share-task` edge function (share a task by
+    /// EMAIL — existing account or invite — plus roster / link).
+    public nonisolated let taskShare: TaskShareClient
     /// Co-focus presence factory (Supabase Realtime Presence, `cofocus:<taskId>`)
     /// for the owner CoFocusBar + recipient PartnerPresence surfaces (M5).
     public nonisolated let coFocus: CoFocusPresenceClient
@@ -100,6 +103,7 @@ public actor SyncCoordinator {
         self.preferences = PreferencesClient(provider.client)
         self.share = CollectionShareClient(provider.client)
         self.circle = CircleClient(provider.client)
+        self.taskShare = TaskShareClient(provider.client)
         self.coFocus = CoFocusPresenceClient(provider.client)
         self.feedback = FeedbackClient(provider.client)
         self.loginTracker = LoginTrackerClient(provider.client)

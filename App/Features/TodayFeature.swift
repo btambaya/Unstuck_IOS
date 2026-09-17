@@ -230,6 +230,8 @@ struct TodayView: View {
     @State private var showNotifCenter = false
     @State private var showPalette = false
     @State private var showInsights = false
+    /// The row whose "Share…" context action opened the Share screen.
+    @State private var shareTarget: ShareTarget?
     @State private var notifsEnabled = true
     @State private var areaFilter: String?
     @State private var backlogActive = false
@@ -290,6 +292,8 @@ struct TodayView: View {
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
+        // Row context menu "Share…" → the ONE Share screen.
+        .sheet(item: $shareTarget) { target in ShareScreen(target: target) }
         // Gateway mic → realtime Talk. Same cover the Assistant sheet uses.
         // onDismiss flushes a deep link the assistant parked while Talk was
         // up (open_screen → insights / inbox / settings) so it presents once
@@ -717,6 +721,13 @@ struct TodayView: View {
                       systemImage: t.done ? "circle" : "checkmark.circle")
             }
             Button { model.router.beginFocus(t) } label: { Label("Focus", systemImage: "play.fill") }
+            // "Share…" straight from the row (unified sharing v1). An occurrence
+            // row is a projection (id = block id) — share its series from the editor.
+            if !isOccurrence {
+                Button { shareTarget = .task(id: t.id, name: t.name) } label: {
+                    Label("Share…", systemImage: "person.badge.plus")
+                }
+            }
             if isOccurrence {
                 Button(role: .destructive) { model.skipOccurrence(t.id) } label: {
                     Label("Skip this day", systemImage: "calendar.badge.minus")

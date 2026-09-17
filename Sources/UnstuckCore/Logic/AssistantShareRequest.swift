@@ -31,14 +31,21 @@ public struct PendingShare: Equatable, Sendable, Identifiable {
     public let id: String
     public let taskId: String
     public let taskName: String
+    /// Empty when the request targets an email (see `recipientEmail`).
     public let recipientUserId: String
     public let recipientName: String
     public let level: ShareLevel
     /// Set once the user confirms or dismisses — the card stops offering.
     public var outcome: PendingShareOutcome?
+    /// Unified sharing v1: the user named an email address instead of a
+    /// connection. The confirm card then calls `share-task add` (existing
+    /// account → shared at once; no account → invite by email) instead of the
+    /// by-id RPC. nil for a circle member.
+    public var recipientEmail: String?
 
     public init(id: String, taskId: String, taskName: String, recipientUserId: String,
-                recipientName: String, level: ShareLevel, outcome: PendingShareOutcome? = nil) {
+                recipientName: String, level: ShareLevel, outcome: PendingShareOutcome? = nil,
+                recipientEmail: String? = nil) {
         self.id = id
         self.taskId = taskId
         self.taskName = taskName
@@ -46,6 +53,7 @@ public struct PendingShare: Equatable, Sendable, Identifiable {
         self.recipientName = recipientName
         self.level = level
         self.outcome = outcome
+        self.recipientEmail = recipientEmail
     }
 }
 
@@ -109,6 +117,19 @@ public func resolveShareRequest(
     }()
     guard let task else {
         return ResolveShareResult(message: "error: task not found — ask which task they mean")
+    }
+
+    // An email address needs no circle: `share-task add` shares with an
+    // existing account at once or stores an invite that is claimed when they
+    // sign up (unified sharing v1). Still staged — the user confirms on screen.
+    if let person, isEmailLike(person) {
+        let email = normalizedShareEmail(person)
+        let level = normalizeLevel(level)
+        return ResolveShareResult(
+            pending: PendingShare(id: newId(), taskId: task.id, taskName: task.name,
+                                  recipientUserId: "", recipientName: email, level: level,
+                                  recipientEmail: email),
+            message: "ok: prepared a share of \"\(task.name)\" with \(email) (\(level.rawValue)). If they have an Unstuck account it is shared the moment the user confirms; otherwise they get an invite email. The user must CONFIRM it on screen — tell them it's ready to confirm, and do not claim it is shared.")
     }
 
     if people.isEmpty {

@@ -278,10 +278,10 @@ func buildVoiceInstructions(_ api: AssistantAppState) -> String {
         fn("complete_tasks", "Mark SEVERAL tasks done in one call — always use this for \"all my tasks\" / \"everything\".", ["taskIds"], [
             "taskIds": ["type": "array", "items": ["type": "string"], "description": "Every task id to complete."],
         ]),
-        fn("share_task", "Prepare sharing a task with someone in the user's trusted circle — stages a request they confirm on screen; never shares directly. Levels: view, partner, assign.", ["person"], [
+        fn("share_task", "Prepare sharing a task with someone in the user's trusted circle OR with an email address — stages a request they confirm on screen; never shares directly. Levels: view, partner, assign.", ["person"], [
             "taskId": p("string", "Preferred: the task id."),
             "taskName": p("string", "Fallback when the id is unknown."),
-            "person": p("string", "Who to share with, as the user named them."),
+            "person": p("string", "Who to share with, as the user named them — a connection's name, or an email address (an existing account is shared with at once; anyone else gets an invite)."),
             "level": p("string", "view | partner | assign (default view)."),
         ]),
         fn("create_tasks", "Create SEVERAL tasks in one call — always use this for a brain-dump of more than one item. Each may carry date+startTime to schedule it too.", ["tasks"], [

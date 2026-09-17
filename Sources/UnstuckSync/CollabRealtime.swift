@@ -21,6 +21,11 @@ public extension Notification.Name {
     /// trusted_circle changed (a member joined/left/was removed) → refetch the
     /// roster. Mirrors web CIRCLE_CHANGED.
     static let unstuckCollabCircleChanged = Notification.Name("unstuck.collab.circleChanged")
+    /// A trusted_circle row I can see went ACTIVE (someone accepted my invite,
+    /// claimed it at sign-up, or a share connected us) — the sender-side
+    /// "they joined" moment (unified sharing v1). Posted IN ADDITION to
+    /// circleChanged; the People roster and an open Share screen refresh.
+    static let unstuckCollabConnectionActivated = Notification.Name("unstuck.collab.connectionActivated")
 }
 
 public actor CollabRealtime {
@@ -54,9 +59,30 @@ public actor CollabRealtime {
         streamTasks.append(Task { for await _ in shareInserts { await Self.emitShares() } })
         streamTasks.append(Task { for await _ in shareUpdates { await Self.emitShares() } })
         streamTasks.append(Task { for await _ in shareDeletes { await Self.emitShares() } })
-        streamTasks.append(Task { for await _ in circleInserts { await Self.emitCircle() } })
-        streamTasks.append(Task { for await _ in circleUpdates { await Self.emitCircle() } })
+        streamTasks.append(Task {
+            for await ins in circleInserts {
+                // A row born active = the server connected us in one step
+                // (circle-invite existing-user branch, ensure_connection).
+                if Self.circleRowWentActive(old: [:], new: ins.record) { await Self.emitConnectionActivated() }
+                await Self.emitCircle()
+            }
+        })
+        streamTasks.append(Task {
+            for await upd in circleUpdates {
+                if Self.circleRowWentActive(old: upd.oldRecord, new: upd.record) { await Self.emitConnectionActivated() }
+                await Self.emitCircle()
+            }
+        })
         streamTasks.append(Task { for await _ in circleDeletes { await Self.emitCircle() } })
+    }
+
+    /// Pure: did this change flip a trusted_circle row to `active`? The old
+    /// record only carries the columns replica identity projects (the PK
+    /// alone by default), so "old status unknown" counts as a flip — an
+    /// extra refresh is harmless; a missed join is not.
+    static func circleRowWentActive(old: [String: AnyJSON], new: [String: AnyJSON]) -> Bool {
+        guard new["status"]?.stringValue == "active" else { return false }
+        return old["status"]?.stringValue != "active"
     }
 
     public func stop() async {
@@ -72,5 +98,8 @@ public actor CollabRealtime {
     }
     @MainActor private static func emitCircle() {
         NotificationCenter.default.post(name: .unstuckCollabCircleChanged, object: nil)
+    }
+    @MainActor private static func emitConnectionActivated() {
+        NotificationCenter.default.post(name: .unstuckCollabConnectionActivated, object: nil)
     }
 }

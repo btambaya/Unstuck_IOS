@@ -56,8 +56,9 @@ struct TaskEditor: View {
     @State private var tagPanelOpen = false
     @State private var tagQuery = ""
 
-    // Per-task share sheet (M2).
+    // The ONE Share screen (unified sharing v1) + the "Hand over to…" picker.
     @State private var showShare = false
+    @State private var showHandOver = false
 
     // Bumped after each reminder-override write so the device-local (UserDefaults,
     // non-observable) value re-reads — `reminderLead` depends on it.
@@ -140,14 +141,32 @@ struct TaskEditor: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                // Share this task with a circle member at a graded level (M2).
-                ToolbarItem(placement: .primaryAction) {
+                // A LABELLED "Share" (unified sharing v1 — testers couldn't find
+                // the old bare icon) + the task-action menu ("Hand over to…").
+                ToolbarItemGroup(placement: .primaryAction) {
                     Button { showShare = true } label: {
-                        Image(systemName: "person.crop.circle.badge.plus")
-                    }.accessibilityLabel("Share task")
+                        HStack(spacing: 5) {
+                            Image(systemName: "person.badge.plus")
+                            Text("Share").font(UFont.sans(15, .medium))
+                        }
+                    }
+                    .accessibilityLabel("Share task")
+                    if !isOcc {
+                        Menu {
+                            Button { showHandOver = true } label: {
+                                Label("Hand over to…", systemImage: "arrowshape.turn.up.right")
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis.circle")
+                        }
+                        .accessibilityLabel("More actions")
+                    }
                 }
             }
-            .sheet(isPresented: $showShare) { ShareSheet(task: editTarget) }
+            .sheet(isPresented: $showShare) { ShareScreen(target: .task(id: editTarget.id, name: editTarget.name)) }
+            .sheet(isPresented: $showHandOver) {
+                ShareScreen(target: .task(id: editTarget.id, name: editTarget.name), mode: .handOver)
+            }
             // Live outgoing badges → the view-only (assigned-out) gate (T3).
             // Idempotent; refetches so a directly-opened editor has current state.
             .task { model.shareState.start() }

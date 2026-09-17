@@ -7,7 +7,8 @@
 //    or Leave (member), "shared with N" line, recolor swatches, Pinned/All item
 //    rows (checkbox + body + ellipsis reveal: pin / move-to-task / remove +
 //    accountability chips), add-item pill, move-to-task chooser + by-time picker.
-//  • Share sheet: invite by email + role, live member/pending list.
+//  • Sharing: the ONE ShareScreen (ShareScreen.swift) — from the detail's
+//    Share button and the card's "Share…" context menu (owner only).
 // Reads via Repository<ItemCollection>; writes route through AppModel
 // (own → outbox upsert, shared → atomic item RPCs).
 
@@ -57,6 +58,12 @@ struct ListsView: View {
     @State private var showArchived = false
     @State private var showSettings = false
     @State private var showPalette = false
+    /// The card whose "Share…" context action opened the Share screen.
+    @State private var shareTarget: ShareTarget?
+    /// A collection pushed by a deep link (`unstuck://collections/<id>` — a
+    /// share push tap): the router parks the id, this view consumes it once
+    /// the store is observed.
+    @State private var pushedCollectionId: String?
 
     var body: some View {
         NavigationStack {
@@ -66,11 +73,18 @@ struct ListsView: View {
             }
             .background(theme.palette.bg.ignoresSafeArea())
             .navigationBarHidden(true)
+            .navigationDestination(item: $pushedCollectionId) { id in
+                if let vm { CollectionDetailView(vm: vm, id: id) }
+            }
             .sheet(isPresented: $showSettings) { SettingsView() }
             .sheet(isPresented: $showPalette) { CommandPalette() }
             .sheet(isPresented: $showNew) { newCollectionSheet }
+            .sheet(item: $shareTarget) { target in ShareScreen(target: target) }
             .assistantLauncher()
         }
+        // Consume a deep-linked collection id (push tap on a shared list).
+        .onChange(of: model.router.openCollectionId, initial: true) { _, _ in consumeOpenCollection() }
+        .onChange(of: vm?.collections.count ?? -1) { _, _ in consumeOpenCollection() }
         // A shared-list edit the server refused: the outbox dropped it and the
         // row was rolled back to the server's copy — say so once (never a
         // silent vanish on the next echo).
@@ -91,6 +105,16 @@ struct ListsView: View {
             let m = CollectionsModel(Repository<ItemCollection>(db, orderColumn: "sortOrder"))
             vm = m; await m.observe()
         }
+    }
+
+    /// Push the router's parked collection once it exists locally (a share
+    /// push can land before the hydrate that brings the row; the count
+    /// onChange retries). An id that never appears stays parked, harmlessly.
+    private func consumeOpenCollection() {
+        guard let id = model.router.openCollectionId, let vm,
+              vm.collections.contains(where: { $0.id == id }) else { return }
+        model.router.openCollectionId = nil
+        pushedCollectionId = id
     }
 
     private func shown(_ all: [ItemCollection]) -> [ItemCollection] {
@@ -156,6 +180,14 @@ struct ListsView: View {
                         ForEach(list) { col in
                             NavigationLink { CollectionDetailView(vm: vm, id: col.id) } label: { gridCard(col) }
                                 .buttonStyle(.plain)
+                                // Owner-only "Share…" straight from the card (unified sharing v1).
+                                .contextMenu {
+                                    if model.isOwner(col) {
+                                        Button { shareTarget = .collection(id: col.id, name: col.name) } label: {
+                                            Label("Share…", systemImage: "person.badge.plus")
+                                        }
+                                    }
+                                }
                         }
                     }
                     .padding(.top, 14)
@@ -285,7 +317,7 @@ struct CollectionDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarHidden(false)   // keep the standard back button (overview hides its bar)
         .sheet(isPresented: $showShare) {
-            if let col = collection { CollectionShareView(collectionId: col.id, collectionName: col.name) }
+            if let col = collection { ShareScreen(target: .collection(id: col.id, name: col.name)) }
         }
         .sheet(item: $byTimeTarget) { item in
             if let col = collection {
@@ -362,8 +394,9 @@ struct CollectionDetailView: View {
                                     Image(systemName: "trash").font(.system(size: 21)).foregroundStyle(theme.palette.ink3).padding(1)
                                 }.buttonStyle(.plain)
                                 Button { showShare = true } label: {
-                                    Image(systemName: "square.and.arrow.up").font(.system(size: 22)).foregroundStyle(theme.palette.ink2)
+                                    Image(systemName: "person.badge.plus").font(.system(size: 22)).foregroundStyle(theme.palette.ink2)
                                 }.buttonStyle(.plain)
+                                    .accessibilityLabel("Share")
                             }
                         } else {
                             // Pop only once the SERVER confirms the leave — the
@@ -656,179 +689,6 @@ private struct ByTimePicker: View {
         if target < Date() { target = cal.date(byAdding: .day, value: 1, to: target) ?? target }
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]
         return f.string(from: target)
-    }
-}
-
-// MARK: - share sheet
-
-struct CollectionShareView: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.uTheme) private var theme
-    @Environment(\.dismiss) private var dismiss
-    let collectionId: String
-    let collectionName: String
-
-    init(collectionId: String, collectionName: String) {
-        self.collectionId = collectionId; self.collectionName = collectionName
-    }
-
-    @State private var email = ""
-    @State private var role = "editor"
-    @State private var busy = false
-    @State private var message: (ok: Bool, text: String)?
-    @State private var members: [CollectionMemberInfo] = []
-    @State private var loading = true
-    @State private var reportTarget: CollectionMemberInfo?
-
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    SectionLabel("Share · \(collectionName)")
-                    Text("Invite anyone by email. If they don't have an Unstuck account yet, they'll get access the moment they sign up. Changes sync live between you.")
-                        .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
-
-                    TextField("partner@email.com", text: $email)
-                        .textFieldStyle(.roundedBorder).textInputAutocapitalization(.never)
-                        .keyboardType(.emailAddress).autocorrectionDisabled()
-                        .submitLabel(.done)
-                        .onSubmit(submit)
-
-                    HStack(spacing: 8) {
-                        ForEach([("editor", "Can edit"), ("viewer", "Can view")], id: \.0) { value, label in
-                            Button { role = value } label: {
-                                Text(label).font(UFont.sans(12, .semibold))
-                                    .foregroundStyle(role == value ? theme.palette.bg : theme.palette.ink2)
-                                    .padding(.horizontal, 14).padding(.vertical, 8)
-                                    .background(role == value ? theme.palette.ink : theme.palette.bg2)
-                                    .clipShape(Capsule())
-                                    .overlay(Capsule().stroke(theme.palette.line2))
-                            }.buttonStyle(.plain)
-                        }
-                        Spacer()
-                        Button { submit() } label: {
-                            Text(busy ? "Sharing…" : "Share").font(UFont.sans(14, .semibold)).foregroundStyle(.white)
-                                .padding(.horizontal, 16).padding(.vertical, 9)
-                                .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
-                        }.buttonStyle(.plain).disabled(busy || email.trimmingCharacters(in: .whitespaces).isEmpty)
-                    }
-
-                    if let m = message {
-                        Text(m.text).font(UFont.sans(13)).foregroundStyle(m.ok ? theme.palette.greenInk : theme.palette.coralDeep)
-                    }
-
-                    SectionLabel(memberSummary)
-                    if loading {
-                        Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
-                    } else {
-                        ForEach(members) { m in memberRow(m) }
-                    }
-                }
-                .padding(20)
-            }
-            .background(theme.palette.bg.ignoresSafeArea())
-            .navigationTitle("Share").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
-        }
-        .presentationDetents([.medium, .large])
-        .task { await refresh() }
-        .confirmationDialog("Report this person?", isPresented: Binding(
-            get: { reportTarget != nil }, set: { if !$0 { reportTarget = nil } }),
-            titleVisibility: .visible, presenting: reportTarget) { m in
-            ForEach(["Objectionable content", "Spam", "Harassment", "Other"], id: \.self) { reason in
-                Button(reason) {
-                    Task { await model.reportConcern(collectionId: collectionId, about: m.email, reason: reason) }
-                    reportTarget = nil
-                }
-            }
-            Button("Cancel", role: .cancel) { reportTarget = nil }
-        } message: { m in
-            Text("Send a report about \(m.email) to the Unstuck team. We review reports and take action.")
-        }
-    }
-
-    private var memberSummary: String {
-        let accepted = members.filter { !$0.pending }.count
-        let invited = members.filter { $0.pending }.count
-        if accepted > 0 { return "Shared with \(accepted)" + (invited > 0 ? " · \(invited) invited" : "") }
-        if invited > 0 { return "\(invited) invited" }
-        return "Not shared yet"
-    }
-
-    private func memberRow(_ m: CollectionMemberInfo) -> some View {
-        HStack(spacing: 8) {
-            Text(m.email).font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            if m.pending { Text("PENDING").font(UFont.sans(9, .bold)).foregroundStyle(theme.palette.amberInk) }
-            Text(m.role == "viewer" ? "VIEW" : "EDIT").font(UFont.sans(10, .bold)).foregroundStyle(theme.palette.ink3)
-            // Safety actions (App Store 1.2): report or block a collaborator,
-            // plus remove them from this list.
-            Menu {
-                Button { remove(m) } label: { Label("Remove from list", systemImage: "xmark") }
-                Button { reportTarget = m } label: { Label("Report…", systemImage: "flag") }
-                Button(role: .destructive) {
-                    let prior = members
-                    // The blocklist is device-local and always sticks; only the
-                    // server-side REMOVAL can be refused — put the row back and
-                    // say so rather than implying they lost access.
-                    model.blockUser(email: m.email, inCollection: collectionId, userId: m.userId) {
-                        members = prior
-                        message = (false, "Blocked \(m.email), but couldn't remove them from this list — try again.")
-                    }
-                    members.removeAll { $0.id == m.id }
-                } label: { Label("Block \(m.email)", systemImage: "hand.raised") }
-            } label: {
-                Image(systemName: "ellipsis").foregroundStyle(theme.palette.ink3).padding(4)
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 12).padding(.vertical, 9)
-        .background(theme.palette.bg2).clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func refresh() async {
-        members = await model.listCollectionMembers(collectionId)
-        loading = false
-    }
-
-    private func submit() {
-        let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !e.isEmpty, !busy else { return }
-        guard !model.isBlocked(e) else {
-            message = (false, "You've blocked that person."); return
-        }
-        busy = true; message = nil
-        Task {
-            let outcome = await model.shareCollection(collectionId, email: e, role: role)
-            busy = false
-            switch outcome {
-            case .ok: email = ""; message = (true, "Shared with \(e) (\(role == "viewer" ? "can view" : "can edit"))."); await refresh()
-            case .invited: email = ""; message = (true, "Invited \(e) — they'll get access when they sign up."); await refresh()
-            case .selfError: message = (false, "That's you.")
-            case .notFound: message = (false, "No Unstuck account for that email yet.")
-            case .error: message = (false, "Could not share. Try again.")
-            }
-        }
-    }
-
-    /// Revoke one person's access. The row goes optimistically, but a server
-    /// REFUSAL (403 / 5xx / offline) puts it back and says so — this used to
-    /// ignore the answer entirely, so a failed removal still told the owner the
-    /// person was gone while they kept full access to the list.
-    private func remove(_ m: CollectionMemberInfo) {
-        let prior = members
-        members.removeAll { $0.id == m.id }   // optimistic
-        Task {
-            let ok = m.pending
-                ? await model.cancelCollectionInvite(collectionId, email: m.email)
-                : await model.unshareCollection(collectionId, userId: m.userId)
-            if !ok {
-                members = prior
-                message = (false, "Couldn't remove \(m.email). They still have access — try again.")
-                return
-            }
-            await refresh()
-        }
     }
 }
 

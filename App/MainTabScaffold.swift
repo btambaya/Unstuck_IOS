@@ -45,6 +45,12 @@ struct MainTabScaffold: View {
             .sheet(item: $router.detailTask, onDismiss: { model.flushPendingDeepLink() }) { task in
                 TaskEditor(task: task)
             }
+            // A push tap on a task shared WITH me (`unstuck://task/<id>` whose id
+            // is not in my store): the read-only shared detail, not the owner
+            // editor (unified sharing v1).
+            .sheet(item: $router.sharedDetail, onDismiss: { model.flushPendingDeepLink() }) { target in
+                SharedTaskDetailSheet(taskId: target.id, block: target.block)
+            }
             .fullScreenCover(isPresented: $showCallTalk) { VoiceModeScreen() }
             // "Unstuck calls you", fallback B: a tapped call alert parks a CallSession on
             // the launcher; present Talk, which takes it and runs the call configuration.

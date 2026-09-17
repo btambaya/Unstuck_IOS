@@ -48,6 +48,16 @@ final class AppRouter {
     /// When set, the task editor is presented for this task (notification
     /// deep links: unstuck://task/<id> — Android Route.Detail).
     var detailTask: TaskItem?
+    /// When set, the read-only SHARED-task detail is presented for this task
+    /// (a `task_share` / `invite_claimed` push tap on a task someone shared
+    /// WITH me — its id is not in my local store, RLS keeps the row away, so
+    /// the owner editor can't open it; the shared sheet reads the
+    /// `shared_task_detail` projection instead).
+    var sharedDetail: SharedDetailTarget?
+    /// A collection id parked by `unstuck://collections/<id>` (a share push
+    /// tap): the Collections tab pushes its detail once the row exists
+    /// locally and clears this.
+    var openCollectionId: String?
     /// A deep link captured INSIDE a presented sheet (Inbox "Open", Notification
     /// Center tap) to route AFTER that sheet finishes dismissing. SwiftUI can't
     /// present a second sheet from the same host while the first is still
@@ -65,7 +75,7 @@ final class AppRouter {
     /// one silently no-ops), so a push deep-link arriving now must dismiss first
     /// and present after (see AppModel.routeDeepLink).
     var hasActivePresentation: Bool {
-        activeSheet != nil || showAssistant || detailTask != nil || focusTask != nil || showTalk
+        activeSheet != nil || showAssistant || detailTask != nil || sharedDetail != nil || focusTask != nil || showTalk
     }
 
     /// Tear down every active modal so a deferred deep-link can present cleanly
@@ -75,6 +85,7 @@ final class AppRouter {
         showAssistant = false
         showTalk = false
         detailTask = nil
+        sharedDetail = nil
         focusTask = nil
         sharedFocus = nil
     }
@@ -89,6 +100,7 @@ final class AppRouter {
         showAssistant = false
         showTalk = false
         detailTask = nil
+        sharedDetail = nil
     }
 }
 

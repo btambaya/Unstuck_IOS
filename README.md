@@ -29,7 +29,11 @@ repo ([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)).
 > with a first-run interview, Settings → "What Unstuck knows", and "Unstuck
 > calls you" (CallKit + VoIP push, calls booked by voice, text, or the task
 > editor). Talk's audio engine restarts on iOS configuration changes as of
-> build 52 (it used to die 100 ms in on real devices). Remaining gaps: the
+> build 52 (it used to die 100 ms in on real devices). Sharing is ONE Share
+> screen for tasks and lists (2026-09-17, unified sharing v1): People /
+> Someone new (email — shared at once or invited) / Share a link, "Can edit"
+> or "Can view", honest result lines, "Hand over to…" for assigning a task,
+> and a push on a task shared with you opens that task. Remaining gaps: the
 > on-device call validation and the manual
 > deploy/capability steps — see [`handover.md`](handover.md) for the honest list.
 
