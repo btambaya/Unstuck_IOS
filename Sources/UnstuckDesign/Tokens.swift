@@ -83,27 +83,33 @@ public enum Accent: String, CaseIterable, Sendable {
 }
 
 public extension Palette {
-    /// Override the primary/coral ramps for the chosen accent. Same override
-    /// values for light + dark, matching Android's `withAccent`.
-    func withAccent(_ accent: Accent) -> Palette {
+    /// Override the primary/coral ramps for the chosen accent, per SCHEME.
+    /// Values mirror `unstuck/app/globals.css` verbatim — the web defines
+    /// BOTH halves per accent, and its dark block overrides `primary`,
+    /// `primaryDeep`, `primarySoft` and `coralSoft` ONLY (`coral` and
+    /// `coralDeep` keep the light accent values in dark). The previous
+    /// one-set-fits-both form applied the LIGHT ramp on top of the dark
+    /// palette: rose / forest in dark mode got a primaryDeep of L 0.42 on a
+    /// 0.205 background (≈1.9:1) and a near-white primarySoft capsule.
+    func withAccent(_ accent: Accent, dark: Bool) -> Palette {
         var p = self
         switch accent {
         case .indigo:
-            return self
+            return self                                    // base :root / .u-dark, no remap
         case .rose:
-            p.primary = OKLCH(0.62, 0.14, 265).color
-            p.primaryDeep = OKLCH(0.42, 0.16, 265).color
-            p.primarySoft = OKLCH(0.94, 0.04, 265).color
-            p.coral = OKLCH(0.74, 0.14, 15).color
-            p.coralSoft = OKLCH(0.95, 0.05, 15).color
-            p.coralDeep = OKLCH(0.50, 0.16, 15).color
+            p.primary     = dark ? OKLCH(0.74, 0.13, 265).color : OKLCH(0.62, 0.14, 265).color
+            p.primaryDeep = dark ? OKLCH(0.82, 0.12, 265).color : OKLCH(0.42, 0.16, 265).color
+            p.primarySoft = dark ? OKLCH(0.32, 0.07, 265).color : OKLCH(0.94, 0.04, 265).color
+            p.coral       = OKLCH(0.74, 0.14, 15).color                       // light + dark
+            p.coralDeep   = OKLCH(0.50, 0.16, 15).color                       // light + dark
+            p.coralSoft   = dark ? OKLCH(0.36, 0.08, 15).color : OKLCH(0.95, 0.05, 15).color
         case .forest:
-            p.primary = OKLCH(0.55, 0.10, 170).color
-            p.primaryDeep = OKLCH(0.38, 0.10, 170).color
-            p.primarySoft = OKLCH(0.94, 0.04, 170).color
-            p.coral = OKLCH(0.74, 0.14, 65).color
-            p.coralSoft = OKLCH(0.95, 0.05, 65).color
-            p.coralDeep = OKLCH(0.48, 0.13, 65).color
+            p.primary     = dark ? OKLCH(0.70, 0.11, 170).color : OKLCH(0.55, 0.10, 170).color
+            p.primaryDeep = dark ? OKLCH(0.80, 0.10, 170).color : OKLCH(0.38, 0.10, 170).color
+            p.primarySoft = dark ? OKLCH(0.32, 0.06, 170).color : OKLCH(0.94, 0.04, 170).color
+            p.coral       = OKLCH(0.74, 0.14, 65).color
+            p.coralDeep   = OKLCH(0.48, 0.13, 65).color
+            p.coralSoft   = dark ? OKLCH(0.36, 0.08, 65).color : OKLCH(0.95, 0.05, 65).color
         }
         return p
     }
@@ -139,7 +145,8 @@ private struct UThemeResolver: ViewModifier {
     @Environment(\.colorScheme) private var scheme
     let accent: Accent
     func body(content: Content) -> some View {
-        content.environment(\.uTheme,
-                            UTheme(palette: (scheme == .dark ? Palette.dark : Palette.light).withAccent(accent)))
+        let dark = scheme == .dark
+        let base = dark ? Palette.dark : Palette.light
+        content.environment(\.uTheme, UTheme(palette: base.withAccent(accent, dark: dark)))
     }
 }

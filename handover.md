@@ -3,7 +3,100 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-17, latest) — Unified sharing v1: ONE Share screen for tasks + lists (spec `unstuck/docs/unified-sharing-spec.md` §4)
+## Where things stand (2026-09-17, latest) — Share screen: the People card collapses; the accent sweep; scheme-aware accent ramps
+
+Ahmad, from a tester's screenshot before the web + Android push: (1) "the
+accent colour you use doesn't match the actual colour we use for the rest of
+the app", (2) someone with seven connections got seven full-width rows —
+"very ugly … find a better way and collapse that list". Both fixed; NOT
+bumped / archived (build 56 stays on TestFlight until he has seen it).
+
+- **People card (`App/Features/ShareScreen.swift`)** — the per-person surface
+  cards are gone. ONE 12pt `surface`/`line` card (the Share screen's own
+  radius; `CardDivider` between rows), 44pt rows: monogram · name · "· Coach"
+  … trailing word. The WHOLE row is the control — a Button that shares
+  ("Share", `ink` semibold) or hands over ("Hand over"), or the Menu for
+  someone who already has it ("Can edit" / "Can view" / "Handed over" in
+  `ink2` + a chevron; Can edit ✓ / Can view / Report… / Block <email> /
+  Remove or "Take it back" — verbatim, now `accessMenu`). The old `pill()`
+  and the email-on-the-row are gone (the email survives in "Block <email>",
+  the report dialog and Waiting to join). Eyebrow "People · N".
+  **Collapse rule** — pure `sharePeopleLayout` in
+  `Sources/UnstuckCore/Logic/UnifiedSharing.swift` next to `composeSharePeople`:
+  shared-first (roster order inside each half), cap = max(3, pinned.count) so
+  someone who already has it is NEVER hidden, hide only when it hides ≥ 2
+  rows ("Show 1 more" is worse than the row), "Show N more ⌄" / "Show less ⌃"
+  as the card's last row, and at ≥ 10 people the EXPANDED card gets a Find
+  field (diacritic/case-insensitive prefix-of-word over name, label, email;
+  searching lifts the cap and hides the disclosure). 7 people = 3 rows + "Show
+  4 more" (179pt, was ~400). Constants `sharePeopleCollapsedCap = 3` /
+  `sharePeopleSearchThreshold = 10` — **mirror them in the Android + web
+  ports** or the three platforms collapse differently.
+  **Pin-at-open** — `ShareScreenModel.pinnedIds` is fixed by the FIRST
+  non-empty `load()` and never recomputed (hand-over mode pins only the
+  holder), so a row you just shared changes its monogram + word IN PLACE and
+  floats to the top only on the next open; `people` keeps roster order.
+  `peopleExpanded` / `peopleQuery` are `@State` on the sheet (survive every
+  reload, reset per presentation). Accessibility: every row/disclosure is a
+  full-width 44pt target; VoiceOver labels unchanged ("Share with Maya, Can
+  edit", "Maya, Can edit. Change access" + hint, "Hand over to Maya", "Maya,
+  already handed over", "Maya, working"); at accessibility sizes the row
+  becomes two lines (monogram · VStack{name, word}) with wrapping text;
+  monogram is `@ScaledMetric`; Reduce Motion drops the 0.22s expand.
+- **Accent sweep** — the People section uses NO accent token (looks the same
+  under indigo / rose / forest, light + dark): the monogram is the app's
+  selected / unselected chip pair (`ink` fill + `bg` letter when they hold the
+  item; `bg2` / `ink2` / `line2` ring when not), never a `primary` disc. Four
+  shipped dark-mode invisibilities fixed — literal white on dark `ink`
+  (≈1.05:1): the People "Share"/"Hand over" pills (deleted with `pill`), the
+  "Someone new" Share button (+ a 44pt hit frame), NewTaskSheet's "Copy link"
+  / "Generate link" / "Send invite", plus its share-member avatar (same chip
+  pair) and Off/Can edit/Can view segment; SharingFeature's "Complete" and
+  "Sit with them" (`bg` on `primary`). Acceptance:
+  `grep -nE "palette\.primary|\.white\b|Color\.black|#[0-9A-Fa-f]{6}" App/Features/ShareScreen.swift`
+  → nothing.
+- **Root cause of "doesn't match": `withAccent` applied the LIGHT ramp in DARK
+  mode** (`Sources/UnstuckDesign/Tokens.swift`; the web fixed the same bug in
+  `globals.css` and is the source of truth). Now `withAccent(_:dark:)` — the
+  web's values verbatim: the dark block overrides `primary` / `primaryDeep` /
+  `primarySoft` / `coralSoft` only; `coral` / `coralDeep` keep the light
+  accent values (mirrored precisely, not "improved"). `UThemeResolver` passes
+  the scheme; the old one-arg signature is deleted so it cannot come back.
+  Before: rose/forest in dark = primaryDeep L 0.42 on bg 0.205 (≈1.9:1) and a
+  near-white `primarySoft` capsule. **Android has the identical bug**
+  (`design/…/theme/Theme.kt` `withAccent` at :114-124, called at :133) — the
+  same six values per accent, `withAccent(accent, dark)`; not yet done.
+- **Found in the shots, fixed before commit:** `layoutPriority(1)` on the
+  name must be the OUTERMOST modifier (ahead of `fixedSize` it did nothing
+  and "Priya Raghuna… · Accountab…" truncated together); the hand-over
+  HOLDER's row is inert content, not a disabled Button (which greyed the
+  whole row, monogram included — the spec's "a state, not a dimmed
+  control"); the disclosure row dims with its siblings while a write is in
+  flight; and at accessibility sizes the name and the label STACK (side by
+  side, a full-width name left the label one character wide, wrapping letter
+  by letter into a 1500pt row). Verified: 25/25 configs on iPhone 17
+  (`scratchpad/share-shots`), the affected ones re-shot after each fix.
+- **Demo transport for shots** — `UITEST_SHARE_PEOPLE="<count>,<shared>
+  [,<handed>]"` (+ `UITEST_SHARE_SLOW=1`), `DemoShareTransport` in
+  `App/UITestSupport.swift` (DEBUG + env-gated like every UITEST_* hook),
+  wired in `makeShareScreenModel`. `UITests/SharePeopleCardShots.swift` shoots
+  the whole matrix (0/1/4/7/20 people × 0/2/6/10 shared, hand-over ± holder,
+  light/dark, indigo/forest, AX XXXL, expanded/search/busy/menu) from one
+  test on one simulator: `TEST_RUNNER_SHARE_SHOTS_DIR=<dir> xcodebuild test …
+  -only-testing:UnstuckUITests/SharePeopleCardShots`.
+- **Tests:** Core `UnifiedSharingTests` +9 (order, the cap never hides a
+  holder, one hidden row is not worth a disclosure, 0/1/3/4/5/7/20 cases,
+  expanded + Find at ten, search lifts the cap, diacritics/case/name/label/
+  email, no match, titles); Design `AccentTests` (new: indigo no-op, dark
+  primaryDeep lighter than dark bg / light darker than light bg per accent at
+  ≥ 4.5:1, the dark ramp swaps only what the web swaps, and `bg`-on-`ink` ≥ 12:1
+  in both schemes while white on dark ink < 1.2:1); App
+  `ShareScreenModelTests` +3 (`pinnedIds` fixed by the first non-empty load,
+  survives share + remove, hand-over pins only the holder). Every existing
+  case unchanged. `TZ=UTC swift test --scratch-path .build-int` → 1034 green (2
+  skipped); `xcodebuild test … -only-testing:UnstuckAppTests` → 584 green.
+
+## Previously (2026-09-17) — Unified sharing v1: ONE Share screen for tasks + lists (spec `unstuck/docs/unified-sharing-spec.md` §4)
 
 Testers: "sharing a task or a collection is difficult, too many steps, not
 straightforward." Before: a task could only be shared with an ACTIVE circle
