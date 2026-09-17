@@ -152,11 +152,24 @@ final class BargeInTests: XCTestCase {
     func test5_transcriptionWhileDuckedCancelsImmediately() {
         var c = speaking()
         _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.gateOpen, now: 1.02)           // the mic agrees
         let out = core(c.handle(.transcription, now: 1.1))
         XCTAssertEqual(count(out, .sendCancel), 1)
         XCTAssertTrue(out.contains(.flushPlayback))
         XCTAssertTrue(c.muted)
         XCTAssertEqual(c.state, .idle)
+    }
+
+    func test5b_transcriptionWithTheMicClosedIsNotAConfirm() {
+        // Deltas stream for the previous turn and for the model's own echo
+        // (device log 2026-09-17); with the gate closed they confirm nothing.
+        var c = speaking()
+        _ = c.handle(.speechStarted, now: 1.0)
+        XCTAssertFalse(c.gateOpen)
+        XCTAssertEqual(core(c.handle(.transcription, now: 1.1)), [])
+        XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server), "still waiting for the tick")
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"))
+        XCTAssertEqual(core(c.handle(.tick, now: 1.3)), [.restore], "and the tick restores (no mic energy)")
     }
 
     // MARK: 6 — Interrupt = hard cancel, never ducks; flush-only on the tail; idle no-op
@@ -389,7 +402,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(VoiceRoute(portType: nil), .speaker)
         // The gate context follows playback: +9 while queued on speaker, frozen while busy.
         var s = speaking()
-        XCTAssertEqual(s.gateContext, GateContext(marginDb: 9, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true))
+        XCTAssertEqual(s.gateContext, GateContext(marginDb: 9, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true, forcedClosed: true))
         _ = s.handle(.responseDone(id: "r1", status: "completed"), now: 1)
         let drained = s.handle(.playbackDrained, now: 2)
         XCTAssertTrue(drained.contains(.updateGate(GateContext(marginDb: 6, freezeAdaptation: false, forcedOpen: false, emitSilenceWhenClosed: true))))
@@ -487,14 +500,69 @@ final class BargeInTests: XCTestCase {
         // response.created freezes adaptation (residual echo is about to start).
         let created = c.handle(.responseCreated(id: "r1"), now: 0)
         XCTAssertTrue(created.contains(.updateGate(GateContext(marginDb: 6, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true))))
-        // First audio: +9 dB margin on the loudspeaker.
+        // First audio: +9 dB margin on the loudspeaker — and half-duplex.
         let delta = c.handle(.audioDelta(id: "r1"), now: 0.1)
-        XCTAssertTrue(delta.contains(.updateGate(GateContext(marginDb: 9, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true))))
+        XCTAssertTrue(delta.contains(.updateGate(GateContext(marginDb: 9, freezeAdaptation: true, forcedOpen: false, emitSilenceWhenClosed: true, forcedClosed: true))))
         // A second delta changes nothing → no gate push.
         let again = c.handle(.audioDelta(id: "r1"), now: 0.2)
         XCTAssertFalse(again.contains { if case .updateGate = $0 { return true } else { return false } })
-        // Low-echo route: the margin stays +6 while playing.
+        // Low-echo route: the margin stays +6 while playing, full-duplex.
         _ = c.handle(.routeChanged(.lowEcho), now: 0.3)
         XCTAssertEqual(c.gateContext.marginDb, 6)
+        XCTAssertFalse(c.gateContext.forcedClosed)
+    }
+
+    // MARK: 16 — loudspeaker half-duplex while the model is audible
+
+    func test16_speakerHalfDuplexWhilePlaying() {
+        // Controller: forced closed exactly while audio is queued on the speaker.
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        XCTAssertFalse(c.gateContext.forcedClosed, "thinking: nothing plays yet, talk-over allowed")
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        XCTAssertTrue(c.gateContext.forcedClosed)
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1)
+        XCTAssertTrue(c.gateContext.forcedClosed, "the buffered tail is still audible")
+        _ = c.handle(.playbackDrained, now: 1.5)
+        XCTAssertFalse(c.gateContext.forcedClosed)
+        // Hold-to-talk wins: the button down opens the mic even mid-reply.
+        var h = BargeInController(profile: .speaker, holdToTalk: true)
+        _ = h.handle(.responseCreated(id: "r1"), now: 0)
+        _ = h.handle(.audioDelta(id: "r1"), now: 0.1)
+        _ = h.handle(.pttDown, now: 0.2)
+        XCTAssertFalse(h.gateContext.forcedClosed)
+        XCTAssertTrue(h.gateContext.forcedOpen)
+        // Low-echo never forces the gate closed.
+        var e = BargeInController(profile: .lowEcho)
+        _ = e.handle(.responseCreated(id: "r1"), now: 0)
+        _ = e.handle(.audioDelta(id: "r1"), now: 0.1)
+        XCTAssertFalse(e.gateContext.forcedClosed)
+
+        // Gate: an open gate slams shut, uploads digital silence for as long
+        // as it is forced, drops the pre-roll, and reopens on speech after.
+        var g = RMSGate()
+        let quiet = frame(amp: 100)
+        for _ in 0..<RMSGate.calibrationFrames { _ = g.push(quiet) }
+        let floor = g.floorDb
+        let loud = frame(amp: amp(dbAbove: floor, 12))
+        _ = g.push(loud); let opened = g.push(loud)
+        XCTAssertTrue(opened.opened && g.isOpen)
+        g.context.forcedClosed = true
+        let slammed = g.push(loud)
+        XCTAssertTrue(slammed.closed)
+        XCTAssertFalse(g.isOpen)
+        let sub = RMSGate.subFrameSamples * 2
+        XCTAssertEqual(slammed.pcm, Data(count: sub), "silence, not the loud frame")
+        for _ in 0..<10 {
+            let o = g.push(loud)
+            XCTAssertEqual(o.pcm, Data(count: sub))
+            XCTAssertFalse(o.opened)
+        }
+        g.context.forcedClosed = false
+        for _ in 0..<3 { _ = g.push(quiet) }        // post-reply room tone → the new pre-roll
+        _ = g.push(loud); let reopened = g.push(loud)
+        XCTAssertTrue(reopened.opened)
+        XCTAssertEqual(reopened.pcm.count, 5 * sub, "pre-roll = 3 quiet + the onset frame, then the live frame — nothing from before the mute")
+        XCTAssertEqual(reopened.pcm.prefix(sub), bytes(quiet))
     }
 }

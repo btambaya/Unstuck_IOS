@@ -5,9 +5,13 @@
 // ECHO / BARGE-IN: iOS gives us hardware acoustic echo cancellation for free via
 // the input node's VOICE-PROCESSING audio unit (`setVoiceProcessingEnabled`) +
 // the AVAudioSession `.voiceChat` mode — the OS uses the playback as the echo
-// reference, so the loudspeaker route is far less echo-prone than Android's
-// manual setup. We therefore run FULL-DUPLEX (mic stays open while the model
-// speaks) and rely on the server VAD (+ the manual Interrupt) for barge-in.
+// reference, so the loudspeaker route is less echo-prone than Android's
+// manual setup. NOT echo-free, though: on an iPhone 15 Pro Max (2026-09-17)
+// the residual echo still opened the gate and the server VAD heard the reply
+// as speech. So the LOUDSPEAKER profile is half-duplex while the model is
+// audible (`GateContext.forcedClosed` — the gate uploads digital silence);
+// low-echo routes (earphones / Bluetooth) run full-duplex with server-VAD
+// barge-in; the Interrupt button always works.
 //
 // BARGE-IN SUPPORT (App/Voice/BargeIn.swift owns the logic; this file only
 // executes it): an RMS NOISE GATE runs in the capture tap right after the

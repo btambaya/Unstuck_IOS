@@ -66,7 +66,37 @@ less exposed (browser AEC, quieter setups).
 - TODO after device validation: port the same confirm rule to web
   `lib/voice/bargein.ts` (`tick`) and Android `core/logic/BargeIn.kt`
   (`onTick`) + their tests, so the three stay in lock-step.
-- Ship: build 53 uploaded; on-device retest pending Ahmad.
+- Ship: build 53 — Ahmad: "worse … it kept tripping itself".
+
+**Then (build 54): it was interrupting itself on its own echo.** The new
+diagnostics said it outright. At 14:04:52–53 the user's turn ends, the reply
+starts on the loudspeaker with the gate OPEN, the server VAD hears the reply's
+echo (`speechStarted → duck`), a transcription delta of that echo arrives
+0.4 ms later and — via the accelerator — cancels the reply, and the server
+then commits the echo as a user turn and ANSWERS it. Underneath: the RMS
+gate's floor clamps at −70 dBFS because voice processing's noise suppression
+leaves the idle mic near digital silence, so the gate opened 6–9 dB above the
+clamp — at −65, −67, −70 dBFS, i.e. on nothing — and residual echo sailed
+through. Web and Android use the same −70 clamp on raw mics (floor ≈ −50),
+which is why it never showed there.
+
+- **`BargeInProfile.halfDuplexWhilePlaying`** (speaker: true, low-echo:
+  false) → `GateContext.forcedClosed` while `playbackQueued`: the gate slams
+  shut, uploads digital silence, and discards its pre-roll (or the reply's
+  tail would prefix the next turn). Nothing the phone plays can reach the
+  server as speech. Talk-over still works while the model is only thinking
+  and on earphones/Bluetooth; the Interrupt button cuts a playing reply on
+  the loudspeaker; hold-to-talk's `forcedOpen` wins.
+- **`RMSGate.floorMinDb` −70 → −58** on iOS (documented deviation from
+  web/Android): opens at −52 idle / −49 while playing, above the VP residual.
+- **Transcription accelerator** obeys the two-sided rule (`gateOpen` required)
+  — deltas stream for the previous turn and for the echo.
+- **Diagnostics** now report the level of the sub-frame that flipped the gate
+  (it was the last sub-frame of the buffer, which read as "opened at −70").
+- Tests: 5/5b (transcription with/without the mic), 11/15 updated for the
+  forced-closed context, 16 (half-duplex: controller + gate incl. pre-roll
+  discard + reopen). 45 voice tests green.
+- Ship: build 54 uploaded; on-device retest pending Ahmad.
 
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 

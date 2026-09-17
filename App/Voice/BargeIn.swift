@@ -63,9 +63,19 @@ struct BargeInProfile: Sendable, Equatable {
     let confirmMs: Int
     private let marginIdle: Float
     private let marginPlaying: Float
+    /// Loudspeaker: the mic upload is muted while the model is AUDIBLE
+    /// (`GateContext.forcedClosed`), so nothing the phone plays can come back
+    /// as "speech". Proven necessary on an iPhone 15 Pro Max (2026-09-17):
+    /// with voice processing's echo cancellation on and the gate open, the
+    /// server VAD heard the reply's own echo, transcribed it, cancelled the
+    /// reply, and then ANSWERED the echo as if it were the user. Talk-over
+    /// stays available on low-echo routes (earphones / Bluetooth) and while
+    /// the model is only thinking (nothing is playing yet); the Interrupt
+    /// button cuts a playing reply on the loudspeaker.
+    let halfDuplexWhilePlaying: Bool
 
-    static let lowEcho = BargeInProfile(route: .lowEcho, threshold: 0.5, confirmMs: 200, marginIdle: 6, marginPlaying: 6)
-    static let speaker = BargeInProfile(route: .speaker, threshold: 0.6, confirmMs: 300, marginIdle: 6, marginPlaying: 9)
+    static let lowEcho = BargeInProfile(route: .lowEcho, threshold: 0.5, confirmMs: 200, marginIdle: 6, marginPlaying: 6, halfDuplexWhilePlaying: false)
+    static let speaker = BargeInProfile(route: .speaker, threshold: 0.6, confirmMs: 300, marginIdle: 6, marginPlaying: 9, halfDuplexWhilePlaying: true)
 
     static func forRoute(_ route: VoiceRoute) -> BargeInProfile {
         switch route {
@@ -113,6 +123,10 @@ struct GateContext: Sendable, Equatable {
     /// server_vad needs digital silence while closed (its silence timer must
     /// see silence); hold-to-talk (turn_detection null) appends nothing.
     var emitSilenceWhenClosed = true
+    /// Half-duplex: the gate is held closed (digital silence out, pre-roll
+    /// discarded) — the loudspeaker while the model is audible. Hold-to-talk's
+    /// `forcedOpen` wins over it.
+    var forcedClosed = false
 }
 
 // MARK: - State machine
@@ -212,7 +226,8 @@ struct BargeInController: Sendable {
         GateContext(marginDb: profile.gateMarginDb(playing: playbackQueued),
                     freezeAdaptation: playbackQueued || responseActive,
                     forcedOpen: state == .hold,
-                    emitSilenceWhenClosed: !holdToTalk)
+                    emitSilenceWhenClosed: !holdToTalk,
+                    forcedClosed: profile.halfDuplexWhilePlaying && playbackQueued && state != .hold)
     }
 
     /// True while the model is (or is about to be) audible — the Interrupt
@@ -323,7 +338,13 @@ struct BargeInController: Sendable {
             }
 
         case .transcription:
-            if case .ducked = state { out += cancel() }
+            // The accelerator is subject to the same two-sided rule as the
+            // tick: transcription deltas also stream for the PREVIOUS turn
+            // and for the model's own echo (device log 2026-09-17: a
+            // speech_started and a delta 0.4 ms apart cancelled a reply the
+            // user never interrupted). A transcript with the mic already
+            // closed is not the user talking over.
+            if case .ducked = state, gateOpen { out += cancel() }
 
         case .tick:
             // Compare in whole milliseconds: `now - since` is floating point
@@ -463,7 +484,12 @@ struct RMSGate: Sendable {
     static let preRollFrames = 15              // 300 ms
     static let holdFrames = 10                 // 200 ms below closeDb before closing
     static let hysteresisDb: Float = 3
-    static let floorMinDb: Float = -70
+    /// −58, not the −70 web/Android use: iOS voice processing (noise
+    /// suppression) leaves the idle mic near digital silence, so the measured
+    /// floor pinned to the clamp and the gate opened 6–9 dB above it — on
+    /// nothing (device log 2026-09-17: opens at −65, −67, −70 dBFS). Speech
+    /// through the AGC sits well above −40 dBFS.
+    static let floorMinDb: Float = -58
     static let floorMaxDb: Float = -35
     static let adaptAlpha: Float = 0.05
     /// +10 dB per minute ⇒ per 20 ms sub-frame.
@@ -530,7 +556,7 @@ struct RMSGate: Sendable {
 
     private mutating func process(_ frame: ArraySlice<Int16>, into out: inout Output) {
         let db = Self.rmsDb(frame)
-        out.levelDb = db
+        if !out.opened && !out.closed { out.levelDb = db }   // the flipping sub-frame's level
         let bytes = Data(bytes: Array(frame), count: frame.count * 2)
 
         // Calibration: the first 500 ms, median (robust to a cough).
@@ -542,6 +568,26 @@ struct RMSGate: Sendable {
                 floorDb = min(Self.floorMaxDb, max(Self.floorMinDb, sorted[sorted.count / 2]))
                 isCalibrated = true
                 calibration.removeAll()
+            }
+            return
+        }
+
+        // Half-duplex (loudspeaker while the model is audible): nothing from
+        // the mic reaches the server — its own echo is what tripped the VAD.
+        // The pre-roll is discarded too, or the reply's tail would be
+        // prefixed to the user's next turn.
+        if context.forcedClosed && !context.forcedOpen {
+            if isOpen || forcedOpen {
+                forcedOpen = false
+                isOpen = false
+                out.closed = true
+                consecutiveAbove = 0
+                belowFrames = 0
+            }
+            preRoll.removeAll()
+            if context.emitSilenceWhenClosed {
+                out.pcm.append(Data(count: bytes.count))
+                out.silenceFrames += 1
             }
             return
         }
