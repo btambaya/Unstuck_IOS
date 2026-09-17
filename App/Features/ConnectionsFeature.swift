@@ -120,6 +120,9 @@ final class CircleModel {
     }
 
     /// Re-read the roster + the pending invites and compose the two lists.
+    /// A refresh is a fresh answer, so it also clears the line a refused
+    /// cancel left (it used to stay through every later collab-signal /
+    /// foreground refresh until the next cancel attempt).
     func refresh() async {
         let circle = await transport.listCircle()
         let pending = await transport.myPendingInvites()
@@ -127,6 +130,7 @@ final class CircleModel {
         let sections = composePeopleSections(circle: circle, pending: pending)
         roster = sections.roster
         waiting = sections.waiting
+        waitingError = nil
         loading = false
     }
 
@@ -158,15 +162,16 @@ final class CircleModel {
 
     /// Cancel a Waiting-to-join invite (`cancel_pending_invite`). Optimistic —
     /// the row leaves at once — then the refetch shows the server's truth: a
-    /// refused cancel brings the row back with a line saying so. Returns
-    /// whether the server deleted it.
+    /// refused cancel brings the row back with a line saying so, which the
+    /// NEXT refresh (a collab signal, foreground, another cancel) clears.
+    /// Returns whether the server deleted it.
     @discardableResult
     func cancelPending(_ p: PendingInvite) async -> Bool {
         waitingError = nil
         waiting.removeAll { $0.id == p.id }
         let ok = await transport.cancelPendingInvite(kind: p.kind, id: p.inviteId)
-        if !ok { waitingError = "Couldn't cancel that invite — try again." }
         await refresh()
+        if !ok { waitingError = "Couldn't cancel that invite — try again." }
         return ok
     }
 
@@ -287,7 +292,9 @@ private struct RosterSection: View {
                 } label: {
                     Text(copiedId == m.id ? "Copied!" : "Copy link")
                         .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
-                }.buttonStyle(.plain)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(copyInviteLinkLabel(email: m.inviteeEmail, copied: copiedId == m.id))
             }
             Button { removeTarget = m } label: {
                 Image(systemName: "xmark")
@@ -311,6 +318,18 @@ private struct RosterSection: View {
 /// or read the grade ("· can edit" / "· can view") the one vocabulary promises.
 func waitingRowLineLimit(_ size: DynamicTypeSize) -> Int? {
     size.isAccessibilitySize ? nil : 1
+}
+
+/// The VoiceOver label of a pending row's "Copy link" button. Both the roster's
+/// pending rows and Waiting to join have one, so a bare "Copy link" read as up
+/// to four identical buttons on the screen; naming the address makes each
+/// unambiguous, and the copied state is spoken too (the visible text flips to
+/// "Copied!", which a fixed label would otherwise hide). A link-only roster
+/// invite has no address and keeps the bare form.
+func copyInviteLinkLabel(email: String?, copied: Bool) -> String {
+    let base = copied ? "Copied invite link" : "Copy invite link"
+    guard let email, !email.isEmpty else { return base }
+    return "\(base) for \(email)"
 }
 
 /// Unified sharing v1 §2 "One place for people": the email invites that are
@@ -383,7 +402,9 @@ private struct WaitingSection: View {
                 } label: {
                     Text(copiedId == p.id ? "Copied!" : "Copy link")
                         .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
-                }.buttonStyle(.plain)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(copyInviteLinkLabel(email: p.email, copied: copiedId == p.id))
             }
             Button { cancelTarget = p } label: {
                 Image(systemName: "xmark")

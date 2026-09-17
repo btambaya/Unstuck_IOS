@@ -2,8 +2,9 @@
 // to join" on the CircleModel over a fake PeopleTransport: the rows come from
 // `my_pending_invites` with the label per kind, Cancel calls
 // `cancel_pending_invite(kind, id)` and drops the row, a refused cancel is
-// honest, a circle invite is never listed twice, the roster stays whole on a
-// server without the RPC, and the collab signals refresh the section.
+// honest (and its line clears on the next refresh), a circle invite is never
+// listed twice, the roster stays whole on a server without the RPC, the collab
+// signals refresh the section, and every Copy link button names its invite.
 
 import XCTest
 import SwiftUI
@@ -141,6 +142,23 @@ final class PeopleWaitingTests: XCTestCase {
         XCTAssertEqual(vm.waiting.count, 2)
     }
 
+    /// Prior-round finding: the line a refused cancel left stayed under the
+    /// section through every later refresh (a collab signal, foreground) until
+    /// the next cancel attempt or leaving the screen. A refresh is a fresh
+    /// answer now — but the line must still survive the refetch that the
+    /// cancel itself performs, or it would never be seen at all.
+    func testTheNextRefreshClearsTheRefusedCancelLine() async {
+        fake.cancelOk = false
+        let vm = model()
+        await vm.refresh()
+        await vm.cancelPending(vm.waiting[0])
+        XCTAssertEqual(vm.waitingError, "Couldn't cancel that invite — try again.",
+                       "set AFTER the cancel's own refetch, so it is actually shown")
+        await vm.refresh()   // a collab signal / foreground
+        XCTAssertNil(vm.waitingError, "a later refresh clears the stale line")
+        XCTAssertEqual(vm.waiting.count, 3, "the invite is still there — only the line went")
+    }
+
     func testRemovingARosterRowStillGoesThroughCircleRemove() async {
         let vm = model()
         await vm.refresh()
@@ -166,6 +184,20 @@ final class PeopleWaitingTests: XCTestCase {
         }
         XCTAssertEqual(waitingRowLineLimit(.large), 1)
         XCTAssertNil(waitingRowLineLimit(.accessibility5), "AX XXXL — the size this was found at")
+    }
+
+    // MARK: accessibility labels
+
+    /// Prior-round finding: with the roster's pending rows on the same screen,
+    /// VoiceOver read up to four identical "Copy link" buttons. Each now names
+    /// its address and speaks the copied state (the visible text flips to
+    /// "Copied!", which a fixed label would hide); a link-only roster invite
+    /// has no address and keeps the bare form.
+    func testCopyLinkButtonsNameTheirInvite() {
+        XCTAssertEqual(copyInviteLinkLabel(email: "p@x.com", copied: false), "Copy invite link for p@x.com")
+        XCTAssertEqual(copyInviteLinkLabel(email: "p@x.com", copied: true), "Copied invite link for p@x.com")
+        XCTAssertEqual(copyInviteLinkLabel(email: nil, copied: false), "Copy invite link", "link-only roster invite")
+        XCTAssertEqual(copyInviteLinkLabel(email: "", copied: true), "Copied invite link")
     }
 
     // MARK: live refresh

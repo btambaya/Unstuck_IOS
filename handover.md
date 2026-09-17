@@ -148,7 +148,7 @@ honestly until they do):
   labels, cancel per kind removes the row + calls the RPC with kind/id,
   refused cancel, dedupe with roster rows, pre-RPC roster, signal refresh).
   Counts: `swift test` → **1021 green** (2 skipped); `-only-testing:
-  UnstuckAppTests` → **579 green** on a fresh container. NOT bumped / archived.
+  UnstuckAppTests` → **581 green** on a fresh container. NOT bumped / archived.
 - **LIVE-VERIFIED against prod (2026-09-17), RPCs deployed.** An independent
   pass drove the real app on the "iPhone 17" simulator signed in as the demo
   account: a task's Share screen → an unknown address ("Can edit"), a list's →
@@ -170,6 +170,24 @@ honestly until they do):
   (`waitingRowLineLimit`, unit-tested in `PeopleWaitingTests`); the compact
   one-line row is unchanged everywhere else. Note the ROSTER's rows keep the
   old one-line rule (pre-existing, not touched here).
+- **Review follow-up (2026-09-17, two low findings, both fixed):** (1)
+  `CircleModel.waitingError` was cleared only at the start of the next
+  `cancelPending`, never by `refresh()` — after a refused cancel the line
+  "Couldn't cancel that invite — try again." stayed through every later
+  collab-signal / foreground refresh until the next cancel attempt or leaving
+  the screen. `refresh()` now clears it (a refresh is a fresh answer), and
+  `cancelPending` sets the line AFTER its own refetch so a refused cancel is
+  still shown — order matters, and `PeopleWaitingTests.
+  testTheNextRefreshClearsTheRefusedCancelLine` pins both halves. (2) The
+  "Copy link" button on a Waiting-to-join row carried no per-invite
+  accessibility label — with the roster's pending rows on the same screen,
+  VoiceOver read up to four identical "Copy link" buttons. Both the Waiting
+  rows AND the roster's pending rows now use `copyInviteLinkLabel(email:
+  copied:)` → "Copy invite link for <address>" / "Copied invite link for
+  <address>" (the copied state is spoken; a fixed label would have hidden the
+  visible "Copied!" flip), bare "Copy invite link" for a link-only roster
+  invite with no address (`testCopyLinkButtonsNameTheirInvite`). No behaviour
+  change beyond those two; NOT bumped / archived.
 - **Known pre-existing flake fixed in passing:** `AssistantToolsTests.
   testGetTasksViewsAreDistinctAndFiltersNarrow` — every seeded task carried
   the fixed `PAST_CREATED` stamp, and `isSlipping` treats anything older
@@ -1420,10 +1438,10 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --scratch-path .build-int  # 1021 tests green, 2 skipped (2026-09-17, unified sharing v1 + People "Waiting to join")
+TZ=UTC swift test --scratch-path .build-int  # 1021 tests green, 2 skipped (2026-09-17, unified sharing v1 + People "Waiting to join" + review follow-up)
 xcodegen generate && xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app + widget
-# App-layer unit tests (host: Unstuck) — 578 green (2026-09-17), on a FRESH container (uninstall first, see above):
+# App-layer unit tests (host: Unstuck) — 581 green (2026-09-17, People review follow-up), on a FRESH container (uninstall first, see above):
 xcodebuild test -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'platform=iOS Simulator,id=38CF1937-7E51-4CDC-B96D-97928A2D1DF3' -only-testing:UnstuckAppTests
 ```
