@@ -63,7 +63,7 @@ struct AssistantSheet: View {
             if let message = note ?? assistant.error.map(assistantFriendlyError) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(message)
-                        .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
                         .accessibilityAddTraits(.updatesFrequently)
                     // Two upstream rejections in a row: the thread itself is
                     // the likely cause (a poisoned replayed tool_call,
@@ -201,7 +201,7 @@ struct AssistantSheet: View {
                             .frame(maxWidth: 320, alignment: .leading)
                             if let note = assistant.undoFailureNote(turnId: turn.id, index: ri) {
                                 Text(note)
-                                    .font(UFont.sans(11.5)).foregroundStyle(theme.palette.coralDeep)
+                                    .font(UFont.sans(11.5)).foregroundStyle(theme.palette.theme.palette.red)
                                     .padding(.leading, 11)
                                     .accessibilityAddTraits(.updatesFrequently)
                             }

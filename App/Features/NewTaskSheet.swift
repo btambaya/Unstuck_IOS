@@ -381,7 +381,7 @@ struct NewTaskSheet: View {
                             .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 5)
-                            .background(selected ? theme.palette.coralDeep : Color.clear, in: Capsule())
+                            .background(selected ? theme.palette.ink : Color.clear, in: Capsule())
                     }
                     .buttonStyle(.plain)
                 }
@@ -451,7 +451,7 @@ struct NewTaskSheet: View {
                 Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 if let inviteErr {
-                    Text(inviteErr).font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                    Text(inviteErr).font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
                 }
                 HStack(spacing: 8) {
                     Button { generateInvite() } label: {

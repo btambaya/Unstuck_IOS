@@ -741,7 +741,7 @@ struct TodayView: View {
     private func recapCard(_ recap: AppModel.RecapState) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top) {
-                SectionLabel("Just now").foregroundStyle(theme.palette.coralDeep)
+                SectionLabel("Just now").foregroundStyle(theme.palette.coral)
                 Spacer()
                 Button { model.lastRecap = nil } label: {
                     Text("✕").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)

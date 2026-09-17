@@ -431,7 +431,7 @@ struct InterviewFlowView: View {
             // "✓ Noted" the store didn't take.
             if let err = machine.saveError {
                 Text(err)
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
                     .accessibilityLabel(err)
                     .accessibilityAddTraits(.updatesFrequently)
             }

@@ -310,7 +310,7 @@ struct AssistantReceiptRow: View {
             if receipt.isUndoable {
                 Button("Undo", action: onUndo)
                     .font(UFont.sans(12, .semibold))
-                    .foregroundStyle(theme.palette.coralDeep)
+                    .foregroundStyle(theme.palette.coral)
                     .buttonStyle(.plain)
             } else if receipt.undone ?? false {
                 Text("undone").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
@@ -449,7 +449,7 @@ struct AssistantShareConfirmCard: View {
                     .font(UFont.sans(11.5)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
                 if let message = error ?? (failed ? "Couldn't share — try again." : nil) {
-                    Text(message).font(UFont.sans(12)).foregroundStyle(theme.palette.coralDeep)
+                    Text(message).font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
                 }
                 HStack(spacing: 8) {
                     Button {

@@ -108,7 +108,7 @@ struct FactsPanelView: View {
         HStack(alignment: .top, spacing: 10) {
             Text(f.category.rawValue.uppercased())
                 .font(UFont.mono(9.5, .semibold)).tracking(0.6)
-                .foregroundStyle(theme.palette.coralDeep)
+                .foregroundStyle(theme.palette.coral)
                 .padding(.horizontal, 6).padding(.vertical, 2)
                 .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                 .padding(.top, 2)

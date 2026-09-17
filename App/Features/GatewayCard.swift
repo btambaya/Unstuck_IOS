@@ -304,7 +304,7 @@ struct GatewayCard: View {
                 ForEach(Self.chips, id: \.label) { c in
                     Button { engage(c.msg) } label: {
                         Text(c.label)
-                            .font(UFont.sans(12.5, .semibold)).foregroundStyle(theme.palette.coralDeep)
+                            .font(UFont.sans(12.5, .semibold)).foregroundStyle(theme.palette.ink)
                             .padding(.horizontal, 13).padding(.vertical, 7)
                             .frame(minHeight: 44)
                             .background(theme.palette.surface, in: Capsule())
@@ -339,7 +339,7 @@ struct GatewayCard: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("YOUR ASSISTANT")
                     .font(UFont.mono(9.5, .semibold)).tracking(1.6)
-                    .foregroundStyle(theme.palette.coralDeep)
+                    .foregroundStyle(theme.palette.coral)
                     .accessibilityLabel("Your assistant")
                 // The brief — deterministic, instant, offline-safe.
                 Text(brief)
@@ -398,7 +398,7 @@ struct GatewayCard: View {
                 // 44pt hit targets (HIG) — the glyphs stay 34pt visually.
                 Button(action: onTalk) {
                     Image(systemName: "mic")
-                        .font(.system(size: 15, weight: .medium)).foregroundStyle(theme.palette.coralDeep)
+                        .font(.system(size: 15, weight: .medium)).foregroundStyle(theme.palette.coral)
                         .frame(width: 44, height: 44).contentShape(Circle())
                 }.buttonStyle(.plain)
                     .accessibilityLabel("Talk to your assistant")

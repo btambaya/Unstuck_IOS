@@ -64,7 +64,7 @@ public struct AreaDot: View {
 
 public enum ButtonKind: Sendable { case primary, ghost, danger, dark }
 
-/// Brand button. Primary uses the AA-contrast coralDeep CTA.
+/// Brand button. Primary uses the brand coral CTA.
 public struct UButton: View {
     @Environment(\.uTheme) private var theme
     let title: String
@@ -94,7 +94,7 @@ public struct UButton: View {
     }
     private var background: Color {
         switch kind {
-        case .primary: return theme.palette.coralDeep
+        case .primary: return theme.palette.coral
         case .danger: return theme.palette.red
         case .ghost: return theme.palette.bg2
         case .dark: return theme.palette.ink

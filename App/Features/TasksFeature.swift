@@ -211,7 +211,7 @@ struct TasksView: View {
     private func accentPair(_ v: TaskListView) -> (soft: Color, ink: Color)? {
         switch v {
         case .backlog:   return (theme.palette.amberSoft, theme.palette.amberInk)
-        case .today:     return (theme.palette.coralSoft, theme.palette.coralDeep)
+        case .today:     return (theme.palette.coralSoft, theme.palette.ink)
         case .upcoming:  return (theme.palette.blueSoft, theme.palette.blueInk)
         case .later:     return (theme.palette.primarySoft, theme.palette.primaryDeep)
         case .recurring: return (theme.palette.blueSoft, theme.palette.blueInk)
@@ -495,7 +495,7 @@ struct TaskRowView: View {
                 if let overdueLabel {
                     Text(overdueLabel)
                         .font(UFont.sans(10, .bold))
-                        .foregroundStyle(theme.palette.coralDeep)
+                        .foregroundStyle(theme.palette.red)
                         .padding(.horizontal, 8).padding(.vertical, 2)
                         .background(theme.palette.coralSoft, in: Capsule())
                         .accessibilityLabel("Missed recurring task. \(overdueLabel)")

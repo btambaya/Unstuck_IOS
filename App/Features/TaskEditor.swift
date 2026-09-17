@@ -253,7 +253,7 @@ struct TaskEditor: View {
                         HStack(spacing: 6) { Image(systemName: "play.fill").font(.system(size: 13)); Text("Focus").font(UFont.sans(15, .medium)) }
                             .foregroundStyle(.white)
                             .padding(.vertical, 11).frame(maxWidth: .infinity)
-                            .background(theme.palette.coralDeep, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                            .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                     }
                     .buttonStyle(.plain)
                 }
