@@ -3,7 +3,40 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-12, latest) — ONE freshness owner, and a cursor catch-up that is the correctness path
+## Where things stand (2026-09-17, latest) — Talk had no audio on a real iPhone: the engine stopped itself 100 ms in (1.1.0 build 52)
+
+Ahmad's report: tap Talk, the greeting's TEXT appears, nothing is heard, and
+speaking never gets a reply. Pinpointed from the phone's own syslog over USB
+(memory `ios-device-logs`; the TestFlight build, no reinstall): the socket
+and the model were fine; the AVAudioEngine started, ran for ~100 ms, then iOS
+re-clocked the speaker for the voice-processing unit (output 48 kHz → 44.1 kHz)
+and the engine **stopped itself** (`iounit configuration changed > stopping
+the engine`), posted `AVAudioEngineConfigurationChange`, and nothing restarted
+it. Our mic tap went onto the dead engine (never fired → nothing uploaded →
+server VAD never triggered → "Listening…" for ever) and every reply buffer
+was scheduled onto it (`AVAudioPlayerNode: Engine is not running … Cannot
+play yet!`). No API reported an error. The simulator never reconfigures the
+IO unit, so every sim run had passed.
+
+- **`App/Voice/VoiceAudioEngine.swift`** now observes
+  `AVAudioEngineConfigurationChange` for its engine once it runs, and on it:
+  retires the queued playback (generation bump; fires `onPlaybackDrained` if
+  a tail was dropped so the state machine doesn't wait on "speaking"),
+  removes the tap, re-reads the CURRENT hardware format, rebuilds the 16 kHz
+  converter (captured by the tap itself now — no shared slot for the render
+  thread), reinstalls the tap, `prepare()` + `start()`, `player.play()`, and
+  recalibrates the gate (the route may have changed). A restart that fails or
+  loops (`EngineRestartPolicy`: 6 per 10 s) ends the session through
+  `onCaptureError` — loudly. Graph mutations are serialised by `graphLock`,
+  never held with `lock` across a `removeTap`. The CallKit call path uses the
+  same engine and inherits the fix.
+- Tests: `VoiceAudioEngineRestartTests` (the pure loop guard + inert-before-
+  start); the AVAudio half is validated on the device via the syslog lines
+  `voice engine restarting after configuration change #1 hw=48000Hz` and the
+  absence of `Cannot play yet`.
+- Ship: build 52 uploaded; on-device retest pending Ahmad.
+
+## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 
 The reason live-sync bugs kept coming back: `postgres_changes` has **no
 replay**, and a channel can report `SUBSCRIBED` while being permanently deaf

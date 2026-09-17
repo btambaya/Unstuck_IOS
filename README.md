@@ -28,7 +28,9 @@ repo ([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)).
 > the same 56 tools and honest harness as the web, a gateway card on Today
 > with a first-run interview, Settings → "What Unstuck knows", and "Unstuck
 > calls you" (CallKit + VoIP push, calls booked by voice, text, or the task
-> editor). Remaining gaps: the on-device call/voice validation and the manual
+> editor). Talk's audio engine restarts on iOS configuration changes as of
+> build 52 (it used to die 100 ms in on real devices). Remaining gaps: the
+> on-device call validation and the manual
 > deploy/capability steps — see [`handover.md`](handover.md) for the honest list.
 
 ## Architecture

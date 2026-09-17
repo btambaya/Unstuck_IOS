@@ -28,8 +28,18 @@
 // ourselves races CallKit's activation and yields a connected call with no
 // audio either way.
 //
-// NOTE: this compiles and wires the full graph, but end-to-end audio (levels,
-// echo, sample-rate drift) can only be validated on a real device.
+// CONFIGURATION CHANGES (proven on an iPhone 15 Pro Max / iOS 26.7, 2026-09-17,
+// from the device syslog): ~100 ms after engine.start() the voice-processing
+// unit settles on the built-in speaker and the OUTPUT hardware flips from
+// 48 kHz to 44.1 kHz. AVAudioEngine reacts to that by STOPPING ITSELF
+// ("iounit configuration changed > stopping the engine") and posting
+// AVAudioEngineConfigurationChange — and nothing else. The mic tap we then
+// install never fires, every reply buffer is scheduled onto a dead engine
+// ("Engine is not running … Cannot play yet!"), and no API reports an error:
+// the greeting's TEXT arrives, its audio doesn't, and the user's voice never
+// reaches the server. Restarting on that notification is Apple's documented
+// contract; this file observes it (`restartAfterConfigurationChange`). The
+// simulator never reconfigures the IO unit, which is why every sim run passed.
 
 import AVFoundation
 
@@ -104,6 +114,19 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     private var captureConverter: AVAudioConverter?
     private var started = false
     private let lock = NSLock()
+    /// The uploader handed to startCapture — kept so the tap can be
+    /// reinstalled after the engine restarts on a configuration change.
+    private var onFrame: (@Sendable (Data) -> Void)?
+    private var tapInstalled = false
+    /// Serialises graph mutations (tap install/remove, restart, shutdown)
+    /// against each other. Never taken on the render thread, and never held
+    /// together with `lock` across a removeTap (removeTap waits for the render
+    /// callback, and that callback takes `lock`).
+    private let graphLock = NSLock()
+    private var configObserver: (any NSObjectProtocol)?
+    private var restartPolicy = EngineRestartPolicy()
+    /// Restarts performed so far (diagnostics + tests).
+    private(set) var configurationRestarts = 0
 
     let sessionOwnership: VoiceAudioSessionOwnership
     private let sessionControl: VoiceAudioSessionControlling
@@ -204,7 +227,59 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
             deactivateSession(); return false
         }
         started = true
+        observeConfigurationChanges()
         return true
+    }
+
+    // MARK: configuration changes (see the file header)
+
+    private func observeConfigurationChanges() {
+        guard configObserver == nil else { return }
+        configObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil) { [weak self] _ in
+            self?.restartAfterConfigurationChange()
+        }
+    }
+
+    /// iOS stopped the engine underneath us (route change, or the voice
+    /// processor re-clocking the speaker right after start). Drop what was
+    /// queued for the old graph, re-tap the mic at the CURRENT hardware
+    /// format, start again. A restart that fails, or one that keeps
+    /// re-triggering, ends the session through `onCaptureError` — loudly,
+    /// never a silent dead "Listening…".
+    private func restartAfterConfigurationChange() {
+        graphLock.lock(); defer { graphLock.unlock() }
+        lock.lock()
+        guard started else { lock.unlock(); return }
+        let allowed = restartPolicy.allowRestart(now: ProcessInfo.processInfo.systemUptime)
+        // Buffers scheduled on the old graph will never play back: retire
+        // their completions (generation) and the drain count they held.
+        playGeneration += 1
+        let dropped = outstanding
+        outstanding = 0
+        recalibratePending = true      // the route, and its noise floor, may have changed
+        if allowed { configurationRestarts += 1 }
+        lock.unlock()
+        guard allowed else {
+            voiceLog.error("voice engine configuration changes are looping — ending the session")
+            onCaptureError?()
+            return
+        }
+        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+        player.stop()
+        let hw = engine.inputNode.inputFormat(forBus: 0)
+        voiceLog.notice("voice engine restarting after configuration change #\(self.configurationRestarts, privacy: .public) hw=\(hw.sampleRate, privacy: .public)Hz ch=\(hw.channelCount, privacy: .public) dropped=\(dropped, privacy: .public)")
+        engine.prepare()
+        do { try engine.start() } catch {
+            voiceLog.error("voice engine restart failed: \(String(describing: error), privacy: .public)")
+            onCaptureError?()
+            return
+        }
+        player.play()
+        if let onFrame, !installCaptureTap(onFrame) { onCaptureError?(); return }
+        // The dropped tail will never report back — tell the state machine
+        // playback is over so it doesn't wait on "speaking" for ever.
+        if dropped > 0 { onPlaybackDrained?() }
     }
 
     // MARK: VoiceAudioIO
@@ -220,27 +295,35 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         // held by another app. Report it (Android bails the same way in
         // startCapture) instead of returning silently into a dead "Listening…".
         guard ensureStarted() else { voiceLog.error("voice capture could not start"); onCaptureError?(); return }
+        graphLock.lock(); defer { graphLock.unlock() }
+        self.onFrame = onFrame
+        if !installCaptureTap(onFrame) { onCaptureError?() }
+    }
+
+    /// Tap the mic at the CURRENT hardware format — re-read on every install,
+    /// it changes with the route — and build the 16 kHz converter to match.
+    /// Each buffer is converted, run through the RMS gate (live audio /
+    /// pre-roll / digital silence / nothing during calibration), accumulated
+    /// into 100 ms frames, and handed to the uploader. Returns false when the
+    /// input is unusable (no converter, degenerate format — which also makes
+    /// installTap raise): every buffer would be dropped in silence, which is
+    /// indistinguishable from "not talking". Callers fail loudly on false.
+    /// Audit, 2026-09-11.
+    private func installCaptureTap(_ onFrame: @escaping @Sendable (Data) -> Void) -> Bool {
         let input = engine.inputNode
         let hwFormat = input.inputFormat(forBus: 0)
-        captureConverter = AVAudioConverter(from: hwFormat, to: captureFormat)
-        // The hardware format drives the 16 kHz conversion; a nil converter is
-        // a silent mic, which is otherwise indistinguishable from "not talking".
-        voiceLog.notice("voice capture hw=\(hwFormat.sampleRate, privacy: .public)Hz ch=\(hwFormat.channelCount, privacy: .public) converter=\(self.captureConverter != nil, privacy: .public)")
-        // No converter (or a degenerate hardware format, which makes installTap
-        // raise) means every buffer would be dropped in silence — "Listening…"
-        // over a dead mic. Fail loudly instead. Audit, 2026-09-11.
-        guard captureConverter != nil, hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
+        let converter = AVAudioConverter(from: hwFormat, to: captureFormat)
+        captureConverter = converter
+        voiceLog.notice("voice capture hw=\(hwFormat.sampleRate, privacy: .public)Hz ch=\(hwFormat.channelCount, privacy: .public) converter=\(converter != nil, privacy: .public)")
+        guard let converter, hwFormat.sampleRate > 0, hwFormat.channelCount > 0 else {
             voiceLog.error("voice capture unusable input format — no converter")
-            onCaptureError?()
-            return
+            return false
         }
-
-        // Tap the mic at the hardware format; convert each buffer to 16k Int16,
-        // run it through the RMS gate (live audio / pre-roll / digital silence
-        // / nothing during calibration), accumulate into 100ms frames, hand
-        // each frame to the uploader.
+        // The converter is captured by the tap itself: a restart removes the
+        // tap (waiting for an in-flight callback) before installing a new one
+        // with a new converter, so the render thread never reads a shared slot.
         input.installTap(onBus: 0, bufferSize: 2048, format: hwFormat) { [weak self] buffer, _ in
-            guard let self, let converter = self.captureConverter else { return }
+            guard let self else { return }
             guard let samples = self.convertToCapture(buffer, converter) else { return }
             self.lock.lock()
             if self.recalibratePending { self.recalibratePending = false; self.gate.recalibrate() }
@@ -257,6 +340,8 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
             for f in out { onFrame(f) }
             if gated.closed { self.onGateChange?(false) }
         }
+        tapInstalled = true
+        return true
     }
 
     func setGateContext(_ ctx: GateContext) {
@@ -384,7 +469,12 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         gainRamp += 1
         lock.unlock()
         guard wasStarted else { return }
+        graphLock.lock(); defer { graphLock.unlock() }
+        if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
+        configObserver = nil
+        onFrame = nil
         engine.inputNode.removeTap(onBus: 0)
+        tapInstalled = false
         player.stop()
         engine.stop()
         try? engine.inputNode.setVoiceProcessingEnabled(false)
@@ -396,4 +486,27 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     /// half-duplex fallback (gate `onFrame` on `!isPlaying`) if a device shows
     /// loudspeaker self-triggering. Unused while we run full-duplex.
     var isPlaying: Bool { player.isPlaying }
+}
+
+/// Loop guard for engine restarts on configuration changes: a restart that
+/// itself provoked another change would otherwise spin for ever with the mic
+/// flapping. Allows `maxRestarts` within a sliding `window` (seconds); the
+/// engine ends the session past that. Pure — unit-tested.
+struct EngineRestartPolicy: Sendable {
+    var maxRestarts = 6
+    var window: TimeInterval = 10
+    private var stamps: [TimeInterval] = []
+
+    init(maxRestarts: Int = 6, window: TimeInterval = 10) {
+        self.maxRestarts = maxRestarts
+        self.window = window
+    }
+
+    /// True if a restart may go ahead now (and records it).
+    mutating func allowRestart(now: TimeInterval) -> Bool {
+        stamps.removeAll { now - $0 > window }
+        guard stamps.count < maxRestarts else { return false }
+        stamps.append(now)
+        return true
+    }
 }
