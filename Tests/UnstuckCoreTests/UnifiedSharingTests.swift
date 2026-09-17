@@ -339,4 +339,42 @@ final class UnifiedSharingTests: XCTestCase {
         XCTAssertEqual(r.pending?.recipientUserId, "u1")
         XCTAssertNil(r.pending?.recipientEmail)
     }
+
+    // MARK: - picker split (2026-09-17: never list the whole roster)
+
+    private func person(_ id: String, _ name: String, access: ShareAccess? = nil, handedOver: Bool = false, subtitle: String? = nil, email: String? = nil) -> SharePersonRow {
+        SharePersonRow(id: id, userId: id, name: name, subtitle: subtitle, email: email, access: access, handedOver: handedOver, shareId: access == nil ? nil : "s-\(id)")
+    }
+
+    func testSplitPutsOnlyPeopleWithAccessInline() {
+        let people = [person("a", "Amara"), person("b", "Bola", access: .edit), person("c", "Chidi"), person("d", "Dara", access: .view)] + (0..<6).map { person("x\($0)", "Extra \($0)") }
+        let split = sharePeopleSplit(people, pinned: [], handOver: false)
+        XCTAssertEqual(split.withAccess.map(\.name), ["Bola", "Dara"], "shared first, in roster order")
+        XCTAssertEqual(split.candidates.count, 8)
+        XCTAssertFalse(split.candidates.contains { $0.isShared })
+    }
+
+    func testSplitKeepsAPinnedRowInlineThroughAReload() {
+        let people = [person("a", "Amara"), person("b", "Bola")]
+        let split = sharePeopleSplit(people, pinned: ["b"], handOver: false)
+        XCTAssertEqual(split.withAccess.map(\.id), ["b"], "the row just tapped stays put until the reload lands")
+        XCTAssertEqual(split.candidates.map(\.id), ["a"])
+    }
+
+    func testSplitInHandOverModeIsAboutTheHolder() {
+        let people = [person("a", "Amara", access: .edit), person("b", "Bola", handedOver: true)]
+        let split = sharePeopleSplit(people, pinned: [], handOver: true)
+        XCTAssertEqual(split.withAccess.map(\.id), ["b"], "only the holder is inline; an editor is still a candidate to hand it to")
+        XCTAssertEqual(split.candidates.map(\.id), ["a"])
+    }
+
+    func testCandidatesFilterByNameLabelAndEmailCaseInsensitively() {
+        let people = [person("a", "Amara Okafor", subtitle: "Coach"), person("b", "Bola", email: "bola@example.com"), person("c", "Chidi")]
+        XCTAssertEqual(sharePeopleCandidates(people, query: "").count, 3)
+        XCTAssertEqual(sharePeopleCandidates(people, query: "  ").count, 3, "blank query is no filter")
+        XCTAssertEqual(sharePeopleCandidates(people, query: "oka").map(\.id), ["a"])
+        XCTAssertEqual(sharePeopleCandidates(people, query: "COACH").map(\.id), ["a"])
+        XCTAssertEqual(sharePeopleCandidates(people, query: "example").map(\.id), ["b"])
+        XCTAssertTrue(sharePeopleCandidates(people, query: "zzz").isEmpty)
+    }
 }

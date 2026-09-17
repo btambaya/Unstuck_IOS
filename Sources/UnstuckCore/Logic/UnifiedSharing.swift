@@ -521,3 +521,34 @@ private func nonBlank(_ s: String?) -> String? {
     let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
     return t.isEmpty ? nil : t
 }
+
+// MARK: - Who has it vs. who could (the picker model)
+
+/// The People section never lists a whole roster: it shows the people who
+/// already have the item (each with its access menu) and hands everyone else
+/// to a searchable picker. Ahmad, 2026-09-17: "ten people is a wall".
+public struct SharePeopleSplit: Equatable, Sendable {
+    /// Already shared / handed over — pinned people stay here through a
+    /// reload so a row never disappears under the finger.
+    public var withAccess: [SharePersonRow]
+    /// Everyone else, in roster order — the picker's list.
+    public var candidates: [SharePersonRow]
+    public init(withAccess: [SharePersonRow], candidates: [SharePersonRow]) {
+        self.withAccess = withAccess
+        self.candidates = candidates
+    }
+}
+
+public func sharePeopleSplit(_ people: [SharePersonRow], pinned: Set<String>, handOver: Bool) -> SharePeopleSplit {
+    let ordered = sharePeopleOrdered(people, pinned: pinned)
+    let has: (SharePersonRow) -> Bool = { handOver ? $0.handedOver : ($0.isShared || pinned.contains($0.id)) }
+    return SharePeopleSplit(withAccess: ordered.filter(has), candidates: ordered.filter { !has($0) })
+}
+
+/// The picker's rows for a query: every candidate when the query is blank,
+/// otherwise the ones whose name / label / email contain it (case-insensitive).
+public func sharePeopleCandidates(_ candidates: [SharePersonRow], query: String) -> [SharePersonRow] {
+    let trimmed = query.trimmingCharacters(in: .whitespaces)
+    if trimmed.isEmpty { return candidates }
+    return candidates.filter { sharePersonMatches($0, query: trimmed) }
+}

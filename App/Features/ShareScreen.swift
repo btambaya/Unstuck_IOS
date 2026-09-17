@@ -486,11 +486,9 @@ struct ShareScreen: View {
     @State private var vm: ShareScreenModel?
     @State private var linkToShare: ShareLinkItem?
     @State private var reportTarget: SharePersonRow?
-    /// People card state — lives on the sheet, so it survives every reload
-    /// (the list never snaps shut under the finger) and resets on the next
-    /// presentation (the tidy collapsed card is the default every time).
-    @State private var peopleExpanded = false
-    @State private var peopleQuery = ""
+    /// The searchable "Choose someone" picker (Ahmad, 2026-09-17: never list
+    /// everyone — ten people is a wall; a dropdown you can search).
+    @State private var showPicker = false
 
     var body: some View {
         NavigationStack {
@@ -583,19 +581,17 @@ struct ShareScreen: View {
     /// The People card. Rows abut inside ONE 12pt surface card (the Share
     /// screen's own card radius — `linkSection` / `pendingRow`), divided by
     /// `CardDivider`. Order + collapse + search are the pure
-    /// `sharePeopleLayout`; only `peopleExpanded` / `peopleQuery` are local.
-    /// No accent token is used anywhere in the section: the monogram carries
-    /// the shared / not-shared state with the app's selected / unselected chip
-    /// pair (`ink`-on-`bg` vs `bg2` / `ink2` / `line2`), so the card looks the
-    /// same under every accent, in light and dark.
+    /// The section shows ONLY the people who already have the item (usually
+    /// none to a few), each a row with its access menu, and one "Choose
+    /// someone" control that opens a searchable picker of everyone else.
+    /// Nobody's whole roster is ever listed inline (Ahmad, 2026-09-17).
     @ViewBuilder
     private func peopleSection(_ vm: ShareScreenModel) -> some View {
-        let count = vm.people.count
+        let split = sharePeopleSplit(vm.people, pinned: vm.pinnedIds, handOver: mode == .handOver)
         let noun = mode == .share ? "People" : "Hand over to"
-        let layout = sharePeopleLayout(vm.people, pinned: vm.pinnedIds, expanded: peopleExpanded, query: peopleQuery)
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(count == 0 ? noun : "\(noun) · \(count)")
-                .accessibilityLabel("\(noun), \(count)")
+            SectionLabel(split.withAccess.isEmpty ? noun : "\(noun) · \(split.withAccess.count)")
+                .accessibilityLabel("\(noun), \(split.withAccess.count)")
             if vm.loading && vm.people.isEmpty {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
             } else if vm.people.isEmpty {
@@ -605,29 +601,54 @@ struct ShareScreen: View {
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                if layout.showsSearch { peopleSearch }
-                if layout.rows.isEmpty {
-                    Text("No one matches “\(peopleQuery.trimmingCharacters(in: .whitespaces))”.")
-                        .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else {
-                    VStack(spacing: 0) {
-                        ForEach(Array(layout.rows.enumerated()), id: \.element.id) { idx, row in
-                            if idx > 0 { CardDivider() }
-                            personRow(vm, row)
-                        }
-                        if layout.canCollapse {
-                            CardDivider()
-                            disclosureRow(hiddenCount: layout.hiddenCount)
-                                .opacity(vm.busyId != nil ? 0.6 : 1)   // dims with the sibling rows
-                        }
+                VStack(spacing: 0) {
+                    ForEach(Array(split.withAccess.enumerated()), id: \.element.id) { idx, row in
+                        if idx > 0 { CardDivider() }
+                        personRow(vm, row)
                     }
-                    .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-                    .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line))
-                    .accessibilityElement(children: .contain)
+                    if !split.candidates.isEmpty {
+                        if !split.withAccess.isEmpty { CardDivider() }
+                        chooseRow(vm, count: split.candidates.count)
+                    }
                 }
+                .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line))
+                .accessibilityElement(children: .contain)
             }
         }
+        .sheet(isPresented: $showPicker) {
+            PeoplePickerSheet(title: mode == .share ? "Share with" : "Hand over to",
+                              action: mode == .share ? "Share" : "Hand over",
+                              people: split.candidates) { row in
+                showPicker = false
+                Task { await vm.tap(row) }
+            }
+        }
+    }
+
+    /// The dropdown: "Choose someone ⌄" — opens the searchable picker.
+    private func chooseRow(_ vm: ShareScreenModel, count: Int) -> some View {
+        Button { showPicker = true } label: {
+            HStack(spacing: 10) {
+                Image(systemName: "person.crop.circle.badge.plus")
+                    .font(.system(size: 18, weight: .regular)).foregroundStyle(theme.palette.coral)
+                    .frame(width: monogramSize, height: monogramSize)
+                Text(mode == .share ? "Choose someone" : "Choose who gets it")
+                    .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                Text("· \(count)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.down").font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.palette.ink3)
+            }
+            .padding(.horizontal, 16)
+            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(vm.busyId != nil)
+        .opacity(vm.busyId != nil ? 0.6 : 1)
+        .accessibilityLabel("Choose someone, \(count) people")
+        .accessibilityHint("Opens a searchable list")
     }
 
     /// One 44pt row. The WHOLE row is the control (a Button that shares /
@@ -752,21 +773,25 @@ struct ShareScreen: View {
                 Text(row.statusLabel ?? "Handed over").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Hand over").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.coralDeep)
+                Text("Hand over").font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(theme.palette.coral, in: Capsule())
             }
         } else if row.isShared {
             HStack(spacing: 4) {
-                Text(row.statusLabel ?? "Shared").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.coralDeep)
+                Text(row.statusLabel ?? "Shared").font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
                     .fixedSize(horizontal: false, vertical: true)
                 Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(theme.palette.coralDeep)
+                    .foregroundStyle(Color.white)
             }
-            .padding(.horizontal, 10).padding(.vertical, 5)
-            .background(theme.palette.coralSoft, in: Capsule())
+            .padding(.horizontal, 11).padding(.vertical, 6)
+            .background(theme.palette.coral, in: Capsule())
         } else {
-            Text("Share").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.coralDeep)
+            Text("Share").font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
                 .fixedSize(horizontal: false, vertical: true)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .background(theme.palette.coral, in: Capsule())
         }
     }
 
@@ -797,57 +822,10 @@ struct ShareScreen: View {
         } label: { Label(row.handedOver ? "Take it back" : "Remove", systemImage: "xmark") }
     }
 
-    /// "Show N more ⌄" / "Show less ⌃" — the last row of the same card.
-    /// Collapsing clears any Find query so the tidy card comes back whole.
-    private func disclosureRow(hiddenCount: Int) -> some View {
-        Button {
-            withAnimation(reduceMotion ? nil : .snappy(duration: 0.22)) { peopleExpanded.toggle() }
-            if !peopleExpanded { peopleQuery = "" }
-        } label: {
-            HStack(spacing: 6) {
-                Text(sharePeopleDisclosureTitle(hiddenCount: hiddenCount, expanded: peopleExpanded))
-                    .font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink2)
-                    .fixedSize(horizontal: false, vertical: true)
-                Image(systemName: peopleExpanded ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(theme.palette.ink3)
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 16)
-            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(peopleExpanded ? "Show fewer people" : "Show \(hiddenCount) more people")
-        .accessibilityValue(peopleExpanded ? "Expanded" : "Collapsed")
-    }
-
     /// The Find field — the unselected chip capsule stretched to a field.
     /// Only when EXPANDED with ten or more people, and never auto-focused:
     /// the default collapsed view must not put a second text field 40pt
     /// above the "Someone new" email field.
-    private var peopleSearch: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "magnifyingglass").font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(theme.palette.ink3)
-            TextField("Find someone", text: $peopleQuery)
-                .font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
-                .textInputAutocapitalization(.never).autocorrectionDisabled().submitLabel(.search)
-                .accessibilityLabel("Find a person")
-            if !peopleQuery.isEmpty {
-                Button { peopleQuery = "" } label: {
-                    Image(systemName: "xmark.circle.fill").font(.system(size: 14)).foregroundStyle(theme.palette.ink3)
-                        .frame(width: 44, height: 44).contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Clear search")
-            }
-        }
-        .padding(.leading, 12).padding(.trailing, peopleQuery.isEmpty ? 12 : 0)
-        .frame(minHeight: 44)
-        .background(theme.palette.bg2, in: Capsule())
-        .overlay(Capsule().stroke(theme.palette.line2))
-    }
-
     // MARK: someone new
 
     private func someoneNewSection(_ vm: ShareScreenModel) -> some View {
@@ -867,7 +845,7 @@ struct ShareScreen: View {
                     // white on dark `ink` (L 0.96) was invisible in dark mode.
                     Text(busy ? "Sharing…" : "Share").font(UFont.sans(13, .semibold)).foregroundStyle(Color.white)
                         .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(theme.palette.coralDeep, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                        .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                         .frame(minHeight: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -974,4 +952,65 @@ private struct ShareActivitySheet: UIViewControllerRepresentable {
         UIActivityViewController(activityItems: [url], applicationActivities: nil)
     }
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+/// The searchable dropdown behind "Choose someone": a system list of everyone
+/// you are connected to who does NOT have the item yet, a search field, one
+/// tap to share / hand over. Medium detent, grows to large.
+private struct PeoplePickerSheet: View {
+    @Environment(\.uTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    let action: String
+    let people: [SharePersonRow]
+    let onPick: (SharePersonRow) -> Void
+    @State private var query = ""
+
+    private var rows: [SharePersonRow] { sharePeopleCandidates(people, query: query) }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if rows.isEmpty {
+                    Text(people.isEmpty ? "Everyone you're connected to already has it."
+                                        : "No one matches “\(query.trimmingCharacters(in: .whitespaces))”.")
+                        .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
+                        .listRowBackground(Color.clear)
+                } else {
+                    ForEach(rows) { row in
+                        Button { onPick(row) } label: {
+                            HStack(spacing: 12) {
+                                Text(String(row.name.prefix(1)).uppercased())
+                                    .font(UFont.sans(11, .semibold)).foregroundStyle(theme.palette.ink2)
+                                    .frame(width: 30, height: 30)
+                                    .background(theme.palette.bg2, in: Circle())
+                                    .overlay(Circle().stroke(theme.palette.line2))
+                                    .accessibilityHidden(true)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(row.name).font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink)
+                                    if let sub = row.subtitle {
+                                        Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                                    }
+                                }
+                                Spacer(minLength: 8)
+                                Text(action).font(UFont.sans(12, .semibold)).foregroundStyle(Color.white)
+                                    .padding(.horizontal, 12).padding(.vertical, 6)
+                                    .background(theme.palette.coral, in: Capsule())
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(action) with \(row.name)")
+                    }
+                }
+            }
+            .listStyle(.plain)
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search people")
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } } }
+            .background(theme.palette.bg)
+        }
+        .presentationDetents([.medium, .large])
+    }
 }
