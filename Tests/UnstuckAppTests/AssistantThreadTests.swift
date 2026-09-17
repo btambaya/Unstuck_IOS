@@ -35,6 +35,29 @@ final class AssistantThreadTests: XCTestCase {
                                   toolCalls: [ToolCall(id: "c1", type: "function", function: ToolFunction(name: name, arguments: "{}"))]), at: 2)
     }
 
+    // MARK: interview prompts in the thread (InterviewThread)
+
+    func testInterviewPromptMetaRoundTripsAndStaysOutOfTheModelWindow() throws {
+        // A question the interview posted: a LOCAL assistant turn tagged with
+        // its key (the sheet keys the chip row on it); the user's chip tap is
+        // a LOCAL user bubble. Both display; neither reaches the model.
+        let q = AssistantTurn(ChatMessage(role: "assistant", content: "When’s your head clearest?"),
+                              at: 4, local: true, interview: InterviewPromptMeta(key: "rhythm"))
+        let tap = AssistantTurn(ChatMessage(role: "user", content: "Morning"), at: 5, local: true)
+        let turns = [user("hi"), assistant("Hello."), q, tap]
+        XCTAssertEqual(AssistantModel.displayTurns(turns).map(\.text),
+                       ["hi", "Hello.", "When’s your head clearest?", "Morning"])
+        XCTAssertEqual(AssistantModel.modelWindow(turns).map(\.content), ["hi", "Hello."])
+        let data = try JSONEncoder().encode(turns)
+        let back = try JSONDecoder().decode([AssistantTurn].self, from: data)
+        XCTAssertEqual(back[2].interview, InterviewPromptMeta(key: "rhythm"))
+        XCTAssertNil(back[3].interview)
+        XCTAssertTrue(back[3].isLocal)
+        // A thread persisted before the field existed decodes with no prompt.
+        let legacy = try JSONDecoder().decode([AssistantTurn].self, from: try JSONEncoder().encode([user("old")]))
+        XCTAssertNil(legacy[0].interview)
+    }
+
     // MARK: display filter (lib/assistant/display.ts parity)
 
     func testATurnWithTwoToolRoundsAndAFinalReplyRendersOneAssistantBubble() {

@@ -1,8 +1,9 @@
 // Today — 1:1 with the Android TodayScreen: Orbit + bell + avatar header, a
-// date eyebrow + "<greeting>, <first name>." serif line ("Unstuck." when no
-// name is set — web greeting-header parity), a "This week · focused"
-// pill, the gradient Start-Next hero (full-width Focus), the Today/Backlog +
-// area filter pills, and the filtered today list. Live store via GRDB.
+// date eyebrow + ONE-line "<greeting> <first name>." serif line ("Unstuck."
+// when no name is set — web greeting-header parity), a "This week · focused"
+// pill, the assistant input pill (the way into the assistant + Talk), the
+// gradient Start-Next hero (full-width Focus), the Today/Backlog + area
+// filter pills, and the filtered today list. Live store via GRDB.
 
 import SwiftUI
 import UIKit
@@ -35,6 +36,13 @@ enum GreetingName {
         let first = full.split(whereSeparator: { $0.isWhitespace || $0 == "." || $0 == "_" || $0 == "-" }).first
         return first.map(String.init)
     }
+
+    /// The ONE-line greeting: "Good evening Maya." — no line break (it used
+    /// to stack the name on a second line); no name → the brand "… Unstuck."
+    /// line. The view clamps it to one line and scales a long name down.
+    static func line(greeting: String, firstName: String?) -> String {
+        "\(greeting) \(firstName ?? "Unstuck")."
+    }
 }
 
 @MainActor
@@ -65,7 +73,8 @@ final class TodayModel {
     /// Backlog list).
     private var backlogBase: [TaskItem] = []
 
-    /// How many tasks sit in the Backlog (for the empty-hero pointer).
+    /// How many tasks sit in the Backlog (perf soak assertions; the hero no
+    /// longer points at the Backlog).
     private(set) var backlogCount: Int = 0
 
     func observe() async {
@@ -235,7 +244,7 @@ struct TodayView: View {
     @State private var notifsEnabled = true
     @State private var areaFilter: String?
     @State private var backlogActive = false
-    /// Realtime "Talk" mode from the gateway card's mic — the same
+    /// Realtime "Talk" mode from the assistant input pill's mic — the same
     /// VoiceModeScreen cover the Assistant sheet presents for its Talk button.
     /// Router-owned (`AppRouter.showTalk`) so the assistant navigating from
     /// Talk goes through the deferred deep-link path: Talk counts as an active
@@ -260,22 +269,14 @@ struct TodayView: View {
                     let hero = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter,
                                             excludeIds: model.shareState.assignedOutIds)
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
-                    // The AI gateway — brief + one moment + composer — sits
-                    // between the greeting and the recap/hero (additive; the
-                    // classic Today continues underneath). Renders nothing
-                    // while the AI kill-switch is off.
-                    GatewayCard(vm: vm, onTalk: { model.router.showTalk = true })
-                        .padding(.horizontal, 18).padding(.top, 10)
                     // "Just now" session recap — shows for 6h after a finished
-                    // focus session, between the gateway and the hero
+                    // focus session, between the header and the hero
                     // (Android TodayScreen recap parity).
                     if let recap = model.lastRecap,
                        Date().timeIntervalSince1970 * 1000 - recap.at < 6 * 3_600_000 {
                         recapCard(recap).padding(.horizontal, 18).padding(.top, 8)
                     }
-                    // The quiet nudge card is no longer rendered: gateway
-                    // moments replace it (they subsume slip radar / habit
-                    // gaps — docs/ios-gateway-plan.md decision 2). The
+                    // The quiet nudge card is not rendered on Today; the
                     // `computeNudges` path + `nudgeCard` stay for parity/tests.
                     heroOrEmpty(vm, hero: hero).padding(.horizontal, 18).padding(.top, 14)
                     filterBar(vm)
@@ -294,7 +295,7 @@ struct TodayView: View {
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
         // Row context menu "Share…" → the ONE Share screen.
         .sheet(item: $shareTarget) { target in ShareScreen(target: target) }
-        // Gateway mic → realtime Talk. Same cover the Assistant sheet uses.
+        // Input-pill mic → realtime Talk. Same cover the Assistant sheet uses.
         // onDismiss flushes a deep link the assistant parked while Talk was
         // up (open_screen → insights / inbox / settings) so it presents once
         // the cover is fully gone.
@@ -363,16 +364,21 @@ struct TodayView: View {
     }
 
     // Greeting block — scrolls with the content (only topBar is pinned).
-    // Greets by first name (web greeting-header.tsx parity: "Good evening,
-    // Maya."); no name → the brand "Unstuck." line, exactly as before. Reads
-    // the CACHED identity (currentUserName → cachedUserName — the same source
-    // Settings · Account shows), never the keychain-backed session in body (T4).
+    // Greets by first name on ONE line ("Good evening Maya."); no name → the
+    // brand "Unstuck." line. Reads the CACHED identity (currentUserName →
+    // cachedUserName — the same source Settings · Account shows), never the
+    // keychain-backed session in body (T4). The assistant input pill sits
+    // directly under the week pill — the way into the assistant and Talk.
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             SectionLabel(dateEyebrow).foregroundStyle(theme.palette.primaryDeep)
-            Text("\(greeting)\n\(GreetingName.firstName(model.currentUserName) ?? "Unstuck").")
+            Text(GreetingName.line(greeting: greeting, firstName: GreetingName.firstName(model.currentUserName)))
                 .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
+                .lineLimit(1).minimumScaleFactor(0.7)
             weekPill
+            if model.assistantEnabled {
+                AssistantInputPill(onTalk: { model.router.showTalk = true }).padding(.top, 10)
+            }
         }
         .padding(.horizontal, 18).padding(.bottom, 4)
     }
@@ -436,26 +442,12 @@ struct TodayView: View {
                         in: RoundedRectangle(cornerRadius: 24, style: .continuous))
             .tourTarget(.startNext)
         } else if vm.backlogCount > 0 {
-            // Nothing scheduled today — point to the Backlog (don't pull a backlog
-            // task into the hero). Tapping flips the list below to the Backlog.
-            Button { backlogActive = true } label: {
-                VStack(alignment: .leading, spacing: 0) {
-                    SectionLabel("Nothing scheduled today").foregroundStyle(theme.palette.primaryDeep)
-                    Text("Pick something to start.")
-                        .font(UFont.sans(21, .bold)).foregroundStyle(theme.palette.ink).padding(.top, 6)
-                    HStack(spacing: 6) {
-                        Text("\(vm.backlogCount) in your backlog")
-                            .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.primaryDeep)
-                        Text("→").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.primaryDeep)
-                    }.padding(.top, 4)
-                }
-                .padding(18)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
-                            in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-            }.buttonStyle(.plain)
-                // Tour fallback: no hero → the backlog pointer stands in.
-                .tourTarget(.backlogPointer)
+            // Nothing scheduled today but a Backlog exists: no card here —
+            // the list below (and its Backlog pill) already say so. The
+            // "Nothing scheduled today / Pick something to start" pointer is
+            // gone (2026-09-17); the tour's today/finish steps fall back to
+            // the list section (.todayList).
+            EmptyView()
         } else {
             VStack(spacing: 10) {
                 Mark(size: 48)
@@ -847,5 +839,68 @@ struct TodayView: View {
     }
     private var dateEyebrow: String {
         TodayFmt.eyebrow.string(from: Date())
+    }
+}
+
+// MARK: - assistant input pill
+
+/// The way into the assistant from Today: ONE pill directly under the week
+/// pill — "✦ Ask, plan, or brain-dump…" with the mic on the right — drawn
+/// exactly like the composer the old gateway card carried (surface capsule,
+/// coral ring, ✦ leading glyph, mic + send affordances). Tapping the field
+/// (or the arrow) opens the Assistant sheet with focus in ITS composer;
+/// the mic starts realtime Talk. No typing happens here. Renders nothing
+/// while the AI kill-switch is off (the caller gates on `assistantEnabled`).
+struct AssistantInputPill: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    /// Talk-mode entry — the host presents VoiceModeScreen, exactly as the
+    /// Assistant sheet does for its Talk button.
+    let onTalk: () -> Void
+
+    static let placeholder = "Ask, plan, or brain-dump…"
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Button { model.openAssistant(focusComposer: true) } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 14, weight: .semibold)).foregroundStyle(theme.palette.coral)
+                        .accessibilityHidden(true)
+                    Text(Self.placeholder)
+                        .font(UFont.sans(14.5)).foregroundStyle(theme.palette.ink3)
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                }
+                .padding(.leading, 13).padding(.vertical, 12)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }.buttonStyle(.plain)
+                .accessibilityLabel("Ask the assistant")
+                .accessibilityHint("Opens the assistant")
+                .accessibilityIdentifier("home-ask-pill")
+            if model.voiceConfigured {
+                // 44pt hit targets (HIG) — the glyphs stay 34pt visually.
+                Button(action: onTalk) {
+                    Image(systemName: "mic")
+                        .font(.system(size: 15, weight: .medium)).foregroundStyle(theme.palette.coral)
+                        .frame(width: 44, height: 44).contentShape(Circle())
+                }.buttonStyle(.plain)
+                    .accessibilityLabel("Talk to your assistant")
+            }
+            // The send affordance of the composer it replaces — the empty-field
+            // look (nothing to send yet); it opens the assistant like the field.
+            Button { model.openAssistant(focusComposer: true) } label: {
+                Image(systemName: "arrow.right")
+                    .font(.system(size: 14, weight: .bold)).foregroundStyle(.white)
+                    .frame(width: 34, height: 34)
+                    .background(theme.palette.coral.opacity(0.3), in: Circle())
+                    .frame(width: 44, height: 44).contentShape(Circle())
+            }.buttonStyle(.plain)
+                .accessibilityHidden(true)
+        }
+        .frame(minHeight: 44)
+        .background(theme.palette.surface, in: Capsule())
+        .overlay(Capsule().stroke(theme.palette.coral.opacity(0.55), lineWidth: 1.5))
     }
 }

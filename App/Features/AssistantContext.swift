@@ -172,9 +172,13 @@ func assistantContextJSON(_ ctx: [String: AnyJSON]) -> String {
 
 // MARK: - voice opening + instructions
 
-/// What the voice assistant should do the instant a session opens. First
-/// contact (no saved facts) = the get-to-know-you interview; otherwise a
-/// by-name hello. Sent as a hidden primer the user never sees.
+/// What the voice assistant should do the instant a session opens. While the
+/// get-to-know-you interview is PENDING on this account (not finished or
+/// skipped — the same flag the in-thread interview keeps), the primer greets
+/// and asks the script's questions one at a time, saving each answer with
+/// `save_profile_fact`, letting them skip, doing their own requests first,
+/// and closing with `finish_interview`; otherwise a by-name hello. Sent as a
+/// hidden primer the user never sees.
 @MainActor
 func buildVoiceOpening(_ api: AssistantAppState) -> String {
     let facts = api.getProfileFacts()
@@ -184,10 +188,13 @@ func buildVoiceOpening(_ api: AssistantAppState) -> String {
     if ProfileFactsLogic.noNamePreference(facts) {
         return "(Voice session just opened. They have asked NOT to be addressed by name — greet them warmly WITHOUT any name, one short sentence, ask what's on their mind, then listen. Greeting happens ONCE — never repeat it after an interruption.)"
     }
-    if knowsThem {
+    if !api.interviewPending() {
         return "(Voice session just opened. One short hello using \"\(first)\" and a plain question — \"Hey \(first). What's on your plate?\" — then listen. That's the only time you say their name this conversation. This greeting happens ONCE — after any interruption, continue the conversation naturally; never greet again or start over.)"
     }
-    return "(Voice session just opened and you have never met this person. Say: \"Hey \(first) — before we start, can I ask a few quick things so I plan around your actual life? First one: when's your head clearest, mornings, afternoons or evenings?\" Then listen. Work through these one at a time, in plain spoken questions, never more than one per turn: their work days and hours; people whose schedules shape theirs (names help); fixed weekly commitments; times to never schedule anything; how they want to be nudged. MANDATORY after EVERY answer: call save_profile_fact before you speak again — an answer you don't save is lost. Let them skip anything; the moment they'd rather get on with something, do that first. This intro happens ONCE — after an interruption, continue where you left off, never re-greet or restart.)"
+    let met = knowsThem
+        ? "you know a little about this person already (the profile facts) but they have not been through your get-to-know-you questions — skip any question the facts already answer"
+        : "you have never met this person"
+    return "(Voice session just opened and \(met). Say: \"Hey \(first) — before we start, can I ask a few quick things so I plan around your actual life? First one: when's your head clearest, mornings, afternoons or evenings?\" Then listen. Work through these one at a time, in plain spoken questions, never more than one per turn: \(InterviewVoice.questionList()). MANDATORY after EVERY answer: call save_profile_fact before you speak again — an answer you don't save is lost. Any question can be skipped — say fine and move to the next. The moment they'd rather get on with something, do that first, then come back to the next question. Once you have been through ALL of them — answered or skipped — call finish_interview, then carry on normally; never ask them again after that. This intro happens ONCE — after an interruption, continue where you left off, never re-greet or restart.)"
 }
 
 /// Voice (realtime) system prompt + live context — session.instructions.
@@ -310,6 +317,9 @@ func buildVoiceInstructions(_ api: AssistantAppState) -> String {
             "fact": p("string", "One short sentence, e.g. \"Sam — partner, works night shifts\"."),
             "whenIso": p("string", "YYYY-MM-DD when the fact is about a date (birthday, show, deadline) — enables reminders."),
         ]),
+        // iOS voice-only: closes the first-meeting intro the opening primer
+        // runs (the in-thread interview closes itself through its chips).
+        fn("finish_interview", "Call once you have been through EVERY get-to-know-you question from the opening (answered or skipped) — marks the intro done so it is never asked again. Only during that intro.", [], [:]),
         fn("get_schedule", "Read the schedule before answering any what's-on question.", ["range"], [
             "range": p("string", "today | tomorrow | week | next_week."),
         ]),

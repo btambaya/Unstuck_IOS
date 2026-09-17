@@ -449,7 +449,7 @@ struct AssistantShareConfirmCard: View {
                     .font(UFont.sans(11.5)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
                 if let message = error ?? (failed ? "Couldn't share — try again." : nil) {
-                    Text(message).font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
+                    Text(message).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                 }
                 HStack(spacing: 8) {
                     Button {

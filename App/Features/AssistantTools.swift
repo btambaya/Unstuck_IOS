@@ -130,6 +130,19 @@ protocol AssistantAppState: AnyObject {
     func setNotificationLevel(_ level: String) async -> Bool
     func setReminderLead(_ minutes: Int) async -> Bool
     func setRitual(_ ritual: String, on: Bool)
+    // ── first-run interview ──
+    /// True until the get-to-know-you interview is finished or skipped on
+    /// this account (InterviewMachine's done flag): the voice opening asks
+    /// the questions while it is.
+    func interviewPending() -> Bool
+    /// `finish_interview`: the model has been through every question — set
+    /// the same done flag the in-thread interview sets.
+    func markInterviewDone()
+}
+
+extension AssistantAppState {
+    func interviewPending() -> Bool { !InterviewMachine.isDone() }
+    func markInterviewDone() { InterviewMachine.markDone() }
 }
 
 /// Tools that never change anything — a success here must NOT count as "the
@@ -570,6 +583,14 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             // should retry, not rephrase.
             return "error: couldn't save that just now — try again"
         }
+
+    case "finish_interview":
+        // Voice only (the text interview finishes itself through its chips):
+        // the model has been through the get-to-know-you questions —
+        // answered or skipped — so the SAME done flag is set, and no host
+        // asks them again.
+        api.markInterviewDone()
+        return "ok: intro done — never ask those questions again"
 
     case "get_schedule":
         return renderSchedule(api, range: args.str("range") ?? "week")

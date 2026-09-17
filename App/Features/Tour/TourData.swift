@@ -88,7 +88,6 @@ enum TourStepView: String, Sendable {
 /// Real views register live frames for these via `.tourTarget(_:)`.
 enum TourTargetID: String, CaseIterable, Sendable {
     case startNext = "start-next"
-    case backlogPointer = "backlog-pointer"
     case todayList = "today-list"
     case firstAction = "first-action"
     case newTask = "new-task"
@@ -164,9 +163,9 @@ enum TourScript {
             primary: "Continue"),
         TourStep(
             id: "today", stage: "Today", view: .today,
-            // Empty-account fallback: a brand-new account with no tasks renders
-            // NO hero card at all — spotlight the backlog pointer / Today list.
-            target: .startNext, targetFallbacks: [.backlogPointer, .todayList],
+            // Empty-account fallback: an account with nothing scheduled renders
+            // NO hero card at all — spotlight the Today list instead.
+            target: .startNext, targetFallbacks: [.todayList],
             title: "Today narrows it down",
             body: "Start Next offers one realistic suggestion — with a short reason, like the time it fits. It’s a recommendation, never a command. Today shows only planned work; everything else waits in Backlog.",
             narration: "This is Today. Instead of a long list, Start Next offers one realistic suggestion, with a short reason — like the gap it fits before your next meeting. It’s a suggestion, never a command. Today shows only planned work; everything else waits quietly in your Backlog.",
@@ -224,7 +223,7 @@ enum TourScript {
             primary: "Continue"),
         TourStep(
             id: "finish", stage: "Begin", view: .today,
-            target: .startNext, targetFallbacks: [.backlogPointer, .todayList],
+            target: .startNext, targetFallbacks: [.todayList],
             title: "You’re ready to begin",
             body: "That’s the loop: Today narrows things down, the first physical action gets you moving, Focus sustains it, and the Assistant helps when you’re stuck. Pick one real next step.",
             narration: "That’s the core loop. Today narrows things down. The first physical action gets you moving. Focus sustains it. And the Assistant is there when you get stuck. You don’t need to learn everything today — just choose one real next step, and begin.",

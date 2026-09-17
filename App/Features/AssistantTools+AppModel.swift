@@ -143,6 +143,15 @@ final class AppModelAssistantState: AssistantAppState {
     func saveStylePreference(_ pref: StylePreference) -> ProfileFact? { model.profileFacts?.saveStylePreference(pref) }
     func removeProfileFact(_ id: String) -> Bool { model.profileFacts?.remove(id: id) ?? false }
 
+    // MARK: first-run interview
+
+    func interviewPending() -> Bool { !InterviewMachine.isDone() }
+    /// Same flag + the same account mirror the in-thread interview uses.
+    func markInterviewDone() {
+        InterviewMachine.markDone()
+        model.pushInterviewDone()
+    }
+
     // MARK: captures
 
     func getCaptures() -> [Capture] {

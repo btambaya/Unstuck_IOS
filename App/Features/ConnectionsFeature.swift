@@ -352,7 +352,7 @@ private struct WaitingSection: View {
                 Text("Invites you've sent that haven't been claimed. They get in the moment they sign up with that address.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 if let err = vm.waitingError {
-                    Text(err).font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
+                    Text(err).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                 }
                 if !vm.waiting.isEmpty {
                     SettingsCard {
@@ -468,7 +468,7 @@ private struct AddSomeoneSection: View {
             Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             if let error {
-                Text(error).font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
+                Text(error).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
             }
             HStack(spacing: 8) {
                 Button(action: submit) {
@@ -590,7 +590,7 @@ private struct RedeemSection: View {
                     }
                     if let m = message {
                         Text(m.text).font(UFont.sans(12))
-                            .foregroundStyle(m.ok ? theme.palette.greenInk : theme.palette.theme.palette.red)
+                            .foregroundStyle(m.ok ? theme.palette.greenInk : theme.palette.red)
                     }
                 }
                 .padding(16)

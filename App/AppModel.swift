@@ -285,10 +285,15 @@ final class AppModel {
     var assistantEnabled: Bool { settings.assistantEnabled }
 
     /// The ONE way to open the Assistant panel (launcher, Siri deep link, the
-    /// guided tour). No-ops while the kill-switch is off, so a stale deep link
-    /// or tour step can never resurrect a disabled assistant.
-    func openAssistant() {
+    /// guided tour, Today's input pill). No-ops while the kill-switch is off,
+    /// so a stale deep link or tour step can never resurrect a disabled
+    /// assistant. `focusComposer` puts the keyboard in the sheet's composer
+    /// on open; `draft` pre-fills it (text typed elsewhere carries over).
+    func openAssistant(draft: String? = nil, focusComposer: Bool = false) {
         guard assistantEnabled else { return }
+        if focusComposer || !(draft ?? "").isEmpty {
+            assistant.requestComposer(draft: draft, focus: focusComposer)
+        }
         router.showAssistant = true
     }
 
@@ -777,6 +782,12 @@ final class AppModel {
         }
         // Debug hook: replay the tester-reported BULK calendar turn through the
         // real assistant (scripted transport, no network) — crash isolation.
+        // Debug hook: a canned one-line reply (no network, no LLM) so a UI walk
+        // can send a message and reach the interview-in-thread prompts.
+        if ProcessInfo.processInfo.environment["UITEST_ASSISTANT_CANNED"] == "1" {
+            AssistantModel.scrubPersisted()
+            assistant.transportOverride = CannedAssistantScript()
+        }
         if ProcessInfo.processInfo.environment["UITEST_ASSISTANT_BULK"] == "1" {
             AssistantModel.scrubPersisted()
             assistant.transportOverride = BulkAssistantScript()

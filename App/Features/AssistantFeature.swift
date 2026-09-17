@@ -51,9 +51,13 @@ struct AssistantTurn: Codable, Equatable, Identifiable {
     var pending: Bool?
     /// Deterministic ✓-cards for what this turn actually changed.
     var receipts: [Receipt]?
+    /// A local interview prompt (InterviewThread): which question this turn
+    /// asks, so the sheet can draw its chip row. Display-only.
+    var interview: InterviewPromptMeta?
 
     init(_ message: ChatMessage, id: String = newUUID(), at: Double? = nil,
-         local: Bool? = nil, hidden: Bool? = nil, pending: Bool? = nil, receipts: [Receipt]? = nil) {
+         local: Bool? = nil, hidden: Bool? = nil, pending: Bool? = nil, receipts: [Receipt]? = nil,
+         interview: InterviewPromptMeta? = nil) {
         self.id = id
         self.message = message
         self.at = at
@@ -61,6 +65,7 @@ struct AssistantTurn: Codable, Equatable, Identifiable {
         self.hidden = hidden
         self.pending = pending
         self.receipts = receipts
+        self.interview = interview
     }
 
     var role: String { message.role }
@@ -380,11 +385,42 @@ final class AssistantModel {
     // MARK: - local (zero-token) turns + the daily check-in
 
     /// Inject a LOCAL display-only assistant turn. Never enters the model
-    /// window; persists like any other display turn.
-    func appendLocal(_ content: String, receipts: [Receipt]? = nil) {
-        turns.append(AssistantTurn(ChatMessage(role: "assistant", content: content),
-                                   at: Self.nowMillis(), local: true, receipts: receipts))
+    /// window; persists like any other display turn. Returns the turn's id
+    /// (the interview driver keys its chip row on it).
+    @discardableResult
+    func appendLocal(_ content: String, receipts: [Receipt]? = nil, interview: InterviewPromptMeta? = nil) -> String {
+        let turn = AssistantTurn(ChatMessage(role: "assistant", content: content),
+                                 at: Self.nowMillis(), local: true, receipts: receipts, interview: interview)
+        turns.append(turn)
         persist()
+        return turn.id
+    }
+
+    /// A LOCAL user bubble — the interview echoes a tapped chip so the thread
+    /// reads as a conversation. Never enters the model window.
+    func appendLocalUser(_ content: String) {
+        turns.append(AssistantTurn(ChatMessage(role: "user", content: content), at: Self.nowMillis(), local: true))
+        persist()
+    }
+
+    // MARK: - composer hand-off (Today's input pill → the sheet's composer)
+
+    struct ComposerRequest: Equatable {
+        var draft: String?
+        var focus: Bool
+    }
+    @ObservationIgnored private var composerRequest: ComposerRequest?
+
+    /// Ask the NEXT presentation of the sheet to focus its composer and/or
+    /// pre-fill it — set by AppModel.openAssistant(draft:focusComposer:).
+    func requestComposer(draft: String?, focus: Bool) {
+        composerRequest = ComposerRequest(draft: draft, focus: focus)
+    }
+
+    /// The sheet takes the pending request exactly once on appear.
+    func takeComposerRequest() -> ComposerRequest? {
+        defer { composerRequest = nil }
+        return composerRequest
     }
 
     /// Once per day, when the panel opens onto an EXISTING conversation, say
@@ -654,7 +690,9 @@ final class AssistantModel {
     /// The system prompt + the live context snapshot, for the realtime session.
     func voiceInstructions() -> String { buildVoiceInstructions(api) }
 
-    /// Tool schemas for the realtime session — all 56 (incl. the four call tools), mirroring tools.ts VOICE_TOOLS.
+    /// Tool schemas for the realtime session — all 58: the 53 app tools + the
+    /// four call tools (tools.ts VOICE_TOOLS parity) + the iOS-only
+    /// `finish_interview` that closes the voice opening's intro.
     func voiceTools() -> [[String: Any]] { VOICE_TOOLS }
 }
 

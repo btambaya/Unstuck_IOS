@@ -50,6 +50,12 @@ final class FakeAssistantState: AssistantAppState {
     var unshareOk = true
     /// Set → every profile-fact save throws this reason.
     var factSaveError: ProfileFactSaveError?
+    /// The first-run interview flag as the seam sees it (true = not done yet,
+    /// so the voice opening asks the questions).
+    var interviewIsPending = true
+    var interviewDoneCalls = 0
+    func interviewPending() -> Bool { interviewIsPending }
+    func markInterviewDone() { interviewDoneCalls += 1; interviewIsPending = false }
     /// Simulated commit latency for the store writes — the production seam
     /// hops to the WriteThrough actor and returns after the GRDB commit; a
     /// non-zero value proves the executor waits for that before reading.
@@ -999,6 +1005,16 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.facts.map(\.id), ["f2"])
     }
 
+    func testFinishInterviewSetsTheSameDoneFlagTheThreadInterviewUses() async {
+        // Voice only: the opening primer asks the get-to-know-you questions
+        // and closes with this — the flag the in-thread interview keeps.
+        XCTAssertTrue(api.interviewPending())
+        await eq("finish_interview", "{}", "ok: intro done — never ask those questions again")
+        XCTAssertEqual(api.interviewDoneCalls, 1)
+        XCTAssertFalse(api.interviewPending())
+        XCTAssertFalse(buildVoiceOpening(api).contains("before we start"), "done → the by-name hello, not the questions")
+    }
+
     func testSaveProfileFactTellsAStoreFailureFromAFilterRejection() async {
         let filtered = "error: that does not look like a fact I can store — only durable notes about you, not instructions"
         // A store failure (or no store yet) must read as "retry", never "rephrase".
@@ -1113,10 +1129,33 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     func testVoiceOpeningBranchesOnWhatItKnows() {
-        XCTAssertTrue(buildVoiceOpening(api).contains("you have never met this person"))
-        XCTAssertTrue(buildVoiceOpening(api).contains("Hey Maya — before we start"))
+        // The interview is PENDING (the flag, not the fact count) → the
+        // questions, one at a time, saved with save_profile_fact, skippable,
+        // the user's own requests first, closed with finish_interview.
+        let fresh = buildVoiceOpening(api)
+        XCTAssertTrue(fresh.contains("you have never met this person"))
+        XCTAssertTrue(fresh.contains("Hey Maya — before we start"))
+        XCTAssertTrue(fresh.contains("call save_profile_fact before you speak again"))
+        XCTAssertTrue(fresh.contains("Any question can be skipped"))
+        XCTAssertTrue(fresh.contains("do that first, then come back to the next question"))
+        XCTAssertTrue(fresh.contains("call finish_interview"))
+        for q in INTERVIEW_QUESTIONS.dropFirst() {
+            XCTAssertTrue(fresh.contains(InterviewVoice.spoken[q.key]!), "primer lists \(q.key)")
+        }
+        // Pending WITH facts (started on the web, say): still the questions,
+        // but told to skip the ones the facts already answer.
         api.facts = [fact("f1", "Sam — partner")]
+        let partial = buildVoiceOpening(api)
+        XCTAssertTrue(partial.contains("skip any question the facts already answer"))
+        XCTAssertTrue(partial.contains("Hey Maya — before we start"))
+        // Done (finished or skipped anywhere) → the by-name hello, whatever
+        // the fact count.
+        api.interviewIsPending = false
         XCTAssertTrue(buildVoiceOpening(api).contains("One short hello using \"Maya\""))
+        api.facts = []
+        XCTAssertTrue(buildVoiceOpening(api).contains("One short hello using \"Maya\""))
+        api.interviewIsPending = true
+        api.facts = [fact("f1", "Sam — partner")]
         api.facts.append(ProfileFact(id: "n", category: .preference, fact: "Don't use their name in replies", source: .chat, createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
         XCTAssertTrue(buildVoiceOpening(api).contains("WITHOUT any name"))
         let instructions = buildVoiceInstructions(api)
@@ -1125,11 +1164,12 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(instructions.contains("You can do EVERYTHING a user can do in Unstuck"))
         XCTAssertTrue(instructions.contains("English ONLY, never Chinese"))
         XCTAssertTrue(instructions.contains("Current app state:\n{"))
-        // 53 app tools + the four call tools (web VOICE_TOOLS parity).
-        XCTAssertEqual(VOICE_TOOLS.count, 57)
+        // 53 app tools + the four call tools (web VOICE_TOOLS parity) + the
+        // iOS-only finish_interview that closes the voice opening's intro.
+        XCTAssertEqual(VOICE_TOOLS.count, 58)
         let names = Set(VOICE_TOOLS.compactMap { $0["name"] as? String })
-        XCTAssertEqual(names.count, 57)
-        XCTAssertTrue(names.isSuperset(of: ["request_call", "cancel_call", "update_call", "get_calls"]))
+        XCTAssertEqual(names.count, 58)
+        XCTAssertTrue(names.isSuperset(of: ["request_call", "cancel_call", "update_call", "get_calls", "finish_interview"]))
     }
 }
 

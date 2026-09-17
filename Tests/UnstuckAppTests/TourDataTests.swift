@@ -81,7 +81,9 @@ final class TourDataTests: XCTestCase {
         for id in ["today", "finish"] {
             let s = TourScript.essential.first { $0.id == id }!
             XCTAssertEqual(s.target, .startNext, id)
-            XCTAssertEqual(s.targetFallbacks, [.backlogPointer, .todayList], id)
+            // The "Nothing scheduled today" backlog pointer is gone from Today
+            // (2026-09-17): the list section is the one fallback.
+            XCTAssertEqual(s.targetFallbacks, [.todayList], id)
         }
     }
 

@@ -928,7 +928,7 @@ struct ShareScreen: View {
     @ViewBuilder
     private func feedback(_ vm: ShareScreenModel) -> some View {
         if let e = vm.error {
-            Text(e).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.theme.palette.red)
+            Text(e).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.red)
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityAddTraits(.updatesFrequently)
         } else if let r = vm.result {

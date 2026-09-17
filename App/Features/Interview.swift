@@ -10,10 +10,11 @@
 // on every sign-in hydrate (AppModel.applyServerInterviewFlag). Everything
 // saved is visible (and deletable) in Settings → "What Unstuck knows".
 //
-// Presented INLINE inside the gateway card on Today (web parity: an inline
-// panel, not a modal). The state machine (`InterviewMachine`) is pure and
-// UserDefaults-injectable so the step/auto-done/resume/skip rules are unit
-// tested without SwiftUI.
+// Presented INSIDE the assistant thread (InterviewThread.swift) — one
+// question per local assistant turn, chips + Skip underneath — and asked
+// aloud by the voice opening primer. The state machine (`InterviewMachine`)
+// is pure and UserDefaults-injectable so the step/auto-done/resume/skip
+// rules are unit tested without SwiftUI.
 
 import SwiftUI
 import UnstuckCore
@@ -256,18 +257,16 @@ final class InterviewMachine {
         notifyDone()
     }
 
-    /// Park the panel WITHOUT finishing (the header chevron): the step is
-    /// persisted so re-opening resumes here — also across relaunch — and,
-    /// while parked, the card shows the pill instead of popping the panel
-    /// open again (`shouldAutoOpen`). Nothing is marked done. Web parity: the
-    /// web has no "Skip for now"; its two controls are the per-question Skip
-    /// and the header "I'm done".
+    /// Park the interview WITHOUT finishing: the step is persisted so the
+    /// next visit resumes here — also across relaunch. Nothing is marked
+    /// done. Web parity: the web has no "Skip for now"; its two controls are
+    /// the per-question Skip and "I'm done".
     func collapse() { markInProgress() }
 
-    /// Persist the current step. The card calls this the moment it OPENS the
-    /// panel: the auto-open gate is per-process, so without a persisted step
-    /// a user with 0 facts got the panel at 1/N on EVERY cold launch — the
-    /// nag it exists to avoid. From then on the pill is the way in.
+    /// Persist the current step. The thread driver calls this the moment it
+    /// starts asking, so a mid-way parked step (> 0) is visible to the
+    /// ≥1-fact stand-down rule (`shouldAutoComplete`) and the questions
+    /// resume where they left off.
     func markInProgress() {
         defaults.set(step, forKey: Self.stepKey)
     }
@@ -346,201 +345,13 @@ final class InterviewMachine {
                                                parkedStep: Int? = nil) -> Bool {
         !done && !isOpen && (parkedStep ?? 0) == 0 && factCount >= 1
     }
-
-    /// Whether to open the interview by itself: nothing learned anywhere, not
-    /// done, and not parked ("Skip for now" persists a resume step — popping
-    /// back open on the next launch would be the nag it exists to avoid; the
-    /// pill is the way back in). Every question is skippable.
-    nonisolated static func shouldAutoOpen(factCount: Int, done: Bool, hasResumeStep: Bool = false) -> Bool {
-        !done && !hasResumeStep && factCount == 0
-    }
 }
 
-/// When the card may open the interview BY ITSELF: exactly once, and only
-/// after BOTH the local facts have been read AND the server hydrate has
-/// completed (success or failure/offline). Deciding on the first local
-/// emission flashed the interview open on a fresh install whose facts live on
-/// the web, then slammed it shut when the hydrate landed. Pure and tested.
-struct InterviewAutoOpenGate: Equatable {
-    private(set) var decided = false
+// MARK: - rituals picker chips
 
-    /// Feed every change (facts emission, hydrate flag flip). Returns true
-    /// exactly once — the moment the panel should open.
-    mutating func evaluate(hydrated: Bool, factsLoaded: Bool, factCount: Int, done: Bool,
-                           hasResumeStep: Bool = false) -> Bool {
-        guard !decided, hydrated, factsLoaded else { return false }
-        decided = true
-        return InterviewMachine.shouldAutoOpen(factCount: factCount, done: done, hasResumeStep: hasResumeStep)
-    }
-}
-
-// MARK: - inline panel
-
-/// The interview panel rendered inside the gateway card. `firstName` greets;
-/// `onFinished` fires after finish/skip; `onCollapse` hides the panel
-/// (resumable). Ritual toggles are wired by the host (`ritualIsOn`/`setRitual`)
-/// so this view doesn't depend on the prefs store's shape.
-struct InterviewFlowView: View {
-    @Environment(\.uTheme) private var theme
-    @Bindable var machine: InterviewMachine
-    let firstName: String?
-    let ritualIsOn: (RitualKey) -> Bool
-    let setRitual: (RitualKey, Bool) -> Void
-    let onFinished: () -> Void
-    let onCollapse: () -> Void
-
-    @State private var free = ""
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if machine.isFirstStep {
-                greeting
-            }
-            HStack(alignment: .firstTextBaseline) {
-                Text(machine.isPicker ? "LAST ONE" : "GETTING TO KNOW YOU · \(machine.progress)")
-                    .font(UFont.mono(10, .semibold)).tracking(1.2)
-                    .foregroundStyle(theme.palette.ink3)
-                Spacer(minLength: 8)
-                // The web's two controls: the per-question Skip (below) and
-                // "I'm done" — the finisher that never re-asks. The chevron
-                // only PARKS the panel (the pill resumes it); it replaced a
-                // "Skip for now" label that read as a third kind of skip.
-                Button { machine.finish(); onFinished() } label: {
-                    Text("I’m done").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                        .frame(minHeight: 44).contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                    .accessibilityLabel("I’m done")
-                    .accessibilityHint("Finishes the interview; it won’t ask again")
-                Button { machine.collapse(); onCollapse() } label: {
-                    Image(systemName: "chevron.up")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(theme.palette.ink3)
-                        .frame(width: 32, height: 44).contentShape(Rectangle())
-                }.buttonStyle(.plain)
-                    .accessibilityLabel("Hide for now")
-                    .accessibilityHint("Hides the questions; resume any time from the card")
-            }
-
-            if let q = machine.current {
-                question(q)
-            } else {
-                ritualsPicker
-            }
-
-            // A dropped local write keeps the step and says so — never a
-            // "✓ Noted" the store didn't take.
-            if let err = machine.saveError {
-                Text(err)
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
-                    .accessibilityLabel(err)
-                    .accessibilityAddTraits(.updatesFrequently)
-            }
-
-            if let last = machine.noted.last {
-                Text("✓ Noted: \(last)")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                    .lineLimit(2)
-                    .accessibilityLabel("Noted: \(last)")
-                    .accessibilityAddTraits(.updatesFrequently)
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Getting to know you")
-    }
-
-    // The agent's FIRST words to a new user: one plain line (no permission
-    // request, no tagline — mirrors the web interview.tsx greeting verbatim),
-    // then the small-print disclosure of what happens to the answers.
-    private var greeting: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Hey\(firstName.map { " \($0)" } ?? ""). A few quick questions so I can plan around your actual life — skip any you like.")
-                .font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
-                .lineSpacing(3)
-            Text("I’ll remember what you tell me; it stays yours — see What Unstuck knows in Settings to view or delete any of it. Facts are shared with our AI provider (which doesn’t train on them) so I can help.")
-                .font(UFont.sans(11.5)).foregroundStyle(theme.palette.ink3)
-                .lineSpacing(2)
-        }
-        .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(theme.palette.bg2, in: UnevenRoundedRectangle(
-            topLeadingRadius: 14, bottomLeadingRadius: 6, bottomTrailingRadius: 14, topTrailingRadius: 14,
-            style: .continuous))
-        .overlay(UnevenRoundedRectangle(
-            topLeadingRadius: 14, bottomLeadingRadius: 6, bottomTrailingRadius: 14, topTrailingRadius: 14,
-            style: .continuous).stroke(theme.palette.line))
-    }
-
-    @ViewBuilder
-    private func question(_ q: InterviewQuestion) -> some View {
-        Text(q.question)
-            .font(UFont.serif(19)).foregroundStyle(theme.palette.ink)
-            .lineSpacing(2)
-        WrapLayout(spacing: 6, lineSpacing: 6) {
-            ForEach(Array(q.chips.enumerated()), id: \.offset) { _, chip in
-                Button { machine.answer(chip: chip); free = "" } label: {
-                    Text(chip.label)
-                        .font(UFont.sans(13)).foregroundStyle(theme.palette.ink)
-                        .padding(.horizontal, 13).padding(.vertical, 8)
-                        .background(theme.palette.surface, in: Capsule())
-                        .overlay(Capsule().stroke(theme.palette.line2))
-                }.buttonStyle(.plain)
-            }
-            Button { machine.skipQuestion(); free = "" } label: {
-                Text("Skip").font(UFont.sans(12.5)).foregroundStyle(theme.palette.ink3)
-                    .padding(.horizontal, 6).padding(.vertical, 8)
-            }.buttonStyle(.plain)
-                .accessibilityLabel("Skip this question")
-        }
-        if q.allowFree {
-            HStack(spacing: 6) {
-                TextField(q.splitNames ? "…or type names, comma-separated" : "…or type it", text: $free)
-                    .font(UFont.sans(13.5)).foregroundStyle(theme.palette.ink)
-                    .textFieldStyle(.plain)
-                    .submitLabel(.done)
-                    .onSubmit(saveFree)
-                    .padding(.horizontal, 14).padding(.vertical, 9)
-                    .background(theme.palette.bg2, in: Capsule())
-                    .overlay(Capsule().stroke(theme.palette.line))
-                    .accessibilityLabel("Type an answer")
-                let can = !free.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                Button(action: saveFree) {
-                    Text("Save").font(UFont.sans(12.5, .semibold))
-                        .foregroundStyle(can ? .white : theme.palette.ink3)
-                        .padding(.horizontal, 14).padding(.vertical, 9)
-                        .background(can ? theme.palette.coral : theme.palette.bg2, in: Capsule())
-                }.buttonStyle(.plain).disabled(!can)
-            }
-        }
-    }
-
-    private func saveFree() {
-        let t = free
-        guard !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        machine.answerFree(t)
-        free = ""
-    }
-
-    /// Final step — which recurring moments the assistant should run. The
-    /// rituals themselves are a personalisation choice; all changeable in
-    /// Settings → What Unstuck knows.
-    private var ritualsPicker: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Which moments should I run for you? All optional, all changeable in Settings.")
-                .font(UFont.serif(19)).foregroundStyle(theme.palette.ink)
-                .lineSpacing(2)
-            RitualChips(isOn: ritualIsOn, set: setRitual)
-            Button { machine.finish(); onFinished() } label: {
-                Text("That’s me set up").font(UFont.sans(13, .semibold)).foregroundStyle(.white)
-                    .padding(.horizontal, 16).padding(.vertical, 9)
-                    .frame(minHeight: 44)
-                    .background(theme.palette.coral, in: Capsule())
-            }.buttonStyle(.plain)
-                .accessibilityLabel("That’s me set up")
-        }
-    }
-}
-
-/// The four ritual toggles as selectable chips (interview picker). Copy from
-/// RITUAL_LABELS so the interview, Settings and the web read identically.
+/// The four ritual toggles as selectable chips (the interview's last step,
+/// now inside the assistant thread). Copy from RITUAL_LABELS so the
+/// interview, Settings and the web read identically.
 struct RitualChips: View {
     @Environment(\.uTheme) private var theme
     let isOn: (RitualKey) -> Bool
@@ -552,10 +363,13 @@ struct RitualChips: View {
                 let on = isOn(r.key)
                 Button { set(r.key, !on) } label: {
                     Text((on ? "✓ " : "") + r.label)   // glyph is visual only — label below reads the name
-                        .font(UFont.sans(13)).foregroundStyle(on ? .white : theme.palette.ink)
+                        .font(UFont.sans(13)).foregroundStyle(on ? theme.palette.bg : theme.palette.ink2)
                         .padding(.horizontal, 13).padding(.vertical, 8)
-                        .background(on ? theme.palette.coral : theme.palette.surface, in: Capsule())
-                        .overlay(Capsule().stroke(on ? theme.palette.coral : theme.palette.line2))
+                        .frame(minHeight: 44)
+                        // Selection is the app's black-and-white pair (ink fill,
+                        // bg text) — the same idiom as every other chip.
+                        .background(on ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+                        .overlay(Capsule().stroke(on ? Color.clear : theme.palette.line2))
                 }.buttonStyle(.plain)
                     .accessibilityLabel(r.label)
                     .accessibilityHint(r.sub)

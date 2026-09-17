@@ -3,7 +3,107 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-17, latest) — Share screen: the People card collapses; the accent sweep; scheme-aware accent ramps
+## Where things stand (2026-09-17, latest) — Today/home: one-line greeting, the assistant input pill, no backlog pointer; the interview moved INTO the assistant
+
+Ahmad approved exactly four home changes (head 53dfe7a → this commit); nothing
+else was redesigned, NOT bumped / archived.
+
+- **Greeting on ONE line** (`App/Features/TodayFeature.swift` `header`):
+  `GreetingName.line(greeting:firstName:)` → "Good evening Maya." (no
+  line break; no name → "… Unstuck."), same `UFont.serifItalic(28)`,
+  `.lineLimit(1).minimumScaleFactor(0.7)` so a long name scales instead of
+  wrapping. Date eyebrow + week pill untouched. Tests: GreetingNameTests.
+- **The "Nothing scheduled today / Pick something to start / N in your
+  backlog →" gradient card is GONE** (`heroOrEmpty`): nothing scheduled +
+  a non-empty Backlog renders nothing there (the list + its Backlog pill
+  already say so). Start-Next hero and the "You're all clear" empty state
+  are exactly as they were. Tour: `TourTargetID.backlogPointer` is
+  removed; the today/finish steps' fallback chain is `[.todayList]`
+  (`TourTargetRegistry.resolve` walks primary → fallbacks, so an account
+  with no hero spotlights the list section). TourDataTests updated.
+- **The gateway card is REPLACED by one input pill** directly under the
+  week pill (`AssistantInputPill`, bottom of TodayFeature.swift): "✦ Ask,
+  plan, or brain-dump…" with the mic on the right — drawn exactly like the
+  composer the card carried (surface capsule, coral 0.55 ring, coral ✦,
+  coral mic, the faded send arrow). Tapping the field (or the arrow) →
+  `AppModel.openAssistant(focusComposer: true)` → the Assistant sheet
+  opens and focuses ITS composer (`AssistantModel.requestComposer` /
+  `takeComposerRequest`; `draft:` carries text over if a caller has one —
+  the pill itself is a Button, no keyboard on the home). The mic → the
+  same `router.showTalk` VoiceModeScreen cover as before. The card's
+  brief, the moment, the chips, the "Personalise your assistant" pill and
+  the orb eyebrow are gone from the home. `GatewayCard.swift` (only ever
+  used on Today) and `GatewayCardTests.swift` are deleted; `composeBrief`
+  / `pickMoment` stay in UnstuckCore (package, tested) for the web/Android
+  parity they carry. Everything from the Today list down is unchanged.
+- **The interview lives INSIDE the assistant** (`App/Features/
+  InterviewThread.swift`). Same `InterviewMachine`, same profile-facts
+  store (`source: .interview`), same done flag (`unstuck-gateway-interview-
+  done`) + resume step, same `pushInterviewDone` account mirror —
+  only the host changed. While the flag is not set:
+  - TEXT (`AssistantSheet`): the sheet builds an `InterviewThreadDriver`
+    on open; the user's FIRST send arms it (`userSent`) and the reply comes
+    first — on the next `sending → false` (`turnFinished`) the driver
+    appends the greeting (once) + the current question as LOCAL assistant
+    turns (`AssistantTurn.interview: InterviewPromptMeta`, new optional
+    field, Codable-compatible with old threads; `appendLocal` now returns
+    the id). The sheet draws `InterviewPromptRow` — chips + Skip (+ the
+    free-text field where the script allows it) — under the turn whose id
+    is `driver.promptTurnId`; a tap echoes as a local user bubble
+    (`appendLocalUser`), the machine advances, the next question is posted.
+    Changing the subject mid-way: the reply comes first, then the SAME
+    question is posted again underneath (the chip row moves to the fresh
+    copy). Reaching the rituals picker marks done (as before); "That's me
+    set up" closes with one line. A failed local save keeps the question +
+    says so (`palette.red`). Stand-down (the existing ≥1-fact rule,
+    `shouldAutoComplete` with the parked step) is evaluated when the
+    message is SENT and only once `profileFactsHydrated` — someone the
+    assistant already knows from the web is never greeted as a stranger,
+    and a fact the first reply itself saves can't cancel the interview.
+    Local turns never enter the model window (zero tokens).
+  - VOICE (`AssistantContext.buildVoiceOpening`): the gate is now the
+    interview flag (`AssistantAppState.interviewPending()`, default impl +
+    `AppModelAssistantState`), not the fact count. While pending the primer
+    greets, asks the seven questions one at a time (`InterviewVoice.spoken`
+    keyed on the script keys — a test checks every key has a line; with
+    facts already present it says to skip what they answer), saves each
+    answer with `save_profile_fact`, allows skips, does the user's own
+    requests first and returns, and closes with the new iOS-only
+    `finish_interview` voice tool (`VOICE_TOOLS` 57 → 58; executor case in
+    `runCoreTool` → `api.markInterviewDone()` = `InterviewMachine.markDone`
+    + `pushInterviewDone`). The voice-proxy Worker only rewrites
+    `instructions`/VAD, so the extra tool passes through. Done → the
+    by-name hello as before.
+  - Removed with the card: `InterviewAutoOpenGate`, `shouldAutoOpen`, the
+    inline `InterviewFlowView` (and their tests); `RitualChips` (the
+    picker, now in the thread) selects with the black-and-white pair.
+    There is no Settings link to a standalone interview screen (there
+    never was — Settings → "What Unstuck knows" is the facts panel).
+- **Colour rules honoured** (memory `brand-colour-coral-only`): diff grepped —
+  no `coralDeep` / `primaryDeep` / `primary` in added lines; coral only on
+  the pill's ✦ / mic / ring / send (where the card's composer had it) and
+  the interview's own Save / "That's me set up" buttons (ported verbatim).
+  Also fixed on the way: HEAD's accent sweep had left `theme.palette.theme.
+  palette.red` in 10 places (a sed over `theme.palette.coralDeep`) — the app
+  target did not compile; collapsed to `theme.palette.red`.
+- **Demo hooks**: `UITEST_ASSISTANT_CANNED=1` (DEBUG) installs
+  `CannedAssistantScript` — one fixed reply, no tools — so a UI walk can
+  send a message and reach the interview prompts. `UITests/HomeShots.swift`
+  shoots 01-home-light / 02-home-dark / 03-assistant-interview into
+  `HOME_SHOTS_DIR` (`TEST_RUNNER_HOME_SHOTS_DIR=…`, default
+  /tmp/unstuck-home-shots).
+- Verify: `TZ=UTC swift test --scratch-path .build-int` → 1038 tests, 2
+  skipped, 0 failures; `UnstuckAppTests` on a fresh container → 575 tests,
+  569 green with `-skip-testing:UnstuckAppTests/CallsOutcomeReporterTests`.
+  That class's `testAfterThreeFailuresTheItemIsReEnqueuedAndRetriedLater`
+  is a PRE-EXISTING race unrelated to this change (it fails/passes run to
+  run on HEAD too): with the stub sleep, `scheduleRetry`'s timer task
+  re-arms `flushTask` while `settle()` is deciding whether to return, so
+  the 4th attempt sometimes lands before the "3 attempts" assertion.
+  Untouched here — fix the test's `settle` (or the timer hand-off), not
+  the reporter.
+
+## Where things stand (2026-09-17) — Share screen: the People card collapses; the accent sweep; scheme-aware accent ramps
 
 Ahmad, from a tester's screenshot before the web + Android push: (1) "the
 accent colour you use doesn't match the actual colour we use for the rest of
@@ -1531,10 +1631,10 @@ Full roadmap + rationale: the build plan at
 
 ```sh
 cd unstuck_ios
-TZ=UTC swift test --scratch-path .build-int  # 1021 tests green, 2 skipped (2026-09-17, unified sharing v1 + People "Waiting to join" + review follow-up)
+TZ=UTC swift test --scratch-path .build-int  # 1038 tests green, 2 skipped (2026-09-17, Today/home + interview-in-thread)
 xcodegen generate && xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'generic/platform=iOS Simulator' build CODE_SIGNING_ALLOWED=NO   # app + widget
-# App-layer unit tests (host: Unstuck) — 581 green (2026-09-17, People review follow-up), on a FRESH container (uninstall first, see above):
+# App-layer unit tests (host: Unstuck) — 575 tests, 569 green + the pre-existing CallsOutcomeReporterTests race (2026-09-17, Today/home + interview-in-thread), on a FRESH container (uninstall first, see above):
 xcodebuild test -project Unstuck.xcodeproj -scheme Unstuck \
   -destination 'platform=iOS Simulator,id=38CF1937-7E51-4CDC-B96D-97928A2D1DF3' -only-testing:UnstuckAppTests
 ```

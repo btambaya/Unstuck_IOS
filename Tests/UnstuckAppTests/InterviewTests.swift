@@ -4,9 +4,10 @@
 // splitting, a failed save keeping the step, done-on-reaching-the-picker, the
 // auto-done rule (≥1 fact, never while open, never while a mid-way step is
 // parked), resume after a collapse, the "I'm done" finisher, the cross-device
-// done hook, the auto-open-once-then-pill rule, the server done-flag, and the
-// auto-open gate that waits for the server hydrate. Each test uses a
-// throwaway UserDefaults suite so nothing touches the device defaults.
+// done hook and the server done-flag. The interview now lives INSIDE the
+// assistant thread (InterviewThreadTests covers that driver); the old Today
+// card's auto-open gate is gone with the card. Each test uses a throwaway
+// UserDefaults suite so nothing touches the device defaults.
 
 import XCTest
 import UnstuckCore
@@ -315,7 +316,6 @@ final class InterviewTests: XCTestCase {
         XCTAssertTrue(InterviewMachine.isDone(d))
         XCTAssertEqual(h.doneCalls, 1, "\"I'm done\" pushes the account flag")
         XCTAssertNil(d.object(forKey: InterviewMachine.stepKey), "no stale resume step once done")
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: InterviewMachine.isDone(d)))
         m.finish()
         XCTAssertEqual(h.doneCalls, 1, "idempotent")
     }
@@ -333,9 +333,6 @@ final class InterviewTests: XCTestCase {
         XCTAssertEqual(h.saved.count, 1, "what was answered stays saved")
         let (resumed, _) = make(d)
         XCTAssertEqual(resumed.step, 1, "re-opening resumes where they left off")
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: false,
-                                                       hasResumeStep: InterviewMachine.hasResumeStep(d)),
-                       "parked ≠ pop back open on the next launch — that's the nag it exists to avoid")
     }
 
     func testImDoneFinishesFromAnyStep() {
@@ -384,34 +381,24 @@ final class InterviewTests: XCTestCase {
         InterviewMachine.resetDone(d)
         XCTAssertFalse(InterviewMachine.isDone(d))
         XCTAssertNil(d.object(forKey: InterviewMachine.stepKey))
-        XCTAssertTrue(InterviewMachine.shouldAutoOpen(factCount: 0, done: InterviewMachine.isDone(d)))
     }
 
-    // MARK: auto-open once, then the pill
+    // MARK: a parked step 0 holds no answers
 
-    func testAutoOpenedPanelIsParkedSoTheNextLaunchShowsThePill() {
+    func testMarkInProgressParksStepZeroWhichHoldsNoAnswersOfItsOwn() {
         let d = freshDefaults()
-        XCTAssertTrue(InterviewMachine.shouldAutoOpen(factCount: 0, done: false,
-                                                      hasResumeStep: InterviewMachine.hasResumeStep(d)),
-                      "first launch, nothing anywhere: the panel opens itself")
         let (m, h) = make(d)
-        m.markInProgress()                                 // what the card does the moment it opens the panel
+        m.markInProgress()                                 // what the thread driver does when it starts asking
         XCTAssertTrue(InterviewMachine.hasResumeStep(d))
         XCTAssertEqual(InterviewMachine.parkedStep(d), 0)
         XCTAssertFalse(InterviewMachine.isDone(d))
         XCTAssertEqual(h.doneCalls, 0)
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: false,
-                                                       hasResumeStep: InterviewMachine.hasResumeStep(d)),
-                       "second cold launch: the pill, not the panel at 1/7 again")
-        var gate = InterviewAutoOpenGate()
-        XCTAssertFalse(gate.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false,
-                                     hasResumeStep: InterviewMachine.hasResumeStep(d)))
         // A parked step 0 holds none of its own answers: a fact saved via chat
         // still stands the interview down.
         XCTAssertTrue(InterviewMachine.shouldAutoComplete(factCount: 1, isOpen: false, done: false,
                                                           parkedStep: InterviewMachine.parkedStep(d)))
         let (again, _) = make(d)
-        XCTAssertEqual(again.step, 0, "the pill resumes at the greeting")
+        XCTAssertEqual(again.step, 0, "resumes at the first question")
     }
 
     // MARK: auto rules
@@ -457,89 +444,20 @@ final class InterviewTests: XCTestCase {
         XCTAssertFalse(InterviewMachine.hasResumeStep(d))
     }
 
-    func testAutoOpenOnlyWithNothingLearnedAnywhere() {
-        XCTAssertTrue(InterviewMachine.shouldAutoOpen(factCount: 0, done: false))
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 1, done: false),
-                       "facts from another device / chat: the pill nudges instead of the panel opening itself")
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: true))
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: false, hasResumeStep: true))
-    }
-
     // MARK: server says done (user_preferences.assistant_interview_done_at, migration 052)
 
-    func testServerDoneFlagPinsLocalAndTheGateNeverOpens() {
+    func testServerDoneFlagPinsLocal() {
         let d = freshDefaults()
         XCTAssertFalse(InterviewMachine.isDone(d), "fresh install: nothing local")
         // What AppModel.applyServerInterviewFlag does when the account row
         // carries assistant_interview_done_at — BEFORE profileFactsHydrated flips.
         InterviewMachine.markDone(d)
-        var gate = InterviewAutoOpenGate()
-        XCTAssertFalse(gate.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: InterviewMachine.isDone(d)),
-                       "onboarded on the web with zero synced facts on this phone: never greeted as a stranger")
-        XCTAssertTrue(gate.decided)
-        XCTAssertFalse(gate.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: InterviewMachine.isDone(d)))
-        XCTAssertFalse(InterviewMachine.shouldAutoOpen(factCount: 0, done: InterviewMachine.isDone(d)),
-                       "nor does the pill's auto-open rule fire")
+        XCTAssertTrue(InterviewMachine.isDone(d),
+                      "onboarded on the web with zero synced facts on this phone: never greeted as a stranger")
         XCTAssertFalse(InterviewMachine.shouldAutoComplete(factCount: 5, isOpen: false, done: InterviewMachine.isDone(d)),
                        "already done — nothing to auto-complete")
         // Sign-out forgets it; the next sign-in's hydrate re-applies it from the server.
         InterviewMachine.resetDone(d)
         XCTAssertFalse(InterviewMachine.isDone(d))
-    }
-
-    func testServerFlagArrivingAfterALocalReadStillWins() {
-        // The card reads isDone() in bootstrap(); the server flag can land
-        // after that (right before the hydrated flip). maybeAutoOpen re-reads.
-        let d = freshDefaults()
-        let before = InterviewMachine.isDone(d)
-        XCTAssertFalse(before)
-        InterviewMachine.markDone(d)                       // the hydrate hook pins it
-        var gate = InterviewAutoOpenGate()
-        XCTAssertTrue(gate.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: before),
-                      "deciding on the STALE read would have opened it —")
-        var fresh = InterviewAutoOpenGate()
-        XCTAssertFalse(fresh.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: InterviewMachine.isDone(d)),
-                       "— the card re-reads the flag at decision time, so it doesn't")
-    }
-
-    // MARK: auto-open gate (C1 — waits for the server hydrate)
-
-    func testNoAutoOpenWhileNotHydratedEvenWithZeroLocalFacts() {
-        var g = InterviewAutoOpenGate()
-        XCTAssertFalse(g.evaluate(hydrated: false, factsLoaded: true, factCount: 0, done: false),
-                       "the first local GRDB emission is empty on a fresh install whose facts live on the web")
-        XCTAssertFalse(g.evaluate(hydrated: false, factsLoaded: true, factCount: 0, done: false))
-        XCTAssertFalse(g.decided, "still undecided — nothing has been ruled out")
-    }
-
-    func testNoAutoOpenBeforeTheLocalFactsAreRead() {
-        var g = InterviewAutoOpenGate()
-        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: false, factCount: 0, done: false))
-        XCTAssertFalse(g.decided)
-    }
-
-    func testOpensOnceAfterHydrateWithZeroFacts() {
-        var g = InterviewAutoOpenGate()
-        XCTAssertFalse(g.evaluate(hydrated: false, factsLoaded: true, factCount: 0, done: false))
-        XCTAssertTrue(g.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false), "hydrate landed, nothing anywhere")
-        XCTAssertTrue(g.decided)
-        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false), "decides exactly once")
-    }
-
-    func testNeverOpensWhenHydrateBringsFacts() {
-        var g = InterviewAutoOpenGate()
-        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: true, factCount: 3, done: false))
-        XCTAssertTrue(g.decided, "decided: the pill (not the panel) is the nudge from here")
-        XCTAssertFalse(g.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false),
-                       "a later empty emission (forget everything) must not pop the interview open")
-        var one = InterviewAutoOpenGate()
-        XCTAssertFalse(one.evaluate(hydrated: true, factsLoaded: true, factCount: 1, done: false))
-    }
-
-    func testGateHonoursDoneAndParked() {
-        var done = InterviewAutoOpenGate()
-        XCTAssertFalse(done.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: true))
-        var parked = InterviewAutoOpenGate()
-        XCTAssertFalse(parked.evaluate(hydrated: true, factsLoaded: true, factCount: 0, done: false, hasResumeStep: true))
     }
 }

@@ -146,6 +146,20 @@ final class BulkAssistantScript: AssistantTransport {
 }
 #endif
 
+// MARK: - canned reply (UITEST_ASSISTANT_CANNED)
+
+/// One fixed reply per turn, no tool calls — enough for a UI walk to send a
+/// message and see the assistant answer it BEFORE the interview questions
+/// follow (InterviewThread). DEBUG-only + env-gated like the bulk script.
+#if DEBUG
+@MainActor
+final class CannedAssistantScript: AssistantTransport {
+    func ask(messages: [ChatMessage], context: [String: AnyJSON]) async -> HarnessAsk {
+        .ok(HarnessReply(content: "I’ve got your day in front of me — tell me what you want to happen and I’ll do it."))
+    }
+}
+#endif
+
 // MARK: - HEAVY soak seed (UITEST_SEED_HEAVY) — TEMPORARY perf scaffolding
 //
 // A large-account fixture (~800 tasks / 4000 cal_blocks / 1500 sessions /

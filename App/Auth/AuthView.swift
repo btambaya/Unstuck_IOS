@@ -136,10 +136,10 @@ struct AuthView: View {
         HStack(spacing: 11) {
             Text(statusIsError ? "!" : "✓")
                 .font(UFont.sans(16, .bold))
-                .foregroundStyle(statusIsError ? theme.palette.theme.palette.red : theme.palette.greenInk)
+                .foregroundStyle(statusIsError ? theme.palette.red : theme.palette.greenInk)
             Text(msg)
                 .font(UFont.sans(14, .medium))
-                .foregroundStyle(statusIsError ? theme.palette.theme.palette.red : theme.palette.greenInk)
+                .foregroundStyle(statusIsError ? theme.palette.red : theme.palette.greenInk)
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 14).padding(.vertical, 13)
@@ -353,7 +353,7 @@ struct SetNewPasswordView: View {
                 .padding(.top, 22)
 
                 if let msg = status ?? error {
-                    Text(msg).font(UFont.sans(13)).foregroundStyle(theme.palette.theme.palette.red)
+                    Text(msg).font(UFont.sans(13)).foregroundStyle(theme.palette.red)
                         .multilineTextAlignment(.center).padding(.top, 12)
                 }
 

@@ -34,6 +34,9 @@ struct AssistantSheet: View {
     /// visit; the ✦ button re-summons it.
     @State private var showChips = true
     @State private var ctx = AssistantContext.empty
+    /// The get-to-know-you interview, hosted in this thread while the account
+    /// hasn't finished or skipped it (InterviewThread). nil once done.
+    @State private var interview: InterviewThreadDriver?
     @SwiftUI.FocusState private var fieldFocused: Bool
 
     private static let chipsAnchor = "assistant.chips"
@@ -63,7 +66,7 @@ struct AssistantSheet: View {
             if let message = note ?? assistant.error.map(assistantFriendlyError) {
                 HStack(alignment: .firstTextBaseline, spacing: 10) {
                     Text(message)
-                        .font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                         .accessibilityAddTraits(.updatesFrequently)
                     // Two upstream rejections in a row: the thread itself is
                     // the likely cause (a poisoned replayed tool_call,
@@ -95,12 +98,30 @@ struct AssistantSheet: View {
             // Once per day, greet with a grounded line built from real counts
             // (local — it never enters the model window).
             assistant.maybeInjectCheckin(line: built.checkinLine)
+            // The interview rides in this thread until the account is done
+            // with it — it arms on the first send (the reply comes first).
+            if interview == nil, !InterviewMachine.isDone() { interview = makeInterview() }
+            // Today's input pill asked for the keyboard (and maybe a draft):
+            // honour it once the sheet has settled, or the focus is dropped.
+            if let req = assistant.takeComposerRequest() {
+                if let d = req.draft, !d.isEmpty { input = d }
+                if req.focus {
+                    try? await Task.sleep(for: .milliseconds(450))
+                    fieldFocused = true
+                }
+            }
             // The circle roster the share_task tool resolves names against.
             await assistant.refreshShareCandidates()
         }
         // Tool calls change the underlying data — rebuild the strip + chips
-        // when a turn lands so the panel never shows a stale day.
-        .onChange(of: assistant.sending) { _, busy in if !busy { refreshContext() } }
+        // when a turn lands so the panel never shows a stale day. The
+        // interview asks its question only now — after the reply.
+        .onChange(of: assistant.sending) { _, busy in
+            if !busy {
+                refreshContext()
+                interview?.turnFinished()
+            }
+        }
         // Read each new assistant reply aloud while the toggle is on.
         .onChange(of: assistant.lastReplyTick) { _, _ in
             if speakReplies, let r = assistant.lastReply { voice.speak(r) }
@@ -184,10 +205,17 @@ struct AssistantSheet: View {
                                 .padding(.top, 6)
                         }
                         MessageBubble(text: turn.text, fromUser: turn.role == "user",
-                                      local: turn.isLocal)
+                                      local: turn.isLocal && turn.role != "user")
                             // A queued send (typed while a turn was in flight)
                             // shows faded until the model picks it up — web parity.
                             .opacity(turn.isPending ? 0.5 : 1)
+                        // The interview's chips, under the question it is asking.
+                        if let interview, interview.promptTurnId == turn.id {
+                            InterviewPromptRow(driver: interview,
+                                               ritualIsOn: { model.paPrefs.rituals[$0] },
+                                               setRitual: { model.paPrefs.setRitual($0, on: $1) })
+                                .padding(.leading, 4)
+                        }
                         ForEach(Array((turn.receipts ?? []).enumerated()), id: \.offset) { ri, receipt in
                             // A network undo (cancel_call) shows "cancelling…" until
                             // the server answers; a failure keeps Undo + says why.
@@ -201,7 +229,7 @@ struct AssistantSheet: View {
                             .frame(maxWidth: 320, alignment: .leading)
                             if let note = assistant.undoFailureNote(turnId: turn.id, index: ri) {
                                 Text(note)
-                                    .font(UFont.sans(11.5)).foregroundStyle(theme.palette.theme.palette.red)
+                                    .font(UFont.sans(11.5)).foregroundStyle(theme.palette.red)
                                     .padding(.leading, 11)
                                     .accessibilityAddTraits(.updatesFrequently)
                             }
@@ -351,6 +379,7 @@ struct AssistantSheet: View {
         showChips = false
         note = nil
         assistant.send(message)
+        interview?.userSent()
     }
 
     /// No `sending` gate: a message typed while a turn is in flight is QUEUED
@@ -372,6 +401,30 @@ struct AssistantSheet: View {
         // re-presented). Tap the field again to keep typing.
         fieldFocused = false
         assistant.send(t)
+        interview?.userSent()
+    }
+
+    /// The interview machine, wired exactly as the old Today card wired it:
+    /// facts save as `.interview` into the profile-facts store, "done" is
+    /// mirrored to the account (`pushInterviewDone`), local turns land in
+    /// this thread.
+    private func makeInterview() -> InterviewThreadDriver {
+        let model = self.model
+        let assistant = self.assistant
+        let machine = InterviewMachine(
+            save: { category, fact in
+                // nil = the local write failed: the machine keeps the step
+                // and the row says so — no echoed answer over a dropped save.
+                model.profileFacts?.save(category: category, fact: fact, source: .interview, whenIso: nil) != nil
+            },
+            onDone: { model.pushInterviewDone() })
+        return InterviewThreadDriver(
+            machine: machine,
+            firstName: GreetingName.firstName(model.currentUserName),
+            ready: { model.profileFactsHydrated },
+            factCount: { (model.profileFacts?.all() ?? []).filter { $0.active }.count },
+            post: { text, meta in assistant.appendLocal(text, interview: meta) },
+            echo: { text in assistant.appendLocalUser(text) })
     }
 
     private func jump(_ destination: AssistantJump) {

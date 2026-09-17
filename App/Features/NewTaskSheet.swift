@@ -451,7 +451,7 @@ struct NewTaskSheet: View {
                 Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 if let inviteErr {
-                    Text(inviteErr).font(UFont.sans(12)).foregroundStyle(theme.palette.theme.palette.red)
+                    Text(inviteErr).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                 }
                 HStack(spacing: 8) {
                     Button { generateInvite() } label: {
