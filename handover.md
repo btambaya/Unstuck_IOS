@@ -69,6 +69,31 @@ below, untouched. NOT bumped (Ship does); not pushed.
   shots regenerated on the iPhone 17 Pro Max sim (TZ America/Los_Angeles,
   reverted after) into /tmp/unstuck-shots/01..08 — 01-today is the new
   home, 02-focus / 03-recap come from the row's Focus.
+- **Independent verification (same day, head 6eb92c5 + this commit).** Re-ran
+  everything on a fresh container: `swift test` 1038/2 skipped/0 failures,
+  `UnstuckAppTests` 577/0, `AppSmokeUITests/testFocus` +
+  `TourUITests/testEssentialTourEndToEnd` 2/0, `StoreScreenshots` green.
+  Drove the seeded build on the iPhone 17: no hero and no all-clear card
+  between the input pill and the list, with tasks and with every task
+  deleted (the plain "Nothing scheduled. Tap + to add." note is all that's
+  left); Focus starts from a row's context menu AND from the editor; dark
+  and AX XXXL fine. Two things worth writing down:
+  - **The `today` / `finish` tour steps render a COLLAPSED panel** (title +
+    controls only — no body, no "Tell me more", no "Ask a question") on a
+    seeded 6.3" screen. This is PRE-EXISTING, not a side effect of the
+    anchor move: the same run on the parent commit b4b8af8 collapses too
+    (the hero's ring left 330pt against a 340pt panel; the list's ring
+    leaves 306pt — `tourPanelPlacement`'s "collapse rather than cover the
+    ring", non-negotiable #1). Worth a design pass, out of scope here.
+  - Because that step is collapsed AND its clips were dropped, `today` is
+    now the one step that conveys nothing but its title in BOTH modes
+    (Read shows no body, Listen has no audio). Regenerating `today.m4a` /
+    `today-more.m4a` — recipe above — or letting that step's panel expand
+    would each fix half of it.
+  - `testNoStepCopyNamesTheRemovedStartNextHero` iterated `TourScript.full`
+    only, which is NOT a superset of `essential` (it drops focus, capture,
+    assistant, reentry, notifications) — widened to both scripts + the
+    canned `TOUR_QA` answers. All 15 distinct steps are clean.
 
 ## Where things stand (2026-09-17) — Today/home: one-line greeting, the assistant input pill, no backlog pointer; the interview moved INTO the assistant
 

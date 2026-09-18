@@ -30,7 +30,10 @@ enum DemoSeed {
         }
 
         // Tasks — a realistic open/later/done spread, with a firstPhysicalAction
-        // on the Start-Next candidate so the headline shows the smallest step.
+        // on the proposal so the Focus screen (entered from that row's context
+        // menu, or from the editor) shows a real first step. It used to feed
+        // the Today Start-Next hero's headline; the hero went on 2026-09-18,
+        // the field and the screenshot flow that relies on it did not.
         let tasks: [TaskItem] = [
             TaskItem(id: "t-proposal", name: "Draft the Q3 proposal", estimateMin: 45, tags: ["deep-work"],
                      lifeArea: "Work", firstPhysicalAction: "Open the doc and write one sentence",

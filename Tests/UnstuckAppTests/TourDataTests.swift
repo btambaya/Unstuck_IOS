@@ -93,12 +93,25 @@ final class TourDataTests: XCTestCase {
 
     func testNoStepCopyNamesTheRemovedStartNextHero() {
         // Body, narration and more must not point the user at a card that no
-        // longer exists on the iOS home.
-        for s in TourScript.full {
+        // longer exists on the iOS home. BOTH scripts, because `full` is NOT a
+        // superset of `essential`: it keeps welcome / today / first-action and
+        // finish but drops focus, capture, assistant, reentry and
+        // notifications — iterating one script alone leaves five steps
+        // unguarded.
+        var seen = Set<String>()
+        let allSteps = (TourScript.essential + TourScript.full).filter { seen.insert($0.id).inserted }
+        XCTAssertEqual(allSteps.count, 15, "9 essential + 6 full-only steps")
+        for s in allSteps {
             for text in [s.body, s.narration, s.more ?? ""] {
                 XCTAssertFalse(text.range(of: "start next", options: .caseInsensitive) != nil,
                                "'\(s.id)' still mentions Start Next: \(text)")
             }
+        }
+        // The canned Q&A is tour copy too — a stock answer describing the card
+        // would be just as wrong as a step body.
+        for qa in TOUR_QA {
+            XCTAssertFalse(qa.answer.range(of: "start next", options: .caseInsensitive) != nil,
+                           "a canned tour answer still names Start Next: \(qa.answer)")
         }
     }
 
