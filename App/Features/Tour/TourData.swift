@@ -159,14 +159,15 @@ struct TourStep: Identifiable, Sendable {
 /// does not (2026-09-18), so its body / narration / more describe the Today
 /// list instead.
 enum TourScript {
-    /// Steps whose bundled Cherry narration + more clips are NOT in the app:
-    /// the `today` clips (today.m4a / today-more.m4a) spoke the old
-    /// "Start Next offers one realistic suggestion…" copy and were dropped
-    /// with the hero rather than narrate a card that isn't there. Listen is
-    /// hidden on these steps until the clips are regenerated from the new
-    /// text (DashScope qwen3-tts-flash, voice "Cherry", AAC 24 kHz mono —
-    /// see handover.md). Empty this set when they land.
-    static let stepsAwaitingNarration: Set<String> = ["today"]
+    /// Steps whose bundled Cherry narration + more clips are NOT in the app —
+    /// Listen is hidden there (`TourAudioPlayer.hasAudio` → false) until the
+    /// clips are regenerated from the CURRENT `narration` / `more` text
+    /// (DashScope qwen3-tts-flash, voice "Cherry", AAC 24 kHz mono — recipe in
+    /// handover.md). EMPTY since 2026-09-18: the `today` clips were re-recorded
+    /// for the hero-less home. Park a step here only while its copy and its
+    /// clips disagree; `TourAudioManifestTests` pins the set AND the exact
+    /// strings the `today` clips speak.
+    static let stepsAwaitingNarration: Set<String> = []
 
     static let essential: [TourStep] = [
         TourStep(
@@ -182,10 +183,14 @@ enum TourScript {
             // no fallback is needed (an empty account rings the list's empty
             // note).
             target: .todayList,
+            // Copy describes the hero-less home (2026-09-18): greeting → week
+            // pill → assistant input pill → the Today list. SAME strings on
+            // Android; today.m4a / today-more.m4a were synthesised from EXACTLY
+            // these (TourAudioManifestTests pins them — edit here = re-record).
             title: "Today narrows it down",
-            body: "Today shows only what’s planned for today — a short list you can actually finish, not everything you’ve ever written down. Everything else waits in Backlog. Start any task from its row, or ask the assistant what to do first.",
-            narration: "This is Today. Instead of one long list, it shows only the work you’ve planned for today — a short list you can actually finish. Everything else waits quietly in your Backlog. Start any task straight from its row, or ask the assistant what to do first.",
-            more: "Filter Today by area with the pills above the list, or switch to Backlog to see what’s waiting. A task that isn’t planned for today isn’t lost — it just isn’t in the way.",
+            body: "Your home: a greeting, how much you’ve focused this week, and the assistant pill — ask, plan, or brain-dump; say it or type it, and it does it. Below that, Today lists only what’s planned for today, filtered by area. Everything else waits in Backlog. Focus starts from any task row, or from inside the task.",
+            narration: "This is Today. Up top: a greeting, how much you’ve focused this week, and the assistant pill — ask, plan, or brain-dump. Say it or type it, and it does it. Under that, the list shows only what’s planned for today, filtered by area; everything else waits quietly in Backlog. Focus starts from any task row, or from inside the task.",
+            more: "Filter Today by area with the pills above the list, or switch to Backlog to see what’s waiting. Any row can start Focus — so can the task itself. Nothing unplanned is lost; it just isn’t in the way.",
             primary: "Continue"),
         TourStep(
             id: "first-action", stage: "Tasks", view: .tasks,

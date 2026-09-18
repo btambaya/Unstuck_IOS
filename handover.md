@@ -3,7 +3,53 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-18, latest) — the "Start next" hero is gone from Today
+## Where things stand (2026-09-18, latest) — the `today` tour step narrates again
+
+The gap the hero removal left (next section: "Narration audio — PENDING") is
+closed. The `today` step's copy was rewritten for the hero-less home and both
+Cherry clips were regenerated from it; iOS and Android ship the SAME copy and
+the SAME bytes. NOT bumped, not pushed.
+
+- **Copy** (`App/Features/Tour/TourData.swift`, `today` step): body /
+  narration / more describe what the screen actually shows — the one-line
+  greeting, the "This week · … focused" pill, the assistant input pill ("ask,
+  plan, or brain-dump; say it or type it, and it does it"), then the Today
+  list with its area filters + Backlog, and that Focus starts from any task
+  row or from inside the task. No Start-Next / hero / "pick something"
+  anywhere (`testNoStepCopyNamesTheRemovedStartNextHero` still guards both
+  scripts + the canned Q&A). Android `TourData.kt` now carries the identical
+  strings (its today copy used to differ). This step's copy still differs
+  from web `tour-data.ts`, whose home keeps its Start-Next card.
+- **Clips** (`App/Resources/TourAudio/today.m4a` 23.2 s, `today-more.m4a`
+  14.0 s): DashScope **qwen3-tts-flash**, voice **"Cherry"**, synthesised
+  server-side through a temporary guard-protected Supabase edge helper that
+  read `DASHSCOPE_API_KEY` from the function env and returned only the audio
+  URL (the key never left the server; the helper was deleted from the project
+  and the tree right after). Why server-side: the Supabase secrets API
+  (`GET /v1/projects/…/secrets`) returns SHA-256 digests, not values, and no
+  DashScope key exists on disk — there is no client-side path. Then WAV 24 kHz
+  mono → gain-matched to the clips they replace (integrated −22.5 LUFS for the
+  narration, −24.3 for the more — exactly the old today / today-more) →
+  `afconvert -f m4af -d aac -b 56000` → AAC-LC 24 kHz mono ~56 kbps like every
+  other clip. Same bytes copied to Android `res/raw/tour_today*.m4a`.
+- **Pins**: `TourScript.stepsAwaitingNarration` is EMPTY again;
+  `TourAudioManifestTests.testNoStepAwaitsNarration` asserts that + both
+  files on disk; `testTodayClipsMatchTheStepCopy` pins the exact
+  narration/more strings the clips speak (edit the copy → re-record, or it
+  fails); `testEveryStepHasANarrationClip` / `testEveryTellMeMoreHasAMoreClip`
+  now cover all 15 steps with no exemption.
+- Verify: `TZ=UTC swift test` → 1038 tests, 2 skipped, 0 failures;
+  `xcodebuild test … -only-testing:UnstuckAppTests/TourDataTests
+  -only-testing:UnstuckAppTests/TourAudioManifestTests` on the iPhone sim →
+  45 tests (40 + 5), 0 failures. Clip check: `ffprobe` → aac/LC, 24000 Hz,
+  1 ch, 23.21 s / 13.95 s (59 / 37 words — the same ~0.4 s/word as the old
+  17.9 s / 48-word clip), integrated −22.5 / −24.3 LUFS vs the old −22.5 /
+  −24.3.
+- Still open (pre-existing, noted below): the `today` / `finish` panels render
+  COLLAPSED on a seeded 6.3" screen, so Read mode shows the title only there —
+  Listen now carries the content; the panel-height design pass is separate.
+
+## Where things stand (2026-09-18) — the "Start next" hero is gone from Today
 
 Ahmad (2026-09-18): the lavender gradient "START NEXT" card on the home —
 "<area> · <task>", the first-step headline, the estimate, the Focus button,

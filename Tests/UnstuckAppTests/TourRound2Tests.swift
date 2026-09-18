@@ -432,21 +432,39 @@ final class TourAudioManifestTests: XCTestCase {
         FileManager.default.fileExists(atPath: audioDir.appendingPathComponent(name).path)
     }
 
-    /// The steps whose clips are deliberately absent — their copy changed
-    /// (the `today` step no longer describes the removed Start-Next hero) and
-    /// the old recordings were dropped rather than narrate the wrong screen.
-    /// Pinned to exactly that set so a clip going missing anywhere else still
-    /// fails, and so regenerating the clips forces the set to be emptied.
+    /// The steps whose clips are deliberately absent. EMPTY since the `today`
+    /// clips were regenerated for the hero-less home (2026-09-18): pinned so a
+    /// clip going missing anywhere fails, and so parking a step here again is
+    /// a conscious decision (copy and clips disagree), never a leftover.
     private let awaiting = TourScript.stepsAwaitingNarration
 
-    func testOnlyTheTodayStepAwaitsRegeneratedNarration() {
-        XCTAssertEqual(awaiting, ["today"])
-        // The stale clips must really be gone — Listen would play the old
-        // "Start Next offers one realistic suggestion…" recording otherwise.
-        for id in awaiting {
-            XCTAssertFalse(exists("\(id).m4a"), "stale narration clip for '\(id)' is still bundled")
-            XCTAssertFalse(exists("\(id)-more.m4a"), "stale more clip for '\(id)' is still bundled")
-        }
+    func testNoStepAwaitsNarration() {
+        XCTAssertTrue(awaiting.isEmpty, "regenerate the clips instead of parking a step: \(awaiting)")
+        // The regenerated today clips are back in the bundle dir.
+        XCTAssertTrue(exists("today.m4a"), "today.m4a must be bundled again")
+        XCTAssertTrue(exists("today-more.m4a"), "today-more.m4a must be bundled again")
+    }
+
+    /// today.m4a / today-more.m4a (DashScope qwen3-tts-flash, voice "Cherry",
+    /// 2026-09-18) speak EXACTLY these strings — the same copy Android ships.
+    /// Editing the step's copy without re-recording would put the live
+    /// captions and the audio out of step; this pin makes that a test failure
+    /// instead of a tester report.
+    func testTodayClipsMatchTheStepCopy() {
+        let today = TourScript.essential.first { $0.id == "today" }!
+        XCTAssertEqual(
+            today.narration,
+            "This is Today. Up top: a greeting, how much you’ve focused this week, and the assistant pill — ask, plan, or brain-dump. Say it or type it, and it does it. Under that, the list shows only what’s planned for today, filtered by area; everything else waits quietly in Backlog. Focus starts from any task row, or from inside the task."
+        )
+        XCTAssertEqual(
+            today.more,
+            "Filter Today by area with the pills above the list, or switch to Backlog to see what’s waiting. Any row can start Focus — so can the task itself. Nothing unplanned is lost; it just isn’t in the way."
+        )
+        // Both scripts carry the one today step (full = essential.prefix(3) + …).
+        let inFull = TourScript.full.first { $0.id == "today" }
+        XCTAssertEqual(inFull?.narration, today.narration)
+        XCTAssertEqual(inFull?.more, today.more)
+        XCTAssertEqual(inFull?.body, today.body)
     }
 
     func testEveryStepHasANarrationClip() {
