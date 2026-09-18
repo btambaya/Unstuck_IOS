@@ -6,7 +6,9 @@
 //    this turn, and text that CLAIMS an action is hidden and bounced ONCE with
 //    the hidden corrective; if the retry's tool ran, its self-correction is
 //    stripped (the user never saw the claim);
-//  • finish_reason=length → the hidden "cut off" hint;
+//  • finish_reason=length on a round that CALLED TOOLS → the hidden "cut off"
+//    hint, appended AFTER that round's tool results (never between the
+//    tool_calls turn and its results); on a tool-less final reply → no hint;
 //  • truncated tool-call JSON → tell the model to split the call;
 //  • receipts derived from execution only; NEVER a synthesised "Done." —
 //    empty text falls back to the first receipt's label / the honest lines.
@@ -185,22 +187,33 @@ enum AssistantHarness {
                     continue
                 }
 
+                // The REAL assistant turn — the receipts, the empty-text
+                // fallback and stripSelfCorrection all attach to THIS index,
+                // never to whatever happens to be last in `working`. The
+                // hidden cut-off hint used to be pushed here, so a cut-off
+                // FINAL reply hung its text and its receipts (and their Undo)
+                // on a turn the panel never draws. `replyIndex` is
+                // use-assistant.ts's `replyTurn`, captured BEFORE anything
+                // else is pushed.
+                //
                 // The thread (persisted + replayed) carries NORMALISED tool
                 // calls — a non-object `arguments` string would 400 every
                 // later request (see argumentsAsObjectJSON); execution below
                 // still runs on the raw reply so the truncated-args hint fires.
+                let replyIndex = working.count
                 working.append(AssistantTurn(
                     ChatMessage(role: "assistant", content: reply.content,
                                 toolCalls: reply.toolCalls.isEmpty ? nil : normalisedForHistory(reply.toolCalls)),
                     at: deps.now()))
-                if reply.finishReason == "length" {
-                    working.append(AssistantTurn(ChatMessage(role: "user", content: cutOffHint), hidden: true))
-                }
 
                 if reply.toolCalls.isEmpty {
                     // Final reply — attach the turn's deterministic receipts.
                     // NEVER synthesize "Done." (harness audit, 2026-09-01).
-                    let last = working.count - 1
+                    // A length cut-off HERE gets no hidden hint at all:
+                    // nothing follows it this turn, and a dangling hidden
+                    // user turn made the model resume the abandoned plan on
+                    // the NEXT message (lib/assistant/use-assistant.ts).
+                    let last = replyIndex
                     var closing = content.trimmingCharacters(in: .whitespacesAndNewlines)
                     if corrected && writeToolSucceeded { closing = stripSelfCorrection(closing) }
                     // Deterministic register polish ("Done —", "Let me know…",
@@ -234,6 +247,17 @@ enum AssistantHarness {
                     }
                     if let receipt = deps.receipt(call.function.name, args, result) { receipts.append(receipt) }
                     working.append(AssistantTurn(ChatMessage(role: "tool", content: result, toolCallId: call.id, name: call.function.name)))
+                }
+                // The upstream said the reply was CUT OFF by length: later
+                // tool calls (or the tail of the text) never arrived. Say so
+                // explicitly instead of inferring it from a parse failure —
+                // and only AFTER the tool results, so every `tool` message
+                // stays adjacent to its `tool_calls` parent. Pushed before
+                // them it produced assistant(tool_calls) → user → tool, the
+                // orphaned-tool shape the upstream 400s on — which is exactly
+                // what a big create_tasks brain dump hits.
+                if reply.finishReason == "length" {
+                    working.append(AssistantTurn(ChatMessage(role: "user", content: cutOffHint), hidden: true))
                 }
                 deps.commit(working, false)
             }

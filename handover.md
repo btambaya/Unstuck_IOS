@@ -3,7 +3,58 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-18, latest) — the + creates what you're looking at
+## Where things stand (2026-09-18, latest) — the cut-off brain dump, and a caption that reads what was said
+
+Two defects a reconciliation sweep confirmed were still open. NOT bumped, not
+pushed, uncommitted.
+
+- **The hidden "cut off" hint orphaned a tool result** (`App/Features/AssistantHarness.swift`).
+  When `finish_reason=length` landed on a round that CALLED TOOLS, the hint was
+  pushed straight after the `tool_calls` turn, so the next round sent
+  `assistant(tool_calls) → user → tool` — an orphaned `tool` message, which
+  DashScope 400s, killing the turn with an inline error. A big
+  `create_tasks` / `complete_tasks` is exactly what hits the 1024-token cap, so
+  it fired on precisely the brain dump the feature exists for. The hint now
+  goes in AFTER that round's tool results.
+  The same push also made `let last = working.count - 1` point at the HIDDEN
+  hint on a tool-less final reply: the closing text, its receipts and their
+  Undo were written onto a turn `displayTurns` never draws, and the empty-text
+  fallback + `stripSelfCorrection` read the wrong turn. The real assistant turn
+  is now captured as `replyIndex` BEFORE anything else is pushed, and a
+  tool-less cut-off reply gets no hint at all (a dangling hidden user turn made
+  the model resume the abandoned plan on the next message).
+  This is web's `replyTurn` rule from `unstuck/lib/assistant/use-assistant.ts`,
+  ported. Android (`core/…/logic/AssistantHarness.kt`) already had it; iOS was
+  the odd one out. Proven by driving it: `AssistantHarnessTests` asserts the
+  message sequence each round sends, with an `orphanedTool` window validator —
+  revert the fix and 14 assertions fail, printing `["user","assistant","user","tool"]`.
+
+- **The Talk caption lost the reply's first words, and ran segments together**
+  (new `App/Voice/VoiceCaption.swift`, wired into `VoiceModeScreen`). Two
+  protocol orderings the inline sink got wrong:
+  `conversation.item.input_audio_transcription.completed` (the ASR of what the
+  USER said) is a separate async job and routinely lands AFTER the reply's
+  first `response.audio_transcript.delta`s — and the sink cleared the caption
+  on EVERY user event, so the first word or two vanished. And one turn speaks
+  in several segments (narrate → tool → answer); their deltas were
+  concatenated raw: "Let me check.You have three today."
+  The reducer now tells the two user events apart — an EMPTY user caption is
+  the barge-in "new turn" signal and always clears; a NON-empty one is an ASR
+  result and only clears a caption that is not the live reply it belongs to —
+  and separates segments at `response.audio_transcript.done` (also emitted on
+  `response.done`, so a backend that skips the transcript terminator still
+  gets a break). It never doubles an existing space.
+  Web (`components/assistant/voice-mode.tsx`) avoids both by clearing the
+  caption on every `done`; iOS deliberately keeps the reply on screen while
+  the audio plays out, so it separates instead of dropping. **Android
+  `ui/assistant/VoiceModeScreen.kt` (~line 216) still has BOTH defects** —
+  same one-line sink, unported.
+  Proven by driving REAL server-event JSON through the real
+  `VoiceRealtimeClient.handle` (`Tests/UnstuckAppTests/VoiceCaptionTests.swift`,
+  9 tests); revert the reducer and it prints "left today." and
+  "Let me check.You have three today." verbatim.
+
+## Where things stand (2026-09-18) — the + creates what you're looking at
 
 The bottom bar's coral + used to open the New-task sheet from every screen.
 It now follows the surface. Same button, same coral, same position — only the

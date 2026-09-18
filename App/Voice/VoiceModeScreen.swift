@@ -30,11 +30,15 @@ final class VoiceSessionModel {
     static fileprivate(set) var isPresented = false
 
     var state: VoiceState = .connecting
+    /// Everything the caption line shows, as ONE reducer (VoiceCaption.swift):
+    /// a late user-ASR result must not wipe the reply it caused, and successive
+    /// reply segments must not run together.
+    private(set) var captions = VoiceCaptionState()
     /// The streaming assistant caption (cleared at the start of each user turn).
-    var caption = ""
+    var caption: String { captions.caption }
     /// The user's last transcribed turn, shown briefly until the assistant's
     /// reply starts streaming — so a spoken request isn't silently discarded.
-    var userTranscript = ""
+    var userTranscript: String { captions.userTranscript }
     /// A local note (permission / config / mic error) shown in the ERROR state.
     var note: String?
     /// The call this screen is running (fallback B), nil for a plain Talk.
@@ -97,7 +101,7 @@ final class VoiceSessionModel {
         client?.stop()
         client = nil
         model.assistant.endVoiceSession()
-        caption = ""; userTranscript = ""; note = nil
+        captions.reset(); note = nil
         state = .connecting
         connect(token: token)
     }
@@ -154,18 +158,10 @@ final class VoiceSessionModel {
             } },
             onCaption: { [weak self] role, text, done in
                 Task { @MainActor in
-                    guard let self else { return }
-                    if role == "user" {
-                        // New user turn: surface what they said + clear the reply.
-                        self.caption = ""
-                        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        if !t.isEmpty { self.userTranscript = t }
-                    } else if role == "assistant", !done {
-                        // The reply is streaming in — drop the user echo so the
-                        // single caption line reads the assistant's words.
-                        self.userTranscript = ""
-                        self.caption += text
-                    }
+                    // One pure reducer (VoiceCaption.swift) — a user ASR result
+                    // that lands after the reply started must not wipe its first
+                    // words, and a second reply segment must not run into the first.
+                    self?.captions.apply(role: role, text: text, done: done)
                 }
             },
             onError: { [weak self] msg in voiceLog.error("voice error \(msg, privacy: .public)"); Task { @MainActor in self?.note = msg } },
@@ -179,7 +175,7 @@ final class VoiceSessionModel {
     /// the model is responding or playing — `canInterrupt`.
     func interrupt() {
         // Barge-in starts a fresh turn — drop the stale caption + user echo.
-        caption = ""; userTranscript = ""
+        captions.reset()
         client?.interrupt()
     }
 
@@ -191,7 +187,7 @@ final class VoiceSessionModel {
     func pttDown() {
         guard holdToTalk, !pttPressed else { return }
         pttPressed = true
-        caption = ""; userTranscript = ""
+        captions.reset()
         client?.pttDown()
     }
 

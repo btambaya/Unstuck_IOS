@@ -543,7 +543,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         onTransportEnded?(error)
     }
 
-    private func handle(_ text: String) {
+    /// One server event, already decoded from the socket frame. Internal (not
+    /// private) so the caption/barge-in tests can drive REAL event JSON
+    /// through the real switch instead of restating what it emits.
+    func handle(_ text: String) {
         guard let data = text.data(using: .utf8),
               let ev = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let type = ev["type"] as? String else { return }
@@ -588,6 +591,12 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             dispatch(.transcription)
             if let t = ev["transcript"] as? String { onCaption("user", t, true) }
         case "response.audio.done", "response.done":
+            // `response.done` is terminal for the WHOLE reply, so it closes the
+            // caption segment too — a backend that never sends
+            // response.audio_transcript.done would otherwise let the next
+            // segment's deltas run straight into this one's last word. The
+            // reducer treats a second segment-end as a no-op.
+            if type == "response.done" { onCaption("assistant", "", true) }
             // First response finished → the opening primer has served its
             // purpose; remove it so it can never be re-executed after an
             // interruption. Best effort: a backend without item.delete just

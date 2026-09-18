@@ -48,7 +48,9 @@ final class AssistantHarnessTests: XCTestCase {
         persisted = []
     }
 
-    private func text(_ s: String) -> HarnessAsk { .ok(HarnessReply(content: s)) }
+    private func text(_ s: String, finishReason: String? = nil) -> HarnessAsk {
+        .ok(HarnessReply(content: s, finishReason: finishReason))
+    }
     private func call(_ name: String, _ args: String, content: String? = nil, finishReason: String? = nil, id: String = "c1") -> HarnessAsk {
         .ok(HarnessReply(content: content, toolCalls: [ToolCall(id: id, type: "function", function: ToolFunction(name: name, arguments: args))],
                          finishReason: finishReason))
@@ -258,11 +260,109 @@ final class AssistantHarnessTests: XCTestCase {
         XCTAssertEqual(AssistantHarness.argumentsAsObjectJSON(#" {"name":"A"} "#), #" {"name":"A"} "#)
     }
 
-    func testFinishReasonLengthAddsTheHiddenCutOffHint() async {
+    // MARK: the completion cap — the cut-off hint must never orphan a tool
+
+    /// The wire rule every OpenAI-shaped upstream enforces: a `tool` message
+    /// only ever appears in the contiguous block that IMMEDIATELY follows the
+    /// `assistant` turn whose `tool_calls` it answers, and every announced
+    /// call is answered there. Returns the first violation, or nil.
+    /// (DashScope 400s the request otherwise — the turn dies inline.)
+    private func orphanedTool(_ win: [ChatMessage]) -> String? {
+        var i = 0
+        while i < win.count {
+            let m = win[i]
+            if m.role == "tool" {
+                return "message \(i): a tool result with no tool_calls turn before it"
+            }
+            guard m.role == "assistant", let calls = m.toolCalls, !calls.isEmpty else { i += 1; continue }
+            var unanswered = calls.map(\.id)
+            var j = i + 1
+            while j < win.count, win[j].role == "tool" {
+                guard let id = win[j].toolCallId, let at = unanswered.firstIndex(of: id) else {
+                    return "message \(j): a tool result that answers no call of the tool_calls turn at \(i)"
+                }
+                unanswered.remove(at: at)
+                j += 1
+            }
+            if !unanswered.isEmpty {
+                let next = j < win.count ? "a \(win[j].role) turn" : "the end of the window"
+                return "message \(i): \(unanswered.count) tool call(s) unanswered — \(next) follows the tool_calls turn"
+            }
+            i = j
+        }
+        return nil
+    }
+
+    func testFinishReasonLengthAddsTheHiddenCutOffHintAfterTheToolResults() async {
         let transport = ScriptedTransport([call("create_task", #"{"name":"A"}"#, finishReason: "length"), text("Added A.")])
         _ = await runTurn("add a", transport)
         XCTAssertTrue(transport.asks[1].contains { $0.role == "user" && $0.content == AssistantHarness.cutOffHint })
         XCTAssertFalse(visible.contains { $0.text == AssistantHarness.cutOffHint })
+        // …and it lands AFTER the tool result, never between the tool_calls
+        // turn and its answer: user, assistant(tool_calls), tool, user(hint).
+        XCTAssertEqual(transport.asks[1].map(\.role), ["user", "assistant", "tool", "user"])
+        XCTAssertEqual(transport.asks[1].last?.content, AssistantHarness.cutOffHint)
+        XCTAssertNil(orphanedTool(transport.asks[1]))
+    }
+
+    /// The brain dump: a big `create_tasks` is exactly what hits the 1024-token
+    /// completion cap, and the round that hits it is the round that CALLED the
+    /// tool. The hint used to be wedged between the tool_calls turn and its
+    /// result — assistant(tool_calls) → user → tool — and the next round 400'd.
+    func testABulkBrainDumpCutOffMidToolCallStillSendsAValidWindow() async {
+        let bulk = #"{"tasks":[{"name":"Dentist"},{"name":"Taxes"},{"name":"Call mum"}]}"#
+        let transport = ScriptedTransport([
+            call("create_tasks", bulk, content: "Adding those now:", finishReason: "length"),
+            call("create_tasks", #"{"tasks":[{"name":"Renew passport"}]}"#, id: "c2"),
+            text("All six are in."),
+        ])
+        let outcome = await runTurn("brain dump: dentist, taxes, call mum, renew passport", transport)
+        XCTAssertEqual(outcome, .reply("All six are in."))
+        // Every round the loop sent is a legal window…
+        for (i, win) in transport.asks.enumerated() {
+            XCTAssertNil(orphanedTool(win), "round \(i + 1) sent an illegal window")
+        }
+        // …and round 2 is exactly user, assistant(tool_calls), tool, user(hint).
+        XCTAssertEqual(transport.asks[1].map(\.role), ["user", "assistant", "tool", "user"])
+        XCTAssertEqual(transport.asks[1][2].toolCallId, "c1")
+        XCTAssertEqual(transport.asks[1][3].content, AssistantHarness.cutOffHint)
+        // The second cut-off-free round's results sit next to THEIR parent too.
+        XCTAssertEqual(transport.asks[2].map(\.role), ["user", "assistant", "tool", "user", "assistant", "tool"])
+        XCTAssertEqual(api.tasks.map(\.name), ["Dentist", "Taxes", "Call mum", "Renew passport"])
+    }
+
+    /// No tool calls: the hint has nothing to precede, so it is not sent at
+    /// all — and the reply's text and receipts stay on the REAL assistant
+    /// turn instead of a hidden one the panel never draws.
+    func testACutOffFinalReplyKeepsItsReceiptsAndSendsNoHint() async {
+        let transport = ScriptedTransport([
+            call("create_task", #"{"name":"Milk"}"#),
+            text("Added Milk, and here's the rest of the plan for tomorrow morning which is where it", finishReason: "length"),
+        ])
+        let outcome = await runTurn("add milk", transport)
+        XCTAssertEqual(outcome, .reply("Added Milk, and here's the rest of the plan for tomorrow morning which is where it"))
+        // A dangling hidden user turn made the model resume the abandoned plan
+        // on the NEXT message — the thread must not end with one.
+        XCTAssertFalse(finalThread.contains { $0.text == AssistantHarness.cutOffHint })
+        XCTAssertEqual(finalThread.last?.role, "assistant")
+        XCTAssertFalse(finalThread.last!.isHidden)
+        // The receipt (and its Undo) rides the turn the panel renders.
+        let closing = finalThread.last!
+        XCTAssertEqual(closing.text, "Added Milk, and here's the rest of the plan for tomorrow morning which is where it")
+        XCTAssertEqual(closing.receipts?.map(\.label), ["Created “Milk”"])
+        XCTAssertEqual(closing.receipts?.first?.undo, .deleteTask(id: api.tasks[0].id))
+        XCTAssertEqual(visible.last?.receipts?.count, 1, "the rendered bubble carries the receipt")
+    }
+
+    /// The other half of the same defect: with the hint last, the empty-text
+    /// fallback wrote its honest line onto the HIDDEN turn, so the panel drew
+    /// nothing at all for the round.
+    func testAnEmptyCutOffFinalReplyPutsItsFallbackOnTheVisibleTurn() async {
+        let transport = ScriptedTransport([text("", finishReason: "length")])
+        let outcome = await runTurn("hello", transport)
+        XCTAssertEqual(outcome, .reply(AssistantHarness.lostThread))
+        XCTAssertEqual(visible.map(\.text), ["hello", AssistantHarness.lostThread])
+        XCTAssertFalse(finalThread.contains(where: \.isHidden))
     }
 
     // MARK: deterministic style save
