@@ -45,9 +45,23 @@ final class TourUITests: XCTestCase {
 
     /// Wait for a step's title (rendered by the tour panel in the overlay
     /// window) and screenshot it.
-    private func expectStep(_ title: String, shot: String, timeout: TimeInterval = 12) {
+    ///
+    /// `body` is the guard the title alone can't give: a COLLAPSED panel still
+    /// renders its title, so the 2026-09-18 today/finish regression — the whole
+    /// step body hidden on 6.3" phones — looked like a perfectly healthy step
+    /// from up here and all three of these tests passed straight through it.
+    /// Pass a distinctive fragment of the step's copy and the panel has to have
+    /// actually rendered it.
+    private func expectStep(_ title: String, shot: String, body: String? = nil,
+                            timeout: TimeInterval = 12) {
         XCTAssertTrue(app.staticTexts[title].firstMatch.waitForExistence(timeout: timeout),
                       "expected tour step '\(title)'")
+        if let body {
+            XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", body))
+                            .firstMatch.waitForExistence(timeout: 4),
+                          "step '\(title)' rendered TITLE-ONLY — its body copy never made it "
+                          + "into the panel (expected to find: \(body))")
+        }
         usleep(900_000)   // let navigation/sheet animations settle for the shot
         snap(shot)
     }
@@ -94,7 +108,27 @@ final class TourUITests: XCTestCase {
         app.buttons["Close question"].firstMatch.tap()
         tapPrimary()
 
-        expectStep("Today narrows it down", shot: "02-today")
+        // The today step is the one the panel-placement regression hit: its ring
+        // is the Today list, which leaves only 242pt above it on a 6.3" phone —
+        // less than the panel's natural 358. The panel must CAP and scroll, not
+        // collapse, so the copy has to be there.
+        expectStep("Today narrows it down", shot: "02-today",
+                   body: "Today lists only what\u{2019}s planned for today")
+        // …and on a capped panel the body is a live scroll view, whose pan
+        // recognizer outranks the panel-wide DragGesture. Swiping DOWN over the
+        // copy is the documented iOS Escape-equivalent and must still reach the
+        // pause confirm on exactly these steps.
+        let todayTitle = app.staticTexts["Today narrows it down"].firstMatch.frame
+        let overTheCopy = app.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(dx: todayTitle.midX, dy: todayTitle.maxY + 20))
+        overTheCopy.press(forDuration: 0.1,
+                          thenDragTo: overTheCopy.withOffset(CGVector(dx: 0, dy: 110)))
+        XCTAssertTrue(app.staticTexts["Pause the tour? Your progress is saved."]
+            .firstMatch.waitForExistence(timeout: 6),
+            "swipe-down over a CAPPED panel's copy must still open the pause confirm")
+        app.buttons["Keep going"].firstMatch.tap()
+        XCTAssertTrue(app.staticTexts["Today narrows it down"].firstMatch.waitForExistence(timeout: 4))
+        XCTAssertFalse(app.staticTexts["Pause the tour? Your progress is saved."].exists)
         // ROUND-2 LOCKDOWN: a tap outside the panel + spotlight is swallowed.
         // ROUND-4 A11Y (build 39) went further — on a step where the touch
         // layer swallows EVERY app point, the app window's elements are hidden
@@ -193,7 +227,8 @@ final class TourUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Calm"].firstMatch.waitForExistence(timeout: 8),
                       "settings should be open on the Notifications section")
         tapPrimary()
-        expectStep("You’re ready to begin", shot: "09-finish")
+        expectStep("You’re ready to begin", shot: "09-finish",
+                   body: "Pick one real next step")
         tapPrimary("Begin")
 
         // Tour done — panel gone, app back on Today, nothing presented, and

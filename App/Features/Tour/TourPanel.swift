@@ -5,20 +5,49 @@
 // deliberately theme-independent so they read correctly in BOTH themes), and
 // the footer controls (Pause / Skip / Back / Continue).
 //
-// The panel NEVER covers the spotlight: the orchestrator docks it opposite
-// the target (top/bottom) and passes `collapsed` when a target spans both
-// halves — collapsed = title + controls only, so the ring stays visible.
+// The panel NEVER covers the spotlight: the orchestrator docks it opposite the
+// target (top/bottom) and hands it a `TourPanelPlacement` — a hard height cap
+// when the free space is tight (header + footer stay pinned, the middle
+// scrolls), and `collapsed` only when even a readable panel cannot fit, where
+// title + controls is all that's left.
 
 import SwiftUI
 import UnstuckDesign
 
+/// The body scroll view's coordinate space, and the id `scrollTo` uses to put
+/// it back at the top on a step change. File scope so the `@Sendable` geometry
+/// closure that reads the space can reference it without hopping actors.
+private let tourPanelBodySpace = "tour-panel-body"
+private let tourPanelBodyTopID = "tour-panel-body-top"
+
 struct TourPanel: View {
     @Environment(\.uTheme) private var theme
     @Bindable var tour: TourModel
-    let collapsed: Bool
+    /// Dock + collapse + cap as ONE value: the collapse flag and the cap come
+    /// from a single decision, so the panel can't be laid out to one and
+    /// measured against the other.
+    let placement: TourPanelPlacement
 
     @State private var question = ""
     @State private var showMore = false
+    /// The NATURAL height of the scrolling middle — see `body`. Laid out
+    /// inside a ScrollView, so it is the ideal height whether or not the
+    /// placement capped the panel.
+    @State private var bodyHeight: CGFloat = 0
+    /// The MEASURED chrome: the pinned header and footer. Seeded with the
+    /// metrics so the first frame is already the right shape, then corrected —
+    /// the footer is NOT a constant (the inline pause confirm adds 67pt).
+    @State private var headerHeight = TourPanelMetrics.header
+    @State private var footerHeight = TourPanelMetrics.footer
+    /// The body scroll view is at its top, and whether the in-flight swipe
+    /// began there — see `bodyPauseSwipe`. Stored as the BOOLEAN rather than the
+    /// offset on purpose: `onGeometryChange` only fires when its value changes,
+    /// so this re-renders the panel twice per scroll instead of every frame.
+    @State private var bodyAtTop = true
+    @State private var swipeBeganAtBodyTop: Bool?
+    /// The Ask thread's natural height, so its 180pt window can be a DEFINITE
+    /// frame — see `askThread`.
+    @State private var askHeight: CGFloat = 0
     @FocusState private var askFocused: Bool
 
     /// FIXED answer-bubble colors (web: oklch(0.93 0.04 280) / oklch(0.25 0.02 280)).
@@ -28,46 +57,81 @@ struct TourPanel: View {
 
     var body: some View {
         let step = tour.currentStep
+        // The cap covers the WHOLE panel, and the header and footer are PINNED,
+        // so what is left of it is the body's. The chrome is MEASURED, not
+        // assumed: the inline pause confirm makes the footer 134pt where the
+        // controls row is 67.
+        let chrome = headerHeight + footerHeight
+        // Never squeeze the body below its title block. If the real chrome is
+        // fatter than the placement rule's floor assumed (confirm open on a
+        // ring-filled screen), a few points of overlap beat hiding the step's
+        // name — and since the panel HUGS, the frame it reports is that taller
+        // height, so the hit-test claim still covers every point it draws on.
+        let bodyLimit = placement.maxHeight.map { max(TourPanelMetrics.titleBlock, $0 - chrome) }
         VStack(spacing: 0) {
             header(step)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(step.title)
-                    .font(UFont.serifItalic(20))
-                    .foregroundStyle(theme.palette.ink)
-                    .fixedSize(horizontal: false, vertical: true)
-                if !collapsed {
-                    Text(step.body)
-                        .font(UFont.sans(13.5))
-                        .lineSpacing(3)
-                        .foregroundStyle(theme.palette.ink2)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .padding(.top, 8)
-                    if showMore, let more = step.more {
-                        Text(more)
-                            .font(UFont.sans(12.5))
-                            .lineSpacing(3)
-                            .foregroundStyle(theme.palette.ink3)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .padding(.top, 10)
-                            .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 1).offset(y: -5) }
-                    }
-                    if tour.mediaMode == .listen && tour.audio.available {
-                        listenBar
-                    }
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { headerHeight = $0 }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    middle(step)
+                        // Measured here, INSIDE the scroll view, where the
+                        // content is always proposed its ideal height — the one
+                        // reading of the panel that a cap can't distort.
+                        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { bodyHeight = $0 }
+                        // Scroll position: the content's top sits at the scroll
+                        // view's own top (or below it, mid-rubber-band) exactly
+                        // while there is nothing left to scroll UP into view.
+                        // Read by the swipe-down-to-pause gesture below.
+                        .onGeometryChange(for: Bool.self) {
+                            $0.frame(in: .named(tourPanelBodySpace)).minY > -0.5
+                        } action: { bodyAtTop = $0 }
+                        .id(tourPanelBodyTopID)
                 }
-                // The Ask thread lives OUTSIDE the collapse conditional: a
-                // collapse while the field owns focus would UNMOUNT it, drop
-                // the keyboard, and re-expand — the focus loop. (It renders
-                // nothing unless the user opened it, so the normal collapsed
-                // panel is unchanged.)
-                askThread(step)
-                if !collapsed {
-                    miniLinks(step)
+                .coordinateSpace(.named(tourPanelBodySpace))
+                // A ScrollView is greedy — left alone it swallows the whole
+                // offered height and strands the footer at the bottom of an
+                // over-tall panel. Capped, it takes the smaller of the measured
+                // content and what the cap leaves (so a short step never shows
+                // dead space) as a DEFINITE height; uncapped, nil leaves it to
+                // hug its content under the `fixedSize` below, exactly as the
+                // plain VStack used to.
+                .frame(height: bodyLimit.map { bodyHeight > 0 ? min(bodyHeight, $0) : $0 })
+                // Uncapped there is nothing to scroll (and the panel-wide
+                // gesture then owns the drag over the copy too).
+                .scrollDisabled(bodyLimit == nil)
+                .scrollBounceBehavior(.basedOnSize)
+                // Capped, the scroll view's pan recognizer outranks the
+                // panel-wide DragGesture, which would silently retire the
+                // swipe-down-to-pause gesture over the copy on exactly the
+                // tight steps this cap exists for. Simultaneous + "only from
+                // the top" gives both: a drag that starts mid-scroll scrolls,
+                // one that starts at the top pauses.
+                .simultaneousGesture(bodyPauseSwipe)
+                .onChange(of: tour.currentStep.id) { _, _ in
+                    // The panel is ONE structural identity across steps
+                    // (TourRootView keeps a single flipping panel), so nothing
+                    // resets this offset on its own — without it a capped step
+                    // opens already scrolled past its own first line.
+                    bodyAtTop = true
+                    proxy.scrollTo(tourPanelBodyTopID, anchor: .top)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 4)
             footer(step)
+                .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { footerHeight = $0 }
+        }
+        // The panel ALWAYS hugs: the cap is spent on the body above, never on
+        // this stack, so the header and footer can never be compressed and the
+        // panel can never draw outside the frame it reports.
+        .fixedSize(horizontal: false, vertical: true)
+        // The ONE place the placement rule's input is written, re-fired whenever
+        // EITHER measurement moves. It has to watch both: the body's own
+        // geometry callback never fires when the FOOTER swaps its controls row
+        // for the pause confirm — the copy above it is untouched — and that is
+        // exactly the 67pt the rule would otherwise never hear about.
+        // (`reportPanelHeight` refuses a collapsed reading; see it for why both
+        // operands are safe to feed back and a rendered frame is not.)
+        .onChange(of: [bodyHeight, chrome], initial: true) { _, m in
+            tour.reportPanelHeight(body: m[0], chrome: m[1], collapsed: placement.collapsed)
         }
         .background(theme.palette.bg, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
@@ -77,16 +141,18 @@ struct TourPanel: View {
         .accessibilityLabel("Product tour")
         // Swipe-down = the pause flow (the iOS Escape-equivalent) — shows the
         // inline confirm first; progress is only saved-and-dismissed on confirm.
-        .gesture(
-            DragGesture(minimumDistance: 30)
-                .onEnded { value in
-                    if value.translation.height > 60 && abs(value.translation.width) < 80 { tour.requestPause() }
-                }
-        )
+        // Nothing competes for the drag over the pinned header and footer, so
+        // this one needs no scroll guard; the body carries its own copy above.
+        .gesture(DragGesture(minimumDistance: 30).onEnded { pauseIfSwipeDown($0) })
         .onChange(of: tour.currentStep.id) { _, _ in
             showMore = false
             question = ""
             askFocused = false
+            // Per-step state that outlives the step otherwise — the panel is one
+            // structural identity across steps. A stale askHeight is a DEFINITE
+            // frame on the next step's thread (180pt of white around one line).
+            askHeight = 0
+            swipeBeganAtBodyTop = nil
         }
         .onChange(of: askFocused) { _, focused in
             // Placement rule input: while the field owns focus the panel is
@@ -95,6 +161,74 @@ struct TourPanel: View {
             // The tour lives in its own overlay window; text entry needs it key.
             if focused { TourWindowHandle.shared.makeTourKey() } else { TourWindowHandle.shared.restoreAppKey() }
         }
+    }
+
+    // MARK: swipe-down-to-pause
+
+    /// Shared tail of both pause swipes: a decisive DOWNWARD drag.
+    private func pauseIfSwipeDown(_ value: DragGesture.Value) {
+        if value.translation.height > 60 && abs(value.translation.width) < 80 { tour.requestPause() }
+    }
+
+    /// The same flow over the SCROLLING body, attached simultaneously so the
+    /// scroll view's pan doesn't swallow it — but only when the swipe BEGAN at
+    /// the top of the body, where a downward drag has nothing left to scroll.
+    /// (Sampled at `onChanged`, not at the end: a genuine scroll-back-to-the-top
+    /// flick also ENDS at the top, and must not pause the tour.)
+    private var bodyPauseSwipe: some Gesture {
+        DragGesture(minimumDistance: 30)
+            .onChanged { _ in
+                if swipeBeganAtBodyTop == nil { swipeBeganAtBodyTop = bodyAtTop }
+            }
+            .onEnded { value in
+                let fromTop = swipeBeganAtBodyTop ?? bodyAtTop
+                swipeBeganAtBodyTop = nil
+                guard fromTop else { return }
+                pauseIfSwipeDown(value)
+            }
+    }
+
+    // MARK: middle (the scrolling part — everything but header and footer)
+
+    private func middle(_ step: TourStep) -> some View {
+        let collapsed = placement.collapsed
+        return VStack(alignment: .leading, spacing: 0) {
+            Text(step.title)
+                .font(UFont.serifItalic(20))
+                .foregroundStyle(theme.palette.ink)
+                .fixedSize(horizontal: false, vertical: true)
+            if !collapsed {
+                Text(step.body)
+                    .font(UFont.sans(13.5))
+                    .lineSpacing(3)
+                    .foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 8)
+                if showMore, let more = step.more {
+                    Text(more)
+                        .font(UFont.sans(12.5))
+                        .lineSpacing(3)
+                        .foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 10)
+                        .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 1).offset(y: -5) }
+                }
+                if tour.mediaMode == .listen && tour.audio.available {
+                    listenBar
+                }
+            }
+            // The Ask thread lives OUTSIDE the collapse conditional: a
+            // collapse while the field owns focus would UNMOUNT it, drop
+            // the keyboard, and re-expand — the focus loop. (It renders
+            // nothing unless the user opened it, so the normal collapsed
+            // panel is unchanged.)
+            askThread(step)
+            if !collapsed {
+                miniLinks(step)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 16).padding(.top, 14).padding(.bottom, 4)
     }
 
     // MARK: header
@@ -243,8 +377,25 @@ struct TourPanel: View {
                                 .id(-1)
                         }
                     }
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { askHeight = $0 }
                 }
-                .frame(maxHeight: 180)
+                // The thread still tops out at 180pt, but as a DEFINITE frame
+                // now that it can sit inside the panel's own scroll view: a
+                // nested ScrollView with only a maxHeight is handed an
+                // unbounded proposal by the outer one, returns its full
+                // content height, and draws straight over what follows it.
+                //
+                // UNTIL it has been measured the frame stays nil — unspecified,
+                // so the thread hugs its content for that first frame. A
+                // definite `min(askHeight, 180)` off the seed would draw the
+                // thread 0-tall on the frame it mounts (and `askHeight` is
+                // reset per step, so a long thread on one step can no longer
+                // leave the next step's one-liner in a 180pt box).
+                .frame(height: askHeight > 0 ? min(askHeight, 180) : nil)
+                // Below the ceiling there is nothing to scroll, and the outer
+                // body should own the drag.
+                .scrollDisabled(askHeight <= 180)
+                .scrollBounceBehavior(.basedOnSize)
                 .onChange(of: ask.bubbles.count) { _, _ in
                     withAnimation { proxy.scrollTo(ask.bubbles.last?.id ?? -1, anchor: .bottom) }
                 }

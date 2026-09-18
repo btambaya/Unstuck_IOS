@@ -51,9 +51,10 @@ final class TourModel {
     private(set) var explicitOpen = false
     /// The current step's resolved spotlight rect (screen coords; nil = scrim).
     private(set) var targetRect: CGRect?
-    /// Last measured EXPANDED panel height — feeds the collapse decision.
-    /// (Never updated from a collapsed measurement, or the rule oscillates.)
-    var panelExpandedHeight: CGFloat = 340
+    /// The panel's NATURAL (unconstrained) height — the placement rule's input.
+    /// Written only by `reportPanelHeight`; see it for why that is the one
+    /// door in.
+    private(set) var panelExpandedHeight: CGFloat = 340
     /// The panel's current on-screen frame — the ONLY interactive tour region
     /// while running; everything else passes through to the app (the window's
     /// hitTest asks `claims(point:)`).
@@ -419,6 +420,32 @@ final class TourModel {
         if expanded { audio.playMore() } else { audio.stopMore() }
     }
 
+    /// The panel reporting what it really needs — its measured scrolling middle
+    /// plus its measured chrome. The ONLY way `panelExpandedHeight` is written,
+    /// so the rule can't be fed its own output.
+    ///
+    /// Two properties have to hold AT ONCE, and they coexist because both
+    /// operands are functions of the panel's CONTENT alone, never of the
+    /// placement this rule produces:
+    ///
+    ///  • NOT STALE. `chrome` is the live header + footer, not a constant: the
+    ///    inline pause confirm swaps a 67pt controls row for a 134pt block, and
+    ///    a compile-time 121 would under-report the panel by 67pt — enough for
+    ///    the uncapped branch to decide it fits and let it grow into the ring.
+    ///  • NO OSCILLATION. Neither operand can echo the cap back. The middle is
+    ///    measured INSIDE the panel's ScrollView, where it is always proposed
+    ///    its ideal height, so a capped render reports the same number an
+    ///    uncapped one does. The header and footer are never capped at all —
+    ///    the panel spends the cap on its body and hugs — so they always
+    ///    measure their natural height too. The one poisoned reading left is a
+    ///    COLLAPSED render, where the copy is absent from the tree rather than
+    ///    scrolled out of sight; believing that would shrink the requirement,
+    ///    re-expand the panel and flip back. It is refused here.
+    func reportPanelHeight(body: CGFloat, chrome: CGFloat, collapsed: Bool) {
+        guard !collapsed, body > 0, chrome > 0 else { return }
+        panelExpandedHeight = body + chrome
+    }
+
     // MARK: internals
 
     private func applyCurrentStep() {
@@ -730,11 +757,13 @@ struct TourRootView: View {
     private func runningLayer(_ tour: TourModel) -> some View {
         GeometryReader { geo in
             let screen = geo.frame(in: .global)
-            // Non-negotiable #1: dock the panel OPPOSITE the spotlight target;
-            // a target spanning both halves collapses the panel instead of
-            // covering the ring. Re-evaluated on every rect/height change.
-            // While the Ask field owns focus, `keyboard:` forces dock = .top
-            // and suppresses collapse (a collapse would unmount the focused
+            // Non-negotiable #1: dock the panel OPPOSITE the spotlight target
+            // and hard-cap it to the free space on that side, so it can never
+            // grow into the ring; only a target that leaves no room for a
+            // READABLE panel on either side collapses it to title + controls.
+            // Re-evaluated on every rect/height change. While the Ask field
+            // owns focus, `keyboard:` forces dock = .top, uncapped, and
+            // suppresses collapse (either would unmount or hide the focused
             // field → keyboard drop → re-expand loop).
             let placement = tourPanelPlacement(target: tour.targetRect, screen: screen,
                                                panelHeight: tour.panelExpandedHeight,
@@ -774,7 +803,7 @@ struct TourRootView: View {
                 // `topOffset` (keyboard-time only): nudges the forced-top
                 // panel below a top-half ring when both fit — see
                 // tourPanelPlacement's documented keyboard × ring decision.
-                panel(tour, collapsed: placement.collapsed)
+                panel(tour, placement: placement)
                     .frame(maxWidth: .infinity, maxHeight: .infinity,
                            alignment: placement.dock == .top ? .top : .bottom)
                     .padding(.top, placement.dock == .top ? placement.topOffset : 0)
@@ -791,21 +820,23 @@ struct TourRootView: View {
         .ignoresSafeArea(.keyboard)
     }
 
-    private func panel(_ tour: TourModel, collapsed: Bool) -> some View {
-        TourPanel(tour: tour, collapsed: collapsed)
+    private func panel(_ tour: TourModel, placement: TourPanelPlacement) -> some View {
+        TourPanel(tour: tour, placement: placement)
             // UIKit frame reader — the hit-test claim reads this view's LIVE
             // window frame at hitTest time (immune to any SwiftUI callback
             // staleness; a stale claim once sent a tap through to the tab bar).
             .background(TourPanelFrameReader().allowsHitTesting(false))
             .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { frame in
-                // The SwiftUI frame is the claim FALLBACK; only EXPANDED
-                // measurements feed the collapse rule (a collapsed height
-                // would flip it right back — oscillation).
+                // Claim FALLBACK only. This frame is the RESULT of the
+                // placement — collapsed or capped to the space the rule just
+                // chose — so feeding it back as the panel's height would be
+                // feeding the rule its own output. The height input comes from
+                // the panel's unconstrained body + chrome measurements instead
+                // (TourModel.reportPanelHeight).
                 tour.panelFrame = frame
-                if !collapsed { tour.panelExpandedHeight = frame.height }
             }
             .frame(maxWidth: .infinity)
-            .animation(.easeOut(duration: 0.22), value: collapsed)
+            .animation(.easeOut(duration: 0.22), value: placement.collapsed)
     }
 }
 

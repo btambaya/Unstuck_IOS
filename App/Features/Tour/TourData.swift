@@ -591,22 +591,99 @@ func tourHidesAppFromAccessibility(ctx: TourClaimContext) -> Bool {
 
 enum TourPanelDock: Equatable, Sendable { case top, bottom }
 
+/// TourPanel's layout metrics. The placement rule has to know how much PANEL a
+/// slice of free space can actually hold — an all-or-nothing rule that only
+/// knows the whole expanded height collapses a panel that had room for its
+/// title and most of its copy (the 2026-09-18 today/finish bug on 6.3" phones:
+/// 242pt free above the ringed Today list, a 358pt panel — title-only
+/// rendered).
+///
+/// Every number below is MEASURED off the real panel on the simulator (hosted
+/// and laid out at 354pt wide — a 402pt screen less the running layer's 2×24
+/// padding), not read off the padding constants:
+/// SwiftUI's rendered line box for Geist 13.5 is 18.22pt, not the face's own
+/// 17.55pt line height, and the device pixel grid moves each line origin by up
+/// to ⅓pt. `TourPanelMeasureTests` re-measures all of them, so a padding or
+/// font change fails there rather than silently mis-sizing the panel.
+///
+/// The `header`/`footer`/`chrome` figures describe the panel with its ordinary
+/// CONTROLS footer. They are a SEED, not a source of truth: the inline pause
+/// confirm makes the footer 134pt (measured), so the panel measures its own
+/// chrome at runtime and reports `chrome + body` from there — see
+/// `TourModel.reportPanelHeight`.
+enum TourPanelMetrics {
+    /// Header row: 12pt top padding + the 32pt ✕-button row + 10pt bottom.
+    static let header: CGFloat = 54
+    /// Footer with the CONTROLS row. The inline pause confirm swaps in a taller
+    /// block (+67pt measured) — hence "seed, not truth" above.
+    static let footer: CGFloat = 67
+    /// Header + footer: the chrome that stays PINNED while the body scrolls.
+    static let chrome = header + footer                       // 121
+    /// The body block's own padding (14pt top + 4pt bottom).
+    static let bodyInsets: CGFloat = 18
+    /// One line of the serif-italic step title, and the gap under it.
+    static let title: CGFloat = 26
+    static let titleToBody: CGFloat = 8
+    /// One RENDERED line of body copy — SwiftUI's line box for Geist 13.5,
+    /// measured, not the face's 17.55pt ascent+descent — plus the 3pt
+    /// `lineSpacing` the panel sets BETWEEN lines. Measured pitch: 21.22pt.
+    static let bodyLine: CGFloat = 18.22
+    static let bodyLineSpacing: CGFloat = 3
+
+    /// The body block a collapsed panel still shows: its own padding plus the
+    /// one title line. TourPanel floors the body at this against its MEASURED
+    /// chrome, so the step's name survives however tall the footer really is.
+    static let titleBlock = bodyInsets + title                 // 44
+    /// Title + controls only — what a collapsed panel needs with the ordinary
+    /// footer, and the floor the cap is given when a ring leaves less than that
+    /// (overlapping is unavoidable at that point).
+    static let collapsedMin = chrome + titleBlock              // 165
+    /// The smallest panel that still READS: the collapsed floor plus three
+    /// lines of body copy. At or above this the panel stays EXPANDED and its
+    /// body scrolls under the cap; below it there is nothing to show but the
+    /// title, so it collapses. Measured: 233.66pt, against the 242pt the Today
+    /// ring leaves on a 6.3" phone — 8.3pt of headroom, a third of a line.
+    static let readableMin = collapsedMin + titleToBody
+        + bodyLine * 3 + bodyLineSpacing * 2                   // ≈ 233.66
+}
+
 struct TourPanelPlacement: Equatable, Sendable {
     var dock: TourPanelDock
-    /// Target so tall it spans both halves and the free space can't fit the
-    /// full panel → collapse the panel to title + controls rather than cover
-    /// the ring.
+    /// Neither side can hold a READABLE panel (a ring spanning nearly the whole
+    /// screen) → title + controls only, rather than cover the ring.
     var collapsed: Bool
+    /// Hard height cap: the free space outside the ring on the docked side, so
+    /// the panel can never grow into the spotlight. nil = unconstrained — the
+    /// panel fits as it is (or there is no ring to avoid), and it hugs its
+    /// content exactly as it always has.
+    var maxHeight: CGFloat?
     /// Keyboard-time nudge (round 3): extra top inset pushing the forced-TOP
     /// panel just BELOW a top-half ring when both fit above the keyboard.
     /// 0 everywhere else.
     var topOffset: CGFloat = 0
 }
 
-/// Compute where the panel docks for a target rect (screen coordinates):
-/// target center in the TOP half → panel at the BOTTOM; bottom half → TOP;
-/// no target → bottom. If the chosen side's free space (outside the ring +
-/// its padding) can't fit the expanded panel, collapse it. Pure — unit-tested.
+/// Compute where the panel docks for a target rect (screen coordinates) and
+/// how much room it may use there. Ordered rule — pure, unit-tested:
+///
+///  1. Preferred dock = OPPOSITE the target (center in the top half → bottom;
+///     bottom half → top; no target → bottom).
+///  2. That side fits the whole expanded panel → expanded, uncapped.
+///  3. It fits at least `TourPanelMetrics.readableMin` → expanded but CAPPED to
+///     the free space, with the panel's body scrolling inside the cap. This is
+///     the step the old all-or-nothing rule was missing: a 6.3" phone leaves
+///     242pt above the ringed Today list — the title and three-and-a-bit lines
+///     of copy — and the panel was rendering title-only there.
+///  4. Same two tests on the other side. (A safety net rather than a reachable
+///     branch: the "opposite the target" preference IS the roomier side —
+///     midY < screen.midY ⟺ the space below the ring exceeds the space above —
+///     so step 4 can only fire if that preference ever changes.)
+///  5. Neither side can hold a readable panel → the roomier side, collapsed to
+///     title + controls, floored at `collapsedMin` so the controls stay usable.
+///     The single, physically unavoidable overlap. The floor is a floor on the
+///     CAP, not a promise about the drawn height: the panel keeps its measured
+///     chrome plus one title line whatever this says, and it hugs that, so the
+///     frame it reports (the hit-test claim) is always the height it draws.
 ///
 /// - Parameters:
 ///   - target: the spotlight target rect (nil = whisper scrim, panel bottom).
@@ -614,8 +691,11 @@ struct TourPanelPlacement: Equatable, Sendable {
 ///     software keyboard (`.ignoresSafeArea(.keyboard)` / window bounds) — a
 ///     keyboard-shrunk frame would collapse the panel and unmount the very
 ///     field that summoned the keyboard (drop → re-expand → loop).
-///   - panelHeight: the EXPANDED panel height (measured; callers must not feed
-///     the collapsed height back in, or the decision oscillates).
+///   - panelHeight: the panel's NATURAL (unconstrained) height. TourPanel
+///     measures it from its scroll CONTENT, which is laid out at its ideal
+///     height, cap or no cap — the panel's RENDERED frame must never be fed
+///     back here (it is this rule's own output) or the decision oscillates.
+///     TourModel.reportPanelBodyHeight is the only writer.
 ///   - keyboard: the Ask input owns focus / the keyboard is up. The keyboard
 ///     owns the bottom of the screen, so the panel is FORCED to the top dock
 ///     and the collapse rule is suppressed — collapsing would unmount the
@@ -647,17 +727,40 @@ func tourPanelPlacement(target: CGRect?, screen: CGRect, panelHeight: CGFloat,
                 topOffset = ring.maxY + margin - panelTop
             }
         }
-        return TourPanelPlacement(dock: .top, collapsed: false, topOffset: topOffset)
+        // Uncapped: the keyboard branch must never constrain the panel — the
+        // Ask field lives in the body, and a cap that scrolled it out of view
+        // (or a collapse that unmounted it) is the focus loop again.
+        return TourPanelPlacement(dock: .top, collapsed: false, maxHeight: nil, topOffset: topOffset)
     }
     guard let target, target.width > 0, target.height > 0 else {
-        return TourPanelPlacement(dock: .bottom, collapsed: false)
+        return TourPanelPlacement(dock: .bottom, collapsed: false, maxHeight: nil)
     }
     let ring = target.insetBy(dx: -ringPad, dy: -ringPad)
-    let dock: TourPanelDock = target.midY < screen.midY ? .bottom : .top
-    let available: CGFloat = dock == .bottom
-        ? screen.maxY - ring.maxY - margin * 2
-        : ring.minY - screen.minY - margin * 2
-    return TourPanelPlacement(dock: dock, collapsed: available < panelHeight)
+    /// Free space outside the ring on one side, less the panel's own margins.
+    /// Clamped at 0: a ring can run off either edge of the screen (the Today
+    /// list is taller than the viewport), which makes the raw figure negative.
+    func free(_ dock: TourPanelDock) -> CGFloat {
+        let raw = dock == .bottom ? screen.maxY - ring.maxY : ring.minY - screen.minY
+        return max(0, raw - margin * 2)
+    }
+    let preferred: TourPanelDock = target.midY < screen.midY ? .bottom : .top
+    let other: TourPanelDock = preferred == .bottom ? .top : .bottom
+    let preferredFree = free(preferred)
+    let otherFree = free(other)
+    for (dock, space) in [(preferred, preferredFree), (other, otherFree)] {
+        // Fits whole → no cap at all (and so the panel keeps hugging its copy).
+        if space >= panelHeight {
+            return TourPanelPlacement(dock: dock, collapsed: false, maxHeight: nil)
+        }
+        // Fits a readable panel → expanded, capped, the body scrolls inside.
+        if space >= TourPanelMetrics.readableMin {
+            return TourPanelPlacement(dock: dock, collapsed: false, maxHeight: space)
+        }
+    }
+    let dock = otherFree > preferredFree ? other : preferred
+    return TourPanelPlacement(dock: dock, collapsed: true,
+                              maxHeight: max(max(preferredFree, otherFree),
+                                             TourPanelMetrics.collapsedMin))
 }
 
 // MARK: - cross-feature signals

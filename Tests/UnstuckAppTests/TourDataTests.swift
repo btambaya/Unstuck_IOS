@@ -5,6 +5,9 @@
 // non-negotiable #1: the panel docks OPPOSITE the target, and collapses
 // instead of covering the ring).
 
+import SwiftUI
+import UIKit
+import UnstuckDesign
 import XCTest
 @testable import Unstuck
 
@@ -269,6 +272,7 @@ final class TourDataTests: XCTestCase {
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340)
         XCTAssertEqual(p.dock, .bottom)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight, "578pt free below the ring fits the panel whole — no cap")
     }
 
     func testTargetInBottomHalfDocksPanelTop() {
@@ -276,36 +280,194 @@ final class TourDataTests: XCTestCase {
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340)
         XCTAssertEqual(p.dock, .top)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight)
     }
 
     func testNoTargetDocksBottomExpanded() {
         let p = tourPanelPlacement(target: nil, screen: screen, panelHeight: 340)
         XCTAssertEqual(p.dock, .bottom)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight, "no ring to avoid → the panel hugs its copy")
     }
 
     func testTallTargetSpanningBothHalvesCollapsesInsteadOfCovering() {
-        // A target from y=100 to y=744 leaves ~100pt below — nowhere near the
-        // expanded panel height, so the panel must collapse, not cover the ring.
+        // A target from y=100 to y=744 leaves 54pt on either side — not even a
+        // readable panel fits, so the panel must collapse, not cover the ring,
+        // and is floored at the collapsed minimum so its controls stay usable.
         let target = CGRect(x: 20, y: 100, width: 350, height: 644)
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340)
         XCTAssertTrue(p.collapsed)
+        XCTAssertEqual(p.maxHeight, TourPanelMetrics.collapsedMin)
     }
 
     func testRingPaddingCountsAgainstFreeSpace() {
         // Target bottom at y=400: free space below WITHOUT the ring pad is
-        // 844 - 400 - 32 = 412 (a 405 panel would fit); WITH the 14pt ring pad
-        // it's 398 < 405 → the ring must win → collapsed.
+        // 844 - 400 - 32 = 412 (a 405 panel would fit whole); WITH the 14pt ring
+        // pad it's 398 < 405 → the ring wins, and the panel is CAPPED to those
+        // 398pt (well clear of the readable minimum) rather than collapsed.
         let target = CGRect(x: 20, y: 100, width: 350, height: 300)
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 405)
         XCTAssertEqual(p.dock, .bottom)
-        XCTAssertTrue(p.collapsed)
+        XCTAssertFalse(p.collapsed)
+        XCTAssertEqual(p.maxHeight, 398)
     }
 
     func testZeroSizedTargetTreatedAsNone() {
         let p = tourPanelPlacement(target: .zero, screen: screen, panelHeight: 340)
         XCTAssertEqual(p.dock, .bottom)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight)
+    }
+
+    // MARK: - the today/finish regression (2026-09-18, 6.3" phones)
+
+    /// The 6.3" iPhone the today/finish steps rendered title-only on (iPhone
+    /// 16/17 Pro — 402 × 874pt, 62pt Dynamic-Island inset, 34pt home
+    /// indicator). The tour's GeometryReader is safe-area-inset — it ignores
+    /// only the KEYBOARD — so this is the rect the rule actually sees.
+    private let screen63 = CGRect(x: 0, y: 62, width: 402, height: 778)
+
+    /// The ringed Today list, MEASURED off the running tour — TourUITests'
+    /// 02-today shot on that simulator (1206 × 2622px at 3×). The ring's 2pt
+    /// primary stroke occupies 341.0 → 343.0pt at the top and 680.0 → 682.0 at
+    /// the bottom, so it is CENTRED on 342 and 681. TourSpotlight strokes
+    /// `target.insetBy(-8)` — the 8pt spotlight pad, NOT the 14pt `ringPad` the
+    /// placement rule adds for the halo — so the list itself runs 350 → 673:
+    /// 288pt below the safe-area top, 323 tall.
+    ///
+    /// The chrome above the list — top bar, greeting, week pill, assistant
+    /// pill, filters — is the same stack on every iPhone, so the list always
+    /// starts that same 288pt down; that is what `todayList(on:)` re-uses for
+    /// the other screen sizes.
+    private func todayList(on screen: CGRect) -> CGRect {
+        CGRect(x: 10, y: screen.minY + 288, width: screen.width - 20, height: 323)
+    }
+
+    /// What that leaves the panel above the ring on every one of these phones:
+    /// (288 − 14 ringPad) − 2 × 16 margin = 242pt. The readable minimum is
+    /// 233.66, so the headroom is 8.3pt — a third of a line of copy. Any extra
+    /// chrome in the Today header eats it, which is what `TourPanelMeasureTests`
+    /// and this fixture exist to catch.
+    private let todayFree: CGFloat = 242
+
+    func testTodayStepStaysExpandedOn63InchPhone() {
+        // The today panel measures 358pt (title + seven lines of copy + mini
+        // links + chrome — TourPanelMeasureTests pins it) and only 242pt is
+        // free above the ring. The old all-or-nothing rule collapsed it there —
+        // title + footer, the step's whole body hidden. 242 clears the readable
+        // minimum (233.66) by 8.3pt, so it stays EXPANDED and scrolls under the
+        // cap instead.
+        let p = tourPanelPlacement(target: todayList(on: screen63), screen: screen63, panelHeight: 358)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertFalse(p.collapsed, "242pt holds a readable panel — it must not collapse")
+        XCTAssertEqual(p.maxHeight, todayFree)
+        XCTAssertGreaterThanOrEqual(p.maxHeight ?? 0, TourPanelMetrics.readableMin)
+    }
+
+    func testFinishStepStaysExpandedOn63InchPhone() {
+        // Same anchor, shorter copy (295pt measured): same dock, same cap,
+        // expanded.
+        let p = tourPanelPlacement(target: todayList(on: screen63), screen: screen63, panelHeight: 295)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertFalse(p.collapsed)
+        XCTAssertEqual(p.maxHeight, todayFree)
+    }
+
+    func testTodayListStaysExpandedOnASmallPhone() {
+        // 5.4" (375 × 812pt, 50pt notch inset): the Today chrome is the same
+        // stack, so the free space above the ring is the same 242pt. The panel
+        // is 327pt wide there and the copy still wraps to seven lines — 358pt,
+        // measured.
+        let small = CGRect(x: 0, y: 50, width: 375, height: 728)
+        let p = tourPanelPlacement(target: todayList(on: small), screen: small, panelHeight: 358)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertFalse(p.collapsed)
+        XCTAssertEqual(p.maxHeight, todayFree)
+    }
+
+    func testTodayListStaysExpandedOnALargePhone() {
+        // 6.9" (440 × 956pt): the panel hits its own 380pt maxWidth there, so
+        // the copy wraps into one fewer line — 337pt measured, still taller
+        // than the 242pt above the ring.
+        let large = CGRect(x: 0, y: 62, width: 440, height: 860)
+        let p = tourPanelPlacement(target: todayList(on: large), screen: large, panelHeight: 337)
+        XCTAssertEqual(p.dock, .top)
+        XCTAssertFalse(p.collapsed)
+        XCTAssertEqual(p.maxHeight, todayFree)
+    }
+
+    func testRingFillingNearlyTheWholeScreenStillCollapsesWithAFloor() {
+        // 90 → 790pt of a 778pt usable screen: 0pt above the ring, 4pt below.
+        // Nothing readable fits either side → the roomier side, title-only,
+        // floored so the controls are still there to tap.
+        let p = tourPanelPlacement(target: CGRect(x: 18, y: 90, width: 366, height: 700),
+                                   screen: screen63, panelHeight: 354)
+        XCTAssertTrue(p.collapsed)
+        XCTAssertEqual(p.dock, .bottom, "4pt beats 0pt")
+        XCTAssertEqual(p.maxHeight, TourPanelMetrics.collapsedMin)
+    }
+
+    func testPreferredDockIsAlwaysTheRoomierSide() {
+        // Docking "opposite the target" IS choosing the roomier side: a center
+        // above the screen's mid-line means more space below the ring than
+        // above it. That identity is why the flip to the other side is a
+        // safety net and not a branch any geometry can reach — assert it over
+        // a high ring, a low ring, and one that runs off the bottom.
+        for target in [CGRect(x: 18, y: 100, width: 366, height: 120),     // high
+                       CGRect(x: 18, y: 700, width: 366, height: 90),      // low
+                       todayList(on: screen63),                            // the Today list
+                       CGRect(x: 18, y: 400, width: 366, height: 900)] {   // off the bottom
+            let ring = target.insetBy(dx: -14, dy: -14)
+            let above = max(0, ring.minY - screen63.minY - 32)
+            let below = max(0, screen63.maxY - ring.maxY - 32)
+            let p = tourPanelPlacement(target: target, screen: screen63, panelHeight: 354)
+            XCTAssertEqual(p.dock, below > above ? .bottom : .top, "target \(target)")
+        }
+    }
+
+    func testAHighRingDocksTheFullPanelBelowItAndALowRingAboveIt() {
+        let high = tourPanelPlacement(target: CGRect(x: 18, y: 100, width: 366, height: 120),
+                                      screen: screen63, panelHeight: 354)
+        XCTAssertEqual(high.dock, .bottom)
+        XCTAssertNil(high.maxHeight, "574pt below the ring fits the whole panel")
+        let low = tourPanelPlacement(target: CGRect(x: 18, y: 700, width: 366, height: 90),
+                                     screen: screen63, panelHeight: 354)
+        XCTAssertEqual(low.dock, .top)
+        XCTAssertNil(low.maxHeight, "592pt above it does too")
+    }
+
+    func testACappedHeightFedBackWouldFlipTheDecision() {
+        // Why TourModel.reportPanelHeight measures the panel's BODY inside its
+        // scroll view (and its chrome outside the cap) instead of trusting the
+        // rendered frame: a capped panel's frame IS the cap. Hand 242 back as
+        // "the expanded height" and the rule says it fits — the panel re-expands
+        // to its natural 358, covers the ring, measures 358, caps again. Once
+        // "expanded but capped" exists, a capped measurement is as poisonous as
+        // a collapsed one.
+        let capped = tourPanelPlacement(target: todayList(on: screen63), screen: screen63, panelHeight: 358)
+        XCTAssertEqual(capped.maxHeight, todayFree)
+        let poisoned = tourPanelPlacement(target: todayList(on: screen63), screen: screen63,
+                                          panelHeight: capped.maxHeight ?? 0)
+        XCTAssertNil(poisoned.maxHeight, "a capped height fed back flips the rule to 'it fits'")
+        // Fed its true natural height the rule is a fixed point, cap and all.
+        XCTAssertEqual(tourPanelPlacement(target: todayList(on: screen63), screen: screen63,
+                                          panelHeight: 358), capped)
+    }
+
+    func testReadableMinimumIsThreeLinesOfCopyAboveTheCollapsedFloor() {
+        // The metrics are MEASURED off the real panel (TourPanelMeasureTests
+        // re-measures every one of them); these pin the arithmetic built on
+        // top, so a change to either shows up in both places.
+        XCTAssertEqual(TourPanelMetrics.collapsedMin, 165)
+        XCTAssertEqual(TourPanelMetrics.readableMin, 233.66, accuracy: 0.01)
+        // title→body gap + three RENDERED Geist-13.5 line boxes (18.22 each,
+        // not the face's 17.55) + the two 3pt line gaps.
+        let threeLines: CGFloat = 8 + 18.22 * 3 + 3 * 2
+        XCTAssertEqual(TourPanelMetrics.readableMin - TourPanelMetrics.collapsedMin,
+                       threeLines, accuracy: 0.01)
+        // And the headroom that leaves on the tightest real step: a third of a
+        // line. This is the number that decides today/finish.
+        XCTAssertEqual(todayFree - TourPanelMetrics.readableMin, 8.34, accuracy: 0.01)
     }
 
     // MARK: - keyboard rule (the Ask field owns focus)
@@ -317,6 +479,7 @@ final class TourDataTests: XCTestCase {
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340, keyboard: true)
         XCTAssertEqual(p.dock, .top)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight, "and never capped — a cap could scroll the focused field away")
     }
 
     func testKeyboardSuppressesCollapseRule() {
@@ -328,6 +491,7 @@ final class TourDataTests: XCTestCase {
         let p = tourPanelPlacement(target: target, screen: screen, panelHeight: 340, keyboard: true)
         XCTAssertEqual(p.dock, .top)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight)
     }
 
     func testKeyboardAppliesWithNoTarget() {
@@ -336,6 +500,7 @@ final class TourDataTests: XCTestCase {
         let p = tourPanelPlacement(target: nil, screen: screen, panelHeight: 340, keyboard: true)
         XCTAssertEqual(p.dock, .top)
         XCTAssertFalse(p.collapsed)
+        XCTAssertNil(p.maxHeight)
     }
 
     func testKeyboardOffKeepsExistingRules() {
@@ -469,5 +634,218 @@ final class TourAskTests: XCTestCase {
 
     func testResolveAskReplyUnknownQuestionUsesGenericFallback() {
         XCTAssertEqual(resolveAskReply(nil, question: "zzz").text, TOUR_FALLBACK_ANSWER)
+    }
+}
+
+// MARK: - the metrics, measured off the REAL panel
+
+/// `TourPanelMetrics` is the placement rule's model of the panel, and every
+/// number in it is measured rather than derived — SwiftUI's rendered line box
+/// for Geist 13.5 is 18.22pt where the face's own line height is 17.55, and the
+/// pause confirm makes the footer twice its documented size. A model that drifts
+/// from the panel mis-places it silently, so this suite re-measures the panel
+/// itself: a padding or font change fails HERE, with the new number in the
+/// failure message, instead of quietly under-provisioning a cap.
+@MainActor
+final class TourPanelMeasureTests: XCTestCase {
+    /// A 402 × 874pt phone, less the running layer's 2 × 24pt horizontal
+    /// padding: the width the today/finish panels are actually laid out at.
+    private let panelWidth: CGFloat = 354
+    private let expanded = TourPanelPlacement(dock: .top, collapsed: false, maxHeight: nil)
+    private let collapsed = TourPanelPlacement(dock: .top, collapsed: true, maxHeight: nil)
+
+    private func freshStore() -> TourStore {
+        let name = "test.tour.measure.\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        d.removePersistentDomain(forName: name)
+        return TourStore(defaults: d)
+    }
+
+    /// Render the view FOR REAL — in a window, through several layout passes —
+    /// before reading its height: the panel measures its own chrome with
+    /// `onGeometryChange`, and a bare `sizeThatFits` reports the first pass,
+    /// where that is still the seed value.
+    private func mount<V: View>(_ v: V, width: CGFloat? = nil) -> (UIWindow, UIHostingController<V>) {
+        let w = width ?? panelWidth
+        let vc = UIHostingController(rootView: v)
+        // The panel is measured on its own, not inside a screen: without this
+        // the host window donates its safe-area insets and every reading comes
+        // back 54pt tall.
+        vc.safeAreaRegions = []
+        // On the host app's real window scene: a detached window never gets a
+        // display pass, and UIKit-level scroll state (contentSize, offset) never
+        // catches up with SwiftUI's layout.
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let window = scene.map { UIWindow(windowScene: $0) } ?? UIWindow()
+        window.frame = CGRect(x: 0, y: 0, width: w, height: 900)
+        window.rootViewController = vc
+        window.isHidden = false
+        return (window, vc)
+    }
+
+    private func settle(_ window: UIWindow) {
+        for _ in 0..<4 {
+            window.layoutIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+    }
+
+    private func height<V: View>(_ v: V, width: CGFloat? = nil) -> CGFloat {
+        let (window, vc) = mount(v, width: width)
+        settle(window)
+        defer { window.isHidden = true }
+        return vc.sizeThatFits(in: CGSize(width: width ?? panelWidth,
+                                          height: .greatestFiniteMagnitude)).height
+    }
+
+    /// The panel's body scroll view — the only one mounted unless the Ask
+    /// thread is open.
+    private func bodyScrollView(in view: UIView) -> UIScrollView? {
+        if let s = view as? UIScrollView { return s }
+        for sub in view.subviews {
+            if let s = bodyScrollView(in: sub) { return s }
+        }
+        return nil
+    }
+
+    private func tourOn(_ stepID: String, _ body: (TourModel) -> Void) {
+        let app = AppModel()
+        let tour = TourModel(app: app, store: freshStore())
+        tour.begin(.essential)
+        while tour.currentStep.id != stepID && tour.phase == .running { tour.advance() }
+        XCTAssertEqual(tour.currentStep.id, stepID)
+        body(tour)
+        tour.exit()
+    }
+
+    func testTheCollapsedPanelMeasuresTheCollapsedMinimum() {
+        tourOn("today") { tour in
+            // chrome + the body block a collapsed panel keeps (padding + title).
+            XCTAssertEqual(height(TourPanel(tour: tour, placement: collapsed)),
+                           TourPanelMetrics.collapsedMin, accuracy: 1)
+        }
+    }
+
+    func testOneTitleLineAndThreeBodyLinesMatchTheMetrics() {
+        let inner = panelWidth - 32
+        XCTAssertEqual(height(Text("Today narrows it down").font(UFont.serifItalic(20))
+                                .fixedSize(horizontal: false, vertical: true), width: inner),
+                       TourPanelMetrics.title, accuracy: 0.5)
+        // The three lines `readableMin` budgets for — line boxes plus the two
+        // 3pt gaps between them.
+        XCTAssertEqual(height(Text("A\nB\nC").font(UFont.sans(13.5)).lineSpacing(3), width: inner),
+                       TourPanelMetrics.bodyLine * 3 + TourPanelMetrics.bodyLineSpacing * 2,
+                       accuracy: 0.5)
+    }
+
+    /// Defect the round-1 fix left open: the chrome is NOT a constant.
+    func testThePauseConfirmMakesTheChromeMeasurablyTaller() {
+        tourOn("today") { tour in
+            let controls = height(TourPanel(tour: tour, placement: expanded))
+            tour.requestPause()
+            let confirm = height(TourPanel(tour: tour, placement: expanded))
+            tour.cancelPause()
+            XCTAssertEqual(confirm - controls, 67, accuracy: 1,
+                           "the inline pause confirm adds 67pt of FOOTER — a compile-time chrome "
+                           + "constant under-reports the panel by exactly that much")
+        }
+    }
+
+    /// The cap is a promise the panel has to keep whatever its footer is doing:
+    /// the whole point is that it can never grow into the ring.
+    func testACappedPanelNeverExceedsItsCapEvenWithTheConfirmOpen() {
+        tourOn("today") { tour in
+            let cap: CGFloat = 242          // what the Today ring leaves on a 6.3" phone
+            let capped = TourPanelPlacement(dock: .top, collapsed: false, maxHeight: cap)
+            XCTAssertEqual(height(TourPanel(tour: tour, placement: capped)), cap, accuracy: 1)
+            tour.requestPause()
+            XCTAssertLessThanOrEqual(height(TourPanel(tour: tour, placement: capped)), cap + 1)
+            tour.cancelPause()
+        }
+    }
+
+    /// The panel must never draw outside the frame it reports — `tour.panelFrame`
+    /// is the hit-test claim, and a band of panel outside it sends touches
+    /// straight through to the app. With the confirm open the real chrome (188)
+    /// is above the collapsed floor (165), so the panel has to report the taller
+    /// height rather than clamp to a frame it then overflows.
+    func testACollapsedPanelReportsTheHeightItDraws() {
+        tourOn("today") { tour in
+            tour.requestPause()
+            let floored = TourPanelPlacement(dock: .top, collapsed: true,
+                                             maxHeight: TourPanelMetrics.collapsedMin)
+            let natural = height(TourPanel(tour: tour, placement: collapsed))
+            XCTAssertEqual(height(TourPanel(tour: tour, placement: floored)), natural, accuracy: 1,
+                           "a collapsed panel under a cap smaller than its own chrome must report "
+                           + "what it draws, not the cap")
+            tour.cancelPause()
+        }
+    }
+
+    /// The wiring behind all of it: the panel has to TELL the placement rule
+    /// that its footer grew. The body's own geometry callback cannot — the copy
+    /// above the footer is untouched when the confirm opens, so nothing about
+    /// the body's height changes and `onGeometryChange` never fires. Without a
+    /// second trigger the rule keeps placing a 358pt panel that is really 425,
+    /// and the uncapped branch lets those 67pt run into the ring.
+    func testTheReportedHeightFollowsTheFooterNotAConstant() {
+        tourOn("today") { tour in
+            let (window, _) = mount(TourPanel(tour: tour, placement: expanded))
+            defer { window.isHidden = true }
+            settle(window)
+            let withControls = tour.panelExpandedHeight
+            XCTAssertEqual(withControls, 358, accuracy: 2, "the panel's natural height")
+            tour.requestPause()
+            settle(window)
+            XCTAssertEqual(tour.panelExpandedHeight - withControls, 67, accuracy: 2,
+                           "the inline pause confirm makes the panel 67pt taller and the "
+                           + "placement rule has to be told")
+            tour.cancelPause()
+            settle(window)
+            XCTAssertEqual(tour.panelExpandedHeight, withControls, accuracy: 2,
+                           "…and told again when it shrinks back")
+        }
+    }
+
+    /// The body's scroll OFFSET is per-step state on a panel that is deliberately
+    /// ONE structural identity across steps (TourRootView keeps a single
+    /// flipping panel), so nothing resets it on its own: leave a capped step
+    /// scrolled and the next capped step opens past its own first line.
+    func testTheBodyScrollsBackToTheTopOnAStepChange() {
+        tourOn("today") { tour in
+            let capped = TourPanelPlacement(dock: .top, collapsed: false, maxHeight: 242)
+            let (window, vc) = mount(TourPanel(tour: tour, placement: capped))
+            defer { window.isHidden = true }
+            settle(window)
+            guard let scroll = bodyScrollView(in: vc.view) else {
+                return XCTFail("the capped panel's body should be a scroll view")
+            }
+            XCTAssertGreaterThan(scroll.contentSize.height, scroll.bounds.height + 1,
+                                 "242pt cannot hold the 358pt today panel — the body must scroll")
+            scroll.setContentOffset(CGPoint(x: 0, y: 40), animated: false)
+            settle(window)
+            XCTAssertEqual(scroll.contentOffset.y, 40, accuracy: 1, "scrolled down 40pt")
+            tour.advance()
+            settle(window)
+            XCTAssertGreaterThan(scroll.contentSize.height, scroll.bounds.height + 1,
+                                 "the next step's body still overflows — 40pt was a REACHABLE offset "
+                                 + "there, so a reset is the only thing that can have moved it")
+            XCTAssertEqual(scroll.contentOffset.y, 0, accuracy: 1,
+                           "a step change must put the body back at its first line")
+        }
+    }
+
+    /// The fixtures the placement tests use are real panel heights, and the
+    /// today panel really is taller than the space its own ring leaves.
+    func testTheTodayAndFinishPanelsMatchTheirPlacementFixtures() {
+        tourOn("today") { tour in
+            XCTAssertEqual(height(TourPanel(tour: tour, placement: expanded)), 358, accuracy: 1)
+        }
+        tourOn("finish") { tour in
+            XCTAssertEqual(height(TourPanel(tour: tour, placement: expanded)), 295, accuracy: 1)
+        }
+        XCTAssertGreaterThan(358, 242, "the today panel does not fit above its ring — hence the cap")
+        XCTAssertLessThanOrEqual(TourPanelMetrics.readableMin, 242,
+                                 "…but a READABLE panel does, which is why it must not collapse")
     }
 }
