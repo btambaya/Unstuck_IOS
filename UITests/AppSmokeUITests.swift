@@ -200,4 +200,96 @@ final class AppSmokeUITests: XCTestCase {
         expect(app.navigationBars["Insights"], "Settings → Insights did not open")
         usleep(700_000); snap("09-insights")
     }
+
+    /// The bottom-bar + creates the thing you're LOOKING AT (2026-09-18):
+    /// New task on Today/Tasks/Calendar, New collection on the Collections
+    /// grid, and — inside a collection — the cursor in that collection's ONE
+    /// inline add field (no second add UI). The button itself never changes;
+    /// its accessibility label is how the surface-sensitivity is asserted here.
+    func testFabCreatesWhatYoureLookingAt() throws {
+        launchToToday()
+        XCTAssertTrue(app.buttons["New task"].firstMatch.waitForExistence(timeout: 6),
+                      "the + on Today must still be New task (the tour's first-action fallback anchor)")
+        tapNav("Tasks")
+        XCTAssertTrue(app.buttons["New task"].firstMatch.exists, "the + on Tasks must still be New task")
+        tapNav("Calendar")
+        XCTAssertTrue(app.buttons["New task"].firstMatch.exists, "the + on Calendar must still be New task")
+
+        // Collections grid → New collection, and it opens the real sheet.
+        tapNav("Collections")
+        let newCollection = app.buttons["New collection"].firstMatch
+        expect(newCollection, "the + on the Collections grid should offer New collection")
+        XCTAssertFalse(app.buttons["New task"].firstMatch.exists,
+                       "the + must not still be New task on the Collections grid")
+        newCollection.tap()
+        expect(app.staticTexts["NEW COLLECTION"].firstMatch, "the + did not open the New-collection sheet")
+        snap("16-fab-new-collection")
+        app.buttons["Cancel"].firstMatch.tap(); usleep(700_000)
+
+        // Inside a collection → the inline add field.
+        let groceries = app.staticTexts["Groceries"].firstMatch
+        expect(groceries, "the seeded Groceries list is missing")
+        groceries.tap(); usleep(800_000)
+        // The detail ALREADY auto-focuses its add field on open, so clear that
+        // focus first — otherwise this test would pass even if the + did
+        // nothing at all. Opening the title's inline rename and submitting it
+        // unchanged is the path that drops the focus (same trick
+        // StoreScreenshots uses; a flick on a short list won't scroll-dismiss).
+        if app.keyboards.count > 0 {
+            app.staticTexts["Groceries"].firstMatch.tap(); usleep(500_000)
+            app.typeText("\n"); usleep(900_000)
+            XCTAssertEqual(app.keyboards.count, 0, "could not clear the add field's focus")
+        }
+
+        let addToThis = app.buttons["Add to this collection"].firstMatch
+        expect(addToThis, "inside a collection the + should add to THAT collection")
+        addToThis.tap(); usleep(900_000)
+        // No second add UI: no sheet came up, just the field that was already there.
+        XCTAssertFalse(app.staticTexts["What's on your mind?"].firstMatch.exists,
+                       "the + inside a collection must not open the New-task sheet")
+        XCTAssertFalse(app.staticTexts["NEW COLLECTION"].firstMatch.exists,
+                       "the + inside a collection must not open the New-collection sheet")
+        XCTAssertTrue(app.keyboards.count > 0,
+                      "the + should have put the cursor back in the add field")
+        snap("17-fab-add-to-collection")
+        // …and it is THAT field the cursor is in: typing lands in it. (Only the
+        // typing, not a submit — the demo boot has no SyncCoordinator, so
+        // AppModel.mutateCollectionItem no-ops and a committed item would never
+        // appear. Nothing to do with the +.)
+        let addField = app.textFields
+            .matching(NSPredicate(format: "placeholderValue BEGINSWITH 'Add to this collection'")).firstMatch
+        expect(addField, "the collection's inline add field is missing")
+        app.typeText("Olive oil"); usleep(500_000)
+        XCTAssertTrue(((addField.value as? String) ?? "").contains("Olive oil"),
+                      "the + should leave the cursor in the add field, ready to type")
+
+        // Back out to the grid and the + goes back to New collection — a stale
+        // "add to that collection" after the pop would be the bug.
+        app.navigationBars.buttons.firstMatch.tap(); usleep(900_000)
+        XCTAssertTrue(app.buttons["New collection"].firstMatch.waitForExistence(timeout: 6),
+                      "popping back to the grid must retract the open-collection marker")
+        XCTAssertFalse(app.buttons["Add to this collection"].firstMatch.exists,
+                       "the + still points at a collection that is no longer on screen")
+
+        // …and so does leaving the tab entirely.
+        tapNav("Today")
+        XCTAssertTrue(app.buttons["New task"].firstMatch.waitForExistence(timeout: 6),
+                      "the + must be New task again back on Today")
+
+        // The walk that used to be able to strand the marker: leave the tab
+        // STRAIGHT FROM an open collection — tap Today in the bottom nav with
+        // no back tap — then come back to the grid. The retraction used to hang
+        // entirely on the detail's onDisappear; miss it and the + went on
+        // offering "add to that collection" over a grid.
+        tapNav("Collections")
+        expect(app.staticTexts["Groceries"].firstMatch, "the seeded Groceries list is missing")
+        app.staticTexts["Groceries"].firstMatch.tap(); usleep(800_000)
+        expect(app.buttons["Add to this collection"].firstMatch, "the collection detail did not open")
+        tapNav("Today")                    // no back tap — straight out of the tab
+        tapNav("Collections")
+        XCTAssertTrue(app.buttons["New collection"].firstMatch.waitForExistence(timeout: 6),
+                      "back on the Collections grid the + must offer New collection")
+        XCTAssertFalse(app.buttons["Add to this collection"].firstMatch.exists,
+                       "the + survived a tab switch still aimed at a collection that isn't on screen")
+    }
 }

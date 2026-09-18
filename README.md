@@ -109,6 +109,9 @@ xcodebuild -project Unstuck.xcodeproj -scheme Unstuck \
 App sources live in [`App/`](App): `UnstuckApp` (composition root) →
 `AppModel` (builds the store + `SyncCoordinator`, observes auth) →
 `RootView` → `MainTabScaffold` (Today · Tasks · [+FAB] · Calendar · Lists).
+The +FAB creates whatever surface you're on — New task on Today/Tasks/Calendar,
+New collection on the Collections grid, and inside a collection it focuses that
+collection's inline add field. The decision is `AppRouter.fabAction`.
 Config comes from `App/Config.xcconfig` (committed; `SUPABASE_HOST`) +
 `App/Secrets.xcconfig` (gitignored; `SUPABASE_ANON_KEY`). Until those are
 set the app launches to a setup screen.

@@ -19,7 +19,8 @@ struct MainTabScaffold: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             BottomNavBar(active: router.tab,
                          onSelect: { router.tab = $0 },
-                         onFab: { router.present(.newTask) })
+                         fabLabel: fabAction.accessibilityLabel,
+                         onFab: { tapFab() })
         }
             .background(theme.palette.bg.ignoresSafeArea())
             .sheet(item: $router.activeSheet, onDismiss: { model.flushPendingDeepLink() }) { sheet in
@@ -86,6 +87,27 @@ struct MainTabScaffold: View {
             // Mounted from the scaffold = signed-in + onboarded only.
             .background(TourWindowMounter(model: model,
                                           colorSchemeOverride: model.settings.theme.colorScheme))
+    }
+
+    // MARK: - the bottom-bar + (creates what you're looking at)
+
+    /// Resolved from router state only (the tab + what the Collections tab says
+    /// it is showing) — the FAB's look and position are untouched; only what it
+    /// does and its VoiceOver label follow the surface.
+    private var fabAction: AppRouter.FabAction {
+        AppRouter.fabAction(tab: model.router.tab, surface: model.router.collectionsSurface)
+    }
+
+    private func tapFab() {
+        let action = fabAction
+        switch action {
+        case .newTask:
+            model.router.present(.newTask)
+        case .newCollection, .addToCollection:
+            // Both live inside the Collections surface (a local sheet / a
+            // focused text field), so hand the resolved action to it.
+            model.router.collectionFabRequest = .init(action: action)
+        }
     }
 
     /// Presented only while the assistant is enabled — turning the kill-switch

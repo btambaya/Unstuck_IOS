@@ -40,6 +40,10 @@ struct BottomNavBar: View {
     @Environment(\.uTheme) private var theme
     let active: AppRouter.Tab
     let onSelect: (AppRouter.Tab) -> Void
+    /// VoiceOver label for the +. The ONLY thing about the button that moves
+    /// with the surface (see AppRouter.fabAction) — the coral square, its size
+    /// and its position are fixed.
+    var fabLabel: String = "New task"
     let onFab: () -> Void
 
     private let tabs = AppRouter.Tab.allCases
@@ -59,8 +63,10 @@ struct BottomNavBar: View {
             .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 0.5) }
 
             // Tour anchor: the New-task fallback when an empty account has no
-            // task detail to spotlight on the first-action step.
-            CoralFab(action: onFab).tourTarget(.newTask).offset(y: -28)
+            // task detail to spotlight on the first-action step. That step runs
+            // on the Tasks tab, where the + still opens New task — the anchor id
+            // is unchanged on purpose.
+            CoralFab(action: onFab, label: fabLabel).tourTarget(.newTask).offset(y: -28)
         }
     }
 
@@ -88,6 +94,8 @@ struct BottomNavBar: View {
 struct CoralFab: View {
     @Environment(\.uTheme) private var theme
     let action: () -> Void
+    /// Context label only — the drawn button is identical everywhere.
+    var label: String = "New task"
     var body: some View {
         Button(action: action) {
             Image(systemName: "plus")
@@ -98,7 +106,7 @@ struct CoralFab: View {
                 .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("New task")
+        .accessibilityLabel(label)
     }
 }
 

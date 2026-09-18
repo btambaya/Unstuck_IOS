@@ -60,20 +60,24 @@ struct ListsView: View {
     @State private var showPalette = false
     /// The card whose "Share…" context action opened the Share screen.
     @State private var shareTarget: ShareTarget?
-    /// A collection pushed by a deep link (`unstuck://collections/<id>` — a
-    /// share push tap): the router parks the id, this view consumes it once
-    /// the store is observed.
-    @State private var pushedCollectionId: String?
+    /// The tab's navigation path — the collection ids pushed on top of the grid
+    /// (a card tap, or a `unstuck://collections/<id>` deep link). NavigationStack
+    /// owns this binding and rewrites it on every push and pop, the Back button,
+    /// swipe-back and a destination's own `dismiss()` included, so `path.last`
+    /// IS what's on screen. That's what `surface` reports to the router, which
+    /// is why the bottom-bar + can't keep pointing at a collection that has
+    /// already been popped.
+    @State private var path: [String] = []
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             VStack(alignment: .leading, spacing: 0) {
                 AppBar(title: "Collections", onSearch: { showPalette = true }, onAvatar: { showSettings = true })
                 if let vm { content(vm) } else { ProgressView().frame(maxWidth: .infinity).padding(.top, 60) }
             }
             .background(theme.palette.bg.ignoresSafeArea())
             .navigationBarHidden(true)
-            .navigationDestination(item: $pushedCollectionId) { id in
+            .navigationDestination(for: String.self) { id in
                 if let vm { CollectionDetailView(vm: vm, id: id) }
             }
             .sheet(isPresented: $showSettings) { SettingsView() }
@@ -85,6 +89,16 @@ struct ListsView: View {
         // Consume a deep-linked collection id (push tap on a shared list).
         .onChange(of: model.router.openCollectionId, initial: true) { _, _ in consumeOpenCollection() }
         .onChange(of: vm?.collections.count ?? -1) { _, _ in consumeOpenCollection() }
+        // Tell the scaffold what the + is looking at. Republished from `surface`
+        // — derived from the nav path and the live rows — on EVERY update that
+        // changes it, so a push, a pop, a rights downgrade and a deleted row all
+        // land without any one lifecycle callback having to fire. (`tab`'s
+        // setter clears it on the way out of the tab, for the case where this
+        // view is gone and can't republish anything.)
+        .onChange(of: surface, initial: true) { _, s in model.router.collectionsSurface = s }
+        // The bottom-bar + resolved to "New collection" — the sheet is this
+        // view's @State, so the scaffold can only ask (AppRouter.fabAction).
+        .onChange(of: model.router.collectionFabRequest) { _, req in consumeFabRequest(req) }
         // A shared-list edit the server refused: the outbox dropped it and the
         // row was rolled back to the server's copy — say so once (never a
         // silent vanish on the next echo).
@@ -100,11 +114,33 @@ struct ListsView: View {
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
             showSettings = false; showPalette = false; showNew = false
         }
-        .task {
+        // Keyed on "is the store up yet" so this RE-RUNS when it comes up. The
+        // plain `.task` this replaces bailed for good on a boot that reached
+        // this tab before `AppModel.start()` had the database: the shelf stayed
+        // a ProgressView forever and the + offered a New collection whose
+        // Create could never write. Nothing else retried it.
+        .task(id: model.db != nil) {
             guard vm == nil, let db = model.db else { return }
             let m = CollectionsModel(Repository<ItemCollection>(db, orderColumn: "sortOrder"))
             vm = m; await m.observe()
         }
+    }
+
+    /// What this tab is showing, for the bottom-bar + (`AppRouter.fabAction`).
+    /// Entirely DERIVED — nothing here is a flag some callback has to remember
+    /// to unset:
+    ///   • no store yet → nil: the shelf is a spinner, and a New collection
+    ///     created against no store would be a tap into the void.
+    ///   • nothing pushed → the grid.
+    ///   • a collection pushed → that collection, with the rights on the LIVE
+    ///     row, so a mid-view downgrade to viewer moves the + off "add" at once
+    ///     and a deleted / lost-access row falls back to the grid (which is also
+    ///     when the detail pops itself).
+    private var surface: AppRouter.CollectionsSurface? {
+        guard let vm else { return nil }
+        guard let id = path.last else { return .grid }
+        guard let col = vm.collections.first(where: { $0.id == id }) else { return .grid }
+        return .detail(id: id, canEdit: model.canEdit(col))
     }
 
     /// Push the router's parked collection once it exists locally (a share
@@ -114,7 +150,22 @@ struct ListsView: View {
         guard let id = model.router.openCollectionId, let vm,
               vm.collections.contains(where: { $0.id == id }) else { return }
         model.router.openCollectionId = nil
-        pushedCollectionId = id
+        guard path.last != id else { return }   // already showing it
+        path.append(id)
+    }
+
+    /// Open the New-collection sheet for a + tap the scaffold resolved to
+    /// `.newCollection` (the grid, or a shared collection I can only view).
+    /// Ignores `.addToCollection` — that one belongs to the open detail, and
+    /// clearing it here would swallow it.
+    private func consumeFabRequest(_ req: AppRouter.CollectionFabRequest?) {
+        guard let req, case .newCollection = req.action else { return }
+        model.router.collectionFabRequest = nil
+        // The inline "+ New" pill is hidden while the Archived filter is on,
+        // and a new collection is born ACTIVE — drop back to the active shelf
+        // first or it would be created straight out of sight.
+        showArchived = false
+        showNew = true
     }
 
     private func shown(_ all: [ItemCollection]) -> [ItemCollection] {
@@ -178,7 +229,9 @@ struct ListsView: View {
                 } else {
                     LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 10) {
                         ForEach(list) { col in
-                            NavigationLink { CollectionDetailView(vm: vm, id: col.id) } label: { gridCard(col) }
+                            // Value-based, so the push goes through `path` —
+                            // the one place that says which collection is open.
+                            NavigationLink(value: col.id) { gridCard(col) }
                                 .buttonStyle(.plain)
                                 // Owner-only "Share…" straight from the card (unified sharing v1).
                                 .contextMenu {
@@ -305,6 +358,10 @@ struct CollectionDetailView: View {
 
     private var collection: ItemCollection? { vm.collections.first { $0.id == id } }
 
+    /// Scroll anchor on the inline add pill — the + scrolls it into view before
+    /// focusing it.
+    private static let addFieldAnchor = "collection-add-field"
+
     var body: some View {
         Group {
             if let col = collection {
@@ -313,6 +370,13 @@ struct CollectionDetailView: View {
                 Color.clear.onAppear { dismiss() }   // gone (deleted / lost access) → pop
             }
         }
+        // NOTE: this screen deliberately publishes NOTHING to the router. The
+        // bottom-bar + learns a collection is open from ListsView, which derives
+        // it from the navigation path it owns plus the live row — see
+        // `ListsView.surface`. An `onAppear`/`onDisappear` pair here would make
+        // one callback load-bearing: miss the disappear (leave the tab straight
+        // from an open collection) and the + goes on offering "add to that
+        // collection" over the grid.
         .background(theme.palette.bg.ignoresSafeArea())
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarHidden(false)   // keep the standard back button (overview hides its bar)
@@ -427,69 +491,91 @@ struct CollectionDetailView: View {
             .padding(.horizontal, 18).padding(.vertical, 6)
             .background(theme.palette.bg)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                    // Recolor swatches — owner only.
-                    if owner {
-                        HStack(spacing: 8) {
-                            ForEach(COLLECTION_PALETTE, id: \.self) { token in
-                                Circle().fill(theme.palette.areaColor(token)).frame(width: 26, height: 26)
-                                    .overlay(Circle().stroke(theme.palette.ink, lineWidth: col.color == token ? 2 : 0))
-                                    // 44pt hit target; negative padding preserves the
-                                    // drawn 26pt swatch + row spacing.
-                                    .frame(width: 44, height: 44).contentShape(Circle())
-                                    .onTapGesture { model.recolorCollection(col, color: token) }
-                                    .padding(-9)
-                                    .accessibilityElement()
-                                    .accessibilityLabel(token.capitalized)
-                                    .accessibilityAddTraits(col.color == token ? [.isButton, .isSelected] : .isButton)
+            // ScrollViewReader so the bottom-bar + can bring the add field into
+            // view before focusing it (see consumeFabRequest).
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        // Recolor swatches — owner only.
+                        if owner {
+                            HStack(spacing: 8) {
+                                ForEach(COLLECTION_PALETTE, id: \.self) { token in
+                                    Circle().fill(theme.palette.areaColor(token)).frame(width: 26, height: 26)
+                                        .overlay(Circle().stroke(theme.palette.ink, lineWidth: col.color == token ? 2 : 0))
+                                        // 44pt hit target; negative padding preserves the
+                                        // drawn 26pt swatch + row spacing.
+                                        .frame(width: 44, height: 44).contentShape(Circle())
+                                        .onTapGesture { model.recolorCollection(col, color: token) }
+                                        .padding(-9)
+                                        .accessibilityElement()
+                                        .accessibilityLabel(token.capitalized)
+                                        .accessibilityAddTraits(col.color == token ? [.isButton, .isSelected] : .isButton)
+                                }
+                            }.padding(.top, 12)
+                        }
+
+                        if col.items.isEmpty {
+                            VStack(spacing: 8) {
+                                Text("Keep small things here.").font(UFont.serifItalic(19)).foregroundStyle(theme.palette.ink2)
+                                Text("Type below. Hit return. Done.").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                             }
-                        }.padding(.top, 12)
-                    }
+                            .frame(maxWidth: .infinity).padding(.vertical, 38).padding(.horizontal, 20)
+                            .background(theme.palette.bg2).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line2))
+                            .padding(.top, 24)
+                        } else {
+                            if !pinned.isEmpty {
+                                SectionLabel("Pinned").padding(.leading, 4).padding(.top, 20).padding(.bottom, 6)
+                                ForEach(pinned) { item in itemRow(col, item, canEdit: canEdit) }
+                            }
+                            if !rest.isEmpty {
+                                SectionLabel("All").padding(.leading, 4).padding(.top, 14).padding(.bottom, 6)
+                                ForEach(rest) { item in itemRow(col, item, canEdit: canEdit) }
+                            }
+                        }
 
-                    if col.items.isEmpty {
-                        VStack(spacing: 8) {
-                            Text("Keep small things here.").font(UFont.serifItalic(19)).foregroundStyle(theme.palette.ink2)
-                            Text("Type below. Hit return. Done.").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                        }
-                        .frame(maxWidth: .infinity).padding(.vertical, 38).padding(.horizontal, 20)
-                        .background(theme.palette.bg2).clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line2))
-                        .padding(.top, 24)
-                    } else {
-                        if !pinned.isEmpty {
-                            SectionLabel("Pinned").padding(.leading, 4).padding(.top, 20).padding(.bottom, 6)
-                            ForEach(pinned) { item in itemRow(col, item, canEdit: canEdit) }
-                        }
-                        if !rest.isEmpty {
-                            SectionLabel("All").padding(.leading, 4).padding(.top, 14).padding(.bottom, 6)
-                            ForEach(rest) { item in itemRow(col, item, canEdit: canEdit) }
+                        // Add-item pill — at the BOTTOM so new items append right above it.
+                        // Hidden for view-only members.
+                        if canEdit {
+                            HStack(spacing: 10) {
+                                Image(systemName: "plus").foregroundStyle(theme.palette.ink3)
+                                TextField("Add to this collection…", text: $draft)
+                                    .textFieldStyle(.plain).font(UFont.sans(15))
+                                    .focused($addFocused)
+                                    .onSubmit(add)
+                            }
+                            .padding(.horizontal, 16).padding(.vertical, 12)
+                            .background(theme.palette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(theme.palette.line2))
+                            .padding(.top, 18)
+                            .id(Self.addFieldAnchor)
+                            // Autofocus on open so the keyboard is already up for rapid entry
+                            // (Android requestFocus on collectionId). add() re-focuses after each item.
+                            .onAppear { addFocused = true }
                         }
                     }
-
-                    // Add-item pill — at the BOTTOM so new items append right above it.
-                    // Hidden for view-only members.
-                    if canEdit {
-                        HStack(spacing: 10) {
-                            Image(systemName: "plus").foregroundStyle(theme.palette.ink3)
-                            TextField("Add to this collection…", text: $draft)
-                                .textFieldStyle(.plain).font(UFont.sans(15))
-                                .focused($addFocused)
-                                .onSubmit(add)
-                        }
-                        .padding(.horizontal, 16).padding(.vertical, 12)
-                        .background(theme.palette.surface)
-                        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-                        .overlay(RoundedRectangle(cornerRadius: 28, style: .continuous).stroke(theme.palette.line2))
-                        .padding(.top, 18)
-                        // Autofocus on open so the keyboard is already up for rapid entry
-                        // (Android requestFocus on collectionId). add() re-focuses after each item.
-                        .onAppear { addFocused = true }
-                    }
+                    .padding(.horizontal, 18).padding(.bottom, 96)
                 }
-                .padding(.horizontal, 18).padding(.bottom, 96)
+                // The + on this screen = "put the cursor in the ONE add field".
+                .onChange(of: model.router.collectionFabRequest) { _, req in
+                    consumeFabRequest(req, proxy: proxy)
+                }
             }
         }
+    }
+
+    /// The bottom-bar + resolved to "add to this collection". Deliberately not
+    /// a second add UI — it drives the inline field that's already here, so
+    /// there stays exactly one add path. Scroll it into view first: in a long
+    /// collection it sits well below the fold, and a focused-but-offscreen
+    /// field swallows typing invisibly.
+    private func consumeFabRequest(_ req: AppRouter.CollectionFabRequest?, proxy: ScrollViewProxy) {
+        // Match the id too: only the collection actually on screen consumes it.
+        guard let req, case .addToCollection(let target) = req.action, target == id else { return }
+        model.router.collectionFabRequest = nil
+        withAnimation { proxy.scrollTo(Self.addFieldAnchor, anchor: .bottom) }
+        addFocused = true
     }
 
     @ViewBuilder

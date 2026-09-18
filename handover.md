@@ -3,7 +3,104 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-18, latest) — the `today` tour step narrates again
+## Where things stand (2026-09-18, latest) — the + creates what you're looking at
+
+The bottom bar's coral + used to open the New-task sheet from every screen.
+It now follows the surface. Same button, same coral, same position — only the
+action and the VoiceOver label move. NOT bumped, not pushed, uncommitted.
+
+- **Today / Tasks / Calendar → New task.** Unchanged, deliberately: the tour's
+  `first-action` step falls back to the `new-task` anchor (on the **Tasks**
+  tab, `view: .tasks`) and the anchor id is untouched.
+- **Collections grid → New collection** — it opens the SAME
+  `newCollectionSheet` the small "+ New" pill opens. If the Archived filter is
+  on, it flips back to active first (the pill is hidden there and a new
+  collection is born active — it would otherwise be created out of sight).
+- **Inside a collection → the cursor goes into that collection's inline
+  "Add to this collection…" field**, scrolled into view first
+  (`ScrollViewReader`). Deliberately NOT a second add UI: one add path.
+- **View-only share → New collection.** No "add" the server would refuse.
+- **Collections tab whose store isn't up yet → New task.** The shelf is still a
+  `ProgressView`; a New collection created there would be a tap into the void
+  (the sheet's Create needs the store). The + offers the one thing that works
+  and its label says so. That window is now transient either way — ListsView's
+  `.task` is keyed on `model.db != nil`, so it RE-RUNS when the store arrives.
+  The plain `.task` it replaces bailed for good on a boot that reached this tab
+  first, leaving a permanent spinner and a + that silently did nothing.
+- **How the scaffold knows** (`AppRouter.collectionsSurface`, `.grid` /
+  `.detail(id:canEdit:)` / nil). `CollectionDetailView` is a `NavigationLink`
+  destination *inside* the Collections tab, so `router.tab` can't see it — but
+  the detail publishes NOTHING. **ListsView** publishes, and every part of it is
+  derived, not remembered: the id is `path.last` of the `NavigationStack(path:)`
+  it now owns — the stack rewrites that binding on every push and pop, Back
+  button, swipe-back and a destination's own `dismiss()` included — and the
+  rights come from the live row (a mid-view downgrade to viewer moves the + off
+  "add" at once; a deleted / lost-access row falls back to `.grid`, which is
+  also when the detail pops itself). Grid cards are `NavigationLink(value:)` and
+  the deep link appends to the same `path`.
+- **Retraction is not one callback.** Three independent mechanisms, because a
+  missed `onDisappear` used to be enough to leave the + aimed at a collection
+  that wasn't on screen: (1) ListsView republishes `surface` from its own state
+  on every update; (2) `AppRouter.tab` is a computed property whose SETTER
+  clears `collectionsSurface` + `collectionFabRequest` — every tab change in the
+  app goes through it (`select(_:)`, the bottom nav, the palette, the assistant,
+  the tour, deep links), so leaving the tab straight from an open collection
+  retracts as part of the state change itself; (3) sign-out calls
+  `router.clearCollectionsSurface()` from `scrubDeviceLocalUserContent` (the
+  scaffold is torn down there without a tab change). Plus `fabAction` ignores
+  the surface entirely off the Collections tab.
+- **Handing the action back.** The New-collection sheet and the add field's
+  focus are view-local (`@State` / `@FocusState`), so the scaffold parks the
+  resolved action in `AppRouter.collectionFabRequest` and the owning view
+  consumes + clears it. Identified (UUID) so two taps in a row both fire; each
+  action has exactly one consumer, so neither view can swallow the other's.
+- **Files.** `App/AppRouter.swift` (`tab`'s retracting setter, the surface enum,
+  the pure `fabAction` resolver), `App/MainTabScaffold.swift` (`tapFab`),
+  `App/Chrome.swift` (`fabLabel` → `CoralFab.label`),
+  `App/Features/CollectionsFeature.swift` (router-owned nav `path`, the derived
+  `surface`, both consumers, the scroll anchor), `App/AppModel.swift` (the
+  sign-out clear).
+- **Tests.** `Tests/UnstuckAppTests/FabActionTests.swift` pins the routing
+  decision itself (15 cases: the three task tabs, a stale surface off-tab, the
+  grid, an editable detail, target identity, view-only fallback, pop-back, the
+  unbuilt shelf, labels, request identity, the live router, and four on
+  retraction — leaving the tab, `select(_:)` vs. re-selecting the tab you're
+  already on, dropping an unconsumed request, and sign-out).
+  `AppSmokeUITests.testFabCreatesWhatYoureLookingAt` walks it on the demo seed
+  — the label on every tab, the New-collection sheet opening from the +, the +
+  putting the cursor back in the add field (after deliberately clearing the
+  detail's auto-focus via the title-rename trick, or the test would pass with a
+  + that did nothing), the pop back to the grid, and finally leaving the tab
+  STRAIGHT FROM an open collection and returning, which is the walk that could
+  strand the marker. It types but does NOT submit: the demo boot has no
+  `SyncCoordinator`, so `AppModel.mutateCollectionItem` guards out and a
+  committed item would never appear.
+- **Mutation-checked.** Neutering the detail's `addFocused = true` fails the UI
+  test on exactly "the + should have put the cursor back in the add field";
+  removing the `tab` setter's clear fails three FabActionTests. Neither
+  assertion is decorative.
+- **Run (2026-09-18, iPhone 17 sim, whole `Unstuck` scheme).** `UnstuckAppTests`
+  **612 / 0 failures**. `UnstuckUITests` **22 tests, 1 skipped, 2 failing** —
+  exactly the two KNOWN pre-existing ones,
+  `AssistantBulkUITests.testExitingTheSheetMidBulkTurnThenWalkingTheCalendar`
+  and `SharePeopleCardShots.testPeopleCardMatrix`. AppSmoke 7/7, Store 1/1,
+  Tour 3/3, ColdStartSoak 4/4, CrashReportAttach + HomeShots green. Package
+  `swift test` not re-run — nothing under `Sources/` changed.
+- **Two unit flakes worth knowing about, neither related to this work.** Running
+  the UI suite first poisons the next `UnstuckAppTests` run on the same
+  simulator: the UI tests leave a `MAINSTALL` line in the app container's
+  `Library/Application Support/diagnostics/breadcrumbs.log`, and
+  `CrashBreadcrumbs.loadPreviousRun` then hands
+  `CrashBreadcrumbsTests.testNoReportIsOfferedAfterACleanRun` a non-nil
+  `lastReport`. Delete that file and it is 612/0 again (verified). Separately,
+  `CallsOutcomeReporterTests.testAfterThreeFailuresTheItemIsReEnqueuedAndRetried`
+  `Later` is load-sensitive (a 5 s wall-clock deadline around an injected
+  sleep) and failed once under full-scheme load; 6/6 on three isolated re-runs.
+- NOT bumped, not pushed, uncommitted. NOTE: `Unstuck.xcodeproj` is generated —
+  run `xcodegen generate` after any file add/remove or the build fails on a
+  missing input (it was still referencing a deleted UITests file on arrival).
+
+## Where things stand (2026-09-18) — the `today` tour step narrates again
 
 The gap the hero removal left (next section: "Narration audio — PENDING") is
 closed. The `today` step's copy was rewritten for the hero-less home and both

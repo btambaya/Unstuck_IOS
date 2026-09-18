@@ -24,7 +24,24 @@ final class AppRouter {
     /// the mode instead of just landing on the tab.
     enum CalendarMode: String, Hashable, CaseIterable { case day = "Day", week = "Week", month = "Month" }
 
-    var tab: Tab = .today
+    /// Backing storage for `tab` — go through `tab`, never this.
+    private var storedTab: Tab = .today
+    /// The selected tab. Writing it is ALSO the moment the old surface is left,
+    /// so it retracts what that surface published (`collectionsSurface`, which
+    /// only ListsView can republish and only while it is mounted) and drops a
+    /// `+` request the outgoing surface never got to consume. Every tab change
+    /// in the app goes through here — `select(_:)`, the bottom nav, the command
+    /// palette, the assistant, the tour, deep links — so the retraction is part
+    /// of the state change itself and does not wait on an `onDisappear`.
+    var tab: Tab {
+        get { storedTab }
+        set {
+            guard newValue != storedTab else { return }
+            storedTab = newValue
+            collectionsSurface = nil
+            collectionFabRequest = nil
+        }
+    }
     var activeSheet: Sheet?
     var calendarMode: CalendarMode = .day
     /// Realtime Talk presented from Today's gateway mic (a full-screen cover on
@@ -58,14 +75,113 @@ final class AppRouter {
     /// tap): the Collections tab pushes its detail once the row exists
     /// locally and clears this.
     var openCollectionId: String?
+
     /// A deep link captured INSIDE a presented sheet (Inbox "Open", Notification
     /// Center tap) to route AFTER that sheet finishes dismissing. SwiftUI can't
     /// present a second sheet from the same host while the first is still
     /// dismissing, so the host flushes this on its sheet's `onDismiss`.
     var pendingDeepLink: String?
 
+    // MARK: - the bottom-bar + (context-sensitive)
+
+    /// What the Collections tab is showing RIGHT NOW. The Collections detail is
+    /// a `NavigationLink` destination INSIDE that tab, so `tab` alone can't tell
+    /// the scaffold a collection is open, nor which one.
+    ///
+    /// ListsView publishes this, and every part of it is DERIVED rather than
+    /// remembered: the id comes from the NavigationStack path ListsView owns —
+    /// which the stack itself rewrites on every push and pop, Back button and
+    /// swipe-back included — and the rights come from the live row. So it cannot
+    /// say "a collection is open" while the grid is showing, and it cannot keep
+    /// claiming edit rights a sync just took away. `nil` means the surface isn't
+    /// there to answer: the tab isn't mounted, or its store hasn't come up yet
+    /// (see `fabAction` — an unbuilt shelf is offered no create it can't do).
+    ///
+    /// Three independent mechanisms keep it honest, so no single callback is
+    /// load-bearing: ListsView republishes it from its own state on every
+    /// update; `tab`'s setter clears it on the way out of the tab; and sign-out
+    /// clears it via `clearCollectionsSurface()`, since that tears the whole
+    /// scaffold down without a tab change.
+    var collectionsSurface: CollectionsSurface?
+
+    enum CollectionsSurface: Equatable, Sendable {
+        /// The grid, with the store observed — a new collection can be created.
+        case grid
+        /// A collection detail is pushed. `canEdit` is false on a share I can
+        /// only VIEW: the + must not offer an add the server would refuse.
+        case detail(id: String, canEdit: Bool)
+    }
+
+    /// A + tap that only the Collections surface can carry out: the
+    /// New-collection sheet and the detail's add-field focus are view-local
+    /// (`@State` / `@FocusState`) and out of the router's reach, so the
+    /// scaffold parks the resolved action here and the owning view consumes
+    /// and clears it. Identified rather than a Bool so two taps in a row both
+    /// register. Each action has exactly ONE consumer (grid → .newCollection,
+    /// detail → .addToCollection), so neither can swallow the other's request.
+    var collectionFabRequest: CollectionFabRequest?
+
+    struct CollectionFabRequest: Equatable, Identifiable, Sendable {
+        let id = UUID()
+        let action: FabAction
+    }
+
+    /// What the bottom bar's coral + does on the surface you're looking at.
+    /// The button itself never changes — same coral square, same position;
+    /// only this and its VoiceOver label move with context.
+    enum FabAction: Equatable, Sendable {
+        case newTask
+        case newCollection
+        /// Put the cursor in THIS collection's inline "Add to this collection…"
+        /// field. Deliberately NOT a second add sheet — both apps already have
+        /// that one field, and one add path is the whole point.
+        case addToCollection(id: String)
+
+        var accessibilityLabel: String {
+            switch self {
+            case .newTask: return "New task"
+            case .newCollection: return "New collection"
+            case .addToCollection: return "Add to this collection"
+            }
+        }
+    }
+
+    /// Resolve the + for the current surface. Pure and `nonisolated` so the
+    /// routing decision itself is unit-tested (FabActionTests) instead of being
+    /// inferred from the UI:
+    ///   • Today / Tasks / Calendar → New task (unchanged — the guided tour's
+    ///     first-action step falls back to this anchor on the Tasks tab).
+    ///   • The Collections grid → New collection.
+    ///   • Inside a collection I can edit → its inline add field.
+    ///   • Inside a collection I can only VIEW → New collection: a useful
+    ///     fallback beats an "add" I'd be refused.
+    ///   • The Collections tab with NO surface published (its store hasn't been
+    ///     built yet, so the shelf is still a spinner) → New task. Creating a
+    ///     collection there would be a tap into the void — the sheet's Create
+    ///     needs the store this surface hasn't got — so the + offers the one
+    ///     thing that does work, and says so in its label.
+    nonisolated static func fabAction(tab: Tab, surface: CollectionsSurface?) -> FabAction {
+        // Off the Collections tab the surface is irrelevant by construction, so
+        // read it nowhere else — belt-and-braces on top of the retractions.
+        guard tab == .lists else { return .newTask }
+        switch surface {
+        case .detail(let id, canEdit: true): return .addToCollection(id: id)
+        case .detail, .grid: return .newCollection
+        case nil: return .newTask
+        }
+    }
+
     func select(_ tab: Tab) { self.tab = tab }
     func present(_ sheet: Sheet) { activeSheet = sheet }
+
+    /// Sign-out: the whole scaffold is torn down without a tab change, so the
+    /// Collections surface (and any unconsumed + request) is retracted here too
+    /// — it described the account that just left.
+    func clearCollectionsSurface() {
+        collectionsSurface = nil
+        collectionFabRequest = nil
+    }
+
     /// Start a normal own-task focus (clears any stale shared marker so this
     /// session never inherits a prior shared context).
     func beginFocus(_ task: TaskItem) { sharedFocus = nil; focusTask = task }

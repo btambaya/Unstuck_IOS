@@ -757,6 +757,13 @@ final class AppModel {
         refreshLiveSession()
         uiTestWrite = WriteThrough(db: database)
         if heavy { HeavyDemoSeed.seedIfNeeded(database) } else { DemoSeed.seed(database) }
+        // The demo persona has a NAME. Without one the greeting falls back to
+        // "Good evening Unstuck." — correct behaviour, but it reads as a bug in
+        // a marketing screenshot. "Maya" is the persona the web seed already
+        // uses (scripts/seed-demo-account.mjs sets full_name/display_name), so
+        // the three platforms show the same person. Not "Sarah": the seed has a
+        // "Reply to Sarah" task, and a user replying to herself reads wrong.
+        setCachedUserName("Maya")
         startCaptureArchiveObservation(database)
         configured = true
         signedIn = true
@@ -1419,6 +1426,10 @@ final class AppModel {
         _tour?.teardownForSignOut()
         _tour = nil
         TourStore.clear()
+        // What the bottom-bar + is aimed at: the Collections surface described
+        // A's shelf. The tab setter retracts it on every tab change, but a
+        // sign-out tears the whole scaffold down without one.
+        router.clearCollectionsSurface()
         NotificationLog.shared.clear()
         NotificationPrefs.clearUserContent()   // per-task overrides + the cached level / lead
         PausedCheckinBudget.disarm()           // no budget settlement — the JWT is going away
