@@ -2,8 +2,10 @@
 // date eyebrow + ONE-line "<greeting> <first name>." serif line ("Unstuck."
 // when no name is set — web greeting-header parity), a "This week · focused"
 // pill, the assistant input pill (the way into the assistant + Talk), the
-// gradient Start-Next hero (full-width Focus), the Today/Backlog + area
-// filter pills, and the filtered today list. Live store via GRDB.
+// Today/Backlog + area filter pills, and the filtered today list. Live store
+// via GRDB. The gradient "Start next" hero (and its "Nothing to start" twin)
+// is gone (2026-09-18): Focus starts from a row's context menu or the task
+// editor; the list carries every open Today row.
 
 import SwiftUI
 import UIKit
@@ -63,9 +65,8 @@ final class TodayModel {
     /// instead of running two full-table DB reads + a JSON decode PER ROW in body.
     private(set) var occurrenceIds: Set<String> = []
 
-    /// The Today bucket (area-agnostic open rows) — the base for the hero, the
-    /// list, and the Start-Next subtraction. Cached per snapshot so the four
-    /// per-render passes (hero ×2, list, etc.) don't each rebuild it.
+    /// The Today bucket (area-agnostic open rows) — the base for the list.
+    /// Cached per snapshot so the per-render passes don't each rebuild it.
     private var todayBase: [TaskItem] = []
     /// Today's completions kept as struck-through wins (sorted last), cached.
     private var doneTodayBase: [TaskItem] = []
@@ -73,8 +74,7 @@ final class TodayModel {
     /// Backlog list).
     private var backlogBase: [TaskItem] = []
 
-    /// How many tasks sit in the Backlog (perf soak assertions; the hero no
-    /// longer points at the Backlog).
+    /// How many tasks sit in the Backlog (perf soak assertions).
     private(set) var backlogCount: Int = 0
 
     func observe() async {
@@ -145,7 +145,11 @@ final class TodayModel {
     private var lastWidgetContent: StartNextSnapshot?
 
     private func writeWidgetSnapshot() {
-        let next = startNext(liveTaskId: nil, area: nil)
+        // The widget's pick is today-scoped (next scheduled by time → else the
+        // shortest unscheduled → else nothing) — the same rule the on-screen
+        // hero used before it was removed; the home/lock "Start Next" tile
+        // keeps it.
+        let next = pickTodayHero(tasks: all, blocks: blocks, now: Date().timeIntervalSince1970 * 1000)
         let openCount = all.filter { !$0.done && !($0.later ?? false) }.count
         // Compare on a fixed updatedAt so only the meaningful fields drive the
         // Equatable check (the real write stamps the current time).
@@ -160,28 +164,18 @@ final class TodayModel {
         WidgetCenter.shared.reloadAllTimelines()
     }
 
-    /// The Start-Next hero — scoped to TODAY (next-scheduled by time → else
-    /// shortest-estimate → else nil so the hero points to the Backlog instead of
-    /// pulling a backlog task). Excludes the live-focused task + honours the area.
-    /// pickTodayHero is cheap relative to the list passes and depends on view
-    /// state (liveTaskId/area), so the view computes it ONCE per render and
-    /// threads the result into both the hero and the list (no duplicate passes).
-    func startNext(liveTaskId: String?, area: String?, excludeIds: Set<String> = []) -> TaskItem? {
-        pickTodayHero(tasks: all, blocks: blocks, now: Date().timeIntervalSince1970 * 1000,
-                      liveTaskId: liveTaskId, areaFilter: area, excludeIds: excludeIds)
-    }
-
-    func rows(backlog: Bool, area: String?, startNextId: String?, liveTaskId: String?) -> [TaskItem] {
+    func rows(backlog: Bool, area: String?, liveTaskId: String?) -> [TaskItem] {
         if backlog {
-            // backlogBase is cached per snapshot — just subtract the hero/live task.
-            return backlogBase.filter { $0.id != startNextId && $0.id != liveTaskId }
+            // backlogBase is cached per snapshot — just subtract the live task.
+            return backlogBase.filter { $0.id != liveTaskId }
         }
         // Today: cached open rows (area-agnostic bucket) PLUS cached today's
         // completions kept as struck-through wins (sorted last) until tomorrow,
-        // then area-filtered and with the hero/live task subtracted — 1:1 with
-        // Android TodayScreen.kt:127-136.
+        // then area-filtered and with the live task subtracted (it sits in the
+        // live-session card above the rows) — 1:1 with Android
+        // TodayScreen.kt:127-136.
         return (todayBase + doneTodayBase).filter {
-            (area == nil || $0.lifeArea == area) && $0.id != startNextId && $0.id != liveTaskId
+            (area == nil || $0.lifeArea == area) && $0.id != liveTaskId
         }
     }
 
@@ -233,11 +227,9 @@ final class TodayModel {
 struct TodayView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
-    @Environment(\.colorScheme) private var scheme
     @State private var vm: TodayModel?
     @State private var showSettings = false
     @State private var showNotifCenter = false
-    @State private var showPalette = false
     @State private var showInsights = false
     /// The row whose "Share…" context action opened the Share screen.
     @State private var shareTarget: ShareTarget?
@@ -256,21 +248,15 @@ struct TodayView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Pinned top bar — the logo, inbox/notifications, and avatar stay
-            // fixed; only the greeting + hero + filters + task list scroll.
+            // fixed; only the greeting + filters + task list scroll.
             topBar
             ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 if let vm {
-                    // The Start-Next hero is computed ONCE per render here and
-                    // threaded into both the hero card and the list (which only
-                    // needs its id to subtract it) — previously each ran its own
-                    // pickTodayHero pass.
-                    let hero = vm.startNext(liveTaskId: model.liveTaskId, area: areaFilter,
-                                            excludeIds: model.shareState.assignedOutIds)
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
                     // "Just now" session recap — shows for 6h after a finished
-                    // focus session, between the header and the hero
+                    // focus session, between the header and the list
                     // (Android TodayScreen recap parity).
                     if let recap = model.lastRecap,
                        Date().timeIntervalSince1970 * 1000 - recap.at < 6 * 3_600_000 {
@@ -278,9 +264,8 @@ struct TodayView: View {
                     }
                     // The quiet nudge card is not rendered on Today; the
                     // `computeNudges` path + `nudgeCard` stay for parity/tests.
-                    heroOrEmpty(vm, hero: hero).padding(.horizontal, 18).padding(.top, 14)
                     filterBar(vm)
-                    list(vm, hero: hero)
+                    list(vm)
                 } else {
                     ProgressView().frame(maxWidth: .infinity).padding(.top, 60)
                 }
@@ -291,7 +276,6 @@ struct TodayView: View {
         .background(theme.palette.bg.ignoresSafeArea())
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
-        .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showInsights) { NavigationStack { AnalyticsView() } }
         // Row context menu "Share…" → the ONE Share screen.
         .sheet(item: $shareTarget) { target in ShareScreen(target: target) }
@@ -304,7 +288,7 @@ struct TodayView: View {
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
         .onReceive(NotificationCenter.default.publisher(for: .unstuckTourWillNavigate)) { _ in
-            showSettings = false; showNotifCenter = false; showPalette = false; showInsights = false
+            showSettings = false; showNotifCenter = false; showInsights = false
             model.router.showTalk = false
         }
         .task {
@@ -400,79 +384,6 @@ struct TodayView: View {
             .accessibilityIdentifier("week-pill")
     }
 
-    // MARK: Start-Next hero
-
-    @ViewBuilder
-    private func heroOrEmpty(_ vm: TodayModel, hero: TaskItem?) -> some View {
-        if let t = hero {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 6) {
-                    Image(systemName: "bolt.fill").font(.system(size: 11)).foregroundStyle(theme.palette.primaryDeep)
-                    SectionLabel("Start next").foregroundStyle(theme.palette.primaryDeep)
-                }
-                .padding(.horizontal, 9).padding(.vertical, 3)
-                .background(Color.white.opacity(scheme == .dark ? 0.12 : 0.7), in: Capsule())
-                HStack(spacing: 6) {
-                    Circle().fill(theme.palette.coral).frame(width: 6, height: 6)
-                    Text("\(t.lifeArea ?? "Focus") · \(t.name)")
-                        .font(UFont.sans(11, .semibold)).foregroundStyle(theme.palette.primaryDeep).lineLimit(1)
-                }.padding(.top, 12)
-                Text(firstStepHeadline(t))
-                    .font(UFont.sans(21, .bold)).foregroundStyle(theme.palette.ink).lineLimit(2).padding(.top, 6)
-                Text("\(t.estimateMin) min").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2).padding(.top, 6)
-                HStack(spacing: 10) {
-                    Button { model.router.beginFocus(t) } label: {
-                        HStack(spacing: 6) {
-                            Image(systemName: "play.fill").font(.system(size: 13))
-                            Text("Focus").font(UFont.sans(15, .semibold))
-                        }
-                        .foregroundStyle(.white).padding(.horizontal, 18).padding(.vertical, 13)
-                        .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                    }.buttonStyle(.plain)
-                    Button { showPalette = true } label: {
-                        Text("Pick another").font(UFont.sans(13, .medium))
-                            .foregroundStyle(theme.palette.primaryDeep)
-                            .padding(.horizontal, 10).padding(.vertical, 8)
-                    }.buttonStyle(.plain)
-                }.padding(.top, 14)
-            }
-            .padding(18)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
-                        in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .tourTarget(.startNext)
-        } else if vm.backlogCount > 0 {
-            // Nothing scheduled today but a Backlog exists: no card here —
-            // the list below (and its Backlog pill) already say so. The
-            // "Nothing scheduled today / Pick something to start" pointer is
-            // gone (2026-09-17); the tour's today/finish steps fall back to
-            // the list section (.todayList).
-            EmptyView()
-        } else {
-            VStack(spacing: 10) {
-                Mark(size: 48)
-                SectionLabel("Nothing to start").foregroundStyle(theme.palette.primaryDeep)
-                Text("You're all clear.").font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
-                Text("Nothing's missing. When something's on your mind, drop it in.")
-                    .font(UFont.sans(14)).foregroundStyle(theme.palette.ink2)
-                    .multilineTextAlignment(.center).padding(.horizontal, 8)
-                Button { showPalette = true } label: {
-                    Text("Add one thing").font(UFont.sans(15, .semibold))
-                        .foregroundStyle(.white).padding(.horizontal, 18).padding(.vertical, 13)
-                        .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                }.buttonStyle(.plain).padding(.top, 6)
-            }
-            .frame(maxWidth: .infinity).padding(.vertical, 32).padding(.horizontal, 22)
-            .background(LinearGradient(colors: theme.palette.heroGradient, startPoint: .topLeading, endPoint: .bottomTrailing),
-                        in: RoundedRectangle(cornerRadius: 24, style: .continuous))
-        }
-    }
-
-    private func firstStepHeadline(_ t: TaskItem) -> String {
-        if let s = t.firstPhysicalAction?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty { return s }
-        return t.name
-    }
-
     // MARK: filter pills
 
     @ViewBuilder
@@ -517,13 +428,12 @@ struct TodayView: View {
     // MARK: today list
 
     @ViewBuilder
-    private func list(_ vm: TodayModel, hero: TaskItem?) -> some View {
+    private func list(_ vm: TodayModel) -> some View {
         let liveId = model.liveTaskId
-        let startNextId = hero?.id
         // Tasks I've assigned away leave the active buckets (they show in the
         // Delegated group instead) — mirrors the web today-list filter.
         let assignedOut = model.shareState.assignedOut
-        let rows = vm.rows(backlog: backlogActive, area: areaFilter, startNextId: startNextId, liveTaskId: liveId)
+        let rows = vm.rows(backlog: backlogActive, area: areaFilter, liveTaskId: liveId)
             .filter { assignedOut[$0.id] == nil }
         // The in-progress focus session, surfaced at the top of the list (Android
         // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed
@@ -533,7 +443,7 @@ struct TodayView: View {
         let liveTask = liveId.flatMap { id in vm.all.first { $0.id == id } }
             ?? model.sharedLiveTaskFallback()
         // LazyVStack (not VStack): the whole Today/dashboard screen — header,
-        // hero, filter bar, AND these rows — lives in ONE outer ScrollView
+        // filter bar, AND these rows — lives in ONE outer ScrollView
         // (body), so the entire screen scrolls as a single unit. Lazy keeps a
         // long Today/Backlog list from rendering every row eagerly inside that
         // single scroll container. Matches the Tasks list.
@@ -563,8 +473,8 @@ struct TodayView: View {
             ForEach(rows) { t in taskRow(t) }
         }
         .padding(.horizontal, 18)
-        // Tour fallback anchor: an empty account renders no hero at all — the
-        // today/finish steps spotlight the list section instead.
+        // Tour anchor: the today/finish steps spotlight the list section
+        // (the ringed Start-Next hero is gone; the list is the subject now).
         .tourTarget(.todayList)
         // Per-view empty note — only when nothing else is on screen (the live
         // card counts as content, and so do shared rows — "Nothing in Work

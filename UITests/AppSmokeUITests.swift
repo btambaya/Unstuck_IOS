@@ -9,8 +9,8 @@
 //
 // One rule worth remembering here: Settings is a SHEET over Today, so its rows
 // share ONE accessibility tree with the Today screen behind them and bare
-// labels collide ("Focus" is both a Settings row and the Start-Next hero's
-// button). Address rows by identifier — `settings-row-<label>`.
+// labels collide ("Focus" was both a Settings row and the since-removed
+// Start-Next hero's button). Address rows by identifier — `settings-row-<label>`.
 
 import XCTest
 
@@ -58,12 +58,12 @@ final class AppSmokeUITests: XCTestCase {
         XCTAssertTrue(e.waitForExistence(timeout: timeout), why, file: file, line: line)
     }
 
-    /// Scroll `e` into reach. Today's Start-Next hero renders UNDER the AI
-    /// gateway card, so on a fresh launch its Focus button lands in the bottom
-    /// ~100pt that the FLOATING bottom nav covers — and XCUITest still calls
-    /// elements under that nav `isHittable`, so tapping one silently hits the
-    /// nav instead (that is how `testFocus` used to "pass" while starting no
-    /// session). Require the element to clear the nav, not merely to exist.
+    /// Scroll `e` into reach. Today's lower rows land in the bottom ~100pt
+    /// that the FLOATING bottom nav covers — and XCUITest still calls elements
+    /// under that nav `isHittable`, so tapping one silently hits the nav
+    /// instead (that is how `testFocus` used to "pass" while starting no
+    /// session, back when the hero's Focus button sat there). Require the
+    /// element to clear the nav, not merely to exist.
     @discardableResult
     private func scrollIntoReach(_ e: XCUIElement, swipes: Int = 8) -> Bool {
         let clearOfFloatingNav = { e.exists && e.isHittable && e.frame.maxY < self.app.frame.height - 110 }
@@ -104,18 +104,24 @@ final class AppSmokeUITests: XCTestCase {
         snap("07-collection-detail")
     }
 
-    /// Today's primary CTA: the Start-Next hero's Focus button really starts a
-    /// session. (It renders below the AI gateway card, so this also pins the
-    /// fact that it is reachable at all — by scrolling.)
+    /// Focus from a Today row: long-press a seeded row, pick "Focus" in its
+    /// context menu, and a real session starts. (The Start-Next hero and its
+    /// Focus button are gone from the home — 2026-09-18 — so the row's menu
+    /// and the task editor's Focus button are the home's ways into Focus.)
     func testFocus() throws {
         launchToToday()
-        let heroFocus = app.buttons["Focus"].firstMatch
-        expect(heroFocus, "the seeded Today should show the Start-Next hero")
-        XCTAssertTrue(scrollIntoReach(heroFocus),
-                      "the Start-Next hero's Focus button never became reachable on Today")
-        heroFocus.tap()
+        let row = app.staticTexts["Draft the Q3 proposal"].firstMatch
+        expect(row, "the seeded Today should list 'Draft the Q3 proposal'")
+        XCTAssertTrue(scrollIntoReach(row), "the proposal row never became reachable on Today")
+        // No hero on the home any more: nothing labelled Focus before the menu.
+        XCTAssertFalse(app.buttons["Focus"].firstMatch.exists,
+                       "Today must not carry a Focus button outside a row's context menu")
+        row.press(forDuration: 1.2)
+        let focus = app.buttons["Focus"].firstMatch
+        expect(focus, "the row's context menu has no Focus action")
+        focus.tap()
         XCTAssertTrue(app.staticTexts["FOCUSING"].firstMatch.waitForExistence(timeout: 8),
-                      "tapping the hero's Focus did not start a session")
+                      "the row's Focus action did not start a session")
         usleep(700_000)
         snap("11-focus")
     }

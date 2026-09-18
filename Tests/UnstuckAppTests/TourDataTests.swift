@@ -77,13 +77,28 @@ final class TourDataTests: XCTestCase {
         }
     }
 
-    func testTodayAndFinishFallbackChain() {
+    func testTodayAndFinishRingTheTodayList() {
+        // The Start-Next hero (2026-09-18) and the "Nothing scheduled today"
+        // backlog pointer (2026-09-17) are both gone from Today: the list
+        // section is the primary anchor, and it is always mounted on Today,
+        // so no fallback chain remains.
         for id in ["today", "finish"] {
             let s = TourScript.essential.first { $0.id == id }!
-            XCTAssertEqual(s.target, .startNext, id)
-            // The "Nothing scheduled today" backlog pointer is gone from Today
-            // (2026-09-17): the list section is the one fallback.
-            XCTAssertEqual(s.targetFallbacks, [.todayList], id)
+            XCTAssertEqual(s.target, .todayList, id)
+            XCTAssertTrue(s.targetFallbacks.isEmpty, id)
+        }
+        XCTAssertFalse(TourTargetID.allCases.map(\.rawValue).contains("start-next"),
+                       "the start-next anchor must not linger once the hero is gone")
+    }
+
+    func testNoStepCopyNamesTheRemovedStartNextHero() {
+        // Body, narration and more must not point the user at a card that no
+        // longer exists on the iOS home.
+        for s in TourScript.full {
+            for text in [s.body, s.narration, s.more ?? ""] {
+                XCTAssertFalse(text.range(of: "start next", options: .caseInsensitive) != nil,
+                               "'\(s.id)' still mentions Start Next: \(text)")
+            }
         }
     }
 
@@ -365,10 +380,10 @@ final class TourAskTests: XCTestCase {
     private let step = TourScript.essential.first { $0.id == "today" }!
 
     func testBuildTourPromptEmbedsMarkTitleAndQuestion() {
-        let p = buildTourPrompt(stepTitle: step.title, stepBody: step.body, question: "  what is start next?  ")
+        let p = buildTourPrompt(stepTitle: step.title, stepBody: step.body, question: "  what is backlog?  ")
         XCTAssertTrue(p.contains(TOUR_CONTEXT_MARK))
         XCTAssertTrue(p.contains(step.title))
-        XCTAssertTrue(p.hasSuffix("Question: what is start next?"))
+        XCTAssertTrue(p.hasSuffix("Question: what is backlog?"))
         XCTAssertTrue(p.contains("without using any tools"))
     }
 

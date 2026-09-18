@@ -118,7 +118,7 @@ final class TourAccessibilityHidingTests: XCTestCase {
     }
 
     func testADisplayOnlyRingStillHidesTheAppWindow() {
-        // The Start-Next hero is ringed but swallowed, so hiding it is right:
+        // The Today list is ringed but swallowed, so hiding it is right:
         // nothing under the scrim is operable by anyone.
         let ctx = running { $0.targetRect = ring; $0.cutoutInteractive = false }
         XCTAssertTrue(tourHidesAppFromAccessibility(ctx: ctx))

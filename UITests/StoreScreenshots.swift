@@ -7,9 +7,13 @@
 //
 // It used to be written as `if element.exists { … save() }` throughout, so a
 // screen that stopped rendering just dropped out of the set in silence. Two
-// had: the focus + recap shots (Today's hero moved under the floating nav once
-// the AI gateway card landed above it) and the Tasks shot keyed off an
+// had: the focus + recap shots (Today's then-hero moved under the floating nav
+// once the AI gateway card landed above it) and the Tasks shot keyed off an
 // "Upcoming" pill that no longer exists.
+//
+// Focus is entered from a Today ROW's context menu (long-press → "Focus"):
+// the Start-Next hero and its Focus button are gone from the home
+// (2026-09-18); rows and the task editor are where Focus starts now.
 
 import XCTest
 
@@ -68,13 +72,18 @@ final class StoreScreenshots: XCTestCase {
         usleep(1_200_000)
         save("01-today")
 
-        // Focus session, then end it via soft-exit "End for now" (a Button,
-        // not a staticText) — the recap card's "JUST NOW" label confirms we
-        // landed back on Today before shooting.
-        let heroFocus = app.buttons["Focus"].firstMatch
-        expect(heroFocus, "Today's Start-Next hero is missing — no focus screenshot")
-        XCTAssertTrue(scrollIntoReach(heroFocus), "the hero's Focus button never cleared the bottom nav")
-        heroFocus.tap()
+        // Focus session from a Today row (long-press → context menu → Focus;
+        // the seeded proposal task carries a first physical action, so the
+        // focus screen shows a real first step), then end it via soft-exit
+        // "End for now" (a Button, not a staticText) — the recap card's
+        // "JUST NOW" label confirms we landed back on Today before shooting.
+        let row = app.staticTexts["Draft the Q3 proposal"].firstMatch
+        expect(row, "the seeded 'Draft the Q3 proposal' row is missing from Today — no focus screenshot")
+        XCTAssertTrue(scrollIntoReach(row), "the proposal row never cleared the bottom nav")
+        row.press(forDuration: 1.2)
+        let focus = app.buttons["Focus"].firstMatch
+        expect(focus, "the row's context menu has no Focus action")
+        focus.tap()
         expect(app.staticTexts["FOCUSING"].firstMatch, "the focus screen did not open")
         usleep(1_200_000)
         save("02-focus")

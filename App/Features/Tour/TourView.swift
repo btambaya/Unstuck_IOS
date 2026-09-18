@@ -14,8 +14,9 @@
 // ROUND-2 LOCKDOWN: while the tour runs the window claims (and swallows)
 // every touch EXCEPT the panel and — on cutoutInteractive steps only
 // (assistant/reentry) — the spotlight cutout; every other ring is display-
-// only (round-3 cutout policy: the ringed Start-Next hero must never mint a
-// real session). A step-opened surface (assistant sheet, settings section,
+// only (round-3 cutout policy: the ringed Today list must never open a real
+// task — nor, when it still existed, the Start-Next hero mint a real
+// session). A step-opened surface (assistant sheet, settings section,
 // task detail) reverts the claim to panel-only so that surface stays usable
 // while it's the step's subject. While PAUSED, a floating "Resume tour" chip
 // is the only claimed region and the app is fully usable underneath. See

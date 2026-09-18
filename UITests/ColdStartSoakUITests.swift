@@ -19,7 +19,7 @@ final class ColdStartSoakUITests: XCTestCase {
         return app
     }
 
-    /// launch() → the Today tab exists → the Start-Next hero has rendered.
+    /// launch() → the Today tab exists (the bottom nav is the first-frame signal).
     @discardableResult
     private func timeBoot(_ app: XCUIApplication, label: String) -> Double {
         let t0 = CFAbsoluteTimeGetCurrent()

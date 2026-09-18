@@ -6,9 +6,9 @@
 //    (TaskEditor on first-action, Settings→Notifications);
 //  • ROUND-2 lockdown — while running, a tap outside the panel + spotlight is
 //    SWALLOWED (does nothing); ROUND-3 cutout policy — the ring itself is
-//    display-only on ordinary steps (the spotlighted Start-Next hero can't
-//    mint a session) and passes through ONLY on the assistant/reentry steps
-//    (the launcher opens its sheet);
+//    display-only on ordinary steps (the spotlighted Today list can't open a
+//    task) and passes through ONLY on the assistant/reentry steps (the
+//    launcher opens its sheet);
 //  • ROUND-3 key-window handback — exiting with the Ask keyboard up hands
 //    key status back to the app window (its text inputs keep working);
 //  • the focus/capture steps render the tour's DEMO focus surface (frozen at
@@ -108,12 +108,14 @@ final class TourUITests: XCTestCase {
                        "Settings must not be open behind the tour")
         snap("02a-lockdown-blocked")
         // ROUND-3 CUTOUT POLICY: on this step the ring is DISPLAY-ONLY — the
-        // SPOTLIGHTED Start-Next hero is swallowed like everything else, so it
-        // is hidden from the a11y tree too. (Its Focus button mints a real
-        // session in normal use; the end of this test proves it comes back the
-        // moment the tour lets go.)
-        XCTAssertFalse(app.buttons["Focus"].firstMatch.exists,
-                       "a display-only ring must not leave the hero reachable")
+        // SPOTLIGHTED Today list is swallowed like everything else, so its
+        // rows (and the header's week pill) are hidden from the a11y tree
+        // too. (A row opens a real task in normal use; the end of this test
+        // proves it comes back the moment the tour lets go.)
+        XCTAssertFalse(app.staticTexts["Draft the Q3 proposal"].firstMatch.exists,
+                       "a display-only ring must not leave the ringed rows reachable")
+        XCTAssertFalse(app.buttons["week-pill"].firstMatch.exists,
+                       "Today's header must be unreachable under the scrim")
         // The touch layer is the half the a11y tree can't speak for, so probe
         // it with a RAW coordinate touch — the tab bar, whose position is
         // fixed and which is unambiguously app content under the scrim.
@@ -200,12 +202,13 @@ final class TourUITests: XCTestCase {
         usleep(800_000)
         XCTAssertFalse(app.staticTexts["You’re ready to begin"].exists)
         XCTAssertFalse(app.staticTexts["FOCUSING"].exists, "demo never minted a session")
-        // The lock let go with the tour: Today's Start-Next hero — the thing
-        // step 2 ringed, and the one element the lockdown hid hardest — is
-        // back in the tree, tab still Today (proof the swallowed tab-bar tap
-        // on step 2 really went nowhere).
-        XCTAssertTrue(app.buttons["Focus"].firstMatch.waitForExistence(timeout: 8),
-                      "seeded Today shows the Start-Next hero once the lock lifts")
+        // The lock let go with the tour: Today's rows — the thing step 2
+        // ringed, and the elements the lockdown hid — are back in the tree,
+        // tab still Today (proof the swallowed tab-bar tap on step 2 really
+        // went nowhere).
+        XCTAssertTrue(app.staticTexts["Draft the Q3 proposal"].firstMatch.waitForExistence(timeout: 8),
+                      "seeded Today shows its rows once the lock lifts")
+        XCTAssertTrue(app.buttons["week-pill"].firstMatch.exists, "Today's header is back")
         XCTAssertTrue(app.buttons["Account and settings"].firstMatch.exists,
                       "the whole app window is reachable again")
         snap("10-done")

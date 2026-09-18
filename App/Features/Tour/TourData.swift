@@ -87,7 +87,9 @@ enum TourStepView: String, Sendable {
 /// Spotlightable anchors — the iOS analogue of the web `data-tour` selectors.
 /// Real views register live frames for these via `.tourTarget(_:)`.
 enum TourTargetID: String, CaseIterable, Sendable {
-    case startNext = "start-next"
+    /// The Today list section (filters + rows) — the today/finish anchor.
+    /// (`start-next`, the gradient hero card, was removed from Today on
+    /// 2026-09-18; the list is the subject of those steps now.)
     case todayList = "today-list"
     case firstAction = "first-action"
     case newTask = "new-task"
@@ -109,7 +111,7 @@ struct TourStep: Identifiable, Sendable {
     /// Anchor to spotlight; nil = whisper-light scrim only.
     var target: TourTargetID? = nil
     /// Ordered fallbacks when the primary target isn't on screen
-    /// (e.g. an empty account has no hero → the Today list / New-task FAB).
+    /// (e.g. an empty account has no task to open → the New-task FAB).
     var targetFallbacks: [TourTargetID] = []
     let title: String
     let body: String
@@ -123,8 +125,9 @@ struct TourStep: Identifiable, Sendable {
     /// is DISPLAY-ONLY and claims() swallows the cutout region too. TRUE only
     /// for the assistant/reentry steps, whose whole point is tapping the
     /// ringed launcher (and using the sheet it opens). Everywhere else a
-    /// pass-through cutout was a live gun: tapping the ringed Start-Next hero
-    /// minted a REAL focus session mid-tour.
+    /// pass-through cutout was a live gun: tapping the (since removed) ringed
+    /// Start-Next hero minted a REAL focus session mid-tour — and a ringed
+    /// Today row opens a real task just the same.
     var cutoutInteractive: Bool = false
 
     /// Round 2: the focus/capture steps present the tour's own DEMO focus
@@ -151,8 +154,20 @@ struct TourStep: Identifiable, Sendable {
     var surfaceScoped: Bool { view == .settings }
 }
 
-/// The step script — copy ported VERBATIM from web tour-data.ts.
+/// The step script — copy ported VERBATIM from web tour-data.ts, except the
+/// `today` step: the web dashboard still has a Start-Next card, the iOS home
+/// does not (2026-09-18), so its body / narration / more describe the Today
+/// list instead.
 enum TourScript {
+    /// Steps whose bundled Cherry narration + more clips are NOT in the app:
+    /// the `today` clips (today.m4a / today-more.m4a) spoke the old
+    /// "Start Next offers one realistic suggestion…" copy and were dropped
+    /// with the hero rather than narrate a card that isn't there. Listen is
+    /// hidden on these steps until the clips are regenerated from the new
+    /// text (DashScope qwen3-tts-flash, voice "Cherry", AAC 24 kHz mono —
+    /// see handover.md). Empty this set when they land.
+    static let stepsAwaitingNarration: Set<String> = ["today"]
+
     static let essential: [TourStep] = [
         TourStep(
             id: "welcome", stage: "Welcome", view: .today, target: nil,
@@ -163,13 +178,14 @@ enum TourScript {
             primary: "Continue"),
         TourStep(
             id: "today", stage: "Today", view: .today,
-            // Empty-account fallback: an account with nothing scheduled renders
-            // NO hero card at all — spotlight the Today list instead.
-            target: .startNext, targetFallbacks: [.todayList],
+            // The Today list section (filters + rows) — always on screen, so
+            // no fallback is needed (an empty account rings the list's empty
+            // note).
+            target: .todayList,
             title: "Today narrows it down",
-            body: "Start Next offers one realistic suggestion — with a short reason, like the time it fits. It’s a recommendation, never a command. Today shows only planned work; everything else waits in Backlog.",
-            narration: "This is Today. Instead of a long list, Start Next offers one realistic suggestion, with a short reason — like the gap it fits before your next meeting. It’s a suggestion, never a command. Today shows only planned work; everything else waits quietly in your Backlog.",
-            more: "Usable Time (top of the page and right rail) already accounts for meetings and fragmentation, so the suggestion is grounded in the time you actually have.",
+            body: "Today shows only what’s planned for today — a short list you can actually finish, not everything you’ve ever written down. Everything else waits in Backlog. Start any task from its row, or ask the assistant what to do first.",
+            narration: "This is Today. Instead of one long list, it shows only the work you’ve planned for today — a short list you can actually finish. Everything else waits quietly in your Backlog. Start any task straight from its row, or ask the assistant what to do first.",
+            more: "Filter Today by area with the pills above the list, or switch to Backlog to see what’s waiting. A task that isn’t planned for today isn’t lost — it just isn’t in the way.",
             primary: "Continue"),
         TourStep(
             id: "first-action", stage: "Tasks", view: .tasks,
@@ -223,7 +239,7 @@ enum TourScript {
             primary: "Continue"),
         TourStep(
             id: "finish", stage: "Begin", view: .today,
-            target: .startNext, targetFallbacks: [.todayList],
+            target: .todayList,
             title: "You’re ready to begin",
             body: "That’s the loop: Today narrows things down, the first physical action gets you moving, Focus sustains it, and the Assistant helps when you’re stuck. Pick one real next step.",
             narration: "That’s the core loop. Today narrows things down. The first physical action gets you moving. Focus sustains it. And the Assistant is there when you get stuck. You don’t need to learn everything today — just choose one real next step, and begin.",
@@ -502,8 +518,9 @@ struct TourClaimContext: Equatable, Sendable {
 /// nothing. Round-3 refinements (cross-platform cutout policy):
 ///  • the cutout passes through ONLY on cutoutInteractive steps (assistant /
 ///    reentry — the launcher + its sheet ARE the step). Every other ring is
-///    display-only: the cutout region is claimed and swallowed too, so the
-///    spotlighted Start-Next hero can never mint a real session mid-tour;
+///    display-only: the cutout region is claimed and swallowed too, so a
+///    spotlighted Today row can never open a real task (or, before the hero
+///    went, mint a real session) mid-tour;
 ///  • demo focus steps claim everything, EVEN while a presentation is active
 ///    (the demoStep check sits above presentationActive): a live REAL focus
 ///    cover under the opaque demo must never receive blind pass-through

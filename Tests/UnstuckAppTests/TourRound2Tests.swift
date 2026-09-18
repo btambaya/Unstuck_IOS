@@ -112,7 +112,8 @@ final class TourClaimsTests: XCTestCase {
     func testCutoutIsDisplayOnlyByDefault() {
         // Round-3 cutout policy: on ordinary steps the ring is VISUAL — the
         // cutout region is claimed and swallowed too. (A pass-through cutout
-        // let a tap on the spotlighted Start-Next hero mint a REAL session.)
+        // once let a tap on the spotlighted Start-Next hero mint a REAL
+        // session; today it would open a real task from the ringed list.)
         XCTAssertTrue(tourClaims(point: CGPoint(x: 100, y: 150), ctx: running()))
         XCTAssertTrue(tourClaims(point: CGPoint(x: 40, y: 110), ctx: running()))
     }
@@ -431,8 +432,25 @@ final class TourAudioManifestTests: XCTestCase {
         FileManager.default.fileExists(atPath: audioDir.appendingPathComponent(name).path)
     }
 
+    /// The steps whose clips are deliberately absent — their copy changed
+    /// (the `today` step no longer describes the removed Start-Next hero) and
+    /// the old recordings were dropped rather than narrate the wrong screen.
+    /// Pinned to exactly that set so a clip going missing anywhere else still
+    /// fails, and so regenerating the clips forces the set to be emptied.
+    private let awaiting = TourScript.stepsAwaitingNarration
+
+    func testOnlyTheTodayStepAwaitsRegeneratedNarration() {
+        XCTAssertEqual(awaiting, ["today"])
+        // The stale clips must really be gone — Listen would play the old
+        // "Start Next offers one realistic suggestion…" recording otherwise.
+        for id in awaiting {
+            XCTAssertFalse(exists("\(id).m4a"), "stale narration clip for '\(id)' is still bundled")
+            XCTAssertFalse(exists("\(id)-more.m4a"), "stale more clip for '\(id)' is still bundled")
+        }
+    }
+
     func testEveryStepHasANarrationClip() {
-        for s in allSteps {
+        for s in allSteps where !awaiting.contains(s.id) {
             XCTAssertTrue(exists("\(s.id).m4a"), "missing narration clip for '\(s.id)'")
         }
     }
@@ -440,7 +458,7 @@ final class TourAudioManifestTests: XCTestCase {
     func testEveryTellMeMoreHasAMoreClip() {
         let withMore = allSteps.filter { $0.more != nil }
         XCTAssertEqual(withMore.count, 9, "the 9 essential steps carry more-copy")
-        for s in withMore {
+        for s in withMore where !awaiting.contains(s.id) {
             XCTAssertTrue(exists("\(s.id)-more.m4a"), "missing more clip for '\(s.id)'")
         }
     }

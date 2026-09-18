@@ -1,7 +1,7 @@
 // Home + interview-in-thread screenshots — runs against the network-free demo
 // boot (UITEST_SEED + a canned assistant reply) and writes full-resolution
 // PNGs: the Today home in light and dark (one-line greeting, week pill, the
-// assistant input pill, the Start-Next hero, the list) and the assistant
+// assistant input pill, the list) and the assistant
 // thread showing an interview question with its chips after the first
 // message was answered. Not a behaviour test; a failure means a screen it
 // claims to have shot didn't render.

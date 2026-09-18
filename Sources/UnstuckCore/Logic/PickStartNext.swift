@@ -63,14 +63,15 @@ public func pickUpNext(
     return Array(open.sorted(by: ranksBefore).prefix(limit))
 }
 
-/// The Today "Start Next" hero pick — scoped to TODAY, never the backlog:
+/// The today-scoped "Start Next" pick — never the backlog. It drove the
+/// Today hero card until that card was removed (2026-09-18); the home/lock
+/// "Start Next" widget snapshot written from Today still uses it:
 ///  1. If any task is SCHEDULED today (a cal_block dated today, incl. a recurring
 ///     occurrence), return the NEXT by start time — the soonest start ≥ the
 ///     current time, else the earliest of the day if all of today's are past.
 ///  2. Else, among today's UNscheduled tasks (created today, no block today),
 ///     return the lowest-friction one — the shortest estimate.
-///  3. Else nil — the caller shows a "check your Backlog" pointer instead of
-///     pulling a backlog task into the hero.
+///  3. Else nil — never pull a backlog task forward.
 public func pickTodayHero(
     tasks: [TaskItem],
     blocks: [CalBlock],

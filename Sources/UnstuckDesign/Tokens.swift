@@ -14,8 +14,6 @@ public struct Palette: Sendable {
     public let violet, blue, green, amber, red: Color
     /// Soft fills + readable "ink" shades for status chips / rollups (Android parity).
     public let greenInk, greenSoft, blueSoft, blueInk, amberSoft, amberInk: Color
-    /// Start-Next hero gradient (lavender→pink light, indigo→plum dark).
-    public let heroGradient: [Color]
 
     public static let light = Palette(
         bg: Color(hex: "#FAFAF7"), bg2: Color(hex: "#F4F2EC"), surface: Color(hex: "#FFFFFF"),
@@ -33,8 +31,7 @@ public struct Palette: Sendable {
         red: OKLCH(0.66, 0.13, 25).color,
         greenInk: OKLCH(0.40, 0.10, 155).color, greenSoft: OKLCH(0.94, 0.04, 155).color,
         blueSoft: OKLCH(0.94, 0.03, 240).color, blueInk: OKLCH(0.40, 0.10, 240).color,
-        amberSoft: OKLCH(0.95, 0.05, 75).color, amberInk: OKLCH(0.45, 0.13, 75).color,
-        heroGradient: [OKLCH(0.96, 0.04, 280).color, OKLCH(0.95, 0.05, 320).color])
+        amberSoft: OKLCH(0.95, 0.05, 75).color, amberInk: OKLCH(0.45, 0.13, 75).color)
 
     public static let dark = Palette(
         bg: OKLCH(0.205, 0.025, 270).color, bg2: OKLCH(0.24, 0.03, 270).color, surface: OKLCH(0.26, 0.03, 270).color,
@@ -50,8 +47,7 @@ public struct Palette: Sendable {
         red: OKLCH(0.66, 0.13, 25).color,
         greenInk: OKLCH(0.86, 0.10, 155).color, greenSoft: OKLCH(0.34, 0.07, 155).color,
         blueSoft: OKLCH(0.34, 0.06, 240).color, blueInk: OKLCH(0.86, 0.08, 240).color,
-        amberSoft: OKLCH(0.36, 0.08, 75).color, amberInk: OKLCH(0.88, 0.11, 75).color,
-        heroGradient: [OKLCH(0.34, 0.09, 280).color, OKLCH(0.30, 0.07, 322).color])
+        amberSoft: OKLCH(0.36, 0.08, 75).color, amberInk: OKLCH(0.88, 0.11, 75).color)
 
     /// Resolve a life-area / collection color token (indigo, coral, …) to
     /// a Color. Mirrors the web area palette mapping.

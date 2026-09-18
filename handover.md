@@ -3,7 +3,74 @@
 Living doc for resuming the iOS build across sessions. Update it as
 phases land. Newest status at the top.
 
-## Where things stand (2026-09-17, latest) — Today/home: one-line greeting, the assistant input pill, no backlog pointer; the interview moved INTO the assistant
+## Where things stand (2026-09-18, latest) — the "Start next" hero is gone from Today
+
+Ahmad (2026-09-18): the lavender gradient "START NEXT" card on the home —
+"<area> · <task>", the first-step headline, the estimate, the Focus button,
+"Pick another" — AND its empty-state twin ("Nothing to start / You're all
+clear. / Add one thing") go away completely, iOS and Android. The home is now:
+top bar → date eyebrow → one-line greeting → "This week · focused" pill →
+the assistant input pill → the Today list (filters + rows) and everything
+below, untouched. NOT bumped (Ship does); not pushed.
+
+- **`App/Features/TodayFeature.swift`** — `heroOrEmpty(_:hero:)`,
+  `firstStepHeadline`, the per-render `vm.startNext(...)` pass, the
+  `showPalette` state + its `CommandPalette` sheet (both hero buttons were
+  its only Today entry points; the palette stays reachable from the Tasks /
+  Calendar / Collections app bars) and the `colorScheme` env read are
+  deleted. `TodayModel.startNext(liveTaskId:area:excludeIds:)` is gone;
+  `rows(backlog:area:liveTaskId:)` no longer takes `startNextId` — the task
+  the hero used to lift out now simply sits in the list (the live-focused
+  task is still lifted into the live-session card). `writeWidgetSnapshot`
+  keeps the home/lock **Start Next widget** exactly as it was (it calls
+  `pickTodayHero` directly — the today-scoped pick that used to feed the
+  card; `pickStartNext` / `AppModel.refreshWidgetSnapshot` untouched).
+  `Palette.heroGradient` (UnstuckDesign/Tokens.swift) had no other user
+  and is removed. Focus is still one long-press away on every Today row
+  (context menu → Focus) and on the task editor's Focus button — neither
+  changed. No analytics/telemetry was ever wired to the hero (grepped).
+- **Tour** (`App/Features/Tour/TourData.swift`): `TourTargetID.startNext`
+  is removed; the `today` and `finish` steps ring `.todayList` directly (no
+  fallback chain — the list section is always mounted on Today). The
+  `today` step's body / narration / more no longer describe Start Next
+  (new copy: "Today shows only what's planned for today — a short list you
+  can actually finish… Start any task from its row, or ask the assistant
+  what to do first." / more: the area pills + Backlog). This is the ONE
+  step whose copy now differs from web `tour-data.ts` (the web dashboard
+  still has its Start-Next card). **Narration audio — PENDING**: the
+  bundled Cherry clips `today.m4a` / `today-more.m4a` spoke the old copy,
+  so they were removed from `App/Resources/TourAudio/` rather than narrate
+  a card that isn't there — the Listen mini-link is hidden on that step
+  (`TourAudioPlayer.hasAudio` → `available = false`, the designed
+  degradation), every other step narrates as before.
+  `TourScript.stepsAwaitingNarration = ["today"]` names the gap and
+  `TourAudioManifestTests` pins it (the stale files must be absent, every
+  other clip present). To close it: synthesise the new `narration` and
+  `more` strings of the `today` step with DashScope **qwen3-tts-flash,
+  voice "Cherry"** (the same recipe as web commit 28c0e90 — the key lives
+  in the Supabase project secrets / the voice-proxy Worker, not on disk),
+  `afconvert -f m4af -d aac -b 56000` to mono 24 kHz AAC like the other
+  clips, drop them in as `today.m4a` / `today-more.m4a`, empty
+  `stepsAwaitingNarration`, done. Android should ship the same copy + clips.
+- **Tests**: `TourDataTests` — `testTodayAndFinishRingTheTodayList` (+ the
+  `start-next` raw value must not linger) and
+  `testNoStepCopyNamesTheRemovedStartNextHero`; `TourRound2Tests`
+  manifest exemption as above. UI tests: `StoreScreenshots` and
+  `AppSmokeUITests.testFocus` enter Focus by long-pressing the seeded
+  "Draft the Q3 proposal" row → context menu "Focus" (the 02-focus /
+  03-recap captures still work); `testFocus` also asserts there is no
+  bare "Focus" button on the home. `TourUITests` step-2 lockdown probes
+  the ringed row + `week-pill` instead of the hero's Focus button.
+- Verify: `TZ=UTC swift test` → 1038 tests, 2 skipped, 0 failures;
+  `UnstuckAppTests` on a fresh iPhone 17 container → 577 tests, 0 failures
+  (`CallsOutcomeReporterTests` — the known pre-existing flaky retry-timer
+  test — passed this run); `AppSmokeUITests/testFocus` +
+  `TourUITests/testEssentialTourEndToEnd` green on the iPhone 17. Store
+  shots regenerated on the iPhone 17 Pro Max sim (TZ America/Los_Angeles,
+  reverted after) into /tmp/unstuck-shots/01..08 — 01-today is the new
+  home, 02-focus / 03-recap come from the row's Focus.
+
+## Where things stand (2026-09-17) — Today/home: one-line greeting, the assistant input pill, no backlog pointer; the interview moved INTO the assistant
 
 Ahmad approved exactly four home changes (head 53dfe7a → this commit); nothing
 else was redesigned, NOT bumped / archived.
