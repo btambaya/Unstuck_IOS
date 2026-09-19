@@ -64,6 +64,11 @@ final class VoiceSessionModel {
     /// overwrite `.error`, hiding `note` — the label only renders the note in
     /// the error state, so the real reason never reached the user.
     private var failed = false
+    /// Quiet reconnects after the server failed the session before any reply
+    /// (its capacity error — device 2026-09-20 00:41: "Socket is not
+    /// connected" on the first try, fine on the second). Per user-initiated start.
+    private var reconnects = 0
+    private var ended = false
 
     init(model: AppModel) { self.model = model }
 
@@ -78,6 +83,7 @@ final class VoiceSessionModel {
         }
         guard model.voiceConfigured else { note = "Voice isn't set up yet."; state = .error; return }
         note = nil; state = .connecting
+        reconnects = 0; ended = false
         AVAudioApplication.requestRecordPermission { [weak self] granted in
             Task { @MainActor in
                 guard let self else { return }
@@ -103,6 +109,7 @@ final class VoiceSessionModel {
         model.assistant.endVoiceSession()
         captions.reset(); note = nil
         state = .connecting
+        reconnects = 0
         connect(token: token)
     }
 
@@ -167,6 +174,25 @@ final class VoiceSessionModel {
             onError: { [weak self] msg in voiceLog.error("voice error \(msg, privacy: .public)"); Task { @MainActor in self?.note = msg } },
             holdToTalk: holdToTalk)
         client = rc
+        // Dead on arrival (the server failed before any reply): reconnect,
+        // twice at most, before telling the user anything.
+        rc.onTransportEnded = { [weak self, weak rc] error in
+            Task { @MainActor in
+                guard let self, let rc, self.client === rc, !self.ended, !self.failed, rc.failedBeforeAnyReply else { return }
+                if self.reconnects < 2 {
+                    self.reconnects += 1
+                    voiceLog.notice("voice reconnect #\(self.reconnects, privacy: .public): the server failed before any reply (\(error ?? "closed", privacy: .public))")
+                    self.client = nil
+                    self.state = .connecting
+                    try? await Task.sleep(nanoseconds: 800_000_000)
+                    guard !self.ended, self.client == nil else { return }
+                    self.connect(token: token)
+                } else {
+                    self.note = "The voice server dropped the session twice. Please try again in a moment."
+                    self.state = .error
+                }
+            }
+        }
         observeInterruptions()
         rc.start()
     }
@@ -199,6 +225,7 @@ final class VoiceSessionModel {
     }
 
     func end() {
+        ended = true
         if let interruption { NotificationCenter.default.removeObserver(interruption) }
         if let routeChange { NotificationCenter.default.removeObserver(routeChange) }
         interruption = nil

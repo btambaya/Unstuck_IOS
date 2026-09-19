@@ -1000,6 +1000,22 @@ far-end reference — a day's work, not a heuristic.
 - Tests: `BargeInTests` 64 (24a–d), captions 9, engine 5.
 - Ship: 1.1.1 (69) uploaded; on-device retest pending Ahmad.
 
+**Then (build 70): 69 on the phone (00:42) — Ahmad: "I like how the agent
+is performing currently, don't touch the architecture."** With echo
+cancellation on there was not one echo segment in the session (a 7 s reply
+included); two talk-overs cut within ~1 s of speech start; a long question
+with "um"s and pauses was one turn. The only fault was the FIRST connection:
+1 s after the socket opened the server sent `thread pool exausted
+max_workers 100` and dropped it — the user saw "Socket is not connected"
+and had to tap again (the same error hit the scripted probes; it is the
+provider's capacity). Fix, outside the architecture: a server failure
+BEFORE ANY REPLY (an `error` event, or a drop after the handshake) is not
+surfaced — `VoiceRealtimeClient.failedBeforeAnyReply` + `onTransportEnded`
+→ `VoiceModeScreen` reconnects quietly (fresh engine + client, 800 ms
+apart, twice at most; log `voice reconnect #n`), and only then shows "The
+voice server dropped the session twice". Tests: `VoiceReconnectTests` (3).
+- Ship: 1.1.1 (70) uploaded.
+
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 
 The reason live-sync bugs kept coming back: `postgres_changes` has **no

@@ -205,3 +205,69 @@ final class VoiceCaptionTests: XCTestCase {
         XCTAssertEqual(s, VoiceCaptionState())
     }
 }
+
+// MARK: - dead on arrival → reconnect, not an error
+
+/// The server failed a session 1 s after the socket opened ("thread pool
+/// exausted max_workers 100", device 2026-09-20 00:41) and the user saw
+/// "Socket is not connected"; the second try was fine. A server error before
+/// ANY reply is not surfaced — the screen reconnects quietly.
+final class VoiceReconnectTests: XCTestCase {
+    private final class Sink: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _errors: [String] = []
+        private var _states: [VoiceState] = []
+        func error(_ m: String) { lock.lock(); _errors.append(m); lock.unlock() }
+        func state(_ s: VoiceState) { lock.lock(); _states.append(s); lock.unlock() }
+        var errors: [String] { lock.lock(); defer { lock.unlock() }; return _errors }
+        var states: [VoiceState] { lock.lock(); defer { lock.unlock() }; return _states }
+    }
+
+    private func client(_ sink: Sink, hooked: Bool) -> VoiceRealtimeClient {
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
+            runTool: { _, _ in "ok" },
+            onState: { sink.state($0) },
+            onCaption: { _, _, _ in },
+            onError: { sink.error($0) },
+            initialRoute: .speaker,
+            routeProvider: { .speaker },
+            now: { 0 })
+        if hooked { c.onTransportEnded = { _ in } }
+        return c
+    }
+    private func json(_ obj: [String: Any]) -> String {
+        String(data: try! JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+    }
+    private var capacityError: String {
+        json(["type": "error", "error": ["code": "COMMON_ERROR", "message": "thread pool exausted max_workers 100"]])
+    }
+
+    func testAServerErrorBeforeAnyReplyIsSwallowedForTheReconnect() {
+        let sink = Sink()
+        let c = client(sink, hooked: true)
+        c.handle(capacityError)
+        XCTAssertTrue(c.failedBeforeAnyReply)
+        XCTAssertEqual(sink.errors, [], "not the user's problem yet")
+        XCTAssertFalse(sink.states.contains(.error))
+    }
+
+    func testTheSameErrorAfterAReplyStartedIsReported() {
+        let sink = Sink()
+        let c = client(sink, hooked: true)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(capacityError)
+        XCTAssertFalse(c.failedBeforeAnyReply)
+        XCTAssertEqual(sink.errors, ["thread pool exausted max_workers 100"])
+        XCTAssertTrue(sink.states.contains(.error))
+    }
+
+    func testWithNoScreenToReconnectTheErrorIsReportedAtOnce() {
+        let sink = Sink()
+        let c = client(sink, hooked: false)
+        c.handle(capacityError)
+        XCTAssertFalse(c.failedBeforeAnyReply)
+        XCTAssertEqual(sink.errors, ["thread pool exausted max_workers 100"])
+    }
+}

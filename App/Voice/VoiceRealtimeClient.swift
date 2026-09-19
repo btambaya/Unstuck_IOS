@@ -198,6 +198,14 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// Any response.created seen this session, and how many opening
     /// response.creates went out (the first + at most one retry).
     private var _anyResponse = false
+    private var _openedOnce = false
+    /// The server failed the session before it did anything: its capacity
+    /// error ("thread pool exausted max_workers 100", 1 s after the socket
+    /// opened — device, 2026-09-20 00:41, fine on the second try) or a drop
+    /// before any reply. Not an error state: the screen reconnects quietly
+    /// (`onTransportEnded` + `failedBeforeAnyReply`).
+    private var _earlyFailure = false
+    var failedBeforeAnyReply: Bool { withLock { _earlyFailure } }
     private var _openingCreates = 0
     private var _guard = VoiceIntegrityGuard()
     /// Both event shapes can carry the same call — dispatch once.
@@ -492,6 +500,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         let route = initialRoute ?? routeProvider()
         let gateCtx: GateContext = withLock {
             _open = true
+            _openedOnce = true
             _ = _bargeIn.handle(.routeChanged(route), now: now())
             return _bargeIn.initialGateContext()
         }
@@ -552,6 +561,17 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         guard first else { return }
         stopObservingRoute()
         audio.shutdown()
+        // Dead on arrival (a server error, or a drop after the handshake
+        // before any reply): no error state — the screen reconnects, or
+        // reports if it has already tried.
+        let early: Bool = withLock {
+            if _openedOnce, !_anyResponse, error != nil, onTransportEnded != nil { _earlyFailure = true }
+            return _earlyFailure
+        }
+        if early, let hook = onTransportEnded {
+            hook(error)
+            return
+        }
         if let error {
             onError(error)
             onState(.error)
@@ -682,6 +702,19 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // swallow also hid rejected tool outputs.
             let evId = (ev["event_id"] as? String) ?? (errObj?["event_id"] as? String)
             if evId == Self.primerDeleteEvent || (m?.contains(Self.primerItemId) ?? false) { return }
+            // A server error before ANY reply started: the session is dead on
+            // arrival (the socket closes right after). Not surfaced — the
+            // screen reconnects once or twice; only if that fails does the
+            // user see a message.
+            let early: Bool = withLock {
+                guard !_anyResponse, onTransportEnded != nil else { return false }
+                _earlyFailure = true
+                return true
+            }
+            if early {
+                voiceLog.notice("voice server failed before any reply: \(m ?? "-", privacy: .public)")
+                return
+            }
             // Benign realtime-protocol hiccups — cancelling/creating a response
             // that is (or isn't) active ("no active response" / "already has an
             // active response") — are NON-fatal: resync and keep listening.
