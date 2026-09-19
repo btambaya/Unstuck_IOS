@@ -212,13 +212,14 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
 
         // Hardware AEC/NS/AGC only where the echo path needs it. On the
         // BUILT-IN SPEAKER the profile is half-duplex (the upload is muted for
-        // the whole reply), so the echo canceller buys nothing there — and its
-        // double-talk suppressor costs a lot: it attenuates OUR playback
-        // whenever the mic hears loud near-end sound (device, 2026-09-17: a
-        // hand on the table made the reply "break up like a laggy call" with
-        // the client doing nothing at all). Receiver / earphones / Bluetooth
-        // keep it: they run full-duplex and the earpiece leaks.
-        // Best-effort — older devices / simulators may reject it.
+        // the whole reply), so the echo canceller bought nothing there — and
+        // its double-talk suppressor cost something: it attenuates OUR
+        // playback whenever the mic hears loud near-end sound (device,
+        // 2026-09-17: a hand on the table made the reply "break up like a
+        // laggy call"). Since build 69 the loudspeaker is full-duplex and
+        // the canceller is what keeps the reply's echo out of the mic stream
+        // (see wantsVoiceProcessing). Best-effort — older devices /
+        // simulators may reject it.
         let route = VoiceRoute(portType: AVAudioSession.sharedInstance().currentRoute.outputs.first?.portType.rawValue)
         if Self.wantsVoiceProcessing(for: route) { try? engine.inputNode.setVoiceProcessingEnabled(true) }
         voiceLog.notice("voice engine route=\(String(describing: route), privacy: .public) voiceProcessing=\(self.engine.inputNode.isVoiceProcessingEnabled, privacy: .public)")
@@ -249,9 +250,22 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         return true
     }
 
-    /// Voice processing is worth its double-talk suppressor everywhere except
-    /// the loudspeaker, where the profile is half-duplex anyway.
-    static func wantsVoiceProcessing(for route: VoiceRoute) -> Bool { route != .speaker }
+    /// Voice processing (Apple's echo canceller + noise suppression + AGC) on
+    /// EVERY route, the loudspeaker included, since build 69 (2026-09-20).
+    ///
+    /// It was turned off for the loudspeaker in build 55 because the server
+    /// kept cutting replies on the residual echo — and that turned out to be
+    /// the server's own turn detection, which build 66 switched off. Without
+    /// the canceller the mic sends the whole reply back: the server VAD
+    /// segments it, the transcriber writes it down, and the client is left
+    /// telling the user's words from the reply's by TEXT — which fails a new
+    /// way every session (garbles, split segments, half words, "all right"
+    /// for "alright"). The canceller takes the echo out at the source; the
+    /// text rules in BargeIn stay as a backstop for what is left. Its cost —
+    /// the double-talk suppressor attenuating our playback when the mic hears
+    /// loud near-end sound — is a dip during a talk-over we are about to cut
+    /// anyway, or under a loud room.
+    static func wantsVoiceProcessing(for route: VoiceRoute) -> Bool { true }
 
     // MARK: configuration changes (see the file header)
 

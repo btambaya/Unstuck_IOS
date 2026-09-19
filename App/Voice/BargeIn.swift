@@ -24,7 +24,8 @@
 //      `response.create`. No words (a cough, an echo the transcriber heard
 //      as Chinese) → the item is deleted, nothing is answered. If a reply is
 //      still generating, cancel it first and create only when its done
-//      arrives (`pendingCreate`).
+//      arrives (`pendingCreate`) — and never before `turnHoldMs` of quiet,
+//      so a pause mid-sentence does not get the fragment answered.
 //   2. INTERRUPT: on low-echo routes (receiver, earphones, Bluetooth) the
 //      DUCK → CONFIRM → CANCEL energy machine: the first hint of speech ducks
 //      −12 dB; the server VAD in a segment AND the mic above the gate for
@@ -279,13 +280,21 @@ struct BargeInController: Sendable {
     /// How many DUCK→restore cycles happened (the "noisy room?" chip, spec §8).
     private(set) var falseBargeIns = 0
 
-    /// A user turn is waiting for `response.create` until the reply we just
-    /// cancelled reports done: created in the same breath as the cancel, the
-    /// server drops the connection (measured 2026-09-19).
-    private(set) var pendingCreate = false
-    private var pendingCreateSince: TimeInterval = 0
-    /// If that done never comes (or the cancel found nothing), ask anyway.
-    /// 2.5 s: a done took 1.9 s once (a tool call in flight, 2026-09-20).
+    /// A real turn waiting to be asked for: `since` = the last moment the
+    /// user was heard (their completed transcript, or a further speech start
+    /// while nothing plays). Asked once the hold has elapsed, the server VAD
+    /// is silent and no reply is generating — a `response.create` in the same
+    /// breath as a `response.cancel` drops the connection (measured 2026-09-19).
+    private var pendingTurnSince: TimeInterval?
+    var pendingCreate: Bool { pendingTurnSince != nil }
+    /// A pause mid-sentence ends a VAD segment (600 ms of silence) and the
+    /// fragment was answered on its own; the continuation then cancelled that
+    /// reply and got its own — "it kept tripping itself" on long questions
+    /// (device log 2026-09-20 00:25). Half a second more before asking
+    /// bridges a pause of ~1.2 s; a longer one still gets cancel-and-re-ask.
+    static let turnHoldMs = 500
+    /// If a cancelled reply's done never comes (or the cancel found nothing),
+    /// ask anyway. 2.5 s: a done took 1.9 s once (a tool call in flight).
     static let pendingCreateFallbackMs = 2500
 
     /// Echo reference: the words of the reply on air and of the one before
@@ -393,7 +402,7 @@ struct BargeInController: Sendable {
             responseActive = true
             activeResponseId = id
             muted = false
-            pendingCreate = false
+            pendingTurnSince = nil
             // A new reply: the one before it is now the "previous" reference.
             spokenPrevious = spokenCurrent
             spokenCurrent = []
@@ -415,11 +424,10 @@ struct BargeInController: Sendable {
             if let id, let active = activeResponseId, id != active { break }
             responseActive = false
             if pendingCreate {
-                // The reply we cancelled is finished server-side: now the
-                // user's turn can be answered.
-                pendingCreate = false
-                out.append(.createResponse)
-                out.append(.uiState(.thinking))
+                // The reply we cancelled is finished server-side: the user's
+                // turn can be asked for once its hold is up and they are quiet.
+                let ask = tryAsk(now: now)
+                out += ask.isEmpty ? [.startConfirmTimer(ms: Self.turnHoldMs)] : ask
             } else if !playbackQueued {
                 if state == .speaking { state = .idle }
                 out.append(.uiState(.listening))
@@ -462,6 +470,8 @@ struct BargeInController: Sendable {
             let inGrace = !onAir && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
             out += flushPendingDeletes(except: itemId)
             segments.append(Segment(itemId: itemId, echoPossible: onAir || inGrace, onAir: onAir))
+            // They go on talking before their turn was asked for: hold from here.
+            if pendingCreate, !(onAir || inGrace) { pendingTurnSince = now }
             if segments.count > Self.segmentHistory { segments.removeFirst(segments.count - Self.segmentHistory) }
             switch state {
             case .speaking where modelBusy && profile.confirm == .transcript:
@@ -479,6 +489,9 @@ struct BargeInController: Sendable {
 
         case .speechStopped:
             serverSpeaking = false
+            // A held turn is asked for `turnHoldMs` after the user's last
+            // sound, whether or not that segment produced a transcript.
+            if pendingCreate { out.append(.startConfirmTimer(ms: Self.turnHoldMs)) }
             if case .ducked(_, let trigger) = state, trigger == .server {
                 // A blip: nothing confirmed it. Its completed transcript decides
                 // whether anything is answered (no words → nothing).
@@ -526,7 +539,8 @@ struct BargeInController: Sendable {
                 // nothing is on air; never cut a reply on it.
                 out.append(.userTurn(text))
                 if !holdToTalk, !modelBusy {
-                    out.append(.createResponse)
+                    pendingTurnSince = now
+                    out.append(.startConfirmTimer(ms: Self.turnHoldMs))
                     out.append(.uiState(.thinking))
                 }
                 break
@@ -553,15 +567,11 @@ struct BargeInController: Sendable {
             segments[index].responded = true
             out += flushPendingDeletes(except: nil)   // before the ask: the model never sees the echo items
             if modelBusy && !alreadyCancelled { out += cancel(now: now) }
-            if responseActive {
-                // Wait for the cancelled reply's done; ask on the tick if it
-                // never comes.
-                pendingCreate = true
-                pendingCreateSince = now
-                out.append(.startConfirmTimer(ms: Self.pendingCreateFallbackMs))
-            } else {
-                out.append(.createResponse)
-            }
+            // Not asked for yet: the hold first (they may be mid-sentence),
+            // and, if a cancel is in flight, its done — or the fallback.
+            pendingTurnSince = now
+            out.append(.startConfirmTimer(ms: Self.turnHoldMs))
+            if responseActive { out.append(.startConfirmTimer(ms: Self.pendingCreateFallbackMs)) }
             out.append(.uiState(.thinking))
 
         case .assistantTranscript(let delta):
@@ -590,17 +600,11 @@ struct BargeInController: Sendable {
                     out += restoreToSpeaking()
                 }
             }
-            if pendingCreate, Int(((now - pendingCreateSince) * 1000).rounded()) >= Self.pendingCreateFallbackMs {
-                // The cancelled reply's done never came: ask anyway.
-                pendingCreate = false
-                responseActive = false
-                out.append(.createResponse)
-                out.append(.uiState(.thinking))
-            }
+            out += tryAsk(now: now)
 
         case .interruptPressed:
             if state == .hold { break }
-            pendingCreate = false   // the user wants silence, not the next reply
+            pendingTurnSince = nil   // the user wants silence, not the next reply
             if modelBusy {
                 out += cancel(now: now, hard: true)
             }
@@ -621,10 +625,9 @@ struct BargeInController: Sendable {
             }
             if pendingCreate {
                 // Our cancel found nothing to cancel — the reply had already
-                // finished. Its done is not coming; answer now.
-                pendingCreate = false
-                out.append(.createResponse)
-                out.append(.uiState(.thinking))
+                // finished. Its done is not coming; ask once the hold is up.
+                let ask = tryAsk(now: now)
+                out += ask.isEmpty ? [.startConfirmTimer(ms: Self.turnHoldMs)] : ask
             } else {
                 out.append(.uiState(uiStateNow))
             }
@@ -679,6 +682,22 @@ struct BargeInController: Sendable {
         return (itemId == nil || segments[last].itemId == nil) ? last : nil
     }
 
+    /// The held turn, asked for when it is ready: the hold has elapsed since
+    /// the user was last heard, the server VAD is silent, and no reply is
+    /// generating — or the cancelled reply's done never came (the fallback).
+    private mutating func tryAsk(now: TimeInterval) -> [BargeInCommand] {
+        guard let since = pendingTurnSince else { return [] }
+        let elapsed = Int(((now - since) * 1000).rounded())
+        if responseActive {
+            guard elapsed >= Self.pendingCreateFallbackMs else { return [] }
+            responseActive = false
+        } else {
+            guard elapsed >= Self.turnHoldMs, !serverSpeaking else { return [] }
+        }
+        pendingTurnSince = nil
+        return [.createResponse, .uiState(.thinking)]
+    }
+
     /// The held deletes, as commands — all of them, or all but one item's.
     private mutating func flushPendingDeletes(except itemId: String?) -> [BargeInCommand] {
         let due = pendingDeletes.filter { $0 != itemId }
@@ -725,13 +744,28 @@ struct BargeInController: Sendable {
         var trailing = 0, trailingMisses = 0
         var firstContentIsHit = false
     }
+    /// A heard word matches a said one outright, or is the START of one at
+    /// least two letters longer: the transcriber heard "Alright" as "All
+    /// right" and caught "anything" mid-word as "any" (device log 2026-09-20
+    /// 00:25, both cut the reply). Three letters at least, so "on" is not
+    /// "Monday".
+    private func matches(_ t: String) -> Bool {
+        let s = Self.stem(t)
+        if spokenSet.contains(s) { return true }
+        guard s.count >= 3 else { return false }
+        return spokenSet.contains { $0.count >= s.count + 2 && $0.hasPrefix(s) }
+    }
+
     private func echoEvidence(_ heard: [String]) -> EchoEvidence {
         var e = EchoEvidence()
         let isContent: (String) -> Bool = { !Self.stopWords.contains($0) }
-        let isHit: (String) -> Bool = { isContent($0) && self.spokenSet.contains(Self.stem($0)) }
+        let isHit: (String) -> Bool = { isContent($0) && self.matches($0) }
+        // A content word the model never said — of three letters or more:
+        // "go" alone cut a reply ("Have to go", same log).
+        let isMiss: (String) -> Bool = { isContent($0) && !self.matches($0) && $0.count >= 3 }
         let content = heard.filter(isContent)
         let judged = content.isEmpty ? heard : content
-        e.hits = judged.filter { spokenSet.contains(Self.stem($0)) }.count
+        e.hits = judged.filter(matches).count
         e.heard = judged.count
         e.fallback = content.isEmpty
         e.firstContentIsHit = content.first.map(isHit) ?? false
@@ -740,9 +774,9 @@ struct BargeInController: Sendable {
         let head = heard[..<(first ?? heard.count)]
         let tail = last.map { heard[($0 + 1)...] } ?? heard[...]
         e.leading = head.count
-        e.leadingMisses = head.filter { isContent($0) && !isHit($0) }.count
+        e.leadingMisses = head.filter(isMiss).count
         e.trailing = tail.count
-        e.trailingMisses = tail.filter { isContent($0) && !isHit($0) }.count
+        e.trailingMisses = tail.filter(isMiss).count
         return e
     }
 

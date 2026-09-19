@@ -39,12 +39,14 @@ final class VoiceAudioEngineRestartTests: XCTestCase {
         XCTAssertFalse(p.allowRestart(now: 6.5))
     }
 
-    func testVoiceProcessingIsSkippedOnlyOnTheLoudspeaker() {
-        // Half-duplex there makes the echo canceller pointless, and its
-        // double-talk suppressor chops our playback under near-end noise.
-        XCTAssertFalse(VoiceAudioEngine.wantsVoiceProcessing(for: .speaker))
+    func testVoiceProcessingIsOnForEveryRoute() {
+        // Build 55 skipped it on the loudspeaker (half-duplex then, and its
+        // double-talk suppressor chops playback under near-end noise); since
+        // build 69 the loudspeaker is full-duplex and the canceller is the
+        // one thing that keeps the reply's echo out of the mic stream.
+        XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: .speaker), "the loudspeaker too, since build 69: the echo canceller is what keeps the reply out of the mic stream")
         XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: .lowEcho))
-        XCTAssertFalse(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: nil)), "no port info = the built-in speaker")
+        XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: nil)), "no port info = the built-in speaker: still on")
         XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: "Receiver")))
         XCTAssertTrue(VoiceAudioEngine.wantsVoiceProcessing(for: VoiceRoute(portType: "BluetoothHFP")))
     }

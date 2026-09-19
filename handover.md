@@ -966,6 +966,40 @@ greeting.** The garbled-echo rule held (4/5 → echo). Three findings:
 - Tests: `BargeInTests` 60 (22a–e, 23a–d replay the session), captions 9.
 - Ship: 1.1.1 (68) uploaded; on-device retest pending Ahmad.
 
+**Then (build 69): the phone test of 68 (00:25) — and Ahmad's call to stop
+patching case by case.** The greeting came back, the live-guess cut worked
+twice within a second, the held deletes kept a question that shared its
+segment with the echo. Three new misses: a pause mid-sentence got the
+fragment answered and the continuation cancelled it ("kept tripping itself"
+on long questions); "Alright" heard as "All right" (two unknown words) cut a
+reply; the echo of "Is there anything…" caught mid-word as "Is there any" cut
+another; "Have to go" cut on "go" alone.
+
+*The holistic view.* Builds 63–68 fought an ACOUSTIC problem in the TEXT
+domain: the loudspeaker's echo reaches the server, the server transcribes
+it, and the client tells the user's words from the reply's by comparing text
+— which a transcriber can defeat a new way every session. The structural
+fix is to keep the echo out of the mic stream: **Apple voice processing
+(echo cancellation) is ON for the loudspeaker again** (`VoiceAudioEngine.
+wantsVoiceProcessing` → true everywhere). It was switched off in build 55
+because the server kept cutting replies on residual echo — which build 66
+proved was the server's own turn detection, now off. What stays, because it
+is architecture rather than heuristics: the server never cuts or answers by
+itself; every reply is asked for by the client from a completed transcript;
+a cancel settles before the next ask; and the **turn hold** (new here):
+`turnHoldMs` 500 of quiet after the user's last transcript / speech start
+before `response.create`, so a pause mid-sentence is bridged (VAD 600 +
+hold 500 ≈ 1.2 s) instead of answered. The text rules (echo ratio, leading /
+trailing words, live-guess cut, held deletes, prefix match for a word caught
+mid-word, three-letter evidence) remain as the backstop for residual echo.
+Known cost of voice processing: its double-talk suppressor attenuates our
+playback under loud near-end sound — a dip during a talk-over we cut anyway,
+or in a loud room. If that proves unacceptable, the next structural step is
+a software canceller (speex/WebRTC AEC3) fed with our own playback as the
+far-end reference — a day's work, not a heuristic.
+- Tests: `BargeInTests` 64 (24a–d), captions 9, engine 5.
+- Ship: 1.1.1 (69) uploaded; on-device retest pending Ahmad.
+
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 
 The reason live-sync bugs kept coming back: `postgres_changes` has **no
