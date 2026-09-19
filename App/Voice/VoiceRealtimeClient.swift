@@ -562,7 +562,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // DUCKS (−12 dB) and starts the confirm timer; the state machine
             // turns it into response.cancel + flush + mute (a real barge-in)
             // or a restore (a blip that speech_stopped ends first).
-            dispatch(.speechStarted)
+            dispatch(.speechStarted(itemId: ev["item_id"] as? String))
         case "input_audio_buffer.speech_stopped":
             dispatch(.speechStopped)
         case "response.created":
@@ -581,19 +581,30 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 dispatch(.audioDelta(id: responseId))
             }
         case "response.audio_transcript.delta":
+            // The echo reference sees EVERY word the model produced, before
+            // the caption/cancel gate: a reply cancelled mid-air still played
+            // its first second, and that second comes back through the mic.
+            if let d = (ev["delta"] as? String) ?? (ev["text"] as? String), !d.isEmpty {
+                dispatch(.assistantTranscript(delta: d))
+            }
             // Captions for a cancelled reply never leak through (same id rule).
             guard withLock({ _bargeIn.acceptsTranscript(id: responseId) }) else { return }
             if let d = ev["delta"] as? String {
                 withLock { _guard.transcriptDelta(d) }
-                dispatch(.assistantTranscript(delta: d))   // the echo reference
                 onCaption("assistant", d, false)
             }
         case "response.audio_transcript.done":
+            // Belt and braces for the echo reference: the whole reply at once,
+            // in case the deltas lagged the audio (device log 2026-09-19).
+            if let t = ev["transcript"] as? String, !t.isEmpty { dispatch(.assistantTranscript(delta: t)) }
             onCaption("assistant", "", true)
         case "conversation.item.input_audio_transcription.delta":
             // Energy profiles: a confirm accelerator that may never arrive.
             // Transcript profiles (loudspeaker): THE confirm — see BargeIn.
-            dispatch(.transcription(text: (ev["delta"] as? String) ?? "", itemId: ev["item_id"] as? String))
+            // DashScope: `text` is the confirmed part, `stash` the guess; the
+            // OpenAI shape is `delta`. Confirmed words only.
+            let piece = (ev["text"] as? String) ?? (ev["delta"] as? String) ?? ""
+            dispatch(.transcription(text: piece, itemId: ev["item_id"] as? String))
         case "conversation.item.input_audio_transcription.completed":
             let t = (ev["transcript"] as? String) ?? ""
             dispatch(.transcription(text: t, itemId: ev["item_id"] as? String))

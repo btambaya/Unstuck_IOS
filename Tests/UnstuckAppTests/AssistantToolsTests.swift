@@ -1151,9 +1151,14 @@ final class AssistantToolsTests: XCTestCase {
         // Done (finished or skipped anywhere) → the by-name hello, whatever
         // the fact count.
         api.interviewIsPending = false
-        XCTAssertTrue(buildVoiceOpening(api).contains("One short hello using \"Maya\""))
+        // The hello is one-shot, natural and varied — the name once, no stock
+        // line, and never the old "What's on your plate?" (2026-09-19).
+        let hello = buildVoiceOpening(api)
+        XCTAssertTrue(hello.contains("Use \"Maya\" once, here, and not again"))
+        XCTAssertTrue(hello.contains("different every time"))
+        XCTAssertFalse(hello.contains("What's on your plate"))
         api.facts = []
-        XCTAssertTrue(buildVoiceOpening(api).contains("One short hello using \"Maya\""))
+        XCTAssertTrue(buildVoiceOpening(api).contains("Use \"Maya\" once, here, and not again"))
         api.interviewIsPending = true
         api.facts = [fact("f1", "Sam — partner")]
         api.facts.append(ProfileFact(id: "n", category: .preference, fact: "Don't use their name in replies", source: .chat, createdAt: PAST_CREATED, updatedAt: PAST_CREATED))

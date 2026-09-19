@@ -37,7 +37,7 @@ final class BargeInTests: XCTestCase {
 
     func test1_speechStartedDucksWithoutCancelling() {
         var c = speaking()
-        let out = c.handle(.speechStarted, now: 1.0)
+        let out = c.handle(.speechStarted(itemId: nil), now: 1.0)
         XCTAssertEqual(core(out), [.duck, .startConfirmTimer(ms: 300)])
         XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server))
         XCTAssertFalse(c.muted)
@@ -50,7 +50,7 @@ final class BargeInTests: XCTestCase {
 
     func test2_confirmWithSustainedMicEnergyCancels() {
         var c = speaking()
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         _ = c.handle(.gateOpen, now: 1.05)          // the mic agrees, and stays open
         XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server), "gate opening while ducked is bookkeeping only")
         XCTAssertEqual(core(c.handle(.tick, now: 1.2)), [], "before confirmMs nothing happens")
@@ -74,7 +74,7 @@ final class BargeInTests: XCTestCase {
         // speech_stopped cannot arrive inside the window (600 ms of silence
         // first). The timer must NOT cancel.
         var c = speaking()
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         _ = c.handle(.gateOpen, now: 1.02)
         _ = c.handle(.gateClose, now: 1.25)         // the tap ended; server still in its segment
         XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server), "a server duck waits for the tick")
@@ -87,7 +87,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(c.falseBargeIns, 1)
         _ = c.handle(.speechStopped, now: 1.9)
         let created = core(c.handle(.responseCreated(id: "r2"), now: 2.0))
-        XCTAssertEqual(created, [.sendCancel, .uiState(.listening)])
+        XCTAssertEqual(created, [.sendCancel, .uiState(.speaking)], "the reply on air keeps playing; only the blip's reply is cancelled")
         XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"))
     }
 
@@ -103,7 +103,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertFalse(c.suppressNextResponse)
         XCTAssertEqual(c.state, .speaking)
         XCTAssertTrue(c.gateOpen, "the gate is still open; a later speech_started re-ducks and can then confirm")
-        _ = c.handle(.speechStarted, now: 2.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 2.0)
         XCTAssertEqual(c.state, .ducked(since: 2.0, trigger: .server))
         XCTAssertEqual(count(core(c.handle(.tick, now: 2.3)), .sendCancel), 1, "gate + server agree at confirm → real talk-over")
     }
@@ -112,7 +112,7 @@ final class BargeInTests: XCTestCase {
 
     func test3_blipRestoresAndSuppressesTheNextResponse() {
         var c = speaking()
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         let out = core(c.handle(.speechStopped, now: 1.15))
         XCTAssertEqual(out, [.restore])
         XCTAssertTrue(c.suppressNextResponse)
@@ -122,7 +122,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(count(c.handle(.tick, now: 1.3), .sendCancel), 0)
         // The server replies to the blip → cancelled the moment it is created.
         let created = core(c.handle(.responseCreated(id: "r2"), now: 1.8))
-        XCTAssertEqual(created, [.sendCancel, .uiState(.listening)])
+        XCTAssertEqual(created, [.sendCancel, .uiState(.speaking)], "the reply on air keeps playing; only the blip's reply is cancelled")
         XCTAssertFalse(c.suppressNextResponse)
         XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"), "deltas for the suppressed reply are dropped")
         XCTAssertFalse(c.acceptsTranscript(id: "r2"))
@@ -147,7 +147,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(count(c.handle(.tick, now: 1.3), .sendCancel), 0)
         // A gate duck the server AGREES with is speech → cancel at once.
         _ = c.handle(.gateOpen, now: 2.0)
-        let agreed = core(c.handle(.speechStarted, now: 2.05))
+        let agreed = core(c.handle(.speechStarted(itemId: nil), now: 2.05))
         XCTAssertEqual(count(agreed, .sendCancel), 1)
         XCTAssertTrue(agreed.contains(.flushPlayback))
         XCTAssertEqual(c.state, .idle)
@@ -157,7 +157,7 @@ final class BargeInTests: XCTestCase {
 
     func test5_transcriptionWhileDuckedCancelsImmediately() {
         var c = speaking()
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         _ = c.handle(.gateOpen, now: 1.02)           // the mic agrees
         let out = core(c.handle(.transcription(text: "yes go ahead", itemId: nil), now: 1.1))
         XCTAssertEqual(count(out, .sendCancel), 1)
@@ -170,7 +170,7 @@ final class BargeInTests: XCTestCase {
         // Deltas stream for the previous turn and for the model's own echo
         // (device log 2026-09-17); with the gate closed they confirm nothing.
         var c = speaking()
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         XCTAssertFalse(c.gateOpen)
         XCTAssertEqual(core(c.handle(.transcription(text: "yes go ahead", itemId: nil), now: 1.1)), [])
         XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server), "still waiting for the tick")
@@ -213,7 +213,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertFalse(out.contains(.uiState(.error)))
         // While ducked: the gain comes back too.
         var d = speaking()
-        _ = d.handle(.speechStarted, now: 1)
+        _ = d.handle(.speechStarted(itemId: nil), now: 1)
         let ducked = core(d.handle(.benignActiveResponseError, now: 1.1))
         XCTAssertTrue(ducked.contains(.restore))
         XCTAssertEqual(d.state, .speaking, "audio is still queued")
@@ -429,7 +429,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(c.gateContext.forcedOpen)
         XCTAssertTrue(down.contains(.updateGate(c.gateContext)))
         // Nothing the server VAD would send matters while held.
-        XCTAssertEqual(core(c.handle(.speechStarted, now: 1.2)), [])
+        XCTAssertEqual(core(c.handle(.speechStarted(itemId: nil), now: 1.2)), [])
         XCTAssertEqual(core(c.handle(.interruptPressed, now: 1.3)), [])
         let up = c.handle(.pttUp, now: 2)
         XCTAssertTrue(up.contains(.commitAndRespond))
@@ -448,7 +448,7 @@ final class BargeInTests: XCTestCase {
     func test13_idleEventsNeverDuckOrCancel() {
         var c = BargeInController(profile: .speaker)
         _ = c.initialGateContext()
-        XCTAssertEqual(c.handle(.speechStarted, now: 0), [], "normal turn-taking: no duck, no gate change")
+        XCTAssertEqual(c.handle(.speechStarted(itemId: nil), now: 0), [], "normal turn-taking: no duck, no gate change")
         XCTAssertEqual(c.handle(.gateOpen, now: 0.1), [])
         XCTAssertEqual(c.handle(.speechStopped, now: 0.5), [])
         XCTAssertEqual(c.handle(.gateClose, now: 0.6), [])
@@ -462,7 +462,7 @@ final class BargeInTests: XCTestCase {
         // does nothing); on a low-echo route by energy, as before.
         _ = c.handle(.responseCreated(id: "r1"), now: 2)
         XCTAssertEqual(c.uiStateNow, .thinking)
-        XCTAssertEqual(core(c.handle(.speechStarted, now: 2.5)), [], "loudspeaker: no duck, no timer")
+        XCTAssertEqual(core(c.handle(.speechStarted(itemId: nil), now: 2.5)), [], "loudspeaker: no duck, no timer")
         let out = core(c.handle(.transcription(text: "no wait", itemId: "i1"), now: 2.8))
         XCTAssertEqual(count(out, .sendCancel), 1)
         XCTAssertEqual(c.state, .idle)
@@ -470,7 +470,7 @@ final class BargeInTests: XCTestCase {
         var e = BargeInController(profile: .lowEcho)
         _ = e.initialGateContext()
         _ = e.handle(.responseCreated(id: "r1"), now: 2)
-        XCTAssertEqual(core(e.handle(.speechStarted, now: 2.5)), [.duck, .startConfirmTimer(ms: 200)])
+        XCTAssertEqual(core(e.handle(.speechStarted(itemId: nil), now: 2.5)), [.duck, .startConfirmTimer(ms: 200)])
         _ = e.handle(.gateOpen, now: 2.55)           // the mic agrees (confirm needs both sides)
         let eout = core(e.handle(.tick, now: 2.7))
         XCTAssertEqual(count(eout, .sendCancel), 1)
@@ -481,7 +481,7 @@ final class BargeInTests: XCTestCase {
 
     func test14_responseDoneAndDrainedWhileDucked() {
         var c = speaking()
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         _ = c.handle(.gateOpen, now: 1.02)           // the mic agrees (confirm needs both sides)
         // Generation finished mid-duck: still speaking (tail queued), still ducked.
         let done = core(c.handle(.responseDone(id: "r1", status: "completed"), now: 1.05))
@@ -497,7 +497,7 @@ final class BargeInTests: XCTestCase {
         // Tail drains during the duck: nothing left to cancel; restore on confirm.
         var d = speaking()
         _ = d.handle(.responseDone(id: "r1", status: "completed"), now: 0.5)
-        _ = d.handle(.speechStarted, now: 1.0)
+        _ = d.handle(.speechStarted(itemId: nil), now: 1.0)
         let drained = core(d.handle(.playbackDrained, now: 1.1))
         XCTAssertEqual(drained, [.uiState(.listening)])
         XCTAssertFalse(d.modelBusy)
@@ -597,7 +597,7 @@ final class BargeInTests: XCTestCase {
 
     func test17a_speakerNeverDucksOrArmsATimerOnSpeechOrGate() {
         var c = speaking(.speaker)
-        XCTAssertEqual(core(c.handle(.speechStarted, now: 1.0)), [], "the server VAD hears the loudspeaker's echo on every reply")
+        XCTAssertEqual(core(c.handle(.speechStarted(itemId: nil), now: 1.0)), [], "the server VAD hears the loudspeaker's echo on every reply")
         XCTAssertEqual(c.state, .speaking)
         XCTAssertEqual(core(c.handle(.gateOpen, now: 1.05)), [], "so does the gate — ducking on either would dim every reply")
         XCTAssertEqual(c.state, .speaking)
@@ -608,7 +608,7 @@ final class BargeInTests: XCTestCase {
     func test17b_echoOfTheReplyIsDiscardedAndTheServersReplyToItSuppressed() {
         var c = speaking(.speaker)
         said(&c, "Taxi's at quarter to eight, after the gym.")
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         let out = core(c.handle(.transcription(text: "taxi's at quarter to eight after the gym", itemId: "item-echo"), now: 1.4))
         XCTAssertEqual(count(out, .sendCancel), 0, "its own words are not an interruption")
         XCTAssertEqual(count(out, .flushPlayback), 0)
@@ -629,7 +629,7 @@ final class BargeInTests: XCTestCase {
     func test17c_realWordsOverTheReplyStopIt() {
         var c = speaking(.speaker)
         said(&c, "Taxi's at quarter to eight, after the gym.")
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         let out = core(c.handle(.transcription(text: "actually make it before the gym", itemId: "item-1"), now: 1.4))
         XCTAssertEqual(out, [.sendCancel, .flushPlayback, .restore, .clearCaption, .uiState(.listening)])
         XCTAssertTrue(c.muted)
@@ -641,7 +641,7 @@ final class BargeInTests: XCTestCase {
 
     func test17d_noWordsIsNotAnInterruption_andTheSegmentCountsAsABlip() {
         var c = speaking(.speaker)
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         XCTAssertEqual(core(c.handle(.transcription(text: "…", itemId: "i"), now: 1.2)), [])
         XCTAssertEqual(core(c.handle(.transcription(text: "a", itemId: "i"), now: 1.2)), [], "one-letter tokens match everything and are dropped")
         XCTAssertEqual(c.state, .speaking)
@@ -653,7 +653,7 @@ final class BargeInTests: XCTestCase {
     func test17e_blipSuppressesTheServersReply_lateRealWordsLiftItAndAskAgain() {
         var c = speaking(.speaker)
         said(&c, "Taxi's at quarter to eight, after the gym.")
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         _ = c.handle(.speechStopped, now: 1.3)
         XCTAssertTrue(c.suppressNextResponse)
         _ = c.handle(.responseCreated(id: "r2"), now: 1.4)   // the server replies first
@@ -672,7 +672,7 @@ final class BargeInTests: XCTestCase {
     func test17f_streamingWordsCancelOnce_theServersAnswerToThemIsKept() {
         var c = speaking(.speaker)
         said(&c, "Taxi's at quarter to eight, after the gym.")
-        _ = c.handle(.speechStarted, now: 1.0)
+        _ = c.handle(.speechStarted(itemId: nil), now: 1.0)
         let first = core(c.handle(.transcription(text: "make it", itemId: "i3"), now: 1.2))
         XCTAssertEqual(count(first, .sendCancel), 1, "the first real words stop the reply")
         _ = c.handle(.speechStopped, now: 1.5)
@@ -687,7 +687,7 @@ final class BargeInTests: XCTestCase {
 
     func test17g_lowEchoRouteStillConfirmsByEnergy() {
         var c = speaking(.lowEcho)
-        XCTAssertEqual(core(c.handle(.speechStarted, now: 1.0)), [.duck, .startConfirmTimer(ms: 200)])
+        XCTAssertEqual(core(c.handle(.speechStarted(itemId: nil), now: 1.0)), [.duck, .startConfirmTimer(ms: 200)])
         XCTAssertEqual(c.state, .ducked(since: 1.0, trigger: .server))
     }
 
@@ -700,6 +700,92 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(c.isEcho(BargeInController.tokens("taxi at quarter to eight after gym")), "transcription drops words; 70 % is enough")
         XCTAssertFalse(c.isEcho(BargeInController.tokens("book the dentist")), "one shared word out of three is not echo")
         XCTAssertFalse(c.isEcho(BargeInController.tokens("stop")))
+    }
+
+
+    // MARK: 18 — the loop from Ahmad's phone, 2026-09-19 22:18, replayed
+    // event for event from the device log. The greeting's echo was committed
+    // as the user's turn and ANSWERED 10 ms before its transcript arrived;
+    // the answer echoed and was answered; the assistant talked to itself.
+
+    func test18a_theGreetingsEchoIsDeletedAndTheServersReplyToItCancelledBeforeItPlays() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 3.5)
+        _ = c.handle(.audioDelta(id: "r1"), now: 3.6)
+        said(&c, "Hey, just what's on your plate?")
+        _ = c.handle(.gateOpen, now: 3.96)
+        _ = c.handle(.speechStarted(itemId: "item_A"), now: 4.52)       // the echo, while r1 is on air
+        for _ in 0..<8 { _ = c.handle(.transcription(text: "", itemId: "item_A"), now: 4.7) }   // DashScope's empty deltas
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 5.0)
+        _ = c.handle(.playbackDrained, now: 5.24)                          // played=5 — the greeting finished
+        XCTAssertEqual(c.state, .idle)
+        _ = c.handle(.speechStopped, now: 6.22)
+        XCTAssertFalse(c.suppressNextResponse, "nothing was busy when the segment ended")
+        // 06.36: the server answers the echo as the user's turn.
+        _ = c.handle(.responseCreated(id: "r2"), now: 6.36)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r2"), "not yet known to be an echo reply")
+        // 06.376: its transcript lands — and it is the greeting.
+        let out = core(c.handle(.transcription(text: "Hey, just what's on your plate?", itemId: "item_A"), now: 6.376))
+        XCTAssertTrue(out.contains(.deleteItem(id: "item_A")), "the echo leaves the conversation")
+        XCTAssertEqual(count(out, .sendCancel), 1, "the server's reply to its own echo is cancelled")
+        XCTAssertEqual(count(out, .flushPlayback), 0, "nothing was playing")
+        XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"), "\"Do small things.\" never plays")
+        XCTAssertFalse(c.suppressNextResponse)
+        // A real turn afterwards is answered normally.
+        _ = c.handle(.responseCreated(id: "r3"), now: 9)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r3"))
+    }
+
+    func test18b_anEchoReplyAlreadyOnAirIsCutAndTheOriginalKeepsPlaying() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&c, "Taxi's at quarter to eight, after the gym.")
+        _ = c.handle(.speechStarted(itemId: "item_B"), now: 1.0)          // echo of r1 while r1 streams
+        _ = c.handle(.speechStopped, now: 1.8)
+        XCTAssertTrue(c.suppressNextResponse, "no words yet: a blip until proven otherwise")
+        _ = c.handle(.responseCreated(id: "r2"), now: 1.9)               // the server answers the echo
+        XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"), "cancelled on creation")
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"), "the reply on air keeps streaming — it is not muted by the cancel")
+        _ = c.handle(.audioDelta(id: "r1"), now: 2.0)
+        XCTAssertTrue(c.playbackQueued)
+        let out = core(c.handle(.transcription(text: "taxi's at quarter to eight after the gym", itemId: "item_B"), now: 2.2))
+        XCTAssertTrue(out.contains(.deleteItem(id: "item_B")))
+        XCTAssertEqual(count(out, .sendCancel), 0, "already cancelled on creation; nothing to cancel twice")
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"))
+    }
+
+    func test18c_anEchoReplyThatStartedPlayingIsFlushedMidAir() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&c, "Do small things.")
+        _ = c.handle(.speechStarted(itemId: "item_C"), now: 0.4)          // echo begins while r1 is on air
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 0.5)
+        _ = c.handle(.playbackDrained, now: 0.9)
+        XCTAssertEqual(c.state, .idle)
+        _ = c.handle(.responseCreated(id: "r2"), now: 1.5)                // server answers the echo…
+        _ = c.handle(.audioDelta(id: "r2"), now: 1.6)                      // …and it is already playing
+        XCTAssertEqual(c.playingResponseId, "r2")
+        let out = core(c.handle(.transcription(text: "do small things", itemId: "item_C"), now: 2.0))
+        XCTAssertTrue(out.contains(.deleteItem(id: "item_C")))
+        XCTAssertEqual(count(out, .sendCancel), 1)
+        XCTAssertEqual(count(out, .flushPlayback), 1, "cut mid-air")
+        XCTAssertEqual(c.state, .idle)
+        XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"))
+    }
+
+    func test18d_theLateTranscriptOfTheQuestionThisReplyAnswersIsCaptionsOnly() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "item_Q"), now: 0)            // the user asks, while idle
+        _ = c.handle(.speechStopped, now: 1.0)
+        _ = c.handle(.responseCreated(id: "r1"), now: 1.2)
+        _ = c.handle(.audioDelta(id: "r1"), now: 1.4)
+        said(&c, "You have three things left today.")
+        let out = core(c.handle(.transcription(text: "what have I got left today", itemId: "item_Q"), now: 1.6))
+        XCTAssertEqual(out, [], "its segment began before the reply: never an interruption")
+        XCTAssertEqual(c.state, .speaking)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"))
     }
 
 }

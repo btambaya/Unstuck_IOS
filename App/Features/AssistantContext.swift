@@ -189,7 +189,7 @@ func buildVoiceOpening(_ api: AssistantAppState) -> String {
         return "(Voice session just opened. They have asked NOT to be addressed by name — greet them warmly WITHOUT any name, one short sentence, ask what's on their mind, then listen. Greeting happens ONCE — never repeat it after an interruption.)"
     }
     if !api.interviewPending() {
-        return "(Voice session just opened. One short hello using \"\(first)\" and a plain question — \"Hey \(first). What's on your plate?\" — then listen. That's the only time you say their name this conversation. This greeting happens ONCE — after any interruption, continue the conversation naturally; never greet again or start over.)"
+        return "(Voice session just opened. Say hello the way a person you know would — one short, warm line in your own words, different every time, never a stock phrase and never \"what's on your plate\". Use \"\(first)\" once, here, and not again. You don't have to ask anything; if you do, make it one easy, natural question. Then stop and listen. This greeting happens ONCE — after any interruption, continue the conversation naturally; never greet again or start over.)"
     }
     let met = knowsThem
         ? "you know a little about this person already (the profile facts) but they have not been through your get-to-know-you questions — skip any question the facts already answer"
@@ -208,7 +208,7 @@ func buildVoiceInstructions(_ api: AssistantAppState) -> String {
         + "and you sound like it: calm, warm, brief, a person not a bot. "
         + (noName
             ? "They have asked you NOT to address them by name — never say their name, not even once. Open with a warm hello (no name) and ask what's on their mind — then listen. "
-            : "The session just opened: one short hello using \"\(name)\" (what they want to be called), and a plain question — \"Hey \(name). What's on your plate?\" — then listen. That's the only time you say their name this conversation; ending sentences with someone's name sounds like a telemarketer. ")
+            : "Their name is \"\(name)\" (what they want to be called): say it once, in your hello, and not again — ending sentences with someone's name sounds like a telemarketer. ")
         + "If they tell you what to call them, or to stop using their name: obey from your very next sentence AND save it with save_profile_fact (category preference, e.g. \"Call them Ari\" or \"Don't use their name\") in that same moment — saying you'll note it without calling the tool means it is NOT noted and you will get it wrong next session. "
         + "When they say \"all my tasks\" or \"everything\", use complete_tasks with EVERY matching id in one call — never do a partial job or claim it without the call. "
         // FACTS ARE FOR DECIDING, NOT FOR SAYING (2026-09-19). The previous wording

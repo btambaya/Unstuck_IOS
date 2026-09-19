@@ -190,7 +190,10 @@ enum BargeInEvent: Equatable, Sendable {
     case audioDelta(id: String?)
     case responseDone(id: String?, status: String?)
     case playbackDrained
-    case speechStarted
+    /// The server VAD opened a segment; `itemId` is the conversation item it
+    /// will commit that speech into (DashScope sends it), so a transcript can
+    /// be tied back to WHEN its speech began — while a reply was busy, or not.
+    case speechStarted(itemId: String?)
     case speechStopped
     /// transcription.delta or .completed for the user's input. On an energy
     /// profile an accelerator only; on a transcript profile THE confirm.
@@ -257,12 +260,17 @@ struct BargeInController: Sendable {
     /// transcript arrive, and did we cancel a suppressed reply for it?
     private var transcriptSeenThisSegment = false
     private var suppressedCancelledThisSegment = false
-    /// A speech segment began WHILE this reply was busy — the only kind of
-    /// words that can be an interruption. The transcript of the user's own
-    /// previous turn (the question that CAUSED this reply) arrives late, after
-    /// the reply has started (VoiceCaptionTests, 2026-09-18); its segment
-    /// began before the reply did, so it must never cancel the reply.
-    private var interruptSegmentOpen = false
+    /// Speech segments that began WHILE a reply was busy, keyed by the item id
+    /// the server commits them into — the only words that can be an
+    /// interruption or an echo. Value: the response that was active when the
+    /// segment began, so a response created LATER is the server's reply to
+    /// that segment (device log 2026-09-19: the echo of the greeting was
+    /// committed as the user's turn and answered 10 ms before its transcript
+    /// arrived). The transcript of the user's own previous turn — the question
+    /// a reply answers — began before the reply did and is never in here.
+    private var busySegments: [String: String?] = [:]
+    /// The same for a segment the server sent no item id for.
+    private var lastSegmentBusy: (busy: Bool, activeAtStart: String?) = (false, nil)
 
     private var lastGate: GateContext?
 
@@ -294,8 +302,12 @@ struct BargeInController: Sendable {
 
     /// Whether an audio delta for `id` should be played.
     func shouldEnqueueAudio(id: String?) -> Bool {
-        if muted { return false }
         if let id, id == cancelledResponseId { return false }
+        // The reply on air finishes: the server may create — and we may cancel
+        // — a NEWER response while this one is still streaming (its reply to
+        // an echo), and that must not drop the rest of what is playing.
+        if let id, let playing = playingResponseId, id == playing { return true }
+        if muted { return false }
         if let id, let active = activeResponseId, id != active { return false }
         return true
     }
@@ -321,16 +333,17 @@ struct BargeInController: Sendable {
             responseActive = true
             activeResponseId = id
             if suppressNextResponse {
-                // The reply the server made from a false-start blip.
+                // The reply the server made from a false-start blip (or an
+                // echo). Cancelled BY ID: the reply already on air keeps
+                // playing — `muted` would have dropped its remaining audio
+                // too (device log 2026-09-19: every greeting cut mid-way).
                 suppressNextResponse = false
                 cancelledResponseId = id
-                muted = true
                 suppressedCancelledThisSegment = true
                 out.append(.sendCancel)
-                out.append(.uiState(.listening))
+                out.append(.uiState(playbackQueued ? .speaking : .listening))
             } else {
                 muted = false
-                interruptSegmentOpen = false        // a new reply: earlier segments were before it
                 out.append(.uiState(.thinking))
                 if state == .idle { state = .speaking }
             }
@@ -357,6 +370,7 @@ struct BargeInController: Sendable {
 
         case .playbackDrained:
             playbackQueued = false
+            playingResponseId = nil
             if !responseActive {
                 if state == .speaking { state = .idle }
                 out.append(.uiState(.listening))
@@ -378,11 +392,12 @@ struct BargeInController: Sendable {
                 out += restoreToSpeaking()
             }
 
-        case .speechStarted:
+        case .speechStarted(let itemId):
             serverSpeaking = true
             transcriptSeenThisSegment = false
             suppressedCancelledThisSegment = false
-            if modelBusy { interruptSegmentOpen = true }
+            if let itemId, modelBusy { busySegments[itemId] = activeResponseId }
+            lastSegmentBusy = (modelBusy, activeResponseId)
             switch state {
             case .speaking where modelBusy && profile.confirm == .transcript:
                 // Words decide. The server VAD hears the loudspeaker's echo
@@ -426,43 +441,55 @@ struct BargeInController: Sendable {
                 let tokens = Self.tokens(text)
                 guard !tokens.isEmpty else { break }    // "um", "…", one letter: no words, not an interruption — and not proof of speech either
                 transcriptSeenThisSegment = true
-                // Not an interruption unless the words belong to a segment that
-                // began while this reply was busy: a normal turn, or the late
+                // Only words from a segment that began while a reply was busy
+                // can be an interruption or an echo. A normal turn, or the late
                 // transcript of the question this reply answers, is captions only.
-                guard modelBusy, interruptSegmentOpen else { break }
-                // A response the server created for THIS segment, still live:
-                // not the one whose audio we are playing, and not one we
-                // already cancelled as a blip.
-                // "Newer" only makes sense when something IS playing: while the
-                // model is still thinking (no audio yet) the active response is
-                // the reply to stop, not a reply to keep.
-                let newerReply: String? = {
-                    guard responseActive, let a = activeResponseId, let playing = playingResponseId,
-                          a != playing, a != cancelledResponseId else { return nil }
+                // Match by item id when both sides carry one; otherwise (a
+                // server that ids transcripts but not speech_started, or the
+                // other way round) fall back to the last segment we saw.
+                let segment: (busy: Bool, activeAtStart: String?)? = {
+                    if let itemId, let known = busySegments[itemId] { return (true, known) }
+                    return lastSegmentBusy.busy ? lastSegmentBusy : nil
+                }()
+                guard let segment else { break }
+                // A response created since the segment began is the server's
+                // reply TO that segment — to the echo, or to the interruption.
+                let replyToSegment: String? = {
+                    guard let a = activeResponseId, a != segment.activeAtStart, a != cancelledResponseId else { return nil }
                     return a
                 }()
                 if isEcho(tokens) {
-                    // The model's own words came back through the mic.
+                    // The model's own words came back through the mic. Take the
+                    // echo out of the conversation and kill the server's reply
+                    // to it — before it plays, if we are quick; mid-air if not.
                     if let itemId { out.append(.deleteItem(id: itemId)) }
-                    if let newer = newerReply {
-                        // The server already answered its own echo — cancel
-                        // THAT reply and keep playing the real one.
-                        cancelledResponseId = newer
+                    if let reply = replyToSegment {
+                        cancelledResponseId = reply
                         responseActive = false
                         out.append(.sendCancel)
+                        if playingResponseId == reply {
+                            out.append(.flushPlayback)
+                            playbackQueued = false
+                            playingResponseId = nil
+                            out.append(.clearCaption)
+                            out.append(.uiState(.listening))
+                            if state == .speaking { state = .idle }
+                        }
                     } else if !suppressedCancelledThisSegment {
                         suppressNextResponse = true
                     }
-                } else {
+                } else if modelBusy {
                     // Real words over the reply: stop it — once. A later
                     // transcript of the same words must not cancel again.
                     suppressNextResponse = false
-                    interruptSegmentOpen = false
-                    if newerReply != nil {
+                    if let itemId { busySegments[itemId] = nil }
+                    lastSegmentBusy = (false, nil)
+                    if let reply = replyToSegment, reply != playingResponseId {
                         // The server already answered the interruption; only
                         // the OLD reply's queued audio has to go.
                         out.append(.flushPlayback)
                         playbackQueued = false
+                        playingResponseId = nil
                         out.append(.clearCaption)
                         out.append(.uiState(.thinking))
                     } else {
