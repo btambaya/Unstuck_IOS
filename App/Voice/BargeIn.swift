@@ -304,6 +304,9 @@ struct BargeInController: Sendable {
         /// grace — only those words can be echo or an interruption. A segment
         /// that began while nothing played is the user, whatever it says.
         var echoPossible: Bool
+        /// The reply's AUDIO was on air when it began (as opposed to the
+        /// drain grace, where only the reply's tail can still echo).
+        var onAir = false
         /// `response.create` already issued (or pending) for it.
         var responded = false
     }
@@ -381,7 +384,7 @@ struct BargeInController: Sendable {
             // A new reply: the one before it is now the "previous" reference.
             spokenPrevious = spokenCurrent
             spokenCurrent = []
-            spokenSet = Set(spokenPrevious)
+            spokenSet = Set(spokenPrevious.map(Self.stem))
             out.append(.uiState(.thinking))
             if state == .idle { state = .speaking }
 
@@ -438,10 +441,13 @@ struct BargeInController: Sendable {
 
         case .speechStarted(let itemId):
             serverSpeaking = true
-            // Busy, or just after the reply's audio drained — its tail is still
-            // in the air and comes back as a segment of its own.
-            let inGrace = !modelBusy && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
-            segments.append(Segment(itemId: itemId, echoPossible: modelBusy || inGrace))
+            // Echo needs AUDIO: the reply on air, or just drained — its tail is
+            // still in the room and comes back as a segment of its own. A
+            // model that is only thinking (its transcript arrives ~1 s before
+            // its audio) has said nothing aloud yet.
+            let onAir = playbackQueued
+            let inGrace = !onAir && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
+            segments.append(Segment(itemId: itemId, echoPossible: onAir || inGrace, onAir: onAir))
             if segments.count > Self.segmentHistory { segments.removeFirst(segments.count - Self.segmentHistory) }
             switch state {
             case .speaking where modelBusy && profile.confirm == .transcript:
@@ -472,18 +478,22 @@ struct BargeInController: Sendable {
             if profile.confirm == .energy, case .ducked = state, gateOpen { out += cancel() }
             let tokens = Self.tokens(text)
             let index = segmentIndex(for: itemId)
-            let segment = index.map { segments[$0] } ?? Segment(itemId: itemId, echoPossible: false)
             let alreadyCancelled = activeResponseId != nil && activeResponseId == cancelledResponseId
             if !final {
                 // Streaming words. On the loudspeaker the first REAL ones of a
-                // segment that began on air stop the reply — once.
-                guard profile.confirm == .transcript, !tokens.isEmpty, segment.echoPossible, modelBusy, !alreadyCancelled else { break }
-                lastEchoScore = score(tokens)
-                if !isEcho(tokens) { out += cancel() }
+                // segment we saw begin, while a reply is busy, stop it — once.
+                // A segment we never saw begin never cuts a reply.
+                guard profile.confirm == .transcript, !tokens.isEmpty, modelBusy, !alreadyCancelled, let index else { break }
+                let segment = segments[index]
+                if segment.echoPossible {
+                    lastEchoScore = score(tokens)
+                    if isEcho(tokens, onAir: segment.onAir) { break }
+                }
+                out += cancel()
                 break
             }
             if index.map({ segments[$0].responded }) == true { break }   // a completed transcript re-sent
-            let id = segment.itemId ?? itemId
+            let id = (index.map { segments[$0].itemId } ?? nil) ?? itemId
             guard !tokens.isEmpty else {
                 // A cough, "um", "…", an echo heard as Chinese: no words, no turn.
                 if let id { out.append(.deleteItem(id: id)) }
@@ -502,9 +512,10 @@ struct BargeInController: Sendable {
                 }
                 break
             }
+            let segment = segments[index]
             if segment.echoPossible {
                 lastEchoScore = score(tokens)
-                if isEcho(tokens) {
+                if isEcho(tokens, onAir: segment.onAir) {
                     // The model's own words came back through the mic.
                     if let id { out.append(.deleteItem(id: id)) }
                     break
@@ -531,7 +542,7 @@ struct BargeInController: Sendable {
             guard !t.isEmpty else { break }
             spokenCurrent.append(contentsOf: t)
             if spokenCurrent.count > Self.spokenCap { spokenCurrent.removeFirst(spokenCurrent.count - Self.spokenCap) }
-            spokenSet = Set(spokenPrevious).union(spokenCurrent)
+            spokenSet = Set((spokenPrevious + spokenCurrent).map(Self.stem))
 
         case .tick:
             // Compare in whole milliseconds: `now - since` is floating point
@@ -642,7 +653,39 @@ struct BargeInController: Sendable {
     }
 
     private func score(_ heard: [String]) -> (hits: Int, heard: Int, spoken: Int) {
-        (heard.filter { spokenSet.contains($0) }.count, heard.count, spokenPrevious.count + spokenCurrent.count)
+        let e = echoEvidence(heard)
+        return (e.hits, e.heard, spokenPrevious.count + spokenCurrent.count)
+    }
+
+    /// Words that carry no content — the transcriber adds and drops them
+    /// freely ("Monday's open" came back as "Monday is open", device log
+    /// 2026-09-19 23:50), and a real interruption is full of them ("How about
+    /// Tuesday?" shares two of three with "How about you?"). They only count
+    /// when an utterance has nothing else ("How about you?", "Okay.").
+    static let stopWords: Set<String> = [
+        "a", "an", "the", "and", "or", "but", "if", "so", "of", "to", "in", "on", "at", "by", "for", "with", "from", "as",
+        "into", "over", "about", "up", "down", "out", "off", "than", "then", "too", "also",
+        "is", "are", "was", "were", "be", "been", "being", "am", "do", "does", "did", "have", "has", "had",
+        "will", "would", "can", "could", "should", "may", "might", "shall", "must",
+        "i", "me", "my", "mine", "you", "your", "yours", "youre", "youve", "youll", "youd", "he", "him", "his", "she", "her", "hers",
+        "it", "its", "im", "ive", "ill", "id", "we", "us", "our", "ours", "weve", "well", "they", "them", "their", "theyre",
+        "this", "that", "these", "those", "there", "here", "what", "which", "who", "whom", "whose", "how", "when", "where", "why",
+        "not", "no", "yes", "ok", "okay", "oh", "um", "uh", "hmm", "just", "really", "very", "quite",
+    ]
+
+    /// Plurals and possessives fold ("mondays" / "players" → "monday" /
+    /// "player"): the model writes Monday's, the transcriber Monday is.
+    static func stem(_ t: String) -> String {
+        guard t.count >= 4, t.hasSuffix("s") else { return t }
+        return String(t.dropLast())
+    }
+
+    /// Content words heard vs the reference (whole utterance if it has none).
+    private func echoEvidence(_ heard: [String]) -> (hits: Int, heard: Int, fallback: Bool) {
+        let content = heard.filter { !Self.stopWords.contains($0) }
+        let judged = content.isEmpty ? heard : content
+        let hits = judged.filter { spokenSet.contains(Self.stem($0)) }.count
+        return (hits, judged.count, content.isEmpty)
     }
 
     /// Lower-cased word tokens, punctuation and APOSTROPHES stripped, one-letter
@@ -662,13 +705,19 @@ struct BargeInController: Sendable {
             .filter { $0.count >= 2 && $0.unicodeScalars.contains { $0.isASCII && ($0.properties.isAlphabetic || ("0"..."9").contains(Character($0))) } }
     }
 
-    /// Echo: (nearly) every word heard is a word the model recently said.
-    /// 70 %, not 100 %: transcription drops and mangles words. A user talking
-    /// OVER the reply mixes their words in and pulls the ratio down.
-    func isEcho(_ heard: [String]) -> Bool {
+    /// Echo: the content words heard are words the model just said. Not all
+    /// of them — the transcriber garbles short echoes ("Saturday's clear" →
+    /// "Saturday's players", 1 of 2). While the reply's audio is ON AIR half
+    /// is enough: echo is the likeliest source of a match, and a two-word
+    /// interruption that shares one topic word can be repeated once the reply
+    /// ends. In the drain grace only the reply's tail can echo, so a
+    /// follow-up sharing one word ("Tuesday morning" after "Tuesday's wide
+    /// open") stays a turn: 60 %. Filler-only utterances: 70 % of all words.
+    func isEcho(_ heard: [String], onAir: Bool = true) -> Bool {
         guard !heard.isEmpty, !spokenSet.isEmpty else { return false }
-        let hits = heard.filter { spokenSet.contains($0) }.count
-        return Double(hits) / Double(heard.count) >= 0.7
+        let e = echoEvidence(heard)
+        let threshold: Double = e.fallback ? 0.7 : (onAir ? 0.5 : 0.6)
+        return Double(e.hits) / Double(e.heard) >= threshold
     }
 
     // MARK: transitions

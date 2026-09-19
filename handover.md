@@ -910,6 +910,30 @@ What changed (`App/Voice/BargeIn.swift`, `App/Voice/VoiceRealtimeClient.swift`):
   needs echo cancellation the gate can trust — the next step if wanted.
 - Ship: 1.1.1 (66) uploaded (delivery b9e73040); on-device retest pending Ahmad.
 
+**Then (build 67): the phone test of 66 (23:50, Wi-Fi log) — right except two
+garbled echoes.** Every response.done `completed` (no server cuts), 7 echo
+segments deleted, 6 real turns answered, one genuine talk-over ("How about
+Tuesday?" over the tomorrow reply) worked. But two SHORT replies came back
+through the mic garbled — "Saturday's clear" heard as "Saturday's players",
+"Monday's open" as "Monday is open" — scored 1/2 and 2/3 against the 70 %
+all-words rule, were taken for the user, cut the reply and were answered
+again (the self-tripping). Echo scoring v2 (`BargeIn.swift`):
+- Filler words (`stopWords`: is/the/you/how/about…) don't count; the
+  transcriber adds and drops them freely and a real interruption is full of
+  them ("How about Tuesday?" → only "tuesday" is judged). Filler-only
+  utterances ("How about you?", "Okay.") are judged whole at 70 %.
+- Plurals/possessives fold at the comparison (`stem`: mondays → monday).
+- The threshold depends on WHEN the segment began: reply audio on air → half
+  the content words is echo (a two-word interruption sharing a topic word can
+  be repeated once the reply ends); in the 1.5 s drain grace only the tail can
+  echo → 60 % ("Tuesday morning" after "Tuesday's wide open" stays a turn).
+- Echo needs audio: a segment that began while the model was only THINKING
+  is never echo (its transcript deltas land ~1 s before its audio, so the
+  reference already holds the words). Streaming words of a known segment stop
+  a busy model early; a segment we never saw begin still never cuts a reply.
+- Tests: `BargeInTests` 51 (new 21a–f replay the 23:50 session), captions 9.
+- Ship: 1.1.1 (67) uploaded; on-device retest pending Ahmad.
+
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 
 The reason live-sync bugs kept coming back: `postgres_changes` has **no

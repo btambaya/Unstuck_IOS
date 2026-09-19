@@ -627,8 +627,8 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(c.state, .speaking)
         XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"), "the real reply keeps playing")
         XCTAssertFalse(c.pendingCreate)
-        XCTAssertEqual(c.lastEchoScore.hits, 8)
-        XCTAssertEqual(c.lastEchoScore.heard, 8)
+        XCTAssertEqual(c.lastEchoScore.hits, 5, "content words only: taxi's, quarter, eight, after, gym")
+        XCTAssertEqual(c.lastEchoScore.heard, 5)
     }
 
     func test17c_realWordsOverTheReplyStopIt_andAreAnsweredOnceTheCancelSettles() {
@@ -1009,6 +1009,112 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.playbackDrained, now: 3)
         XCTAssertEqual(core(c.handle(.transcription(text: "and tomorrow", itemId: nil, final: true), now: 4)),
                        [.userTurn("and tomorrow"), .createResponse, .uiState(.thinking)], "idle: a turn")
+    }
+
+    // MARK: 21 — the fourth phone test, 2026-09-19 23:50 (build 66): echo
+    // handled, real turns answered, one genuine talk-over — and two SHORT
+    // replies whose echo the transcriber garbled ("Saturday's clear" →
+    // "Saturday's players", "Monday's open" → "Monday is open") scored 1/2
+    // and 2/3 against a 70 % all-words rule, were taken for the user, cut the
+    // reply and were answered again. Filler words are ignored, plurals and
+    // possessives fold, a segment that began while the reply's AUDIO was on
+    // air needs only half its content words to match, one in the drain grace
+    // (only the tail can echo) needs more, and one that began while the model
+    // was merely thinking is never echo.
+
+    func test21a_garbledEchoOfAShortReplyIsStillEcho() {
+        var c = speaking(.speaker)
+        said(&c, "Monday's open.")
+        _ = c.handle(.speechStarted(itemId: "a"), now: 1.0)
+        _ = c.handle(.speechStopped, now: 1.8)
+        XCTAssertEqual(core(c.handle(.transcription(text: "Monday is open.", itemId: "a", final: true), now: 1.9)), [.deleteItem(id: "a")])
+        XCTAssertEqual(c.lastEchoScore.hits, 2)
+        XCTAssertEqual(c.lastEchoScore.heard, 2, "\"is\" carries nothing; Monday's and Monday fold")
+        var d = speaking(.speaker)
+        said(&d, "Saturday's clear.")
+        _ = d.handle(.speechStarted(itemId: "b"), now: 1.0)
+        XCTAssertEqual(core(d.handle(.transcription(text: "Saturday's players.", itemId: "b", final: true), now: 1.9)), [.deleteItem(id: "b")], "half the content words, on air: echo")
+        XCTAssertTrue(d.shouldEnqueueAudio(id: "r1"), "the reply plays on")
+        XCTAssertEqual(d.state, .speaking)
+    }
+
+    func test21b_aRealTalkOverSharingOnlyFillerWordsIsStillReal() {
+        var c = speaking(.speaker)
+        said(&c, "I'm doing well. How about you?")
+        _ = c.handle(.speechStarted(itemId: "q"), now: 1.0)
+        let out = core(c.handle(.transcription(text: "How about Tuesday?", itemId: "q", final: true), now: 1.9))
+        XCTAssertTrue(out.contains(.userTurn("How about Tuesday?")))
+        XCTAssertEqual(count(out, .sendCancel), 1)
+        XCTAssertEqual(c.lastEchoScore.hits, 0)
+        XCTAssertEqual(c.lastEchoScore.heard, 1, "only \"tuesday\" carries content")
+    }
+
+    func test21c_inTheDrainGraceOnlyTheTailCanEcho() {
+        // A follow-up sharing one topic word, right after the reply ended: a turn.
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&c, "Tuesday's wide open.")
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1)
+        _ = c.handle(.playbackDrained, now: 2)
+        _ = c.handle(.speechStarted(itemId: "f"), now: 2.3)              // inside the grace window
+        _ = c.handle(.speechStopped, now: 3.2)
+        XCTAssertEqual(core(c.handle(.transcription(text: "Tuesday morning", itemId: "f", final: true), now: 3.4)),
+                       [.userTurn("Tuesday morning"), .createResponse, .uiState(.thinking)], "1 of 2 content words in the grace window is not echo")
+        // The tail itself, in the grace window, is.
+        var t = BargeInController(profile: .speaker)
+        _ = t.handle(.responseCreated(id: "r1"), now: 0)
+        _ = t.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&t, "Tuesday's wide open.")
+        _ = t.handle(.responseDone(id: "r1", status: "completed"), now: 1)
+        _ = t.handle(.playbackDrained, now: 2)
+        _ = t.handle(.speechStarted(itemId: "tail"), now: 2.05)
+        XCTAssertEqual(core(t.handle(.transcription(text: "wide open.", itemId: "tail", final: true), now: 2.9)), [.deleteItem(id: "tail")])
+        // The same follow-up while that reply's audio was still on air would be echo.
+        var d = speaking(.speaker)
+        said(&d, "Tuesday's wide open.")
+        _ = d.handle(.speechStarted(itemId: "g"), now: 1.0)
+        XCTAssertEqual(core(d.handle(.transcription(text: "Tuesday morning", itemId: "g", final: true), now: 1.9)), [.deleteItem(id: "g")])
+    }
+
+    func test21d_wordsWhileTheModelIsOnlyThinkingAreNeverEcho() {
+        // The reply's transcript arrives ~1 s BEFORE its audio: the reference
+        // already holds "Monday's open" while nothing has been said aloud.
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        said(&c, "Monday's open.")
+        XCTAssertFalse(c.playbackQueued)
+        _ = c.handle(.speechStarted(itemId: "k"), now: 0.5)
+        _ = c.handle(.speechStopped, now: 1.3)
+        let out = core(c.handle(.transcription(text: "Monday is open?", itemId: "k", final: true), now: 1.4))
+        XCTAssertTrue(out.contains(.userTurn("Monday is open?")))
+        XCTAssertEqual(count(out, .sendCancel), 1, "the user spoke over a thinking model: stop it, answer them")
+        XCTAssertTrue(c.pendingCreate)
+        // Streaming words in that state stop it early too.
+        var d = BargeInController(profile: .speaker)
+        _ = d.handle(.responseCreated(id: "r1"), now: 0)
+        said(&d, "Monday's open.")
+        _ = d.handle(.speechStarted(itemId: "m"), now: 0.5)
+        XCTAssertEqual(count(core(d.handle(.transcription(text: "Monday is", itemId: "m", final: false), now: 0.9)), .sendCancel), 1)
+    }
+
+    func test21e_fillerOnlyUtterancesAreJudgedWhole() {
+        var c = speaking(.speaker)
+        said(&c, "Okay. How about you?")
+        _ = c.handle(.speechStarted(itemId: "h"), now: 1.0)
+        XCTAssertEqual(core(c.handle(.transcription(text: "How about you?", itemId: "h", final: true), now: 1.9)), [.deleteItem(id: "h")])
+        var d = speaking(.speaker)
+        said(&d, "Taxi's at quarter to eight.")
+        _ = d.handle(.speechStarted(itemId: "i"), now: 1.0)
+        XCTAssertEqual(count(core(d.handle(.transcription(text: "No!", itemId: "i", final: true), now: 1.9)), .sendCancel), 1, "a \"No!\" the model never said is an interruption")
+    }
+
+    func test21f_stemFoldsPluralsAndPossessives() {
+        XCTAssertEqual(BargeInController.stem("mondays"), "monday")
+        XCTAssertEqual(BargeInController.stem("players"), "player")
+        XCTAssertEqual(BargeInController.stem("gym"), "gym")
+        XCTAssertEqual(BargeInController.stem("was"), "was")
+        XCTAssertEqual(BargeInController.tokens("Monday's open."), ["mondays", "open"], "tokens stay raw; folding happens at the comparison")
     }
 
 }
