@@ -271,6 +271,15 @@ struct BargeInController: Sendable {
     private var busySegments: [String: String?] = [:]
     /// The same for a segment the server sent no item id for.
     private var lastSegmentBusy: (busy: Bool, activeAtStart: String?) = (false, nil)
+    /// The reply whose audio just finished, and when: its LAST words echo back
+    /// after the queue has drained (device log 2026-09-19 22:39:35: drained,
+    /// then 30 ms later a segment that transcribed as the reply's tail and was
+    /// answered as the user's turn). A segment starting inside this window is
+    /// treated as begun while that reply was on air.
+    private var lastDrained: (id: String?, at: TimeInterval)?
+    static let drainEchoGraceSec: TimeInterval = 1.5
+    /// For the device log: the last echo decision, as hits/heard/reference.
+    private(set) var lastEchoScore: (hits: Int, heard: Int, spoken: Int) = (0, 0, 0)
 
     private var lastGate: GateContext?
 
@@ -370,6 +379,7 @@ struct BargeInController: Sendable {
 
         case .playbackDrained:
             playbackQueued = false
+            lastDrained = (playingResponseId, now)
             playingResponseId = nil
             if !responseActive {
                 if state == .speaking { state = .idle }
@@ -396,8 +406,20 @@ struct BargeInController: Sendable {
             serverSpeaking = true
             transcriptSeenThisSegment = false
             suppressedCancelledThisSegment = false
-            if let itemId, modelBusy { busySegments[itemId] = activeResponseId }
-            lastSegmentBusy = (modelBusy, activeResponseId)
+            // Busy, or just after the reply's audio drained — its tail is still
+            // in the air and comes back as a segment of its own.
+            let inGrace = !modelBusy && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
+            let echoPossible = modelBusy || inGrace
+            let reference = modelBusy ? activeResponseId : lastDrained?.id
+            if let itemId, echoPossible { busySegments[itemId] = reference }
+            lastSegmentBusy = (echoPossible, reference)
+            if !echoPossible {
+                // A real turn is starting while nothing plays: whatever the
+                // server replies to it must play. A suppress left armed by an
+                // earlier echo swallowed the answer to "how is my day going to
+                // be tomorrow?" (device log 2026-09-19 22:39:02).
+                suppressNextResponse = false
+            }
             switch state {
             case .speaking where modelBusy && profile.confirm == .transcript:
                 // Words decide. The server VAD hears the loudspeaker's echo
@@ -458,7 +480,9 @@ struct BargeInController: Sendable {
                     guard let a = activeResponseId, a != segment.activeAtStart, a != cancelledResponseId else { return nil }
                     return a
                 }()
-                if isEcho(tokens) {
+                let echo = isEcho(tokens)
+                lastEchoScore = (tokens.filter { spokenSet.contains($0) }.count, tokens.count, spokenTail.count)
+                if echo {
                     // The model's own words came back through the mic. Take the
                     // echo out of the conversation and kill the server's reply
                     // to it — before it plays, if we are quick; mid-air if not.
@@ -478,12 +502,15 @@ struct BargeInController: Sendable {
                     } else if !suppressedCancelledThisSegment {
                         suppressNextResponse = true
                     }
-                } else if modelBusy {
-                    // Real words over the reply: stop it — once. A later
-                    // transcript of the same words must not cancel again.
+                } else {
+                    // Real words. Whatever the server replies to them must play —
+                    // even if an earlier echo left a suppress armed.
                     suppressNextResponse = false
                     if let itemId { busySegments[itemId] = nil }
                     lastSegmentBusy = (false, nil)
+                    guard modelBusy else { break }   // said after the reply ended: a normal turn
+                    // Over the reply: stop it — once. A later transcript of the
+                    // same words must not cancel again.
                     if let reply = replyToSegment, reply != playingResponseId {
                         // The server already answered the interruption; only
                         // the OLD reply's queued audio has to go.
@@ -597,13 +624,21 @@ struct BargeInController: Sendable {
 
     // MARK: transcript confirm
 
-    /// Lower-cased word tokens, punctuation stripped, one-letter tokens
-    /// dropped ("a", "I" match everything).
+    /// Lower-cased word tokens, punctuation and APOSTROPHES stripped, one-letter
+    /// tokens dropped ("a", "I" match everything). The model writes Tuesday’s
+    /// with a curly apostrophe and the transcriber writes Tuesday's with a
+    /// straight one — that one character failed a three-word echo at 2/3
+    /// (device log 2026-09-19 22:39:30), so both become "tuesdays". Tokens
+    /// without a Latin letter or digit are dropped: the transcriber sometimes
+    /// hears the loudspeaker's echo as Chinese ("嘿。" for "Hey", same log),
+    /// and this assistant speaks English — such a transcript is noise, never
+    /// an instruction to stop.
     static func tokens(_ text: String) -> [String] {
-        text.lowercased()
-            .split { !($0.isLetter || $0.isNumber || $0 == "'") }
+        let noApostrophes = text.replacingOccurrences(of: "’", with: "").replacingOccurrences(of: "'", with: "")
+        return noApostrophes.lowercased()
+            .split { !($0.isLetter || $0.isNumber) }
             .map(String.init)
-            .filter { $0.count >= 2 }
+            .filter { $0.count >= 2 && $0.unicodeScalars.contains { $0.isASCII && ($0.properties.isAlphabetic || ("0"..."9").contains(Character($0))) } }
     }
 
     /// Echo: (nearly) every word heard is a word the model recently said.

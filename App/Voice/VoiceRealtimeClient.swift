@@ -357,7 +357,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         let (cmds, stateAfter): ([BargeInCommand], String) = withLock {
             let c = _bargeIn.handle(event, now: t)
             if c.contains(.flushPlayback) { _guard.bargeIn() }
-            return (c, "\(_bargeIn.state) gate=\(_bargeIn.gateOpen) server=\(_bargeIn.serverSpeaking)")
+            let e = _bargeIn.lastEchoScore
+            return (c, "\(_bargeIn.state) gate=\(_bargeIn.gateOpen) server=\(_bargeIn.serverSpeaking) echo=\(e.hits)/\(e.heard) ref=\(e.spoken)")
         }
         // The barge-in decisions, content-free: which event, what it decided.
         // Ducks/restores/cancels are a handful per session; routine events

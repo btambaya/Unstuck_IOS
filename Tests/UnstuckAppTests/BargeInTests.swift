@@ -692,7 +692,7 @@ final class BargeInTests: XCTestCase {
     }
 
     func test17h_tokensAndEchoRule() {
-        XCTAssertEqual(BargeInController.tokens("Taxi's at 7:45, after the GYM!"), ["taxi's", "at", "45", "after", "the", "gym"])
+        XCTAssertEqual(BargeInController.tokens("Taxi's at 7:45, after the GYM!"), ["taxis", "at", "45", "after", "the", "gym"])
         var c = BargeInController(profile: .speaker)
         XCTAssertFalse(c.isEcho(BargeInController.tokens("after the gym")), "nothing said yet: nothing can be echo")
         said(&c, "Taxi's at quarter to eight, after the gym.")
@@ -786,6 +786,76 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(out, [], "its segment began before the reply: never an interruption")
         XCTAssertEqual(c.state, .speaking)
         XCTAssertTrue(c.shouldEnqueueAudio(id: "r1"))
+    }
+
+
+    // MARK: 19 — the second phone test, 2026-09-19 22:39
+
+    func test19a_anEchoSuppressLeftArmedNeverEatsTheUsersNextReply() {
+        // 22:38:59 the reply's last echo arms a suppress (no server reply yet);
+        // 22:39:02 the user's real question is answered — and the stale flag
+        // cancelled that answer. Silence.
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&c, "I'm doing well. How about you?")
+        _ = c.handle(.speechStarted(itemId: "echo"), now: 1.0)
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1.2)
+        _ = c.handle(.playbackDrained, now: 1.3)
+        _ = c.handle(.speechStopped, now: 1.8)
+        _ = c.handle(.transcription(text: "How about you?", itemId: "echo"), now: 1.9)
+        XCTAssertTrue(c.suppressNextResponse, "armed against the server's reply to the echo")
+        // The user starts a real turn while nothing plays…
+        _ = c.handle(.speechStarted(itemId: "q"), now: 3.5)
+        XCTAssertFalse(c.suppressNextResponse, "…so whatever the server replies to it must play")
+        _ = c.handle(.speechStopped, now: 5.8)
+        _ = c.handle(.responseCreated(id: "r2"), now: 5.9)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r2"), "the answer to the question plays")
+    }
+
+    func test19b_aCurlyApostropheDoesNotMakeAnEchoLookLikeRealWords() {
+        var c = BargeInController(profile: .speaker)
+        said(&c, "Tuesday’s wide open.")                          // the model, curly
+        XCTAssertTrue(c.isEcho(BargeInController.tokens("Tuesday's wide open.")), "the transcriber, straight")
+        XCTAssertEqual(BargeInController.tokens("Tuesday’s wide open."), ["tuesdays", "wide", "open"])
+        XCTAssertEqual(BargeInController.tokens("I'm doing well."), ["im", "doing", "well"])
+    }
+
+    func test19c_theReplysTailEchoingAfterTheQueueDrainedIsStillEcho() {
+        // 22:39:35.645 drained; 35.680 a segment began; it transcribed as the
+        // reply's last words and the server answered it as the user's turn.
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&c, "Tuesday's wide open. Want to block something?")
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 2.0)
+        _ = c.handle(.playbackDrained, now: 3.0)
+        _ = c.handle(.speechStarted(itemId: "tail"), now: 3.03)          // 30 ms after drain
+        _ = c.handle(.speechStopped, now: 3.8)
+        let out = core(c.handle(.transcription(text: "Want to block something?", itemId: "tail"), now: 3.9))
+        XCTAssertTrue(out.contains(.deleteItem(id: "tail")), "the tail is echo, not a question from the user")
+        XCTAssertTrue(c.suppressNextResponse)
+        _ = c.handle(.responseCreated(id: "r2"), now: 4.0)
+        XCTAssertFalse(c.shouldEnqueueAudio(id: "r2"), "the server's answer to the echo never plays")
+        // Well after the grace window, the same words from the user are a turn.
+        var d = BargeInController(profile: .speaker)
+        _ = d.handle(.responseCreated(id: "r1"), now: 0)
+        _ = d.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&d, "Want to block something?")
+        _ = d.handle(.responseDone(id: "r1", status: "completed"), now: 1)
+        _ = d.handle(.playbackDrained, now: 2)
+        _ = d.handle(.speechStarted(itemId: "later"), now: 6)
+        XCTAssertEqual(core(d.handle(.transcription(text: "want to block something", itemId: "later"), now: 7)), [])
+        XCTAssertFalse(d.suppressNextResponse)
+    }
+
+    func test19d_aTranscriptWithNoLatinWordsIsNoiseNotAnInterruption() {
+        XCTAssertEqual(BargeInController.tokens("嘿。"), [])
+        XCTAssertEqual(BargeInController.tokens("你好吗？"), [])
+        var c = speaking(.speaker)
+        _ = c.handle(.speechStarted(itemId: "cn"), now: 1.0)
+        XCTAssertEqual(core(c.handle(.transcription(text: "你好吗？", itemId: "cn"), now: 1.5)), [])
+        XCTAssertEqual(c.state, .speaking)
     }
 
 }
