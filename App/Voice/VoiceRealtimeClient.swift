@@ -6,7 +6,9 @@
 //
 //   session.update {modalities, instructions, input/output_audio_format:pcm16,
 //                   turn_detection:{server_vad, threshold, prefix_padding_ms,
-//                   silence_duration_ms} per ROUTE PROFILE (or null for
+//                   silence_duration_ms, interrupt_response:false,
+//                   create_response:false} per ROUTE PROFILE — the CLIENT cancels
+//                   and creates every reply (BargeIn.swift) (or null for
 //                   hold-to-talk), tools, tool_choice}  — re-sent on route change
 //   client → conversation.item.create {PRIMER}  + response.create   (opening)
 //   client → input_audio_buffer.append {audio: base64}
@@ -364,7 +366,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         // Ducks/restores/cancels are a handful per session; routine events
         // (audio deltas, ticks that decided nothing) stay out of the log.
         let decisive = cmds.contains { c in
-            switch c { case .duck, .restore, .sendCancel, .flushPlayback: return true; default: return false }
+            switch c { case .duck, .restore, .sendCancel, .flushPlayback, .createResponse, .deleteItem: return true; default: return false }
         }
         switch event {
         case .speechStarted, .speechStopped, .transcription, .interruptPressed, .gateOpen, .gateClose:
@@ -384,6 +386,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .sendCancel: return "cancel"
             case .deleteItem: return "delete-echo"
             case .createResponse: return "respond"
+            case .userTurn: return "turn"
             case .flushPlayback: return "flush"
             case .startConfirmTimer(let ms): return "timer\(ms)"
             case .uiState(let s): return "ui:\(s)"
@@ -424,6 +427,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 // A completed EMPTY user caption = "new turn": the screen
                 // clears the streaming reply and keeps the last user line.
                 onCaption("user", "", true)
+            case .userTurn(let text):
+                // The user's completed words — only for a turn the controller
+                // judged real; echo and coughs never reach the screen.
+                onCaption("user", text, true)
             case .uiState(let s): onState(s)
             }
         }
@@ -605,11 +612,15 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // DashScope: `text` is the confirmed part, `stash` the guess; the
             // OpenAI shape is `delta`. Confirmed words only.
             let piece = (ev["text"] as? String) ?? (ev["delta"] as? String) ?? ""
-            dispatch(.transcription(text: piece, itemId: ev["item_id"] as? String))
+            dispatch(.transcription(text: piece, itemId: ev["item_id"] as? String, final: false))
         case "conversation.item.input_audio_transcription.completed":
+            // THE decision point since build 66: the controller answers with
+            // `.userTurn` (caption) + `.createResponse` for a real turn, or
+            // `.deleteItem` for echo / no words — nothing is shown or asked
+            // for those (the echo used to appear as the user's line and wipe
+            // the reply's caption).
             let t = (ev["transcript"] as? String) ?? ""
-            dispatch(.transcription(text: t, itemId: ev["item_id"] as? String))
-            if !t.isEmpty { onCaption("user", t, true) }
+            dispatch(.transcription(text: t, itemId: ev["item_id"] as? String, final: true))
         case "response.audio.done", "response.done":
             // `response.done` is terminal for the WHOLE reply, so it closes the
             // caption segment too — a backend that never sends
@@ -633,6 +644,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 // A cancelled/incomplete response (barge-in) is not a claim:
                 // never score it, and never inject a corrective mid-utterance.
                 let status = response?["status"] as? String
+                let reason = ((response?["status_details"] as? [String: Any])?["reason"] as? String) ?? "-"
+                voiceLog.notice("voice response.done status=\(status ?? "nil", privacy: .public) reason=\(reason, privacy: .public)")
                 if status == nil || status == "completed" { checkFabrication() }
                 else { withLock { _guard.responseCancelled() } }
                 // responseActive stays true until response.DONE (audio.done

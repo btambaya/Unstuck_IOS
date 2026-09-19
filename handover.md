@@ -861,6 +861,55 @@ canceller buys nothing there.
 - Tests: 46 voice tests green (new: the route rule; 15/16 for the wider mute).
 - Ship: build 55 uploaded; on-device retest pending Ahmad.
 
+## Where things stand (2026-09-19, latest) — the CLIENT owns turn-taking (1.1.1 build 66)
+
+Three phone tests over Wi-Fi (`pymobiledevice3 syslog live`, builds 64/65) and
+four scripted probes against the live proxy (python `websockets`, a Supabase
+JWT, a `say`-generated 16 kHz sample) settled what was wrong:
+- **The server was cutting its own replies.** DashScope server_vad defaults to
+  `interrupt_response:true`: the moment its VAD hears speech it cancels the
+  in-flight response (`response.done status=cancelled reason=turn_detected`).
+  On the loudspeaker that "speech" is the reply's own echo → replies came out
+  in fragments, and no client logic could undo it after the fact. The flags
+  `interrupt_response:false` + `create_response:false` ARE honoured (echoed
+  back in session.updated); with them the server still segments, commits and
+  transcribes (completed transcript ~300 ms after speech_stopped) but never
+  cuts or answers by itself.
+- **`response.create` in the same breath as `response.cancel` kills the
+  socket** ("thread pool exausted max_workers 100", close 1007). Sent after
+  the cancelled response.done (~300 ms later) it works.
+- **Captions**: every completed input transcript was shown as the user's line,
+  so the echo (sometimes transcribed as Chinese — "嘿。") replaced the reply on
+  screen a second or two in. The reply's own transcript deltas legitimately
+  arrive ~1 s BEFORE its first audio (text first, then speech): not a bug.
+
+What changed (`App/Voice/BargeIn.swift`, `App/Voice/VoiceRealtimeClient.swift`):
+- `TurnDetection` sends both flags off on every route (hold-to-talk stays null).
+- Every reply is created by the client from a segment's COMPLETED transcript:
+  real words → `.userTurn` (the only path to a user caption now) +
+  `response.create`; no words / echo (≥70 % of the words the reply on air or
+  the one before it said — the reference is those two replies, not a long
+  tail) → `conversation.item.delete`, nothing asked, nothing shown.
+- Interruption: loudspeaker = the first real words of a segment that began on
+  air (or within 1.5 s of drain) cancel + flush; low-echo routes keep the
+  energy DUCK→CONFIRM→CANCEL. Then `pendingCreate` holds the ask until the
+  cancelled reply's done (fallback tick 1.5 s; "no active response" → ask at
+  once); the Interrupt button drops a pending ask.
+- A transcript whose segment we never saw begin never cuts a reply (caption
+  only; a turn when idle). Hold-to-talk transcripts are caption only.
+- Log: `voice response.done status=… reason=…`, and `respond` / `delete-echo`
+  / `turn` in the `voice barge-in` lines.
+- Tests: `BargeInTests` rewritten to the contract (45 green), `VoiceCaptionTests`
+  green (late-ASR race preserved), suite 648 with 1 red —
+  `CrashBreadcrumbsTests.testNoReportIsOfferedAfterACleanRun` is a
+  pre-existing isolation flake (a prior run's trail in the simulator
+  container; passes on a fresh simulator).
+- Expected feel on the loudspeaker: the reply keeps playing while you talk over
+  it and stops ~0.9 s after your last word (600 ms VAD silence + the
+  transcript), then the answer starts ~0.8 s later. A stop at the FIRST word
+  needs echo cancellation the gate can trust — the next step if wanted.
+- Ship: 1.1.1 (66) uploaded (delivery b9e73040); on-device retest pending Ahmad.
+
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 
 The reason live-sync bugs kept coming back: `postgres_changes` has **no

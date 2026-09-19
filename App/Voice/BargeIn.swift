@@ -1,30 +1,51 @@
 // Barge-in for realtime voice — the PURE part (no socket, no AVFoundation), so
 // every transition and the noise gate are unit-testable with a fake clock and
-// synthetic PCM (Tests/UnstuckAppTests/BargeInTests.swift). Mirrors the web
-// lib/voice/barge-in.ts and the Android BargeInController so the three stay in
-// lock-step (same 12 test cases).
+// synthetic PCM (Tests/UnstuckAppTests/BargeInTests.swift).
 //
-// Why: the server VAD (DashScope, threshold 0.5 by default) treats any
-// transient above the noise floor as speech, and no client ever sent
-// response.cancel — so a gust/cough mid-reply silenced the model locally while
-// the server kept generating, captions leaked, and the next turn collided with
-// the still-active response. The fix is three layers:
+// The contract with the server (DashScope Qwen-Omni realtime) since build 66,
+// 2026-09-19: server_vad with `interrupt_response:false` and
+// `create_response:false`. Measured against the live proxy that day:
 //
-//   1. session.update turn_detection tuned PER ROUTE (receiver/headset vs the
-//      loudspeaker) and re-sent whenever the route changes.
-//   2. A DUCK → CONFIRM → CANCEL state machine: the first hint of speech
-//      (client RMS gate or server speech_started) only ducks playback −12 dB;
-//      a confirm timer (200/300 ms by profile), the server agreeing, or a
-//      transcription decides between a real barge-in (response.cancel + flush
-//      + mute stale deltas) and a blip (restore). The manual Interrupt button
-//      stays a hard cancel that never ducks.
-//   3. An RMS noise gate in the capture path: floor-calibrated, hysteresis,
+//   * with the defaults the server CANCELS its own reply the moment its VAD
+//     hears speech (response.done status=cancelled, reason=turn_detected). On
+//     the loudspeaker that "speech" is the reply's own echo, so replies came
+//     out in fragments — nothing a client could prevent after the fact;
+//   * with both flags off it still segments (speech_started(item_id) …
+//     speech_stopped), commits and transcribes what it heard (the completed
+//     transcript ~300 ms after speech_stopped), but neither truncates nor
+//     answers anything by itself;
+//   * a `response.create` in the same breath as a `response.cancel` drops the
+//     connection ("thread pool exhausted"); sent after the cancelled
+//     response.done (~300 ms later) it works.
+//
+// So the CLIENT owns turn-taking:
+//
+//   1. REPLY: a speech segment's completed transcript with real words →
+//      `response.create`. No words (a cough, an echo the transcriber heard
+//      as Chinese) → the item is deleted, nothing is answered. If a reply is
+//      still generating, cancel it first and create only when its done
+//      arrives (`pendingCreate`).
+//   2. INTERRUPT: on low-echo routes (receiver, earphones, Bluetooth) the
+//      DUCK → CONFIRM → CANCEL energy machine: the first hint of speech ducks
+//      −12 dB; the server VAD in a segment AND the mic above the gate for
+//      confirmMs cancels; a blip restores. On the loudspeaker the mic hears
+//      every reply, so WORDS decide: the first real words of a segment that
+//      began while a reply was on air stop it.
+//   3. ECHO: a transcript that is (≥70 %) words the model itself just said,
+//      from a segment that began while a reply was on air or within 1.5 s of
+//      its audio draining, is echo → item deleted, nothing answered, nothing
+//      shown. The reference is the reply on air and the one before it, not a
+//      long tail, so a real sentence sharing everyday words with older
+//      replies does not look like echo.
+//   4. An RMS noise gate in the capture path: floor-calibrated, hysteresis,
 //      300 ms pre-roll, DIGITAL SILENCE while closed (the server's
 //      silence_duration_ms timer must observe silence to end a turn), and no
 //      floor adaptation while the model is playing (residual echo).
 //
-// Inputs are events + a monotonic clock (seconds); outputs are commands the
-// transport/audio layers execute (VoiceRealtimeClient / VoiceAudioEngine).
+// Hold-to-talk (turn_detection null) is unchanged: the client commits and
+// creates on release. Inputs are events + a monotonic clock (seconds);
+// outputs are commands the transport/audio layers execute
+// (VoiceRealtimeClient / VoiceAudioEngine).
 
 import Foundation
 
@@ -111,11 +132,15 @@ struct BargeInProfile: Sendable, Equatable {
 /// The `turn_detection` we send in session.update. `nil` = null (hold-to-talk:
 /// the client commits). prefix_padding 300 matches the gate's 300 ms pre-roll;
 /// 600 ms silence is inside the doc's 500–600 recommendation for short turns.
+/// `interrupt_response` / `create_response` are OFF (see the header): the
+/// server segments and transcribes; the client cancels and creates.
 struct TurnDetection: Sendable, Equatable {
     var type: String = "server_vad"
     var threshold: Double
     var prefixPaddingMs: Int = 300
     var silenceDurationMs: Int = 600
+    var interruptResponse = false
+    var createResponse = false
 
     static func serverVAD(_ profile: BargeInProfile) -> TurnDetection {
         TurnDetection(threshold: profile.threshold)
@@ -125,7 +150,8 @@ struct TurnDetection: Sendable, Equatable {
     static func json(_ td: TurnDetection?) -> Any {
         guard let td else { return NSNull() }
         return ["type": td.type, "threshold": td.threshold,
-                "prefix_padding_ms": td.prefixPaddingMs, "silence_duration_ms": td.silenceDurationMs]
+                "prefix_padding_ms": td.prefixPaddingMs, "silence_duration_ms": td.silenceDurationMs,
+                "interrupt_response": td.interruptResponse, "create_response": td.createResponse]
     }
 }
 
@@ -164,7 +190,8 @@ enum BargeInCommand: Equatable, Sendable {
     case sendCancel
     /// Hold-to-talk release: `input_audio_buffer.commit` + `response.create`.
     case commitAndRespond
-    /// Arm the confirm timer: deliver `.tick` after this many ms.
+    /// Arm a timer: deliver `.tick` after this many ms (the energy confirm,
+    /// and the fallback for a cancelled reply whose done never comes).
     case startConfirmTimer(ms: Int)
     /// Re-send session.update with this turn_detection (route change / mode).
     case updateTurnDetection(TurnDetection?)
@@ -173,14 +200,19 @@ enum BargeInCommand: Equatable, Sendable {
     /// The reply being cancelled must not linger on screen.
     case clearCaption
     case uiState(VoiceState)
-    /// `conversation.item.delete` — the server transcribed the model's own
-    /// echo as a user turn; take it out of the conversation so the model
-    /// never sees its words attributed to the user.
+    /// `conversation.item.delete` — the segment was the model's own echo, or
+    /// had no words (a cough, "um", an echo the transcriber heard as
+    /// Chinese); take it out so the model never sees it as the user's turn.
     case deleteItem(id: String)
-    /// `response.create` — the user's real words arrived AFTER the server's
-    /// reply to that segment was already cancelled as a suspected blip; ask
-    /// again so they are not left in silence.
+    /// `response.create` — a user turn is complete (its transcript has real
+    /// words) and nothing is generating. The server never creates replies by
+    /// itself (create_response:false).
     case createResponse
+    /// The user's completed words, for the caption — REAL turns only. Every
+    /// completed transcript used to be shown as the user's line and start a
+    /// new turn on screen, so the reply's own echo wiped the reply's caption
+    /// a second in and left "a Chinese phrase" there (Ahmad, 2026-09-19).
+    case userTurn(String)
 }
 
 enum BargeInEvent: Equatable, Sendable {
@@ -195,11 +227,12 @@ enum BargeInEvent: Equatable, Sendable {
     /// be tied back to WHEN its speech began — while a reply was busy, or not.
     case speechStarted(itemId: String?)
     case speechStopped
-    /// transcription.delta or .completed for the user's input. On an energy
-    /// profile an accelerator only; on a transcript profile THE confirm.
-    case transcription(text: String, itemId: String?)
-    /// response.audio_transcript.delta — the model's own words, kept as a
-    /// rolling tail so an input transcript can be recognised as echo.
+    /// transcription.delta (`final: false`) or .completed (`final: true`) for
+    /// the user's input. Deltas can stop a reply early; only the completed
+    /// transcript decides what is answered.
+    case transcription(text: String, itemId: String?, final: Bool)
+    /// response.audio_transcript.delta — the model's own words, the echo
+    /// reference.
     case assistantTranscript(delta: String)
     case gateOpen
     case gateClose
@@ -239,43 +272,47 @@ struct BargeInController: Sendable {
     private(set) var gateOpenSince: TimeInterval?
     /// The server VAD is inside a speech segment (speech_started … stopped).
     private(set) var serverSpeaking = false
-    /// The server saw a blip and WILL create a reply for it — cancel that one
-    /// the moment it is created.
-    private(set) var suppressNextResponse = false
     /// Drop audio/transcript deltas until the next (non-cancelled) response.
     private(set) var muted = false
     /// How many DUCK→restore cycles happened (the "noisy room?" chip, spec §8).
     private(set) var falseBargeIns = 0
 
-    /// Transcript confirm (see BargeInProfile.Confirm). The last ~160 tokens
-    /// the model spoke, across replies — echo of the PREVIOUS reply can land
-    /// after the next response was created.
-    private(set) var spokenTail: [String] = []
+    /// A user turn is waiting for `response.create` until the reply we just
+    /// cancelled reports done: created in the same breath as the cancel, the
+    /// server drops the connection (measured 2026-09-19).
+    private(set) var pendingCreate = false
+    private var pendingCreateSince: TimeInterval = 0
+    /// If that done never comes (or the cancel found nothing), ask anyway.
+    static let pendingCreateFallbackMs = 1500
+
+    /// Echo reference: the words of the reply on air and of the one before
+    /// it (a reply's tail echoes after the next response was created). Not a
+    /// long history — everyday words pile up and a real question starts to
+    /// look like echo (device log 2026-09-19 23:01: 8/12 on a real one).
+    private(set) var spokenCurrent: [String] = []
+    private(set) var spokenPrevious: [String] = []
     private var spokenSet: Set<String> = []
-    /// The response whose audio is (or was last) queued for playback — the
-    /// one an interruption should stop, as opposed to a NEWER response the
-    /// server may already have created for the interrupting turn.
+    static let spokenCap = 400
+    /// The response whose audio is (or was last) queued for playback.
     private(set) var playingResponseId: String?
-    /// Per speech segment (speech_started … stopped): did any input
-    /// transcript arrive, and did we cancel a suppressed reply for it?
-    private var transcriptSeenThisSegment = false
-    private var suppressedCancelledThisSegment = false
-    /// Speech segments that began WHILE a reply was busy, keyed by the item id
-    /// the server commits them into — the only words that can be an
-    /// interruption or an echo. Value: the response that was active when the
-    /// segment began, so a response created LATER is the server's reply to
-    /// that segment (device log 2026-09-19: the echo of the greeting was
-    /// committed as the user's turn and answered 10 ms before its transcript
-    /// arrived). The transcript of the user's own previous turn — the question
-    /// a reply answers — began before the reply did and is never in here.
-    private var busySegments: [String: String?] = [:]
-    /// The same for a segment the server sent no item id for.
-    private var lastSegmentBusy: (busy: Bool, activeAtStart: String?) = (false, nil)
+
+    /// One server VAD speech segment (speech_started … stopped), by the item
+    /// id the server commits it into.
+    struct Segment: Equatable, Sendable {
+        var itemId: String?
+        /// Began while a reply was on air / generating, or within the drain
+        /// grace — only those words can be echo or an interruption. A segment
+        /// that began while nothing played is the user, whatever it says.
+        var echoPossible: Bool
+        /// `response.create` already issued (or pending) for it.
+        var responded = false
+    }
+    private var segments: [Segment] = []
+    static let segmentHistory = 8
     /// The reply whose audio just finished, and when: its LAST words echo back
     /// after the queue has drained (device log 2026-09-19 22:39:35: drained,
-    /// then 30 ms later a segment that transcribed as the reply's tail and was
-    /// answered as the user's turn). A segment starting inside this window is
-    /// treated as begun while that reply was on air.
+    /// then 30 ms later a segment that transcribed as the reply's tail). A
+    /// segment starting inside this window counts as begun on air.
     private var lastDrained: (id: String?, at: TimeInterval)?
     static let drainEchoGraceSec: TimeInterval = 1.5
     /// For the device log: the last echo decision, as hits/heard/reference.
@@ -312,9 +349,7 @@ struct BargeInController: Sendable {
     /// Whether an audio delta for `id` should be played.
     func shouldEnqueueAudio(id: String?) -> Bool {
         if let id, id == cancelledResponseId { return false }
-        // The reply on air finishes: the server may create — and we may cancel
-        // — a NEWER response while this one is still streaming (its reply to
-        // an echo), and that must not drop the rest of what is playing.
+        // The reply on air keeps streaming whatever else is going on.
         if let id, let playing = playingResponseId, id == playing { return true }
         if muted { return false }
         if let id, let active = activeResponseId, id != active { return false }
@@ -341,21 +376,14 @@ struct BargeInController: Sendable {
             if let id, id == cancelledResponseId { break }   // never resurrect a cancelled reply
             responseActive = true
             activeResponseId = id
-            if suppressNextResponse {
-                // The reply the server made from a false-start blip (or an
-                // echo). Cancelled BY ID: the reply already on air keeps
-                // playing — `muted` would have dropped its remaining audio
-                // too (device log 2026-09-19: every greeting cut mid-way).
-                suppressNextResponse = false
-                cancelledResponseId = id
-                suppressedCancelledThisSegment = true
-                out.append(.sendCancel)
-                out.append(.uiState(playbackQueued ? .speaking : .listening))
-            } else {
-                muted = false
-                out.append(.uiState(.thinking))
-                if state == .idle { state = .speaking }
-            }
+            muted = false
+            pendingCreate = false
+            // A new reply: the one before it is now the "previous" reference.
+            spokenPrevious = spokenCurrent
+            spokenCurrent = []
+            spokenSet = Set(spokenPrevious)
+            out.append(.uiState(.thinking))
+            if state == .idle { state = .speaking }
 
         case .audioDelta(let id):
             guard shouldEnqueueAudio(id: id) else { break }
@@ -370,7 +398,13 @@ struct BargeInController: Sendable {
             // reply that has already started.
             if let id, let active = activeResponseId, id != active { break }
             responseActive = false
-            if !playbackQueued {
+            if pendingCreate {
+                // The reply we cancelled is finished server-side: now the
+                // user's turn can be answered.
+                pendingCreate = false
+                out.append(.createResponse)
+                out.append(.uiState(.thinking))
+            } else if !playbackQueued {
                 if state == .speaking { state = .idle }
                 out.append(.uiState(.listening))
             } else {
@@ -404,22 +438,11 @@ struct BargeInController: Sendable {
 
         case .speechStarted(let itemId):
             serverSpeaking = true
-            transcriptSeenThisSegment = false
-            suppressedCancelledThisSegment = false
             // Busy, or just after the reply's audio drained — its tail is still
             // in the air and comes back as a segment of its own.
             let inGrace = !modelBusy && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
-            let echoPossible = modelBusy || inGrace
-            let reference = modelBusy ? activeResponseId : lastDrained?.id
-            if let itemId, echoPossible { busySegments[itemId] = reference }
-            lastSegmentBusy = (echoPossible, reference)
-            if !echoPossible {
-                // A real turn is starting while nothing plays: whatever the
-                // server replies to it must play. A suppress left armed by an
-                // earlier echo swallowed the answer to "how is my day going to
-                // be tomorrow?" (device log 2026-09-19 22:39:02).
-                suppressNextResponse = false
-            }
+            segments.append(Segment(itemId: itemId, echoPossible: modelBusy || inGrace))
+            if segments.count > Self.segmentHistory { segments.removeFirst(segments.count - Self.segmentHistory) }
             switch state {
             case .speaking where modelBusy && profile.confirm == .transcript:
                 // Words decide. The server VAD hears the loudspeaker's echo
@@ -436,107 +459,79 @@ struct BargeInController: Sendable {
 
         case .speechStopped:
             serverSpeaking = false
-            if profile.confirm == .transcript, modelBusy, !transcriptSeenThisSegment {
-                // The segment ended and no words came: a blip (a cough, the
-                // reply's own tail). The server WILL commit + reply to it —
-                // suppress that. If words arrive late and are real, the
-                // transcription branch lifts this and asks again.
-                suppressNextResponse = true
-            }
             if case .ducked(_, let trigger) = state, trigger == .server {
-                // The server saw a blip and WILL commit + reply to it.
-                suppressNextResponse = true
+                // A blip: nothing confirmed it. Its completed transcript decides
+                // whether anything is answered (no words → nothing).
                 out += restoreToSpeaking()
             }
 
-        case .transcription(let text, let itemId):
-            switch profile.confirm {
-            case .energy:
-                // The accelerator is subject to the same two-sided rule as
-                // the tick: transcription deltas also stream for the PREVIOUS
-                // turn and for the model's own echo (device log 2026-09-17:
-                // a speech_started and a delta 0.4 ms apart cancelled a reply
-                // the user never interrupted). A transcript with the mic
-                // already closed is not the user talking over.
-                if case .ducked = state, gateOpen { out += cancel() }
-            case .transcript:
-                let tokens = Self.tokens(text)
-                guard !tokens.isEmpty else { break }    // "um", "…", one letter: no words, not an interruption — and not proof of speech either
-                transcriptSeenThisSegment = true
-                // Only words from a segment that began while a reply was busy
-                // can be an interruption or an echo. A normal turn, or the late
-                // transcript of the question this reply answers, is captions only.
-                // Match by item id when both sides carry one; otherwise (a
-                // server that ids transcripts but not speech_started, or the
-                // other way round) fall back to the last segment we saw.
-                let segment: (busy: Bool, activeAtStart: String?)? = {
-                    if let itemId, let known = busySegments[itemId] { return (true, known) }
-                    return lastSegmentBusy.busy ? lastSegmentBusy : nil
-                }()
-                guard let segment else { break }
-                // A response created since the segment began is the server's
-                // reply TO that segment — to the echo, or to the interruption.
-                let replyToSegment: String? = {
-                    guard let a = activeResponseId, a != segment.activeAtStart, a != cancelledResponseId else { return nil }
-                    return a
-                }()
-                let echo = isEcho(tokens)
-                lastEchoScore = (tokens.filter { spokenSet.contains($0) }.count, tokens.count, spokenTail.count)
-                if echo {
-                    // The model's own words came back through the mic. Take the
-                    // echo out of the conversation and kill the server's reply
-                    // to it — before it plays, if we are quick; mid-air if not.
-                    if let itemId { out.append(.deleteItem(id: itemId)) }
-                    if let reply = replyToSegment {
-                        cancelledResponseId = reply
-                        responseActive = false
-                        out.append(.sendCancel)
-                        if playingResponseId == reply {
-                            out.append(.flushPlayback)
-                            playbackQueued = false
-                            playingResponseId = nil
-                            out.append(.clearCaption)
-                            out.append(.uiState(.listening))
-                            if state == .speaking { state = .idle }
-                        }
-                    } else if !suppressedCancelledThisSegment {
-                        suppressNextResponse = true
-                    }
-                } else {
-                    // Real words. Whatever the server replies to them must play —
-                    // even if an earlier echo left a suppress armed.
-                    suppressNextResponse = false
-                    if let itemId { busySegments[itemId] = nil }
-                    lastSegmentBusy = (false, nil)
-                    guard modelBusy else { break }   // said after the reply ended: a normal turn
-                    // Over the reply: stop it — once. A later transcript of the
-                    // same words must not cancel again.
-                    if let reply = replyToSegment, reply != playingResponseId {
-                        // The server already answered the interruption; only
-                        // the OLD reply's queued audio has to go.
-                        out.append(.flushPlayback)
-                        playbackQueued = false
-                        playingResponseId = nil
-                        out.append(.clearCaption)
-                        out.append(.uiState(.thinking))
-                    } else {
-                        out += cancel()
-                        if suppressedCancelledThisSegment {
-                            // Their reply was cancelled as a suspected blip
-                            // before the words arrived — ask again.
-                            suppressedCancelledThisSegment = false
-                            out.append(.createResponse)
-                        }
-                    }
+        case .transcription(let text, let itemId, let final):
+            // Energy routes: an accelerator, under the same two-sided rule as
+            // the tick — a transcript with the mic already closed is not the
+            // user talking over (deltas also stream for the model's echo).
+            if profile.confirm == .energy, case .ducked = state, gateOpen { out += cancel() }
+            let tokens = Self.tokens(text)
+            let index = segmentIndex(for: itemId)
+            let segment = index.map { segments[$0] } ?? Segment(itemId: itemId, echoPossible: false)
+            let alreadyCancelled = activeResponseId != nil && activeResponseId == cancelledResponseId
+            if !final {
+                // Streaming words. On the loudspeaker the first REAL ones of a
+                // segment that began on air stop the reply — once.
+                guard profile.confirm == .transcript, !tokens.isEmpty, segment.echoPossible, modelBusy, !alreadyCancelled else { break }
+                lastEchoScore = score(tokens)
+                if !isEcho(tokens) { out += cancel() }
+                break
+            }
+            if index.map({ segments[$0].responded }) == true { break }   // a completed transcript re-sent
+            let id = segment.itemId ?? itemId
+            guard !tokens.isEmpty else {
+                // A cough, "um", "…", an echo heard as Chinese: no words, no turn.
+                if let id { out.append(.deleteItem(id: id)) }
+                break
+            }
+            guard let index else {
+                // No segment we saw begin: a server that sends no
+                // speech_started, or the ASR of the turn a reply is already
+                // answering, landing late (it used to wipe the reply's first
+                // words — VoiceCaptionTests). Caption it; answer it only if
+                // nothing is on air; never cut a reply on it.
+                out.append(.userTurn(text))
+                if !holdToTalk, !modelBusy {
+                    out.append(.createResponse)
+                    out.append(.uiState(.thinking))
+                }
+                break
+            }
+            if segment.echoPossible {
+                lastEchoScore = score(tokens)
+                if isEcho(tokens) {
+                    // The model's own words came back through the mic.
+                    if let id { out.append(.deleteItem(id: id)) }
+                    break
                 }
             }
+            // The user's turn.
+            out.append(.userTurn(text))
+            if holdToTalk { break }   // the release already committed + asked
+            segments[index].responded = true
+            if modelBusy && !alreadyCancelled { out += cancel() }
+            if responseActive {
+                // Wait for the cancelled reply's done; ask on the tick if it
+                // never comes.
+                pendingCreate = true
+                pendingCreateSince = now
+                out.append(.startConfirmTimer(ms: Self.pendingCreateFallbackMs))
+            } else {
+                out.append(.createResponse)
+            }
+            out.append(.uiState(.thinking))
 
         case .assistantTranscript(let delta):
             let t = Self.tokens(delta)
             guard !t.isEmpty else { break }
-            spokenTail.append(contentsOf: t)
-            if spokenTail.count > 160 { spokenTail.removeFirst(spokenTail.count - 160) }
-            spokenSet = Set(spokenTail)
+            spokenCurrent.append(contentsOf: t)
+            if spokenCurrent.count > Self.spokenCap { spokenCurrent.removeFirst(spokenCurrent.count - Self.spokenCap) }
+            spokenSet = Set(spokenPrevious).union(spokenCurrent)
 
         case .tick:
             // Compare in whole milliseconds: `now - since` is floating point
@@ -554,16 +549,20 @@ struct BargeInController: Sendable {
                 if gateOpen && serverSpeaking {
                     out += cancel()
                 } else {
-                    // A blip. If the server is still in its segment it WILL
-                    // commit + reply to it — suppress that reply, as the
-                    // speech_stopped path does. Nothing committed otherwise.
-                    if serverSpeaking { suppressNextResponse = true }
                     out += restoreToSpeaking()
                 }
+            }
+            if pendingCreate, Int(((now - pendingCreateSince) * 1000).rounded()) >= Self.pendingCreateFallbackMs {
+                // The cancelled reply's done never came: ask anyway.
+                pendingCreate = false
+                responseActive = false
+                out.append(.createResponse)
+                out.append(.uiState(.thinking))
             }
 
         case .interruptPressed:
             if state == .hold { break }
+            pendingCreate = false   // the user wants silence, not the next reply
             if modelBusy {
                 out += cancel(hard: true)
             }
@@ -582,7 +581,15 @@ struct BargeInController: Sendable {
             default:
                 break
             }
-            out.append(.uiState(uiStateNow))
+            if pendingCreate {
+                // Our cancel found nothing to cancel — the reply had already
+                // finished. Its done is not coming; answer now.
+                pendingCreate = false
+                out.append(.createResponse)
+                out.append(.uiState(.thinking))
+            } else {
+                out.append(.uiState(uiStateNow))
+            }
 
         case .routeChanged(let route):
             let next = BargeInProfile.forRoute(route)
@@ -623,6 +630,20 @@ struct BargeInController: Sendable {
     }
 
     // MARK: transcript confirm
+
+    /// The segment a transcript belongs to: by item id when both sides carry
+    /// one; otherwise (id-less on either side) the most recent segment. Two
+    /// different ids is no match — never attribute one item's words to
+    /// another's segment.
+    private func segmentIndex(for itemId: String?) -> Int? {
+        if let itemId, let i = segments.lastIndex(where: { $0.itemId == itemId }) { return i }
+        guard let last = segments.indices.last else { return nil }
+        return (itemId == nil || segments[last].itemId == nil) ? last : nil
+    }
+
+    private func score(_ heard: [String]) -> (hits: Int, heard: Int, spoken: Int) {
+        (heard.filter { spokenSet.contains($0) }.count, heard.count, spokenPrevious.count + spokenCurrent.count)
+    }
 
     /// Lower-cased word tokens, punctuation and APOSTROPHES stripped, one-letter
     /// tokens dropped ("a", "I" match everything). The model writes Tuesday’s
