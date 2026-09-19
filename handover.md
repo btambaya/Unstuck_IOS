@@ -934,6 +934,38 @@ again (the self-tripping). Echo scoring v2 (`BargeIn.swift`):
 - Tests: `BargeInTests` 51 (new 21a–f replay the 23:50 session), captions 9.
 - Ship: 1.1.1 (67) uploaded; on-device retest pending Ahmad.
 
+**Then (build 68): the phone test of 67 (00:04, Wi-Fi log) — "interrupted it
+three times, it ignored me till it finished, then tripped itself", and no
+greeting.** The garbled-echo rule held (4/5 → echo). Three findings:
+- **Interruptions judged too late, and lost.** On the loudspeaker a VAD
+  segment can only end when the reply pauses (its echo keeps the VAD open),
+  so a verdict at the end of the segment is a verdict AFTER the reply — and
+  the user's words, FIRST in the segment, were outscored by the echo of what
+  played after them ("How will this be like? You've got a few tasks wrapped
+  up" → 4/5 → echo). Fix: the transcriber's LIVE GUESS (`stash` on every
+  transcription.delta, cumulative, first word ~200 ms in — `text` stays empty
+  until the segment ends) now feeds the controller; `isEarlyInterruption`
+  cuts the reply mid-segment on clear evidence: ≥ 3 words, the first content
+  word not one the model said, ≥ 1 content word it never said, not echo. And
+  `isEcho` gained a LEADING rule mirroring the trailing one (≥ 3 words before
+  the first echoed word, with a content miss among them → theirs).
+- **A segment completed in pieces.** "Coming up on." (echo) then "Day." as a
+  second completed transcript for the SAME item → judged alone → cut the reply
+  → answered; its echo "And Friday." landed 90 ms after the flush, outside any
+  grace window → answered too. Fix: a later short piece of an echo-judged
+  segment is echo; `conversation.item.delete` for echo / no-word items is
+  HELD (`pendingDeletes`) until the next segment starts or a reply is asked
+  for, so the user's question inside the same segment (a later completed for
+  the same item, ≥ 3 words / a content miss) un-deletes it; a flush now sets
+  `lastDrained` so the flushed tail's echo gets the 1.5 s grace window.
+- **No greeting.** Socket open, primer + response.create sent, NOTHING back
+  (no response.created, no error) until the user spoke 6 s later; the session
+  before had greeted in 2 s. `scheduleOpeningWatchdog`: one more
+  response.create if nothing has started 2.5 s in (log: `voice opening retry`).
+- `pendingCreateFallbackMs` 1500 → 2500 (a done took 1.9 s with a tool call in flight).
+- Tests: `BargeInTests` 60 (22a–e, 23a–d replay the session), captions 9.
+- Ship: 1.1.1 (68) uploaded; on-device retest pending Ahmad.
+
 ## Where things stand (2026-09-12) — ONE freshness owner, and a cursor catch-up that is the correctness path
 
 The reason live-sync bugs kept coming back: `postgres_changes` has **no

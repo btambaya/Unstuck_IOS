@@ -33,8 +33,10 @@
 //      began while a reply was on air stop it.
 //   3. ECHO: a transcript that is (≥70 %) words the model itself just said,
 //      from a segment that began while a reply was on air or within 1.5 s of
-//      its audio draining, is echo → item deleted, nothing answered, nothing
-//      shown. The reference is the reply on air and the one before it, not a
+//      its audio draining, is echo → nothing answered, nothing shown, and
+//      the item deleted once the next segment starts (the user's question
+//      often shares the segment with the echo's tail and arrives as a later
+//      piece of the same item). The reference is the reply on air and the one before it, not a
 //      long tail, so a real sentence sharing everyday words with older
 //      replies does not look like echo.
 //   4. An RMS noise gate in the capture path: floor-calibrated, hysteresis,
@@ -283,7 +285,8 @@ struct BargeInController: Sendable {
     private(set) var pendingCreate = false
     private var pendingCreateSince: TimeInterval = 0
     /// If that done never comes (or the cancel found nothing), ask anyway.
-    static let pendingCreateFallbackMs = 1500
+    /// 2.5 s: a done took 1.9 s once (a tool call in flight, 2026-09-20).
+    static let pendingCreateFallbackMs = 2500
 
     /// Echo reference: the words of the reply on air and of the one before
     /// it (a reply's tail echoes after the next response was created). Not a
@@ -309,9 +312,19 @@ struct BargeInController: Sendable {
         var onAir = false
         /// `response.create` already issued (or pending) for it.
         var responded = false
+        /// Judged echo by its words. The transcriber can complete one segment
+        /// in pieces ("Coming up on." then "Day.", device log 2026-09-20
+        /// 00:04:43): a short later piece is more of the same echo, not a turn.
+        var echoJudged = false
     }
     private var segments: [Segment] = []
     static let segmentHistory = 8
+    /// Items judged echo / no words, whose `conversation.item.delete` is HELD
+    /// until the next segment starts or a reply is asked for: the user often
+    /// starts talking inside the same VAD segment as the reply's echo tail,
+    /// and their words then arrive as a later completed transcript for the
+    /// same item — deleted already, it would answer nothing.
+    private(set) var pendingDeletes: [String] = []
     /// The reply whose audio just finished, and when: its LAST words echo back
     /// after the queue has drained (device log 2026-09-19 22:39:35: drained,
     /// then 30 ms later a segment that transcribed as the reply's tail). A
@@ -447,6 +460,7 @@ struct BargeInController: Sendable {
             // its audio) has said nothing aloud yet.
             let onAir = playbackQueued
             let inGrace = !onAir && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
+            out += flushPendingDeletes(except: itemId)
             segments.append(Segment(itemId: itemId, echoPossible: onAir || inGrace, onAir: onAir))
             if segments.count > Self.segmentHistory { segments.removeFirst(segments.count - Self.segmentHistory) }
             switch state {
@@ -458,7 +472,7 @@ struct BargeInController: Sendable {
                 out += duck(now: now, trigger: .server)
             case .ducked(_, let trigger) where trigger == .gate:
                 // The server agrees with the gate — that's speech.
-                out += cancel()
+                out += cancel(now: now)
             default:
                 break
             }
@@ -475,7 +489,7 @@ struct BargeInController: Sendable {
             // Energy routes: an accelerator, under the same two-sided rule as
             // the tick — a transcript with the mic already closed is not the
             // user talking over (deltas also stream for the model's echo).
-            if profile.confirm == .energy, case .ducked = state, gateOpen { out += cancel() }
+            if profile.confirm == .energy, case .ducked = state, gateOpen { out += cancel(now: now) }
             let tokens = Self.tokens(text)
             let index = segmentIndex(for: itemId)
             let alreadyCancelled = activeResponseId != nil && activeResponseId == cancelledResponseId
@@ -485,21 +499,26 @@ struct BargeInController: Sendable {
                 // A segment we never saw begin never cuts a reply.
                 guard profile.confirm == .transcript, !tokens.isEmpty, modelBusy, !alreadyCancelled, let index else { break }
                 let segment = segments[index]
+                if segment.echoJudged { break }
                 if segment.echoPossible {
+                    // The live guess grows word by word while they speak; the
+                    // reply is cut the moment it is clearly theirs, not when
+                    // the segment ends (which, on the loudspeaker, is when the
+                    // reply pauses — device log 2026-09-20 00:04: three
+                    // interruptions "ignored until it finished").
                     lastEchoScore = score(tokens)
-                    if isEcho(tokens, onAir: segment.onAir) { break }
+                    guard isEarlyInterruption(tokens, onAir: segment.onAir) else { break }
                 }
-                out += cancel()
+                out += cancel(now: now)
                 break
             }
             if index.map({ segments[$0].responded }) == true { break }   // a completed transcript re-sent
             let id = (index.map { segments[$0].itemId } ?? nil) ?? itemId
-            guard !tokens.isEmpty else {
-                // A cough, "um", "…", an echo heard as Chinese: no words, no turn.
-                if let id { out.append(.deleteItem(id: id)) }
-                break
-            }
             guard let index else {
+                guard !tokens.isEmpty else {
+                    if let id { out.append(.deleteItem(id: id)) }   // no words, no segment: nothing to wait for
+                    break
+                }
                 // No segment we saw begin: a server that sends no
                 // speech_started, or the ASR of the turn a reply is already
                 // answering, landing late (it used to wipe the reply's first
@@ -513,19 +532,27 @@ struct BargeInController: Sendable {
                 break
             }
             let segment = segments[index]
-            if segment.echoPossible {
+            var notATurn = tokens.isEmpty                       // a cough, "um", "…", an echo heard as Chinese
+            if !notATurn, segment.echoJudged, tokens.count < 3 {
+                notATurn = true                                 // a later piece of the echo already judged
+            } else if !notATurn, segment.echoPossible || segment.echoJudged {
                 lastEchoScore = score(tokens)
-                if isEcho(tokens, onAir: segment.onAir) {
-                    // The model's own words came back through the mic.
-                    if let id { out.append(.deleteItem(id: id)) }
-                    break
-                }
+                notATurn = isEcho(tokens, onAir: segment.onAir)  // the model's own words, back through the mic
             }
-            // The user's turn.
+            if notATurn {
+                if !tokens.isEmpty { segments[index].echoJudged = true }
+                if let id, !pendingDeletes.contains(id) { pendingDeletes.append(id) }
+                break
+            }
+            // The user's turn — possibly riding on the echo's tail inside the
+            // same segment; then the whole item is theirs and stays.
+            if let id { pendingDeletes.removeAll { $0 == id } }
+            segments[index].echoJudged = false
             out.append(.userTurn(text))
             if holdToTalk { break }   // the release already committed + asked
             segments[index].responded = true
-            if modelBusy && !alreadyCancelled { out += cancel() }
+            out += flushPendingDeletes(except: nil)   // before the ask: the model never sees the echo items
+            if modelBusy && !alreadyCancelled { out += cancel(now: now) }
             if responseActive {
                 // Wait for the cancelled reply's done; ask on the tick if it
                 // never comes.
@@ -558,7 +585,7 @@ struct BargeInController: Sendable {
                 // loudspeaker — a tap, a chair, a cough — cancelled the reply
                 // (Ahmad's iPhone, 2026-09-17: "interrupted by any noise").
                 if gateOpen && serverSpeaking {
-                    out += cancel()
+                    out += cancel(now: now)
                 } else {
                     out += restoreToSpeaking()
                 }
@@ -575,7 +602,7 @@ struct BargeInController: Sendable {
             if state == .hold { break }
             pendingCreate = false   // the user wants silence, not the next reply
             if modelBusy {
-                out += cancel(hard: true)
+                out += cancel(now: now, hard: true)
             }
 
         case .benignActiveResponseError:
@@ -611,7 +638,7 @@ struct BargeInController: Sendable {
 
         case .pttDown:
             guard holdToTalk, state != .hold else { break }
-            if modelBusy { out += cancel(hard: true) }
+            if modelBusy { out += cancel(now: now, hard: true) }
             state = .hold
             out.append(.uiState(.listening))
 
@@ -652,6 +679,13 @@ struct BargeInController: Sendable {
         return (itemId == nil || segments[last].itemId == nil) ? last : nil
     }
 
+    /// The held deletes, as commands — all of them, or all but one item's.
+    private mutating func flushPendingDeletes(except itemId: String?) -> [BargeInCommand] {
+        let due = pendingDeletes.filter { $0 != itemId }
+        pendingDeletes.removeAll { $0 != itemId }
+        return due.map { .deleteItem(id: $0) }
+    }
+
     private func score(_ heard: [String]) -> (hits: Int, heard: Int, spoken: Int) {
         let e = echoEvidence(heard)
         return (e.hits, e.heard, spokenPrevious.count + spokenCurrent.count)
@@ -680,12 +714,49 @@ struct BargeInController: Sendable {
         return String(t.dropLast())
     }
 
-    /// Content words heard vs the reference (whole utterance if it has none).
-    private func echoEvidence(_ heard: [String]) -> (hits: Int, heard: Int, fallback: Bool) {
-        let content = heard.filter { !Self.stopWords.contains($0) }
+    /// Content words heard vs the reference (whole utterance if it has none),
+    /// and the stretches BEFORE the first / AFTER the last content word the
+    /// model said: how many words each, and whether either holds a content
+    /// word the model never said.
+    private struct EchoEvidence {
+        var hits = 0, heard = 0
+        var fallback = false
+        var leading = 0, leadingMisses = 0
+        var trailing = 0, trailingMisses = 0
+        var firstContentIsHit = false
+    }
+    private func echoEvidence(_ heard: [String]) -> EchoEvidence {
+        var e = EchoEvidence()
+        let isContent: (String) -> Bool = { !Self.stopWords.contains($0) }
+        let isHit: (String) -> Bool = { isContent($0) && self.spokenSet.contains(Self.stem($0)) }
+        let content = heard.filter(isContent)
         let judged = content.isEmpty ? heard : content
-        let hits = judged.filter { spokenSet.contains(Self.stem($0)) }.count
-        return (hits, judged.count, content.isEmpty)
+        e.hits = judged.filter { spokenSet.contains(Self.stem($0)) }.count
+        e.heard = judged.count
+        e.fallback = content.isEmpty
+        e.firstContentIsHit = content.first.map(isHit) ?? false
+        let first = heard.firstIndex(where: isHit)
+        let last = heard.lastIndex(where: isHit)
+        let head = heard[..<(first ?? heard.count)]
+        let tail = last.map { heard[($0 + 1)...] } ?? heard[...]
+        e.leading = head.count
+        e.leadingMisses = head.filter { isContent($0) && !isHit($0) }.count
+        e.trailing = tail.count
+        e.trailingMisses = tail.filter { isContent($0) && !isHit($0) }.count
+        return e
+    }
+
+    /// While a segment is still open, from the transcriber's live guess: cut
+    /// the reply only on clear evidence — three or more words, the first
+    /// content word not one the model said (the user's words come first in a
+    /// mixed segment; an echo's do not), at least one content word the model
+    /// never said, and not echo by the usual rules. A garbled echo ("Lucks
+    /// pretty solid") stays echo; "How will this be like" cuts at word five.
+    func isEarlyInterruption(_ heard: [String], onAir: Bool) -> Bool {
+        guard heard.count >= 3, !spokenSet.isEmpty else { return heard.count >= 3 && spokenSet.isEmpty }
+        let e = echoEvidence(heard)
+        guard !e.fallback, !e.firstContentIsHit, e.leadingMisses + e.trailingMisses >= 1 else { return false }
+        return !isEcho(heard, onAir: onAir)
     }
 
     /// Lower-cased word tokens, punctuation and APOSTROPHES stripped, one-letter
@@ -716,6 +787,16 @@ struct BargeInController: Sendable {
     func isEcho(_ heard: [String], onAir: Bool = true) -> Bool {
         guard !heard.isEmpty, !spokenSet.isEmpty else { return false }
         let e = echoEvidence(heard)
+        // Their words and the echo's in ONE segment: a question riding on the
+        // echo's tail ("…coming up on Friday. What about Monday?" — the reply
+        // ended, they spoke before the VAD's 600 ms), or their interruption
+        // with the echo of what played after it ("How will this be like?
+        // You've got a few tasks wrapped up", device log 2026-09-20). Three
+        // or more words before the first / after the last word the model
+        // said, with a content word among them it never said, are theirs,
+        // whatever the ratio. A garbled echo differs by one word.
+        if !e.fallback, e.trailing >= 3, e.trailingMisses >= 1 { return false }
+        if !e.fallback, e.leading >= 3, e.leadingMisses >= 1 { return false }
         let threshold: Double = e.fallback ? 0.7 : (onAir ? 0.5 : 0.6)
         return Double(e.hits) / Double(e.heard) >= threshold
     }
@@ -736,7 +817,7 @@ struct BargeInController: Sendable {
     /// CANCEL: stop the reply for good. `hard` = the Interrupt button, which
     /// never went through DUCKED; the restore is idempotent either way and
     /// keeps the NEXT reply at unity.
-    private mutating func cancel(hard: Bool = false) -> [BargeInCommand] {
+    private mutating func cancel(now: TimeInterval, hard: Bool = false) -> [BargeInCommand] {
         var out: [BargeInCommand] = []
         if responseActive {
             cancelledResponseId = activeResponseId
@@ -747,6 +828,13 @@ struct BargeInController: Sendable {
             cancelledResponseId = active
         }
         out.append(.flushPlayback)
+        if playbackQueued {
+            // The last of the flushed audio is already in the room and comes
+            // back as a segment of its own, exactly as after a natural drain
+            // (device log 2026-09-20 00:04:43: "And Friday." 90 ms after a flush).
+            lastDrained = (playingResponseId, now)
+            playingResponseId = nil
+        }
         playbackQueued = false
         muted = true
         out.append(.restore)

@@ -195,6 +195,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     // didCompleteWithError delegate for the same failed connection.
     private var _reportedError = false
     private var _primerDeleted = false
+    /// Any response.created seen this session, and how many opening
+    /// response.creates went out (the first + at most one retry).
+    private var _anyResponse = false
+    private var _openingCreates = 0
     private var _guard = VoiceIntegrityGuard()
     /// Both event shapes can carry the same call — dispatch once.
     private var _handledCalls = Set<String>()
@@ -502,6 +506,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
               "item": ["id": Self.primerItemId, "type": "message", "role": "user",
                        "content": [["type": "input_text", "text": opening]]]])
         send(["type": "response.create"])
+        withLock { _openingCreates = 1 }
+        scheduleOpeningWatchdog()
         audio.onPlaybackDrained = { [weak self] in self?.dispatch(.playbackDrained) }
         audio.onGateChange = { [weak self] open in self?.dispatch(open ? .gateOpen : .gateClose) }
         audio.setGateContext(gateCtx)
@@ -574,7 +580,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case "input_audio_buffer.speech_stopped":
             dispatch(.speechStopped)
         case "response.created":
-            withLock { _guard.responseCreated() }
+            withLock { _guard.responseCreated(); _anyResponse = true }
             // The model heard the user and is reasoning — "Thinking" until the
             // first audio delta (or an immediate cancel if this reply is the
             // one the server made from a false-start blip).
@@ -609,9 +615,14 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case "conversation.item.input_audio_transcription.delta":
             // Energy profiles: a confirm accelerator that may never arrive.
             // Transcript profiles (loudspeaker): THE confirm — see BargeIn.
-            // DashScope: `text` is the confirmed part, `stash` the guess; the
-            // OpenAI shape is `delta`. Confirmed words only.
-            let piece = (ev["text"] as? String) ?? (ev["delta"] as? String) ?? ""
+            // DashScope: `text` is the confirmed part (empty until the segment
+            // ends) and `stash` the live guess, cumulative, first word ~200 ms
+            // after speech_started; the OpenAI shape is `delta`. The guess is
+            // what lets the controller cut a reply while the user is still
+            // talking (2026-09-20).
+            let confirmed = (ev["text"] as? String) ?? (ev["delta"] as? String) ?? ""
+            let guess = (ev["stash"] as? String) ?? ""
+            let piece = confirmed.isEmpty ? guess : confirmed + guess
             dispatch(.transcription(text: piece, itemId: ev["item_id"] as? String, final: false))
         case "conversation.item.input_audio_transcription.completed":
             // THE decision point since build 66: the controller answers with
@@ -735,6 +746,27 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 self.withLock { self._continueTask = nil }
                 self.send(["type": "response.create"])
             }
+        }
+    }
+
+    /// The opening reply went missing once on the device (2026-09-20 00:04:
+    /// socket open, primer + response.create sent, and nothing came back — no
+    /// response.created, no error — until the user spoke 6 s later; the same
+    /// code had greeted in 2 s the session before). Ask again, once, if
+    /// nothing has started 2.5 s in. A duplicate while a reply IS starting
+    /// only earns an "already has an active response" error, which is benign.
+    private func scheduleOpeningWatchdog() {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard let self else { return }
+            let retry: Bool = self.withLock {
+                guard self._open, !self._anyResponse, self._openingCreates < 2 else { return false }
+                self._openingCreates += 1
+                return true
+            }
+            guard retry else { return }
+            voiceLog.notice("voice opening retry: no response 2.5 s after the first response.create")
+            self.send(["type": "response.create"])
         }
     }
 
