@@ -73,9 +73,30 @@ struct BargeInProfile: Sendable, Equatable {
     /// loudspeaker the Interrupt button cuts a reply, from response.created
     /// until its audio has drained.
     let halfDuplexWhilePlaying: Bool
+    /// How a barge-in is CONFIRMED (2026-09-19).
+    /// `.energy`: the two-sided rule — server VAD in a speech segment AND the
+    ///   mic still above the gate for `confirmMs`. Right where the mic hears
+    ///   little playback (receiver, earphones, Bluetooth).
+    /// `.transcript`: by WORDS. Nothing ducks and no timer runs; the server's
+    ///   transcription of what it heard is compared with what the model just
+    ///   said. Echo → discarded (and the server's reply to it suppressed, its
+    ///   item deleted). Real words → the reply stops. A cough has no words.
+    ///   This is the loudspeaker answer: half-duplex (build 54) took talk-over
+    ///   away entirely, and echo cancellation with ducking off (build 37→54)
+    ///   was tried on the device and still let the echo cancel the reply.
+    ///   Words don't care about acoustics.
+    let confirm: Confirm
+    enum Confirm: Sendable, Equatable { case energy, transcript }
 
-    static let lowEcho = BargeInProfile(route: .lowEcho, threshold: 0.5, confirmMs: 200, marginIdle: 6, marginPlaying: 6, halfDuplexWhilePlaying: false)
-    static let speaker = BargeInProfile(route: .speaker, threshold: 0.6, confirmMs: 300, marginIdle: 6, marginPlaying: 9, halfDuplexWhilePlaying: true)
+    /// The same tunables with a different confirm — the state-machine tests
+    /// (1–15) exercise the ENERGY path on the loudspeaker's timings.
+    func with(confirm: Confirm) -> BargeInProfile {
+        BargeInProfile(route: route, threshold: threshold, confirmMs: confirmMs, marginIdle: marginIdle,
+                       marginPlaying: marginPlaying, halfDuplexWhilePlaying: halfDuplexWhilePlaying, confirm: confirm)
+    }
+
+    static let lowEcho = BargeInProfile(route: .lowEcho, threshold: 0.5, confirmMs: 200, marginIdle: 6, marginPlaying: 6, halfDuplexWhilePlaying: false, confirm: .energy)
+    static let speaker = BargeInProfile(route: .speaker, threshold: 0.6, confirmMs: 300, marginIdle: 6, marginPlaying: 9, halfDuplexWhilePlaying: false, confirm: .transcript)
 
     static func forRoute(_ route: VoiceRoute) -> BargeInProfile {
         switch route {
@@ -152,6 +173,14 @@ enum BargeInCommand: Equatable, Sendable {
     /// The reply being cancelled must not linger on screen.
     case clearCaption
     case uiState(VoiceState)
+    /// `conversation.item.delete` — the server transcribed the model's own
+    /// echo as a user turn; take it out of the conversation so the model
+    /// never sees its words attributed to the user.
+    case deleteItem(id: String)
+    /// `response.create` — the user's real words arrived AFTER the server's
+    /// reply to that segment was already cancelled as a suspected blip; ask
+    /// again so they are not left in silence.
+    case createResponse
 }
 
 enum BargeInEvent: Equatable, Sendable {
@@ -163,8 +192,12 @@ enum BargeInEvent: Equatable, Sendable {
     case playbackDrained
     case speechStarted
     case speechStopped
-    /// transcription.delta or .completed for the user's input (accelerator only).
-    case transcription
+    /// transcription.delta or .completed for the user's input. On an energy
+    /// profile an accelerator only; on a transcript profile THE confirm.
+    case transcription(text: String, itemId: String?)
+    /// response.audio_transcript.delta — the model's own words, kept as a
+    /// rolling tail so an input transcript can be recognised as echo.
+    case assistantTranscript(delta: String)
     case gateOpen
     case gateClose
     case interruptPressed
@@ -210,6 +243,26 @@ struct BargeInController: Sendable {
     private(set) var muted = false
     /// How many DUCK→restore cycles happened (the "noisy room?" chip, spec §8).
     private(set) var falseBargeIns = 0
+
+    /// Transcript confirm (see BargeInProfile.Confirm). The last ~160 tokens
+    /// the model spoke, across replies — echo of the PREVIOUS reply can land
+    /// after the next response was created.
+    private(set) var spokenTail: [String] = []
+    private var spokenSet: Set<String> = []
+    /// The response whose audio is (or was last) queued for playback — the
+    /// one an interruption should stop, as opposed to a NEWER response the
+    /// server may already have created for the interrupting turn.
+    private(set) var playingResponseId: String?
+    /// Per speech segment (speech_started … stopped): did any input
+    /// transcript arrive, and did we cancel a suppressed reply for it?
+    private var transcriptSeenThisSegment = false
+    private var suppressedCancelledThisSegment = false
+    /// A speech segment began WHILE this reply was busy — the only kind of
+    /// words that can be an interruption. The transcript of the user's own
+    /// previous turn (the question that CAUSED this reply) arrives late, after
+    /// the reply has started (VoiceCaptionTests, 2026-09-18); its segment
+    /// began before the reply did, so it must never cancel the reply.
+    private var interruptSegmentOpen = false
 
     private var lastGate: GateContext?
 
@@ -272,10 +325,12 @@ struct BargeInController: Sendable {
                 suppressNextResponse = false
                 cancelledResponseId = id
                 muted = true
+                suppressedCancelledThisSegment = true
                 out.append(.sendCancel)
                 out.append(.uiState(.listening))
             } else {
                 muted = false
+                interruptSegmentOpen = false        // a new reply: earlier segments were before it
                 out.append(.uiState(.thinking))
                 if state == .idle { state = .speaking }
             }
@@ -283,6 +338,7 @@ struct BargeInController: Sendable {
         case .audioDelta(let id):
             guard shouldEnqueueAudio(id: id) else { break }
             playbackQueued = true
+            if let id { playingResponseId = id }
             if state == .idle { state = .speaking }
             out.append(.uiState(.speaking))
 
@@ -309,7 +365,7 @@ struct BargeInController: Sendable {
         case .gateOpen:
             gateOpen = true
             gateOpenSince = now
-            if state == .speaking, modelBusy {
+            if state == .speaking, modelBusy, profile.confirm == .energy {
                 out += duck(now: now, trigger: .gate)
             }
 
@@ -324,7 +380,14 @@ struct BargeInController: Sendable {
 
         case .speechStarted:
             serverSpeaking = true
+            transcriptSeenThisSegment = false
+            suppressedCancelledThisSegment = false
+            if modelBusy { interruptSegmentOpen = true }
             switch state {
+            case .speaking where modelBusy && profile.confirm == .transcript:
+                // Words decide. The server VAD hears the loudspeaker's echo
+                // on every reply, so ducking here would dim every reply.
+                break
             case .speaking where modelBusy:
                 out += duck(now: now, trigger: .server)
             case .ducked(_, let trigger) where trigger == .gate:
@@ -336,20 +399,90 @@ struct BargeInController: Sendable {
 
         case .speechStopped:
             serverSpeaking = false
+            if profile.confirm == .transcript, modelBusy, !transcriptSeenThisSegment {
+                // The segment ended and no words came: a blip (a cough, the
+                // reply's own tail). The server WILL commit + reply to it —
+                // suppress that. If words arrive late and are real, the
+                // transcription branch lifts this and asks again.
+                suppressNextResponse = true
+            }
             if case .ducked(_, let trigger) = state, trigger == .server {
                 // The server saw a blip and WILL commit + reply to it.
                 suppressNextResponse = true
                 out += restoreToSpeaking()
             }
 
-        case .transcription:
-            // The accelerator is subject to the same two-sided rule as the
-            // tick: transcription deltas also stream for the PREVIOUS turn
-            // and for the model's own echo (device log 2026-09-17: a
-            // speech_started and a delta 0.4 ms apart cancelled a reply the
-            // user never interrupted). A transcript with the mic already
-            // closed is not the user talking over.
-            if case .ducked = state, gateOpen { out += cancel() }
+        case .transcription(let text, let itemId):
+            switch profile.confirm {
+            case .energy:
+                // The accelerator is subject to the same two-sided rule as
+                // the tick: transcription deltas also stream for the PREVIOUS
+                // turn and for the model's own echo (device log 2026-09-17:
+                // a speech_started and a delta 0.4 ms apart cancelled a reply
+                // the user never interrupted). A transcript with the mic
+                // already closed is not the user talking over.
+                if case .ducked = state, gateOpen { out += cancel() }
+            case .transcript:
+                let tokens = Self.tokens(text)
+                guard !tokens.isEmpty else { break }    // "um", "…", one letter: no words, not an interruption — and not proof of speech either
+                transcriptSeenThisSegment = true
+                // Not an interruption unless the words belong to a segment that
+                // began while this reply was busy: a normal turn, or the late
+                // transcript of the question this reply answers, is captions only.
+                guard modelBusy, interruptSegmentOpen else { break }
+                // A response the server created for THIS segment, still live:
+                // not the one whose audio we are playing, and not one we
+                // already cancelled as a blip.
+                // "Newer" only makes sense when something IS playing: while the
+                // model is still thinking (no audio yet) the active response is
+                // the reply to stop, not a reply to keep.
+                let newerReply: String? = {
+                    guard responseActive, let a = activeResponseId, let playing = playingResponseId,
+                          a != playing, a != cancelledResponseId else { return nil }
+                    return a
+                }()
+                if isEcho(tokens) {
+                    // The model's own words came back through the mic.
+                    if let itemId { out.append(.deleteItem(id: itemId)) }
+                    if let newer = newerReply {
+                        // The server already answered its own echo — cancel
+                        // THAT reply and keep playing the real one.
+                        cancelledResponseId = newer
+                        responseActive = false
+                        out.append(.sendCancel)
+                    } else if !suppressedCancelledThisSegment {
+                        suppressNextResponse = true
+                    }
+                } else {
+                    // Real words over the reply: stop it — once. A later
+                    // transcript of the same words must not cancel again.
+                    suppressNextResponse = false
+                    interruptSegmentOpen = false
+                    if newerReply != nil {
+                        // The server already answered the interruption; only
+                        // the OLD reply's queued audio has to go.
+                        out.append(.flushPlayback)
+                        playbackQueued = false
+                        out.append(.clearCaption)
+                        out.append(.uiState(.thinking))
+                    } else {
+                        out += cancel()
+                        if suppressedCancelledThisSegment {
+                            // Their reply was cancelled as a suspected blip
+                            // before the words arrived — ask again.
+                            suppressedCancelledThisSegment = false
+                            out.append(.createResponse)
+                        }
+                    }
+                }
+            }
+
+        case .assistantTranscript(let delta):
+            let t = Self.tokens(delta)
+            guard !t.isEmpty else { break }
+            spokenTail.append(contentsOf: t)
+            if spokenTail.count > 160 { spokenTail.removeFirst(spokenTail.count - 160) }
+            spokenSet = Set(spokenTail)
 
         case .tick:
             // Compare in whole milliseconds: `now - since` is floating point
@@ -433,6 +566,26 @@ struct BargeInController: Sendable {
         let ctx = gateContext
         lastGate = ctx
         return ctx
+    }
+
+    // MARK: transcript confirm
+
+    /// Lower-cased word tokens, punctuation stripped, one-letter tokens
+    /// dropped ("a", "I" match everything).
+    static func tokens(_ text: String) -> [String] {
+        text.lowercased()
+            .split { !($0.isLetter || $0.isNumber || $0 == "'") }
+            .map(String.init)
+            .filter { $0.count >= 2 }
+    }
+
+    /// Echo: (nearly) every word heard is a word the model recently said.
+    /// 70 %, not 100 %: transcription drops and mangles words. A user talking
+    /// OVER the reply mixes their words in and pulls the ratio down.
+    func isEcho(_ heard: [String]) -> Bool {
+        guard !heard.isEmpty, !spokenSet.isEmpty else { return false }
+        let hits = heard.filter { spokenSet.contains($0) }.count
+        return Double(hits) / Double(heard.count) >= 0.7
     }
 
     // MARK: transitions

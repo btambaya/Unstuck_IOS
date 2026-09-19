@@ -381,6 +381,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .duck: return "duck"
             case .restore: return "restore"
             case .sendCancel: return "cancel"
+            case .deleteItem: return "delete-echo"
+            case .createResponse: return "respond"
             case .flushPlayback: return "flush"
             case .startConfirmTimer(let ms): return "timer\(ms)"
             case .uiState(let s): return "ui:\(s)"
@@ -397,6 +399,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .restore: audio.setPlaybackGain(1)
             case .flushPlayback: audio.flushPlayback()
             case .sendCancel: send(["type": "response.cancel"])
+            case .deleteItem(let id): send(["type": "conversation.item.delete", "item_id": id])
+            case .createResponse: send(["type": "response.create"])
             case .commitAndRespond:
                 send(["type": "input_audio_buffer.commit"])
                 send(["type": "response.create"])
@@ -581,15 +585,19 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             guard withLock({ _bargeIn.acceptsTranscript(id: responseId) }) else { return }
             if let d = ev["delta"] as? String {
                 withLock { _guard.transcriptDelta(d) }
+                dispatch(.assistantTranscript(delta: d))   // the echo reference
                 onCaption("assistant", d, false)
             }
         case "response.audio_transcript.done":
             onCaption("assistant", "", true)
         case "conversation.item.input_audio_transcription.delta":
-            dispatch(.transcription)   // confirm accelerator only — may never arrive
+            // Energy profiles: a confirm accelerator that may never arrive.
+            // Transcript profiles (loudspeaker): THE confirm — see BargeIn.
+            dispatch(.transcription(text: (ev["delta"] as? String) ?? "", itemId: ev["item_id"] as? String))
         case "conversation.item.input_audio_transcription.completed":
-            dispatch(.transcription)
-            if let t = ev["transcript"] as? String { onCaption("user", t, true) }
+            let t = (ev["transcript"] as? String) ?? ""
+            dispatch(.transcription(text: t, itemId: ev["item_id"] as? String))
+            if !t.isEmpty { onCaption("user", t, true) }
         case "response.audio.done", "response.done":
             // `response.done` is terminal for the WHOLE reply, so it closes the
             // caption segment too — a backend that never sends
