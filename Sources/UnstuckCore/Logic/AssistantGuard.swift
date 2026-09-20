@@ -161,6 +161,12 @@ private let CLAIM_PATTERNS: [NSRegularExpression] = [
     // Compliance promises that require persistence: "I'll skip/stop using
     // the name" — unsaved, that's forgotten by the next session.
     re("\\bI(?:['’]ll| will) (?:skip|stop|avoid|drop|leave out|not (?:use|say|mention))\\b"),
+    // Any promise of an action the tools do: "I'll set a reminder for one
+    // minute from now", "I'll call you at 3" — said INSTEAD of calling the
+    // tool (voice, 2026-09-20: a call the user asked for was promised and
+    // never booked). A promise followed by the tool in the same turn is fine:
+    // the bounce only fires when no write succeeded.
+    re("\\bI(?:['’]ll| will|['’]m going to| am going to) (?:set|call|ring|phone|remind|book|schedule|add|create|make|move|reschedule|shift|cancel|delete|remove|mark|save|put|block|share|start|pause|resume|extend|finish|tick|pin|archive|restore|rename|recolou?r|turn|switch|complete|update|change|clear|park|carry|send)\\b"),
     re("^noted\\b"),
 ]
 

@@ -7,12 +7,36 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (72) uploaded to TestFlight — the calls build-out (iOS half) on top of build 71; the backend (migration 072, send-call, call-outcome) is live in prod. 2026-09-20.
 
+- Ship: 1.1.1 (73) uploaded to TestFlight — a promised action is a claim + the voice CALLS rule (see the entry below). 2026-09-20.
+
+
+## Where things stand (2026-09-20, evening) — build 73: a promised action is a claim; the voice prompt gets the CALLS rule
+
+Ahmad asked Talk "call me in one minute and remind me…" and no call came: the
+assistant said "I'll set a reminder for one minute from now" and called no tool
+(`assistant_turns`, 15:18 UTC; no `call_requests` row). Two holes, fixed in
+lockstep with web (commit 40fbc94) and Android (vc98):
+
+- `Sources/UnstuckCore/Logic/AssistantGuard.swift` — a new claim pattern: any
+  `I'll / I will / I'm going to <tool verb>` (set, call, remind, book, add, move,
+  mark, share…) is an action claim, so a promise made INSTEAD of a tool call is
+  bounced into the real call by the existing corrective (text harness and the
+  voice integrity guard share the pattern). Offers ("do you want me to call
+  you?") and refusals ("I can't book that outside your hours") still pass.
+  Test: `AssistantGuardTests.testPromisesOfAnActionAreClaims`.
+- `App/Features/AssistantContext.swift` — the voice honesty block now carries
+  the CALLS rule (verbatim from web `CALLS_RULE`): "call me at/in …" means
+  `request_call` NOW with `when` from `context.today` + `context.now` ("in one
+  minute" = now + 1 min), the reminders verbatim as notes, a call exists only on
+  `ok`, never book an unasked call, a bare "remind me at 5" is a scheduled task.
+- Rules of record: `unstuck/docs/assistant-tooling-rules.md` §2 + §3.
+
 ## Where things stand (2026-09-20, later) — calls build-out, iOS half
 
 The iOS section of `unstuck/docs/calls-build-out.md` (backend built in parallel:
 migration 072 `call_requests.kind/retries`, `notification_preferences.call_*`,
 `callKind` + `endTime` on the push, `call-outcome → { ok, status, retry, snoozeUntil? }`).
-NOT bumped, not committed.
+Shipped as build 72 (commit a66f6e9).
 
 - **Settings › Calls** (`CallSettingsView`): master **Calls** switch
   (`CallSettings.enabled`, device-local, default ON — enforced ON RECEIPT in

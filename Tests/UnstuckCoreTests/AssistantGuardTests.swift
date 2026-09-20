@@ -167,4 +167,15 @@ final class AssistantGuardTests: XCTestCase {
         XCTAssertEqual(stripSelfCorrection("Sorry about that."), "Sorry about that.")
         XCTAssertEqual(stripSelfCorrection("   Sorry about that.  "), "Sorry about that.")
     }
+
+    func testPromisesOfAnActionAreClaims() {
+        // Voice, 2026-09-20: "call me in one minute" → "I'll set a reminder for
+        // one minute from now" and no request_call. A promise IS a claim.
+        XCTAssertTrue(looksLikeActionClaim("Sure, just testing — I'll set a reminder for one minute from now."))
+        XCTAssertTrue(looksLikeActionClaim("I'll call you at three about James."))
+        XCTAssertTrue(looksLikeActionClaim("I'm going to add that to your list."))
+        XCTAssertTrue(looksLikeActionClaim("I will remind you before the dentist."))
+        XCTAssertFalse(looksLikeActionClaim("Do you want me to call you before the dentist?"))
+        XCTAssertFalse(looksLikeActionClaim("I can't book that outside your call hours — want 9am tomorrow?"))
+    }
 }
