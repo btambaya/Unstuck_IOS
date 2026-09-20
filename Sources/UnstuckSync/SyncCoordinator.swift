@@ -70,6 +70,9 @@ public actor SyncCoordinator {
     public nonisolated let assistant: AssistantClient
     /// "Unstuck calls you" (C1): call_requests rows + the call-outcome edge fn.
     public nonisolated let calls: CallsClient
+    /// The local mirror of `call_requests` (hydrate + realtime + catch-up) —
+    /// what get_calls, the task editor and the call deep link read.
+    public nonisolated let callsMirror: CallRequestsMirror
     /// THE FRESHNESS OWNER — the single component that answers "am I in step?"
     /// and the only thing allowed to decide a pull is needed. Realtime, the
     /// app lifecycle, the network monitor and the floor interval all report
@@ -109,6 +112,7 @@ public actor SyncCoordinator {
         self.loginTracker = LoginTrackerClient(provider.client)
         self.assistant = AssistantClient(provider.client)
         self.calls = CallsClient(provider.client)
+        self.callsMirror = CallRequestsMirror(db)
         let hydrator = Hydrator(gateway: gateway, db: db)
         let flusher = OutboxFlusher(gateway: gateway, db: db)
         let realtime = RealtimeMirror(client: provider.client, db: db)

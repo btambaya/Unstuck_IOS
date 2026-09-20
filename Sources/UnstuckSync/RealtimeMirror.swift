@@ -190,6 +190,13 @@ public actor RealtimeMirror {
         await subscribe("life_areas", LifeAreaDbRow.self, userId: userId,
                         onUpsert: { [db] in try? db.save($0.model()) },
                         onDelete: { [db] in try? db.deleteById(LifeArea.self, id: $0) })
+        // call_requests (migration 051: published, replica identity full): a
+        // booking from the web / the assistant, the dispatcher flipping a row
+        // to `calling`, call-outcome settling it — all reach the mirror live.
+        // LWW on `updated_at`; the cursor catch-up is the correctness path.
+        await subscribe("call_requests", CallRequest.self, userId: userId,
+                        onUpsert: { [db] row in try? CallRequestsMirror(db).upsert(row) },
+                        onDelete: { [db] in try? db.deleteById(CallRequest.self, id: $0) })
         // Membership changes for ME — a new share or a revocation. Re-hydrate
         // collections so the freshly-shared list appears / the revoked one drops.
         await subscribeMembers(userId: userId, onChanged: onMembersChanged)

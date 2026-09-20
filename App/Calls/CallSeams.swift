@@ -90,14 +90,21 @@ protocol CallEnvironment: AnyObject {
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool
     /// The user's own allowed-hours guard (Settings → Calls from Unstuck).
     func isWithinCallHours(_ date: Date) -> Bool
+    /// The master "Calls" switch on THIS phone (Settings › Calls; Android's
+    /// `enabled`). Off → a call that lands ends as `declined` quietly + the
+    /// notes as a notification, exactly like the outside-hours rule.
+    var isCallsEnabled: Bool { get }
 }
 
 extension CallEnvironment {
     var isSessionKnown: Bool { true }
+    var isCallsEnabled: Bool { true }
 }
 
-/// A local notification the coordinator wants posted.
-struct CallNotification: Equatable, Sendable {
+/// A local notification the coordinator wants posted. Codable so the outcome
+/// reporter can persist a "post this unless the server retries" note with
+/// the queued `missed` report (see CallsOutcomeReporter).
+struct CallNotification: Equatable, Sendable, Codable {
     var id: String
     var title: String
     var body: String
@@ -116,7 +123,12 @@ protocol CallNotifier: AnyObject {
 protocol CallOutcomeReporting: AnyObject {
     /// `callKitId` is the CXCall UUID the phone presented (CallSession.uuid);
     /// the server stores it on the row (`call_id`) for cross-referencing.
-    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?)
+    /// `notifyUnlessRetry`: a local notification to post ONCE the server has
+    /// taken the report AND answered `retry: false` — the "I called about X"
+    /// for a miss. `retry: true` (the server re-rings in 5 min) swallows it;
+    /// the second miss posts its own. Only `missed` carries one.
+    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?,
+                notifyUnlessRetry: CallNotification?)
     /// Late-bind the network client (a killed-state launch reports before the
     /// coordinator has one — implementations buffer + flush).
     func attach(client: CallsClient)
@@ -129,6 +141,10 @@ protocol CallOutcomeReporting: AnyObject {
 extension CallOutcomeReporting {
     func attach(client: CallsClient) {}
     func discardAll() {}
+    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?) {
+        report(callId: callId, callKitId: callKitId, outcome: outcome, snoozeMinutes: snoozeMinutes,
+               outcomeNotes: outcomeNotes, notifyUnlessRetry: nil)
+    }
 }
 
 /// The CXProvider surface the coordinator uses.

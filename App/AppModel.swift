@@ -105,6 +105,12 @@ final class AppModel {
     /// pending-push flag its own change set.
     @ObservationIgnored private var notifPrefsPushGen = 0
     @ObservationIgnored private var ritualsPushGen = 0
+    /// The opt-in proactive calls (morning plan / evening wrap-up / check-in
+    /// after a block) — `notification_preferences.call_*` (migration 072).
+    /// Observed by Settings › Calls; the device cache is CallSettings.proactive,
+    /// re-pushed on the next hydrate while `pendingProactivePush` is set.
+    var callProactivePrefs: CallProactivePrefs = CallSettings.proactive
+    @ObservationIgnored var callPrefsPushGen = 0
     /// In-memory backing for the archived-capture id set the Inbox triage tray
     /// reads (`archivedCaptureIds` in AppModel+Captures keeps a UserDefaults
     /// cache of it). Stored here because @Observable extensions can't add
@@ -572,6 +578,20 @@ final class AppModel {
                     let row = try await prefs.notificationPrefs(userId: uid)
                     guard let self, coord.auth.currentUserId == uid else { return }
                     self.applyServerNotificationPrefs(row)
+                } catch { complete = false }
+            }
+            // Proactive calls (server-backed toggles; the phone caches them).
+            if CallSettings.pendingProactivePush {
+                do {
+                    try await prefs.setCallProactivePrefs(userId: uid, prefs: CallSettings.proactive)
+                    guard coord.auth.currentUserId == uid else { return }
+                    CallSettings.pendingProactivePush = false
+                } catch { complete = false }
+            } else {
+                do {
+                    let server = try await prefs.callProactivePrefs(userId: uid)
+                    guard let self, coord.auth.currentUserId == uid else { return }
+                    if let server { self.applyServerCallProactivePrefs(server) }
                 } catch { complete = false }
             }
             // PA rituals.
@@ -1448,10 +1468,10 @@ final class AppModel {
         for key in ["unstuck.onboarded", "unstuck.adhdStruggles",
                     "unstuck.dismissedNudges", "unstuck.blockedEmails",
                     "unstuck.usableMinutesPerDay", "unstuck.usableMinutesWeekend",
-                    CallSettings.windowStartKey, CallSettings.windowEndKey, CallSettings.defaultLeadKey,
-                    "unstuck.calls.outcomeQueue"] {
+                    "unstuck.calls.outcomeQueue"] + CallSettings.userContentKeys {
             d.removeObject(forKey: key)
         }
+        callProactivePrefs = .defaults
         for key in d.dictionaryRepresentation().keys
         where key.hasPrefix("unstuck.loginPing.") || key.hasPrefix("unstuck.wakeWindow.") {
             d.removeObject(forKey: key)

@@ -4,10 +4,15 @@
 //                     │
 //                     ├─ same uuid as the live call → duplicate push: state untouched
 //                     ├─ nobody signed in     → end .failed, silent (no outcome, no notes)
+//                     ├─ calls switched off   → end .declinedElsewhere, outcome declined, notify
 //                     ├─ outside call hours   → end .declinedElsewhere, outcome declined, notify
 //                     ├─ focus session live   → end .answeredElsewhere, outcome busy, notify
 //                     ├─ anchor gone          → end .remoteEnded, outcome stale (silent)
-//                     └─ else ring; 30 s unanswered → .unanswered, outcome missed, notify
+//                     └─ else ring; 30 s unanswered → .unanswered, outcome missed —
+//                        the "I called about X" notification is handed to the
+//                        REPORTER and posted only once call-outcome answers
+//                        `retry: false` (a first miss is re-rung by the server
+//                        5 min later — `retry: true` — and must stay quiet)
 //   CXAnswerCallAction ──▶ performAnswer (configure audio, fulfil, outcome answered)
 //   provider(_:didActivate:) ──▶ audioSessionDidActivate ──▶ launcher.start
 //   CXEndCallAction / launcher.onEnded ──▶ performEnd ──▶ launcher.stop, outcome done|snoozed
@@ -39,7 +44,7 @@ final class CallCoordinator {
             provider: provider, controller: CallKitController(),
             environment: AppCallEnvironment(model: nil),
             launcher: NoopCallVoiceLauncher(), launcherAttached: false,
-            notifier: SystemCallNotifier(), reporter: CallsOutcomeReporter(),
+            notifier: SystemCallNotifier(), reporter: CallsOutcomeReporter(notifier: SystemCallNotifier()),
             clock: SystemCallClock(),
             rearmVoip: { VoipPushRegistry.shared.rearm() })
         provider.coordinator = c
@@ -193,7 +198,13 @@ final class CallCoordinator {
         }
         active = ActiveCall(session: session, phase: .ringing)
 
-        // Receipt rules — evaluated locally, after reporting.
+        // Receipt rules — evaluated locally, after reporting. Android order:
+        // signed in → the kill-switch → hours → focus → anchor.
+        if !environment.isCallsEnabled {
+            endSilently(session, reason: .declinedElsewhere, outcome: .declined,
+                        notification: CallNotifications.callsOff(session))
+            return
+        }
         if !environment.isWithinCallHours(session.receivedAt) {
             endSilently(session, reason: .declinedElsewhere, outcome: .declined,
                         notification: CallNotifications.outsideHours(session))
@@ -226,8 +237,18 @@ final class CallCoordinator {
         _ = error
         ringTimer?.cancel(); ringTimer = nil
         active = nil
-        report(cur.session, .missed)
-        notifier.post(CallNotifications.missed(cur.session))
+        reportMissed(cur.session)
+    }
+
+    /// A miss: the outcome goes up with the "I called about X" notification
+    /// attached — the reporter posts it once the server answers `retry:
+    /// false` (or refuses the report for good), and swallows it on `retry:
+    /// true` (the server re-rings in 5 min; the second miss notifies). Never
+    /// posted here at the timeout: the flag arrives asynchronously.
+    private func reportMissed(_ session: CallSession) {
+        reporter.report(callId: session.callId, callKitId: session.uuid, outcome: .missed,
+                        snoozeMinutes: nil, outcomeNotes: nil,
+                        notifyUnlessRetry: CallNotifications.missed(session))
     }
 
     private func endSilently(_ session: CallSession, reason: CallEndedReason, outcome: CallOutcome,
@@ -243,14 +264,13 @@ final class CallCoordinator {
         ringTimer = nil
         active = nil
         provider.reportEnded(uuid: uuid, reason: .unanswered)
-        report(cur.session, .missed)
-        notifier.post(CallNotifications.missed(cur.session))
+        reportMissed(cur.session)
     }
 
     private func report(_ session: CallSession, _ outcome: CallOutcome,
                         snoozeMinutes: Int? = nil, outcomeNotes: [String]? = nil) {
         reporter.report(callId: session.callId, callKitId: session.uuid, outcome: outcome,
-                        snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes)
+                        snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes, notifyUnlessRetry: nil)
     }
 
     // MARK: - CallKit events (forwarded by CallKitProvider)
@@ -442,7 +462,8 @@ final class CallCoordinator {
     /// Clamped 1…180 like the CallKit snooze.
     func reportFallbackSnooze(callId: String, minutes: Int) {
         let m = min(180, max(1, minutes))
-        reporter.report(callId: callId, callKitId: nil, outcome: .snoozed, snoozeMinutes: m, outcomeNotes: nil)
+        reporter.report(callId: callId, callKitId: nil, outcome: .snoozed, snoozeMinutes: m, outcomeNotes: nil,
+                        notifyUnlessRetry: nil)
     }
 
     /// The account signed in (or switched) within this launch: re-arm PushKit
@@ -488,6 +509,12 @@ enum CallNotifications {
     static func outsideHours(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.hours.\(s.callId)", title: "I called about \(s.label)",
              body: body(s.notes) + "\n(outside your call hours — Settings › Calls)")
+    }
+    /// The master switch is off on this phone: declined quietly, the notes
+    /// still land (Android's `enabled` rule) — with the honest reason.
+    static func callsOff(_ s: CallSession) -> CallNotification {
+        make(s, id: "unstuck.call.off.\(s.callId)", title: "I called about \(s.label)",
+             body: body(s.notes) + "\n(calls are off on this iPhone — Settings › Calls)")
     }
     static func voiceFailed(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.failed.\(s.callId)", title: "Couldn't start the call — here's what it was about", body: body(s.notes))

@@ -287,9 +287,19 @@ extension AppModel {
     func openCall(id: String) {
         guard !id.isEmpty else { router.select(.today); return }
         if CallCoordinator.shared.resumeFromDeepLink(callId: id) { return }
-        guard let calls = coordinator?.calls else { router.select(.today); return }
+        guard let coord = coordinator else { router.select(.today); return }
+        // The local mirror first (offline-safe, and the realtime / catch-up
+        // path keeps it current); the live read only when the mirror can't
+        // answer — it has nothing yet, or not this id (a card from another
+        // device that raced the mirror).
+        if let local = try? coord.callsMirror.get(id: id) {
+            routeResolvedCall(local)
+            return
+        }
+        let calls = coord.calls
         Task {
             let req = try? await calls.get(id: id)
+            if let req { try? coord.callsMirror.upsert(req) }
             routeResolvedCall(req)
         }
     }
@@ -479,6 +489,52 @@ extension AppModel {
         } else {
             saveSession(Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: "Focus session",
                                 estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+        }
+    }
+
+    // MARK: proactive calls (calls build-out; migration 072)
+
+    /// A toggle / time change in Settings › Calls: cache it, mark it pending,
+    /// and write `notification_preferences.call_*` through — the dispatcher
+    /// reads those columns, so nothing rings until the write lands. A failed
+    /// push stays pending and the next hydrate re-pushes it (never pulls the
+    /// server's older value over it). Only when the value actually changed.
+    func setCallProactivePrefs(_ prefs: CallProactivePrefs) {
+        guard prefs != callProactivePrefs || CallSettings.proactive != prefs else { return }
+        callProactivePrefs = prefs
+        CallSettings.proactive = prefs
+        CallSettings.pendingProactivePush = true
+        callPrefsPushGen += 1
+        let gen = callPrefsPushGen
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        Task { [weak self] in
+            do {
+                try await coord.preferences.setCallProactivePrefs(userId: uid, prefs: prefs)
+                guard let self, coord.auth.currentUserId == uid, self.callPrefsPushGen == gen else { return }
+                CallSettings.pendingProactivePush = false
+            } catch {}
+        }
+    }
+
+    /// The server's proactive-call row landed (hydrate / a preferences
+    /// realtime event): the account is the source of truth, so it replaces
+    /// the cache — unless a change made here is still waiting to go up.
+    func applyServerCallProactivePrefs(_ server: CallProactivePrefs) {
+        guard !CallSettings.pendingProactivePush else { return }
+        if CallSettings.proactive != server { CallSettings.proactive = server }
+        if callProactivePrefs != server { callProactivePrefs = server }
+    }
+
+    /// Settings › Calls opened: re-read the server row (best-effort) so a
+    /// toggle flipped on another device shows here without waiting for the
+    /// next gap trigger.
+    func refreshCallProactivePrefs() {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
+        let prefs = coord.preferences
+        Task { [weak self] in
+            guard let server = try? await prefs.callProactivePrefs(userId: uid),
+                  let self, coord.auth.currentUserId == uid else { return }
+            self.applyServerCallProactivePrefs(server)
         }
     }
 

@@ -52,6 +52,8 @@ final class AppCallEnvironment: CallEnvironment {
     }
 
     func isWithinCallHours(_ date: Date) -> Bool { CallSettings.isWithinWindow(date) }
+
+    var isCallsEnabled: Bool { CallSettings.enabled }
 }
 
 /// Posts the coordinator's notifications through UNUserNotificationCenter.
@@ -88,7 +90,14 @@ final class SystemCallNotifier: CallNotifier {
 ///     `missed` / `snoozed` / `done` behind it forever (`dropped` keeps the
 ///     tally for diagnostics);
 ///   • sign-out discards the queue (`discardAll`) — nothing left in it can be
-///     sent with the next account's JWT.
+///     sent with the next account's JWT;
+///   • a `missed` report carries the "I called about X" notification with it
+///     (persisted too): it is posted through `notifier` when the server takes
+///     the report and answers `retry: false`, or refuses it for good (no
+///     re-ring is coming either way) — and swallowed on `retry: true`, the
+///     server's one automatic ring-back 5 min later (calls build-out §5).
+///     The flag arrives asynchronously, so the coordinator never posts it at
+///     the 30 s timeout itself.
 /// Injectable sleep + sender so the ordering / retry / persistence rules run
 /// in XCTest without a network (CallCoordinatorTests).
 @MainActor
@@ -99,8 +108,29 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
         let outcome: CallOutcome
         let snooze: Int?
         let notes: [String]?
+        /// Posted once the server answers without `retry` (see above).
+        var notification: CallNotification?
+
+        init(callId: String, callKitId: String?, outcome: CallOutcome, snooze: Int?, notes: [String]?,
+             notification: CallNotification? = nil) {
+            self.callId = callId; self.callKitId = callKitId; self.outcome = outcome
+            self.snooze = snooze; self.notes = notes; self.notification = notification
+        }
+
+        enum CodingKeys: String, CodingKey { case callId, callKitId, outcome, snooze, notes, notification }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            callId = try c.decode(String.self, forKey: .callId)
+            callKitId = try c.decodeIfPresent(String.self, forKey: .callKitId)
+            outcome = try c.decode(CallOutcome.self, forKey: .outcome)
+            snooze = try c.decodeIfPresent(Int.self, forKey: .snooze)
+            notes = try c.decodeIfPresent([String].self, forKey: .notes)
+            notification = try c.decodeIfPresent(CallNotification.self, forKey: .notification)
+        }
     }
-    typealias Sender = @Sendable (Item) async throws -> Void
+    /// Sends one report; returns what the server answered (`retry`).
+    typealias Sender = @Sendable (Item) async throws -> CallOutcomeReceipt
 
     static let queueKey = "unstuck.calls.outcomeQueue"
     static let maxAttempts = 3
@@ -112,6 +142,8 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private let defaults: UserDefaults
     private let key: String
     private let sleep: @Sendable (TimeInterval) async -> Void
+    /// Posts a report's `notification` once the server has settled it.
+    private let notifier: CallNotifier?
     private var send: Sender?
     private(set) var queue: [Item] = []
     private(set) var flushTask: Task<Void, Never>?
@@ -121,11 +153,13 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private(set) var dropped: [(item: Item, error: Error)] = []
 
     init(defaults: UserDefaults = .standard, key: String = CallsOutcomeReporter.queueKey,
+         notifier: CallNotifier? = nil,
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { s in
              try? await Task.sleep(nanoseconds: UInt64(max(0, s) * 1_000_000_000))
          }) {
         self.defaults = defaults
         self.key = key
+        self.notifier = notifier
         self.sleep = sleep
         if let data = defaults.data(forKey: key),
            let saved = try? JSONDecoder().decode([Item].self, from: data) {
@@ -146,9 +180,10 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
         flush()
     }
 
-    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?) {
+    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?,
+                notifyUnlessRetry: CallNotification?) {
         queue.append(Item(callId: callId, callKitId: callKitId?.uuidString.lowercased(), outcome: outcome,
-                          snooze: snoozeMinutes, notes: outcomeNotes))
+                          snooze: snoozeMinutes, notes: outcomeNotes, notification: notifyUnlessRetry))
         persist()
         flush()
     }
@@ -189,10 +224,11 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private func drain() async {
         while let head = queue.first, let send {
             var sent = false
+            var receipt = CallOutcomeReceipt()
             var rejected: Error?
             for attempt in 0..<Self.maxAttempts {
                 do {
-                    try await send(head)
+                    receipt = try await send(head)
                     sent = true
                     break
                 } catch {
@@ -208,10 +244,13 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
             if Task.isCancelled { return }
             if let rejected {
                 // The server will answer the same way forever: drop this item
-                // (logged) and carry on with the ones behind it.
+                // (logged) and carry on with the ones behind it. No re-ring is
+                // coming for a row the server won't take a report on, so the
+                // miss notification (if any) still goes out.
                 dropped.append((head, rejected))
                 NSLog("[calls] outcome %@ for %@ rejected for good: %@ — dropped",
                       head.outcome.rawValue, head.callId, String(describing: rejected))
+                settleNotification(head, retry: false)
             } else {
                 guard sent else {
                     // Re-enqueued (still at the head, persisted). Try again later.
@@ -219,11 +258,22 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
                     return
                 }
                 failedCycles = 0
+                settleNotification(head, retry: receipt.retry)
             }
             if queue.first == head { queue.removeFirst() }
             persist()
         }
     }
+
+    /// The server settled a report: post its notification unless a retry
+    /// ring is coming. Pure decision (`shouldNotify`), tested.
+    private func settleNotification(_ item: Item, retry: Bool) {
+        guard let n = item.notification, Self.shouldNotify(retry: retry) else { return }
+        notifier?.post(n)
+    }
+
+    /// `retry: true` ⇒ the server rings again in 5 min ⇒ stay quiet.
+    static func shouldNotify(retry: Bool) -> Bool { !retry }
 
     private func scheduleRetry() {
         retryTimer?.cancel()

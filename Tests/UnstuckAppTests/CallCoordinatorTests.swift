@@ -87,14 +87,24 @@ final class FakeNotifier: CallNotifier {
 
 @MainActor
 final class FakeReporter: CallOutcomeReporting {
-    struct Report: Equatable { let callId: String; let callKitId: UUID?; let outcome: CallOutcome; let snooze: Int?; let notes: [String]? }
+    struct Report: Equatable {
+        let callId: String; let callKitId: UUID?; let outcome: CallOutcome; let snooze: Int?; let notes: [String]?
+        /// The "I called about X" the coordinator hands over with a `missed`
+        /// report — posted by the REAL reporter once the server answers
+        /// `retry: false` (CallsOutcomeReporterTests), never by the coordinator.
+        var notification: CallNotification? = nil
+    }
     var reports: [Report] = []
     var discards = 0
-    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?) {
-        reports.append(Report(callId: callId, callKitId: callKitId, outcome: outcome, snooze: snoozeMinutes, notes: outcomeNotes))
+    func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?,
+                notifyUnlessRetry: CallNotification?) {
+        reports.append(Report(callId: callId, callKitId: callKitId, outcome: outcome, snooze: snoozeMinutes,
+                              notes: outcomeNotes, notification: notifyUnlessRetry))
     }
     func discardAll() { discards += 1 }
     var outcomes: [CallOutcome] { reports.map(\.outcome) }
+    /// The miss notification attached to the latest report (nil = none).
+    var pendingMissNotification: CallNotification? { reports.last?.notification }
 }
 
 @MainActor
@@ -106,11 +116,13 @@ final class FakeEnvironment: CallEnvironment {
     var focusLive = false
     var anchorLive = true
     var withinHours = true
+    var callsEnabled = true
     var isSignedIn: Bool { signedIn }
     var isSessionKnown: Bool { sessionKnown }
     var isFocusSessionLive: Bool { focusLive }
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool { anchorLive }
     func isWithinCallHours(_ date: Date) -> Bool { withinHours }
+    var isCallsEnabled: Bool { callsEnabled }
 }
 
 @MainActor
@@ -261,8 +273,11 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(provider.ended[0].reason, .unanswered)
         XCTAssertEqual(reporter.outcomes, [.missed])
         XCTAssertNil(sut.active)
-        XCTAssertEqual(notifier.posted.count, 1)
-        let n = notifier.posted[0]
+        // The notification rides with the `missed` report: the reporter posts
+        // it once call-outcome answers `retry: false` (a first miss is re-rung
+        // by the server 5 min later and must stay quiet). Never at the timeout.
+        XCTAssertTrue(notifier.posted.isEmpty, "not posted at the 30 s timeout — the server's retry flag decides")
+        guard let n = reporter.pendingMissNotification else { return XCTFail("miss notification handed to the reporter") }
         XCTAssertEqual(n.title, "I called about speak to James")
         XCTAssertEqual(n.body, "Ask about the invoice\nConfirm Friday")
         XCTAssertEqual(n.categoryId, NotificationCategories.taskStarting)
@@ -275,7 +290,7 @@ final class CallCoordinatorTests: XCTestCase {
     func testUnansweredWithoutTaskHasNoActionsAndOpensToday() {
         sut.reportIncoming(payload(taskId: nil))
         clock.fireAll()
-        let n = notifier.posted[0]
+        guard let n = reporter.pendingMissNotification else { return XCTFail("miss notification handed to the reporter") }
         XCTAssertNil(n.categoryId)
         XCTAssertEqual(n.userInfo["deepLink"], "unstuck://today")
         XCTAssertNil(n.userInfo["taskId"])
@@ -284,7 +299,43 @@ final class CallCoordinatorTests: XCTestCase {
     func testUnansweredWithNoNotesSaysSo() {
         sut.reportIncoming(payload(notes: []))
         clock.fireAll()
-        XCTAssertEqual(notifier.posted[0].body, "No notes on this one.")
+        XCTAssertEqual(reporter.pendingMissNotification?.body, "No notes on this one.")
+    }
+
+    func testOnlyAMissCarriesTheRetryGatedNotification() {
+        // busy / outside-hours / declined / done: posted (or not) at once —
+        // the server never retries those, so nothing rides with the report.
+        env.focusLive = true
+        sut.reportIncoming(payload())
+        XCTAssertEqual(reporter.outcomes, [.busy])
+        XCTAssertNil(reporter.pendingMissNotification)
+        XCTAssertEqual(notifier.posted.count, 1, "busy posts immediately")
+    }
+
+    func testCallsSwitchedOffDeclinesQuietlyWithNotification() {
+        // The master switch (Settings › Calls) — Android's `enabled`: the call
+        // is declined like the outside-hours rule, with the honest reason.
+        env.callsEnabled = false
+        env.withinHours = false   // the switch is checked first
+        sut.reportIncoming(payload())
+        XCTAssertEqual(provider.incoming.count, 1, "still reported (Apple rule)")
+        XCTAssertEqual(provider.ended.map(\.reason), [.declinedElsewhere])
+        XCTAssertEqual(reporter.outcomes, [.declined])
+        XCTAssertNil(reporter.pendingMissNotification)
+        XCTAssertEqual(notifier.posted.count, 1)
+        XCTAssertEqual(notifier.posted[0].title, "I called about speak to James")
+        XCTAssertTrue(notifier.posted[0].body.contains("calls are off on this iPhone"))
+        XCTAssertNil(sut.active)
+        XCTAssertTrue(clock.pending.isEmpty, "no ring timer")
+    }
+
+    func testSignedOutBeatsTheCallsSwitch() {
+        env.signedIn = false
+        env.callsEnabled = false
+        sut.reportIncoming(payload())
+        XCTAssertEqual(provider.ended.map(\.reason), [.failed])
+        XCTAssertTrue(reporter.reports.isEmpty)
+        XCTAssertTrue(notifier.posted.isEmpty)
     }
 
     // MARK: - receipt rules
@@ -352,7 +403,8 @@ final class CallCoordinatorTests: XCTestCase {
         provider.complete(uuid, error: NSError(domain: "CXErrorDomainIncomingCall", code: 5))   // filteredByDoNotDisturb
         XCTAssertNil(sut.active)
         XCTAssertEqual(reporter.outcomes, [.missed])
-        XCTAssertEqual(notifier.posted.count, 1)
+        XCTAssertTrue(notifier.posted.isEmpty, "retry-gated: the reporter posts it")
+        XCTAssertEqual(reporter.pendingMissNotification?.title, "I called about speak to James")
         XCTAssertTrue(clock.pending.isEmpty)
     }
 
@@ -731,13 +783,18 @@ final class CallCoordinatorTests: XCTestCase {
 final class CallsOutcomeReporterTests: XCTestCase {
     /// Records sends; throws (transient) for the first `failures` calls, and
     /// answers a PERMANENT `CallOutcomeRejected` for any callId in `rejected`.
+    /// `retryFor` = the callIds the server answers `{ retry: true }` for (the
+    /// automatic ring-back after a first miss).
     @MainActor
     final class Recorder {
         var sent: [CallsOutcomeReporter.Item] = []
         var attempts = 0
         var failures: Int
         var rejected: [String: Int] = [:]
-        init(failures: Int = 0, rejected: [String: Int] = [:]) { self.failures = failures; self.rejected = rejected }
+        var retryFor: Set<String>
+        init(failures: Int = 0, rejected: [String: Int] = [:], retryFor: Set<String> = []) {
+            self.failures = failures; self.rejected = rejected; self.retryFor = retryFor
+        }
         func sender() -> CallsOutcomeReporter.Sender {
             { [self] item in
                 await MainActor.run { self.attempts += 1 }
@@ -750,8 +807,15 @@ final class CallsOutcomeReporterTests: XCTestCase {
                 }
                 if fail { throw NSError(domain: "net", code: 1) }
                 await MainActor.run { self.sent.append(item) }
+                let retry = await MainActor.run { self.retryFor.contains(item.callId) }
+                return CallOutcomeReceipt(ok: true, retry: retry)
             }
         }
+    }
+
+    private func missNotification(_ callId: String) -> CallNotification {
+        CallNotifications.missed(CallSession(payload: IncomingCallPayload(
+            callId: callId, label: "speak to James", notes: ["Ask about the invoice"], name: "Ahmad")))
     }
 
     @MainActor
@@ -868,6 +932,78 @@ final class CallsOutcomeReporterTests: XCTestCase {
         r.report(callId: "new", callKitId: nil, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
         await settle(r)
         XCTAssertEqual(rec.sent.map(\.callId), ["new"])
+    }
+
+    // MARK: the miss notification rides with the report (calls build-out §5)
+
+    func testAMissNotificationPostsOnlyWhenTheServerSaysNoRetry() async {
+        let notifier = FakeNotifier()
+        let r = CallsOutcomeReporter(defaults: suite, notifier: notifier, sleep: { _ in })
+        let rec = Recorder(retryFor: ["first"])
+        r.attach(send: rec.sender())
+        // First miss: the server re-arms the call (retry: true) → stay quiet.
+        r.report(callId: "first", callKitId: uuid, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil,
+                 notifyUnlessRetry: missNotification("first"))
+        await settle(r)
+        XCTAssertEqual(rec.sent.map(\.callId), ["first"])
+        XCTAssertTrue(notifier.posted.isEmpty, "retry: true — the server rings again in 5 min; no notification")
+        // Second miss (or a test call, never retried): retry: false → post.
+        r.report(callId: "second", callKitId: uuid, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil,
+                 notifyUnlessRetry: missNotification("second"))
+        await settle(r)
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.missed.second"])
+        XCTAssertEqual(notifier.posted[0].title, "I called about speak to James")
+        XCTAssertEqual(notifier.posted[0].body, "Ask about the invoice")
+    }
+
+    func testANotificationlessReportNeverPosts() async {
+        let notifier = FakeNotifier()
+        let r = CallsOutcomeReporter(defaults: suite, notifier: notifier, sleep: { _ in })
+        r.attach(send: Recorder().sender())
+        r.report(callId: "c1", callKitId: uuid, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertTrue(notifier.posted.isEmpty)
+    }
+
+    func testAPermanentlyRejectedMissStillNotifies() async {
+        // 404: the row is gone server-side — no ring-back can come, and the
+        // phone did ring; the user still gets the notes.
+        let notifier = FakeNotifier()
+        let r = CallsOutcomeReporter(defaults: suite, notifier: notifier, sleep: { _ in })
+        r.attach(send: Recorder(rejected: ["dead": 404]).sender())
+        r.report(callId: "dead", callKitId: uuid, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil,
+                 notifyUnlessRetry: missNotification("dead"))
+        await settle(r)
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.missed.dead"])
+    }
+
+    func testTheMissNotificationSurvivesARelaunchWithTheQueuedReport() async {
+        // Killed before the report went up: the notification is persisted with
+        // the item and posted by the relaunch once the server answers.
+        let first = CallsOutcomeReporter(defaults: suite, notifier: FakeNotifier(), sleep: { _ in })
+        first.report(callId: "c1", callKitId: uuid, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil,
+                     notifyUnlessRetry: missNotification("c1"))
+        XCTAssertEqual(first.queue.first?.notification?.id, "unstuck.call.missed.c1")
+
+        let notifier = FakeNotifier()
+        let relaunch = CallsOutcomeReporter(defaults: suite, notifier: notifier, sleep: { _ in })
+        XCTAssertEqual(relaunch.queue.first?.notification?.title, "I called about speak to James", "persisted with the item")
+        relaunch.attach(send: Recorder().sender())
+        await settle(relaunch)
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.missed.c1"])
+        XCTAssertTrue(relaunch.queue.isEmpty)
+    }
+
+    func testShouldNotifyIsTheInverseOfRetry() {
+        XCTAssertTrue(CallsOutcomeReporter.shouldNotify(retry: false))
+        XCTAssertFalse(CallsOutcomeReporter.shouldNotify(retry: true))
+    }
+
+    func testReceiptDecodesTheContractAndDefaultsToNoRetry() {
+        XCTAssertEqual(CallsClient.decodeReceipt(Data("{\"ok\":true,\"retry\":true}".utf8)), CallOutcomeReceipt(ok: true, retry: true))
+        XCTAssertEqual(CallsClient.decodeReceipt(Data("{\"ok\":true}".utf8)), CallOutcomeReceipt(ok: true, retry: false))
+        XCTAssertEqual(CallsClient.decodeReceipt(Data()), CallOutcomeReceipt(ok: true, retry: false), "a pre-072 empty 2xx")
+        XCTAssertEqual(CallsClient.decodeReceipt(Data("not json".utf8)), CallOutcomeReceipt(ok: true, retry: false))
     }
 
     func testAfterThreeFailuresTheItemIsReEnqueuedAndRetriedLater() async {

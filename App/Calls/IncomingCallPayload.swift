@@ -3,15 +3,40 @@
 //
 // Contract (send-call, APNs VoIP push, topic io.unstucknow.app.voip):
 //   { kind:'call', callId, label, notes:[String], taskId?, blockId?, taskName?,
-//     startTime?, firstAction?, captures:[String], name? }
+//     startTime?, firstAction?, captures:[String], name?,
+//     callKind?: requested|test|morning|evening|after_block, endTime?: "HH:MM" }
 // The same shape rides the fallback time-sensitive ALERT push (custom keys at
 // the top level next to `aps`, or under `data`) when no VoIP token is
 // registered — `init?(dictionary:)` accepts both.
+//
+// WHICH CALL THIS IS (calls build-out, migration 072): the row's `kind`
+// travels as `callKind`; a server that instead overwrites the push's own
+// `kind` discriminator with the row's kind is accepted too (`kind` ∈ the five
+// call kinds ⇒ a call push of that kind — `isCallPush`). Unknown / absent ⇒
+// `requested`, the only kind there was before. `endTime` (after_block) is
+// the block's end, "HH:MM" local, for "<task> was on till <time>".
 
 import Foundation
 
+/// Who booked the call — the script opens differently per kind.
+enum CallKind: String, Codable, Equatable, Sendable, CaseIterable {
+    case requested, test, morning, evening, afterBlock = "after_block"
+
+    /// Tolerant: nil / blank / unknown → `.requested`.
+    init(raw: String?) {
+        let t = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        self = CallKind(rawValue: t) ?? .requested
+    }
+}
+
 struct IncomingCallPayload: Codable, Equatable, Sendable {
+    /// The push discriminator (`'call'`), or — from a server that reuses the
+    /// key — the call kind itself. `isCallPush` accepts both.
     var kind: String?
+    /// The `call_requests.kind` this ring is for (nil ⇒ requested).
+    var callKind: String?
+    /// after_block: the block's end, "HH:MM" local (or ISO / "YYYY-MM-DD HH:MM").
+    var endTime: String?
     var callId: String
     var label: String
     var notes: [String]
@@ -27,10 +52,27 @@ struct IncomingCallPayload: Codable, Equatable, Sendable {
 
     init(kind: String? = "call", callId: String, label: String, notes: [String] = [],
          taskId: String? = nil, blockId: String? = nil, taskName: String? = nil,
-         startTime: String? = nil, firstAction: String? = nil, captures: [String] = [], name: String? = nil) {
+         startTime: String? = nil, firstAction: String? = nil, captures: [String] = [], name: String? = nil,
+         callKind: String? = nil, endTime: String? = nil) {
         self.kind = kind; self.callId = callId; self.label = label; self.notes = notes
         self.taskId = taskId; self.blockId = blockId; self.taskName = taskName
         self.startTime = startTime; self.firstAction = firstAction; self.captures = captures; self.name = name
+        self.callKind = callKind; self.endTime = endTime
+    }
+
+    /// The resolved kind: `callKind` when given, else `kind` when the server
+    /// put the row's kind there, else requested.
+    var resolvedKind: CallKind {
+        if let k = callKind, CallKind(rawValue: k.lowercased()) != nil { return CallKind(raw: k) }
+        if let k = kind, CallKind(rawValue: k.lowercased()) != nil { return CallKind(raw: k) }
+        return .requested
+    }
+
+    /// A push's `kind` names a call: the `'call'` discriminator, or one of the
+    /// five call kinds (a server that writes the row's kind into `kind`).
+    static func isCallPush(kind: String?) -> Bool {
+        guard let k = kind?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !k.isEmpty else { return false }
+        return k == "call" || CallKind(rawValue: k) != nil
     }
 
     /// Tolerant decode: `callId` + a non-empty `label` are REQUIRED (a push
@@ -54,6 +96,8 @@ struct IncomingCallPayload: Codable, Equatable, Sendable {
         firstAction = Self.blankToNil(try c.decodeIfPresent(String.self, forKey: .firstAction))
         captures = Self.cleanLines(try c.decodeIfPresent([String].self, forKey: .captures) ?? [])
         name = Self.blankToNil(try c.decodeIfPresent(String.self, forKey: .name))
+        callKind = Self.blankToNil(try c.decodeIfPresent(String.self, forKey: .callKind))
+        endTime = Self.blankToNil(try c.decodeIfPresent(String.self, forKey: .endTime))
     }
 
     /// Decode from a PushKit `dictionaryPayload` / a UNNotification `userInfo`.
@@ -111,6 +155,18 @@ struct CallSession: Equatable, Sendable {
     var taskName: String? { payload.taskName }
     var firstAction: String? { payload.firstAction }
     var captures: [String] { payload.captures }
+    /// Who booked it — what the script opens with.
+    var kind: CallKind { payload.resolvedKind }
+    /// after_block: the block's end as a Date (same forms as `startTime`).
+    var endDate: Date? { CallSession.parseStart(payload.endTime, relativeTo: receivedAt) }
+    /// after_block: "till 11:30am" — the end the way people say it; nil when
+    /// the push carried none.
+    var spokenEnd: String? {
+        guard let raw = payload.endTime?.trimmingCharacters(in: .whitespaces), !raw.isEmpty else { return nil }
+        if CallSettings.minutesOfDay(raw) != nil { return CallSettings.spokenTime(raw) }
+        guard let d = endDate else { return nil }
+        return CallSettings.spokenTime(CallSettings.hhmm(d))
+    }
     /// The name the call opens with — the server's preferred name, first
     /// token only (a full "Ahmad Tambaya" reads wrong on a phone call).
     var preferredName: String? {

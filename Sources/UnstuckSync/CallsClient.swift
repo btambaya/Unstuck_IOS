@@ -9,9 +9,20 @@
 // Server contract (built concurrently — code against it, don't infer):
 //   public.call_requests(id, user_id, task_id?, block_id?, call_at timestamptz,
 //     lead_min?, label, notes text[], status, snooze_until, outcome_notes text[],
-//     call_id, attempts, created_at, updated_at)
+//     call_id, attempts, kind, retries, created_at, updated_at)
 //   status: scheduled|calling|answered|declined|missed|busy|snoozed|stale|cancelled|done
+//   kind (migration 072): requested|test|morning|evening|after_block — who booked
+//     it (the user / the test button / the proactive dispatcher); the call
+//     script opens differently per kind. retries: automatic re-rings after a miss.
 //   call-outcome (user JWT): { callId, outcome, snoozeMinutes?, outcomeNotes?[], callKitId? }
+//     → { ok, retry } — `retry: true` means the server re-arms the call for one
+//     automatic ring-back (a first miss, kind ≠ test), so the phone must NOT
+//     post its local "I called about X" notification for that miss.
+//
+// LOCAL MIRROR (CallRequestsMirror.swift): the rows also live in GRDB
+// (`call_requests`), hydrated, mirrored via realtime and caught up by cursor
+// like every other synced table, so get_calls / the task editor / the deep
+// link read offline and see status changes live.
 // `callId` on call-outcome is the id the VoIP push carried (payload.callId),
 // passed through verbatim — the server resolves it to the row; `callKitId` is
 // the CXCall UUID the phone presented (stored on the row as `call_id`).
@@ -49,6 +60,37 @@ public struct CallOutcomeRejected: Error, Equatable, Sendable {
     }
 }
 
+/// What `call-outcome` answered — `{ ok, status, retry, snoozeUntil? }` on
+/// every outcome. `retry` is true ONLY for a missed call the server re-armed
+/// for one automatic ring-back 5 min later (migration 072): the phone then
+/// skips its local "I called about X" notification — the second miss (or the
+/// answer) settles it. `status` is the row's status after the report,
+/// `snoozeUntil` the re-ring instant when one was scheduled. A pre-072 server
+/// answers no `retry` → false.
+public struct CallOutcomeReceipt: Sendable, Equatable, Codable {
+    public var ok: Bool
+    public var retry: Bool
+    public var status: String?
+    public var snoozeUntil: String?
+
+    public init(ok: Bool = true, retry: Bool = false, status: String? = nil, snoozeUntil: String? = nil) {
+        self.ok = ok
+        self.retry = retry
+        self.status = status
+        self.snoozeUntil = snoozeUntil
+    }
+
+    enum CodingKeys: String, CodingKey { case ok, retry, status, snoozeUntil }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        ok = (try? c.decodeIfPresent(Bool.self, forKey: .ok)) ?? true
+        retry = (try? c.decodeIfPresent(Bool.self, forKey: .retry)) ?? false
+        status = try? c.decodeIfPresent(String.self, forKey: .status)
+        snoozeUntil = try? c.decodeIfPresent(String.self, forKey: .snoozeUntil)
+    }
+}
+
 /// A `call_requests` row as the client reads it (snake_case ↔ camelCase at
 /// this boundary, like DbRowCodec). Tolerant decoding: array columns default
 /// to `[]`, so a row written by another platform without notes still loads.
@@ -68,8 +110,18 @@ public struct CallRequest: Codable, Sendable, Equatable, Identifiable {
     public var outcomeNotes: [String]
     public var callId: String?
     public var attempts: Int?
+    /// Who booked it: requested | test | morning | evening | after_block
+    /// (migration 072). Rows from before the column default to `requested`.
+    public var kind: String
+    /// Automatic re-rings after a miss (migration 072); nil before the column.
+    public var retries: Int?
     public var createdAt: String?
     public var updatedAt: String?
+
+    /// The `kind` values the server writes (`request_call` / the task editor →
+    /// requested, the test button → test, the proactive dispatcher → the rest).
+    public static let kinds = ["requested", "test", "morning", "evening", "after_block"]
+    public static let defaultKind = "requested"
 
     /// Web parity (lib/calls/types.ts LIVE_CALL_STATUSES): a call that is
     /// ringing right now still "is coming" — get_calls lists it ("· ringing
@@ -98,7 +150,7 @@ public struct CallRequest: Codable, Sendable, Equatable, Identifiable {
         case snoozeUntil = "snooze_until"
         case outcomeNotes = "outcome_notes"
         case callId = "call_id"
-        case attempts
+        case attempts, kind, retries
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
@@ -106,11 +158,13 @@ public struct CallRequest: Codable, Sendable, Equatable, Identifiable {
     public init(id: String, userId: String? = nil, taskId: String? = nil, blockId: String? = nil,
                 callAt: String, leadMin: Int? = nil, label: String, notes: [String] = [],
                 status: String = "scheduled", snoozeUntil: String? = nil, outcomeNotes: [String] = [],
-                callId: String? = nil, attempts: Int? = nil, createdAt: String? = nil, updatedAt: String? = nil) {
+                callId: String? = nil, attempts: Int? = nil, kind: String = CallRequest.defaultKind,
+                retries: Int? = nil, createdAt: String? = nil, updatedAt: String? = nil) {
         self.id = id; self.userId = userId; self.taskId = taskId; self.blockId = blockId
         self.callAt = callAt; self.leadMin = leadMin; self.label = label; self.notes = notes
         self.status = status; self.snoozeUntil = snoozeUntil; self.outcomeNotes = outcomeNotes
-        self.callId = callId; self.attempts = attempts; self.createdAt = createdAt; self.updatedAt = updatedAt
+        self.callId = callId; self.attempts = attempts; self.kind = kind; self.retries = retries
+        self.createdAt = createdAt; self.updatedAt = updatedAt
     }
 
     public init(from decoder: Decoder) throws {
@@ -128,6 +182,9 @@ public struct CallRequest: Codable, Sendable, Equatable, Identifiable {
         outcomeNotes = try c.decodeIfPresent([String].self, forKey: .outcomeNotes) ?? []
         callId = try c.decodeIfPresent(String.self, forKey: .callId)
         attempts = try c.decodeIfPresent(Int.self, forKey: .attempts)
+        let k = (try c.decodeIfPresent(String.self, forKey: .kind) ?? "").trimmingCharacters(in: .whitespaces)
+        kind = k.isEmpty ? Self.defaultKind : k
+        retries = try c.decodeIfPresent(Int.self, forKey: .retries)
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt)
         updatedAt = try c.decodeIfPresent(String.self, forKey: .updatedAt)
     }
@@ -160,9 +217,12 @@ public struct CallsClient: Sendable {
     /// Throws `CallOutcomeRejected` for a PERMANENT refusal (404 not_found /
     /// 410 / 400 / 422 …) so the reporter can drop the item; every other
     /// failure (transport, 5xx, 401 refresh, 429) is rethrown as-is → retry.
+    /// Returns the server's `{ ok, retry }` (an empty / older body decodes as
+    /// `retry: false`).
+    @discardableResult
     public func outcome(callId: String, outcome: CallOutcome,
                         snoozeMinutes: Int? = nil, outcomeNotes: [String]? = nil,
-                        callKitId: String? = nil) async throws {
+                        callKitId: String? = nil) async throws -> CallOutcomeReceipt {
         struct Body: Encodable {
             let callId: String
             let outcome: String
@@ -171,15 +231,25 @@ public struct CallsClient: Sendable {
             let callKitId: String?
         }
         do {
-            try await client.functions.invoke(
+            let data: Data = try await client.functions.invoke(
                 "call-outcome",
                 options: FunctionInvokeOptions(method: .post, body: Body(
                     callId: callId, outcome: outcome.rawValue,
                     snoozeMinutes: snoozeMinutes, outcomeNotes: outcomeNotes,
-                    callKitId: callKitId)))
+                    callKitId: callKitId))) { data, _ in data }
+            return Self.decodeReceipt(data)
         } catch let FunctionsError.httpError(code, data) where CallOutcomeRejected.isPermanent(status: code) {
             throw CallOutcomeRejected(status: code, message: String(data: data, encoding: .utf8))
         }
+    }
+
+    /// `{ ok, retry }` from the response body; anything unparseable (an
+    /// empty 2xx from a pre-072 server) is "no retry" — the notification posts.
+    public static func decodeReceipt(_ data: Data) -> CallOutcomeReceipt {
+        guard !data.isEmpty, let r = try? JSONDecoder().decode(CallOutcomeReceipt.self, from: data) else {
+            return CallOutcomeReceipt()
+        }
+        return r
     }
 
     // MARK: - reads
@@ -222,11 +292,14 @@ public struct CallsClient: Sendable {
 
     // MARK: - writes
 
-    /// Book a call (upsert on id). Returns the row as stored.
+    /// Book a call (upsert on id). Returns the row as stored. `kind` is
+    /// `requested` for everything a user books; the Settings test button
+    /// passes `test` (the script's test-call opening; never auto-retried).
     @discardableResult
     public func create(id: String = UUID().uuidString.lowercased(), userId: String,
                        taskId: String? = nil, blockId: String? = nil,
-                       callAt: Date, leadMin: Int? = nil, label: String, notes: [String]) async throws -> CallRequest {
+                       callAt: Date, leadMin: Int? = nil, label: String, notes: [String],
+                       kind: String = CallRequest.defaultKind) async throws -> CallRequest {
         struct Row: Encodable {
             let id: String
             let user_id: String
@@ -237,17 +310,19 @@ public struct CallsClient: Sendable {
             let label: String
             let notes: [String]
             let status: String
+            let kind: String
             let updated_at: String
         }
         let now = Self.iso(Date())
         let rows: [CallRequest] = try await client.from("call_requests")
             .upsert(Row(id: id, user_id: userId, task_id: taskId, block_id: blockId,
                         call_at: Self.iso(callAt), lead_min: leadMin, label: label, notes: notes,
-                        status: "scheduled", updated_at: now), onConflict: "id")
+                        status: "scheduled", kind: kind, updated_at: now), onConflict: "id")
             .select()
             .execute().value
         return rows.first ?? CallRequest(id: id, userId: userId, taskId: taskId, blockId: blockId,
-                                         callAt: Self.iso(callAt), leadMin: leadMin, label: label, notes: notes)
+                                         callAt: Self.iso(callAt), leadMin: leadMin, label: label, notes: notes,
+                                         kind: kind, updatedAt: now)
     }
 
     /// Patch a booked call — only the given fields change. Re-arms a snoozed

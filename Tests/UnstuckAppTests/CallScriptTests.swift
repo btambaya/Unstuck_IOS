@@ -24,11 +24,13 @@ final class CallScriptTests: XCTestCase {
     private func session(name: String? = "Ahmad", label: String = "speak to James",
                          notes: [String] = ["Ask about the invoice", "Confirm Friday", "Send the deck"],
                          taskId: String? = "t1", startTime: String? = nil, firstAction: String? = nil,
-                         captures: [String] = [], receivedAt: Date = Date(timeIntervalSince1970: 1_800_000_000)) -> CallSession {
+                         captures: [String] = [], receivedAt: Date = Date(timeIntervalSince1970: 1_800_000_000),
+                         kind: String? = nil, endTime: String? = nil, taskName: String? = "Speak to James") -> CallSession {
         CallSession(payload: IncomingCallPayload(
             callId: "0f1e2d3c-4b5a-4697-8877-665544332211", label: label, notes: notes,
-            taskId: taskId, blockId: taskId.map { _ in "b1" }, taskName: "Speak to James",
-            startTime: startTime, firstAction: firstAction, captures: captures, name: name), receivedAt: receivedAt)
+            taskId: taskId, blockId: taskId.map { _ in "b1" }, taskName: taskName,
+            startTime: startTime, firstAction: firstAction, captures: captures, name: name,
+            callKind: kind, endTime: endTime), receivedAt: receivedAt)
     }
 
     // MARK: opening
@@ -139,9 +141,113 @@ final class CallScriptTests: XCTestCase {
         XCTAssertTrue(i.contains("call id 0f1e2d3c-4b5a-4697-8877-665544332211"))
     }
 
-    func testCallToolsList() {
-        XCTAssertEqual(CallScript.callTools,
-                       ["complete_task", "add_capture", "schedule_task", "start_focus", "update_call", "snooze_call"])
+    func testCallToolsIsEveryVoiceToolPlusTheCallExtras() {
+        // A call is the full assistant on the phone (calls build-out): every
+        // registry voice tool, in registry order, then the call-only extras.
+        let voiceNames = ToolRegistry.voice.compactMap { $0["name"] as? String }
+        let callNames = ToolRegistry.call.compactMap { $0["name"] as? String }
+        XCTAssertFalse(voiceNames.isEmpty)
+        XCTAssertEqual(Array(CallScript.callTools.prefix(voiceNames.count)), voiceNames)
+        for n in callNames { XCTAssertTrue(CallScript.callTools.contains(n), n) }
+        XCTAssertEqual(CallScript.callTools.count, Set(CallScript.callTools).count, "no duplicates")
+        for t in ["get_schedule", "get_tasks", "carry_to_tomorrow", "complete_task", "schedule_task", "add_capture",
+                  "share_task", "request_call", "update_call", "snooze_call", "skip_occurrence", "set_task_later"] {
+            XCTAssertTrue(CallScript.callTools.contains(t), t)
+        }
+        // Pure: de-duplicated, order kept, blanks dropped.
+        XCTAssertEqual(CallScript.callToolNames(voice: [["name": "a"], ["name": "b"], ["x": 1]],
+                                                call: [["name": "b"], ["name": "c"], ["name": ""]]), ["a", "b", "c"])
+    }
+
+    // MARK: kinds (calls build-out §2)
+
+    func testOpeningPerKind() {
+        XCTAssertEqual(CallScript.opening(session(kind: "test")),
+                       "Hi Ahmad — this is your test call from Unstuck. Everything works. Want to try something — ask me what's on today?")
+        XCTAssertEqual(CallScript.opening(session(name: nil, kind: "test")),
+                       "Hi — this is your test call from Unstuck. Everything works. Want to try something — ask me what's on today?")
+        XCTAssertEqual(CallScript.opening(session(kind: "morning")), "Morning, Ahmad. Want to walk through today?")
+        XCTAssertEqual(CallScript.opening(session(name: nil, kind: "morning")), "Morning. Want to walk through today?")
+        XCTAssertEqual(CallScript.opening(session(kind: "evening")), "Evening, Ahmad. Quick wrap-up?")
+        XCTAssertEqual(CallScript.opening(session(name: nil, kind: "evening")), "Evening. Quick wrap-up?")
+        XCTAssertEqual(CallScript.opening(session(kind: "after_block", endTime: "11:30")),
+                       "Hi Ahmad — Speak to James was on till 11:30am. How did it go?")
+        XCTAssertEqual(CallScript.opening(session(kind: "after_block", endTime: "14:00", taskName: nil)),
+                       "Hi Ahmad — speak to James was on till 2pm. How did it go?", "no task name → the label")
+        XCTAssertEqual(CallScript.opening(session(name: nil, kind: "after_block", endTime: nil)),
+                       "Hi — Speak to James just finished. How did it go?", "no end time → 'just finished'")
+        // The requested opening is untouched — and the default when the push
+        // carries no kind at all, or one this build doesn't know.
+        let requested = "Hi Ahmad — you asked me to ring so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday; Send the deck. Start the timer, or ring you back in ten?"
+        XCTAssertEqual(CallScript.opening(session()), requested)
+        XCTAssertEqual(CallScript.opening(session(kind: "requested")), requested)
+        XCTAssertEqual(CallScript.opening(session(kind: "something_new")), requested)
+    }
+
+    func testInstructionsPerKindKeepTheVerbatimOpeningAndTheHonestyRule() {
+        for kind in ["requested", "test", "morning", "evening", "after_block"] {
+            let s = session(kind: kind, endTime: "11:30")
+            let i = CallScript.instructions(s)
+            XCTAssertTrue(i.contains("\"" + CallScript.opening(s) + "\""), "\(kind): opening quoted verbatim")
+            XCTAssertTrue(i.contains("1. Open by saying EXACTLY this, verbatim, before anything else"), kind)
+            XCTAssertTrue(i.contains("Never claim an action happened without its tool result"), kind)
+            XCTAssertTrue(i.contains("English"), kind)
+            XCTAssertTrue(i.contains("say bye"), kind)
+            XCTAssertTrue(i.contains("- kind: \(kind)"), kind)
+            XCTAssertTrue(i.contains("update_call"), kind)
+            XCTAssertTrue(i.contains("snooze_call"), kind)
+        }
+        XCTAssertTrue(CallScript.instructions(session()).contains("THIS IS A PHONE CALL the user asked you to make"))
+        XCTAssertTrue(CallScript.instructions(session()).contains("read the notes word for word"))
+        XCTAssertTrue(CallScript.instructions(session(kind: "test")).contains("TEST CALL"))
+        XCTAssertTrue(CallScript.instructions(session(kind: "morning")).contains("get_schedule"))
+        XCTAssertTrue(CallScript.instructions(session(kind: "morning")).contains("MORNING PLANNING CALL"))
+        XCTAssertTrue(CallScript.instructions(session(kind: "evening")).contains("get_tasks(view: completed)"))
+        XCTAssertTrue(CallScript.instructions(session(kind: "evening")).contains("carry_to_tomorrow ONLY when they ask"))
+        let after = CallScript.instructions(session(kind: "after_block", endTime: "11:30"))
+        XCTAssertTrue(after.contains("CHECK-IN AFTER A BLOCK"))
+        XCTAssertTrue(after.contains("complete_task"))
+        XCTAssertTrue(after.contains("skip_occurrence"))
+        XCTAssertTrue(after.contains("schedule_task"))
+        XCTAssertTrue(after.contains("- block ended at: "))
+    }
+
+    func testPayloadParsesCallKindAndEndTimeTolerantly() throws {
+        let json = """
+        {"kind":"call","callKind":"after_block","endTime":"11:30","callId":"abc","label":"speak to James"}
+        """
+        let p = try JSONDecoder().decode(IncomingCallPayload.self, from: Data(json.utf8))
+        XCTAssertEqual(p.resolvedKind, .afterBlock)
+        XCTAssertEqual(p.endTime, "11:30")
+        XCTAssertEqual(CallSession(payload: p).kind, .afterBlock)
+        XCTAssertEqual(CallSession(payload: p).spokenEnd, "11:30am")
+        // A server that writes the row's kind into the push's own `kind`.
+        let alt = try JSONDecoder().decode(IncomingCallPayload.self, from: Data("{\"kind\":\"morning\",\"callId\":\"x\",\"label\":\"Morning plan\"}".utf8))
+        XCTAssertEqual(alt.resolvedKind, .morning)
+        // Absent / blank / unknown → requested; the discriminator alone is not a kind.
+        let plain = try JSONDecoder().decode(IncomingCallPayload.self, from: Data("{\"kind\":\"call\",\"callId\":\"x\",\"label\":\"y\",\"callKind\":\" \"}".utf8))
+        XCTAssertEqual(plain.resolvedKind, .requested)
+        XCTAssertNil(plain.callKind)
+        XCTAssertEqual(IncomingCallPayload(dictionary: ["callId": "x", "label": "y", "callKind": "weird"])?.resolvedKind, .requested)
+        XCTAssertEqual(CallKind(raw: " Evening "), .evening)
+        XCTAssertEqual(CallKind(raw: nil), .requested)
+        // The fallback-B tap recognises both spellings of a call push.
+        XCTAssertTrue(IncomingCallPayload.isCallPush(kind: "call"))
+        XCTAssertTrue(IncomingCallPayload.isCallPush(kind: "after_block"))
+        XCTAssertFalse(IncomingCallPayload.isCallPush(kind: "task_reminder"))
+        XCTAssertFalse(IncomingCallPayload.isCallPush(kind: nil))
+    }
+
+    func testSpokenTime() {
+        XCTAssertEqual(CallSettings.spokenTime("09:00"), "9am")
+        XCTAssertEqual(CallSettings.spokenTime("14:05"), "2:05pm")
+        XCTAssertEqual(CallSettings.spokenTime("12:30"), "12:30pm")
+        XCTAssertEqual(CallSettings.spokenTime("00:15"), "12:15am")
+        XCTAssertEqual(CallSettings.spokenTime("23:00"), "11pm")
+        XCTAssertEqual(CallSettings.spokenTime("soon"), "soon")
+        // An ISO end time is spoken in local time too.
+        let s = session(kind: "after_block", endTime: "2026-09-02 11:30")
+        XCTAssertEqual(s.spokenEnd, "11:30am")
     }
 
     // MARK: payload decoding
@@ -194,6 +300,115 @@ final class CallScriptTests: XCTestCase {
         XCTAssertNil(CallSession.parseStart("25:00", relativeTo: anchor, calendar: cal))
         XCTAssertNil(CallSession.parseStart("soon", relativeTo: anchor, calendar: cal))
         XCTAssertNil(CallSession.parseStart(nil, relativeTo: anchor, calendar: cal))
+    }
+
+    // MARK: settings persistence (Settings › Calls)
+
+    private func withFreshDefaults(_ body: () -> Void) {
+        let name = "CallSettingsTests.\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        d.removePersistentDomain(forName: name)
+        let previous = CallSettings.defaults
+        CallSettings.defaults = d
+        defer { CallSettings.defaults = previous; d.removePersistentDomain(forName: name) }
+        body()
+    }
+
+    func testCallsSwitchDefaultsOnAndPersists() {
+        withFreshDefaults {
+            XCTAssertTrue(CallSettings.enabled, "a missing key is ON — bool(forKey:) would read false")
+            CallSettings.enabled = false
+            XCTAssertFalse(CallSettings.enabled)
+            XCTAssertEqual(CallSettings.defaults.object(forKey: CallSettings.enabledKey) as? Bool, false)
+            CallSettings.enabled = true
+            XCTAssertTrue(CallSettings.enabled)
+        }
+    }
+
+    func testHoursAndLeadPersistAndFallBackOnGarbage() {
+        withFreshDefaults {
+            XCTAssertEqual(CallSettings.windowStart, "08:00")
+            XCTAssertEqual(CallSettings.windowEnd, "21:00")
+            XCTAssertEqual(CallSettings.defaultLeadMin, 15)
+            CallSettings.windowStart = "07:30"; CallSettings.windowEnd = "22:15"; CallSettings.defaultLeadMin = 30
+            XCTAssertEqual(CallSettings.windowStart, "07:30")
+            XCTAssertEqual(CallSettings.windowEnd, "22:15")
+            XCTAssertEqual(CallSettings.defaultLeadMin, 30)
+            CallSettings.defaults.set("25:99", forKey: CallSettings.windowStartKey)
+            XCTAssertEqual(CallSettings.windowStart, "08:00", "garbage → default")
+        }
+    }
+
+    func testProactivePrefsCacheRoundTripsWithThePendingFlag() {
+        withFreshDefaults {
+            XCTAssertEqual(CallSettings.proactive, .defaults, "all off until the server row is read")
+            XCTAssertFalse(CallSettings.pendingProactivePush)
+            let p = CallProactivePrefs(morningEnabled: true, morningTime: "07:45", eveningEnabled: false,
+                                       eveningTime: "18:00", afterBlockEnabled: true)
+            CallSettings.proactive = p
+            CallSettings.pendingProactivePush = true
+            XCTAssertEqual(CallSettings.proactive, p)
+            XCTAssertTrue(CallSettings.pendingProactivePush)
+            CallSettings.pendingProactivePush = false
+            XCTAssertFalse(CallSettings.pendingProactivePush)
+            XCTAssertNil(CallSettings.defaults.object(forKey: CallSettings.pendingProactivePushKey), "cleared, not false")
+            // Every call key is in the sign-out scrub list.
+            for key in [CallSettings.enabledKey, CallSettings.windowStartKey, CallSettings.windowEndKey,
+                        CallSettings.defaultLeadKey, CallSettings.proactiveKey, CallSettings.pendingProactivePushKey,
+                        CallSettings.voipNudgeDismissedKey] {
+                XCTAssertTrue(CallSettings.userContentKeys.contains(key), key)
+            }
+        }
+    }
+
+    func testProactivePrefsNormaliseServerTimes() {
+        XCTAssertEqual(CallProactivePrefs.hhmm("08:30:00"), "08:30")
+        XCTAssertEqual(CallProactivePrefs.hhmm("18:05:00.000"), "18:05")
+        XCTAssertEqual(CallProactivePrefs.hhmm("7:5"), nil)
+        XCTAssertEqual(CallProactivePrefs.hhmm("09:00"), "09:00")
+        XCTAssertNil(CallProactivePrefs.hhmm(nil))
+        XCTAssertNil(CallProactivePrefs.hhmm("25:00:00"))
+        XCTAssertEqual(CallProactivePrefs.defaults.morningTime, "08:30")
+        XCTAssertEqual(CallProactivePrefs.defaults.eveningTime, "18:00")
+    }
+
+    func testVoipNudgePolicy() {
+        // No token 10 s after a signed-in launch, not yet acted on → show.
+        XCTAssertTrue(VoipRegistrationNudge.shouldShow(tokenPresent: false, signedIn: true, secondsSinceStart: 10, dismissed: false))
+        XCTAssertTrue(VoipRegistrationNudge.shouldShow(tokenPresent: false, signedIn: true, secondsSinceStart: 600, dismissed: false))
+        XCTAssertFalse(VoipRegistrationNudge.shouldShow(tokenPresent: false, signedIn: true, secondsSinceStart: 9.9, dismissed: false), "still in the grace")
+        XCTAssertFalse(VoipRegistrationNudge.shouldShow(tokenPresent: true, signedIn: true, secondsSinceStart: 60, dismissed: false), "a token arrived")
+        XCTAssertFalse(VoipRegistrationNudge.shouldShow(tokenPresent: false, signedIn: false, secondsSinceStart: 60, dismissed: false), "signed out")
+        XCTAssertFalse(VoipRegistrationNudge.shouldShow(tokenPresent: false, signedIn: true, secondsSinceStart: 60, dismissed: true), "one-time")
+        XCTAssertFalse(VoipRegistrationNudge.shouldShow(tokenPresent: false, signedIn: true, secondsSinceStart: nil, dismissed: false), "registration never started")
+        withFreshDefaults {
+            XCTAssertFalse(CallSettings.voipNudgeDismissed)
+            CallSettings.voipNudgeDismissed = true
+            XCTAssertTrue(CallSettings.voipNudgeDismissed)
+        }
+    }
+
+    func testPreviousTestCallsAreTheLiveOnesWithTheTestLabelOrKind() {
+        let rows = [
+            CallRequest(id: "a", callAt: "2026-09-02T14:00:00Z", label: "Test call", status: "scheduled"),
+            CallRequest(id: "b", callAt: "2026-09-02T14:00:00Z", label: "test CALL ", status: "snoozed"),
+            CallRequest(id: "c", callAt: "2026-09-02T14:00:00Z", label: "Test call", status: "done"),
+            CallRequest(id: "d", callAt: "2026-09-02T14:00:00Z", label: "Ring", status: "scheduled", kind: "test"),
+            CallRequest(id: "e", callAt: "2026-09-02T14:00:00Z", label: "speak to James", status: "scheduled"),
+        ]
+        XCTAssertEqual(CallSettingsView.previousTestCalls(in: rows).map(\.id), ["a", "b", "d"])
+    }
+
+    func testCallRequestKindDefaultsAndDecodes() throws {
+        let row = try JSONDecoder().decode(CallRequest.self, from: Data("""
+        {"id":"x","call_at":"2026-09-02T14:45:00+00:00","label":"Morning plan","status":"scheduled","kind":"morning","retries":1}
+        """.utf8))
+        XCTAssertEqual(row.kind, "morning")
+        XCTAssertEqual(row.retries, 1)
+        let old = try JSONDecoder().decode(CallRequest.self, from: Data("{\"id\":\"y\",\"call_at\":\"2026-09-02T14:45:00+00:00\",\"label\":\"z\"}".utf8))
+        XCTAssertEqual(old.kind, "requested", "a pre-072 row")
+        XCTAssertNil(old.retries)
+        XCTAssertEqual(CallRequest(id: "n", callAt: "2026-09-02T14:45:00Z", label: "l").kind, "requested")
     }
 
     // MARK: settings window

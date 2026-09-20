@@ -6,6 +6,12 @@
 // they're read back verbatim when the phone rings. Update / cancel are
 // compare-and-set on the row still being live: a miss reloads instead of
 // showing stale state.
+//
+// The row comes from the LOCAL call_requests mirror (offline-safe; a status
+// change made by the dispatcher / the phone's outcome report / another device
+// updates the toggle live through the mirror's observation) — the live read
+// runs only when the mirror is still empty. Writes go through the same
+// MirrorFirstCallStore the assistant's tools use.
 
 import SwiftUI
 import UnstuckCore
@@ -27,7 +33,8 @@ struct CallMeSection: View {
     @State private var busy = false
     @State private var error: String?
 
-    private var client: CallsClient? { model.coordinator?.calls }
+    private var store: MirrorFirstCallStore? { model.coordinator?.callStore }
+    private var mirror: CallRequestsMirror? { model.coordinator?.callsMirror }
     private var nextBlock: CalBlock? { CallToolLogic.nextLiveBlock(blocks, now: Date()) }
     private var blockStart: Date? { nextBlock.flatMap { CallToolLogic.blockStart($0) } }
     private var canBook: Bool { blockStart != nil && task.later != true }
@@ -35,7 +42,7 @@ struct CallMeSection: View {
     private var callAt: Date? { blockStart?.addingTimeInterval(TimeInterval(-lead * 60)) }
 
     var body: some View {
-        if client != nil {
+        if store != nil {
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     SectionLabel("Call me about this")
@@ -62,6 +69,7 @@ struct CallMeSection: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .task(id: task.id) { await load() }
+            .task(id: task.id) { await observeMirror() }
         }
     }
 
@@ -122,15 +130,41 @@ struct CallMeSection: View {
     // MARK: behaviour
 
     private func load() async {
-        guard let client else { return }
-        let existing = try? await client.forTask(taskId: task.id)
+        guard let store else { return }
+        // The mirror first; the server only while the mirror has nothing yet.
+        var existing = try? store.mirror.forTask(taskId: task.id)
+        if existing == nil, (try? store.mirror.isEmpty()) == true {
+            existing = try? await store.client.forTask(taskId: task.id)
+            if let existing { try? store.mirror.upsert(existing) }
+        }
+        apply(existing)
+        loaded = true
+    }
+
+    /// Follow the mirror: a call that rang / was cancelled elsewhere drops the
+    /// toggle; one booked from the web / the assistant raises it.
+    private func observeMirror() async {
+        guard let mirror else { return }
+        do {
+            for try await live in mirror.observeForTask(taskId: task.id) {
+                guard loaded, !busy else { continue }
+                if live?.id != row?.id || live?.status != row?.status || live?.notes != row?.notes
+                    || live?.leadMin != row?.leadMin || live?.blockId != row?.blockId {
+                    apply(live)
+                }
+            }
+        } catch {}
+    }
+
+    private func apply(_ existing: CallRequest?) {
         row = existing
         if let existing {
             enabled = true
             lead = existing.leadMin ?? CallSettings.defaultLeadMin
             notesText = existing.notes.joined(separator: "\n")
+        } else {
+            enabled = false
         }
-        loaded = true
     }
 
     private func toggle(_ on: Bool) {
@@ -140,12 +174,12 @@ struct CallMeSection: View {
             return
         }
         enabled = false
-        guard let row, let client else { return }
+        guard let row, let store else { return }
         busy = true
         Task {
             do {
                 // nil ⇒ it already rang / was cancelled elsewhere — gone either way.
-                _ = try await client.cancel(id: row.id)
+                _ = try await store.cancelCall(id: row.id)
                 self.row = nil
             } catch {
                 self.error = "Couldn't cancel the call — try again."
@@ -156,7 +190,7 @@ struct CallMeSection: View {
     }
 
     private func save() {
-        guard let client, let callAt, let block = nextBlock,
+        guard let store, let callAt, let block = nextBlock,
               let uid = model.coordinator?.auth.currentUserId else { return }
         if let e = CallToolLogic.timeGuard(callAt, now: Date()) {
             error = e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst
@@ -169,8 +203,8 @@ struct CallMeSection: View {
         Task {
             do {
                 if let row {
-                    if let updated = try await client.update(id: row.id, callAt: callAt, blockId: .some(block.id),
-                                                             leadMin: .some(leadNow), notes: notesNow) {
+                    if let updated = try await store.patch(id: row.id, callAt: callAt, blockId: .some(block.id),
+                                                           leadMin: .some(leadNow), label: nil, notes: notesNow) {
                         self.row = updated
                     } else {
                         // Zero rows: the call rang / was cancelled underneath us.
@@ -178,9 +212,9 @@ struct CallMeSection: View {
                         await load()
                     }
                 } else {
-                    self.row = try await client.create(userId: uid, taskId: task.id, blockId: block.id,
-                                                       callAt: callAt, leadMin: leadNow,
-                                                       label: task.name, notes: notesNow)
+                    self.row = try await store.book(userId: uid, taskId: task.id, blockId: block.id,
+                                                    callAt: callAt, leadMin: leadNow,
+                                                    label: task.name, notes: notesNow)
                 }
             } catch {
                 self.error = "Couldn't book the call — check your connection and try again."

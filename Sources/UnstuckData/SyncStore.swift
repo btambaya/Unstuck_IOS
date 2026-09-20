@@ -163,6 +163,7 @@ public extension AppDatabase {
             case "life_areas":   return Set(try String.fetchAll(db, sql: "SELECT id FROM life_areas"))
             case "captures":     return Set(try String.fetchAll(db, sql: "SELECT id FROM captures"))
             case "cal_blocks":   return Set(try String.fetchAll(db, sql: "SELECT id FROM cal_blocks"))
+            case "call_requests": return Set(try String.fetchAll(db, sql: "SELECT id FROM call_requests"))
             default:             return []
             }
         }
@@ -183,7 +184,7 @@ public extension AppDatabase {
         // device is already in step with rows it no longer holds.
         let tables = ["tasks", "sessions", "cal_blocks", "captures", "reason_logs",
                       "collections", "tags", "life_areas", "calendar_connections",
-                      "profile_facts", "outbox", "live_session", "capture_archive",
+                      "profile_facts", "call_requests", "outbox", "live_session", "capture_archive",
                       "sync_cursors"]
         try writer.write { db in
             for t in tables { try db.execute(sql: "DELETE FROM \(t)") }

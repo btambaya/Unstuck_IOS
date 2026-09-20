@@ -1,9 +1,14 @@
-// Settings → Notifications → "Calls from Unstuck": what a call is, the
-// allowed hours (the phone's own guard, applied on receipt), the default lead
-// for task-anchored calls, and "Test call now" — which books a REAL
-// call_requests row for one minute from now so the whole server → APNs VoIP →
-// CallKit path rings the phone. (The nav row in SettingsFeature is added by
-// the integrator.)
+// Settings → "Calls from Unstuck" (calls build-out, docs/calls-build-out.md
+// iOS §1): the master Calls on/off switch (device-local, applied on receipt),
+// the allowed hours (the phone's own guard) + the default lead for task-
+// anchored calls, the three OPT-IN proactive calls (morning plan / evening
+// wrap-up / check-in after a block — account-wide, written through
+// `notification_preferences.call_*` via AppModel.setCallProactivePrefs), the
+// one-time VoIP-registration nudge, and "Test call now" — a REAL
+// call_requests row (kind `test`) one minute from now so the whole server →
+// APNs VoIP → CallKit path rings the phone; a previous live test call is
+// cancelled first (Android's behaviour — the one-live-call-per-label rule
+// would refuse the retry otherwise).
 
 import SwiftUI
 import UnstuckDesign
@@ -13,17 +18,28 @@ struct CallSettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
 
+    @State private var enabled = CallSettings.enabled
     @State private var windowStart = CallSettingsView.date(CallSettings.windowStart)
     @State private var windowEnd = CallSettingsView.date(CallSettings.windowEnd)
     @State private var lead = CallSettings.defaultLeadMin
     @State private var testState: TestState = .idle
+    @State private var showVoipNudge = false
+    @State private var nudgeRetried = false
 
     private enum TestState: Equatable { case idle, booking, booked(String), failed(String) }
+
+    /// The test call's label + note (the row the button books; the same
+    /// label is what a retry cancels first).
+    static let testCallLabel = "Test call"
+    static let testCallNote = "This is what a call from Unstuck sounds like"
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
                 explainer
+
+                masterSwitch.padding(.top, 14)
+                if showVoipNudge { voipNudge.padding(.top, 10) }
 
                 SectionLabel("Allowed hours").padding(.top, 22).padding(.bottom, 8)
                 VStack(spacing: 0) {
@@ -45,6 +61,12 @@ struct CallSettingsView: View {
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).padding(.top, 10)
                     .fixedSize(horizontal: false, vertical: true)
 
+                SectionLabel("Calls Unstuck can make on its own").padding(.top, 22).padding(.bottom, 8)
+                proactiveCard
+                Text("All off unless you switch them on. They ring within your allowed hours, on every phone where calls are on.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).padding(.top, 10)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 SectionLabel("Try it").padding(.top, 22).padding(.bottom, 8)
                 testCallCard
             }
@@ -55,6 +77,123 @@ struct CallSettingsView: View {
         .background(theme.palette.bg.ignoresSafeArea())
         .navigationTitle("Calls from Unstuck")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            model.refreshCallProactivePrefs()
+            // The nudge: no VoIP token 10 s after a signed-in launch, once.
+            showVoipNudge = VoipPushRegistry.shared.shouldShowNudge(signedIn: model.signedIn)
+            if !showVoipNudge, let s = VoipPushRegistry.shared.secondsSinceRegistrationStart,
+               s < VoipRegistrationNudge.graceSeconds {
+                try? await Task.sleep(nanoseconds: UInt64((VoipRegistrationNudge.graceSeconds - s + 0.2) * 1_000_000_000))
+                showVoipNudge = VoipPushRegistry.shared.shouldShowNudge(signedIn: model.signedIn)
+            }
+        }
+    }
+
+    // MARK: master switch + proactive calls
+
+    private var masterSwitch: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Calls").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                Text(enabled ? "This iPhone rings for calls you book."
+                             : "Off — a booked call is declined quietly here and you get the notes as a notification.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Toggle("", isOn: Binding(get: { enabled }, set: { on in
+                enabled = on
+                CallSettings.enabled = on
+            }))
+            .labelsHidden()
+            .tint(theme.palette.primary)
+            .accessibilityLabel("Calls")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 13)
+        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+    }
+
+    private var proactiveCard: some View {
+        let prefs = model.callProactivePrefs
+        return VStack(spacing: 0) {
+            proactiveRow("Morning planning call", sub: "Rings to walk through the day and plan it with you.",
+                         isOn: prefs.morningEnabled, time: prefs.morningTime,
+                         setOn: { var p = prefs; p.morningEnabled = $0; model.setCallProactivePrefs(p) },
+                         setTime: { var p = prefs; p.morningTime = $0; model.setCallProactivePrefs(p) })
+            Rectangle().fill(theme.palette.line).frame(height: 1)
+            proactiveRow("Evening wrap-up call", sub: "Rings to go over what got done and what moves to tomorrow.",
+                         isOn: prefs.eveningEnabled, time: prefs.eveningTime,
+                         setOn: { var p = prefs; p.eveningEnabled = $0; model.setCallProactivePrefs(p) },
+                         setTime: { var p = prefs; p.eveningTime = $0; model.setCallProactivePrefs(p) })
+            Rectangle().fill(theme.palette.line).frame(height: 1)
+            proactiveRow("Check in after a block", sub: "Rings when a block ends without its task marked done — how did it go?",
+                         isOn: prefs.afterBlockEnabled, time: nil,
+                         setOn: { var p = prefs; p.afterBlockEnabled = $0; model.setCallProactivePrefs(p) },
+                         setTime: { _ in })
+        }
+        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+    }
+
+    private func proactiveRow(_ title: String, sub: String, isOn: Bool, time: String?,
+                              setOn: @escaping (Bool) -> Void, setTime: @escaping (String) -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                    Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Toggle("", isOn: Binding(get: { isOn }, set: setOn))
+                    .labelsHidden()
+                    .tint(theme.palette.primary)
+                    .accessibilityLabel(title)
+            }
+            if isOn, let time {
+                HStack {
+                    Text("At").font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                    Spacer()
+                    DatePicker("", selection: Binding(get: { Self.date(time) },
+                                                      set: { setTime(CallSettings.hhmm($0)) }),
+                               displayedComponents: .hourAndMinute)
+                        .labelsHidden()
+                }
+            }
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    /// One-time: PushKit produced no VoIP token 10 s after a signed-in launch.
+    private var voipNudge: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle").font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(theme.palette.amber).padding(.top, 1)
+                Text("Calls need Voice-over-IP registration on this iPhone — without it a call arrives as a notification you tap instead of a ring.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Button {
+                VoipPushRegistry.shared.retryRegistration()
+                nudgeRetried = true
+                Task {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    showVoipNudge = PushRegistrar.shared.voipTokenHex == nil && !CallSettings.voipNudgeDismissed
+                }
+            } label: {
+                Text(nudgeRetried ? "Retrying…" : "Retry registration")
+                    .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(theme.palette.ink, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(nudgeRetried)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     // MARK: pieces
@@ -81,7 +220,8 @@ struct CallSettingsView: View {
         let ready = PushRegistrar.shared.voipTokenHex != nil
         return HStack(spacing: 6) {
             Circle().fill(ready ? theme.palette.green : theme.palette.ink3).frame(width: 7, height: 7)
-            Text(ready ? "This iPhone can take calls." : "Waiting for this iPhone's call token — calls fall back to a notification until it arrives.")
+            Text(ready ? (enabled ? "This iPhone can take calls." : "This iPhone can take calls — they're switched off below.")
+                       : "Waiting for this iPhone's call token — calls fall back to a notification until it arrives.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -150,6 +290,10 @@ struct CallSettingsView: View {
         guard let coord = model.coordinator, let uid = coord.auth.currentUserId else {
             testState = .failed("Sign in first."); return
         }
+        guard enabled else {
+            testState = .failed("Calls are off on this iPhone — switch them on above to try it.")
+            return
+        }
         // The same guards the assistant's request_call applies (server window
         // 06:00–23:00) plus the user's own allowed hours — otherwise the
         // server would refuse or the phone would decline it quietly and the
@@ -165,16 +309,30 @@ struct CallSettingsView: View {
             return
         }
         testState = .booking
-        let client = coord.calls
+        let store = coord.callStore
         Task {
             do {
-                try await client.create(userId: uid, callAt: at, label: "Test call",
-                                        notes: ["This is what a call from Unstuck sounds like"])
+                // A live earlier test call is cancelled first (Android's
+                // bookTestCall): the one-live-call-per-label rule would refuse
+                // the retry, and two test rows would ring twice.
+                let live = try await store.liveCalls()
+                for stale in Self.previousTestCalls(in: live) {
+                    _ = try? await store.cancelCall(id: stale.id)
+                }
+                let row = try await store.client.create(userId: uid, callAt: at, label: Self.testCallLabel,
+                                                        notes: [Self.testCallNote], kind: "test")
+                try? store.mirror.upsert(row)
                 testState = .booked(CallSettings.hhmm(at))
             } catch {
                 testState = .failed("Couldn't book the test call — check your connection and try again.")
             }
         }
+    }
+
+    /// The live rows a new test call replaces: the same label (case-
+    /// insensitive) — or, once the server stamps kinds, kind `test`.
+    static func previousTestCalls(in live: [CallRequest]) -> [CallRequest] {
+        live.filter { $0.isLive && ($0.kind == "test" || $0.label.trimmingCharacters(in: .whitespaces).lowercased() == testCallLabel.lowercased()) }
     }
 
     private static func date(_ hhmm: String) -> Date {

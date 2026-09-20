@@ -239,6 +239,34 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        // "Unstuck calls you": the local mirror of `call_requests` (server
+        // migrations 051 / 053 / 072). Columns ARE the server's snake_case names
+        // (the CallRequest row type in UnstuckSync is the record); `notes` /
+        // `outcome_notes` are JSON text. Never written by the outbox — the
+        // client books / cancels through direct writes and mirrors the returned
+        // row; the hydrate / realtime / cursor catch-up keep it in step.
+        m.registerMigration("v6_call_requests") { db in
+            try db.create(table: "call_requests") { t in
+                t.primaryKey("id", .text)
+                t.column("user_id", .text)
+                t.column("task_id", .text).indexed()
+                t.column("block_id", .text)
+                t.column("call_at", .text).notNull().indexed()
+                t.column("lead_min", .integer)
+                t.column("label", .text).notNull()
+                t.column("notes", .text)             // JSON [String]
+                t.column("status", .text).notNull().defaults(to: "scheduled")
+                t.column("snooze_until", .text)
+                t.column("outcome_notes", .text)     // JSON [String]
+                t.column("call_id", .text)
+                t.column("attempts", .integer)
+                t.column("kind", .text).notNull().defaults(to: "requested")
+                t.column("retries", .integer)
+                t.column("created_at", .text)
+                t.column("updated_at", .text).indexed()
+            }
+        }
+
         return m
     }()
 }

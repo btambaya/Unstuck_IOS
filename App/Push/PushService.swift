@@ -132,7 +132,7 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         // conversation in Talk with the same payload the VoIP path would get.
         if response.actionIdentifier == UNNotificationDefaultActionIdentifier
             || response.actionIdentifier == NotificationCategories.actionAnswerCall,
-           PushAppDelegate.callKind(info) == "call",
+           IncomingCallPayload.isCallPush(kind: PushAppDelegate.callKind(info)),
            let payload = IncomingCallPayload(dictionary: info) {
             let posted = PostedNotification(response.notification)
             let done = CompletionBox(call: completionHandler)

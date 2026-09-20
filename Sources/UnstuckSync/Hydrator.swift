@@ -120,6 +120,27 @@ public actor Hydrator {
         await replace("calendar_connections", CalendarConnectionRow.self) { try self.db.replaceAll(CalendarConnection.self, with: $0.map { $0.model() }) }
         await hydrateCalBlocks()
         await hydrateProfileFacts()
+        await hydrateCallRequests()
+    }
+
+    /// `call_requests` — the local mirror the call surfaces read (see
+    /// CallRequestsMirror). Server-canonical, with one preservation rule: a
+    /// LOCAL-ONLY row stamped newer than every server row is a booking whose
+    /// echo this fetch predated — kept until the next pull confirms it (there
+    /// is no outbox op to consult; calls are direct writes). False = the fetch
+    /// failed (local left intact).
+    @discardableResult
+    public func hydrateCallRequests() async -> Bool {
+        do {
+            let remote = try await gateway.fetchAllTolerant(CallRequest.self, table: "call_requests")
+            try db.replaceAllAtomically(CallRequest.self) { _, local in
+                CallRequestsMirror.mergeHydrated(remote: remote, local: local)
+            }
+            return true
+        } catch {
+            print("[hydrate] call_requests failed, leaving local intact: \(error)")
+            return false
+        }
     }
 
     /// Ids with a queued (non-quarantined or quarantined — either way un-acked)

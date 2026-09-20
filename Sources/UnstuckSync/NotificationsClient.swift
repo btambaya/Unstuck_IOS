@@ -47,6 +47,24 @@ public struct NotificationsClient: Sendable {
 
     // MARK: wake-window calibration (migration 015 `wake_window_history`)
 
+    // MARK: notification_queue cards (the "Unstuck called you about X" card)
+
+    /// The server-side in-app cards for the signed-in user (RLS
+    /// `notification_queue_own`), one `moment` only, newest first — what the
+    /// web's `useNotificationQueue` reads (id, moment, title, body,
+    /// created_at). The bell reads moment `call` so a call the server rang
+    /// (answered, missed, or on a phone that couldn't take it) shows up as a
+    /// card on every device. Throws on transport failure; the caller keeps
+    /// what it had.
+    public func queueCards(moment: String, limit: Int = 30) async throws -> [NotificationQueueCard] {
+        try await client.from("notification_queue")
+            .select("id, moment, title, body, created_at")
+            .eq("moment", value: moment)
+            .order("created_at", ascending: false)
+            .limit(limit)
+            .execute().value
+    }
+
     /// Record the day's FIRST app input (foreground) for `calibrate_wake_windows`
     /// — one row per (user, local date); a repeat for the same day is IGNORED
     /// (the earliest input is the wake signal). Until every client wrote this,
@@ -64,6 +82,33 @@ public struct NotificationsClient: Sendable {
                         first_input_local: sample.firstInputLocal, weekday: sample.weekday),
                     onConflict: "user_id,local_date", ignoreDuplicates: true)
             .execute()
+    }
+}
+
+/// One `notification_queue` row as the bell reads it (web `QueueRow`).
+public struct NotificationQueueCard: Codable, Sendable, Equatable, Identifiable {
+    public var id: String
+    public var moment: String
+    public var title: String
+    public var body: String
+    public var createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, moment, title, body
+        case createdAt = "created_at"
+    }
+
+    public init(id: String, moment: String, title: String, body: String, createdAt: String) {
+        self.id = id; self.moment = moment; self.title = title; self.body = body; self.createdAt = createdAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        moment = try c.decodeIfPresent(String.self, forKey: .moment) ?? ""
+        title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
+        body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
+        createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
     }
 }
 
@@ -157,6 +202,55 @@ public struct PreferencesClient: Sendable {
             .select("notification_level, reminder_lead_min").eq("user_id", value: userId).limit(1)
             .execute().value
         return NotificationPrefsRow(level: rows.first?.notification_level, reminderLeadMin: rows.first?.reminder_lead_min)
+    }
+
+    // MARK: proactive calls (migration 072: `notification_preferences.call_*`)
+
+    /// The opt-in proactive calls as the server has them — the morning
+    /// planning call, the evening wrap-up and the check-in after a block
+    /// (docs/calls-build-out.md). Nil when the row is absent; a column the
+    /// server doesn't have yet reads as its default. Throws on transport
+    /// failure (the caller keeps its cache).
+    public func callProactivePrefs(userId: String) async throws -> CallProactivePrefs? {
+        struct Row: Decodable {
+            let call_morning_enabled: Bool?
+            let call_morning_time: String?
+            let call_evening_enabled: Bool?
+            let call_evening_time: String?
+            let call_after_block_enabled: Bool?
+        }
+        let rows: [Row] = try await client.from("notification_preferences")
+            .select("call_morning_enabled, call_morning_time, call_evening_enabled, call_evening_time, call_after_block_enabled")
+            .eq("user_id", value: userId).limit(1)
+            .execute().value
+        guard let r = rows.first else { return nil }
+        return CallProactivePrefs(
+            morningEnabled: r.call_morning_enabled ?? false,
+            morningTime: CallProactivePrefs.hhmm(r.call_morning_time) ?? CallProactivePrefs.defaultMorningTime,
+            eveningEnabled: r.call_evening_enabled ?? false,
+            eveningTime: CallProactivePrefs.hhmm(r.call_evening_time) ?? CallProactivePrefs.defaultEveningTime,
+            afterBlockEnabled: r.call_after_block_enabled ?? false)
+    }
+
+    /// Persist the proactive-call toggles + times (upsert on user_id like the
+    /// other prefs writers; a bare UPDATE on a missing row is a silent no-op).
+    /// Times go up as "HH:MM" — Postgres `time` accepts it.
+    public func setCallProactivePrefs(userId: String, prefs: CallProactivePrefs) async throws {
+        struct Row: Encodable {
+            let user_id: String
+            let call_morning_enabled: Bool
+            let call_morning_time: String
+            let call_evening_enabled: Bool
+            let call_evening_time: String
+            let call_after_block_enabled: Bool
+        }
+        _ = try await client.from("notification_preferences")
+            .upsert(Row(user_id: userId,
+                        call_morning_enabled: prefs.morningEnabled, call_morning_time: prefs.morningTime,
+                        call_evening_enabled: prefs.eveningEnabled, call_evening_time: prefs.eveningTime,
+                        call_after_block_enabled: prefs.afterBlockEnabled),
+                    onConflict: "user_id")
+            .execute()
     }
 
     // MARK: PA rituals (migration 053: `user_preferences.pa_rituals jsonb`)
@@ -275,6 +369,42 @@ public struct PreferencesClient: Sendable {
         let rest = afterDot.dropFirst(digits.count)
         let millis = String(digits.prefix(3)).padding(toLength: 3, withPad: "0", startingAt: 0)
         return CallsClient.parseISO(String(t[..<dot]) + "." + millis + String(rest))
+    }
+}
+
+/// The opt-in proactive calls (`notification_preferences.call_*`, migration
+/// 072). Off by default — a call only happens because the user asked for one.
+public struct CallProactivePrefs: Codable, Sendable, Equatable {
+    public var morningEnabled: Bool
+    /// "HH:MM" local.
+    public var morningTime: String
+    public var eveningEnabled: Bool
+    public var eveningTime: String
+    public var afterBlockEnabled: Bool
+
+    public static let defaultMorningTime = "08:30"
+    public static let defaultEveningTime = "18:00"
+    public static let defaults = CallProactivePrefs(morningEnabled: false, morningTime: defaultMorningTime,
+                                                    eveningEnabled: false, eveningTime: defaultEveningTime,
+                                                    afterBlockEnabled: false)
+
+    public init(morningEnabled: Bool, morningTime: String, eveningEnabled: Bool, eveningTime: String,
+                afterBlockEnabled: Bool) {
+        self.morningEnabled = morningEnabled
+        self.morningTime = morningTime
+        self.eveningEnabled = eveningEnabled
+        self.eveningTime = eveningTime
+        self.afterBlockEnabled = afterBlockEnabled
+    }
+
+    /// A Postgres `time` as PostgREST emits it ("08:30:00", "08:30:00.000")
+    /// or a bare "HH:MM" → "HH:MM"; nil for null / garbage.
+    public static func hhmm(_ raw: String?) -> String? {
+        guard let t = raw?.trimmingCharacters(in: .whitespacesAndNewlines), t.count >= 5 else { return nil }
+        let head = String(t.prefix(5))
+        let p = head.split(separator: ":").compactMap { Int($0) }
+        guard p.count == 2, (0..<24).contains(p[0]), (0..<60).contains(p[1]) else { return nil }
+        return String(format: "%02d:%02d", p[0], p[1])
     }
 }
 

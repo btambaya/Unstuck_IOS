@@ -43,8 +43,38 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
     nonisolated static let tokenKey = "unstuck.push.voipToken"
 
     private var registry: PKPushRegistry?
+    /// When PushKit registration was (last) requested — `start()` / a retry.
+    /// Settings › Calls shows the one-time "needs VoIP registration — retry"
+    /// note when no token has arrived `VoipRegistrationNudge.graceSeconds`
+    /// after a signed-in launch.
+    private(set) var registrationStartedAt: Date?
 
     private override init() { super.init() }
+
+    /// Seconds since registration was requested (nil before `start()`).
+    var secondsSinceRegistrationStart: TimeInterval? {
+        registrationStartedAt.map { Date().timeIntervalSince($0) }
+    }
+
+    /// The Settings nudge's verdict, from the live facts (pure policy in
+    /// VoipRegistrationNudge).
+    func shouldShowNudge(signedIn: Bool, now: Date = Date()) -> Bool {
+        VoipRegistrationNudge.shouldShow(
+            tokenPresent: Self.storedToken != nil, signedIn: signedIn,
+            secondsSinceStart: registrationStartedAt.map { now.timeIntervalSince($0) },
+            dismissed: CallSettings.voipNudgeDismissed)
+    }
+
+    /// The nudge's retry: drop and re-request the VoIP registration so PushKit
+    /// issues credentials again (`didUpdate` → the token goes up with
+    /// register-push-token). Marks the nudge acted on.
+    func retryRegistration() {
+        CallSettings.voipNudgeDismissed = true
+        registrationStartedAt = Date()
+        guard let r = registry else { start(); return }
+        r.desiredPushTypes = []
+        r.desiredPushTypes = [.voIP]
+    }
 
     /// The last VoIP token PushKit issued (device-scoped, persisted).
     nonisolated static var storedToken: String? {
@@ -60,6 +90,7 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
         r.delegate = self
         r.desiredPushTypes = [.voIP]
         registry = r
+        registrationStartedAt = Date()
     }
 
     /// Sign-out (AppModel.scrubDeviceLocalUserContent): forget the token, stop
@@ -78,6 +109,7 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
     func rearm() {
         guard let r = registry, !(r.desiredPushTypes ?? []).contains(.voIP) else { return }
         r.desiredPushTypes = [.voIP]
+        registrationStartedAt = Date()
     }
 
     // MARK: PKPushRegistryDelegate (main queue)

@@ -27,8 +27,11 @@
 // coordinator either way. nil ⇒ not a call tool (the normal dispatcher runs).
 //
 // Pure pieces (when-parsing, guards, formatting) live in CallToolLogic and
-// are unit-tested; the network is behind `CallStore` (CallsClient in
-// production, a fake in CallScriptTests).
+// are unit-tested; the store is behind `CallStore` — in production
+// `MirrorFirstCallStore` (the GRDB mirror of call_requests for every READ,
+// so get_calls works offline and sees status changes live; CallsClient for
+// every WRITE, whose returned row is upserted into the mirror at once), a
+// fake in CallScriptTests.
 
 import Foundation
 import UnstuckCore
@@ -94,6 +97,62 @@ extension CallsClient: CallStore {
     func cancelCall(id: String) async throws -> CallRequest? { try await cancel(id: id) }
 }
 
+/// The production store: READS come from the local `call_requests` mirror
+/// (CallRequestsMirror — hydrated, mirrored via realtime, caught up by
+/// cursor), falling back to the live read ONLY when the mirror is empty (a
+/// fresh sign-in before the hydrate landed). Offline with an empty mirror ⇒
+/// "no calls" rather than an error. WRITES go to the server (the status
+/// guard lives there) and the returned row lands in the mirror at once, so
+/// the next get_calls / the task editor sees it before the realtime echo.
+struct MirrorFirstCallStore: CallStore {
+    let client: CallsClient
+    let mirror: CallRequestsMirror
+
+    func liveCalls() async throws -> [CallRequest] {
+        let local = try mirror.live()
+        let mirrorEmpty = try mirror.isEmpty()
+        if !local.isEmpty || !mirrorEmpty { return local }
+        guard let remote = try? await client.list(upcoming: true) else { return [] }
+        for r in remote { try? mirror.upsert(r) }
+        return remote
+    }
+
+    func call(id: String) async throws -> CallRequest? {
+        if let local = try mirror.get(id: id) { return local }
+        guard try mirror.isEmpty() else { return nil }
+        let remote = try await client.get(id: id)
+        if let remote { try? mirror.upsert(remote) }
+        return remote
+    }
+
+    func book(userId: String, taskId: String?, blockId: String?, callAt: Date, leadMin: Int?,
+              label: String, notes: [String]) async throws -> CallRequest {
+        let row = try await client.create(userId: userId, taskId: taskId, blockId: blockId, callAt: callAt,
+                                          leadMin: leadMin, label: label, notes: notes)
+        try? mirror.upsert(row)
+        return row
+    }
+
+    func patch(id: String, callAt: Date?, blockId: String??, leadMin: Int??,
+               label: String?, notes: [String]?) async throws -> CallRequest? {
+        let row = try await client.update(id: id, callAt: callAt, blockId: blockId, leadMin: leadMin,
+                                          label: label, notes: notes)
+        if let row { try? mirror.upsert(row) }
+        return row
+    }
+
+    func cancelCall(id: String) async throws -> CallRequest? {
+        let row = try await client.cancel(id: id)
+        if let row { try? mirror.upsert(row) }
+        return row
+    }
+}
+
+extension SyncCoordinator {
+    /// The app's call store: the mirror for reads, the client for writes.
+    nonisolated var callStore: MirrorFirstCallStore { MirrorFirstCallStore(client: calls, mirror: callsMirror) }
+}
+
 @MainActor
 enum CallTools {
     static let names: Set<String> = ["request_call", "cancel_call", "update_call", "get_calls", "snooze_call"]
@@ -115,11 +174,11 @@ enum CallTools {
             return CallCoordinator.shared.snoozeActiveCall(minutes: CallToolLogic.int(args["minutes"]) ?? 10)
         }
         guard let model = CallCoordinator.shared.attachedModel,
-              let client = model.coordinator?.calls,
-              let userId = model.coordinator?.auth.currentUserId else {
+              let coord = model.coordinator,
+              let userId = coord.auth.currentUserId else {
             return "error: calls aren't available right now — sign in on the phone first"
         }
-        return await run(name: name, args: args, api: api, scratch: scratch, store: client, userId: userId)
+        return await run(name: name, args: args, api: api, scratch: scratch, store: coord.callStore, userId: userId)
     }
 
     static func run(name: String, args: [String: Any], api: AssistantAppState, scratch: TurnScratch,

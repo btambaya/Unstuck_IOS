@@ -118,12 +118,23 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         XCTAssertEqual(sessionStarts, 1)
     }
 
-    func testToolsAreCallToolsOnlyPlusSnoozeCall() {
+    /// A call is the FULL assistant (calls build-out): every voice tool the
+    /// registry publishes rides along, in CallScript.callTools order, plus
+    /// snooze_call from the registry's call surface. The fake VOICE_TOOLS
+    /// slice only carries six schemas, so the config holds those six (all of
+    /// them — create_task and delete_task are no longer filtered out) plus
+    /// the two the launcher can synthesise (snooze_call, update_call).
+    func testToolsAreEveryVoiceToolPlusSnoozeCall() {
         let live = start()
-        XCTAssertEqual(live.config.toolNames, CallScript.callTools)
-        XCTAssertEqual(live.config.toolNames, ["complete_task", "add_capture", "schedule_task", "start_focus", "update_call", "snooze_call"])
-        XCTAssertFalse(live.config.toolNames.contains("create_task"))
-        XCTAssertFalse(live.config.toolNames.contains("delete_task"))
+        let expected = CallScript.callTools.filter { name in
+            Self.voiceTools.contains { $0["name"] as? String == name } || name == "snooze_call" || name == "update_call"
+        }
+        XCTAssertEqual(live.config.toolNames, expected, "registry order, nothing the fake can't describe")
+        XCTAssertEqual(Set(live.config.toolNames),
+                       ["create_task", "complete_task", "schedule_task", "add_capture", "start_focus", "delete_task", "update_call", "snooze_call"])
+        XCTAssertTrue(live.config.toolNames.contains("create_task"), "a call can do everything Talk can")
+        XCTAssertTrue(live.config.toolNames.contains("delete_task"))
+        for n in live.config.toolNames { XCTAssertTrue(CallScript.callTools.contains(n), n) }
         // VOICE_TOOLS schemas are passed through untouched.
         let complete = live.config.tools.first { $0["name"] as? String == "complete_task" }
         XCTAssertEqual(complete?["description"] as? String, "Mark a task done.")
@@ -238,7 +249,7 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         XCTAssertEqual(reporter.outcomes, [.answered])
 
         controller.flush()   // CallKit's CXEndCallAction lands
-        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, callKitId: UUID(uuidString: Self.callId), outcome: .snoozed, snooze: 10, notes: nil))
+        XCTAssertEqual(reporter.reports.last, FakeReporter.Report(callId: Self.callId, callKitId: UUID(uuidString: Self.callId), outcome: .snoozed, snooze: 10, notes: nil, notification: nil))
         XCTAssertEqual(reporter.outcomes, [.answered, .snoozed], "exactly one outcome for the end")
         XCTAssertEqual(controller.requested.count, 1)
         XCTAssertNil(coordinator.active)
@@ -330,11 +341,13 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         let live = start()
         let complete = await live.tool("complete_task", #"{"taskId":"task-1"}"#)
         let update = await live.tool("update_call", #"{"callId":"x","notes":["a"]}"#)
-        let create = await live.tool("create_task", #"{"name":"nope"}"#)
+        let create = await live.tool("create_task", #"{"name":"a task from the call"}"#)
+        let unknown = await live.tool("make_coffee", "{}")
         XCTAssertEqual(complete, "ok: complete_task")
         XCTAssertEqual(update, "ok: update_call")
-        XCTAssertEqual(create, "error: create_task isn't available during a call")
-        XCTAssertEqual(appToolCalls, ["complete_task", "update_call"])
+        XCTAssertEqual(create, "ok: create_task", "every voice tool runs during a call")
+        XCTAssertEqual(unknown, "error: make_coffee isn't available during a call", "a name outside the registry is refused")
+        XCTAssertEqual(appToolCalls, ["complete_task", "update_call", "create_task"])
         XCTAssertTrue(ended.isEmpty)
     }
 
@@ -391,7 +404,9 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
     func testTalkConfigurationForFallbackSnoozesByReportingTheOutcome() async {
         let s = session()
         guard let cfg = launcher.talkConfiguration(for: s) else { return XCTFail("bound launcher gives a configuration") }
-        XCTAssertEqual(cfg.toolNames, CallScript.callTools)
+        XCTAssertEqual(cfg.toolNames,
+                       RealtimeCallVoiceLauncher.callToolSchemas(from: Self.voiceTools).compactMap { $0["name"] as? String },
+                       "the same tool set as the CallKit path")
         XCTAssertEqual(cfg.opening, CallScript.opening(s, now: Self.now))
         XCTAssertTrue(cfg.primer.contains(cfg.opening))
         let r = await cfg.runTool("snooze_call", #"{"minutes":15}"#)
@@ -402,8 +417,10 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty, "the Talk screen owns its own session")
         let complete = await cfg.runTool("complete_task", "{}")
         let create = await cfg.runTool("create_task", "{}")
+        let unknown = await cfg.runTool("make_coffee", "{}")
         XCTAssertEqual(complete, "ok: complete_task")
-        XCTAssertEqual(create, "error: create_task isn't available during a call")
+        XCTAssertEqual(create, "ok: create_task", "the full assistant in the fallback path too")
+        XCTAssertEqual(unknown, "error: make_coffee isn't available during a call")
         XCTAssertNil(RealtimeCallVoiceLauncher().talkConfiguration(for: s), "unbound → nil")
     }
 

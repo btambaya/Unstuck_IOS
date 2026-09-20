@@ -5,6 +5,73 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (71) uploaded to TestFlight (delivery 680be3e7) — tools v2 + the voice guard's tool-backed rule (ok: from a tool that changes something, not reads or navigation), 2026-09-20.
 
+- Ship: 1.1.1 (72) uploaded to TestFlight — the calls build-out (iOS half) on top of build 71; the backend (migration 072, send-call, call-outcome) is live in prod. 2026-09-20.
+
+## Where things stand (2026-09-20, later) — calls build-out, iOS half
+
+The iOS section of `unstuck/docs/calls-build-out.md` (backend built in parallel:
+migration 072 `call_requests.kind/retries`, `notification_preferences.call_*`,
+`callKind` + `endTime` on the push, `call-outcome → { ok, status, retry, snoozeUntil? }`).
+NOT bumped, not committed.
+
+- **Settings › Calls** (`CallSettingsView`): master **Calls** switch
+  (`CallSettings.enabled`, device-local, default ON — enforced ON RECEIPT in
+  `CallCoordinator` before the hours rule, Android order: a call that lands
+  while off ends `declined` quietly + the notes as a notification with the
+  honest "calls are off on this iPhone" line); hours + lead unchanged; three
+  **server-backed** toggles + times (morning plan / evening wrap-up / check-in
+  after a block) → `PreferencesClient.callProactivePrefs / setCallProactivePrefs`
+  (`notification_preferences.call_*`), cached in `CallSettings.proactive` with
+  `pendingProactivePush` (offline toggle re-pushed on the next hydrate, never
+  pulled over — `AppModel.setCallProactivePrefs / applyServerCallProactivePrefs`,
+  wired into `pullServerPreferencesIfNeeded` so a prefs realtime event refreshes
+  it); the **VoIP nudge** (no PushKit token 10 s after a signed-in launch →
+  one-time inline note with "Retry registration" → `VoipPushRegistry.retryRegistration`;
+  pure policy `VoipRegistrationNudge`); **Test call** cancels a previous live
+  test row first and books with kind `test`.
+- **The call is the full assistant**: `CallScript.callTools` = every
+  `ToolRegistry.voice` name + `ToolRegistry.call` (the launcher's
+  `callToolSchemas` now resolves names from both surfaces); `CallScript.opening /
+  instructions` vary by `CallSession.kind` (`IncomingCallPayload.callKind`, with
+  `endTime` for after_block — `CallKind`, tolerant of a server that writes the
+  kind into `kind`): requested unchanged; test; morning → get_schedule + plan;
+  evening → get_tasks(completed) + carry_to_tomorrow on request; after_block →
+  "<task> was on till <spoken time>. How did it go?" → done / skip / reschedule.
+  The verbatim-opening line and "never claim an action without its tool result"
+  hold for every kind.
+- **Missed → retry-aware**: `CallsClient.outcome` returns `CallOutcomeReceipt`;
+  the coordinator no longer posts "I called about X" at the 30 s timeout — the
+  notification rides WITH the persisted `missed` item
+  (`CallsOutcomeReporter.Item.notification`) and the reporter posts it when
+  the server answers `retry: false` (or refuses the report for good), swallows
+  it on `retry: true` (the server's one automatic ring-back 5 min later).
+  Survives a kill (persisted with the queue).
+- **Local mirror of `call_requests`** (`Sources/UnstuckSync/CallRequestsMirror.swift`,
+  GRDB migration `v6_call_requests`, columns = the server's snake_case names):
+  `Hydrator.hydrateCallRequests` (server-canonical; a local-only row newer than
+  every server row survives — a booking whose echo the fetch predated),
+  `RealtimeMirror` subscribes the table (LWW on `updated_at`),
+  `CatchUpPuller` pulls it by the `updated_at` cursor + id-reconciles the
+  30-day prune, `clearAll` / `localIds` know it. Readers go mirror-first:
+  `MirrorFirstCallStore` (get_calls / cancel / update reads; writes through
+  `CallsClient` then upsert the returned row), `CallMeSection` (+ live
+  observation of the task's row), `AppModel.openCall` (live read only on a
+  mirror miss). Offline `get_calls` answers from the mirror.
+- **The bell's call card**: `NotificationsClient.queueCards(moment: "call")`
+  → `NotificationQueueCards.entry` ("Unstuck called you about <label>" + the
+  matched mirror row's notes, task deep link) merged into Recent with the
+  web's `mergeRecent` rules; refetched on open and on foreground.
+- **Tests**: `CallScriptTests` (per-kind openings/instructions, registry tool
+  list, payload kinds, spoken time, CallSettings persistence on a throwaway
+  suite, nudge policy, test-call replacement, kind decode),
+  `CallCoordinatorTests` (calls switch, retry-gated miss notification, reporter
+  retry true/false/rejected/relaunch), NEW `CallsMirrorTests` (real Hydrator +
+  CatchUpPuller + cursors over in-memory GRDB and a fake server across a
+  realtime gap; offline reads; the bell card + merge). Added to the pbxproj by
+  hand (xcodegen still broken).
+- **Left**: on-device validation of the ring per kind, and the Android half
+  (same prefs + tool set + retry flag + the Play "calling app" declaration).
+
 ## Where things stand (2026-09-20, latest) — assistant tooling v2: one registry, executors that report real outcomes
 
 The iOS half of the cross-platform tooling rewrite (`unstuck/docs/assistant-tooling-rules.md`,

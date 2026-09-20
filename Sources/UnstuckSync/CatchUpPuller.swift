@@ -364,6 +364,24 @@ public actor CatchUpPuller {
                    },
                    delete: { _, _ in },
                    reconcileDeletes: false),
+
+        // call_requests: direct writes only (no outbox op to guard), a touch
+        // trigger on `updated_at` (migration 051) so every status change the
+        // dispatcher / call-outcome makes is a delta row, and a 30-day prune
+        // of finished rows the id-reconcile mirrors. LWW keeps a stale page
+        // from rewinding a row a realtime echo already advanced.
+        DeltaTable(name: "call_requests", column: "updated_at",
+                   apply: { raw, db in
+                       guard let row = try? JSONDecoder().decode(CallRequest.self, from: raw) else { return .failed }
+                       guard (try? db.writer.write({ conn -> Bool in
+                           guard CallRequestsMirror.incomingWins(row, in: conn) else { return false }
+                           try row.upsert(conn)
+                           return true
+                       })) != nil else { return .failed }
+                       return .applied
+                   },
+                   delete: { id, db in try? db.deleteById(CallRequest.self, id: id) },
+                   reconcileDeletes: true),
     ]
 
     /// Table names the cursor pull covers (diagnostics + tests).
