@@ -255,10 +255,13 @@ extension AppModel {
     /// Turn a collection item into a task. LOOP on a shared list links the task
     /// to the item (so completion/lateness flows back to everyone) + sets a "by"
     /// time and schedules it on the calendar.
-    func moveItemToTask(_ col: ItemCollection, item: CollectionItem, mode: PromoteMode, dueAtIso: String? = nil) {
+    /// Returns the new task (nil when the item was skipped) — the assistant's
+    /// `promote_item_to_task` reports its id (2026-09-20 tooling rules §1).
+    @discardableResult
+    func moveItemToTask(_ col: ItemCollection, item: CollectionItem, mode: PromoteMode, dueAtIso: String? = nil) -> TaskItem? {
         // Don't duplicate a task for an item already promoted + in flight (a
         // completed one may be re-promoted for a fresh cycle).
-        if item.promoted == true && item.promotedDone != true { return }
+        if item.promoted == true && item.promotedDone != true { return nil }
         let loop = mode == .loop && isShared(col)
         let task = addTask(name: item.body, estimateMin: 25, tags: ["from-collection"],
                            sourceCollectionId: loop ? col.id : nil,
@@ -274,6 +277,7 @@ extension AppModel {
             markItemPromoted(col, itemId: item.id, assignee: currentUserName ?? "Someone",
                              done: loop ? false : nil, dueAt: loop ? dueAtIso : nil)
         }
+        return task
     }
 
     // MARK: - task add / completion (with shared-item notification)

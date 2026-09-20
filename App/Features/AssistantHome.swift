@@ -335,11 +335,29 @@ protocol AssistantSharePerformer {
     /// the server shares at once (existing account) or stores + emails an
     /// invite, and tells us which. Default: not available (older performers).
     func shareByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome
+    /// `share_list` (2026-09-20): share a LIST with a connection (`userId`)
+    /// or an email, as editor/viewer, through the Share screen's collection
+    /// path. Returns the honest line for the card, or throws with the reason.
+    func shareList(listId: String, userId: String?, email: String?, role: String) async throws -> String
 }
 
 extension AssistantSharePerformer {
     func shareByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
         .failed(reason: "not_configured")
+    }
+    func shareList(listId: String, userId: String?, email: String?, role: String) async throws -> String {
+        throw AssistantListShareError.notAvailable
+    }
+}
+
+enum AssistantListShareError: LocalizedError {
+    case notAvailable
+    case refused(String)
+    var errorDescription: String? {
+        switch self {
+        case .notAvailable: return "List sharing isn't available right now."
+        case .refused(let why): return why
+        }
     }
 }
 
@@ -348,11 +366,25 @@ extension AssistantSharePerformer {
 struct ShareModelPerformer: AssistantSharePerformer {
     let shares: ShareModel
     var taskShare: TaskShareClient? = nil
+    /// `AppModel.shareCollection(_:email:userId:role:)` — the Lists share
+    /// screen's own path (marks the owner's row shared + re-hydrates).
+    var listShare: ((_ listId: String, _ email: String?, _ userId: String?, _ role: String) async -> ShareOutcome)? = nil
     func share(taskId: String, user: String, level: ShareLevel) async throws {
         try await shares.shareTask(taskId: taskId, user: user, level: level)
     }
     func notify(taskId: String, recipientId: String) async {
         await shares.notifyShare(taskId: taskId, recipientId: recipientId)
+    }
+    func shareList(listId: String, userId: String?, email: String?, role: String) async throws -> String {
+        guard let listShare else { throw AssistantListShareError.notAvailable }
+        let outcome = await listShare(listId, email, userId, role)
+        let can = role == "editor" ? "they can add and tick items" : "they can view it"
+        switch outcome {
+        case .ok: return "Shared — \(can)."
+        case .invited: return "Invite sent\(email.map { " to \($0)" } ?? "") — theirs when they sign up."
+        case .accepted: return "Shared — \(can) (or an invite if they're new)."
+        default: throw AssistantListShareError.refused(ShareFailure(reason: outcome.failureReason ?? "error").message)
+        }
     }
     func shareByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
         guard let taskShare else { return .failed(reason: "not_configured") }
@@ -368,6 +400,10 @@ struct ShareModelPerformer: AssistantSharePerformer {
 @MainActor
 func performConfirmedShare(_ pending: PendingShare,
                            using performer: AssistantSharePerformer) async -> (PendingShareOutcome, String?) {
+    if pending.target == .list {
+        let (outcome, line) = await performConfirmedListShare(pending, using: performer)
+        return (outcome, outcome == .failed ? line : nil)
+    }
     if pending.recipientEmail != nil {
         let (outcome, line) = await performConfirmedEmailShare(pending, using: performer)
         return (outcome, outcome == .failed ? line : nil)
@@ -403,6 +439,23 @@ func performConfirmedEmailShare(_ pending: PendingShare,
     }
 }
 
+/// Run a staged LIST share (`share_list`, 2026-09-20): the collection share
+/// path, by connection id or by email, as editor/viewer. Returns the outcome
+/// + the honest line for the card.
+@MainActor
+func performConfirmedListShare(_ pending: PendingShare,
+                               using performer: AssistantSharePerformer) async -> (PendingShareOutcome, String) {
+    let role = pending.listRole ?? "viewer"
+    do {
+        let line = try await performer.shareList(listId: pending.taskId,
+                                                 userId: pending.recipientEmail == nil ? pending.recipientUserId : nil,
+                                                 email: pending.recipientEmail, role: role)
+        return (.shared, line)
+    } catch {
+        return (.failed, error.localizedDescription)
+    }
+}
+
 /// The ONLY place an assistant-prepared share actually happens. The agent
 /// stages a request; this card shows exactly who gets what; the RPC runs on the
 /// user's tap. Mirrors components/assistant/share-confirm-card.tsx.
@@ -421,8 +474,10 @@ struct AssistantShareConfirmCard: View {
     private var dismissed: Bool { pending.outcome == .dismissed }
     private var failed: Bool { pending.outcome == .failed }
     private var byEmail: Bool { pending.recipientEmail != nil }
+    private var isList: Bool { pending.target == .list }
     /// "can edit" / "can view" / "handed over" — the unified vocabulary (§2).
     private var grade: String {
+        if isList { return pending.listRole == "editor" ? "can edit" : "can view" }
         if let a = ShareAccess(taskLevel: pending.level) { return a.label.lowercased() }
         return "handed over"
     }
@@ -445,7 +500,9 @@ struct AssistantShareConfirmCard: View {
             if !done && !dismissed {
                 Text(byEmail
                      ? "If they have an Unstuck account it’s shared right away; otherwise they get an invite email and it’s theirs when they sign up."
-                     : "They’ll see this task’s title and whether it’s done. Nothing else is shared.")
+                     : isList
+                        ? "They’ll see every item on this list\(pending.listRole == "editor" ? " and can add or tick items" : ""). Nothing else is shared."
+                        : "They’ll see this task’s title and whether it’s done. Nothing else is shared.")
                     .font(UFont.sans(11.5)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
                 if let message = error ?? (failed ? "Couldn't share — try again." : nil) {
@@ -457,7 +514,11 @@ struct AssistantShareConfirmCard: View {
                         busy = true; error = nil
                         Task {
                             let outcome: PendingShareOutcome
-                            if byEmail {
+                            if isList {
+                                let (o, line) = await performConfirmedListShare(pending, using: performer)
+                                outcome = o
+                                if o == .failed { error = line } else { note = line }
+                            } else if byEmail {
                                 let (o, line) = await performConfirmedEmailShare(pending, using: performer)
                                 outcome = o
                                 if o == .failed { error = line } else { note = line }

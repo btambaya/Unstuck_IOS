@@ -92,6 +92,7 @@ struct VoiceIntegrityGuard: Sendable {
     var wasCorrection = false
     /// The reply AFTER a tool result is tool-backed.
     var nextResponseToolBacked = false
+    static func counts(_ name: String) -> Bool { !READ_ONLY_TOOLS.contains(name) && !NAVIGATION_TOOLS.contains(name) }
     /// Per-session cap — never loop.
     var correctionsLeft = 3
 
@@ -106,9 +107,13 @@ struct VoiceIntegrityGuard: Sendable {
     mutating func bargeIn() { transcript = "" }
     mutating func transcriptDelta(_ d: String) { transcript += d }
     /// A tool ran during this response (read-only tools don't make it "tool-backed").
-    mutating func toolDispatched(_ name: String) { if !READ_ONLY_TOOLS.contains(name) { toolCalled = true } }
+    // Tool-backed = a tool that CHANGES something (not a read, not opening a
+    // screen) whose result says "ok:" — the same rule as the text harness
+    // (docs/assistant-tooling-rules.md §3, 2026-09-20). "Not an error" let a
+    // bare "ok" from a seam that could not fail back a spoken claim.
+    mutating func toolDispatched(_ name: String) { if Self.counts(name) { toolCalled = true } }
     mutating func toolFinished(_ name: String, result: String) {
-        nextResponseToolBacked = !result.hasPrefix("error") && !READ_ONLY_TOOLS.contains(name)
+        nextResponseToolBacked = result.hasPrefix("ok:") && Self.counts(name)
     }
     /// A cancelled/incomplete response (barge-in) is not a claim.
     mutating func responseCancelled() { wasCorrection = false }

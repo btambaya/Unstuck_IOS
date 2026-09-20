@@ -213,16 +213,18 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
         "(The call just connected — YOU rang them, this is not the user speaking. Say EXACTLY this now, word for word, before anything else, then listen: \"\(opening)\" This opening happens ONCE — after any interruption continue the conversation naturally; never repeat it.)"
     }
 
-    /// The VOICE_TOOLS schemas filtered to CallScript.callTools (in that
-    /// order), snooze_call always from `snoozeCallSchema`, update_call from
-    /// `updateCallSchema` when VOICE_TOOLS doesn't carry one.
+    /// The voice schemas filtered to CallScript.callTools (in that order);
+    /// snooze_call from the registry's call surface (`ToolRegistry.call`,
+    /// 2026-09-20 — `snoozeCallSchema` is the fallback when the registry
+    /// lacks it), update_call from `updateCallSchema` when the voice schemas
+    /// don't carry one.
     static func callToolSchemas(from voiceTools: [[String: Any]]) -> [[String: Any]] {
         var byName: [String: [String: Any]] = [:]
         for t in voiceTools {
             if let n = t["name"] as? String, byName[n] == nil { byName[n] = t }
         }
         return CallScript.callTools.compactMap { name in
-            if name == "snooze_call" { return snoozeCallSchema }
+            if name == "snooze_call" { return ToolRegistry.call.first { $0["name"] as? String == "snooze_call" } ?? snoozeCallSchema }
             if let s = byName[name] { return s }
             return name == "update_call" ? updateCallSchema : nil
         }

@@ -74,17 +74,29 @@ enum AssistantHarness {
     static let maxIterations = 5
 
     /// Hidden user-role bounce after a fabricated claim. NOT from the user, and
-    /// the user never saw the claim — so the retry must read like a first answer.
-    static let correctiveText = "(integrity check from the app — not the user. The user did NOT see your last message. No tool was called, so nothing was done. If the action is still needed, call the right tool NOW, then answer as if for the first time: no apology, no \"I said\", no \"I didn't\", no mention of this note.)"
+    /// the user never saw the claim — so the retry must read like a first
+    /// answer. It never asserts "nothing was done" (that invited redoing an
+    /// earlier turn's action). Verbatim on every platform — tooling rules §3.
+    static let correctiveText = "(from the app, not the user: you described an action, but no tool ran THIS turn. If it is still needed, call the right tool now and then say in a few words what happened; if you were describing something from an earlier turn, answer plainly without claiming it again. Never claim an action without its tool result.)"
     /// Hidden hint when the upstream says the reply was cut off by length.
     static let cutOffHint = "(your previous reply was cut off by the length limit — continue from where it stopped, splitting any large tool call into smaller calls of at most 12 items.)"
     /// Tool result substituted when the call's JSON parsed to {} but wasn't empty.
     static let truncatedArgsResult = "error: your tool call arguments were cut off mid-JSON — retry with fewer items per call (split large lists across several calls)"
     // Honest fallbacks (contract §6) — verbatim from use-assistant.ts.
     static let lostThread = "Hmm, I lost my thread there — nothing was changed. Try me again?"
+    /// A staged share (share_task / share_list) with no text: the card IS the reply.
     static let stagedReady = "Ready — check the card below."
+    /// A receipt-less, card-less write succeeded (2026-09-20: never "Ready —
+    /// check the card below" when there is no card).
+    static let wentThrough = "That went through."
+    /// A navigation with no text: say what was opened, never "nothing changed".
+    static func opened(_ screen: String) -> String { "Opened \(screen)." }
     static let droppedMidReply = "The connection dropped mid-reply — but these went through:"
     static let partwayStaged = "I got partway through — see what's staged below and tell me what's still missing."
+    static let partwayWrite = "I got partway through — something went through, but I ran out of steps. Tell me what's still missing."
+    static func partwayOpened(_ screen: String) -> String {
+        "I opened \(screen) but ran out of steps before finishing — nothing else was changed. Tell me what's still missing."
+    }
     static let ranOut = "I ran out of steps without getting that done — nothing was changed. Try again, or break it into smaller asks."
     static func partway(_ n: Int) -> String {
         "I got partway through — \(n) thing\(n == 1 ? "" : "s") went through (receipts below). Tell me what's still missing."
@@ -151,8 +163,14 @@ enum AssistantHarness {
         // Fabrication guard state — at most one corrective bounce per turn.
         var corrected = false
         // A WRITE tool succeeded this turn (even receipt-less ones like
-        // share_task). Read-only successes and errored tools don't count.
+        // share_task): a name outside the registry's read-only + navigation
+        // sets whose result starts with "ok:" (tooling rules §3). Read-only
+        // successes, navigations and errored tools don't count.
         var writeToolSucceeded = false
+        // A staged share (share_task / share_list) — the card is the reply.
+        var stagedShare = false
+        // The last screen a navigation opened — its own kind of empty reply.
+        var navigatedTo: String?
 
         for i in 0..<maxIterations {
             if deps.isCancelled() { return .cancelled }
@@ -221,10 +239,22 @@ enum AssistantHarness {
                     // AFTER the fabrication guard saw the raw claim, never on
                     // the hidden bounce, never on voice (naturalness, 2026-09-06).
                     if !closing.isEmpty { closing = polishReply(closing) }
+                    // The web's five-branch ladder (use-assistant.ts): a
+                    // receipt-less write is still a success — never assert
+                    // "nothing changed" over one, and never promise a card
+                    // that isn't there (2026-09-20).
                     if closing.isEmpty {
-                        closing = !receipts.isEmpty
-                            ? "\(receipts[0].label)\(receipts.count > 1 ? " — and \(receipts.count - 1) more below" : "")."
-                            : (writeToolSucceeded ? stagedReady : lostThread)
+                        if !receipts.isEmpty {
+                            closing = "\(receipts[0].label)\(receipts.count > 1 ? " — and \(receipts.count - 1) more below" : "")."
+                        } else if stagedShare {
+                            closing = stagedReady
+                        } else if writeToolSucceeded {
+                            closing = wentThrough
+                        } else if let navigatedTo {
+                            closing = opened(navigatedTo)
+                        } else {
+                            closing = lostThread
+                        }
                     }
                     working[last].message.content = closing
                     if !receipts.isEmpty { working[last].receipts = receipts }
@@ -239,7 +269,16 @@ enum AssistantHarness {
                     CrashBreadcrumbs.drop("tool.run \(call.function.name)")
                     var result = await runAssistantTool(name: call.function.name, args: args, api: deps.api, scratch: deps.scratch)
                     CrashBreadcrumbs.drop("tool.done \(call.function.name) \(result.hasPrefix("error") ? "err" : "ok")")
-                    if !result.hasPrefix("error") && !READ_ONLY_TOOLS.contains(call.function.name) { writeToolSucceeded = true }
+                    if result.hasPrefix("ok:") {
+                        if NAVIGATION_TOOLS.contains(call.function.name) {
+                            let screen = result.dropFirst("ok:".count).trimmingCharacters(in: .whitespaces)
+                                .replacingOccurrences(of: "opened ", with: "", options: .anchored)
+                            navigatedTo = screen.isEmpty ? "that screen" : screen
+                        } else if !READ_ONLY_TOOLS.contains(call.function.name) {
+                            writeToolSucceeded = true
+                            if STAGED_TOOLS.contains(call.function.name) { stagedShare = true }
+                        }
+                    }
                     // Truncated tool-call JSON (completion cap) parses to {} —
                     // tell the model WHY so it splits the call instead of flailing.
                     if result.hasPrefix("error") && args.isEmpty && call.function.arguments.count > 2 {
@@ -264,7 +303,12 @@ enum AssistantHarness {
         }
 
         // Ran out of iterations — close out HONESTLY (the plan may be half-executed).
-        let closing = !receipts.isEmpty ? partway(receipts.count) : (writeToolSucceeded ? partwayStaged : ranOut)
+        let closing: String
+        if !receipts.isEmpty { closing = partway(receipts.count) }
+        else if stagedShare { closing = partwayStaged }
+        else if writeToolSucceeded { closing = partwayWrite }
+        else if let navigatedTo { closing = partwayOpened(navigatedTo) }
+        else { closing = ranOut }
         working.append(AssistantTurn(ChatMessage(role: "assistant", content: closing), at: deps.now(),
                                      receipts: receipts.isEmpty ? nil : receipts))
         deps.commit(working, true)

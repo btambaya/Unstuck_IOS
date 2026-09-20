@@ -240,7 +240,10 @@ struct AssistantSheet: View {
                         AssistantShareConfirmCard(
                             pending: pending,
                             performer: ShareModelPerformer(shares: model.shareState,
-                                                           taskShare: model.coordinator?.taskShare),
+                                                           taskShare: model.coordinator?.taskShare,
+                                                           listShare: { [weak model] listId, email, userId, role in
+                                                               await model?.shareCollection(listId, email: email, userId: userId, role: role) ?? .error
+                                                           }),
                             onResolved: { assistant.resolveShare(id: pending.id, outcome: $0) })
                     }
 

@@ -7,6 +7,7 @@
 // The executor runs against an in-memory `AssistantAppState`, the same seam
 // the app wires to AppModel — so these cover the executor, not the store.
 
+import CryptoKit
 import XCTest
 import Supabase
 import UnstuckCore
@@ -48,6 +49,23 @@ final class FakeAssistantState: AssistantAppState {
     var reminderSaveOk = true
     /// false → the revoke RPC "failed" (nothing recorded, shares untouched).
     var unshareOk = true
+    /// false → every list write "fails" (nothing changes, the seam says so).
+    var listWriteOk = true
+    /// false → the leave RPC is refused (the row stays).
+    var leaveOk = true
+    var left: [String] = []
+    /// false → the join-or-mint never produced a live session.
+    var startFocusOk = true
+    /// The per-task reminder overrides the seam was asked to save.
+    var reminderOverrides: [String: Int?] = [:]
+    var reminderSaveOverrideOk = true
+    /// What `get_settings` reads / the set_* tools write.
+    var settings = AssistantSettingsSnapshot(
+        notificationLevel: "balanced", reminderLeadMin: 10, usableWeekdayMin: nil, usableWeekendMin: nil,
+        focusDefaultMin: 25, focusOverrunMin: 5, focusSoftExit: true, focusPauseReasons: true,
+        theme: "system", ambient: "off", rituals: ["morning": false, "evening": false, "friday": false, "sunday": true])
+    var settingsSaveOk = true
+    var factRemoveOk = true
     /// Set → every profile-fact save throws this reason.
     var factSaveError: ProfileFactSaveError?
     /// The first-run interview flag as the seam sees it (true = not done yet,
@@ -104,29 +122,64 @@ final class FakeAssistantState: AssistantAppState {
         collections.append(ItemCollection(id: id, name: name, color: color, items: [], sortOrder: collections.count))
         return id
     }
-    func addCollectionItem(collectionId: String, body: String) {
+    func addCollectionItem(collectionId: String, body: String) async -> String? {
+        await commit()
+        guard listWriteOk, collections.contains(where: { $0.id == collectionId }) else { return nil }
         let id = nid("i")
         patch(collectionId) { $0.items.append(CollectionItem(id: id, body: body, at: "2026-09-02T09:00:00.000Z")) }
+        return id
     }
-    func promoteItemToTask(collectionId: String, itemId: String, loop: Bool, dueAt: String?) {
+    func promoteItemToTask(collectionId: String, itemId: String, loop: Bool, dueAt: String?) -> String? {
+        guard listWriteOk else { return nil }
         promoted.append("\(collectionId):\(itemId):\(loop ? "loop" : "self"):\(dueAt ?? "-")")
-        guard let c = collections.first(where: { $0.id == collectionId }), let item = c.items.first(where: { $0.id == itemId }) else { return }
-        tasks.append(TaskItem(id: nid("t"), name: item.body, estimateMin: 25, tags: ["from-collection"], createdAt: "x", updatedAt: "x"))
+        guard let c = collections.first(where: { $0.id == collectionId }), let item = c.items.first(where: { $0.id == itemId }) else { return nil }
+        let id = nid("t")
+        tasks.append(TaskItem(id: id, name: item.body, estimateMin: 25, tags: ["from-collection"], createdAt: "x", updatedAt: "x"))
         patch(collectionId) { c in if let i = c.items.firstIndex(where: { $0.id == itemId }) { c.items[i].promoted = true } }
+        return id
     }
-    func renameCollection(_ id: String, name: String) { patch(id) { $0.name = name } }
-    func updateCollection(_ id: String, archived: Bool?, color: String?) {
+    func renameCollection(_ id: String, name: String) async -> Bool {
+        await commit()
+        guard listWriteOk, collections.contains(where: { $0.id == id }) else { return false }
+        patch(id) { $0.name = name }
+        return true
+    }
+    func updateCollection(_ id: String, archived: Bool?, color: String?) async -> Bool {
+        await commit()
+        guard listWriteOk, collections.contains(where: { $0.id == id }) else { return false }
         patch(id) { if let archived { $0.archived = archived }; if let color { $0.color = color } }
+        return true
     }
-    func removeCollection(_ id: String) { collections.removeAll { $0.id == id } }
-    func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?) {
+    func removeCollection(_ id: String) async -> Bool {
+        await commit()
+        guard listWriteOk, collections.contains(where: { $0.id == id }) else { return false }
+        collections.removeAll { $0.id == id }
+        return true
+    }
+    func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?, pinned: Bool?) async -> Bool {
+        await commit()
+        guard listWriteOk, let c = collections.first(where: { $0.id == collectionId }), c.items.contains(where: { $0.id == itemId }) else { return false }
         patch(collectionId) { c in
             guard let i = c.items.firstIndex(where: { $0.id == itemId }) else { return }
             if let body { c.items[i].body = body }
             if let done { c.items[i].done = done }
+            if let pinned { c.items[i].pinned = pinned }
         }
+        return true
     }
-    func removeCollectionItem(collectionId: String, itemId: String) { patch(collectionId) { $0.items.removeAll { $0.id == itemId } } }
+    func removeCollectionItem(collectionId: String, itemId: String) async -> Bool {
+        await commit()
+        guard listWriteOk, let c = collections.first(where: { $0.id == collectionId }), c.items.contains(where: { $0.id == itemId }) else { return false }
+        patch(collectionId) { $0.items.removeAll { $0.id == itemId } }
+        return true
+    }
+    func leaveCollection(_ id: String) async -> Bool {
+        await commit()
+        guard leaveOk, collections.contains(where: { $0.id == id }) else { return false }
+        left.append(id)
+        collections.removeAll { $0.id == id }
+        return true
+    }
     func canEditCollection(_ id: String) -> Bool {
         if let canEditOverride { return canEditOverride }
         guard let c = collections.first(where: { $0.id == id }) else { return false }
@@ -166,7 +219,7 @@ final class FakeAssistantState: AssistantAppState {
         return f
     }
     func removeProfileFact(_ id: String) -> Bool {
-        guard facts.contains(where: { $0.id == id }) else { return false }
+        guard factRemoveOk, facts.contains(where: { $0.id == id }) else { return false }
         facts.removeAll { $0.id == id }
         removedFactIds.append(id)
         return true
@@ -189,14 +242,44 @@ final class FakeAssistantState: AssistantAppState {
     }
 
     func getLiveFocus() -> LiveSession? { live }
-    func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) {
+    func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) async -> Bool {
+        await commit()
         focusCalls.append("start:\(taskId):\(estimateMin.map(String.init) ?? "nil"):\(occurrenceBlockId ?? "-")")
+        guard startFocusOk else { return false }
         live = liveSession(taskId, estimate: estimateMin ?? 25)
+        return true
     }
     func pauseFocus() { focusCalls.append("pause"); live?.paused = true; live?.pausedAt = Date().timeIntervalSince1970 * 1000 }
     func resumeFocus() { focusCalls.append("resume"); live?.paused = false; live?.pausedAt = nil }
-    func extendFocus(_ minutes: Int) { focusCalls.append("extend:\(minutes)"); live?.sessionEstimateMin += minutes }
+    func extendFocus(_ minutes: Int) -> Bool {
+        guard live?.sessionStart != nil else { return false }
+        focusCalls.append("extend:\(minutes)"); live?.sessionEstimateMin += minutes
+        return true
+    }
+    /// The Focus screen's Done: a Session row, the task's totalFocused, done
+    /// when asked (never for a repeating template), the store cleared.
+    func finishFocus(markDone: Bool) async -> FocusFinishOutcome? {
+        await commit()
+        guard let cur = live, cur.sessionStart != nil else { return nil }
+        focusCalls.append("finish:\(markDone)")
+        let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        let t = tasks.first { $0.id == cur.taskId }
+        sessions.append(Session(id: cur.id ?? nid("s"), taskId: cur.taskId, taskName: t?.name ?? "Focus session",
+                                estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: "2026-09-02T09:00:00.000Z"))
+        var markedDone = false
+        if let i = tasks.firstIndex(where: { $0.id == cur.taskId }) {
+            tasks[i].totalFocused += elapsed
+            if markDone && tasks[i].recurrence == nil { tasks[i].done = true; markedDone = true }
+        }
+        live = nil
+        return FocusFinishOutcome(taskId: cur.taskId, taskName: t?.name ?? "Focus session", elapsedSec: elapsed, markedDone: markedDone)
+    }
     func cancelFocus() { focusCalls.append("cancel"); live = nil }
+    func setTaskReminder(taskId: String, minutes: Int?) -> Bool {
+        guard reminderSaveOverrideOk else { return false }
+        reminderOverrides[taskId] = minutes
+        return true
+    }
 
     func navigate(screen: String, id: String?) { navigated.append(screen + (id.map { "?id=\($0)" } ?? "")) }
 
@@ -221,10 +304,49 @@ final class FakeAssistantState: AssistantAppState {
     }
     func removeTag(_ id: String) async { await commit(); tagRows.removeAll { $0.id == id } }
 
-    func setUsableMinutes(weekday: Int?, weekend: Int?) async -> Bool { prefCalls.append("usable:\(weekday.map(String.init) ?? "-"):\(weekend.map(String.init) ?? "-")"); return usableMinutesOK }
-    func setNotificationLevel(_ level: String) async -> Bool { prefCalls.append("notif:\(level)"); return notificationSaveOk }
-    func setReminderLead(_ minutes: Int) async -> Bool { prefCalls.append("lead:\(minutes)"); return reminderSaveOk }
-    func setRitual(_ ritual: String, on: Bool) { prefCalls.append("ritual:\(ritual):\(on)") }
+    func getSettings() -> AssistantSettingsSnapshot { settings }
+    func setUsableMinutes(weekday: Int?, weekend: Int?) async -> Bool {
+        prefCalls.append("usable:\(weekday.map(String.init) ?? "-"):\(weekend.map(String.init) ?? "-")")
+        if usableMinutesOK { if let weekday { settings.usableWeekdayMin = weekday }; if let weekend { settings.usableWeekendMin = weekend } }
+        return usableMinutesOK
+    }
+    func setNotificationLevel(_ level: String) async -> Bool {
+        prefCalls.append("notif:\(level)")
+        if notificationSaveOk { settings.notificationLevel = level }
+        return notificationSaveOk
+    }
+    func setReminderLead(_ minutes: Int) async -> Bool {
+        prefCalls.append("lead:\(minutes)")
+        if reminderSaveOk { settings.reminderLeadMin = minutes }
+        return reminderSaveOk
+    }
+    func setRitual(_ ritual: String, on: Bool) -> Bool {
+        prefCalls.append("ritual:\(ritual):\(on)")
+        guard settingsSaveOk else { return false }
+        settings.rituals[ritual] = on
+        return true
+    }
+    func setTheme(_ theme: String) -> Bool {
+        prefCalls.append("theme:\(theme)")
+        guard settingsSaveOk else { return false }
+        settings.theme = theme
+        return true
+    }
+    func setFocusDefaults(defaultMinutes: Int?, overrunMinutes: Int?, softExit: Bool?, pauseReasons: Bool?) -> Bool {
+        prefCalls.append("focus:\(defaultMinutes.map(String.init) ?? "-"):\(overrunMinutes.map(String.init) ?? "-"):\(softExit.map(String.init) ?? "-"):\(pauseReasons.map(String.init) ?? "-")")
+        guard settingsSaveOk else { return false }
+        if let defaultMinutes { settings.focusDefaultMin = defaultMinutes }
+        if let overrunMinutes { settings.focusOverrunMin = overrunMinutes }
+        if let softExit { settings.focusSoftExit = softExit }
+        if let pauseReasons { settings.focusPauseReasons = pauseReasons }
+        return true
+    }
+    func setAmbientSound(_ sound: String) -> Bool {
+        prefCalls.append("ambient:\(sound)")
+        guard settingsSaveOk else { return false }
+        settings.ambient = sound
+        return true
+    }
 }
 
 // MARK: - row builders
@@ -318,7 +440,8 @@ final class AssistantToolsTests: XCTestCase {
     func testCompleteTasksClosesEveryListedOpenTaskAndReportsOnlyTheFlippedIds() async {
         api.tasks = [task("a", "One"), task("b", "Two"), task("c", "Done already", done: true)]
         let r = await run("complete_tasks", #"{"taskIds":["a","b","c"]}"#)
-        XCTAssertEqual(r, "ok: completed 2 tasks ids=a,b")
+        // The partial is SPELLED OUT (rules §1): what was and was not done.
+        XCTAssertEqual(r, "ok: completed 2 tasks ids=a,b — \"One\", \"Two\". Not done: \"Done already\" (already done)")
         XCTAssertTrue(api.tasks.allSatisfy(\.done))
         let receipt = assistantReceipt(name: "complete_tasks", args: ToolArgs(json: "{}"), result: r, tasks: api.tasks, facts: [])
         XCTAssertEqual(receipt?.label, "Completed 2 tasks")
@@ -327,7 +450,7 @@ final class AssistantToolsTests: XCTestCase {
 
     func testCompleteTasksErrorsOnEmptyOrUnmatchedIds() async {
         await eq("complete_tasks", "{}", "error: taskIds required")
-        await eq("complete_tasks", #"{"taskIds":["nope"]}"#, "error: no matching open tasks")
+        await eq("complete_tasks", #"{"taskIds":["nope"]}"#, "error: none completed — nope (not found)")
     }
 
     func testCreateTasksCreatesTheWholeBrainDumpAndSchedulesDatedItems() async {
@@ -353,9 +476,11 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     func testCreateTasksSkipsNamelessEntriesAndErrorsWhenNothingIsValid() async {
-        await prefix("create_tasks", #"{"tasks":[{"name":"Real"},{"estimateMin":5}]}"#, "ok: created 1 tasks")
+        // A nameless entry is NAMED as not created — never silently dropped.
+        let partial = await run("create_tasks", #"{"tasks":[{"name":"Real"},{"estimateMin":5}]}"#)
         XCTAssertEqual(api.tasks.count, 1)
-        await eq("create_tasks", #"{"tasks":[{}]}"#, "error: no valid tasks in the list")
+        XCTAssertEqual(partial, "ok: created 1 tasks ids=\(api.tasks[0].id) — \"Real\". Not created: item 2 (no name) — say so.")
+        await eq("create_tasks", #"{"tasks":[{}]}"#, "error: no tasks created — item 1 (no name)")
         await eq("create_tasks", "{}", "error: tasks required")
     }
 
@@ -454,14 +579,22 @@ final class AssistantToolsTests: XCTestCase {
 
     func testSetLaterAndRecurrence() async {
         api.tasks = [task("a", "Alpha")]
-        await eq("set_task_later", #"{"taskId":"a","later":true}"#, "ok")
+        await eq("set_task_later", #"{"taskId":"a","later":true}"#, "ok: moved \"Alpha\" to Later")
         XCTAssertEqual(api.tasks[0].later, true)
+        await eq("set_task_later", #"{"taskId":"a","later":false}"#, "ok: brought \"Alpha\" back from Later")
         await eq("set_task_recurrence", #"{"taskId":"a","kind":"fortnightly"}"#, "error: unknown recurrence kind \"fortnightly\" — use daily, weekly, monthly, or none")
         XCTAssertNil(api.tasks[0].recurrence)
-        await eq("set_task_recurrence", #"{"taskId":"a","kind":"weekly","daysOfWeek":[1,3]}"#, "ok")
-        XCTAssertEqual(api.tasks[0].recurrence, .weekly(daysOfWeek: [1, 3], until: nil))
-        await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "ok")
+        // Weekly with no days used to save an EMPTY series and say ok.
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"weekly"}"#, "error: weekly needs daysOfWeek (0=Sunday … 6=Saturday) — ask which days")
         XCTAssertNil(api.tasks[0].recurrence)
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"weekly","daysOfWeek":[1,3]}"#,
+                 "ok: \"Alpha\" now repeats weekly on Mon, Wed — it has no calendar slot yet; schedule_task it to place the first one")
+        XCTAssertEqual(api.tasks[0].recurrence, .weekly(daysOfWeek: [1, 3], until: nil))
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"daily","until":"\#(NEXT_WEEK)"}"#,
+                 "ok: \"Alpha\" now repeats daily until \(NEXT_WEEK) — it has no calendar slot yet; schedule_task it to place the first one")
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "ok: \"Alpha\" no longer repeats")
+        XCTAssertNil(api.tasks[0].recurrence)
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "error: \"Alpha\" doesn't repeat — nothing changed")
     }
 
     // MARK: get_tasks
@@ -552,15 +685,18 @@ final class AssistantToolsTests: XCTestCase {
     func testUpdateTaskSetsDueAtResizesTheLiveBlockAndRefusesScheduleArgs() async {
         api.tasks = [task("a", "Alpha")]
         api.blocks = [block("old", "a", YESTERDAY, "09:00", done: true), block("live", "a", TOMORROW, "09:00")]
-        await eq("update_task", #"{"taskId":"a","estimateMin":50,"dueAt":"2026-09-05T17:00:00Z"}"#, "ok: updated \"Alpha\"")
+        await eq("update_task", #"{"taskId":"a","estimateMin":50,"dueAt":"2026-09-05T17:00:00Z"}"#, "ok: updated \"Alpha\" (estimate, deadline)")
         XCTAssertEqual(api.tasks[0].estimateMin, 50)
         XCTAssertEqual(api.tasks[0].dueAt, "2026-09-05T17:00:00Z")
         XCTAssertEqual(api.blocks.first { $0.id == "live" }?.durationMinutes, 50)
         XCTAssertEqual(api.blocks.first { $0.id == "old" }?.durationMinutes, 25)
-        await eq("update_task", #"{"taskId":"a","name":"Alpha 2","dueAt":null}"#, "ok: updated \"Alpha 2\"")
+        await eq("update_task", #"{"taskId":"a","name":"Alpha 2","dueAt":null}"#, "ok: updated \"Alpha 2\" (name, deadline)")
         XCTAssertNil(api.tasks[0].dueAt)
         _ = await run("update_task", #"{"taskId":"a","dueAt":"2026-09-06T09:00:00Z"}"#)
-        await eq("update_task", #"{"taskId":"a","name":"Alpha 3"}"#, "ok: updated \"Alpha 3\"")
+        await eq("update_task", #"{"taskId":"a","name":"Alpha 3"}"#, "ok: updated \"Alpha 3\" (name)")
+        // The same values again is a no-op — an error, never an "Updated" receipt.
+        await eq("update_task", #"{"taskId":"a","name":"Alpha 3","estimateMin":50}"#,
+                 "error: nothing to change on \"Alpha 3\" — every field given already has that value (or none was given)")
         XCTAssertEqual(api.tasks[0].dueAt, "2026-09-06T09:00:00Z")
         let before = snapshot(api.tasks) + snapshot(api.blocks)
         await prefix("update_task", #"{"taskId":"a","estimateMin":5,"date":"\#(NEXT_WEEK)"}"#, "error: update_task cannot change the schedule")
@@ -605,9 +741,9 @@ final class AssistantToolsTests: XCTestCase {
         await eq("uncomplete_task", #"{"taskId":"a"}"#, "error: \"Alpha\" is already open — nothing changed")
         await eq("complete_task", #"{"taskId":"d"}"#, "error: \"Delta\" is already done — nothing changed")
 
-        await eq("set_task_later", #"{"taskId":"a","later":true}"#, "ok")
+        await eq("set_task_later", #"{"taskId":"a","later":true}"#, "ok: moved \"Alpha\" to Later")
         await eq("set_task_later", #"{"taskId":"a","later":true}"#, "error: \"Alpha\" is already in Later — nothing changed")
-        await eq("set_task_later", #"{"taskId":"a","later":false}"#, "ok")
+        await eq("set_task_later", #"{"taskId":"a","later":false}"#, "ok: brought \"Alpha\" back from Later")
         await eq("set_task_later", #"{"taskId":"a","later":false}"#, "error: \"Alpha\" is not in Later — nothing changed")
 
         await eq("skip_occurrence", #"{"taskId":"a"}"#, "ok: skipped \"Alpha\" on \(TODAY) (the task and its other days stay)")
@@ -640,7 +776,8 @@ final class AssistantToolsTests: XCTestCase {
     func testCarryToTomorrowMovesSkipsWhenTakenAndBumpsMoveCount() async {
         api.tasks = [task("a", "Alpha"), task("b", "Beta", moveCount: 1), task("c", "Gamma")]
         api.blocks = [block("a_td", "a", TODAY, "09:00"), block("b_td", "b", TODAY, "10:00"), block("b_tm", "b", TOMORROW, "10:00"), block("c_td", "c", TODAY, "11:00", done: true)]
-        await eq("carry_to_tomorrow", "{}", "ok: carried 2 to \(TOMORROW) — \"Alpha\", \"Beta\"")
+        // Beta already has tomorrow: skipped today, NOT counted as moved (rules §1).
+        await eq("carry_to_tomorrow", "{}", "ok: moved 1 to \(TOMORROW) — \"Alpha\". Not moved: \"Beta\" (tomorrow already has it; skipped today instead)")
         XCTAssertEqual(api.blocks.first { $0.id == "a_td" }?.date, TOMORROW)
         XCTAssertTrue(api.blocks.first { $0.id == "b_td" }!.skipped)
         XCTAssertEqual(api.blocks.filter { $0.taskId == "b" && $0.date == TOMORROW }.count, 1)
@@ -653,7 +790,7 @@ final class AssistantToolsTests: XCTestCase {
     func testCarryToTomorrowHonoursASubset() async {
         api.tasks = [task("a", "Alpha"), task("b", "Beta")]
         api.blocks = [block("a_td", "a", TODAY), block("b_td", "b", TODAY)]
-        await eq("carry_to_tomorrow", #"{"taskIds":["b"]}"#, "ok: carried 1 to \(TOMORROW) — \"Beta\"")
+        await eq("carry_to_tomorrow", #"{"taskIds":["b"]}"#, "ok: moved 1 to \(TOMORROW) — \"Beta\"")
         XCTAssertEqual(api.blocks.first { $0.id == "a_td" }?.date, TODAY)
         XCTAssertEqual(api.blocks.first { $0.id == "b_td" }?.date, TOMORROW)
     }
@@ -698,7 +835,7 @@ final class AssistantToolsTests: XCTestCase {
         api.writeLatencyNs = 5_000_000
         api.tasks = [task("a", "Alpha")]
         api.blocks = [block("live", "a", TOMORROW, "09:00")]
-        await eq("update_task", #"{"taskId":"a","estimateMin":50}"#, "ok: updated \"Alpha\"")
+        await eq("update_task", #"{"taskId":"a","estimateMin":50}"#, "ok: updated \"Alpha\" (estimate)")
         await eq("schedule_task", #"{"taskId":"a","date":"\#(NEXT_WEEK)"}"#, "ok: scheduled \"Alpha\" \(NEXT_WEEK) 09:00 (kept its existing time — say so)")
         XCTAssertEqual(api.blocks.count, 1)
         XCTAssertEqual(api.blocks[0].durationMinutes, 50, "the resize must not be overwritten by a stale snapshot")
@@ -721,14 +858,14 @@ final class AssistantToolsTests: XCTestCase {
         api.collections = [list("v", "Shared reads", myRole: "viewer"), list("e", "Groceries", myRole: "editor")]
         await eq("add_to_list", #"{"listId":"v","body":"Dune"}"#, "error: you only have view access to \"Shared reads\" — can't add to it")
         XCTAssertEqual(api.collections[0].items.count, 0)
-        await eq("add_to_list", #"{"listId":"e","body":"Milk"}"#, "ok: added to \"Groceries\"")
+        await eq("add_to_list", #"{"listId":"e","body":"Milk"}"#, "ok: added to \"Groceries\" item id=i1")
         XCTAssertEqual(api.collections[1].items.map(\.body), ["Milk"])
         await eq("add_to_list", #"{"listId":"e"}"#, "error: body required")
         api.canEditOverride = false
         let created = await run("create_list", #"{"name":"Fresh"}"#)
         XCTAssertTrue(created.hasPrefix("ok: created list id="), created)
         let id = created.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
-        await eq("add_to_list", #"{"listId":"\#(id)","body":"Yes"}"#, "ok: added to \"Fresh\"")
+        await prefix("add_to_list", #"{"listId":"\#(id)","body":"Yes"}"#, "ok: added to \"Fresh\" item id=")
         XCTAssertEqual(api.collections.first { $0.id == id }?.items.map(\.body), ["Yes"])
         await eq("add_to_list", #"{"listId":"zz","body":"x"}"#, "error: list not found")
     }
@@ -769,7 +906,7 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.collections.map(\.name), ["Trip plan"])
         XCTAssertNil(api.collections[0].archived)
         // Editing ITEMS on the same list is still allowed (editor rights).
-        await eq("add_to_list", #"{"listId":"e","body":"Pack"}"#, "ok: added to \"Trip plan\"")
+        await prefix("add_to_list", #"{"listId":"e","body":"Pack"}"#, "ok: added to \"Trip plan\" item id=")
         // A list created this turn has no ownerId yet — still ours to rename.
         let created = await run("create_list", #"{"name":"Fresh"}"#)
         let id = created.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
@@ -796,9 +933,11 @@ final class AssistantToolsTests: XCTestCase {
 
     func testPromoteItemToTaskGoesThroughTheListPathAndRefusesInFlightItems() async {
         api.collections = [list("l1", "Groceries", [("i1", "Milk")], members: ["u2"])]
-        await eq("promote_item_to_task", #"{"listId":"l1","itemId":"i1","mode":"loop","dueAt":"2026-09-05T17:00:00Z"}"#, "ok: promoted \"Milk\"")
+        await eq("promote_item_to_task", #"{"listId":"l1","itemId":"i1","mode":"loop","dueAt":"2026-09-05T17:00:00Z"}"#,
+                 "ok: promoted \"Milk\" to task id=t1 — the list's members can see the user took it by 2026-09-05T17:00:00Z")
         XCTAssertEqual(api.promoted, ["l1:i1:loop:2026-09-05T17:00:00Z"])
         XCTAssertEqual(api.tasks.map(\.name), ["Milk"])
+        XCTAssertNotNil(scratch.newTasks["t1"], "the promoted task is addressable this turn")
         await prefix("promote_item_to_task", #"{"listId":"l1","itemId":"i1","mode":"self"}"#, "error: \"Milk\" is already promoted")
         await eq("promote_item_to_task", #"{"listId":"l1","itemId":"zz","mode":"self"}"#, "error: item not found")
         await eq("promote_item_to_task", #"{"listId":"zz","itemId":"i1","mode":"self"}"#, "error: list not found")
@@ -939,8 +1078,11 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     func testTagsCreateRenameDelete() async {
-        await eq("create_tag", #"{"name":"deep"}"#, "ok: tag \"deep\" ready")
+        await eq("create_tag", #"{"name":"deep"}"#, "ok: created tag \"deep\"")
         XCTAssertEqual(api.tagRows.map(\.name), ["deep"])
+        // "The result says if it already exists" — a second "ready" read as new.
+        await eq("create_tag", #"{"name":"DEEP"}"#, "error: tag \"deep\" already exists — nothing changed")
+        XCTAssertEqual(api.tagRows.count, 1)
         await eq("rename_tag", #"{"name":"DEEP","newName":"focus"}"#, "ok: renamed tag \"DEEP\" → \"focus\"")
         XCTAssertEqual(api.tagRows.map(\.name), ["focus"])
         await eq("delete_tag", #"{"name":"Focus"}"#, "ok: deleted tag \"Focus\" (removed from tasks)")
@@ -1088,11 +1230,13 @@ final class AssistantToolsTests: XCTestCase {
         await eq("open_screen", #"{"screen":"people"}"#, "ok: opened people")
         await eq("open_screen", #"{"screen":"week"}"#, "ok: opened week")
         XCTAssertEqual(api.navigated, ["tasks", "tasks?id=abc", "lists?id=L 1", "people", "week"])
-        await prefix("open_screen", #"{"screen":"garage"}"#, "error: unknown screen \"garage\" — try today, tasks")
+        await prefix("open_screen", #"{"screen":"garage"}"#, "error: unknown screen \"garage\" — use one of: today, tasks, calendar, day, week, month, focus, insights, lists, captures, settings, people, notifications, areas")
         await prefix("open_screen", "{}", "error: unknown screen \"\"")
-        XCTAssertEqual(api.navigated.count, 5)
+        await eq("open_screen", #"{"screen":"areas"}"#, "ok: opened areas")
+        XCTAssertEqual(api.navigated.count, 6)
+        // The unknown-tool result names THE registry's tools (rules §1).
         let unknown = await run("nonsense")
-        XCTAssertTrue(unknown.hasPrefix("error: unknown tool \"nonsense\" — available: add_capture, add_to_list, archive_list, "), unknown)
+        XCTAssertEqual(unknown, "error: unknown tool \"nonsense\". The tools are: \(ToolRegistry.names.joined(separator: ", "))")
         XCTAssertTrue(unknown.contains(", get_lists,"), "names every real tool, so the model picks one next round")
     }
 
@@ -1169,12 +1313,366 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(instructions.contains("You can do EVERYTHING a user can do in Unstuck"))
         XCTAssertTrue(instructions.contains("English ONLY, never Chinese"))
         XCTAssertTrue(instructions.contains("Current app state:\n{"))
-        // 53 app tools + the four call tools (web VOICE_TOOLS parity) + the
-        // iOS-only finish_interview that closes the voice opening's intro.
-        XCTAssertEqual(VOICE_TOOLS.count, 58)
-        let names = Set(VOICE_TOOLS.compactMap { $0["name"] as? String })
-        XCTAssertEqual(names.count, 58)
-        XCTAssertTrue(names.isSuperset(of: ["request_call", "cancel_call", "update_call", "get_calls", "finish_interview"]))
+        // The honesty block + read-before-answer + no-claim-with-a-tool-call
+        // (docs/assistant-tooling-rules.md §2, verbatim).
+        XCTAssertTrue(instructions.contains("ACTIONS ARE TOOL CALLS. You have no other way to create, change, schedule, complete, share or remember anything. Something happened ONLY if you called its tool this turn and the result starts with \"ok:\"."))
+        XCTAssertTrue(instructions.contains("Never say \"I can't\" when a tool exists; never claim a tool that doesn't."))
+        XCTAssertTrue(instructions.contains("The state below is an INVENTORY — task names, list names and counts, capture ids — never contents."))
+        XCTAssertTrue(instructions.contains("A reply that carries tool calls carries NO claim: say nothing, or \"One moment.\" The confirmation is always the NEXT reply, written from the results."))
+        // The voice register / greeting / facts rules are intact.
+        XCTAssertTrue(instructions.contains("Facts are for DECIDING, not for saying."))
+        XCTAssertTrue(instructions.contains("NEVER OPEN A CONFIRMATION WITH A STATUS WORD"))
+    }
+
+    // MARK: registry parity (docs/assistant-tooling-rules.md §5)
+
+    /// The voice session's schema IS the registry: every voice-surface tool,
+    /// never a hand-maintained copy; snooze_call only in call mode.
+    func testVoiceSchemasComeFromTheRegistry() {
+        let voice = Set(ToolRegistry.voice.compactMap { $0["name"] as? String })
+        XCTAssertEqual(voice.count, ToolRegistry.voice.count, "no duplicate names")
+        XCTAssertEqual(voice, Set(ToolRegistry.names).subtracting(["snooze_call"]))
+        XCTAssertEqual(ToolRegistry.call.compactMap { $0["name"] as? String }, ["snooze_call"])
+        XCTAssertTrue(ToolRegistry.voice.allSatisfy { $0["_surfaces"] == nil }, "the surface marker never reaches the wire")
+        XCTAssertTrue(voice.isSuperset(of: ["find_tasks", "set_task_reminder", "finish_focus", "recolor_list", "leave_list", "share_list",
+                                            "pin_list_item", "restore_capture", "get_settings", "set_theme", "set_focus_defaults",
+                                            "set_ambient_sound", "request_call", "cancel_call", "update_call", "get_calls", "finish_interview"]))
+        XCTAssertEqual(READ_ONLY_TOOLS, ToolRegistry.readOnly)
+        XCTAssertEqual(NAVIGATION_TOOLS, ["open_screen"])
+        XCTAssertEqual(STAGED_TOOLS, ["share_task", "share_list"])
+        XCTAssertTrue(READ_ONLY_TOOLS.isSuperset(of: ["find_tasks", "get_settings", "get_lists", "get_calls"]))
+    }
+
+    /// The generated Swift registry was produced from THE registry JSON:
+    /// its embedded sha256 prefix equals the sibling repo's file (skipped
+    /// when the web checkout isn't next to this one).
+    func testRegistryHashMatchesTheSourceRegistry() throws {
+        let here = URL(fileURLWithPath: #filePath)
+        let registry = here.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("unstuck/lib/assistant/tool-registry.json")
+        guard let data = try? Data(contentsOf: registry) else { throw XCTSkip("web checkout not found at \(registry.path)") }
+        let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined().prefix(16)
+        XCTAssertEqual(String(hash), ToolRegistry.hash, "run `node scripts/gen-tool-registry.mjs` in the web repo")
+        XCTAssertEqual(ToolRegistry.hash.count, 16)
+    }
+
+    /// Every name in the registry has an executor case: none of them comes
+    /// back as the unknown-tool error (with empty args each returns its own
+    /// `error:` or an `ok:`), and a retired name does.
+    func testEveryRegistryToolHasAnExecutorCase() async {
+        for name in ToolRegistry.names {
+            let r = await run(name, "{}")
+            XCTAssertFalse(r.hasPrefix("error: unknown tool"), "\(name) → \(r)")
+            XCTAssertTrue(r.hasPrefix("ok") || r.hasPrefix("error:"), "\(name) → \(r)")
+        }
+        for retired in ["get_collections", "list_tasks", "share"] {
+            let r = await run(retired, "{}")
+            XCTAssertTrue(r.hasPrefix("error: unknown tool \"\(retired)\". The tools are: "), r)
+        }
+    }
+
+    // MARK: 2026-09-20 — real outcomes, partial results, the new tools
+
+    func testCreateTaskTakesEveryRegistryFieldAndSchedulesInTheSameCall() async {
+        let r = await run("create_task", #"{"name":"Deck","tags":["deep","q3"],"firstPhysicalAction":"Open the file","date":"\#(NEXT_WEEK)","startTime":"09:30","dueAt":"2026-10-01T17:00:00Z","later":false}"#)
+        let t = api.tasks[0]
+        XCTAssertEqual(r, "ok: created task id=\(t.id) name=\"Deck\" (scheduled \(NEXT_WEEK) 09:30, due 2026-10-01T17:00:00Z)")
+        XCTAssertEqual(t.tags, ["deep", "q3"])
+        XCTAssertEqual(t.firstPhysicalAction, "Open the file")
+        XCTAssertEqual(api.blocks.map(\.date), [NEXT_WEEK])
+        XCTAssertEqual(api.blocks[0].startTime, "09:30")
+        let receipt = assistantReceipt(name: "create_task", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Created “Deck”")
+        XCTAssertEqual(receipt?.undo, .deleteTask(id: t.id))
+        // A day without a time is NOT guessed at — created, unscheduled, said.
+        let noTime = await run("create_task", #"{"name":"Dentist","date":"\#(TOMORROW)","later":true}"#)
+        XCTAssertTrue(noTime.hasPrefix("ok: created task id="), noTime)
+        XCTAssertTrue(noTime.hasSuffix("name=\"Dentist\" (in Later) NOTE: it has a day (\(TOMORROW)) but no time — left unscheduled. Ask ONE question suggesting a time, then schedule_task."), noTime)
+        XCTAssertEqual(api.blocks.count, 1)
+        XCTAssertEqual(api.tasks[1].later, true)
+        // A past day is refused BEFORE anything is created.
+        let past = await run("create_task", #"{"name":"Late","date":"\#(YESTERDAY)","startTime":"09:00"}"#)
+        XCTAssertTrue(past.hasPrefix("error: \(YESTERDAY) is in the PAST"), past)
+        XCTAssertTrue(past.hasSuffix("The task was NOT created — give another day, or omit the date."), past)
+        XCTAssertEqual(api.tasks.count, 2)
+    }
+
+    func testCreateTasksCapsAtFiftyAndNamesWhatWasNotCreated() async {
+        let items = (1...52).map { #"{"name":"T\#($0)","tags":["bulk"]}"# }.joined(separator: ",")
+        let r = await run("create_tasks", "{\"tasks\":[\(items)]}")
+        XCTAssertTrue(r.hasPrefix("ok: created 50 tasks ids="), r)
+        XCTAssertTrue(r.hasSuffix(" Not created: \"T51\" (over the 50 limit — call create_tasks again for the rest), \"T52\" (over the 50 limit — call create_tasks again for the rest) — say so."), r)
+        XCTAssertEqual(api.tasks.count, 50)
+        XCTAssertEqual(api.tasks[0].tags, ["bulk"])
+        let receipt = assistantReceipt(name: "create_tasks", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Created 50 tasks")
+        XCTAssertEqual(receipt?.undo, .deleteTasks(ids: api.tasks.map(\.id)))
+    }
+
+    func testUpdateTaskClearsWithNoneAndParksInLater() async {
+        api.tasks = [task("a", "Alpha", lifeArea: "Work", tags: ["x"], dueAt: "2026-09-05T17:00:00Z")]
+        api.tasks[0].firstPhysicalAction = "Open it"
+        await eq("update_task", #"{"taskId":"a","lifeArea":"none","firstPhysicalAction":"none","dueAt":"none","tags":[],"later":true}"#,
+                 "ok: updated \"Alpha\" (area, tags, first step, deadline, parked in Later)")
+        XCTAssertNil(api.tasks[0].lifeArea)
+        XCTAssertNil(api.tasks[0].firstPhysicalAction)
+        XCTAssertNil(api.tasks[0].dueAt)
+        XCTAssertEqual(api.tasks[0].tags, [])
+        XCTAssertEqual(api.tasks[0].later, true)
+        await eq("update_task", #"{"taskId":"a","later":false,"tags":["deep"]}"#, "ok: updated \"Alpha\" (tags, back from Later)")
+        XCTAssertEqual(api.tasks[0].later, false)
+    }
+
+    func testFindTasksIsFuzzyAndReportsSeveralMatches() async {
+        api.tasks = [task("g1", "Gym session", lifeArea: "Health"), task("g2", "Book gym class"), task("d", "Dentist", done: true), task("l", "Laundry", later: true)]
+        api.blocks = [block("b1", "g1", TOMORROW, "18:00")]
+        await eq("find_tasks", #"{"query":"gym class"}"#, "ok: 1 task matches \"gym class\":\n- Book gym class [id=g2] 25m")
+        let several = await run("find_tasks", #"{"query":"GYM"}"#)
+        XCTAssertEqual(several, "ok: 2 tasks match \"GYM\" — several match: ask which one, never pick:\n- Gym session [id=g1] 25m · Health · \(TOMORROW) 18:00\n- Book gym class [id=g2] 25m")
+        await eq("find_tasks", #"{"query":"dentist"}"#, "ok: no task matches \"dentist\" (completed tasks not searched — includeDone=true to include them) — tell the user, and offer to create it")
+        await eq("find_tasks", #"{"query":"dentist","includeDone":true}"#, "ok: 1 task matches \"dentist\":\n- Dentist [id=d] 25m · done")
+        await eq("find_tasks", #"{"query":"laun"}"#, "ok: 1 task matches \"laun\":\n- Laundry [id=l] 25m · Later")
+        await eq("find_tasks", "{}", "error: query required")
+        XCTAssertTrue(READ_ONLY_TOOLS.contains("find_tasks"), "a read never disarms the fabrication guard")
+        XCTAssertNil(assistantReceipt(name: "find_tasks", args: ToolArgs(), result: several, tasks: api.tasks, facts: []))
+        // A task created this turn is findable before the store echoes it.
+        scratch.newTasks["n"] = task("n", "Gym shoes")
+        let fresh = await run("find_tasks", #"{"query":"shoes"}"#)
+        XCTAssertTrue(fresh.contains("[id=n]"), fresh)
+    }
+
+    func testSetTaskReminderSavesTheOverrideAndReportsIt() async {
+        api.tasks = [task("a", "Alpha")]
+        api.blocks = [block("b1", "a", TOMORROW, "09:00")]
+        await eq("set_task_reminder", #"{"taskId":"a","minutes":15}"#, "ok: \"Alpha\" reminds 15 minutes before it starts")
+        XCTAssertEqual(api.reminderOverrides["a"], 15)
+        await eq("set_task_reminder", #"{"taskId":"a","minutes":0}"#, "ok: no reminder for \"Alpha\"")
+        XCTAssertEqual(api.reminderOverrides["a"], 0)
+        await eq("set_task_reminder", #"{"taskId":"a"}"#, "ok: \"Alpha\" reminds at the default lead — 10 minutes before")
+        XCTAssertEqual(api.reminderOverrides["a"] ?? 99, nil)
+        await eq("set_task_reminder", #"{"taskId":"a","minutes":7}"#, "error: minutes must be 0 (off), 5, 10 or 15 — or omit it for the default")
+        await eq("set_task_reminder", #"{"taskId":"zz","minutes":5}"#, "error: task not found")
+        api.blocks = []
+        await eq("set_task_reminder", #"{"taskId":"a","minutes":5}"#, "ok: \"Alpha\" reminds 5 minutes before it starts (it isn't on the calendar yet — the reminder applies once it is scheduled)")
+        api.reminderSaveOverrideOk = false
+        await eq("set_task_reminder", #"{"taskId":"a","minutes":10}"#, "error: couldn't save the reminder — try again")
+        let receipt = assistantReceipt(name: "set_task_reminder", args: ToolArgs(), result: "ok: \"Alpha\" reminds 15 minutes before it starts", tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Reminder: \"Alpha\" reminds 15 minutes before it starts")
+    }
+
+    func testFinishFocusLogsTheSessionAndOptionallyCompletesTheTask() async {
+        await eq("finish_focus", "{}", "error: no focus session is running")
+        api.tasks = [task("a", "Alpha"), task("r", "Standup", recurrence: .daily(until: nil))]
+        api.live = liveSession("a")
+        let r = await run("finish_focus", #"{"markDone":true}"#)
+        XCTAssertEqual(r, "ok: finished the session on \"Alpha\" — 5m logged, task marked done")
+        XCTAssertNil(api.live)
+        XCTAssertTrue(api.tasks[0].done)
+        XCTAssertEqual(api.sessions.count, 1)
+        XCTAssertEqual(api.tasks[0].totalFocused, api.sessions[0].actualSec)
+        XCTAssertEqual(api.focusCalls, ["finish:true"])
+        let receipt = assistantReceipt(name: "finish_focus", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Finished “Alpha” · 5m logged, task marked done")
+        // A repeating template is never closed by a session — SAID.
+        api.live = liveSession("r")
+        await eq("finish_focus", #"{"markDone":true}"#, "ok: finished the session on \"Standup\" — 5m logged, task still open (a repeating task's series is never closed this way)")
+        XCTAssertFalse(api.tasks[1].done)
+        api.live = liveSession("a")
+        await eq("finish_focus", "{}", "ok: finished the session on \"Alpha\" — 5m logged, task still open")
+    }
+
+    func testStartFocusReportsAJoinOrMintThatDidNotLand() async {
+        api.tasks = [task("a", "Alpha")]
+        api.startFocusOk = false
+        await eq("start_focus", #"{"taskId":"a"}"#, "error: couldn't start a session on \"Alpha\" — nothing is running; try again")
+        XCTAssertEqual(api.navigated, [], "no focus screen over a session that isn't running")
+    }
+
+    func testRecolorListIsOwnerOnlyAndNeverANoOp() async {
+        api.collections = [list("l1", "Groceries"), list("v", "Theirs", myRole: "editor", ownerId: "someone-else")]
+        await eq("recolor_list", #"{"listId":"l1","color":"Green"}"#, "ok: recoloured list \"Groceries\" to green")
+        XCTAssertEqual(api.collections[0].color, "green")
+        await eq("recolor_list", #"{"listId":"l1","color":"green"}"#, "error: \"Groceries\" is already green — nothing changed")
+        await eq("recolor_list", #"{"listId":"l1","color":"teal"}"#, "error: unknown colour \"teal\" — use indigo, coral, green, amber, blue, violet")
+        await eq("recolor_list", #"{"listId":"v","color":"blue"}"#, "error: \"Theirs\" is shared with you by its owner — only they can recolour it. You can still add, edit and tick items.")
+        await eq("recolor_list", #"{"listId":"zz","color":"blue"}"#, "error: list not found")
+        api.listWriteOk = false
+        await eq("recolor_list", #"{"listId":"l1","color":"blue"}"#, "error: couldn't save — try again")
+        XCTAssertEqual(api.collections[0].color, "green")
+        let receipt = assistantReceipt(name: "recolor_list", args: ToolArgs(), result: "ok: recoloured list \"Groceries\" to green", tasks: [], facts: [])
+        XCTAssertEqual(receipt?.label, "recoloured list \"Groceries\" to green")
+        XCTAssertEqual(receipt?.icon, .list)
+    }
+
+    func testLeaveListOnlyLeavesAListSharedWithTheUserAndOnlyOnceTheServerConfirms() async {
+        api.collections = [list("mine", "Mine"), list("s", "Trip plan", myRole: "editor", ownerId: "owner-1")]
+        await eq("leave_list", #"{"listId":"mine"}"#, "error: \"Mine\" is the user's own list — only a list shared WITH them can be left; delete_list or archive_list it instead")
+        api.leaveOk = false
+        await eq("leave_list", #"{"listId":"s"}"#, "error: couldn't leave \"Trip plan\" — the server didn't confirm it (offline?); it is still shared with them; try again")
+        XCTAssertEqual(api.collections.count, 2)
+        api.leaveOk = true
+        await eq("leave_list", #"{"listId":"s"}"#, "ok: left \"Trip plan\" — the user no longer sees it; the owner keeps it")
+        XCTAssertEqual(api.left, ["s"])
+        XCTAssertEqual(api.collections.map(\.id), ["mine"])
+        await eq("leave_list", #"{"listId":"s"}"#, "error: list not found")
+        XCTAssertTrue(ToolRegistry.confirmFirst.contains("leave_list"))
+        let receipt = assistantReceipt(name: "leave_list", args: ToolArgs(), result: "ok: left \"Trip plan\" — the user no longer sees it; the owner keeps it", tasks: [], facts: [])
+        XCTAssertEqual(receipt?.label, "Left “Trip plan”")
+    }
+
+    func testShareListOnlyStagesAConfirmCard() async {
+        api.collections = [list("l1", "Groceries"), list("v", "Theirs", myRole: "editor", ownerId: "someone-else")]
+        api.candidates = [ShareCandidate(userId: "u2", name: "Zubair")]
+        await eq("share_list", #"{"listId":"l1","person":"Zubair","role":"editor"}"#,
+                 "ok: prepared a share of list \"Groceries\" with Zubair (editor). The user must CONFIRM it on screen — tell them it's ready to confirm, and do not claim it is shared.")
+        XCTAssertEqual(api.staged.count, 1)
+        XCTAssertEqual(api.staged[0].target, .list)
+        XCTAssertEqual(api.staged[0].taskId, "l1")
+        XCTAssertEqual(api.staged[0].taskName, "Groceries")
+        XCTAssertEqual(api.staged[0].recipientUserId, "u2")
+        XCTAssertEqual(api.staged[0].listRole, "editor")
+        XCTAssertEqual(api.collections[0].members ?? [], [], "nothing was shared")
+        // An email is staged for the server to resolve; the role defaults to viewer.
+        await prefix("share_list", #"{"listId":"l1","person":"maya@x.com"}"#, "ok: prepared a share of list \"Groceries\" with maya@x.com (viewer). If they have an Unstuck account")
+        XCTAssertEqual(api.staged[1].recipientEmail, "maya@x.com")
+        XCTAssertEqual(api.staged[1].listRole, "viewer")
+        await prefix("share_list", #"{"listId":"l1","person":"Nobody"}"#, "error: no circle member matches \"Nobody\"")
+        await eq("share_list", #"{"listId":"v","person":"Zubair"}"#, "error: \"Theirs\" is shared with you by its owner — only they can share it")
+        await eq("share_list", #"{"listId":"zz","person":"Zubair"}"#, "error: list not found — ask which list they mean")
+        XCTAssertEqual(api.staged.count, 2)
+        XCTAssertTrue(STAGED_TOOLS.contains("share_list"))
+        XCTAssertNil(assistantReceipt(name: "share_list", args: ToolArgs(), result: "ok: prepared a share of list \"Groceries\" with Zubair (editor).", tasks: [], facts: []), "a staged share has a card, not a receipt")
+    }
+
+    func testPinListItemTogglesAndRefusesANoOp() async {
+        api.collections = [list("l1", "Groceries", [("i1", "Milk")]), list("v", "Shared", [("s1", "Theirs")], myRole: "viewer")]
+        await eq("pin_list_item", #"{"listId":"l1","itemId":"i1"}"#, "ok: pinned \"Milk\" in \"Groceries\"")
+        XCTAssertEqual(api.collections[0].items[0].pinned, true)
+        await eq("pin_list_item", #"{"listId":"l1","itemId":"i1","pinned":true}"#, "error: \"Milk\" is already pinned — nothing changed")
+        await eq("pin_list_item", #"{"listId":"l1","itemId":"i1","pinned":false}"#, "ok: unpinned \"Milk\" in \"Groceries\"")
+        XCTAssertEqual(api.collections[0].items[0].pinned, false)
+        await eq("pin_list_item", #"{"listId":"l1","itemId":"i1","pinned":false}"#, "error: \"Milk\" is not pinned — nothing changed")
+        await eq("pin_list_item", #"{"listId":"v","itemId":"s1"}"#, "error: you can't edit \"Shared\"")
+        await eq("pin_list_item", #"{"listId":"l1","itemId":"zz"}"#, "error: list item not found")
+        let lists = await run("get_lists", #"{"listId":"l1"}"#)
+        _ = await run("pin_list_item", #"{"listId":"l1","itemId":"i1"}"#)
+        let pinnedLists = await run("get_lists", #"{"listId":"l1"}"#)
+        XCTAssertTrue(pinnedLists.contains("- Milk (pinned) [id=i1]"), pinnedLists)
+        XCTAssertFalse(lists.contains("(pinned)"))
+    }
+
+    func testListWritesReportAFailedCommitInsteadOfOk() async {
+        api.collections = [list("l1", "Groceries", [("i1", "Milk")])]
+        api.listWriteOk = false
+        let before = snapshot(api.collections)
+        await eq("add_to_list", #"{"listId":"l1","body":"Eggs"}"#, "error: couldn't add to \"Groceries\" — try again")
+        await eq("rename_list", #"{"listId":"l1","name":"Food"}"#, "error: couldn't rename \"Groceries\" — try again")
+        await eq("archive_list", #"{"listId":"l1"}"#, "error: couldn't save — try again")
+        await eq("edit_list_item", #"{"listId":"l1","itemId":"i1","body":"Oat milk"}"#, "error: couldn't save — try again")
+        await eq("set_list_item_done", #"{"listId":"l1","itemId":"i1"}"#, "error: couldn't save — try again")
+        await eq("remove_list_item", #"{"listId":"l1","itemId":"i1"}"#, "error: couldn't save — try again")
+        await eq("promote_item_to_task", #"{"listId":"l1","itemId":"i1"}"#, "error: couldn't promote \"Milk\" — try again")
+        await eq("delete_list", #"{"listId":"l1"}"#, "error: couldn't delete \"Groceries\" — try again")
+        XCTAssertEqual(snapshot(api.collections), before)
+        XCTAssertEqual(api.tasks, [])
+    }
+
+    func testListNoOpsRefuseInsteadOfMintingAReceipt() async {
+        api.collections = [list("l1", "Groceries", [("i1", "Milk")])]
+        await eq("rename_list", #"{"listId":"l1","name":"Groceries"}"#, "error: the list is already called \"Groceries\" — nothing changed")
+        await eq("archive_list", #"{"listId":"l1","archived":false}"#, "error: \"Groceries\" is not archived — nothing changed")
+        _ = await run("archive_list", #"{"listId":"l1"}"#)
+        await eq("archive_list", #"{"listId":"l1"}"#, "error: \"Groceries\" is already archived — nothing changed")
+        await eq("set_list_item_done", #"{"listId":"l1","itemId":"i1","done":false}"#, "error: \"Milk\" is already unticked — nothing changed")
+        _ = await run("set_list_item_done", #"{"listId":"l1","itemId":"i1"}"#)
+        await eq("set_list_item_done", #"{"listId":"l1","itemId":"i1"}"#, "error: \"Milk\" is already ticked — nothing changed")
+    }
+
+    func testPromoteItemSaysWhenLoopModeBecameSelf() async {
+        api.collections = [list("solo", "Solo", [("i1", "Paint")]), list("shared", "Trip", [("j1", "Book hotel")], members: ["u2"])]
+        await eq("promote_item_to_task", #"{"listId":"solo","itemId":"i1","mode":"loop"}"#,
+                 "ok: promoted \"Paint\" to task id=t1 as the user's own task — the list isn't shared, so loop mode became self (say so)")
+        XCTAssertEqual(api.promoted, ["solo:i1:self:-"])
+        await eq("promote_item_to_task", #"{"listId":"shared","itemId":"j1"}"#, "ok: promoted \"Book hotel\" to task id=t2")
+        XCTAssertEqual(api.promoted.last, "shared:j1:self:-")
+        let receipt = assistantReceipt(name: "promote_item_to_task", args: ToolArgs(), result: "ok: promoted \"Paint\" to task id=t1 as the user's own task — the list isn't shared, so loop mode became self (say so)", tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Promoted “Paint” to a task")
+    }
+
+    func testRestoreCaptureBringsAnArchivedCaptureBack() async {
+        api.captures = [capture("c1", "Buy milk"), capture("c2", "Open")]
+        api.archivedIds = ["c1"]
+        await eq("restore_capture", #"{"captureId":"c1"}"#, "ok: restored capture \"Buy milk\" to the inbox")
+        XCTAssertEqual(api.archivedIds, [])
+        await eq("restore_capture", #"{"captureId":"c1"}"#, "error: \"Buy milk\" is not archived — it is already in the inbox; nothing changed")
+        await eq("restore_capture", #"{"captureId":"zz"}"#, "error: capture not found")
+        await eq("resolve_capture", #"{"captureId":"c1"}"#, "ok: resolved capture \"Buy milk\"")
+        await eq("resolve_capture", #"{"captureId":"c1"}"#, "error: \"Buy milk\" is already resolved — nothing changed")
+        let receipt = assistantReceipt(name: "restore_capture", args: ToolArgs(), result: "ok: restored capture \"Buy milk\" to the inbox", tasks: [], facts: [])
+        XCTAssertEqual(receipt?.label, "Restored: Buy milk")
+    }
+
+    func testAddCaptureReportsTruncationAndPromoteCaptureTakesTheLinkedTasksArea() async {
+        let long = String(repeating: "x", count: 600)
+        let r = await run("add_capture", #"{"body":"\#(long)"}"#)
+        XCTAssertEqual(api.captures[0].body.count, 500)
+        XCTAssertTrue(r.hasSuffix("\" (cut to 500 characters — say so)"), r)
+        // The promoted task's area follows the capture's task — never a hard-coded "Work".
+        api.tasks = [task("h", "Garden", lifeArea: "Home")]
+        api.captures = [capture("c1", "Buy seeds", taskId: "h"), capture("c2", "Loose thought")]
+        _ = await run("promote_capture", #"{"captureId":"c1"}"#)
+        XCTAssertEqual(api.tasks.last?.lifeArea, "Home")
+        _ = await run("promote_capture", #"{"captureId":"c2"}"#)
+        XCTAssertNil(api.tasks.last?.lifeArea)
+        XCTAssertEqual(api.tasks.last?.tags, ["from-capture", "idea"])
+    }
+
+    func testGetSettingsAndTheSettingWritesReportRealOutcomes() async {
+        await eq("get_settings", "{}",
+                 "ok: settings:\n- notifications: balanced\n- reminder lead: 10 minutes before a task\n- usable minutes: not set\n"
+                 + "- focus defaults: 25m sessions, 5m overrun grace, soft exit on, pause reasons on\n- theme: system\n- ambient sound: off\n"
+                 + "- rituals: morning off, evening off, friday off, sunday on")
+        XCTAssertTrue(READ_ONLY_TOOLS.contains("get_settings"))
+        await eq("set_theme", #"{"theme":"Dark"}"#, "ok: theme set to dark")
+        await eq("set_theme", #"{"theme":"dark"}"#, "error: the theme is already dark — nothing changed")
+        await eq("set_theme", #"{"theme":"sepia"}"#, "error: theme must be system, light, or dark")
+        await eq("set_focus_defaults", #"{"defaultMinutes":45,"overrunMinutes":0,"softExit":false}"#, "ok: focus defaults — 45m sessions, no overrun grace, soft exit off")
+        await eq("set_focus_defaults", "{}", "error: give at least one of defaultMinutes, overrunMinutes, softExit, pauseReasons")
+        await eq("set_focus_defaults", #"{"defaultMinutes":30}"#, "error: defaultMinutes must be 15, 25 or 45")
+        await eq("set_focus_defaults", #"{"overrunMinutes":7}"#, "error: overrunMinutes must be 0, 5 or 10")
+        await eq("set_ambient_sound", #"{"sound":"brown"}"#, "ok: ambient sound set to brown noise")
+        await eq("set_ambient_sound", #"{"sound":"brown"}"#, "error: ambient sound is already brown — nothing changed")
+        await eq("set_ambient_sound", #"{"sound":"rain"}"#, "error: sound must be off, brown, or pink")
+        await eq("set_ambient_sound", #"{"sound":"off"}"#, "ok: ambient sound off")
+        await eq("set_ritual", #"{"ritual":"sunday"}"#, "error: the sunday moment is already on — nothing changed")
+        _ = await run("set_usable_minutes", #"{"weekdayMin":240,"weekendMin":60}"#)
+        await contains("get_settings", "{}", "- theme: dark\n- ambient sound: off\n- rituals: morning off")
+        await contains("get_settings", "{}", "- usable minutes: weekdays 240m, weekends 60m\n- focus defaults: 45m sessions, no overrun grace, soft exit off, pause reasons on")
+        XCTAssertEqual(api.prefCalls, ["theme:dark", "focus:45:0:false:-", "ambient:brown", "ambient:off", "usable:240:60"])
+        api.settingsSaveOk = false
+        await eq("set_theme", #"{"theme":"light"}"#, "error: couldn't switch the theme — it is still dark")
+        await eq("set_ambient_sound", #"{"sound":"pink"}"#, "error: couldn't save — try again")
+        await eq("set_focus_defaults", #"{"pauseReasons":false}"#, "error: couldn't save — try again")
+        await eq("set_ritual", #"{"ritual":"morning"}"#, "error: couldn't save the morning moment — it is still off")
+        for (name, result) in [("set_theme", "ok: theme set to dark"), ("set_focus_defaults", "ok: focus defaults — 45m sessions"), ("set_ambient_sound", "ok: ambient sound set to brown noise")] {
+            XCTAssertEqual(assistantReceipt(name: name, args: ToolArgs(), result: result, tasks: [], facts: [])?.label, String(result.dropFirst(4)), name)
+        }
+    }
+
+    func testForgetFactReportsAStoreFailure() async {
+        api.facts = [fact("f1", "Sam — partner")]
+        api.factRemoveOk = false
+        await eq("forget_fact", #"{"factId":"f1"}"#, "error: couldn't forget that just now — try again")
+        XCTAssertEqual(api.facts.count, 1)
+    }
+
+    func testCarryToTomorrowWithNothingMovableSaysSo() async {
+        api.tasks = [task("b", "Beta")]
+        api.blocks = [block("b_td", "b", TODAY, "10:00"), block("b_tm", "b", TOMORROW, "10:00")]
+        let r = await run("carry_to_tomorrow", "{}")
+        XCTAssertEqual(r, "ok: moved 0 to \(TOMORROW). Not moved: \"Beta\" (tomorrow already has it; skipped today instead)")
+        XCTAssertTrue(api.blocks.first { $0.id == "b_td" }!.skipped)
+        XCTAssertEqual(assistantReceipt(name: "carry_to_tomorrow", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])?.label, "Nothing moved — skipped today instead")
     }
 }
 

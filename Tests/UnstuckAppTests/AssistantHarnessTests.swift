@@ -114,7 +114,9 @@ final class AssistantHarnessTests: XCTestCase {
         XCTAssertEqual(second.map(\.role), ["user", "assistant", "user"])
         XCTAssertEqual(second[1].content, "Done — added \"Milk\" to your list.")
         XCTAssertEqual(second[2].content, AssistantHarness.correctiveText)
-        XCTAssertEqual(second[2].content, "(integrity check from the app — not the user. The user did NOT see your last message. No tool was called, so nothing was done. If the action is still needed, call the right tool NOW, then answer as if for the first time: no apology, no \"I said\", no \"I didn't\", no mention of this note.)")
+        // Verbatim docs/assistant-tooling-rules.md §3 (2026-09-20) — the same
+        // words on web + Android; it never asserts "nothing was done".
+        XCTAssertEqual(second[2].content, "(from the app, not the user: you described an action, but no tool ran THIS turn. If it is still needed, call the right tool now and then say in a few words what happened; if you were describing something from an earlier turn, answer plainly without claiming it again. Never claim an action without its tool result.)")
         // The user never sees the claim or the check.
         XCTAssertEqual(visible.map(\.text), ["add milk", "Which list should it go on?"])
         XCTAssertEqual(finalThread.filter(\.isHidden).count, 2)
@@ -186,6 +188,75 @@ final class AssistantHarnessTests: XCTestCase {
         let outcome = await runTurn("share alpha with zubair", transport)
         XCTAssertEqual(outcome, .reply(AssistantHarness.stagedReady))
         XCTAssertEqual(api.staged.count, 1)
+    }
+
+    // 2026-09-20 tooling rewrite (rules §3): the corrective is verbatim, the
+    // write rule is "not read-only/navigation AND ok:", and the empty-reply
+    // ladder has the web's five branches.
+
+    func testTheCorrectiveIsTheRulesWordingVerbatim() {
+        XCTAssertEqual(AssistantHarness.correctiveText,
+                       "(from the app, not the user: you described an action, but no tool ran THIS turn. If it is still needed, call the right tool now and then say in a few words what happened; if you were describing something from an earlier turn, answer plainly without claiming it again. Never claim an action without its tool result.)")
+        XCTAssertFalse(AssistantHarness.correctiveText.contains("nothing was done"))
+    }
+
+    func testAReceiptLessCardLessWriteFallsBackToWentThrough() async {
+        // finish_interview is a write with no receipt and no card — never
+        // "Ready — check the card below" over a card that isn't there.
+        let transport = ScriptedTransport([call("finish_interview", "{}"), text("")])
+        let outcome = await runTurn("that's everything", transport)
+        XCTAssertEqual(outcome, .reply(AssistantHarness.wentThrough))
+        XCTAssertEqual(api.interviewDoneCalls, 1)
+    }
+
+    func testAStagedListShareFallsBackToTheStagedLine() async {
+        api.collections = [list("l1", "Groceries")]
+        api.candidates = [ShareCandidate(userId: "u2", name: "Zubair")]
+        let transport = ScriptedTransport([call("share_list", #"{"listId":"l1","person":"Zubair","role":"editor"}"#), text("")])
+        let outcome = await runTurn("share groceries with zubair", transport)
+        XCTAssertEqual(outcome, .reply(AssistantHarness.stagedReady))
+        XCTAssertEqual(api.staged.first?.target, .list)
+    }
+
+    func testANavigationWithNoTextSaysWhatWasOpened() async {
+        let transport = ScriptedTransport([call("open_screen", #"{"screen":"tasks"}"#), text("")])
+        let outcome = await runTurn("show my tasks", transport)
+        XCTAssertEqual(outcome, .reply("Opened tasks."))
+        XCTAssertEqual(api.navigated, ["tasks"])
+    }
+
+    func testANavigationDoesNotDisarmTheFabricationGuard() async {
+        let transport = ScriptedTransport([
+            call("open_screen", #"{"screen":"tasks"}"#),
+            text("Done — added \"Milk\"."),
+            text("Which list should it go on?"),
+        ])
+        let outcome = await runTurn("open tasks and add milk", transport)
+        XCTAssertEqual(outcome, .reply("Which list should it go on?"))
+        XCTAssertTrue(transport.asks[2].contains { $0.content == AssistantHarness.correctiveText })
+        XCTAssertEqual(api.tasks.count, 0)
+    }
+
+    func testAnErroredWriteDoesNotDisarmTheFabricationGuard() async {
+        // complete_task on a missing id → error: → the later claim is still bounced.
+        let transport = ScriptedTransport([
+            call("complete_task", #"{"taskId":"nope"}"#),
+            text("Done — completed it."),
+            text("I couldn't find that task — which one did you mean?"),
+        ])
+        let outcome = await runTurn("mark it done", transport)
+        XCTAssertEqual(outcome, .reply("I couldn't find that task — which one did you mean?"))
+        XCTAssertTrue(transport.asks[2].contains { $0.content == AssistantHarness.correctiveText })
+    }
+
+    func testRunningOutAfterAReceiptLessWriteOrANavigationClosesHonestly() async {
+        let writes = ScriptedTransport((0..<5).map { i in call("finish_interview", "{}", id: "c\(i)") })
+        let wrote = await runTurn("x", writes)
+        XCTAssertEqual(wrote, .reply(AssistantHarness.partwayWrite))
+        reset()
+        let navs = ScriptedTransport((0..<5).map { i in call("open_screen", #"{"screen":"week"}"#, id: "c\(i)") })
+        let opened = await runTurn("x", navs)
+        XCTAssertEqual(opened, .reply(AssistantHarness.partwayOpened("week")))
     }
 
     func testExhaustedRoundsCloseHonestly() async {

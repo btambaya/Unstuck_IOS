@@ -690,10 +690,14 @@ final class AssistantModel {
     /// The system prompt + the live context snapshot, for the realtime session.
     func voiceInstructions() -> String { buildVoiceInstructions(api) }
 
-    /// Tool schemas for the realtime session — all 58: the 53 app tools + the
-    /// four call tools (tools.ts VOICE_TOOLS parity) + the iOS-only
-    /// `finish_interview` that closes the voice opening's intro.
-    func voiceTools() -> [[String: Any]] { VOICE_TOOLS }
+    /// Tool schemas for the realtime session — THE registry's voice surface
+    /// (ToolRegistry.generated.swift, from lib/assistant/tool-registry.json),
+    /// never a hand-maintained copy (2026-09-20 tooling rewrite). A parity
+    /// test proves every name here has an executor case.
+    func voiceTools() -> [[String: Any]] { ToolRegistry.voice }
+
+    /// Call-mode extras (snooze_call) — the registry's `call` surface.
+    func callTools() -> [[String: Any]] { ToolRegistry.call }
 }
 
 /// Transport when the edge function client isn't available (signed-out demo

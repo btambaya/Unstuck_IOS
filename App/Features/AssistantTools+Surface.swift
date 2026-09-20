@@ -1,8 +1,11 @@
 // The full app surface (2026-09-02: "the model should be able to do everything
 // a user can do"): reopen/list tasks, calendar edits, focus controls, captures,
-// list edits, areas + tags, unshare, settings, insights, navigation. 1:1 with
-// the matching cases in lib/assistant/tools.ts — result strings are the
-// contract's, byte for byte.
+// list edits, areas + tags, unshare, settings, insights, navigation — and the
+// 2026-09-20 registry additions (set_task_reminder, finish_focus,
+// recolor_list, leave_list, pin_list_item, restore_capture, get_settings,
+// set_theme, set_focus_defaults, set_ambient_sound). Every `ok:` describes a
+// change the store confirmed; partial results name what was NOT done
+// (docs/assistant-tooling-rules.md §1).
 
 import Foundation
 import UnstuckCore
@@ -22,7 +25,7 @@ private func ownerOnlyRefusal(_ c: ItemCollection, verb: String,
     return "error: \"\(c.name)\" is shared with you by its owner — only they can \(verb) it. You can still add, edit and tick items."
 }
 
-// MARK: - dispatcher for the 2026-09-02 tools
+// MARK: - dispatcher for the 2026-09-02 tools (+ the 2026-09-20 additions)
 
 @MainActor
 func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratch: TurnScratch) async -> String? {
@@ -88,6 +91,24 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             return line
         }
         return "ok: \(view.rawValue) (\(rows.count))\(rows.count > 30 ? ", first 30" : ""):\n\(lines.isEmpty ? "(none)" : lines.joined(separator: "\n"))"
+
+    case "set_task_reminder":
+        // Per-task lead override (NotificationPrefs.setReminderOverride + a
+        // scheduler resync) — omit minutes = back to the default, 0 = off.
+        guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        let minutes = args.int("minutes")
+        if let m = minutes, ![0, 5, 10, 15].contains(m) { return "error: minutes must be 0 (off), 5, 10 or 15 — or omit it for the default" }
+        guard api.setTaskReminder(taskId: t.id, minutes: minutes) else { return "error: couldn't save the reminder — try again" }
+        let unscheduled = nextLiveBlock(api, taskId: t.id) == nil ? " (it isn't on the calendar yet — the reminder applies once it is scheduled)" : ""
+        switch minutes {
+        case nil:
+            let lead = api.getSettings().reminderLeadMin
+            return "ok: \"\(t.name)\" reminds at the default lead — \(lead == 0 ? "reminders are off by default" : "\(lead) minutes before")\(unscheduled)"
+        case 0?:
+            return "ok: no reminder for \"\(t.name)\"\(unscheduled)"
+        case let m?:
+            return "ok: \"\(t.name)\" reminds \(m) minutes before it starts\(unscheduled)"
+        }
 
     // ── CALENDAR ──
     case "unschedule_task":
@@ -156,7 +177,10 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
                 && (wanted == nil || wanted!.contains(b.taskId ?? ""))
         }
         if todays.isEmpty { return "error: nothing left on today to carry" }
-        var names: [String] = []
+        // A task tomorrow ALREADY has is skipped today instead of moved — it
+        // is reported as "not moved", never counted as carried (rules §1).
+        var moved: [String] = []
+        var skipped: [String] = []
         for b in todays {
             let t = api.getTasks().first { $0.id == b.taskId }
             let tomorrowTaken = api.getBlocks().contains { $0.taskId == b.taskId && $0.date == tomorrow && !$0.skipped }
@@ -164,9 +188,12 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             if tomorrowTaken { next.skipped = true } else { next.date = tomorrow }
             await api.upsertBlock(next)
             if let t { await api.upsertTask(bumpMoveCount(t, nowISO: now())) }
-            names.append(t?.name ?? b.taskName)
+            let nm = "\"\(t?.name ?? b.taskName)\""
+            if tomorrowTaken { skipped.append(nm) } else { moved.append(nm) }
         }
-        return "ok: carried \(names.count) to \(tomorrow) — \(names.map { "\"\($0)\"" }.joined(separator: ", "))"
+        let notMoved = skipped.isEmpty ? "" : ". Not moved: \(skipped.joined(separator: ", ")) (tomorrow already has \(skipped.count == 1 ? "it" : "them"); skipped today instead)"
+        if moved.isEmpty { return "ok: moved 0 to \(tomorrow)\(notMoved)" }
+        return "ok: moved \(moved.count) to \(tomorrow) — \(moved.joined(separator: ", "))\(notMoved)"
 
     // ── FOCUS ──
     case "start_focus":
@@ -177,7 +204,11 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         }
         let occ = t.recurrence != nil ? nextLiveBlock(api, taskId: t.id) : nil
         let est = args.int("estimateMin") ?? t.estimateMin
-        api.startFocus(taskId: t.id, estimateMin: est, occurrenceBlockId: occ?.id)
+        // Awaited join-or-mint (was fire-and-forget): "focus started" is said
+        // only once the session is live in the store.
+        guard await api.startFocus(taskId: t.id, estimateMin: est, occurrenceBlockId: occ?.id) else {
+            return "error: couldn't start a session on \"\(t.name)\" — nothing is running; try again"
+        }
         api.navigate(screen: "focus", id: nil)
         return "ok: focus started on \"\(t.name)\" (\(est)m) — the user is now on the focus screen"
 
@@ -197,13 +228,25 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard let live = api.getLiveFocus(), live.sessionStart != nil else { return "error: no focus session is running" }
         let mins = args.int("minutes") ?? 10
         if mins < 1 || mins > 180 { return "error: minutes must be between 1 and 180" }
-        api.extendFocus(mins)
+        guard api.extendFocus(mins) else { return "error: couldn't extend the session — its length is unchanged" }
         return "ok: extended the session by \(mins)m"
+
+    case "finish_focus":
+        // End + LOG (the focus screen's Done/End path): Session row,
+        // totalFocused, optional completion. cancel_focus is the no-log one.
+        guard let live = api.getLiveFocus(), live.sessionStart != nil else { return "error: no focus session is running" }
+        let markDone = args.bool("markDone") ?? false
+        guard let out = await api.finishFocus(markDone: markDone) else {
+            return "error: couldn't finish the session — nothing was logged and the task is unchanged; try again or use Done on the focus screen"
+        }
+        let mins = max(1, Int((Double(out.elapsedSec) / 60.0).rounded()))
+        let state = out.markedDone ? "task marked done" : (markDone ? "task still open (a repeating task's series is never closed this way)" : "task still open")
+        return "ok: finished the session on \"\(out.taskName)\" — \(mins)m logged, \(state)"
 
     case "cancel_focus":
         guard let live = api.getLiveFocus(), live.sessionStart != nil else { return "error: no focus session is running" }
         api.cancelFocus()
-        return "ok: cancelled the focus session (nothing logged). To finish and LOG a session, the user taps Done on the focus screen."
+        return "ok: cancelled the focus session (nothing logged). To finish and LOG a session, use finish_focus."
 
     // ── CAPTURES ──
     case "add_capture":
@@ -212,10 +255,13 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let tag = CaptureTag(rawValue: tagRaw) ?? .idea
         let t = findTask(args.str("taskId"), api: api, scratch: scratch)
         let live = api.getLiveFocus()
+        // A body over the 500-character cap is truncated — and SAID (no silent
+        // fallbacks, rules §1).
+        let cut = body.count > 500
         let c = Capture(id: newUUID(), taskId: t?.id, sessionId: (live?.sessionStart != nil) ? live?.id : nil,
                         tag: tag, body: String(body.prefix(500)), at: now())
         await api.upsertCapture(c)
-        return "ok: captured id=\(c.id) [\(tag.rawValue)] \"\(c.body)\"\(t.map { " on \"\($0.name)\"" } ?? "")"
+        return "ok: captured id=\(c.id) [\(tag.rawValue)] \"\(c.body)\"\(t.map { " on \"\($0.name)\"" } ?? "")\(cut ? " (cut to 500 characters — say so)" : "")"
 
     case "get_captures":
         let archived = Set(api.getArchivedCaptureIds())
@@ -246,7 +292,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             let done = c.items.filter { $0.done == true }.count
             lines.append("- \"\(c.name)\" [id=\(c.id)] — \(c.items.count - done) open\(done > 0 ? ", \(done) done" : "")\(c.archived == true ? " · archived" : "")")
             if c.items.isEmpty { lines.append("  (empty)"); continue }
-            for i in c.items.prefix(itemCap) { lines.append("  - \(i.body)\(i.done == true ? " (done)" : "") [id=\(i.id)]") }
+            for i in c.items.prefix(itemCap) { lines.append("  - \(i.body)\(i.done == true ? " (done)" : "")\(i.pinned == true ? " (pinned)" : "") [id=\(i.id)]") }
             if c.items.count > itemCap { lines.append("  … and \(c.items.count - itemCap) more — get_lists listId=\(c.id) for all") }
         }
         if lists.count > 20 { lines.append("… and \(lists.count - 20) more lists") }
@@ -258,21 +304,33 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         // lib/capture-actions promoteCapture: task from the body, link the capture.
         let newId = newUUID()
         let name = c.body.count > 160 ? String(c.body.prefix(160)) : c.body
+        // The area comes from the task the capture is attached to, if any —
+        // the old hard-coded "Work" put every promoted thought in Work.
+        let linked = c.taskId.flatMap { tid in findTask(tid, api: api, scratch: scratch) }
         let made = TaskItem(id: newId, name: name.isEmpty ? "Untitled task" : name, estimateMin: 25, totalFocused: 0, done: false,
                             priority: .medium, tags: ["from-capture", c.tag.rawValue], objectives: [], comments: [],
-                            lifeArea: "Work", createdAt: now(), updatedAt: now())
+                            lifeArea: linked?.lifeArea, createdAt: now(), updatedAt: now())
         await api.upsertTask(made)
         c.taskId = c.taskId ?? newId
         await api.upsertCapture(c)
         api.archiveCapture(c.id, archived: true)
         scratch.newTasks[made.id] = made
-        return "ok: promoted capture to task id=\(newId) name=\"\(c.body)\""
+        let trimmed = name.count < c.body.count ? " (title cut to 160 characters)" : ""
+        return "ok: promoted capture to task id=\(newId) name=\"\(c.body)\"\(trimmed)"
 
     case "resolve_capture":
         let id = args.str("captureId")
         guard let c = api.getCaptures().first(where: { $0.id == id }) else { return "error: capture not found" }
+        if api.getArchivedCaptureIds().contains(c.id) { return "error: \"\(c.body)\" is already resolved — nothing changed" }
         api.archiveCapture(c.id, archived: true)
         return "ok: resolved capture \"\(c.body)\""
+
+    case "restore_capture":
+        let id = args.str("captureId")
+        guard let c = api.getCaptures().first(where: { $0.id == id }) else { return "error: capture not found" }
+        if !api.getArchivedCaptureIds().contains(c.id) { return "error: \"\(c.body)\" is not archived — it is already in the inbox; nothing changed" }
+        api.archiveCapture(c.id, archived: false)
+        return "ok: restored capture \"\(c.body)\" to the inbox"
 
     case "delete_capture":
         let id = args.str("captureId")
@@ -287,22 +345,48 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard let c else { return "error: list not found" }
         guard let nm else { return "error: name required" }
         if let refusal = ownerOnlyRefusal(c, verb: "rename", api: api, scratch: scratch) { return refusal }
-        api.renameCollection(c.id, name: nm)
+        if nm.trimmingCharacters(in: .whitespacesAndNewlines) == c.name { return "error: the list is already called \"\(c.name)\" — nothing changed" }
+        guard await api.renameCollection(c.id, name: nm) else { return "error: couldn't rename \"\(c.name)\" — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
         return "ok: renamed list \"\(c.name)\" → \"\(nm)\""
+
+    case "recolor_list":
+        guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
+        let color = (args.str("color") ?? "").lowercased()
+        if !LIST_COLORS.contains(color) { return "error: unknown colour \"\(color)\" — use \(LIST_COLORS.joined(separator: ", "))" }
+        if let refusal = ownerOnlyRefusal(c, verb: "recolour", api: api, scratch: scratch) { return refusal }
+        if c.color == color { return "error: \"\(c.name)\" is already \(color) — nothing changed" }
+        guard await api.updateCollection(c.id, archived: nil, color: color) else { return "error: couldn't save — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
+        return "ok: recoloured list \"\(c.name)\" to \(color)"
 
     case "archive_list":
         guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
         let archived = args.bool("archived") ?? true
         if let refusal = ownerOnlyRefusal(c, verb: archived ? "archive" : "unarchive", api: api, scratch: scratch) { return refusal }
-        api.updateCollection(c.id, archived: archived, color: nil)
+        if (c.archived ?? false) == archived { return "error: \"\(c.name)\" is \(archived ? "already archived" : "not archived") — nothing changed" }
+        guard await api.updateCollection(c.id, archived: archived, color: nil) else { return "error: couldn't save — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
         return "ok: \(archived ? "archived" : "unarchived") list \"\(c.name)\""
 
     case "delete_list":
         guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
         if let refusal = ownerOnlyRefusal(c, verb: "delete", api: api, scratch: scratch) { return refusal }
-        api.removeCollection(c.id)
+        guard await api.removeCollection(c.id) else { return "error: couldn't delete \"\(c.name)\" — try again" }
         scratch.newLists.removeValue(forKey: c.id)
         return "ok: deleted list \"\(c.name)\""
+
+    case "leave_list":
+        // Confirm-first in the prompt; here only the facts: an own list can't
+        // be left, and "left" is said only once the server confirmed it.
+        guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
+        if scratch.newLists[c.id] != nil || api.ownsCollection(c.id) {
+            return "error: \"\(c.name)\" is the user's own list — only a list shared WITH them can be left; delete_list or archive_list it instead"
+        }
+        guard await api.leaveCollection(c.id) else {
+            return "error: couldn't leave \"\(c.name)\" — the server didn't confirm it (offline?); it is still shared with them; try again"
+        }
+        return "ok: left \"\(c.name)\" — the user no longer sees it; the owner keeps it"
 
     case "edit_list_item":
         let c = findList(args.str("listId"), api: api, scratch: scratch)
@@ -311,7 +395,8 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard let c, let item else { return "error: list item not found" }
         guard let body else { return "error: body required" }
         if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
-        api.updateCollectionItem(collectionId: c.id, itemId: item.id, body: body, done: nil)
+        guard await api.updateCollectionItem(collectionId: c.id, itemId: item.id, body: body, done: nil, pinned: nil) else { return "error: couldn't save — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
         return "ok: edited item in \"\(c.name)\" → \"\(body)\""
 
     case "remove_list_item":
@@ -319,7 +404,8 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let item = c?.items.first { $0.id == args.str("itemId") }
         guard let c, let item else { return "error: list item not found" }
         if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
-        api.removeCollectionItem(collectionId: c.id, itemId: item.id)
+        guard await api.removeCollectionItem(collectionId: c.id, itemId: item.id) else { return "error: couldn't save — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
         return "ok: removed \"\(item.body)\" from \"\(c.name)\""
 
     case "set_list_item_done":
@@ -328,8 +414,21 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         guard let c, let item else { return "error: list item not found" }
         if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
         let done = args.bool("done") ?? true
-        api.updateCollectionItem(collectionId: c.id, itemId: item.id, body: nil, done: done)
+        if (item.done ?? false) == done { return "error: \"\(item.body)\" is already \(done ? "ticked" : "unticked") — nothing changed" }
+        guard await api.updateCollectionItem(collectionId: c.id, itemId: item.id, body: nil, done: done, pinned: nil) else { return "error: couldn't save — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
         return "ok: \(done ? "ticked" : "unticked") \"\(item.body)\" in \"\(c.name)\""
+
+    case "pin_list_item":
+        let c = findList(args.str("listId"), api: api, scratch: scratch)
+        let item = c?.items.first { $0.id == args.str("itemId") }
+        guard let c, let item else { return "error: list item not found" }
+        if !api.canEditCollection(c.id) { return "error: you can't edit \"\(c.name)\"" }
+        let pinned = args.bool("pinned") ?? true
+        if (item.pinned ?? false) == pinned { return "error: \"\(item.body)\" is \(pinned ? "already pinned" : "not pinned") — nothing changed" }
+        guard await api.updateCollectionItem(collectionId: c.id, itemId: item.id, body: nil, done: nil, pinned: pinned) else { return "error: couldn't save — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
+        return "ok: \(pinned ? "pinned" : "unpinned") \"\(item.body)\" in \"\(c.name)\""
 
     // ── AREAS & TAGS ──
     case "create_area":
@@ -358,8 +457,13 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
 
     case "create_tag":
         guard let nm = args.str("name") else { return "error: name required" }
+        // "The result says if it already exists" (registry) — a second
+        // "ready" over an existing tag read as a fresh creation.
+        if let existing = api.getTagRows().first(where: { $0.name.lowercased() == nm.lowercased() }) {
+            return "error: tag \"\(existing.name)\" already exists — nothing changed"
+        }
         await api.addTag(name: nm)
-        return "ok: tag \"\(nm)\" ready"
+        return "ok: created tag \"\(nm)\""
 
     case "rename_tag":
         let from = args.str("name")
@@ -396,6 +500,23 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         return "ok: stopped sharing \"\(t.name)\" with \(hits[0].recipientName)"
 
     // ── SETTINGS ──
+    case "get_settings":
+        let s = api.getSettings()
+        func onOff(_ b: Bool) -> String { b ? "on" : "off" }
+        let budget: String = {
+            if s.usableWeekdayMin == nil && s.usableWeekendMin == nil { return "not set" }
+            return [s.usableWeekdayMin.map { "weekdays \($0)m" }, s.usableWeekendMin.map { "weekends \($0)m" }].compactMap { $0 }.joined(separator: ", ")
+        }()
+        let rituals = ["morning", "evening", "friday", "sunday"].map { "\($0) \(onOff(s.rituals[$0] ?? false))" }.joined(separator: ", ")
+        return "ok: settings:\n"
+            + "- notifications: \(s.notificationLevel)\n"
+            + "- reminder lead: \(s.reminderLeadMin == 0 ? "off" : "\(s.reminderLeadMin) minutes before a task")\n"
+            + "- usable minutes: \(budget)\n"
+            + "- focus defaults: \(s.focusDefaultMin)m sessions, \(s.focusOverrunMin == 0 ? "no overrun grace" : "\(s.focusOverrunMin)m overrun grace"), soft exit \(onOff(s.focusSoftExit)), pause reasons \(onOff(s.focusPauseReasons))\n"
+            + "- theme: \(s.theme)\n"
+            + "- ambient sound: \(s.ambient)\n"
+            + "- rituals: \(rituals)"
+
     case "set_usable_minutes":
         let wd = args.int("weekdayMin")
         let we = args.int("weekendMin")
@@ -422,8 +543,40 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let r = (args.str("ritual") ?? "").lowercased()
         if !["morning", "evening", "friday", "sunday"].contains(r) { return "error: ritual must be morning, evening, friday, or sunday" }
         let on = args.bool("on") ?? true
-        api.setRitual(r, on: on)
+        let cur = api.getSettings().rituals[r] ?? false
+        if cur == on { return "error: the \(r) moment is already \(on ? "on" : "off") — nothing changed" }
+        guard api.setRitual(r, on: on) else { return "error: couldn't save the \(r) moment — it is still \(cur ? "on" : "off")" }
         return "ok: \(r) moment \(on ? "on" : "off")"
+
+    case "set_theme":
+        let theme = (args.str("theme") ?? "").lowercased()
+        if !["system", "light", "dark"].contains(theme) { return "error: theme must be system, light, or dark" }
+        if api.getSettings().theme == theme { return "error: the theme is already \(theme) — nothing changed" }
+        guard api.setTheme(theme) else { return "error: couldn't switch the theme — it is still \(api.getSettings().theme)" }
+        return "ok: theme set to \(theme)"
+
+    case "set_focus_defaults":
+        let dm = args.int("defaultMinutes")
+        let om = args.int("overrunMinutes")
+        let se = args.bool("softExit")
+        let pr = args.bool("pauseReasons")
+        if dm == nil && om == nil && se == nil && pr == nil { return "error: give at least one of defaultMinutes, overrunMinutes, softExit, pauseReasons" }
+        if let dm, ![15, 25, 45].contains(dm) { return "error: defaultMinutes must be 15, 25 or 45" }
+        if let om, ![0, 5, 10].contains(om) { return "error: overrunMinutes must be 0, 5 or 10" }
+        guard api.setFocusDefaults(defaultMinutes: dm, overrunMinutes: om, softExit: se, pauseReasons: pr) else { return "error: couldn't save — try again" }
+        var parts: [String] = []
+        if let dm { parts.append("\(dm)m sessions") }
+        if let om { parts.append(om == 0 ? "no overrun grace" : "\(om)m overrun grace") }
+        if let se { parts.append("soft exit \(se ? "on" : "off")") }
+        if let pr { parts.append("pause reasons \(pr ? "on" : "off")") }
+        return "ok: focus defaults — \(parts.joined(separator: ", "))"
+
+    case "set_ambient_sound":
+        let sound = (args.str("sound") ?? "").lowercased()
+        if !["off", "brown", "pink"].contains(sound) { return "error: sound must be off, brown, or pink" }
+        if api.getSettings().ambient == sound { return "error: ambient sound is already \(sound) — nothing changed" }
+        guard api.setAmbientSound(sound) else { return "error: couldn't save — try again" }
+        return "ok: ambient sound \(sound == "off" ? "off" : "set to \(sound) noise")"
 
     case "forget_fact":
         let id = args.str("factId")
@@ -440,7 +593,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             target = hits.first
         }
         guard let target else { return "error: no matching fact" }
-        _ = api.removeProfileFact(target.id)
+        // The store's verdict used to be ignored — "forgot" over a fact still
+        // in every future prompt.
+        guard api.removeProfileFact(target.id) else { return "error: couldn't forget that just now — try again" }
         return "ok: forgot \"\(target.fact)\""
 
     // ── INSIGHTS ──
@@ -455,7 +610,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let s = (args.str("screen") ?? "").lowercased()
         let id = args.str("id")
         guard AssistantScreens.known.contains(s) else {
-            return "error: unknown screen \"\(s)\" — try today, tasks, calendar, week, month, focus, insights, lists, captures, settings, people, notifications"
+            return "error: unknown screen \"\(s)\" — use one of: \(AssistantScreens.registry.joined(separator: ", "))"
         }
         let withId = id != nil && (s == "tasks" || s == "lists" || s == "collections")
         api.navigate(screen: s, id: withId ? id : nil)
@@ -469,8 +624,11 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
 /// The contract's screen vocabulary (+ the web's aliases). The AppModel side
 /// (`AppModel+Routing.swift`) maps each to the existing tab/route machinery.
 enum AssistantScreens {
-    static let known: Set<String> = [
-        "today", "dashboard", "home", "tasks", "calendar", "day", "week", "month", "focus", "insights", "analytics",
-        "lists", "collections", "captures", "inbox", "settings", "people", "notifications", "areas",
+    /// The registry's `open_screen.screen` enum, in its order.
+    static let registry: [String] = [
+        "today", "tasks", "calendar", "day", "week", "month", "focus", "insights", "lists", "captures", "settings",
+        "people", "notifications", "areas",
     ]
+    /// Registry names + the web's aliases (dashboard/home, analytics, collections, inbox).
+    static let known: Set<String> = Set(registry).union(["dashboard", "home", "analytics", "collections", "inbox"])
 }

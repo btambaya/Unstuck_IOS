@@ -1,9 +1,12 @@
 // Assistant tool executor — the CLIENT half of the shared assistant contract
-// (docs/assistant-tool-contract.md). The `assistant` edge function owns the
-// tool SCHEMAS and the prompt; this file executes the calls through the same
-// write paths the UI uses, returning the contract's exact result strings
-// (`ok: …` / `error: …`) — the server prompt reads them, so wording is not
-// ours to change. 1:1 port of lib/assistant/tools.ts `runAssistantTool`.
+// (docs/assistant-tool-contract.md, generated from lib/assistant/tool-registry.json;
+// the behavioural half is docs/assistant-tooling-rules.md). The registry owns
+// the tool SCHEMAS (ToolRegistry.generated.swift) and the server owns the text
+// prompt; this file executes the calls through the same write paths the UI
+// uses, returning the contract's result strings (`ok: …` / `error: …`) — the
+// model reads them, so every `ok:` must describe a change the store confirmed
+// and every partial result must spell out what was NOT done (2026-09-20
+// tooling rewrite: "the model says it did something it didn't").
 //
 // The executor is written against `AssistantAppState` (not AppModel) so it
 // runs unchanged in unit tests against an in-memory fake, and in the app
@@ -62,17 +65,26 @@ protocol AssistantAppState: AnyObject {
     func upsertBlock(_ b: CalBlock) async
     func deleteBlock(_ id: String) async
     // ── lists ──
+    // Every list write returns the REAL outcome (2026-09-20 tooling rules §1):
+    // `true` only once the local row is committed; a `Void` seam used to let
+    // the executor say `ok:` over a write that never landed.
     /// → the new list's id.
     func addCollection(name: String, color: String) -> String?
-    func addCollectionItem(collectionId: String, body: String)
+    /// → the new item's id once committed (nil = not added).
+    func addCollectionItem(collectionId: String, body: String) async -> String?
     /// Turn a list item into a task through the SAME path the list UI uses
-    /// (task + promotion mark + loop scheduling). `loop` = keep everyone in the loop.
-    func promoteItemToTask(collectionId: String, itemId: String, loop: Bool, dueAt: String?)
-    func renameCollection(_ id: String, name: String)
-    func updateCollection(_ id: String, archived: Bool?, color: String?)
-    func removeCollection(_ id: String)
-    func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?)
-    func removeCollectionItem(collectionId: String, itemId: String)
+    /// (task + promotion mark + loop scheduling). `loop` = keep everyone in
+    /// the loop. → the new task's id (nil = nothing promoted).
+    func promoteItemToTask(collectionId: String, itemId: String, loop: Bool, dueAt: String?) -> String?
+    func renameCollection(_ id: String, name: String) async -> Bool
+    func updateCollection(_ id: String, archived: Bool?, color: String?) async -> Bool
+    func removeCollection(_ id: String) async -> Bool
+    /// `pinned` (2026-09-20): the item's pin flag, alongside body / done.
+    func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?, pinned: Bool?) async -> Bool
+    func removeCollectionItem(collectionId: String, itemId: String) async -> Bool
+    /// Leave a list shared WITH the user (the owner keeps it). True only when
+    /// the server confirmed the leave — the local row is dropped only then.
+    func leaveCollection(_ id: String) async -> Bool
     func canEditCollection(_ id: String) -> Bool
     /// Rename / archive / delete are OWNER-only — in the UI (CollectionsFeature
     /// gates them on `isOwner`) and server-side (RLS + the metadata lock), where
@@ -109,11 +121,21 @@ protocol AssistantAppState: AnyObject {
     func archiveCapture(_ id: String, archived: Bool)
     // ── focus ──
     func getLiveFocus() -> LiveSession?
-    func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?)
+    /// Join-or-mint, AWAITED: true once a session on `taskId` is live.
+    func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) async -> Bool
     func pauseFocus()
     func resumeFocus()
-    func extendFocus(_ minutes: Int)
+    /// False when there is no running session to extend.
+    func extendFocus(_ minutes: Int) -> Bool
+    /// `finish_focus`: end + LOG the running session the way the focus
+    /// screen's Done/End does (Session row, totalFocused, optional completion,
+    /// Live Activity ended). nil when nothing was running / nothing landed.
+    func finishFocus(markDone: Bool) async -> FocusFinishOutcome?
     func cancelFocus()
+    // ── reminders ──
+    /// `set_task_reminder`: the per-task lead override (nil = back to the
+    /// default) + a scheduler resync. False when it could not be saved.
+    func setTaskReminder(taskId: String, minutes: Int?) -> Bool
     // ── navigation ──
     func navigate(screen: String, id: String?)
     // ── areas + tags ──
@@ -126,10 +148,18 @@ protocol AssistantAppState: AnyObject {
     func updateTag(_ id: String, name: String?) async
     func removeTag(_ id: String) async
     // ── settings ──
+    /// `get_settings`: the current values, read fresh.
+    func getSettings() -> AssistantSettingsSnapshot
     func setUsableMinutes(weekday: Int?, weekend: Int?) async -> Bool
     func setNotificationLevel(_ level: String) async -> Bool
     func setReminderLead(_ minutes: Int) async -> Bool
-    func setRitual(_ ritual: String, on: Bool)
+    func setRitual(_ ritual: String, on: Bool) -> Bool
+    /// "system" | "light" | "dark".
+    func setTheme(_ theme: String) -> Bool
+    /// Only the non-nil fields change.
+    func setFocusDefaults(defaultMinutes: Int?, overrunMinutes: Int?, softExit: Bool?, pauseReasons: Bool?) -> Bool
+    /// "off" | "brown" | "pink".
+    func setAmbientSound(_ sound: String) -> Bool
     // ── first-run interview ──
     /// True until the get-to-know-you interview is finished or skipped on
     /// this account (InterviewMachine's done flag): the voice opening asks
@@ -145,9 +175,43 @@ extension AssistantAppState {
     func markInterviewDone() { InterviewMachine.markDone() }
 }
 
+/// What `finish_focus` landed — enough for the result line.
+struct FocusFinishOutcome: Equatable, Sendable {
+    let taskId: String
+    let taskName: String
+    let elapsedSec: Int
+    let markedDone: Bool
+}
+
+/// The `get_settings` read (2026-09-20). Strings carry the registry's
+/// vocabulary (notification level calm/balanced/coach, theme
+/// system/light/dark, ambient off/brown/pink); nil budget = never set.
+struct AssistantSettingsSnapshot: Equatable, Sendable {
+    var notificationLevel: String
+    var reminderLeadMin: Int
+    var usableWeekdayMin: Int?
+    var usableWeekendMin: Int?
+    var focusDefaultMin: Int
+    var focusOverrunMin: Int
+    var focusSoftExit: Bool
+    var focusPauseReasons: Bool
+    var theme: String
+    var ambient: String
+    /// morning / evening / friday / sunday → on.
+    var rituals: [String: Bool]
+}
+
 /// Tools that never change anything — a success here must NOT count as "the
-/// assistant acted" for either fabrication guard (text or voice).
-let READ_ONLY_TOOLS: Set<String> = ["get_schedule", "get_tasks", "get_captures", "get_lists", "get_insights", "get_calls"]
+/// assistant acted" for either fabrication guard (text or voice). From the
+/// registry (`kind: read`), never hand-maintained (2026-09-20).
+let READ_ONLY_TOOLS: Set<String> = ToolRegistry.readOnly
+/// Tools that only NAVIGATE — no data changes, no staged card. Neither a
+/// write (they must not disarm the fabrication guard) nor "nothing changed"
+/// (the harness's empty-reply fallback says what was opened instead).
+let NAVIGATION_TOOLS: Set<String> = ToolRegistry.navigation
+/// Tools that STAGE something for the user to confirm on screen (share_task,
+/// share_list) — a write for the guard, a card (not a receipt) for the panel.
+let STAGED_TOOLS: Set<String> = ToolRegistry.staged
 
 /// Entities created THIS turn/session, so a later call (schedule_task after
 /// create_task) can reference them by id before the optimistic write has
@@ -342,14 +406,31 @@ func runAssistantTool(name: String, args: ToolArgs, api: AssistantAppState, scra
     return unknownToolResult(name)
 }
 
-/// Every tool the executor knows (VOICE_TOOLS mirrors the executor 1:1), so
-/// an unknown-tool result names the real options — the model picks one next
-/// round instead of guessing again (three narrated guesses at a list-reading
-/// tool, tester round 2026-09-06). Same wording on web + Android.
+/// Every tool the executor knows (the registry — a parity test proves each
+/// name has an executor case), so an unknown-tool result names the real
+/// options — the model picks one next round instead of guessing again (three
+/// narrated guesses at a list-reading tool, tester round 2026-09-06). Same
+/// wording on web + Android (tooling rules §1).
 @MainActor
 func unknownToolResult(_ name: String) -> String {
-    let names = VOICE_TOOLS.compactMap { $0["name"] as? String }.sorted()
-    return "error: unknown tool \"\(name)\" — available: \(names.joined(separator: ", "))"
+    "error: unknown tool \"\(name)\". The tools are: \(ToolRegistry.names.joined(separator: ", "))"
+}
+
+/// After a successful list write, drop the turn's stale scratch copy in
+/// favour of the committed row — `findList` prefers scratch, so a rename or
+/// an added item on a list created THIS turn was invisible to the next tool.
+@MainActor
+func refreshScratchList(_ id: String, api: AssistantAppState, scratch: TurnScratch) {
+    guard scratch.newLists[id] != nil, let fresh = api.getCollections().first(where: { $0.id == id }) else { return }
+    scratch.newLists[id] = fresh
+}
+
+/// The registry's list-colour vocabulary (create_list / recolor_list).
+let LIST_COLORS = ["indigo", "coral", "green", "amber", "blue", "violet"]
+
+/// A recurrence's day list, spelled ("Mon, Wed") for a result line.
+func weekdayNames(_ days: [Int]) -> String {
+    days.sorted().map { WEEKDAY_NAMES_CAP[max(0, min(6, $0))].prefix(3) }.map(String.init).joined(separator: ", ")
 }
 
 /// Resolve a task id: scratch map first (the live store lags the optimistic
@@ -368,7 +449,8 @@ func findList(_ id: String?, api: AssistantAppState, scratch: TurnScratch) -> It
     return api.getCollections().first { $0.id == id }
 }
 
-/// The base (pre-2026-09-02) tools: tasks, schedule, lists, profile, sharing.
+/// The base (pre-2026-09-02) tools: tasks, schedule, lists, profile, sharing —
+/// plus the 2026-09-20 read `find_tasks`.
 @MainActor
 private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, scratch: TurnScratch) async -> String? {
     let now = AppModel.isoNow
@@ -376,13 +458,32 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
     switch name {
     case "create_task":
         guard let nm = args.str("name") else { return "error: name required" }
+        let date = args.str("date")
+        let startTime = args.str("startTime")
+        // A past day is refused BEFORE anything is created — an error means
+        // nothing happened (rules §1), so the model asks for another day.
+        if let date, let past = rejectPastDate(api, date) ?? rejectPastTime(api, date, startTime) {
+            return past + " The task was NOT created — give another day, or omit the date."
+        }
         let t = TaskItem(id: newUUID(), name: nm, estimateMin: args.int("estimateMin") ?? 25, totalFocused: 0, done: false,
                          tags: args.strList("tags"), lifeArea: args.str("lifeArea"),
                          firstPhysicalAction: args.str("firstPhysicalAction"), later: args.bool("later") ?? false,
                          createdAt: now(), updatedAt: now(), dueAt: args.str("dueAt"))
         await api.upsertTask(t)
         scratch.newTasks[t.id] = t
-        return "ok: created task id=\(t.id) name=\"\(t.name)\""
+        // date + startTime → on the calendar in the same call (registry). A
+        // day WITHOUT a time is NOT guessed at: created unscheduled and said so.
+        var extras: [String] = []
+        var note = ""
+        if let date, let startTime {
+            let landed = await scheduleTask(api, t, date: date, startTime: startTime)
+            extras.append("scheduled \(date) \(landed)")
+        } else if let date {
+            note = " NOTE: it has a day (\(date)) but no time — left unscheduled. Ask ONE question suggesting a time, then schedule_task."
+        }
+        if t.later == true { extras.append("in Later") }
+        if let due = t.dueAt { extras.append("due \(due)") }
+        return "ok: created task id=\(t.id) name=\"\(t.name)\"\(extras.isEmpty ? "" : " (\(extras.joined(separator: ", ")))")\(note)"
 
     case "schedule_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -407,13 +508,29 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: update_task cannot change the schedule — use schedule_task(taskId, date, startTime?) instead"
         }
         var upd = t
-        upd.name = args.str("name") ?? t.name
-        upd.estimateMin = args.int("estimateMin") ?? t.estimateMin
-        upd.lifeArea = args.str("lifeArea") ?? t.lifeArea
-        upd.tags = args.strList("tags") ?? t.tags
-        upd.firstPhysicalAction = args.str("firstPhysicalAction") ?? t.firstPhysicalAction
-        // "make that due Friday" was unreachable (inventory 2026-09-02)
-        upd.dueAt = args.isNull("dueAt") ? nil : (args.str("dueAt") ?? t.dueAt)
+        var changed: [String] = []
+        if let nm = args.str("name"), nm != t.name { upd.name = nm; changed.append("name") }
+        if let est = args.int("estimateMin"), est != t.estimateMin { upd.estimateMin = est; changed.append("estimate") }
+        // "none" clears an area / a first step / a deadline (registry wording);
+        // a JSON null on dueAt still clears it (older callers).
+        if let la = args.str("lifeArea") {
+            let next: String? = la.lowercased() == "none" ? nil : la
+            if next != t.lifeArea { upd.lifeArea = next; changed.append("area") }
+        }
+        if let tags = args.strList("tags"), tags != (t.tags ?? []) { upd.tags = tags; changed.append("tags") }
+        if let fpa = args.str("firstPhysicalAction") {
+            let next: String? = fpa.lowercased() == "none" ? nil : fpa
+            if next != t.firstPhysicalAction { upd.firstPhysicalAction = next; changed.append("first step") }
+        }
+        if args.isNull("dueAt") {
+            if t.dueAt != nil { upd.dueAt = nil; changed.append("deadline") }
+        } else if let due = args.str("dueAt") {
+            let next: String? = due.lowercased() == "none" ? nil : due
+            if next != t.dueAt { upd.dueAt = next; changed.append("deadline") }
+        }
+        if let later = args.bool("later"), later != (t.later ?? false) { upd.later = later; changed.append(later ? "parked in Later" : "back from Later") }
+        // A no-op is an error, never an "Updated" receipt over nothing.
+        if changed.isEmpty { return "error: nothing to change on \"\(t.name)\" — every field given already has that value (or none was given)" }
         upd.updatedAt = now()
         await api.upsertTask(upd)
         scratch.newTasks[upd.id] = upd
@@ -422,7 +539,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             blk.durationMinutes = upd.estimateMin
             await api.upsertBlock(blk)
         }
-        return "ok: updated \"\(upd.name)\""
+        return "ok: updated \"\(upd.name)\" (\(changed.joined(separator: ", ")))"
 
     case "set_task_later":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -436,7 +553,8 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         t.updatedAt = now()
         await api.upsertTask(t)
         scratch.newTasks[t.id] = t
-        return "ok"
+        // Names the task (rules §1) — a bare "ok" told the model nothing.
+        return wantLater ? "ok: moved \"\(t.name)\" to Later" : "ok: brought \"\(t.name)\" back from Later"
 
     case "set_task_recurrence":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -446,10 +564,15 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: unknown recurrence kind \"\(kind)\" — use daily, weekly, monthly, or none"
         }
         let until = args.str("until")
+        let days = (args.intList("daysOfWeek") ?? []).filter { (0...6).contains($0) }
+        // Weekly with no days used to save an EMPTY weekly series (never
+        // materialised a single day) and report ok — refuse and ask instead.
+        if kind == "weekly" && days.isEmpty { return "error: weekly needs daysOfWeek (0=Sunday … 6=Saturday) — ask which days" }
+        if kind == nil || kind == "none", t.recurrence == nil { return "error: \"\(t.name)\" doesn't repeat — nothing changed" }
         let rec: Recurrence?
         switch kind {
         case "daily": rec = .daily(until: until)
-        case "weekly": rec = .weekly(daysOfWeek: args.intList("daysOfWeek") ?? [], until: until)
+        case "weekly": rec = .weekly(daysOfWeek: days, until: until)
         case "monthly": rec = .monthly(until: until)
         default: rec = nil
         }
@@ -465,7 +588,11 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             for b in plan.toUpsert { await api.upsertBlock(b) }
             for id in plan.toDelete { await api.deleteBlock(id) }
         }
-        return "ok"
+        let anchored = blocks.contains { $0.taskId == t.id }
+        guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")" }
+        let how = kind == "weekly" ? "weekly on \(weekdayNames(days))" : kind
+        let till = until.map { " until \($0)" } ?? ""
+        return "ok: \"\(t.name)\" now repeats \(how)\(till)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
 
     case "complete_task":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -480,14 +607,20 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         return "ok: completed \"\(t.name)\" id=\(t.id)"
 
     case "create_tasks":
-        // Bulk brain-dump — ten spoken tasks must land as ONE call.
+        // Bulk brain-dump — ten spoken tasks must land as ONE call. Cap 50
+        // (was 25); whatever is NOT created is named in the result (rules §1).
         guard let items = args.objList("tasks"), !items.isEmpty else { return "error: tasks required" }
+        let cap = 50
         var made: [(id: String, name: String)] = []
         var needsTime: [String] = []
-        for it in items.prefix(25) {
-            guard let nm = it.str("name") else { continue }
+        var notCreated: [String] = []
+        for (i, it) in items.enumerated() {
+            guard let nm = it.str("name") else { notCreated.append("item \(i + 1) (no name)"); continue }
+            if made.count >= cap { notCreated.append("\"\(nm)\" (over the \(cap) limit — call create_tasks again for the rest)"); continue }
             let t = TaskItem(id: newUUID(), name: nm, estimateMin: it.int("estimateMin") ?? 25, totalFocused: 0, done: false,
-                             lifeArea: it.str("lifeArea"), later: false, createdAt: now(), updatedAt: now())
+                             tags: it.strList("tags"), lifeArea: it.str("lifeArea"),
+                             firstPhysicalAction: it.str("firstPhysicalAction"), later: it.bool("later") ?? false,
+                             createdAt: now(), updatedAt: now(), dueAt: it.str("dueAt"))
             await api.upsertTask(t)
             scratch.newTasks[t.id] = t
             let date = it.str("date")
@@ -504,28 +637,33 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             }
             made.append((t.id, t.name))
         }
-        if made.isEmpty { return "error: no valid tasks in the list" }
+        if made.isEmpty { return "error: no tasks created — \(notCreated.isEmpty ? "no valid tasks in the list" : notCreated.joined(separator: ", "))" }
         let ask = needsTime.isEmpty ? "" :
             " NOTE: \(needsTime.joined(separator: ", ")) \(needsTime.count == 1 ? "has" : "have") a day but no time — left unscheduled. Ask ONE question suggesting a time for them, then schedule_task each."
-        return "ok: created \(made.count) tasks ids=\(made.map(\.id).joined(separator: ",")) — \(made.map { "\"\($0.name)\"" }.joined(separator: ", ")).\(ask)"
+        let missed = notCreated.isEmpty ? "" : " Not created: \(notCreated.joined(separator: ", ")) — say so."
+        return "ok: created \(made.count) tasks ids=\(made.map(\.id).joined(separator: ",")) — \(made.map { "\"\($0.name)\"" }.joined(separator: ", ")).\(missed)\(ask)"
 
     case "complete_tasks":
         // Bulk close — "close all my tasks" must be ONE reliable call.
         let ids = args.strList("taskIds") ?? []
         if ids.isEmpty { return "error: taskIds required" }
-        // Report only the ids we ACTUALLY flipped — the receipt's undo re-opens exactly these.
-        var flipped: [String] = []
+        // Report only the ids we ACTUALLY flipped — the receipt's undo re-opens
+        // exactly these — and name every id that was NOT (already done / not
+        // found), so the model repeats it instead of saying "all done".
+        var flipped: [TaskItem] = []
+        var notDone: [String] = []
         for id in ids {
-            if var t = findTask(id, api: api, scratch: scratch), !t.done {
-                t.done = true
-                t.updatedAt = now()
-                await api.upsertTask(t)
-                scratch.newTasks[t.id] = t
-                flipped.append(t.id)
-            }
+            guard var t = findTask(id, api: api, scratch: scratch) else { notDone.append("\(id) (not found)"); continue }
+            if t.done { notDone.append("\"\(t.name)\" (already done)"); continue }
+            t.done = true
+            t.updatedAt = now()
+            await api.upsertTask(t)
+            scratch.newTasks[t.id] = t
+            flipped.append(t)
         }
-        if flipped.isEmpty { return "error: no matching open tasks" }
-        return "ok: completed \(flipped.count) tasks ids=\(flipped.joined(separator: ","))"
+        if flipped.isEmpty { return "error: none completed — \(notDone.joined(separator: ", "))" }
+        let skipped = notDone.isEmpty ? "" : ". Not done: \(notDone.joined(separator: ", "))"
+        return "ok: completed \(flipped.count) tasks ids=\(flipped.map(\.id).joined(separator: ",")) — \(flipped.map { "\"\($0.name)\"" }.joined(separator: ", "))\(skipped)"
 
     case "delete_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -536,9 +674,41 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         scratch.newTasks.removeValue(forKey: t.id)
         return "ok: deleted \"\(t.name)\""
 
+    case "find_tasks":
+        // READ (2026-09-20): fuzzy title search — every word of the query must
+        // appear in the title (partial words match). The model calls this
+        // when it has a name but no id; "several match" is reported HERE so
+        // it asks which, never picks.
+        guard let q = args.str("query") else { return "error: query required" }
+        let words = q.lowercased().split(whereSeparator: { $0.isWhitespace || $0 == "," }).map(String.init).filter { !$0.isEmpty }
+        if words.isEmpty { return "error: query required" }
+        let includeDone = args.bool("includeDone") ?? false
+        let tasks = api.getTasks()
+        // A task created THIS turn may not have echoed through the store yet.
+        var pool = tasks
+        for t in scratch.newTasks.values where !pool.contains(where: { $0.id == t.id }) { pool.append(t) }
+        let hits = pool.filter { t in (includeDone || !t.done) && words.allSatisfy { t.name.lowercased().contains($0) } }
+        if hits.isEmpty {
+            return "ok: no task matches \"\(q)\"\(includeDone ? "" : " (completed tasks not searched — includeDone=true to include them)") — tell the user, and offer to create it"
+        }
+        let lines = hits.prefix(15).map { t -> String in
+            var line = "- \(t.name) [id=\(t.id)] \(t.estimateMin)m"
+            if let area = t.lifeArea, !area.isEmpty { line += " · \(area)" }
+            if let b = nextLiveBlock(api, taskId: t.id) { line += " · \(b.date) \(b.startTime)" }
+            if t.recurrence != nil { line += " · repeats" }
+            if t.later == true { line += " · Later" }
+            if t.done { line += " · done" }
+            return line
+        }
+        let head = hits.count == 1
+            ? "ok: 1 task matches \"\(q)\":"
+            : "ok: \(hits.count) tasks match \"\(q)\" — several match: ask which one, never pick:"
+        return head + "\n" + lines.joined(separator: "\n") + (hits.count > 15 ? "\n… and \(hits.count - 15) more — narrow the query" : "")
+
     case "create_list":
         guard let nm = args.str("name") else { return "error: name required" }
-        let color = args.str("color") ?? "indigo"
+        let color = (args.str("color") ?? "indigo").lowercased()
+        if !LIST_COLORS.contains(color) { return "error: unknown colour \"\(color)\" — use \(LIST_COLORS.joined(separator: ", "))" }
         guard let id = api.addCollection(name: nm, color: color) else { return "error: could not create list" }
         scratch.newLists[id] = ItemCollection(id: id, name: nm, color: color, items: [], sortOrder: 0)
         return "ok: created list id=\(id) name=\"\(nm)\""
@@ -549,8 +719,9 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: you only have view access to \"\(c.name)\" — can't add to it"
         }
         guard let body = args.str("body") else { return "error: body required" }
-        api.addCollectionItem(collectionId: c.id, body: body)
-        return "ok: added to \"\(c.name)\""
+        guard let itemId = await api.addCollectionItem(collectionId: c.id, body: body) else { return "error: couldn't add to \"\(c.name)\" — try again" }
+        refreshScratchList(c.id, api: api, scratch: scratch)
+        return "ok: added to \"\(c.name)\" item id=\(itemId)"
 
     case "promote_item_to_task":
         guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found" }
@@ -562,9 +733,19 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: \"\(item.body)\" is already promoted — its task is still in flight"
         }
         let shared = !(c.members ?? []).isEmpty || c.myRole == "editor" || c.myRole == "viewer"
-        let loop = args.str("mode") == "loop" && shared
-        api.promoteItemToTask(collectionId: c.id, itemId: item.id, loop: loop, dueAt: loop ? args.str("dueAt") : nil)
-        return "ok: promoted \"\(item.body)\""
+        let wantLoop = args.str("mode") == "loop"
+        let loop = wantLoop && shared
+        let dueAt = loop ? args.str("dueAt") : nil
+        guard let taskId = api.promoteItemToTask(collectionId: c.id, itemId: item.id, loop: loop, dueAt: dueAt) else {
+            return "error: couldn't promote \"\(item.body)\" — try again"
+        }
+        refreshScratchList(c.id, api: api, scratch: scratch)
+        if let made = api.getTasks().first(where: { $0.id == taskId }) { scratch.newTasks[made.id] = made }
+        // The registry promises "the result says which of the two happened":
+        // a loop request on an unshared list is downgraded to self — SAID here.
+        if loop { return "ok: promoted \"\(item.body)\" to task id=\(taskId) — the list's members can see the user took it\(dueAt.map { " by \($0)" } ?? "")" }
+        if wantLoop { return "ok: promoted \"\(item.body)\" to task id=\(taskId) as the user's own task — the list isn't shared, so loop mode became self (say so)" }
+        return "ok: promoted \"\(item.body)\" to task id=\(taskId)"
 
     case "save_profile_fact":
         guard let fact = args.str("fact") else { return "error: fact required" }
@@ -601,6 +782,18 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         let res = resolveShareRequest(taskId: args.str("taskId"), taskName: args.str("taskName"),
                                       person: args.str("person"), level: args.str("level"),
                                       tasks: api.getTasks(), people: api.getShareCandidates(), newId: { newUUID() })
+        if let pending = res.pending { api.stageShare(pending) }
+        return res.message
+
+    case "share_list":
+        // STAGED exactly like share_task (2026-09-20): resolve the person,
+        // stage the card, never share. Owner-only, like the Share screen.
+        guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return "error: list not found — ask which list they mean" }
+        if scratch.newLists[c.id] == nil && !api.ownsCollection(c.id) {
+            return "error: \"\(c.name)\" is shared with you by its owner — only they can share it"
+        }
+        let res = resolveListShareRequest(listId: c.id, listName: c.name, person: args.str("person"), role: args.str("role"),
+                                          people: api.getShareCandidates(), newId: { newUUID() })
         if let pending = res.pending { api.stageShare(pending) }
         return res.message
 

@@ -99,3 +99,38 @@ final class AssistantShareRequestTests: XCTestCase {
         XCTAssertTrue(r.message.hasPrefix("error:"))
     }
 }
+
+// MARK: - share_list (2026-09-20 tooling rewrite)
+
+final class AssistantListShareRequestTests: XCTestCase {
+    private let people = [ShareCandidate(userId: "u2", name: "Zubair Kazaure"), ShareCandidate(userId: "u3", name: "Ana")]
+
+    func testStagesAListShareByCircleMemberWithTheRole() {
+        let r = resolveListShareRequest(listId: "l1", listName: "Groceries", person: "zubair", role: "EDITOR", people: people, newId: { "p1" })
+        XCTAssertEqual(r.pending, PendingShare(id: "p1", taskId: "l1", taskName: "Groceries", recipientUserId: "u2",
+                                               recipientName: "Zubair Kazaure", level: .view, target: .list, listRole: "editor"))
+        XCTAssertEqual(r.message, "ok: prepared a share of list \"Groceries\" with Zubair Kazaure (editor). The user must CONFIRM it on screen — tell them it's ready to confirm, and do not claim it is shared.")
+    }
+
+    func testAnyOtherRoleIsViewerAndAnEmailIsStagedForTheServer() {
+        let r = resolveListShareRequest(listId: "l1", listName: "Groceries", person: " Maya@X.com ", role: "owner", people: [], newId: { "p2" })
+        XCTAssertEqual(r.pending?.recipientEmail, "maya@x.com")
+        XCTAssertEqual(r.pending?.listRole, "viewer")
+        XCTAssertEqual(r.pending?.target, .list)
+        XCTAssertTrue(r.message.hasPrefix("ok: prepared a share of list \"Groceries\" with maya@x.com (viewer). If they have an Unstuck account"))
+    }
+
+    func testNeverStagesWithoutAnUnambiguousPerson() {
+        XCTAssertNil(resolveListShareRequest(listId: "l1", listName: "G", person: "Sam", role: nil, people: people, newId: { "p" }).pending)
+        XCTAssertEqual(resolveListShareRequest(listId: "l1", listName: "G", person: "Sam", role: nil, people: people, newId: { "p" }).message,
+                       "error: no circle member matches \"Sam\" — their circle is: Zubair Kazaure, Ana. Ask which person.")
+        XCTAssertEqual(resolveListShareRequest(listId: "l1", listName: "G", person: "Sam", role: nil, people: [], newId: { "p" }).message,
+                       "error: the user has nobody in their trusted circle yet — tell them to add someone in Settings → People first, or give an email address")
+    }
+
+    func testATaskShareStillDefaultsToATaskTarget() {
+        let p = PendingShare(id: "p", taskId: "t", taskName: "T", recipientUserId: "u", recipientName: "U", level: .partner)
+        XCTAssertEqual(p.target, .task)
+        XCTAssertNil(p.listRole)
+    }
+}

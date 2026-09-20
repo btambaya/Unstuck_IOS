@@ -162,7 +162,9 @@ public func deriveReceipt(
         return Receipt(icon: .pencil, label: "Updated “\(quotedFragment(result) ?? "task")”")
 
     case "set_task_later":
-        let nm = args.taskId.flatMap { id in tasks.first { $0.id == id }?.name }
+        // The 2026-09-20 result names the task ("ok: moved "X" to Later") —
+        // prefer that; the store lookup keeps legacy persisted results working.
+        let nm = quotedFragment(result) ?? args.taskId.flatMap { id in tasks.first { $0.id == id }?.name }
         // Web: `args.later !== false` — anything but an explicit false is "to Later".
         let toLater = args.later != false
         let verb = toLater ? "Moved to Later" : "Brought back from Later"
@@ -233,6 +235,9 @@ public func deriveReceipt(
                        undo: id.map { .deleteTask(id: $0) })
 
     case "carry_to_tomorrow":
+        // 2026-09-20: a task tomorrow already had is SKIPPED today, never
+        // counted as moved — with nothing moved the card must say so.
+        if result.hasPrefix("ok: moved 0 ") { return Receipt(icon: .calendar, label: "Nothing moved — skipped today instead") }
         return Receipt(icon: .calendar, label: stripAfterDash(stripOk(result)))
 
     case "start_focus":
@@ -249,6 +254,29 @@ public func deriveReceipt(
 
     case "cancel_focus":
         return Receipt(icon: .pencil, label: "Focus cancelled")
+
+    // ── 2026-09-20 tooling rewrite (docs/assistant-tooling-rules.md §4) — cards
+    // for the new write tools, each read off the executor's result string. ──
+    case "finish_focus":
+        // "ok: finished the session on "X" — 25m logged, task marked done" →
+        // "Finished “X” · 25m logged, task marked done" (web parity).
+        guard let nm = quotedFragment(result), let tail = result.range(of: "\" — ") else { return Receipt(icon: .check, label: stripOk(result)) }
+        return Receipt(icon: .check, label: "Finished “\(nm)” · \(result[tail.upperBound...])")
+
+    case "set_task_reminder":
+        // "ok: "X" reminds 10 minutes before" / "ok: no reminder for "X"" /
+        // "ok: "X" reminds at the default lead (10 minutes before)"
+        return Receipt(icon: .pencil, label: "Reminder: \(stripTrailingParenthetical(stripOk(result)))")
+
+    case "leave_list":
+        return Receipt(icon: .trash, label: "Left “\(quotedFragment(result) ?? "list")”")
+
+    case "recolor_list", "pin_list_item", "set_theme", "set_focus_defaults", "set_ambient_sound":
+        return Receipt(icon: name == "recolor_list" || name == "pin_list_item" ? .list : .pencil,
+                       label: stripTrailingParenthetical(stripOk(result)))
+
+    case "restore_capture":
+        return Receipt(icon: .plus, label: "Restored: \(quotedFragment(result) ?? "capture")")
 
     case "add_capture":
         let id = idFragment(result)

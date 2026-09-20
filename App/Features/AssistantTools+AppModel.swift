@@ -76,33 +76,119 @@ final class AppModelAssistantState: AssistantAppState {
         if let coord = model.coordinator { Task { await coord.kickFlush() } }
         return col.id
     }
-    func addCollectionItem(collectionId: String, body: String) {
-        guard let c = collection(collectionId) else { return }
-        model.addCollectionItem(c, body: body)
+
+    // The list writes below AWAIT the same WriteThrough calls AppModel's
+    // mutate helpers fire-and-forget (`mutateCollection` / `mutateCollectionItem`
+    // wrap them in a detached Task and return Void), so the executor can
+    // report the REAL outcome (tooling rules §1, 2026-09-20): `true` only once
+    // the local row + its outbox op are committed, `false` on a missing list
+    // or a failed write — a `Void` seam let the assistant say `ok:` over a
+    // write that never landed. Routing is AppModel's, byte for byte: a shared
+    // list takes the atomic item RPC (never the items JSONB) and the owner's
+    // partial metadata UPDATE; an own list takes the whole-row upsert.
+
+    /// Item-array change, committed. `rpc` builds the shared-list descriptor.
+    private func mutateItemsCommitted(_ id: String, _ transform: (ItemCollection) -> ItemCollection,
+                                      rpc: (ItemCollection) -> CollectionRPC) async -> Bool {
+        guard let write = model.write, let latest = collection(id) else { return false }
+        let next = transform(latest)
+        do {
+            if model.isShared(latest) {
+                try await write.applyCollectionRPC(next, rpc: rpc(next), nowISO: AppModel.isoNow())
+            } else {
+                try await write.upsertCollection(next, nowISO: AppModel.isoNow())
+            }
+        } catch { return false }
+        return true
     }
-    func promoteItemToTask(collectionId: String, itemId: String, loop: Bool, dueAt: String?) {
-        guard let c = collection(collectionId), let item = c.items.first(where: { $0.id == itemId }) else { return }
-        model.moveItemToTask(c, item: item, mode: loop ? .loop : .selfOnly, dueAtIso: dueAt)
+
+    /// Metadata change (name / colour / archived), committed. A SHARED list
+    /// goes through AppModel's own method (`viaModel`: a synchronous local
+    /// save + the partial-UPDATE RPC queued per collection), then the row is
+    /// read back to confirm it landed.
+    private func mutateCollectionCommitted(_ id: String, _ transform: (ItemCollection) -> ItemCollection,
+                                           viaModel: (ItemCollection) -> Void) async -> Bool {
+        guard let write = model.write, let latest = collection(id) else { return false }
+        let next = transform(latest)
+        if model.isShared(latest) {
+            viaModel(latest)
+        } else {
+            do { try await write.upsertCollection(next, nowISO: AppModel.isoNow()) } catch { return false }
+        }
+        return collection(id) == next
     }
-    func renameCollection(_ id: String, name: String) {
-        guard let c = collection(id) else { return }
-        model.renameCollection(c, name: name)
+
+    func addCollectionItem(collectionId: String, body: String) async -> String? {
+        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return nil }
+        let item = CollectionItem(id: newUUID(), body: text, at: AppModel.isoNow())
+        let ok = await mutateItemsCommitted(collectionId, { var c = $0; c.items.append(item); return c },
+            rpc: { _ in CollectionRPC.addItem(collectionId: collectionId, id: item.id, body: item.body, at: item.at) })
+        return ok ? item.id : nil
     }
-    func updateCollection(_ id: String, archived: Bool?, color: String?) {
-        guard let c = collection(id) else { return }
-        if let archived { model.archiveCollection(id, archived: archived) }
-        if let color { model.recolorCollection(c, color: color) }
+    /// The list UI's own path (task + promotion mark + loop scheduling) —
+    /// it returns the task it made, nil when the item was skipped.
+    func promoteItemToTask(collectionId: String, itemId: String, loop: Bool, dueAt: String?) -> String? {
+        guard model.write != nil, let c = collection(collectionId), let item = c.items.first(where: { $0.id == itemId }) else { return nil }
+        return model.moveItemToTask(c, item: item, mode: loop ? .loop : .selfOnly, dueAtIso: dueAt)?.id
     }
-    func removeCollection(_ id: String) { model.deleteCollection(id) }
-    func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?) {
-        guard let c = collection(collectionId), let item = c.items.first(where: { $0.id == itemId }) else { return }
-        if let body { model.updateCollectionItemBody(c, itemId: itemId, body: body) }
-        // The UI only has a toggle — flip only when the desired state differs.
-        if let done, (item.done ?? false) != done { model.toggleCollectionItemDone(c, itemId: itemId) }
+    func renameCollection(_ id: String, name: String) async -> Bool {
+        let nm = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !nm.isEmpty else { return false }
+        return await mutateCollectionCommitted(id, { var c = $0; c.name = nm; return c },
+                                               viaModel: { model.renameCollection($0, name: nm) })
     }
-    func removeCollectionItem(collectionId: String, itemId: String) {
-        guard let c = collection(collectionId) else { return }
-        model.removeCollectionItem(c, itemId: itemId)
+    func updateCollection(_ id: String, archived: Bool?, color: String?) async -> Bool {
+        var ok = true
+        if let archived {
+            ok = await mutateCollectionCommitted(id, { var c = $0; c.archived = archived; return c },
+                                                 viaModel: { _ in model.archiveCollection(id, archived: archived) })
+        }
+        if ok, let color {
+            ok = await mutateCollectionCommitted(id, { var c = $0; c.color = color; return c },
+                                                 viaModel: { model.recolorCollection($0, color: color) })
+        }
+        return ok
+    }
+    func removeCollection(_ id: String) async -> Bool {
+        guard let write = model.write, collection(id) != nil else { return false }
+        do { try await write.deleteCollection(id: id, nowISO: AppModel.isoNow()) } catch { return false }
+        return collection(id) == nil
+    }
+    func updateCollectionItem(collectionId: String, itemId: String, body: String?, done: Bool?, pinned: Bool?) async -> Bool {
+        guard let c = collection(collectionId), c.items.contains(where: { $0.id == itemId }) else { return false }
+        var ok = true
+        if let body {
+            let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            ok = await mutateItemsCommitted(collectionId,
+                { c in var n = c; if let i = n.items.firstIndex(where: { $0.id == itemId }) { n.items[i].body = text }; return n },
+                rpc: { _ in CollectionRPC.updateItem(collectionId: collectionId, itemId: itemId, body: text) })
+        }
+        if ok, let done {
+            ok = await mutateItemsCommitted(collectionId,
+                { c in var n = c; if let i = n.items.firstIndex(where: { $0.id == itemId }) { n.items[i].done = done }; return n },
+                rpc: { _ in CollectionRPC.setItemFlag(collectionId: collectionId, itemId: itemId, flag: "done", value: done) })
+        }
+        if ok, let pinned {
+            ok = await mutateItemsCommitted(collectionId,
+                { c in var n = c; if let i = n.items.firstIndex(where: { $0.id == itemId }) { n.items[i].pinned = pinned }; return n },
+                rpc: { _ in CollectionRPC.setItemFlag(collectionId: collectionId, itemId: itemId, flag: "pinned", value: pinned) })
+        }
+        return ok
+    }
+    func removeCollectionItem(collectionId: String, itemId: String) async -> Bool {
+        guard let c = collection(collectionId), c.items.contains(where: { $0.id == itemId }) else { return false }
+        return await mutateItemsCommitted(collectionId,
+            { c in var n = c; n.items.removeAll { $0.id == itemId }; return n },
+            rpc: { _ in CollectionRPC.removeItem(collectionId: collectionId, itemId: itemId) })
+    }
+    /// The Lists screen's leave: the RPC + local drop, TRUE only when the
+    /// server confirmed (a refusal keeps the row and says so).
+    func leaveCollection(_ id: String) async -> Bool {
+        guard collection(id) != nil else { return false }
+        return await withCheckedContinuation { cont in
+            model.leaveCollection(id) { cont.resume(returning: $0) }
+        }
     }
     /// Unknown → false (the web's use-assistant-api rule); else editable unless viewer.
     func canEditCollection(_ id: String) -> Bool {
@@ -175,19 +261,66 @@ final class AppModelAssistantState: AssistantAppState {
     /// clocks finalized separately. `startFocusJoinOrMint` finalizes a
     /// displaced session, probes the co-focus channel and ADOPTS a partner's
     /// in-flight session when there is one, else mints. It is resume-aware, so
-    /// re-entering the same occurrence never restarts the clock.
-    func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) {
-        Task { await model.startFocusJoinOrMint(taskId: taskId, estimateMin: estimateMin, occurrenceBlockId: occurrenceBlockId) }
+    /// re-entering the same occurrence never restarts the clock. AWAITED
+    /// (2026-09-20) — "focus started" is reported only once the store has it.
+    func startFocus(taskId: String, estimateMin: Int?, occurrenceBlockId: String?) async -> Bool {
+        await model.startFocusJoinOrMint(taskId: taskId, estimateMin: estimateMin, occurrenceBlockId: occurrenceBlockId)
+        guard let live = getLiveFocus() else { return false }
+        return live.sessionStart != nil && live.taskId == taskId
     }
     func pauseFocus() { model.pauseFocus() }
     func resumeFocus() { model.resumeFocus() }
-    func extendFocus(_ minutes: Int) {
-        guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return }
+    func extendFocus(_ minutes: Int) -> Bool {
+        guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return false }
         let next = FocusTimer.extend(cur, minutes: minutes)
-        try? store.set(next)
+        do { try store.set(next) } catch { return false }
         model.refreshLiveSession()
         LiveActivityController.shared.update(sessionStartMs: next.sessionStart ?? 0, paused: next.paused,
                                              estimateMin: next.sessionEstimateMin)
+        return true
+    }
+    /// The focus screen's Done/End path, minus the screen (FocusFeature →
+    /// FocusMachine.finish + AppModel.finishFocus): the Session row is
+    /// attributed to the TEMPLATE (`cur.taskId`) for an occurrence focus, the
+    /// store is cleared with `FocusTimer.done`, the Live Activity and the
+    /// paused check-in end, and the accrual takes the same three routes —
+    /// a session on a task shared WITH me → `finalizeSharedFocus` (owner's
+    /// ledger, optional completion by level); an own task → `finishFocus`
+    /// (partner-shared → exactly-once ledger); a task row that's gone →
+    /// the bare Session. nil = nothing was running.
+    func finishFocus(markDone: Bool) async -> FocusFinishOutcome? {
+        guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return nil }
+        let now = Date().timeIntervalSince1970 * 1000
+        let elapsed = FocusTimer.elapsedSec(cur, now: now)
+        let task = (try? model.taskRepo?.fetch(id: cur.taskId)) ?? nil
+        let name = task?.name ?? "Focus session"
+        let session = Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: name,
+                              estimateMin: task?.estimateMin ?? cur.sessionEstimateMin, actualSec: elapsed,
+                              completedAt: AppModel.isoNow())
+        do { try store.set(FocusTimer.done(cur)) } catch { return nil }
+        model.refreshLiveSession()
+        LiveActivityController.shared.end()
+        PausedCheckinScheduler.cancel()
+        var markedDone = false
+        if let level = cur.sharedFocusLevel {
+            markedDone = markDone && levelCanComplete(level)
+            model.finalizeSharedFocus(taskId: cur.taskId, taskName: name, sessionId: session.id,
+                                      elapsedSec: elapsed, estimateMin: cur.sessionEstimateMin,
+                                      markDone: markedDone, showRecap: false)
+        } else if let task {
+            // A recurring TEMPLATE with no occurrence attached is never marked
+            // done (that would end the whole series) — AppModel.finishFocus
+            // falls through there, so the outcome says the task stays open.
+            markedDone = markDone && (cur.occurrenceBlockId != nil || focusMayCompleteRow(task))
+            model.finishFocus(task: task, session: session, elapsedSec: elapsed, markDone: markDone,
+                              occurrenceBlockId: cur.occurrenceBlockId,
+                              sharedLedger: model.accruesViaSharedLedger(cur, taskId: task.id))
+        } else {
+            model.saveSession(session)
+        }
+        // A presented Focus screen would keep showing a clock the store no longer has.
+        if model.router.focusTask != nil { model.router.focusTask = nil; model.router.sharedFocus = nil }
+        return FocusFinishOutcome(taskId: cur.taskId, taskName: name, elapsedSec: elapsed, markedDone: markedDone)
     }
     func cancelFocus() {
         guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return }
@@ -198,6 +331,16 @@ final class AppModelAssistantState: AssistantAppState {
         PausedCheckinScheduler.cancel()
         // A presented Focus screen would keep showing a clock the store no longer has.
         if model.router.focusTask != nil { model.router.focusTask = nil; model.router.sharedFocus = nil }
+    }
+
+    // MARK: reminders
+
+    /// Device-local per-task override (Settings → task reminder), then the
+    /// scheduler rebuild the Settings toggle triggers — read back to confirm.
+    func setTaskReminder(taskId: String, minutes: Int?) -> Bool {
+        NotificationPrefs.setReminderOverride(taskId: taskId, leadMin: minutes)
+        ReminderScheduler.shared.resync()
+        return NotificationPrefs.reminderOverride(taskId: taskId) == minutes
     }
 
     // MARK: navigation
@@ -255,6 +398,22 @@ final class AppModelAssistantState: AssistantAppState {
 
     // MARK: settings
 
+    /// `get_settings`: the same stores the Settings screen reads.
+    func getSettings() -> AssistantSettingsSnapshot {
+        let d = UserDefaults.standard
+        let s = model.settings
+        var rituals: [String: Bool] = [:]
+        for key in RitualKey.allCases { rituals[key.rawValue] = model.paPrefs.rituals[key] }
+        return AssistantSettingsSnapshot(
+            notificationLevel: NotificationPrefs.level.rawValue.lowercased(),
+            reminderLeadMin: NotificationPrefs.reminderLeadMin,
+            usableWeekdayMin: d.object(forKey: "unstuck.usableMinutesPerDay") == nil ? nil : d.integer(forKey: "unstuck.usableMinutesPerDay"),
+            usableWeekendMin: d.object(forKey: "unstuck.usableMinutesWeekend") == nil ? nil : d.integer(forKey: "unstuck.usableMinutesWeekend"),
+            focusDefaultMin: s.focusDefaultMin, focusOverrunMin: s.focusOverrunMin,
+            focusSoftExit: s.focusSoftExit, focusPauseReasons: s.focusPauseReasons,
+            theme: s.theme.rawValue, ambient: s.ambient.rawValue, rituals: rituals)
+    }
+
     /// The budget lives on the server (`user_preferences.usable_minutes_*` —
     /// the web calendar's capacity math reads it; nothing on iOS does yet), so
     /// the server write IS the change: awaited, and the local cache is written
@@ -277,11 +436,36 @@ final class AppModelAssistantState: AssistantAppState {
     func setReminderLead(_ minutes: Int) async -> Bool {
         await model.setReminderLeadAwaiting(minutes)
     }
-    func setRitual(_ ritual: String, on: Bool) {
-        guard let key = RitualKey(rawValue: ritual) else { return }
+    func setRitual(_ ritual: String, on: Bool) -> Bool {
+        guard let key = RitualKey(rawValue: ritual) else { return false }
         // Through the shared observable (writes to PAPrefsStore underneath) so
         // the gateway card's moment picker and the Settings toggles update live.
         model.paPrefs.setRitual(key, on: on)
+        return model.paPrefs.rituals[key] == on
+    }
+    // Theme / focus defaults / ambient are device-local SettingsState scalars
+    // (UserDefaults-backed, observed app-wide) — the same properties the
+    // Settings screen binds to, read back to confirm.
+    func setTheme(_ theme: String) -> Bool {
+        guard let pref = ThemePref(rawValue: theme) else { return false }
+        model.settings.theme = pref
+        return model.settings.theme == pref
+    }
+    func setFocusDefaults(defaultMinutes: Int?, overrunMinutes: Int?, softExit: Bool?, pauseReasons: Bool?) -> Bool {
+        let s = model.settings
+        if let defaultMinutes { s.focusDefaultMin = defaultMinutes }
+        if let overrunMinutes { s.focusOverrunMin = overrunMinutes }
+        if let softExit { s.focusSoftExit = softExit }
+        if let pauseReasons { s.focusPauseReasons = pauseReasons }
+        return (defaultMinutes.map { s.focusDefaultMin == $0 } ?? true)
+            && (overrunMinutes.map { s.focusOverrunMin == $0 } ?? true)
+            && (softExit.map { s.focusSoftExit == $0 } ?? true)
+            && (pauseReasons.map { s.focusPauseReasons == $0 } ?? true)
+    }
+    func setAmbientSound(_ sound: String) -> Bool {
+        guard let pref = AmbientSound(rawValue: sound) else { return false }
+        model.settings.ambient = pref
+        return model.settings.ambient == pref
     }
 }
 
