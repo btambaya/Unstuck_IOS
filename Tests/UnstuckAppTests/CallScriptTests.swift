@@ -212,6 +212,54 @@ final class CallScriptTests: XCTestCase {
         XCTAssertTrue(after.contains("- block ended at: "))
     }
 
+    // MARK: day context (2026-09-20 — Zubair's evening call read nothing, then
+    // an undated all-time list as "today")
+
+    private let london = TimeZone(identifier: "Europe/London")!
+    private func dayStore() -> ([TaskItem], [CalBlock]) {
+        let tasks = [task("t-course", "Beginner course", done: true, completedAt: "2026-09-20T08:10:00.000Z"),
+                     task("t-gym", "Gym"), task("t-mum", "Call mum"), task("t-dentist", "Dentist"),
+                     task("t-sc200", "SC-200 revision", done: true, completedAt: "2026-09-19T10:00:00.000Z"),
+                     task("t-late", "Late tick", done: true, completedAt: "2026-09-19T23:30:00.000Z")]   // 00:30 London on the 20th
+        let blocks = [block("b6", "t-course", "2026-09-20", "09:00"), block("b7", "t-gym", "2026-09-20", "15:00"),
+                      block("b8", "t-mum", "2026-09-20", "17:30"), block("b9", "t-dentist", "2026-09-21", "10:00"),
+                      block("b5", "t-sc200", "2026-09-19", "09:00")]
+        return (tasks, blocks)
+    }
+
+    func testDayContextEveningReadsDoneOpenAndTomorrowFromTheStore() {
+        let (tasks, blocks) = dayStore()
+        let lines = CallDayContext.lines(kind: .evening, tasks: tasks, blocks: blocks, today: "2026-09-20", nowHM: "19:01", tz: london)
+        XCTAssertTrue(lines[0].hasPrefix("today: 2026-09-20 (") && lines[0].hasSuffix("), now 19:01"), lines[0])
+        XCTAssertEqual(lines[1], "done today (2): Beginner course, Late tick", "by the LOCAL completion day — 23:30Z on the 19th is the 20th in London; SC-200 (the 19th) is not today")
+        XCTAssertEqual(lines[2], "still open today (2): Gym (15:00), Call mum (17:30)")
+        XCTAssertEqual(lines[3], "tomorrow starts with: Dentist at 10:00")
+    }
+
+    func testDayContextMorningAndAfterBlockAndEmptyDay() {
+        let (tasks, blocks) = dayStore()
+        let morning = CallDayContext.lines(kind: .morning, tasks: tasks, blocks: blocks, today: "2026-09-20", nowHM: "08:30", tz: london)
+        XCTAssertEqual(morning[1], "today's plan (3): 09:00 Beginner course · done; 15:00 Gym; 17:30 Call mum")
+        XCTAssertEqual(morning[2], "done today (2): Beginner course, Late tick")
+        let after = CallDayContext.lines(kind: .afterBlock, tasks: tasks, blocks: blocks, today: "2026-09-20", nowHM: "15:50", tz: london)
+        XCTAssertEqual(after[1], "still open today (2): Gym (15:00), Call mum (17:30)")
+        let empty = CallDayContext.lines(kind: .evening, tasks: [], blocks: [], today: "2026-09-22", nowHM: "19:00", tz: london)
+        XCTAssertEqual(Array(empty.dropFirst()), ["done today: nothing ticked off yet", "still open today: nothing", "tomorrow: nothing scheduled yet"])
+        XCTAssertEqual(CallDayContext.localDate(ofISO: "2026-09-19T23:30:00Z", tz: london), "2026-09-20")
+        XCTAssertNil(CallDayContext.localDate(ofISO: "nope", tz: london))
+    }
+
+    @MainActor func testInstructionsCarryTheDayContextAndTheEveningRuleNeverAsksWhatGotDone() {
+        let i = CallScript.instructions(session(kind: "evening"), dayContext: ["done today (1): Beginner course", "still open today: nothing"])
+        XCTAssertTrue(i.contains("- done today (1): Beginner course"), i)
+        XCTAssertTrue(i.contains("- still open today: nothing"), i)
+        XCTAssertTrue(i.contains("NEVER ask them what got done"), i)
+        XCTAssertTrue(i.contains("read from the app as the call connected"), i)
+        XCTAssertTrue(CallScript.instructions(session(kind: "morning")).contains("read today's plan from the call context"))
+        let comp = RealtimeCallVoiceLauncher.compose(session: session(kind: "evening"), baseInstructions: "BASE", voiceTools: [], dayContext: ["done today (1): X"])
+        XCTAssertTrue(comp.instructions.contains("- done today (1): X"), "the launcher threads the store's lines through")
+    }
+
     func testPayloadParsesCallKindAndEndTimeTolerantly() throws {
         let json = """
         {"kind":"call","callKind":"after_block","endTime":"11:30","callId":"abc","label":"speak to James"}

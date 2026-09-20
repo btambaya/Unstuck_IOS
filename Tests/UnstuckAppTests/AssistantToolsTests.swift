@@ -627,6 +627,24 @@ final class AssistantToolsTests: XCTestCase {
         for id in ["t_up", "t_later", "t_done", "t_old", "t_tag"] { XCTAssertFalse(r.contains("[id=\(id)]"), id) }
     }
 
+    func testGetTasksCompletedIsDatedAndNewestFirst() async {
+        // An undated all-time list was read back as "today" (Zubair's
+        // evening call, 2026-09-20). Newest first, each line says when.
+        let yesterday = LocalDate.addDays(TODAY, -1)
+        api.tasks = [task("t_old", "Aged", done: true, completedAt: "2026-01-05T12:00:00.000Z"),
+                     task("t_today", "Fresh", done: true, completedAt: "\(TODAY)T12:00:00.000Z"),
+                     task("t_yday", "Recent", done: true, completedAt: "\(yesterday)T12:00:00.000Z"),
+                     task("t_open", "Still open")]
+        let r = await run("get_tasks", #"{"view":"completed"}"#)
+        XCTAssertTrue(r.hasPrefix("ok: Completed (3), newest first:"), r)
+        let lines = r.split(separator: "\n").map(String.init)
+        XCTAssertTrue(lines[1].contains("[id=t_today]") && lines[1].hasSuffix("· done today"), lines[1])
+        XCTAssertTrue(lines[2].contains("[id=t_yday]") && lines[2].hasSuffix("· done yesterday"), lines[2])
+        XCTAssertTrue(lines[3].contains("[id=t_old]") && lines[3].hasSuffix("· done Mon 5 Jan"), lines[3])
+        XCTAssertFalse(r.contains("[id=t_open]"))
+        XCTAssertNil(doneWhenLabel(nil, today: TODAY))
+    }
+
     func testGetTasksViewsAreDistinctAndFiltersNarrow() async {
         seedViews()
         let later = await run("get_tasks", #"{"view":"later"}"#)

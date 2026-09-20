@@ -25,6 +25,7 @@
 // speak to James", anything else → "you asked me to ring about James".
 
 import Foundation
+import UnstuckCore
 
 enum CallScript {
     /// Tools live during a call: every voice tool the registry publishes, in
@@ -176,7 +177,14 @@ enum CallScript {
     /// tool's rules). Line 1 (the verbatim opening) and the "never claim an
     /// action without its tool result" rule hold for every kind; line 2 is
     /// the kind's own shape of conversation.
-    static func instructions(_ s: CallSession, now: Date = Date()) -> String {
+    /// `dayContext`: lines read from the local store as the call connects
+    /// (CallDayContext.lines) — what got done today, what is still open,
+    /// today's plan, tomorrow's first thing. Zubair's evening call
+    /// (2026-09-20 19:01): the model asked HIM what got done, answered "what
+    /// did we have today" from nothing, then read an undated all-time
+    /// completed list as "today". With the facts in the instructions the
+    /// answer needs no tool call the model might skip.
+    static func instructions(_ s: CallSession, now: Date = Date(), dayContext: [String] = []) -> String {
         var ctx: [String] = ["- kind: \(s.kind.rawValue)", "- label: \(s.label)"]
         if let t = s.taskId {
             ctx.append("- task: \(s.taskName ?? "(unnamed)") [id=\(t)]")
@@ -195,6 +203,7 @@ enum CallScript {
         if !s.captures.isEmpty {
             ctx.append("- recent captures on it: " + s.captures.map { "\"\($0)\"" }.joined(separator: ", "))
         }
+        for line in dayContext { ctx.append("- " + line) }
         let openingRule: String
         switch s.kind {
         case .requested:
@@ -208,7 +217,7 @@ enum CallScript {
         "\(opening(s, now: now))"
         2. \(conversationRule(s.kind)) You have every tool you have in Talk — reschedule, add tasks, tick things off, capture, share, plus update_call (changes this call's notes for later) and snooze_call ("call me back in ten" — say the minutes). Never claim an action happened without its tool result; if a tool errors, say so plainly.
         3. One or two sentences a turn, one question at a time, times the way people say them. When they're done, say bye — they hang up from the screen.
-        Call context:
+        Call context (read from the app as the call connected — answer \"what got done\" / \"what's on today\" from it; call get_schedule / get_tasks only for what it doesn't cover):
         \(ctx.joined(separator: "\n"))
         """
     }
@@ -232,11 +241,79 @@ enum CallScript {
         case .test:
             return "If they try something, do it for real through the tools (get_schedule / get_tasks answer \"what's on today\"); keep it light — this call proves the ring works."
         case .morning:
-            return "If they say yes, call get_schedule and read today back briefly (times the way people say them), then plan with them: move things with schedule_task / block_time, add what's missing with create_task, drop what won't happen with set_task_later or carry_to_tomorrow. Act ONLY through tools."
+            return "If they say yes, read today's plan from the call context below, briefly (times the way people say them) — call get_schedule only if the context has no plan — then plan with them: move things with schedule_task / block_time, add what's missing with create_task, drop what won't happen with set_task_later or carry_to_tomorrow. Act ONLY through tools."
         case .evening:
-            return "If they say yes, call get_tasks(view: completed) and say what got done today in a sentence, then ask what moves to tomorrow — carry_to_tomorrow ONLY when they ask for it, complete_task for anything they finished, add_capture for a loose thought. Act ONLY through tools."
+            return "If they say yes, say from the call context below what got done today and what is still open, in one sentence — NEVER ask them what got done, and call get_tasks(view: completed) only if the context has no such line — then ask what moves to tomorrow: carry_to_tomorrow ONLY when they ask for it, complete_task for anything they finished, add_capture for a loose thought. Act ONLY through tools."
         case .afterBlock:
             return "Listen, then settle it in one move: done → complete_task (or complete_occurrence for a recurring one); not now → skip_occurrence / set_task_later; needs another go → schedule_task or block_time for a new slot. Act ONLY through tools."
         }
+    }
+}
+
+
+// MARK: - CallDayContext
+
+/// The day's facts for a call, read from the local store as the call
+/// connects (pure; the launcher feeds it AppModel's tasks + blocks). Lines
+/// go into the call instructions' context, so "what got done today" and
+/// "what's on today" are answered from here, not from a tool call the model
+/// may skip — and never from an undated list.
+enum CallDayContext {
+    static let maxNames = 12
+
+    static func lines(kind: CallKind, tasks: [TaskItem], blocks: [CalBlock], today: String, nowHM: String,
+                      tz: TimeZone = .current) -> [String] {
+        var out: [String] = ["today: \(today) (\(weekdayName(today: today))), now \(nowHM)"]
+        let byId = Dictionary(tasks.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let todays = blocks.filter { $0.date == today }.sorted { $0.startTime < $1.startTime }
+        // The task's current name first (a block's copy can be stale after a rename).
+        func name(_ b: CalBlock) -> String { b.taskId.flatMap { byId[$0]?.name } ?? (b.taskName.isEmpty ? "?" : b.taskName) }
+        // Done today: tasks ticked today (by completedAt) + today's occurrence blocks ticked.
+        var done: [String] = []
+        for t in tasks where t.done && localDate(ofISO: t.completedAt, tz: tz) == today { done.append(t.name) }
+        for b in todays where b.done { done.append(name(b)) }
+        done = dedupe(done)
+        // Still open today: today's live blocks whose task isn't done.
+        let open = todays.filter { b in
+            guard !b.done, !b.skipped else { return false }
+            if let tid = b.taskId, let t = byId[tid], t.done { return false }
+            return true
+        }
+        let plan = todays.map { b -> String in
+            let taskDone = b.taskId.flatMap { byId[$0]?.done } ?? false
+            return "\(b.startTime) \(name(b))" + ((b.done || taskDone) ? " · done" : (b.skipped ? " · skipped" : ""))
+        }
+        let tomorrow = LocalDate.addDays(today, 1)
+        let firstTomorrow = blocks.filter { $0.date == tomorrow && !$0.done && !$0.skipped }.sorted { $0.startTime < $1.startTime }.first
+        func names(_ xs: [String]) -> String {
+            xs.count <= maxNames ? xs.joined(separator: ", ") : xs.prefix(maxNames).joined(separator: ", ") + " and \(xs.count - maxNames) more"
+        }
+        let doneLine = done.isEmpty ? "done today: nothing ticked off yet" : "done today (\(done.count)): \(names(done))"
+        let openLine = open.isEmpty ? "still open today: nothing" : "still open today (\(open.count)): " + names(open.map { "\(name($0)) (\($0.startTime))" })
+        let planLine = plan.isEmpty ? "today's plan: nothing scheduled" : "today's plan (\(plan.count)): " + plan.prefix(maxNames).joined(separator: "; ") + (plan.count > maxNames ? "; and \(plan.count - maxNames) more" : "")
+        let tomorrowLine = firstTomorrow.map { "tomorrow starts with: \(name($0)) at \($0.startTime)" } ?? "tomorrow: nothing scheduled yet"
+        switch kind {
+        case .evening: out += [doneLine, openLine, tomorrowLine]
+        case .morning: out += [planLine, doneLine]
+        case .afterBlock: out += [openLine, doneLine]
+        case .requested, .test: out += [planLine]
+        }
+        return out
+    }
+
+    /// 'YYYY-MM-DD' in `tz` for an ISO-8601 instant ("2026-09-20T08:10:00.000Z"); nil when unparseable.
+    static func localDate(ofISO iso: String?, tz: TimeZone) -> String? {
+        guard let iso, !iso.isEmpty else { return nil }
+        let f1 = ISO8601DateFormatter(); f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let f2 = ISO8601DateFormatter(); f2.formatOptions = [.withInternetDateTime]
+        guard let d = f1.date(from: iso) ?? f2.date(from: iso) else { return nil }
+        let df = DateFormatter(); df.locale = Locale(identifier: "en_US_POSIX"); df.timeZone = tz; df.dateFormat = "yyyy-MM-dd"
+        return df.string(from: d)
+    }
+
+    private static func dedupe(_ xs: [String]) -> [String] {
+        var seen = Set<String>(); var out: [String] = []
+        for x in xs where seen.insert(x.lowercased()).inserted { out.append(x) }
+        return out
     }
 }

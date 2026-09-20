@@ -11,7 +11,44 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (74) uploaded to TestFlight — the tiered echo verdict (your words are no longer deleted as "echo" after a reply ends) + the corrective forces the tool call. 2026-09-20.
 
+- Ship: 1.1.1 (75) uploaded to TestFlight — the three harness fixes from Zubair's evening call (the call is handed today's facts; the completed view is dated; a swallowed create is re-asked). The VOICE MODEL is now OpenAI gpt-realtime-2.1-mini via the proxy (no app change). 2026-09-20.
 
+
+
+
+## Where things stand (2026-09-20, late) — build 75: the model switched (proxy), three harness fixes
+
+**The verdict.** Ahmad asked "harness or model?". A scratchpad bake-off
+(`unstuck` scratchpad `bakeoff/run2.py`: the real voice prompt + all 70
+tools, text in, fake tool results, 14 scenarios × 2 × 3 models) settled it:
+qwen3.5-omni-flash-realtime 7/28 tool-first, 6 promises/claims with no tool,
+and the app's forced-tool corrective rescued it 0/6 (it answered the
+corrective with "Call booked … about integrity check" and once SPOKE a fake
+tool result); gpt-realtime-2.1-mini 23/26, 0 promises, 4/4 facts. The
+voice-proxy now relays to OpenAI's GA realtime API through a protocol
+adapter (`unstuck/workers/voice-proxy/src/openai-adapter.ts`): the iOS
+client is unchanged (16 kHz mic audio resampled to 24 kHz in the Worker,
+transcription switched on, events renamed back). Constraint: the OpenAI org
+is tier 1 — 40k TPM ≈ 4 replies a minute; each reply ~8.8k tokens (the tool
+schemas). `assistant_turns.model` shows the model that ran.
+
+**The harness fixes (this build), from Zubair's 19:01 evening call:**
+- `App/Calls/CallScript.swift` `CallDayContext` + `instructions(_:now:dayContext:)`
+  — the launcher (`Deps.dayContext`, `live()`) reads the local store as the
+  call connects and puts "done today", "still open today", "today's plan",
+  "tomorrow starts with" into the call context; the evening rule says NEVER
+  ask them what got done; the morning rule reads the plan from the context.
+  Completion day is the LOCAL day of `completedAt`.
+- `App/Features/AssistantTools+Surface.swift` — `get_tasks(view: completed)`
+  is newest first and every line says when: "done today / yesterday /
+  Fri 19 Sep" (`doneWhenLabel`). The model read an undated all-time list as
+  "today".
+- `App/Voice/BargeIn.swift` — a `response.create` keeps the turn PENDING
+  until `response.created` (`createSentAt`, 3 s grace): a create the server
+  swallows is re-asked when the active reply finishes (also when the server
+  ignored our cancel and the reply completed) or after the grace. His late
+  "Yes." got 20 s of silence.
+- Tests: CallScriptTests +3, AssistantToolsTests +1, BargeInTests 25a–c.
 
 ## Where things stand (2026-09-20, night) — build 74: the echo verdict narrowed, the corrective forces the tool
 

@@ -106,6 +106,10 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
         /// VoiceAudioEngine(.callKit) in production). nil ⇒ voice unavailable.
         var makeSession: (CallVoiceSessionConfig) -> CallRealtimeSession?
         var now: () -> Date
+        /// CallDayContext.lines over the live store — what got done today,
+        /// what's open, today's plan — for the call instructions. Default:
+        /// nothing (tests; a store that isn't ready).
+        var dayContext: (CallKind) -> [String] = { _ in [] }
     }
 
     /// Fallback B: the call session Talk should open with. Observable so the
@@ -177,7 +181,7 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
     func talkConfiguration(for session: CallSession) -> CallVoiceSessionConfig? {
         guard let deps else { return nil }
         let comp = Self.compose(session: session, baseInstructions: deps.voiceInstructions(),
-                                voiceTools: deps.voiceTools(), now: deps.now())
+                                voiceTools: deps.voiceTools(), now: deps.now(), dayContext: deps.dayContext(session.kind))
         return CallVoiceSessionConfig(
             session: session, instructions: comp.instructions, opening: comp.opening,
             primer: comp.primer, tools: comp.tools,
@@ -199,10 +203,10 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
     /// instructions = base + call script; opening = CallScript.opening; primer
     /// wraps the opening; tools = call tools only (+ snooze_call).
     static func compose(session: CallSession, baseInstructions: String, voiceTools: [[String: Any]],
-                        now: Date = Date()) -> Composition {
+                        now: Date = Date(), dayContext: [String] = []) -> Composition {
         let opening = CallScript.opening(session, now: now)
         return Composition(
-            instructions: baseInstructions + "\n\n" + CallScript.instructions(session, now: now),
+            instructions: baseInstructions + "\n\n" + CallScript.instructions(session, now: now, dayContext: dayContext),
             opening: opening,
             primer: primer(opening: opening),
             tools: callToolSchemas(from: voiceTools))
@@ -271,7 +275,7 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
 
     private func makeConfig(_ session: CallSession, deps: Deps, generation gen: Int) -> CallVoiceSessionConfig {
         let comp = Self.compose(session: session, baseInstructions: deps.voiceInstructions(),
-                                voiceTools: deps.voiceTools(), now: deps.now())
+                                voiceTools: deps.voiceTools(), now: deps.now(), dayContext: deps.dayContext(session.kind))
         return CallVoiceSessionConfig(
             session: session, instructions: comp.instructions, opening: comp.opening,
             primer: comp.primer, tools: comp.tools,
@@ -384,7 +388,13 @@ extension RealtimeCallVoiceLauncher.Deps {
                 audio.onCaptureError = { ended("microphone unavailable") }
                 return client
             },
-            now: { Date() })
+            now: { Date() },
+            dayContext: { [weak model] kind in
+                guard let model else { return [] }
+                let tasks = (try? model.taskRepo?.all()) ?? []
+                let blocks = (try? model.db?.fetchAllCalBlocks()) ?? []
+                return CallDayContext.lines(kind: kind, tasks: tasks, blocks: blocks, today: Clock.todayISO(), nowHM: localNowHM())
+            })
     }
 }
 

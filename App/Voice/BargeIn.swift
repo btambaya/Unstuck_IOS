@@ -287,6 +287,15 @@ struct BargeInController: Sendable {
     /// breath as a `response.cancel` drops the connection (measured 2026-09-19).
     private var pendingTurnSince: TimeInterval?
     var pendingCreate: Bool { pendingTurnSince != nil }
+    /// When our last `response.create` for the pending turn went out, until
+    /// its response.created arrives. The turn stays PENDING meanwhile: a
+    /// create the server swallowed (Zubair's call, 2026-09-20 18:02 — a cancel
+    /// went unanswered, the 2.5 s fallback create produced nothing, the
+    /// muted reply completed, and his "Yes." was never answered: 20 s of
+    /// silence) is re-asked when the active reply finishes or after the
+    /// grace; a slow one is told apart from it only by time.
+    private(set) var createSentAt: TimeInterval?
+    static let createGraceSec: TimeInterval = 3
     /// A pause mid-sentence ends a VAD segment (600 ms of silence) and the
     /// fragment was answered on its own; the continuation then cancelled that
     /// reply and got its own — "it kept tripping itself" on long questions
@@ -405,7 +414,11 @@ struct BargeInController: Sendable {
             responseActive = true
             activeResponseId = id
             muted = false
-            pendingTurnSince = nil
+            // The turn this create was for is being answered. A turn taken
+            // AFTER the create went out (they spoke again while it was in
+            // flight) stays pending and is asked once this reply is done.
+            if let since = pendingTurnSince, let sent = createSentAt, since > sent { /* keep it */ } else { pendingTurnSince = nil }
+            createSentAt = nil
             // A new reply: the one before it is now the "previous" reference.
             spokenPrevious = spokenCurrent
             spokenCurrent = []
@@ -426,6 +439,10 @@ struct BargeInController: Sendable {
             // reply that has already started.
             if let id, let active = activeResponseId, id != active { break }
             responseActive = false
+            // Any create we sent while this reply was active is dead with it
+            // (the server never queues one): re-ask below if a turn is pending —
+            // also when the server ignored our cancel and the reply completed.
+            createSentAt = nil
             if pendingCreate {
                 // The reply we cancelled is finished server-side: the user's
                 // turn can be asked for once its hold is up and they are quiet.
@@ -624,6 +641,7 @@ struct BargeInController: Sendable {
             // server and we disagree about what's generating — resync, never
             // an error state.
             responseActive = false
+            createSentAt = nil
             switch state {
             case .ducked:
                 out.append(.restore)
@@ -704,7 +722,13 @@ struct BargeInController: Sendable {
         } else {
             guard elapsed >= Self.turnHoldMs, !serverSpeaking else { return [] }
         }
-        pendingTurnSince = nil
+        if let sent = createSentAt, now - sent < Self.createGraceSec {
+            // Our create is in flight: wait the grace out, then ask again if
+            // nothing was created. The turn stays pending until response.created.
+            let left = Int(((Self.createGraceSec - (now - sent)) * 1000).rounded()) + 1
+            return [.startConfirmTimer(ms: left)]
+        }
+        createSentAt = now
         return [.createResponse, .uiState(.thinking)]
     }
 

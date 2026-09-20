@@ -138,8 +138,9 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(c.pendingCreate)
         XCTAssertEqual(core(c.handle(.responseDone(id: "r1", status: "cancelled"), now: 2.7)), [.startConfirmTimer(ms: 500)], "settled, but the hold is not up")
         XCTAssertEqual(core(c.handle(.tick, now: 3.0)), [.createResponse, .uiState(.thinking)])
-        XCTAssertFalse(c.pendingCreate)
+        XCTAssertTrue(c.pendingCreate, "asked for; pending until the server creates (2026-09-20)")
         _ = c.handle(.responseCreated(id: "r2"), now: 3.2)
+        XCTAssertFalse(c.pendingCreate)
         XCTAssertTrue(c.shouldEnqueueAudio(id: "r2"))
     }
 
@@ -688,8 +689,9 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.responseDone(id: "r1", status: "cancelled"), now: 1.9)
         XCTAssertTrue(c.pendingCreate, "settled, but held")
         XCTAssertEqual(core(c.handle(.tick, now: 2.2)), [.createResponse, .uiState(.thinking)])
-        XCTAssertFalse(c.pendingCreate)
+        XCTAssertTrue(c.pendingCreate, "asked for; pending until the server creates")
         _ = c.handle(.responseCreated(id: "r3"), now: 2.2)
+        XCTAssertFalse(c.pendingCreate)
         XCTAssertTrue(c.shouldEnqueueAudio(id: "r3"))
     }
 
@@ -926,7 +928,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(c.pendingCreate)
         XCTAssertEqual(core(c.handle(.responseDone(id: "r1", status: "cancelled"), now: 2.2)), [.startConfirmTimer(ms: 500)], "settled 300 ms in: held")
         XCTAssertEqual(core(c.handle(.tick, now: 2.5)), [.createResponse, .uiState(.thinking)])
-        XCTAssertFalse(c.pendingCreate)
+        XCTAssertTrue(c.pendingCreate, "asked for; pending until the server creates")
         XCTAssertFalse(c.responseActive)
         _ = c.handle(.responseCreated(id: "r2"), now: 2.7)
         XCTAssertTrue(c.shouldEnqueueAudio(id: "r2"))
@@ -942,7 +944,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(core(c.handle(.tick, now: 2.5)), [], "not yet")
         XCTAssertEqual(core(c.handle(.tick, now: 3.4)), [], "1.5 s: a done took 1.9 s once, with a tool call in flight")
         XCTAssertEqual(core(c.handle(.tick, now: 4.4)), [.createResponse, .uiState(.thinking)])
-        XCTAssertFalse(c.pendingCreate)
+        XCTAssertTrue(c.pendingCreate, "asked for; pending until the server creates")
         XCTAssertFalse(c.responseActive)
         // "no active response" to our cancel = it had already finished: ask now.
         var e = speaking(.speaker)
@@ -951,7 +953,7 @@ final class BargeInTests: XCTestCase {
         _ = e.handle(.transcription(text: "no, book the dentist instead", itemId: "u", final: true), now: 1.9)
         XCTAssertEqual(core(e.handle(.benignActiveResponseError, now: 2.0)), [.startConfirmTimer(ms: 500)], "nothing to wait for but the hold")
         XCTAssertEqual(core(e.handle(.tick, now: 2.5)), [.createResponse, .uiState(.thinking)])
-        XCTAssertFalse(e.pendingCreate)
+        XCTAssertTrue(e.pendingCreate, "asked for; pending until the server creates")
         // Interrupt pressed while an ask is pending: the user wants silence.
         var i = speaking(.speaker)
         _ = i.handle(.speechStarted(itemId: "u"), now: 1.0)
@@ -974,7 +976,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(out.contains(.startConfirmTimer(ms: 500)), "no done to wait for — only the hold")
         XCTAssertFalse(out.contains(.startConfirmTimer(ms: 2500)))
         XCTAssertEqual(core(c.handle(.tick, now: 2.5)), [.createResponse, .uiState(.thinking)])
-        XCTAssertFalse(c.pendingCreate)
+        XCTAssertTrue(c.pendingCreate, "asked for; pending until the server creates")
         XCTAssertEqual(c.cancelledResponseId, "r1", "late audio for the flushed tail stays dropped")
     }
 
@@ -1349,6 +1351,59 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(g.pendingDeletes, ["b"])
     }
 
+    // MARK: 25 — a create the server swallowed (Zubair's call, 2026-09-20
+    // 18:02: a cancel went unanswered, the fallback create produced nothing,
+    // the muted reply completed, his "Yes." was never answered — 20 s of
+    // silence). The turn now stays pending until response.created.
+
+    func test25a_theTurnStaysPendingUntilTheServerCreates() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = c.handle(.speechStopped, now: 1.0)
+        _ = c.handle(.transcription(text: "what's on today", itemId: "u", final: true), now: 1.2)
+        XCTAssertEqual(core(c.handle(.tick, now: 1.8)), [.createResponse, .uiState(.thinking)])
+        XCTAssertTrue(c.pendingCreate, "asked for, not yet created")
+        XCTAssertEqual(c.createSentAt, 1.8)
+        XCTAssertEqual(core(c.handle(.tick, now: 2.5)), [.startConfirmTimer(ms: 2301)], "in flight: no second create, a timer for the rest of the grace")
+        _ = c.handle(.responseCreated(id: "r1"), now: 2.6)
+        XCTAssertFalse(c.pendingCreate)
+        XCTAssertNil(c.createSentAt)
+        XCTAssertEqual(core(c.handle(.tick, now: 5.0)), [], "nothing pending once created")
+    }
+
+    func test25b_aSwallowedFallbackCreateIsReaskedWhenTheActiveReplyFinishes() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)                 // the results reply: thinking, no audio yet
+        _ = c.handle(.speechStarted(itemId: "y"), now: 0.4)
+        _ = c.handle(.speechStopped, now: 0.9)
+        let turn = core(c.handle(.transcription(text: "Yes.", itemId: "y", final: true), now: 1.0))
+        XCTAssertEqual(count(turn, .sendCancel), 1)
+        XCTAssertTrue(c.pendingCreate)
+        XCTAssertEqual(core(c.handle(.tick, now: 1.5)), [], "waiting for the cancelled done")
+        XCTAssertEqual(core(c.handle(.tick, now: 3.6)), [.createResponse, .uiState(.thinking)], "no done, no error: the 2.5 s fallback asks")
+        XCTAssertTrue(c.pendingCreate, "still pending: nothing was created")
+        // The server swallowed the create AND the cancel: the reply completes, muted.
+        XCTAssertEqual(core(c.handle(.responseDone(id: "r1", status: "completed"), now: 4.0)), [.createResponse, .uiState(.thinking)], "re-asked at once — hold long up, server quiet")
+        _ = c.handle(.responseCreated(id: "r2"), now: 4.5)
+        XCTAssertFalse(c.pendingCreate)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r2"), "the answer to \"Yes.\" plays")
+    }
+
+    func test25c_aCreateSwallowedWhileIdleIsResentAfterTheGrace() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = c.handle(.speechStopped, now: 1.0)
+        _ = c.handle(.transcription(text: "what's on today", itemId: "u", final: true), now: 1.2)
+        XCTAssertEqual(core(c.handle(.tick, now: 1.8)), [.createResponse, .uiState(.thinking)])
+        XCTAssertEqual(core(c.handle(.tick, now: 2.0)), [.startConfirmTimer(ms: 2801)])
+        XCTAssertEqual(core(c.handle(.tick, now: 4.9)), [.createResponse, .uiState(.thinking)], "nothing came in 3 s: ask again")
+        // "Already has an active response" to that re-send: the mark clears and
+        // the turn is asked for again once the hold is up.
+        let complaint = core(c.handle(.benignActiveResponseError, now: 5.0))
+        XCTAssertTrue(complaint.contains(.createResponse), "re-asked at once: \(complaint)")
+        XCTAssertEqual(c.createSentAt, 5.0, "a fresh create in flight")
+    }
+
     func test23c_theLiveGuessOfAnEchoNeverCuts() {
         var c = speaking(.speaker)
         said(&c, "Looks pretty solid. You've got a few tasks wrapped up.")
@@ -1404,8 +1459,8 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(rest, [.userTurn("you know, that I normally do in a week."), .startConfirmTimer(ms: 500), .uiState(.thinking)])
         XCTAssertEqual(core(c.handle(.tick, now: 3.5)), [], "300 ms after the second piece")
         XCTAssertEqual(core(c.handle(.tick, now: 3.7)), [.createResponse, .uiState(.thinking)], "one ask, for both pieces")
-        XCTAssertFalse(c.pendingCreate)
-        XCTAssertEqual(core(c.handle(.tick, now: 4.0)), [], "never twice")
+        XCTAssertTrue(c.pendingCreate, "asked for; pending until the server creates")
+        XCTAssertFalse(core(c.handle(.tick, now: 4.0)).contains(.createResponse), "never twice — in flight, only the grace timer")
         // A segment that ends WITHOUT a transcript still lets the ask through.
         var d = BargeInController(profile: .speaker)
         _ = d.handle(.speechStarted(itemId: "g1"), now: 0)

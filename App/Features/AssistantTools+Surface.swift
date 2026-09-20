@@ -75,6 +75,11 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         var rows = visibleTasks(view: view, tasks: tasks, blocks: blocks, now: Date().timeIntervalSince1970 * 1000,
                                 activeArea: area, activeTag: nil, slipMode: v == "slipping")
         if let tag { rows = rows.filter { ($0.tags ?? []).contains { $0.lowercased() == tag } } }
+        // The completed view is DATED and newest first: an undated all-time
+        // list was read back as "today" (Zubair's evening call, 2026-09-20 —
+        // "you completed quite a bit today: … Hike, Abba Barde", weeks old).
+        let today = api.todayIso()
+        if view == .completed { rows.sort { ($0.completedAt ?? "") > ($1.completedAt ?? "") } }
         let lines = rows.prefix(30).map { t -> String in
             // Recurring rows are OCCURRENCES: their id is the block id, the
             // real task id is templateId — the model must get the task id.
@@ -87,10 +92,14 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             if occ != nil { line += " · repeats" }
             if t.later == true { line += " · Later" }
             if (t.moveCount ?? 0) >= 3 { line += " · slipped \(t.moveCount ?? 0)×" }
-            if t.done { line += " · done" }
+            if t.done {
+                let stamp = t.completedAt ?? occ?.completedAt
+                line += " · done" + (doneWhenLabel(stamp, today: today).map { " \($0)" } ?? "")
+            }
             return line
         }
-        return "ok: \(view.rawValue) (\(rows.count))\(rows.count > 30 ? ", first 30" : ""):\n\(lines.isEmpty ? "(none)" : lines.joined(separator: "\n"))"
+        let order = view == .completed && rows.count > 1 ? ", newest first" : ""
+        return "ok: \(view.rawValue) (\(rows.count))\(order)\(rows.count > 30 ? ", first 30" : ""):\n\(lines.isEmpty ? "(none)" : lines.joined(separator: "\n"))"
 
     case "set_task_reminder":
         // Per-task lead override (NotificationPrefs.setReminderOverride + a
@@ -631,4 +640,17 @@ enum AssistantScreens {
     ]
     /// Registry names + the web's aliases (dashboard/home, analytics, collections, inbox).
     static let known: Set<String> = Set(registry).union(["dashboard", "home", "analytics", "collections", "inbox"])
+}
+
+
+/// "today" / "yesterday" / "Fri 19 Sep" for a completion instant, in the
+/// device's zone against the app's local `today`; nil when there is no stamp.
+func doneWhenLabel(_ completedAt: String?, today: String, tz: TimeZone = .current) -> String? {
+    guard let day = CallDayContext.localDate(ofISO: completedAt, tz: tz) else { return nil }
+    if day == today { return "today" }
+    if day == LocalDate.addDays(today, -1) { return "yesterday" }
+    let inF = DateFormatter(); inF.locale = Locale(identifier: "en_US_POSIX"); inF.timeZone = tz; inF.dateFormat = "yyyy-MM-dd"
+    guard let d = inF.date(from: day) else { return day }
+    let outF = DateFormatter(); outF.locale = Locale(identifier: "en_US_POSIX"); outF.timeZone = tz; outF.dateFormat = "EEE d MMM"
+    return outF.string(from: d)
 }
