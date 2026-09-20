@@ -844,9 +844,12 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(BargeInController.tokens("I'm doing well."), ["im", "doing", "well"])
     }
 
-    func test19c_theReplysTailEchoingAfterTheQueueDrainedIsStillEcho() {
+    func test19c_theReplysWordsAfterTheQueueDrainedAreTheUsers() {
         // 22:39:35.645 drained; 35.680 a segment began; it transcribed as the
-        // reply's last words.
+        // reply's last words — before echo cancellation came back (build 69).
+        // Since then no tail echo has reached the transcriber, and the user's
+        // answers in that window were being deleted ("Have you set up the
+        // call?", 2026-09-20 15:36): after the drain the words are theirs.
         var c = BargeInController(profile: .speaker)
         _ = c.handle(.responseCreated(id: "r1"), now: 0)
         _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
@@ -856,9 +859,9 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.speechStarted(itemId: "tail"), now: 3.03)          // 30 ms after drain
         _ = c.handle(.speechStopped, now: 3.8)
         let out = core(c.handle(.transcription(text: "Want to block something?", itemId: "tail", final: true), now: 3.9))
-        XCTAssertEqual(out, [], "the tail is echo, not a question from the user")
-        XCTAssertEqual(c.pendingDeletes, ["tail"], "held until the next segment starts")
-        XCTAssertFalse(c.pendingCreate)
+        XCTAssertEqual(out, [.userTurn("Want to block something?"), .startConfirmTimer(ms: 500), .uiState(.thinking)], "after the drain: a turn, never judged by its words")
+        XCTAssertEqual(c.pendingDeletes, [])
+        XCTAssertTrue(c.pendingCreate)
         // Well after the grace window, the same words from the user are a turn.
         var d = BargeInController(profile: .speaker)
         _ = d.handle(.responseCreated(id: "r1"), now: 0)
@@ -1088,7 +1091,8 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.speechStopped, now: 3.2)
         XCTAssertEqual(core(c.handle(.transcription(text: "Tuesday morning", itemId: "f", final: true), now: 3.4)),
                        [.userTurn("Tuesday morning"), .startConfirmTimer(ms: 500), .uiState(.thinking)], "1 of 2 content words in the grace window is not echo")
-        // The tail itself, in the grace window, is.
+        // Even the tail itself, in the grace window, is theirs now (2026-09-20:
+        // echo cancellation removes it; the user's short answers were dying).
         var t = BargeInController(profile: .speaker)
         _ = t.handle(.responseCreated(id: "r1"), now: 0)
         _ = t.handle(.audioDelta(id: "r1"), now: 0.1)
@@ -1096,8 +1100,9 @@ final class BargeInTests: XCTestCase {
         _ = t.handle(.responseDone(id: "r1", status: "completed"), now: 1)
         _ = t.handle(.playbackDrained, now: 2)
         _ = t.handle(.speechStarted(itemId: "tail"), now: 2.05)
-        XCTAssertEqual(core(t.handle(.transcription(text: "wide open.", itemId: "tail", final: true), now: 2.9)), [])
-        XCTAssertEqual(t.pendingDeletes, ["tail"], "held until the next segment starts")
+        XCTAssertEqual(core(t.handle(.transcription(text: "wide open.", itemId: "tail", final: true), now: 2.9)),
+                       [.userTurn("wide open."), .startConfirmTimer(ms: 500), .uiState(.thinking)])
+        XCTAssertEqual(t.pendingDeletes, [])
         // The same follow-up while that reply's audio was still on air would be echo.
         var d = speaking(.speaker)
         said(&d, "Tuesday's wide open.")
@@ -1208,20 +1213,27 @@ final class BargeInTests: XCTestCase {
                        [.userTurn("book the dentist"), .startConfirmTimer(ms: 500), .uiState(.thinking)])
     }
 
-    func test22d_aFlushStartsTheEchoGraceWindow() {
+    func test22d_wordsAfterAFlushAreTheUsersAndRideWithTheirAsk() {
+        // Before echo cancellation came back, the flushed audio's last words
+        // came back through the mic 90 ms after a flush ("And Friday.",
+        // device log 2026-09-20 00:04:43). Since build 69 nothing after the
+        // drain is judged by its words: a segment there is the user's, it
+        // never cancels twice, and the one pending ask covers it.
         var c = speaking(.speaker)
         said(&c, "Looks pretty solid. Friday's coming up.")
         _ = c.handle(.speechStarted(itemId: "q"), now: 1.0)
         let cut = core(c.handle(.transcription(text: "What about Monday?", itemId: "q", final: true), now: 1.9))
         XCTAssertTrue(cut.contains(.flushPlayback))
         XCTAssertTrue(c.pendingCreate)
-        // 90 ms later the flushed audio's last words come back through the mic.
         _ = c.handle(.speechStarted(itemId: "e"), now: 1.99)
         _ = c.handle(.speechStopped, now: 2.7)
-        XCTAssertEqual(core(c.handle(.transcription(text: "And Friday.", itemId: "e", final: true), now: 2.8)), [], "echo of the flushed tail: no second cancel, no second ask")
-        XCTAssertEqual(c.pendingDeletes, ["e"])
-        XCTAssertTrue(c.pendingCreate, "the user's ask is still the one waiting")
-        XCTAssertEqual(core(c.handle(.responseDone(id: "r1", status: "cancelled"), now: 3.0)), [.createResponse, .uiState(.thinking)], "hold up, server quiet, cancel settled")
+        let more = core(c.handle(.transcription(text: "And Friday.", itemId: "e", final: true), now: 2.8))
+        XCTAssertTrue(more.contains(.userTurn("And Friday.")))
+        XCTAssertEqual(count(more, .sendCancel), 0, "the reply is already cancelled — never twice")
+        XCTAssertEqual(c.pendingDeletes, [])
+        XCTAssertTrue(c.pendingCreate, "one ask, held from their last words")
+        XCTAssertEqual(core(c.handle(.responseDone(id: "r1", status: "cancelled"), now: 3.0)), [.startConfirmTimer(ms: 500)], "cancel settled; the hold since 2.8 is not up")
+        XCTAssertEqual(core(c.handle(.tick, now: 3.4)), [.createResponse, .uiState(.thinking)])
     }
 
     func test22e_noWordsFirstThenWordsForTheSameItemIsATurn() {
@@ -1272,6 +1284,69 @@ final class BargeInTests: XCTestCase {
         XCTAssertTrue(c.pendingCreate)
         XCTAssertEqual(count(core(c.handle(.responseDone(id: "r1", status: "cancelled"), now: 4.9)), .createResponse), 0, "held")
         XCTAssertEqual(count(core(c.handle(.tick, now: 5.2)), .createResponse), 1)
+    }
+
+    // MARK: 24 — Ahmad's call-booking session, 2026-09-20 15:21–15:37
+    // (assistant_turns): three real utterances deleted as echo of the question
+    // they answered, zero true echoes caught since echo cancellation came back.
+    // The verdict now: only a segment that began ON AIR is judged by its
+    // words; four words or more must be verbatim; after the drain it is theirs.
+
+    func test24a_answeringOverTheReplyInItsOwnWordsIsTheUsersTurn() {
+        var c = speaking(.speaker)
+        said(&c, "I can't set a reminder without a call being booked first. Shall I schedule a task to remind you, or would you like me to book a quick call now?")
+        _ = c.handle(.speechStarted(itemId: "u"), now: 1.0)               // on air
+        _ = c.handle(.speechStopped, now: 2.2)
+        let out = core(c.handle(.transcription(text: "Book the cool call now.", itemId: "u", final: true), now: 2.4))
+        XCTAssertTrue(out.contains(.userTurn("Book the cool call now.")), "3 of 4 content words, but 5 words with one the model never said: theirs")
+        XCTAssertEqual(count(out, .sendCancel), 1, "their words stop the reply")
+        XCTAssertFalse(out.contains(.deleteItem(id: "u")))
+        XCTAssertEqual(c.pendingDeletes, [])
+    }
+
+    func test24b_aQuestionRightAfterTheReplyEndsIsNeverEcho() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&c, "Got it, I'll set that up now. What's the call about?")
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1.5)
+        _ = c.handle(.playbackDrained, now: 3.0)
+        _ = c.handle(.speechStarted(itemId: "q"), now: 3.3)               // in the grace: both content words are the reply's
+        _ = c.handle(.speechStopped, now: 4.6)
+        XCTAssertEqual(core(c.handle(.transcription(text: "Have you set up the call?", itemId: "q", final: true), now: 4.8)),
+                       [.userTurn("Have you set up the call?"), .startConfirmTimer(ms: 500), .uiState(.thinking)])
+        XCTAssertEqual(c.pendingDeletes, [])
+        // The test call's opening, answered with the one word it ended on.
+        var d = BargeInController(profile: .speaker)
+        _ = d.handle(.responseCreated(id: "r1"), now: 0)
+        _ = d.handle(.audioDelta(id: "r1"), now: 0.1)
+        said(&d, "Hi — this is your test call from Unstuck. Everything works. Want to try something — ask me what's on today?")
+        _ = d.handle(.responseDone(id: "r1", status: "completed"), now: 2)
+        _ = d.handle(.playbackDrained, now: 7)
+        _ = d.handle(.speechStarted(itemId: "w"), now: 7.6)
+        _ = d.handle(.speechStopped, now: 8.4)
+        XCTAssertEqual(core(d.handle(.transcription(text: "What is today?", itemId: "w", final: true), now: 8.6)),
+                       [.userTurn("What is today?"), .startConfirmTimer(ms: 500), .uiState(.thinking)])
+    }
+
+    func test24c_fourWordsOrMoreOnAirAreEchoOnlyWhenVerbatim() {
+        var c = speaking(.speaker)
+        said(&c, "You've got a few tasks wrapped up, and Friday coming up.")
+        _ = c.handle(.speechStarted(itemId: "e"), now: 1.0)
+        XCTAssertEqual(core(c.handle(.transcription(text: "Coming up on Friday", itemId: "e", final: true), now: 1.9)), [], "every word the model's: echo")
+        XCTAssertEqual(c.pendingDeletes, ["e"])
+        var d = speaking(.speaker)
+        said(&d, "You've got a few tasks wrapped up, and Friday coming up.")
+        _ = d.handle(.speechStarted(itemId: "u"), now: 1.0)
+        let out = core(d.handle(.transcription(text: "Coming up on Sunday", itemId: "u", final: true), now: 1.9))
+        XCTAssertTrue(out.contains(.userTurn("Coming up on Sunday")), "one word the model never said: theirs")
+        XCTAssertEqual(count(out, .sendCancel), 1)
+        // Three words or fewer keep the content-word scoring: a garble is echo.
+        var g = speaking(.speaker)
+        said(&g, "Saturday's clear.")
+        _ = g.handle(.speechStarted(itemId: "b"), now: 1.0)
+        XCTAssertEqual(core(g.handle(.transcription(text: "Saturday's players.", itemId: "b", final: true), now: 1.9)), [])
+        XCTAssertEqual(g.pendingDeletes, ["b"])
     }
 
     func test23c_theLiveGuessOfAnEchoNeverCuts() {

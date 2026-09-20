@@ -9,6 +9,44 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (73) uploaded to TestFlight — a promised action is a claim + the voice CALLS rule (see the entry below). 2026-09-20.
 
+- Ship: 1.1.1 (74) uploaded to TestFlight — the tiered echo verdict (your words are no longer deleted as "echo" after a reply ends) + the corrective forces the tool call. 2026-09-20.
+
+
+
+## Where things stand (2026-09-20, night) — build 74: the echo verdict narrowed, the corrective forces the tool
+
+Ahmad's 15:21–15:37 Talk session read from `assistant_turns`: three real
+utterances deleted as echo of the question they answered ("Have you set up
+the call?" and "What is today?" right after a reply ended; "Book the cool
+call now." over "…book a quick call now?" at 3 of 4 content words). The first
+left the session silent (a held delete never reaches the log) and he
+restarted Talk, losing the context. Since AEC came back (build 69) the log
+shows zero true echoes across 7 sessions / 23 replies. Ahmad's steer: the
+solution that cannot make the experience worse — so tiered, not off.
+
+- `App/Voice/BargeIn.swift` — a completed transcript is judged by its words
+  ONLY when its segment began while the reply's audio was on air (or is a
+  later piece of an echo-judged segment); after the drain the words are the
+  user's. On air, four words or more are echo only when every CONTENT word is
+  one the model said and at most one filler is not (`echoVerbatimFrom`; the
+  transcriber slips a filler into an echo — "Coming up on Friday" — but the
+  user's framing adds more — "HAVE YOU set up the call?"); three or fewer
+  keep the content-word scoring (the hedge for "Saturday's players"). The live-guess early cut is
+  unchanged. Tests 19c / 21c / 22d flipped (they pinned pre-AEC device logs),
+  24a–c added (the three utterances + the verbatim boundary).
+- `App/Voice/VoiceRealtimeClient.swift` — the integrity corrective's
+  `response.create` carries `response.tool_choice = required` (measured
+  honoured by DashScope; spoken-only, the model answered the corrective with
+  another promise and the same question, twice). New corrective text
+  (verbatim on web + Android): act now with sensible defaults, never re-ask.
+- Backend (web repo, dfffefa): the voice-proxy logs the turn-taking as
+  `assistant_turns` role `event` (client creates/cancels, response.created,
+  non-completed dones, socket closes, the primer removal) — migration 073.
+  The two "same reply twice, 1.5 s apart" replies of that session are still
+  unexplained (not the guard, not the server); the next one will show.
+- Same change on web (`lib/voice/bargein.ts`, `realtime-client.ts`) and
+  Android (`BargeIn.kt`, `VoiceRealtimeClient.kt`); contract
+  `unstuck/docs/voice-turn-taking.md` §3–5 updated.
 
 ## Where things stand (2026-09-20, evening) — build 73: a promised action is a claim; the voice prompt gets the CALLS rule
 

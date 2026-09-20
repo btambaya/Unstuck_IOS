@@ -97,7 +97,13 @@ struct VoiceIntegrityGuard: Sendable {
     var correctionsLeft = 3
 
     /// The corrective injected as a hidden user item (verbatim from the web).
-    static let correctiveText = "(integrity check from the app, not the user: you claimed an action or said you would note something, but no tool ran — nothing actually happened. If it is still needed, call the right tool NOW, then say in a few words what you did (e.g. \"Added it now\") — no apology, no explanation. Never claim an action without its tool call.)"
+    static let correctiveText = "(integrity check from the app, not the user: you said you did or would do something, but no tool ran — nothing happened. Call the right tool NOW, with sensible defaults for anything you were not told (a call label can be a few words, a call time is context.now plus what they said); do not ask again what you already asked. Then say in a few words what the result was — no apology, no explanation.)"
+    /// The corrective's response is created with `tool_choice: required`: the
+    /// model MUST call a tool in it. Spoken, the corrective was answered with
+    /// another promise and the same question ("I'll book the call now. What
+    /// time should it be?" twice, 2026-09-20 15:37); forced, the same turn
+    /// booked the call (measured against DashScope, probe_dup.py P1).
+    static let correctiveResponse: [String: String] = ["tool_choice": "required"]
 
     mutating func responseCreated() {
         transcript = ""
@@ -749,7 +755,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         send(["type": "conversation.item.create",
               "item": ["type": "message", "role": "user",
                        "content": [["type": "input_text", "text": VoiceIntegrityGuard.correctiveText]]]])
-        send(["type": "response.create"])
+        send(["type": "response.create", "response": VoiceIntegrityGuard.correctiveResponse])
     }
 
     private func handleToolCall(name: String?, callId: String?, arguments: String?) {

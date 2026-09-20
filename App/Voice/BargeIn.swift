@@ -340,6 +340,9 @@ struct BargeInController: Sendable {
     /// segment starting inside this window counts as begun on air.
     private var lastDrained: (id: String?, at: TimeInterval)?
     static let drainEchoGraceSec: TimeInterval = 1.5
+    /// From this many words an on-air utterance is echo only when verbatim
+    /// (see `isEcho`); shorter ones are scored by their content words.
+    static let echoVerbatimFrom = 4
     /// For the device log: the last echo decision, as hits/heard/reference.
     private(set) var lastEchoScore: (hits: Int, heard: Int, spoken: Int) = (0, 0, 0)
 
@@ -549,9 +552,16 @@ struct BargeInController: Sendable {
             var notATurn = tokens.isEmpty                       // a cough, "um", "…", an echo heard as Chinese
             if !notATurn, segment.echoJudged, tokens.count < 3 {
                 notATurn = true                                 // a later piece of the echo already judged
-            } else if !notATurn, segment.echoPossible || segment.echoJudged {
+            } else if !notATurn, segment.onAir || segment.echoJudged {
+                // Judged by its words only when it began while the reply's
+                // audio was ON AIR. After the drain the words are the user's:
+                // with echo cancellation on (build 69) no tail echo has
+                // reached the transcriber, and that window is exactly when
+                // they answer — "Have you set up the call?", "What is
+                // today?" were deleted as echo of the question they answered
+                // (assistant_turns, 2026-09-20 15:21 / 15:36).
                 lastEchoScore = score(tokens)
-                notATurn = isEcho(tokens, onAir: segment.onAir)  // the model's own words, back through the mic
+                notATurn = isEcho(tokens, onAir: true)          // the model's own words, back through the mic
             }
             if notATurn {
                 if !tokens.isEmpty { segments[index].echoJudged = true }
@@ -820,6 +830,18 @@ struct BargeInController: Sendable {
     /// open") stays a turn: 60 %. Filler-only utterances: 70 % of all words.
     func isEcho(_ heard: [String], onAir: Bool = true) -> Bool {
         guard !heard.isEmpty, !spokenSet.isEmpty else { return false }
+        // Four words or more: echo only when every CONTENT word is one the
+        // model said and at most one filler is not (the transcriber slips a
+        // filler into an echo — "Coming up on Friday" for "Friday coming up",
+        // "Monday is open" — but the user's framing adds more: "HAVE YOU set
+        // up the call?"). A longer utterance that merely shares most of the
+        // reply's words is the user answering in its terms — "Book the cool
+        // call now" over "…book a quick call now?" was deleted at 3 of 4
+        // content words (2026-09-20 15:37) and the call was never booked.
+        if heard.count >= Self.echoVerbatimFrom {
+            let unsaid = heard.filter { !matches($0) }
+            return unsaid.count <= 1 && unsaid.allSatisfy { Self.stopWords.contains($0) }
+        }
         let e = echoEvidence(heard)
         // Their words and the echo's in ONE segment: a question riding on the
         // echo's tail ("…coming up on Friday. What about Monday?" — the reply
