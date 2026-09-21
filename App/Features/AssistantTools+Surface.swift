@@ -92,6 +92,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             if occ != nil { line += " · repeats" }
             if t.later == true { line += " · Later" }
             if (t.moveCount ?? 0) >= 3 { line += " · slipped \(t.moveCount ?? 0)×" }
+            // When it was created — "the ones I created last week" (Ahmad,
+            // 2026-09-20 23:47: the model rightly said the list didn't show it).
+            if let c = doneWhenLabel(t.createdAt, today: today) { line += " · created \(c)" }
             if t.done {
                 let stamp = t.completedAt ?? occ?.completedAt
                 line += " · done" + (doneWhenLabel(stamp, today: today).map { " \($0)" } ?? "")
@@ -611,8 +614,19 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     case "get_insights":
         let w = (args.str("window") ?? "week").lowercased()
         guard let window = InsightsWindow(rawValue: w) else { return "error: window must be week, month, or all" }
-        return renderInsights(tasks: api.getTasks(), sessions: api.getSessions(), captures: api.getCaptures(),
-                              reasons: api.getReasonLogs(), blocks: api.getBlocks(), now: Date(), window: window)
+        var out = renderInsights(tasks: api.getTasks(), sessions: api.getSessions(), captures: api.getCaptures(),
+                                 reasons: api.getReasonLogs(), blocks: api.getBlocks(), now: Date(), window: window)
+        // The week window starts on Monday: early in the week it is a day or
+        // two of data. "How was my last week?" on a Monday was answered from
+        // it as if it were the week before (Ahmad, 2026-09-20 23:46).
+        if window == .week {
+            let dow = LocalDate.dayOfWeek(api.todayIso())   // 0 = Sunday … 1 = Monday
+            let daysIn = dow == 0 ? 7 : dow
+            if daysIn <= 2 {
+                out += "\nnote: this is the CURRENT week, \(daysIn == 1 ? "today only" : "two days") so far — it says nothing about last week. If they asked about last week, say the app has no last-week window yet and offer the month (window: month)."
+            }
+        }
+        return out
 
     // ── NAVIGATE ──
     case "open_screen":

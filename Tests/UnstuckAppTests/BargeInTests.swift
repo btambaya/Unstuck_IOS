@@ -1404,6 +1404,58 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(c.createSentAt, 5.0, "a fresh create in flight")
     }
 
+    // MARK: 26 — a rate-limited reply (OpenAI: the token bucket ran dry;
+    // Ahmad's 2026-09-20 23:48 session went silent) is asked for again after
+    // the bucket's reset, three times at most.
+
+    func test26a_aRateLimitedReplyIsReaskedAfterTheReset() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = c.handle(.speechStopped, now: 1.0)
+        _ = c.handle(.transcription(text: "what's on today", itemId: "u", final: true), now: 1.2)
+        XCTAssertEqual(core(c.handle(.tick, now: 1.8)), [.createResponse, .uiState(.thinking)])
+        _ = c.handle(.responseCreated(id: "r1"), now: 2.0)
+        XCTAssertFalse(c.pendingCreate)
+        let out = core(c.handle(.responseRateLimited(retryAfterMs: 7000), now: 2.3))
+        XCTAssertEqual(out, [.startConfirmTimer(ms: 7000), .uiState(.thinking)], "the turn is pending again; the tick after the reset asks")
+        XCTAssertTrue(c.pendingCreate)
+        XCTAssertFalse(c.responseActive)
+        XCTAssertEqual(c.rateLimitRetries, 1)
+        XCTAssertEqual(core(c.handle(.tick, now: 9.4)), [.createResponse, .uiState(.thinking)])
+        _ = c.handle(.responseCreated(id: "r2"), now: 9.6)
+        _ = c.handle(.audioDelta(id: "r2"), now: 9.7)
+        XCTAssertTrue(c.shouldEnqueueAudio(id: "r2"), "the retried reply plays")
+        _ = c.handle(.responseDone(id: "r2", status: "completed"), now: 12)
+        XCTAssertEqual(c.rateLimitRetries, 0, "a completed reply clears the count")
+    }
+
+    func test26b_afterThreeRateLimitedRetriesTheTurnIsDropped() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = c.handle(.speechStopped, now: 1.0)
+        _ = c.handle(.transcription(text: "what's on today", itemId: "u", final: true), now: 1.2)
+        _ = c.handle(.tick, now: 1.8)
+        var t = 2.0
+        for i in 1...3 {
+            _ = c.handle(.responseCreated(id: "r\(i)"), now: t)
+            XCTAssertEqual(core(c.handle(.responseRateLimited(retryAfterMs: 2000), now: t + 0.3)), [.startConfirmTimer(ms: 2000), .uiState(.thinking)], "retry \(i)")
+            XCTAssertEqual(core(c.handle(.tick, now: t + 2.4)), [.createResponse, .uiState(.thinking)])
+            t += 3
+        }
+        _ = c.handle(.responseCreated(id: "r4"), now: t)
+        XCTAssertEqual(core(c.handle(.responseRateLimited(retryAfterMs: 2000), now: t + 0.3)), [.uiState(.listening)], "fourth failure: give up (the client says so out loud)")
+        XCTAssertFalse(c.pendingCreate)
+        // A new turn starts the count afresh.
+        _ = c.handle(.speechStarted(itemId: "v"), now: t + 5)
+        _ = c.handle(.speechStopped, now: t + 6)
+        _ = c.handle(.transcription(text: "hello?", itemId: "v", final: true), now: t + 6.2)
+        XCTAssertEqual(c.rateLimitRetries, 0)
+        XCTAssertEqual(VoiceRealtimeClient.retryAfterMs(message: "Rate limit reached … Please try again in 6.946s.", tokenReset: nil), 7196)
+        XCTAssertEqual(VoiceRealtimeClient.retryAfterMs(message: "", tokenReset: 12.5), 12750)
+        XCTAssertEqual(VoiceRealtimeClient.retryAfterMs(message: "", tokenReset: nil), 5250)
+        XCTAssertEqual(VoiceRealtimeClient.retryAfterMs(message: "", tokenReset: 90), 30250)
+    }
+
     func test23c_theLiveGuessOfAnEchoNeverCuts() {
         var c = speaking(.speaker)
         said(&c, "Looks pretty solid. You've got a few tasks wrapped up.")

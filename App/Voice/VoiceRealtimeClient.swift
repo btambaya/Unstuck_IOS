@@ -210,6 +210,21 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// response.creates went out (the first + at most one retry).
     private var _anyResponse = false
     private var _openedOnce = false
+    /// The token bucket's reset, from the last `rate_limits.updated`.
+    private var _tokenResetSec: Double?
+
+    /// How long to wait before re-asking a rate-limited reply: the bucket's
+    /// own reset when known, else the server's "try again in 6.9s", else 5 s;
+    /// 1–30 s.
+    static func retryAfterMs(message: String, tokenReset: Double?) -> Int {
+        var sec: Double = tokenReset ?? 0
+        if sec <= 0, let r = message.range(of: #"try again in ([0-9.]+)\s*s"#, options: .regularExpression) {
+            let digits = message[r].filter { "0123456789.".contains($0) }
+            sec = Double(digits) ?? 0
+        }
+        if sec <= 0 { sec = 5 }
+        return Int((min(30, max(1, sec)) * 1000).rounded()) + 250
+    }
     /// The server failed the session before it did anything: its capacity
     /// error ("thread pool exausted max_workers 100", 1 s after the socket
     /// opened — device, 2026-09-20 00:41, fine on the second try) or a drop
@@ -686,14 +701,42 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 // A cancelled/incomplete response (barge-in) is not a claim:
                 // never score it, and never inject a corrective mid-utterance.
                 let status = response?["status"] as? String
-                let reason = ((response?["status_details"] as? [String: Any])?["reason"] as? String) ?? "-"
+                let details = response?["status_details"] as? [String: Any]
+                let reason = (details?["reason"] as? String) ?? "-"
                 voiceLog.notice("voice response.done status=\(status ?? "nil", privacy: .public) reason=\(reason, privacy: .public)")
                 if status == nil || status == "completed" { checkFabrication() }
                 else { withLock { _guard.responseCancelled() } }
+                // A reply the server could not produce. Rate limit → the turn
+                // is asked for again after the bucket's reset (the app used to
+                // fall silent, 2026-09-20 23:48); anything else → told once.
+                if status == "failed" {
+                    let err = details?["error"] as? [String: Any]
+                    let code = (err?["code"] as? String) ?? ""
+                    let message = (err?["message"] as? String) ?? ""
+                    if code == "rate_limit_exceeded" || message.lowercased().contains("rate limit") {
+                        let ms = Self.retryAfterMs(message: message, tokenReset: withLock { _tokenResetSec })
+                        let retries: Int = withLock { _bargeIn.rateLimitRetries }
+                        voiceLog.notice("voice rate-limited: retry in \(ms, privacy: .public) ms (retry #\(retries + 1, privacy: .public))")
+                        if retries + 1 > BargeInController.rateLimitMaxRetries {
+                            onError("The assistant is busy right now — give it a minute and ask again")
+                        }
+                        dispatch(.responseRateLimited(retryAfterMs: ms))
+                        return
+                    }
+                    if !message.isEmpty { onError(String(message.prefix(160))) }
+                }
                 // responseActive stays true until response.DONE (audio.done
                 // can precede function calls): the UI stays "speaking" while
                 // the buffered tail plays, then playback_drained → listening.
                 dispatch(.responseDone(id: responseId, status: status))
+            }
+        case "rate_limits.updated":
+            // OpenAI, after every response: what is left of the token bucket
+            // and when it refills — the retry delay for a rate-limited reply.
+            if let limits = ev["rate_limits"] as? [[String: Any]],
+               let tokens = limits.first(where: { ($0["name"] as? String) == "tokens" }),
+               let reset = tokens["reset_seconds"] as? Double {
+                withLock { _tokenResetSec = reset }
             }
         case "response.function_call_arguments.done":
             handleToolCall(name: ev["name"] as? String, callId: ev["call_id"] as? String, arguments: ev["arguments"] as? String)

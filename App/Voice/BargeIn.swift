@@ -224,6 +224,12 @@ enum BargeInEvent: Equatable, Sendable {
     /// `shouldEnqueueAudio` — this event only updates bookkeeping.
     case audioDelta(id: String?)
     case responseDone(id: String?, status: String?)
+    /// `response.done` with status `failed` for want of rate limit (OpenAI:
+    /// the org's tokens-per-minute bucket ran dry — 40k TPM ≈ 4 replies a
+    /// minute with the tool schemas, Ahmad's session 2026-09-20 23:48 went
+    /// silent). The reply was for a turn already asked: ask again after the
+    /// bucket's reset, a few times, then give up out loud.
+    case responseRateLimited(retryAfterMs: Int)
     case playbackDrained
     /// The server VAD opened a segment; `itemId` is the conversation item it
     /// will commit that speech into (DashScope sends it), so a transcript can
@@ -296,6 +302,10 @@ struct BargeInController: Sendable {
     /// grace; a slow one is told apart from it only by time.
     private(set) var createSentAt: TimeInterval?
     static let createGraceSec: TimeInterval = 3
+    /// Rate-limited replies re-asked for the current turn; reset by a new turn
+    /// or a reply that completed.
+    private(set) var rateLimitRetries = 0
+    static let rateLimitMaxRetries = 3
     /// A pause mid-sentence ends a VAD segment (600 ms of silence) and the
     /// fragment was answered on its own; the continuation then cancelled that
     /// reply and got its own — "it kept tripping itself" on long questions
@@ -439,6 +449,7 @@ struct BargeInController: Sendable {
             // reply that has already started.
             if let id, let active = activeResponseId, id != active { break }
             responseActive = false
+            rateLimitRetries = 0
             // Any create we sent while this reply was active is dead with it
             // (the server never queues one): re-ask below if a turn is pending —
             // also when the server ignored our cancel and the reply completed.
@@ -454,6 +465,23 @@ struct BargeInController: Sendable {
             } else {
                 out.append(.uiState(.speaking))
             }
+
+        case .responseRateLimited(let retryAfterMs):
+            responseActive = false
+            createSentAt = nil
+            muted = false
+            if state == .speaking, !playbackQueued { state = .idle }
+            rateLimitRetries += 1
+            guard rateLimitRetries <= Self.rateLimitMaxRetries else {
+                pendingTurnSince = nil
+                out.append(.uiState(.listening))
+                break
+            }
+            // The turn is pending again, its hold already up; the tick after
+            // the reset asks for it.
+            pendingTurnSince = now - Double(Self.turnHoldMs) / 1000
+            out.append(.startConfirmTimer(ms: max(retryAfterMs, Self.turnHoldMs)))
+            out.append(.uiState(.thinking))
 
         case .playbackDrained:
             playbackQueued = false
@@ -592,6 +620,7 @@ struct BargeInController: Sendable {
             out.append(.userTurn(text))
             if holdToTalk { break }   // the release already committed + asked
             segments[index].responded = true
+            rateLimitRetries = 0
             out += flushPendingDeletes(except: nil)   // before the ask: the model never sees the echo items
             if modelBusy && !alreadyCancelled { out += cancel(now: now) }
             // Not asked for yet: the hold first (they may be mid-sentence),

@@ -643,6 +643,27 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(lines[3].contains("[id=t_old]") && lines[3].hasSuffix("· done Mon 5 Jan"), lines[3])
         XCTAssertFalse(r.contains("[id=t_open]"))
         XCTAssertNil(doneWhenLabel(nil, today: TODAY))
+        XCTAssertTrue(r.contains("· created "), "every line says when it was created (\"the ones I created last week\", 2026-09-20)")
+    }
+
+    func testGetTasksSaysWhenEachTaskWasCreated() async {
+        var fresh = task("t_new", "Made today")
+        fresh.createdAt = "\(TODAY)T12:00:00.000Z"
+        api.tasks = [fresh, task("t_old", "Made ages ago")]
+        let r = await run("get_tasks", #"{"view":"all"}"#)
+        XCTAssertTrue(r.contains("- Made today [id=t_new] 25m · created today"), r)
+        XCTAssertTrue(r.contains("- Made ages ago [id=t_old] 25m · created "), r)
+    }
+
+    func testGetInsightsWeekWindowEarlyInTheWeekSaysItIsNotLastWeek() async {
+        api.today = "2026-09-21"                                   // a Monday
+        let mon = await run("get_insights", #"{"window":"week"}"#)
+        XCTAssertTrue(mon.contains("note: this is the CURRENT week, today only so far"), mon)
+        api.today = "2026-09-23"                                   // a Wednesday
+        let wed = await run("get_insights", #"{"window":"week"}"#)
+        XCTAssertFalse(wed.contains("note: this is the CURRENT week"), wed)
+        let month = await run("get_insights", #"{"window":"month"}"#)
+        XCTAssertFalse(month.contains("note: this is the CURRENT week"), month)
     }
 
     func testGetTasksViewsAreDistinctAndFiltersNarrow() async {
@@ -652,7 +673,7 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(later.contains("[id=t_later] 25m · Later"))
         let done = await run("get_tasks", #"{"view":"completed"}"#)
         XCTAssertTrue(done.hasPrefix("ok: Completed (1):"), done)
-        XCTAssertTrue(done.contains("[id=t_done] 25m · done"))
+        XCTAssertTrue(done.contains("[id=t_done] 25m · created ") && done.hasSuffix("· done"), done)
         let up = await run("get_tasks", #"{"view":"upcoming"}"#)
         XCTAssertTrue(up.hasPrefix("ok: Upcoming (2):"), up)
         XCTAssertTrue(up.contains("[id=t_up]") && up.contains("[id=t_tag]"))

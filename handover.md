@@ -13,8 +13,49 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (75) uploaded to TestFlight — the three harness fixes from Zubair's evening call (the call is handed today's facts; the completed view is dated; a swallowed create is re-asked). The VOICE MODEL is now OpenAI gpt-realtime-2.1-mini via the proxy (no app change). 2026-09-20.
 
+- Ship: 1.1.1 (76) uploaded to TestFlight — task lines carry their creation date; a rate-limited reply is retried after the bucket's reset and says so instead of going silent; the insights "week" window says when it is only a day old. 2026-09-21.
 
 
+
+
+
+## Where things stand (2026-09-21) — build 76: Ahmad's first session on the new model
+
+`assistant_turns` 2026-09-20 23:46–23:48 (gpt-realtime-2.1-mini): the model
+read insights for "how was my last week", listed the (now dated) completed
+tasks, and when asked for "the ones I created last week and completed" said
+honestly that the list did not show creation dates. Then the session "went
+silent" — two causes stacked:
+
+- **The log went blind, not the session.** Every long session's log stopped
+  at 48 rows with no close row (the proxy inserted each row separately; the
+  free Cloudflare plan allows 50 subrequests per connection). Fixed in the
+  Worker: rows are batched per session (`makeTurnLogger`, stamped at
+  capture, one key set per row, `waitUntil` on the flush). Unstuck commits
+  6086dc1 + follow-up.
+- **The rate limit is what he heard.** Reproduced through the live proxy:
+  the OpenAI org is tier 1 (40k TPM for this model); each reply ~9k tokens
+  (the 70 tool schemas); the 4th reply in a minute fails with
+  `response.done status=failed / rate_limit_exceeded`, then the bucket
+  refills at ~1 reply per 13 s. The client treated a failed reply as nothing
+  to say. Only Ahmad can lift the ceiling (prepaid credit on the OpenAI
+  account → higher tier); Workers Paid would lift the Cloudflare caps too.
+
+This build:
+- `App/Features/AssistantTools+Surface.swift` — every `get_tasks` line says
+  `· created today / yesterday / Fri 19 Sep` (before the done label);
+  `get_insights(window: week)` early in the week appends a note that it is
+  the CURRENT week (a day or two) and says nothing about last week.
+- `App/Voice/BargeIn.swift` + `VoiceRealtimeClient.swift` — a
+  `response.done status=failed` with `rate_limit_exceeded` → the turn is
+  pending again and re-asked after the bucket's reset (`rate_limits.updated`
+  reset_seconds, else the server's "try again in Ns", else 5 s; 1–30 s),
+  three times, then "The assistant is busy right now — give it a minute" via
+  onError. Any other failed reply → its message via onError once. Tests:
+  BargeInTests 26a–b, AssistantToolsTests +2. 746 app tests green bar the
+  known flake.
+- Voice-proxy also logs `rate_limits.updated` (tokens remaining / limit /
+  reset) after every reply, and Workers Logs are on.
 
 ## Where things stand (2026-09-20, late) — build 75: the model switched (proxy), three harness fixes
 
