@@ -826,6 +826,17 @@ final class AssistantToolsTests: XCTestCase {
         await eq("carry_to_tomorrow", "{}", "error: nothing left on today to carry")
     }
 
+    func testCarryToTomorrowLeavesADoneTaskAlone() async {
+        // The task is done (ticked on the task, not the block): not "unfinished".
+        // Zubair's evening call, 2026-09-21: "moved 4 — Project Check-in, …".
+        api.tasks = [task("a", "Alpha"), task("d", "Project Check-in", done: true, completedAt: "\(TODAY)T11:00:00.000Z")]
+        api.blocks = [block("a_td", "a", TODAY, "09:00"), block("d_td", "d", TODAY, "12:00")]
+        await eq("carry_to_tomorrow", "{}", "ok: moved 1 to \(TOMORROW) — \"Alpha\"")
+        XCTAssertEqual(api.blocks.first { $0.id == "d_td" }?.date, TODAY, "the done one stays where it was")
+        api.blocks = [block("d_td", "d", TODAY, "12:00")]
+        await eq("carry_to_tomorrow", "{}", "error: nothing left on today to carry")
+    }
+
     func testCarryToTomorrowHonoursASubset() async {
         api.tasks = [task("a", "Alpha"), task("b", "Beta")]
         api.blocks = [block("a_td", "a", TODAY), block("b_td", "b", TODAY)]

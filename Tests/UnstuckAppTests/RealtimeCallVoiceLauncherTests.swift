@@ -111,9 +111,11 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         XCTAssertTrue(c.instructions.contains("THIS IS A PHONE CALL"))
         XCTAssertEqual(c.opening, CallScript.opening(s, now: Self.now))
         XCTAssertTrue(c.opening.hasPrefix("Hi Ahmad — you asked me to ring so you'd speak to James. You wanted to remember: Ask about the invoice; Confirm Friday."))
-        // The primer carries the opening verbatim and is what goes on the wire as the opening.
-        XCTAssertTrue(c.primer.contains("\"\(c.opening)\""))
-        XCTAssertTrue(c.primer.contains("EXACTLY"))
+        // The primer is the trigger only: the opening lives in the instructions
+        // (quoted in both, the model said it twice — measured 2026-09-21).
+        XCTAssertFalse(c.primer.contains(c.opening), "the primer must not quote the opening")
+        XCTAssertTrue(c.primer.contains("opening line now, once"))
+        XCTAssertTrue(c.instructions.contains("\"\(c.opening)\""), "the instructions carry it verbatim")
         XCTAssertEqual(live.starts, 1)
         XCTAssertEqual(sessionStarts, 1)
     }
@@ -408,7 +410,8 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
                        RealtimeCallVoiceLauncher.callToolSchemas(from: Self.voiceTools).compactMap { $0["name"] as? String },
                        "the same tool set as the CallKit path")
         XCTAssertEqual(cfg.opening, CallScript.opening(s, now: Self.now))
-        XCTAssertTrue(cfg.primer.contains(cfg.opening))
+        XCTAssertFalse(cfg.primer.contains(cfg.opening), "the primer points at the instructions; it never quotes the opening")
+        XCTAssertTrue(cfg.instructions.contains("\"\(cfg.opening)\""))
         let r = await cfg.runTool("snooze_call", #"{"minutes":15}"#)
         XCTAssertTrue(r.hasPrefix("ok: I'll call back in 15 minutes"))
         XCTAssertEqual(fallbackSnoozes.map(\.callId), [Self.callId])

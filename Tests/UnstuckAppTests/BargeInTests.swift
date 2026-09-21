@@ -1456,6 +1456,34 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(VoiceRealtimeClient.retryAfterMs(message: "", tokenReset: 90), 30250)
     }
 
+    // MARK: 27 — one word is the user (Zubair's morning call, 2026-09-21 07:01:
+    // "Morning." answering "Morning. Want to walk through today?" was deleted
+    // as echo of the greeting; nothing happened until "Hello?").
+
+    func test27a_aOneWordAnswerThatSharesTheGreetingsWordIsATurn() {
+        var c = speaking(.speaker)
+        said(&c, "Morning. Want to walk through today?")
+        _ = c.handle(.speechStarted(itemId: "m"), now: 1.0)          // on air, as the greeting's last words play
+        _ = c.handle(.speechStopped, now: 1.6)
+        let out = core(c.handle(.transcription(text: "Morning.", itemId: "m", final: true), now: 1.8))
+        XCTAssertTrue(out.contains(.userTurn("Morning.")), "\(out)")
+        XCTAssertEqual(count(out, .sendCancel), 1, "their word ends the greeting's tail")
+        XCTAssertEqual(c.pendingDeletes, [])
+        // Two words that are the reply's are still judged (a garble is echo).
+        var d = speaking(.speaker)
+        said(&d, "Saturday's clear.")
+        _ = d.handle(.speechStarted(itemId: "b"), now: 1.0)
+        XCTAssertEqual(core(d.handle(.transcription(text: "Saturday's players.", itemId: "b", final: true), now: 1.9)), [])
+        XCTAssertEqual(d.pendingDeletes, ["b"])
+        // A one-word later piece of an echo-judged segment stays echo.
+        var e = speaking(.speaker)
+        said(&e, "Looks pretty solid. You've got a few tasks wrapped up, and Friday coming up.")
+        _ = e.handle(.speechStarted(itemId: "p"), now: 1.0)
+        XCTAssertEqual(core(e.handle(.transcription(text: "Coming up on.", itemId: "p", final: true), now: 1.9)), [])
+        XCTAssertEqual(core(e.handle(.transcription(text: "Day.", itemId: "p", final: true), now: 2.5)), [])
+        XCTAssertEqual(e.pendingDeletes, ["p"])
+    }
+
     func test23c_theLiveGuessOfAnEchoNeverCuts() {
         var c = speaking(.speaker)
         said(&c, "Looks pretty solid. You've got a few tasks wrapped up.")

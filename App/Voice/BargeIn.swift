@@ -597,6 +597,13 @@ struct BargeInController: Sendable {
             var notATurn = tokens.isEmpty                       // a cough, "um", "…", an echo heard as Chinese
             if !notATurn, segment.echoJudged, tokens.count < 3 {
                 notATurn = true                                 // a later piece of the echo already judged
+            } else if !notATurn, tokens.count == 1 {
+                // One word is the user: "Morning." answering "Morning. Want to
+                // walk through today?" was deleted as echo of the greeting
+                // (Zubair's morning call, 2026-09-21 07:01) and the call went
+                // nowhere until "Hello?". With echo cancellation on, a
+                // one-word echo that reaches the transcriber is rarer than a
+                // one-word answer that shares the reply's word.
             } else if !notATurn, segment.onAir || segment.echoJudged {
                 // Judged by its words only when it began while the reply's
                 // audio was ON AIR. After the drain the words are the user's:

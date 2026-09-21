@@ -15,9 +15,45 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (76) uploaded to TestFlight — task lines carry their creation date; a rate-limited reply is retried after the bucket's reset and says so instead of going silent; the insights "week" window says when it is only a day old. 2026-09-21.
 
+- Ship: 1.1.1 (77) uploaded to TestFlight — calls greet once (the primer no longer quotes the opening); carry_to_tomorrow leaves a done task alone; a one-word answer is never dropped as echo. 2026-09-21.
 
 
 
+
+
+
+## Where things stand (2026-09-21, evening) — build 77: Zubair's day on the new model
+
+`assistant_turns` for zyzkazaure@gmail.com, 21 Sep (5 sessions: Talk 04:04, text
+chat 04:48 on qwen-plus, morning call 07:01, after-block call 09:01, evening
+call 18:01). Reads were right every time and the evening call opened from the
+day context (build 75) with no tool call. What went wrong:
+
+1. **Rate limit, three sessions** (Talk, morning call at "reflect that across
+   all events", evening call at "No, undo that" / "Have you reversed it?"):
+   `response.done failed rate_limit_exceeded`, ~11k tokens per reply on his
+   prompt, 40k TPM → 3–4 replies a minute. Ahmad's OpenAI tier.
+2. **Every call greeted him twice.** Measured through the proxy: the call
+   instructions quote the opening AND the primer quoted it → two message
+   items in one response, every time; a primer that only points at the
+   instructions → once. `RealtimeCallVoiceLauncher.primer(opening:)` no
+   longer quotes it (tests updated).
+3. **carry_to_tomorrow moved a DONE task** ("moved 4 — Project Check-in, …",
+   ticked at noon on the task, not the block). The executor now excludes
+   blocks whose task is done (`testCarryToTomorrowLeavesADoneTaskAlone`).
+4. **"Morning." dropped as echo** of "Morning. Want to walk through today?"
+   → the call stalled until "Hello?". `BargeIn`: a one-word utterance is
+   never judged echo by its words (later pieces of an echo-judged segment
+   still are) — test 27a.
+5. **Transcriber guessed the language**: "兩點鐘" (two o'clock), "不服不服",
+   "다음?" → discarded as no words. Proxy adapter pins
+   `transcription.language = 'en'` (deployed c9424c8).
+6. After-block call misheard "It went well" as "You weren't well" → offered
+   to reschedule. No code change.
+7. Text chat (qwen-plus) invented "recurring tasks appear as they get
+   closer" instead of calling `get_schedule(next_week)` — the text model is
+   still Qwen; switching it is a secrets change (LLM_*), Ahmad's call.
+No undo tool exists for carry_to_tomorrow (the model must move each back).
 
 ## Where things stand (2026-09-21) — build 76: Ahmad's first session on the new model
 

@@ -212,9 +212,15 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
             tools: callToolSchemas(from: voiceTools))
     }
 
-    /// The hidden primer: the model must speak the opening verbatim, once.
+    /// The hidden primer: the trigger for the opening, which the call
+    /// instructions carry verbatim. It must NOT quote the opening itself:
+    /// with both the instructions and the primer quoting it, the model spoke
+    /// it twice, as two message items in one response — every call, measured
+    /// through the proxy 2026-09-21 (Zubair heard every greeting twice).
+    /// Pointing at the instructions instead: once, every time.
     static func primer(opening: String) -> String {
-        "(The call just connected — YOU rang them, this is not the user speaking. Say EXACTLY this now, word for word, before anything else, then listen: \"\(opening)\" This opening happens ONCE — after any interruption continue the conversation naturally; never repeat it.)"
+        _ = opening
+        return "(The call just connected — YOU rang them; this is not the user speaking. Say your opening line now, once, exactly as your instructions give it, then listen. Never repeat it later.)"
     }
 
     /// The voice schemas filtered to CallScript.callTools (in that order —

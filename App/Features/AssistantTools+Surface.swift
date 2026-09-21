@@ -184,8 +184,14 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let wanted = args.strList("taskIds")
         // Task blocks only (web: `b.taskId && …`) — a block with no task has
         // nothing to carry and nothing to bump.
+        // "Unfinished" = neither the block nor its TASK is done: a one-off task
+        // ticked off (done on the task, not the block) was carried to tomorrow
+        // with the open ones (Zubair's evening call, 2026-09-21: "moved 4 —
+        // Project Check-in, …" — the check-in was done at noon).
+        let doneTaskIds = Set(api.getTasks().filter { $0.done }.map { $0.id })
         let todays = api.getBlocks().filter { b in
             b.taskId != nil && b.date == today && !b.done && !b.skipped && isTaskBlock(b)
+                && !doneTaskIds.contains(b.taskId ?? "")
                 && (wanted == nil || wanted!.contains(b.taskId ?? ""))
         }
         if todays.isEmpty { return "error: nothing left on today to carry" }
