@@ -142,7 +142,11 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
             "minutesIn": .integer(mins), "paused": .bool(live.paused), "estimateMin": .integer(live.sessionEstimateMin),
         ])
     }
-    ctx["tasks"] = .array(tasks.filter { !$0.done }.prefix(60).map { t in
+    // NEWEST first. The repository orders by createdAt ascending, so past 60
+    // open tasks the model was shown the 60 OLDEST and a task created seconds
+    // ago was invisible — which is how it concluded a task it had just made
+    // still needed making (audit 2026-09-21).
+    ctx["tasks"] = .array(tasks.filter { !$0.done }.sorted { $0.createdAt > $1.createdAt }.prefix(60).map { t in
         var o: [String: AnyJSON] = ["id": .string(t.id), "name": .string(t.name), "estimateMin": .integer(t.estimateMin)]
         if let area = t.lifeArea, !area.isEmpty { o["lifeArea"] = .string(area) }
         if t.later == true { o["later"] = .bool(true) }

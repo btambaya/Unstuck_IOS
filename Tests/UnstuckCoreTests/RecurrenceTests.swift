@@ -191,6 +191,76 @@ final class RegenerateForTaskTests: XCTestCase {
         XCTAssertEqual(plan.toDelete, [])
         XCTAssertEqual(plan.toUpsert.map(\.date), ["2026-06-01"])
     }
+
+    // MARK: the anchor (audit 2026-09-21)
+    //
+    // regenerateForTask deletes every future block that doesn't match the
+    // anchor's date|time, so the anchor decides what survives. Picking an
+    // arbitrary or a historical block rebuilt the series at the wrong time —
+    // one tester ended up with four "Office" tasks, one of them timeless, and
+    // nothing on the next Monday.
+
+    func testAnchorIsTheEarliestLiveBlockNotAnArbitraryOne() {
+        var doneOld = mkBlock(id: "old", taskId: "task-1", startTime: "09:15", date: "2026-05-04")
+        doneOld.done = true
+        let blocks = [
+            doneOld,                                                                     // history, wrong time
+            mkBlock(id: "next", taskId: "task-1", startTime: "11:00", date: "2026-05-25"),  // what the user set
+            mkBlock(id: "later", taskId: "task-1", startTime: "11:00", date: "2026-06-01"),
+            mkBlock(id: "other", taskId: "task-2", startTime: "07:00", date: "2026-05-22"),
+        ]
+        let anchor = recurrenceAnchor(taskId: "task-1", blocks: blocks, todayIso: today)
+        XCTAssertEqual(anchor?.id, "next")
+        XCTAssertEqual(anchor?.startTime, "11:00", "the series keeps the time the user chose")
+        // The old behaviour — the first/earliest block of any kind — would have
+        // anchored on 09:15 and deleted both 11:00 occurrences.
+        let plan = regenerateForTask(task: t, recurrence: .weekly(daysOfWeek: [1], until: nil),
+                                     existingBlocks: blocks, todayIso: today,
+                                     startTime: anchor!.startTime, startDate: Time.civil(2026, 5, 25),
+                                     horizonDays: 14)
+        XCTAssertEqual(plan.toDelete, [], "nothing the user placed is removed")
+        XCTAssertEqual(plan.toUpsert, [], "both Mondays already exist at 11:00")
+    }
+
+    func testAnchorFallsBackToHistoryAndIgnoresTimelessBlocks() {
+        // Only history: keep its time of day rather than snapping to 09:00.
+        var past = mkBlock(id: "past", taskId: "task-1", startTime: "07:30", date: "2026-05-04")
+        past.done = true
+        XCTAssertEqual(recurrenceAnchor(taskId: "task-1", blocks: [past], todayIso: today)?.id, "past")
+        // A block with no time can't anchor a series (it produced the timeless
+        // duplicate); a real one alongside it wins.
+        let timeless = mkBlock(id: "none", taskId: "task-1", startTime: "", date: "2026-05-22")
+        let timed = mkBlock(id: "timed", taskId: "task-1", startTime: "11:00", date: "2026-05-25")
+        XCTAssertEqual(recurrenceAnchor(taskId: "task-1", blocks: [timeless, timed], todayIso: today)?.id, "timed")
+        XCTAssertNil(recurrenceAnchor(taskId: "task-1", blocks: [timeless], todayIso: today))
+        XCTAssertNil(recurrenceAnchor(taskId: "task-1", blocks: [], todayIso: today))
+        // Skipped and done occurrences are not "live".
+        var skipped = mkBlock(id: "skip", taskId: "task-1", startTime: "08:00", date: "2026-05-25")
+        skipped.skipped = true
+        let live = mkBlock(id: "live", taskId: "task-1", startTime: "11:00", date: "2026-05-26")
+        XCTAssertEqual(recurrenceAnchor(taskId: "task-1", blocks: [skipped, live], todayIso: today)?.id, "live")
+    }
+
+    /// The horizon top-up's contract: run again with nothing changed and the
+    /// plan adds nothing, so a launch-time pass is free and idempotent. Run it
+    /// when the horizon has moved on and it only ADDS.
+    func testRegenerateIsIdempotentAndOnlyExtendsWhenTheHorizonMoves() {
+        let anchorDate = Time.civil(2026, 5, 25)
+        let first = regenerateForTask(task: t, recurrence: .weekly(daysOfWeek: [1], until: nil),
+                                      existingBlocks: [], todayIso: today,
+                                      startTime: "11:00", startDate: anchorDate, horizonDays: 14)
+        XCTAssertEqual(first.toUpsert.map(\.date), ["2026-05-25", "2026-06-01"])
+        let again = regenerateForTask(task: t, recurrence: .weekly(daysOfWeek: [1], until: nil),
+                                      existingBlocks: first.toUpsert, todayIso: today,
+                                      startTime: "11:00", startDate: anchorDate, horizonDays: 14)
+        XCTAssertEqual(again.toUpsert, [], "nothing to add the second time")
+        XCTAssertEqual(again.toDelete, [], "and nothing to remove")
+        let wider = regenerateForTask(task: t, recurrence: .weekly(daysOfWeek: [1], until: nil),
+                                      existingBlocks: first.toUpsert, todayIso: today,
+                                      startTime: "11:00", startDate: anchorDate, horizonDays: 28)
+        XCTAssertEqual(wider.toUpsert.map(\.date), ["2026-06-08", "2026-06-15"], "the horizon moved: add only")
+        XCTAssertEqual(wider.toDelete, [])
+    }
 }
 
 // The post-plan coverage decision behind scheduleTaskAt's guarantee-upsert,

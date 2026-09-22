@@ -3,6 +3,7 @@
 // Info.plist, sourced from Config.xcconfig / Secrets.xcconfig), starts
 // the auth→hydrate→subscribe loop, and exposes signed-in state to the UI.
 
+import OSLog
 import SwiftUI
 import UIKit
 import UnstuckCore
@@ -101,8 +102,9 @@ final class AppModel {
     /// Guard for the timezone push — keyed on user + zone, so a re-sign-in
     /// no-ops but a device that has MOVED pushes the new zone once.
     @ObservationIgnored private var timezonePushedFor: String?
-    /// Lives as long as the model; the app has one AppModel for its lifetime.
+    /// Live as long as the model; the app has one AppModel for its lifetime.
     @ObservationIgnored private var timezoneObserver: NSObjectProtocol?
+    @ObservationIgnored private var dayChangeObserver: NSObjectProtocol?
     /// Generation counters so a push that succeeds can only clear the
     /// pending-push flag its own change set.
     @ObservationIgnored private var notifPrefsPushGen = 0
@@ -864,6 +866,10 @@ final class AppModel {
                 self.reconcileAccountOnboardingIfNeeded()
                 self.pullServerPreferencesIfNeeded()
                 self.pushTimezoneIfNeeded()
+                // Repeating tasks whose 8-week horizon has run out since the
+                // last edit (topUpRecurrenceHorizon). After the hydrate, so it
+                // sees the account's real blocks rather than an empty store.
+                self.topUpRecurrenceHorizon()
                 // Hands-free ops whose target wasn't in the local store before
                 // this hydrate (a widget "Done" on a task pulled just now) are
                 // retried the moment the store is faithful, then flushed.
@@ -925,7 +931,14 @@ final class AppModel {
                     guard let self else { return }
                     self.timezonePushedFor = nil   // force the push: the zone changed
                     self.pushTimezoneIfNeeded()
+                    self.topUpRecurrenceHorizon()
                 }
+            }
+        // A new day: repeating tasks get their horizon extended (see
+        // topUpRecurrenceHorizon) for an app that stays open for weeks.
+        dayChangeObserver = NotificationCenter.default.addObserver(
+            forName: .NSCalendarDayChanged, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in self?.topUpRecurrenceHorizon() }
             }
 
         // Register Live Activity per-update push tokens as they're issued.
@@ -1787,14 +1800,14 @@ final class AppModel {
     /// Save a task + reconcile its recurrence: materialize future cal_blocks
     /// (regenerateForTask) and drop mismatched ones. `existingBlocks` is the
     /// task's current blocks from the observed store. The horizon is anchored on
-    /// the task's EARLIEST existing task-block (its real start day/time) so a
-    /// recurrence change keeps the series in place instead of snapping it to
-    /// 09:00 today — matching the Android setRecurrence anchor.
+    /// the task's earliest LIVE task-block (`recurrenceAnchor`) so a recurrence
+    /// change keeps the series where the user put it instead of snapping it to
+    /// 09:00 today — or, as the old "earliest block of any kind" did, back to
+    /// the time of some finished occurrence from weeks ago (audit 2026-09-21).
     func saveTaskWithRecurrence(_ task: TaskItem, existingBlocks: [CalBlock]) {
         saveTask(task)
         guard let write = coordinator?.write else { return }
-        let anchor = existingBlocks.filter { isTaskBlock($0) }
-            .min { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
+        let anchor = recurrenceAnchor(taskId: task.id, blocks: existingBlocks, todayIso: Clock.todayISO())
         let startTime = anchor?.startTime ?? "09:00"
         let startDate: Date = anchor.flatMap { a in
             let parts = a.date.split(separator: "-").compactMap { Int($0) }
@@ -1808,6 +1821,43 @@ final class AppModel {
             for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }
             for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
         }
+    }
+
+    /// Extend every repeating task's occurrences back out to the horizon.
+    ///
+    /// `regenerateForTask` only ever runs when the user touches a task, and it
+    /// mints a fixed 8 weeks ahead. So 8 weeks after the last edit a repeating
+    /// task has no future occurrence left: it disappears from Today, Upcoming
+    /// and the calendar and survives only as one overdue row in Backlog. A beta
+    /// that runs longer than that loses every recurring task its testers made
+    /// (audit 2026-09-21). Run at launch and at a day rollover; the plan is a
+    /// pure diff, so doing it repeatedly costs nothing and changes nothing.
+    ///
+    /// ADDITIONS ONLY: this is maintenance, not an edit. Honouring the plan's
+    /// deletions here would let a background pass quietly remove occurrences
+    /// the user moved by hand.
+    func topUpRecurrenceHorizon() {
+        guard let write = coordinator?.write, let repo = taskRepo else { return }
+        let tasks = (try? repo.all()) ?? []
+        let templates = tasks.filter { $0.recurrence != nil && !$0.done }
+        guard !templates.isEmpty else { return }
+        let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+        let today = Clock.todayISO()
+        var toAdd: [CalBlock] = []
+        for t in templates {
+            guard let anchor = recurrenceAnchor(taskId: t.id, blocks: blocks, todayIso: today) else { continue }
+            let parts = anchor.date.split(separator: "-").compactMap { Int($0) }
+            guard parts.count == 3 else { continue }
+            let plan = regenerateForTask(
+                task: t, recurrence: t.recurrence, existingBlocks: blocks, todayIso: today,
+                startTime: anchor.startTime, startDate: Time.civil(parts[0], parts[1], parts[2]))
+            toAdd.append(contentsOf: plan.toUpsert)
+        }
+        guard !toAdd.isEmpty else { return }
+        let now = Self.isoNow()
+        Logger(subsystem: "io.unstucknow.app", category: "recurrence")
+            .notice("horizon top-up: \(toAdd.count, privacy: .public) occurrence(s) across \(templates.count, privacy: .public) task(s)")
+        Task { for b in toAdd { try? await write.upsertCalBlock(b, nowISO: now) } }
     }
 
     func deleteTask(_ id: String) {

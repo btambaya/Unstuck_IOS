@@ -151,6 +151,13 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         }
         // Already done that day → error, not a second "Done for today" receipt.
         if b.done { return "error: \"\(t.name)\" is already done on \(date) — nothing changed" }
+        // …and for a ONE-OFF task, done can live on the task rather than the
+        // block. complete_task refuses that case precisely because the
+        // receipt's Undo would reopen something finished earlier; this path
+        // was missing the same guard (audit 2026-09-21).
+        if t.recurrence == nil, t.done {
+            return "error: \"\(t.name)\" is already done — nothing changed"
+        }
         b.done = true
         await api.upsertBlock(b)
         if t.recurrence == nil {
@@ -165,7 +172,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let nm = args.str("name")
         let date = args.str("date")
         let startTime = args.str("startTime")
-        let dur = args.int("durationMin") ?? 60
+        // Clamped to the server's CHECK (5…1440): an out-of-range block is
+        // accepted locally, refused on flush and quarantined in silence.
+        let dur = clampDurationMin(args.int("durationMin"), fallback: 60)
         guard let nm, let date, let startTime else { return "error: name, date and startTime are all required for block_time" }
         if let past = rejectPastDate(today: api.todayIso(), date: date)
             ?? rejectPastTime(blocks: api.getBlocks(), today: api.todayIso(), date: date, startTime: startTime, nowHM: api.nowHM()) {

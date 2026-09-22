@@ -86,6 +86,27 @@ public struct RegenPlan: Equatable, Sendable {
     }
 }
 
+/// THE anchor a recurrence change regenerates from: the task's earliest LIVE
+/// block at or after today, falling back to its latest past block so a series
+/// with only history keeps its time of day. Nil when the task has no block at
+/// all (nothing to anchor on; the caller leaves the calendar alone).
+///
+/// Why this exists: `regenerateForTask` deletes every future block whose
+/// date|time doesn't match the anchor's, so the anchor decides what survives.
+/// The assistant used `blocks.first(where:)` — an arbitrary block in SQLite
+/// rowid order, commonly a done past occurrence at a different time or one
+/// with no time at all — and the UI used the earliest block of any kind,
+/// including history. "Make Office every Monday at 11" then deleted the
+/// Monday 11:00 block and rebuilt the series at the old time, which is how one
+/// tester ended up with four "Office" tasks, one of them timeless, and nothing
+/// on the next Monday (audit 2026-09-21).
+public func recurrenceAnchor(taskId: String, blocks: [CalBlock], todayIso: String) -> CalBlock? {
+    let mine = blocks.filter { $0.taskId == taskId && isTaskBlock($0) && !$0.startTime.isEmpty }
+    let live = mine.filter { !$0.done && !$0.skipped && $0.date >= todayIso }
+    if let next = live.min(by: { ($0.date + $0.startTime) < ($1.date + $1.startTime) }) { return next }
+    return mine.max(by: { ($0.date + $0.startTime) < ($1.date + $1.startTime) })
+}
+
 public func regenerateForTask(
     task: TaskItem,
     recurrence: Recurrence?,
@@ -117,7 +138,10 @@ public func regenerateForTask(
     for o in desired where !existingFutureKeys.contains("\(o.date)|\(o.startTime)") {
         toUpsert.append(CalBlock(
             id: newUUID(), taskId: task.id, taskName: task.name,
-            startTime: o.startTime, durationMinutes: task.estimateMin,
+            // The server's CHECK is `duration_minutes between 5 and 1440`, so a
+            // 2-minute task would mint occurrences it refuses on flush — the
+            // rows then live on that one phone for ever (audit 2026-09-21).
+            startTime: o.startTime, durationMinutes: min(1440, max(5, task.estimateMin)),
             date: o.date, kind: .task))
     }
 

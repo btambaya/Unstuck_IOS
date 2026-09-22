@@ -826,6 +826,60 @@ final class AssistantToolsTests: XCTestCase {
         await eq("carry_to_tomorrow", "{}", "error: nothing left on today to carry")
     }
 
+    // MARK: duplicates + clamps (audit 2026-09-21)
+
+    func testCreateTaskRefusesAFreshDuplicateByName() async {
+        let first = await run("create_task", #"{"name":"Office"}"#)
+        XCTAssertTrue(first.hasPrefix("ok: created"), first)
+        let again = await run("create_task", #"{"name":"  office  "}"#)
+        XCTAssertTrue(again.hasPrefix("error:"), again)
+        XCTAssertTrue(again.contains("already exists"), again)
+        XCTAssertTrue(again.contains("schedule_task or update_task"), "it points at the fix")
+        XCTAssertEqual(api.tasks.filter { $0.name.lowercased() == "office" }.count, 1, "one Office, not two")
+        // A DIFFERENT name is unaffected.
+        let third = await run("create_task", #"{"name":"Office admin"}"#)
+        XCTAssertTrue(third.hasPrefix("ok: created"), third)
+        // An old task of the same name is not a duplicate — the user may well
+        // want a fresh one; only a just-made twin is refused.
+        var stale = task("stale", "Gym"); stale.createdAt = "2026-01-02T09:00:00.000Z"
+        api.tasks.append(stale)
+        let gym = await run("create_task", #"{"name":"Gym"}"#)
+        XCTAssertTrue(gym.hasPrefix("ok: created"), gym)
+        // Nor is a COMPLETED one.
+        var finished = task("fin", "Hike", done: true); finished.createdAt = "\(TODAY)T08:00:00.000Z"
+        api.tasks.append(finished)
+        let hike = await run("create_task", #"{"name":"Hike"}"#)
+        XCTAssertTrue(hike.hasPrefix("ok: created"), hike)
+    }
+
+    func testEstimatesAndDurationsAreClampedToWhatTheServerAccepts() async {
+        // migration 001: estimate_min 1…1440, duration_minutes 5…1440. An
+        // out-of-range row is refused on flush and quarantined in silence.
+        XCTAssertEqual(clampEstimateMin(nil), 25)
+        XCTAssertEqual(clampEstimateMin(0), 1)
+        XCTAssertEqual(clampEstimateMin(-5), 1)
+        XCTAssertEqual(clampEstimateMin(5000), 1440)
+        XCTAssertEqual(clampDurationMin(2, fallback: 60), 5, "a 2-minute task still mints a legal block")
+        XCTAssertEqual(clampDurationMin(nil, fallback: 60), 60)
+        XCTAssertEqual(clampDurationMin(99999, fallback: 60), 1440)
+        _ = await run("create_task", #"{"name":"Tiny","estimateMin":0}"#)
+        XCTAssertEqual(api.tasks.first { $0.name == "Tiny" }?.estimateMin, 1)
+        _ = await run("create_task", #"{"name":"Huge","estimateMin":99999}"#)
+        XCTAssertEqual(api.tasks.first { $0.name == "Huge" }?.estimateMin, 1440)
+        _ = await run("block_time", #"{"name":"Deep work","date":"\#(TOMORROW)","startTime":"09:00","durationMin":1}"#)
+        XCTAssertEqual(api.blocks.first { $0.taskName == "Deep work" }?.durationMinutes, 5)
+    }
+
+    func testCompleteOccurrenceRefusesATaskAlreadyDone() async {
+        // The same class as the carry bug: done can live on the TASK, not the
+        // block, and an "ok" receipt's Undo would reopen it.
+        api.tasks = [task("one", "Dentist", done: true, completedAt: "\(TODAY)T09:00:00.000Z")]
+        api.blocks = [block("one_td", "one", TODAY, "10:00")]
+        let r = await run("complete_occurrence", #"{"taskId":"one"}"#)
+        XCTAssertTrue(r.hasPrefix("error:") && r.contains("already done"), r)
+        XCTAssertFalse(api.blocks[0].done, "nothing was ticked")
+    }
+
     func testCarryToTomorrowLeavesADoneTaskAlone() async {
         // The task is done (ticked on the task, not the block): not "unfinished".
         // Zubair's evening call, 2026-09-21: "moved 4 — Project Check-in, …".

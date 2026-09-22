@@ -465,7 +465,17 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         if let date, let past = rejectPastDate(api, date) ?? rejectPastTime(api, date, startTime) {
             return past + " The task was NOT created — give another day, or omit the date."
         }
-        let t = TaskItem(id: newUUID(), name: nm, estimateMin: args.int("estimateMin") ?? 25, totalFocused: 0, done: false,
+        // A task by this exact name that the user (or the model) made minutes
+        // ago is almost certainly the same one, not a second one. One tester
+        // ended up with FOUR identical "Office" tasks: the model could not see
+        // the task it had just created (the context carries the 60 OLDEST open
+        // tasks, and a task with a day but no time appears in neither list),
+        // so a nudge to "call the right tool now" made it create another
+        // (audit 2026-09-21). Point the model at the existing one instead.
+        if let dupe = recentDuplicateTask(named: nm, api: api, scratch: scratch, now: Date()) {
+            return "error: \"\(dupe.name)\" already exists (id=\(dupe.id), created just now) — use schedule_task or update_task on it rather than making another. Only create a second one if the user asks for a separate task."
+        }
+        let t = TaskItem(id: newUUID(), name: nm, estimateMin: clampEstimateMin(args.int("estimateMin")), totalFocused: 0, done: false,
                          tags: args.strList("tags"), lifeArea: args.str("lifeArea"),
                          firstPhysicalAction: args.str("firstPhysicalAction"), later: args.bool("later") ?? false,
                          createdAt: now(), updatedAt: now(), dueAt: args.str("dueAt"))
@@ -582,7 +592,8 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         scratch.newTasks[t.id] = t
         // Regenerate future blocks off the existing anchor, if scheduled.
         let blocks = api.getBlocks()
-        if let anchor = blocks.first(where: { $0.taskId == t.id }) {
+        // The earliest LIVE block, never an arbitrary one — see recurrenceAnchor.
+        if let anchor = recurrenceAnchor(taskId: t.id, blocks: blocks, todayIso: api.todayIso()) {
             let plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: api.todayIso(),
                                          startTime: anchor.startTime, startDate: LocalDate.parse(anchor.date))
             for b in plan.toUpsert { await api.upsertBlock(b) }
@@ -799,5 +810,32 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
 
     default:
         return nil
+    }
+}
+
+/// The server CHECK is `estimate_min between 1 and 1440` (migration 001). An
+/// out-of-range value is accepted locally, rejected by PostgREST on flush,
+/// retried five times and then quarantined — the row lives on that one phone
+/// for ever and the user is never told (audit 2026-09-21). Clamp instead.
+func clampEstimateMin(_ raw: Int?) -> Int { min(1440, max(1, raw ?? 25)) }
+
+/// `duration_minutes between 5 and 1440` (migration 001), so a 2-minute task
+/// would otherwise mint a block the server refuses.
+func clampDurationMin(_ raw: Int?, fallback: Int = 25) -> Int { min(1440, max(5, raw ?? fallback)) }
+
+/// A task with this exact name (case- and space-insensitive), still open, made
+/// within the last few minutes — including one created earlier in THIS turn.
+@MainActor
+func recentDuplicateTask(named name: String, api: AssistantAppState, scratch: TurnScratch,
+                         now: Date, within: TimeInterval = 600) -> TaskItem? {
+    let key = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    guard !key.isEmpty else { return nil }
+    let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let plain = ISO8601DateFormatter(); plain.formatOptions = [.withInternetDateTime]
+    let candidates = Array(scratch.newTasks.values) + api.getTasks()
+    return candidates.first { t in
+        guard !t.done, t.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == key else { return false }
+        guard let made = iso.date(from: t.createdAt) ?? plain.date(from: t.createdAt) else { return false }
+        return now.timeIntervalSince(made) <= within && now.timeIntervalSince(made) >= -within
     }
 }

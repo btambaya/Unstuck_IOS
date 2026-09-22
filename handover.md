@@ -19,11 +19,59 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (78) uploaded to TestFlight — the pre-beta audit fixes: the "busy" message is actually shown, provider errors are plain words, calls ask for the microphone, a failure mid-call ends the call, declined-call notices are silent, travel re-pushes the timezone, and Settings can clear the Assistant history. 2026-09-22.
 
+- Ship: 1.1.1 (79) uploaded to TestFlight — the recurrence + duplicate fixes from the audit: the series anchors on the next LIVE occurrence, the horizon is topped up, duplicate task creation is refused, estimates/durations are clamped, complete_occurrence has the done-guard. 2026-09-22.
 
 
 
 
 
+
+
+
+## Where things stand (2026-09-22, later) — build 79: the recurrence + duplicate bugs
+
+The P1 data findings from the pre-beta audit, all of which Zubair hit:
+
+- `recurrenceAnchor(taskId:blocks:todayIso:)` (UnstuckCore/Recurrence.swift) —
+  THE anchor a recurrence change regenerates from: the earliest LIVE block at
+  or after today, falling back to the latest past one, ignoring timeless
+  blocks. `regenerateForTask` deletes every future block that doesn't match
+  the anchor's date|time, and the assistant was passing
+  `blocks.first(where:)` — an arbitrary block in SQLite rowid order, often a
+  done occurrence at another time — while the UI passed the earliest block of
+  any kind, i.e. history. "Make Office every Monday at 11" therefore deleted
+  the Monday 11:00 block and rebuilt the series at the old time. That is how
+  one tester got four "Office" tasks, one of them timeless, and an empty next
+  Monday. Both call sites now use it (`AssistantTools.set_task_recurrence`,
+  `AppModel.saveTaskWithRecurrence`).
+- `AppModel.topUpRecurrenceHorizon()` — run after hydrate, on a day change and
+  on a time-zone change. `RECURRENCE_HORIZON_DAYS` is 56 and only user edits
+  ever regenerated, so 8 weeks after the last edit a repeating task had no
+  future occurrence at all: gone from Today, Upcoming and the calendar,
+  surviving only as one overdue row in Backlog. ADDITIONS ONLY — honouring the
+  plan's deletions in a background pass would silently undo hand-moved
+  occurrences.
+- `create_task` refuses a same-name open task created in the last ten minutes
+  (`recentDuplicateTask`) and points at schedule_task/update_task instead. The
+  context's task list is now NEWEST first: the repository orders by createdAt
+  ascending, so past 60 open tasks the model saw the 60 OLDEST and could not
+  see what it had just made — which is why a nudge to "call the right tool
+  now" made it create another.
+- `clampEstimateMin` / `clampDurationMin` at every entry point, and in
+  `regenerateForTask`'s minted blocks. The server's CHECKs are 1…1440 and
+  5…1440; an out-of-range row was accepted locally, refused on flush, retried
+  five times and quarantined — living on that one phone for ever with the user
+  never told.
+- `complete_occurrence` refuses a one-off task that is already done, the guard
+  `complete_task` has had all along (the receipt's Undo would reopen it).
+
+752 tests green bar the known CrashBreadcrumbs simulator flake.
+
+Left from the audit, deliberately not done: the unpaginated `fetchAllRaw`
+(latent — the heaviest account today is 186 blocks against a 1,000-row cap),
+the 60-second full replace of `cal_blocks`, `Calendar.current` honouring a
+non-Gregorian device calendar, and the assistant-tool hot paths that re-read
+the whole store per row.
 
 ## Where things stand (2026-09-22) — build 78: the pre-beta audit
 
