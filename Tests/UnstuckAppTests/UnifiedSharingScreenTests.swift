@@ -8,6 +8,7 @@
 // Runs on the in-memory AppModel (UI-test mode: GRDB in memory, no coordinator).
 
 import XCTest
+import Supabase
 import UnstuckCore
 import UnstuckData
 import UnstuckSync
@@ -391,7 +392,9 @@ final class ShareScreenModelTests: XCTestCase {
         let vm = taskModel()
         await vm.load()
         await vm.block(vm.people[0])
-        XCTAssertEqual(vm.error, "Couldn't share — try again.")
+        // The refusal names the BLOCK — "Couldn't share" read as though a
+        // share had failed, on a safety action whose failure matters.
+        XCTAssertEqual(vm.error, "Couldn't block Maya — try again.")
         XCTAssertNil(vm.result)
         XCTAssertEqual(vm.people[0].access, .edit, "they still have it")
     }
@@ -596,6 +599,46 @@ final class RecipientShareControlsTests: XCTestCase {
         let blockedUser = await model.blockUser(userId: "u1")
         XCTAssertFalse(blockedUser)
     }
+
+    /// A refused leave used to count on the refetch to bring the row back —
+    /// offline that refetch reads [] too, so it blanked every Shared-with-you
+    /// row and delegation badge. The row now comes back in place and nothing
+    /// else is touched.
+    func testAnOfflineLeaveKeepsTheRowAndEverythingElse() async {
+        let share = ShareModel(client: Self.offlineCircle())
+        let a = SharedWithMe(shareId: "s1", taskId: "t1", ownerName: "Maya", level: .view, title: "Deck", done: false)
+        let b = SharedWithMe(shareId: "s2", taskId: "t2", ownerName: "Zubair", level: .partner, title: "Run", done: false)
+        share.sharedWithMe = [a, b]
+        share.badges = ["t9": [ShareBadge(taskId: "t9", level: .assign, recipientName: "Maya")]]
+        let revision = share.revision
+        let left = await share.leave(shareId: "s1")
+        XCTAssertFalse(left)
+        XCTAssertEqual(share.sharedWithMe, [a, b], "the row is back in place; the others were never touched")
+        XCTAssertEqual(share.assignedOutIds, ["t9"], "the delegation badge survives")
+        XCTAssertEqual(share.revision, revision, "no re-read")
+        // The re-read the old path ran really does blank it all offline.
+        await share.refresh()
+        XCTAssertTrue(share.sharedWithMe.isEmpty)
+        XCTAssertTrue(share.badges.isEmpty)
+    }
+
+    /// A CircleClient that fails every call fast, like an offline phone's:
+    /// nothing listens on this loopback port. The session lives in memory,
+    /// never the keychain.
+    private static func offlineCircle() -> CircleClient {
+        CircleClient(SupabaseClient(
+            supabaseURL: URL(string: "http://127.0.0.1:1")!, supabaseKey: "offline",
+            options: SupabaseClientOptions(auth: .init(storage: MemoryAuthStorage(), autoRefreshToken: false,
+                                                       emitLocalSessionAsInitialSession: true))))
+    }
+}
+
+private final class MemoryAuthStorage: AuthLocalStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    func store(key: String, value: Data) throws { lock.withLock { values[key] = value } }
+    func retrieve(key: String) throws -> Data? { lock.withLock { values[key] } }
+    func remove(key: String) throws { _ = lock.withLock { values.removeValue(forKey: key) } }
 }
 
 // MARK: - assistant email confirm

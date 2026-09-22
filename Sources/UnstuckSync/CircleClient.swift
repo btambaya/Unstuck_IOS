@@ -120,9 +120,16 @@ public struct CircleClient: Sendable {
     /// shares AND the list memberships between the two of you, in both
     /// directions, releasing the promotions they held (migration 075 — 066
     /// left every shared list shared; audit 2026-09-22, C11). A pending roster
-    /// row is just cancelled. RPC: circle_remove(p_id). Best-effort.
-    public func removeMember(id: String) async {
-        _ = try? await client.rpc("circle_remove", params: IdParams(p_id: id)).execute()
+    /// row is just cancelled. RPC: circle_remove(p_id) → void, so TRUE means
+    /// it didn't throw; offline is false. The caller re-reads the shared
+    /// state only on true — an offline re-read comes back [] and would blank
+    /// Shared-with-you and the delegation badges (audit 2026-09-22, C11).
+    @discardableResult
+    public func removeMember(id: String) async -> Bool {
+        do {
+            _ = try await client.rpc("circle_remove", params: IdParams(p_id: id)).execute()
+            return true
+        } catch { return false }
     }
 
     /// Invite by email (we reach them ourselves) or blank for a shareable link.

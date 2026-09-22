@@ -152,14 +152,26 @@ final class ShareModel {
     /// Remove a task shared WITH me from my list: deletes MY recipient row
     /// (task_share_leave, migration 075); the owner isn't told. A recipient
     /// had no way to drop an unwanted share before (audit 2026-09-22, C10).
-    /// Optimistic — the row leaves every surface at once — and the refetch
-    /// brings it back if the server refused. TRUE only when it confirmed.
+    /// Optimistic — the row leaves every surface at once. A refusal puts the
+    /// row back HERE, not through a refetch: the likeliest refusal is being
+    /// offline, and then tasks_shared_with_me / my_task_share_badges read []
+    /// too, so a refetch would blank every Shared-with-you row and delegation
+    /// badge. Only a confirmed leave re-reads. TRUE only when it confirmed.
     func leave(shareId: String) async -> Bool {
         guard let client else { return false }
+        let index = sharedWithMe.firstIndex { $0.shareId == shareId }
+        let row = index.map { sharedWithMe[$0] }
+        let before = revision
         sharedWithMe.removeAll { $0.shareId == shareId }
-        let ok = await client.leaveSharedTask(shareId: shareId)
+        guard await client.leaveSharedTask(shareId: shareId) else {
+            // A refresh that landed meanwhile read the server's truth — keep it.
+            if let index, let row, revision == before {
+                sharedWithMe.insert(row, at: min(index, sharedWithMe.count))
+            }
+            return false
+        }
         await refresh()
-        return ok
+        return true
     }
 
     /// The shares currently on a task I own — drives the share sheet's picker.

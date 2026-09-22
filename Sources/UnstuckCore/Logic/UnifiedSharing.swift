@@ -372,6 +372,9 @@ public enum ShareFailure: Equatable, Sendable {
     /// Sharing a LIST with a connection by name: the collection function
     /// resolves emails only and the roster has none (contract gap).
     case listNeedsEmail
+    /// A Block the server didn't confirm (offline, or no 075) — its own
+    /// line, so a safety action never reads as a failed share.
+    case blockFailed(name: String)
     /// Offline / a non-2xx with no readable reason.
     case network
     /// Any other server code, kept for the log.
@@ -406,6 +409,7 @@ public enum ShareFailure: Equatable, Sendable {
         case .notSignedIn: return "Sign in to share."
         case .notConnected: return "You're not connected yet — share by email or a link below."
         case .listNeedsEmail: return "Lists can't be shared by name yet — enter their email below."
+        case .blockFailed(let name): return "Couldn't block \(shareShortName(name)) — try again."
         case .network, .server: return "Couldn't share — try again."
         }
     }

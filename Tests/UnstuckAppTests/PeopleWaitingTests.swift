@@ -23,6 +23,7 @@ private final class FakePeopleTransport: PeopleTransport {
     var circle: [CircleMember] = []
     var pending: [PendingInvite] = []
     var cancelOk = true
+    var removeOk = true
     var blockOk = true
     var unblockOk = true
     var blockedList: [BlockedUser] = []
@@ -39,9 +40,11 @@ private final class FakePeopleTransport: PeopleTransport {
     func listCircle() async -> [CircleMember] { circleLoads += 1; return circle }
     func invite(email: String?) async -> CircleInviteResult { CircleInviteResult(ok: true, emailed: true) }
     func redeem(code: String) async -> CircleRedeemResult { CircleRedeemResult(ok: true) }
-    func removeMember(id: String) async {
+    func removeMember(id: String) async -> Bool {
         removed.append(id)
+        guard removeOk else { return false }
         circle.removeAll { $0.id == id }
+        return true
     }
     func myPendingInvites() async -> [PendingInvite] { pendingLoads += 1; return pending }
     func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool {
@@ -225,6 +228,21 @@ final class PeopleWaitingTests: XCTestCase {
         await vm.remove(id: "c3")   // status invited, memberUserId nil
         XCTAssertEqual(fake.removed, ["c3"], "still goes through circle_remove")
         XCTAssertEqual(calls.n, 0, "a pending invite changes no list")
+    }
+
+    /// A removal the server didn't accept (offline) must not re-read the
+    /// shared state: offline those reads come back [] and would blank
+    /// Shared-with-you and the delegation badges.
+    func testARefusedRemovalDoesNotReHydrate() async {
+        fake.removeOk = false
+        let vm = model()
+        let calls = Counter()
+        vm.onConnectionRemoved = { calls.n += 1 }
+        await vm.refresh()
+        await vm.remove(id: "c1")
+        XCTAssertEqual(fake.removed, ["c1"], "the removal was attempted")
+        XCTAssertEqual(calls.n, 0, "nothing was severed, so nothing is re-read")
+        XCTAssertEqual(vm.roster.map(\.id), ["c1"], "the refetch shows they're still connected")
     }
 
     /// The dialog used to promise "will no longer see anything you've shared"

@@ -359,11 +359,12 @@ final class ShareScreenModel {
     /// you unblock them in Settings › People. The old block was device-local,
     /// lists-only, and reloaded BEFORE its removal ran with no failure path, so
     /// the person often still showed "Can edit"; now the reload follows the
-    /// server's answer and a refusal is shown (audit 2026-09-22, C10).
+    /// server's answer and a refusal says the BLOCK didn't land, not that a
+    /// share failed (audit 2026-09-22, C10).
     func block(_ row: SharePersonRow) async {
         guard busyId == nil else { return }
         await perform(row.id) {
-            guard await self.transport.block(userId: row.userId) else { throw ShareActionError(.network) }
+            guard await self.transport.block(userId: row.userId) else { throw ShareActionError(.blockFailed(name: row.name)) }
             return .blocked(name: row.name)
         }
     }

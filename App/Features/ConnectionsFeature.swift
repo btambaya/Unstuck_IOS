@@ -42,8 +42,9 @@ protocol PeopleTransport: AnyObject {
     func invite(email: String?) async -> CircleInviteResult
     /// `circle_redeem(p_code)` — join someone else's circle.
     func redeem(code: String) async -> CircleRedeemResult
-    /// `circle_remove(p_id)` — a member, or a pending roster row.
-    func removeMember(id: String) async
+    /// `circle_remove(p_id)` — a member, or a pending roster row. True only
+    /// when the server accepted it.
+    func removeMember(id: String) async -> Bool
     /// `my_pending_invites()` — every invite I sent, all kinds (tolerant → []).
     func myPendingInvites() async -> [PendingInvite]
     /// `cancel_pending_invite(p_kind, p_id)` — true only when a row was deleted.
@@ -74,7 +75,7 @@ final class LivePeopleTransport: PeopleTransport {
         guard let client else { return CircleRedeemResult(ok: false, error: "not_configured") }
         return await client.redeem(code: code)
     }
-    func removeMember(id: String) async { await client?.removeMember(id: id) }
+    func removeMember(id: String) async -> Bool { await client?.removeMember(id: id) ?? false }
     func myPendingInvites() async -> [PendingInvite] { await client?.myPendingInvites() ?? [] }
     func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool {
         await client?.cancelPendingInvite(kind: kind, id: id) ?? false
@@ -183,13 +184,15 @@ final class CircleModel {
     /// `onConnectionRemoved`: the owner's collection_members channel is
     /// filtered to my own rows and the collections echo carries the old
     /// members forward, so nothing live would drop them. A pending-invite row
-    /// changes no list, so it doesn't. Optimistic + refetch.
+    /// changes no list, so it doesn't, and neither does a removal the server
+    /// didn't accept: offline, that re-read comes back [] and would blank
+    /// Shared-with-you and the delegation badges. Optimistic + refetch.
     func remove(id: String) async {
         let wasConnection = members.first { $0.id == id }?.memberUserId != nil
         members.removeAll { $0.id == id }
         roster.removeAll { $0.id == id }
-        await transport.removeMember(id: id)
-        if wasConnection { await onConnectionRemoved?() }
+        let ok = await transport.removeMember(id: id)
+        if ok && wasConnection { await onConnectionRemoved?() }
         await refresh()
     }
 
