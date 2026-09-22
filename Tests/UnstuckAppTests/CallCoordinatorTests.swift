@@ -117,11 +117,13 @@ final class FakeEnvironment: CallEnvironment {
     var anchorLive = true
     var withinHours = true
     var callsEnabled = true
+    /// Every instant the hours rule was asked about (receipt, snooze).
+    var hoursCheckedAt: [Date] = []
     var isSignedIn: Bool { signedIn }
     var isSessionKnown: Bool { sessionKnown }
     var isFocusSessionLive: Bool { focusLive }
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool { anchorLive }
-    func isWithinCallHours(_ date: Date) -> Bool { withinHours }
+    func isWithinCallHours(_ date: Date) -> Bool { hoursCheckedAt.append(date); return withinHours }
     var isCallsEnabled: Bool { callsEnabled }
 }
 
@@ -609,6 +611,34 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertNil(sut.active)
     }
 
+    /// "Call me back in two hours" at 20:30 used to be answered ok, then the
+    /// call-back was declined quietly on receipt by this phone's hours
+    /// (audit 2026-09-22, C12). Refused now — and the call stays up.
+    func testSnoozeOutsideCallHoursIsRefusedAndTheCallStaysUp() {
+        answerAndActivate()
+        env.withinHours = false
+        let refused = sut.snoozeActiveCall(minutes: 120)
+        XCTAssertTrue(refused.hasPrefix("error:"), refused)
+        XCTAssertTrue(refused.contains("call hours"), refused)
+        XCTAssertTrue(refused.contains("in 120 minutes"), refused)
+        XCTAssertEqual(env.hoursCheckedAt.last, clock.now.addingTimeInterval(120 * 60), "judged at the call-back's ring time")
+        XCTAssertTrue(controller.requested.isEmpty, "no hang-up")
+        XCTAssertNil(sut.active?.pendingEnd)
+        XCTAssertEqual(sut.active?.phase, .active)
+        XCTAssertEqual(reporter.outcomes, [.answered], "nothing reported")
+        XCTAssertEqual(launcher.stops, 0)
+        // Clamped before it's judged.
+        XCTAssertTrue(sut.snoozeActiveCall(minutes: 999).contains("in 180 minutes"))
+        // Inside the hours it snoozes as before.
+        env.withinHours = true
+        let ok = sut.snoozeActiveCall(minutes: 10)
+        XCTAssertTrue(ok.hasPrefix("ok:"), ok)
+        controller.flush()
+        XCTAssertEqual(reporter.outcomes, [.answered, .snoozed])
+        XCTAssertEqual(reporter.reports.last?.snooze, 10)
+        XCTAssertNil(sut.active)
+    }
+
     func testSnoozeClampsAndRefusesWhenNoCall() {
         XCTAssertEqual(sut.snoozeActiveCall(minutes: 10), "error: no call is active")
         sut.reportIncoming(payload())
@@ -747,6 +777,61 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(reporter.reports.last?.notes, ["voice failed: voice unavailable"])
         XCTAssertEqual(notifier.posted.count, 1)
         XCTAssertEqual(notifier.posted[0].title, "Couldn't start the call — here's what it was about")
+    }
+
+    // MARK: - killed-state launch with NO scene: the push boots the app (C16)
+
+    /// A coordinator as PushAppDelegate builds it (Noop launcher, nothing
+    /// attached), with a recording `bootApp`.
+    private func killedStateCoordinator(boot: @escaping @MainActor () -> Void) -> CallCoordinator {
+        let c = CallCoordinator(provider: provider, controller: controller, environment: env,
+                                launcher: NoopCallVoiceLauncher(), launcherAttached: false,
+                                notifier: notifier, reporter: reporter, clock: clock, bootApp: boot)
+        controller.coordinator = c
+        return c
+    }
+
+    func testAPushBeforeTheAppModelAttachesBootsTheAppAfterTheReport() {
+        env.sessionKnown = false
+        var reportsSeenAtBoot: [Int] = []
+        let c = killedStateCoordinator { reportsSeenAtBoot.append(self.provider.incoming.count) }
+        c.reportIncoming(payload())
+        XCTAssertEqual(reportsSeenAtBoot, [1], "booted once, AFTER the synchronous CallKit report")
+        XCTAssertEqual(c.active?.phase, .ringing)
+        XCTAssertEqual(clock.pending.map(\.seconds), [CallCoordinator.ringTimeout])
+    }
+
+    func testAPushWithTheAppModelAttachedNeverBoots() {
+        var boots = 0
+        let c = killedStateCoordinator { boots += 1 }
+        c.reportIncoming(payload())
+        XCTAssertEqual(boots, 0)
+        XCTAssertEqual(c.active?.phase, .ringing)
+    }
+
+    /// Declined / missed / busy need the reporter's sender too, so every
+    /// push boots — not only an answered one. (Whether the process lives
+    /// long enough to send it is a device matter; see startWithoutScene.)
+    func testAPushDeclinedByAReceiptRuleStillBoots() {
+        env.sessionKnown = false
+        env.callsEnabled = false
+        var boots = 0
+        let c = killedStateCoordinator { boots += 1 }
+        c.reportIncoming(payload())
+        XCTAssertEqual(boots, 1)
+        XCTAssertEqual(reporter.outcomes, [.declined])
+        XCTAssertNil(c.active)
+    }
+
+    func testADuplicatePushBootsOnce() {
+        env.sessionKnown = false
+        var boots = 0
+        let c = killedStateCoordinator { boots += 1 }
+        c.reportIncoming(payload())
+        c.reportIncoming(payload())
+        XCTAssertEqual(boots, 1)
+        XCTAssertEqual(provider.incoming.count, 2, "Apple's report-per-push rule still holds")
+        XCTAssertEqual(c.active?.phase, .ringing)
     }
 
     func testNoopLauncherEndsCallAsFailedWithNotes() {

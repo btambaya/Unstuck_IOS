@@ -45,6 +45,21 @@ struct CallSettingsView: View {
         }
     }
 
+    /// The assistant just booked or changed a call (CallTools.dispatch): is
+    /// the microphone there for it? Asks only while the app is ACTIVE — from
+    /// a lock-screen call or the background the prompt can't show, so it
+    /// answers true and the next foreground asks
+    /// (AppModel.askForCallMicrophoneIfNeeded). Audit 2026-09-22, C13.
+    @MainActor static func microphoneAllowedAfterBooking() async -> Bool {
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted: return true
+        case .denied: return false
+        default:
+            guard UIApplication.shared.applicationState == .active else { return true }
+            return await AVAudioApplication.requestRecordPermission()
+        }
+    }
+
     /// The test call's label + note (the row the button books; the same
     /// label is what a retry cancels first).
     static let testCallLabel = "Test call"
@@ -80,7 +95,7 @@ struct CallSettingsView: View {
 
                 SectionLabel("Calls Unstuck can make on its own").padding(.top, 22).padding(.bottom, 8)
                 proactiveCard
-                Text("All off unless you switch them on. They ring within your allowed hours, on every phone where calls are on.")
+                Text("All off unless you switch them on. Unstuck books them between \(CallSettings.serverWindowStart) and \(CallSettings.serverWindowEnd); this iPhone still declines one outside the allowed hours above, or while Calls is off.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).padding(.top, 10)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -168,7 +183,14 @@ struct CallSettingsView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
-                Toggle("", isOn: Binding(get: { isOn }, set: setOn))
+                Toggle("", isOn: Binding(get: { isOn }, set: { on in
+                    setOn(on)
+                    // A proactive call rings a phone that was never asked
+                    // for the microphone — Calls default on, so the master
+                    // switch's prompt never ran (audit 2026-09-22, C13). Not
+                    // while Calls is off here: this phone declines them.
+                    if on, enabled { Self.ensureMicrophone { granted in micDenied = !granted } }
+                }))
                     .labelsHidden()
                     .tint(theme.palette.primary)
                     .accessibilityLabel(title)
@@ -183,8 +205,23 @@ struct CallSettingsView: View {
                         .labelsHidden()
                 }
             }
+            if isOn, let warning = proactiveWarning(time: time) {
+                Text(warning).font(UFont.sans(12)).foregroundStyle(theme.palette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    /// Will this proactive call ring HERE? Read from the screen's own state,
+    /// so moving the allowed hours or flipping Calls updates it live. The
+    /// pickers used to accept times the dispatcher never books or this phone
+    /// declines every day (audit 2026-09-22, C12). nil `time` = the
+    /// after-block check-in.
+    private func proactiveWarning(time: String?) -> String? {
+        let start = CallSettings.hhmm(windowStart), end = CallSettings.hhmm(windowEnd)
+        guard let time else { return CallSettings.afterBlockWarning(enabled: enabled, start: start, end: end) }
+        return CallSettings.proactiveTimeWarning(time, enabled: enabled, start: start, end: end)
     }
 
     /// One-time: PushKit produced no VoIP token 10 s after a signed-in launch.
@@ -369,7 +406,7 @@ struct CallSettingsView: View {
     }
 
     private static func date(_ hhmm: String) -> Date {
-        let m = CallSettings.minutesOfDay(hhmm) ?? 8 * 60
+        let m = CallSettings.minutesOfDay(hhmm) ?? 6 * 60
         var c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
         c.hour = m / 60; c.minute = m % 60
         return Calendar.current.date(from: c) ?? Date()

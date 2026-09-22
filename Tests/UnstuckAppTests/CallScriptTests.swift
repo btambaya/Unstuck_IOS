@@ -375,15 +375,42 @@ final class CallScriptTests: XCTestCase {
 
     func testHoursAndLeadPersistAndFallBackOnGarbage() {
         withFreshDefaults {
-            XCTAssertEqual(CallSettings.windowStart, "08:00")
-            XCTAssertEqual(CallSettings.windowEnd, "21:00")
+            // The server's window, like Android (audit 2026-09-22, C12).
+            XCTAssertEqual(CallSettings.windowStart, "06:00")
+            XCTAssertEqual(CallSettings.windowEnd, "23:00")
+            XCTAssertEqual(CallSettings.windowStart, CallSettings.serverWindowStart)
+            XCTAssertEqual(CallSettings.windowEnd, CallSettings.serverWindowEnd)
             XCTAssertEqual(CallSettings.defaultLeadMin, 15)
             CallSettings.windowStart = "07:30"; CallSettings.windowEnd = "22:15"; CallSettings.defaultLeadMin = 30
             XCTAssertEqual(CallSettings.windowStart, "07:30")
             XCTAssertEqual(CallSettings.windowEnd, "22:15")
             XCTAssertEqual(CallSettings.defaultLeadMin, 30)
             CallSettings.defaults.set("25:99", forKey: CallSettings.windowStartKey)
-            XCTAssertEqual(CallSettings.windowStart, "08:00", "garbage → default")
+            XCTAssertEqual(CallSettings.windowStart, "06:00", "garbage → default")
+        }
+    }
+
+    /// C13 (audit 2026-09-22): the foreground microphone prompt only when a
+    /// call can actually ring on this phone.
+    func testMicrophonePromptOnlyWhenACallCanRingHere() {
+        withFreshDefaults {
+            // Defaults: Calls on, every proactive call off.
+            XCTAssertTrue(CallSettings.expectsCalls(hasCallRows: true))
+            XCTAssertFalse(CallSettings.expectsCalls(hasCallRows: false))
+            let off = CallProactivePrefs.defaults
+            var p = off; p.morningEnabled = true
+            CallSettings.proactive = p
+            XCTAssertTrue(CallSettings.expectsCalls(hasCallRows: false), "morning call on")
+            p = off; p.eveningEnabled = true
+            CallSettings.proactive = p
+            XCTAssertTrue(CallSettings.expectsCalls(hasCallRows: false), "evening call on")
+            p = off; p.afterBlockEnabled = true
+            CallSettings.proactive = p
+            XCTAssertTrue(CallSettings.expectsCalls(hasCallRows: false), "after-block call on")
+            // Calls off on this iPhone: it declines them, so never ask.
+            CallSettings.enabled = false
+            XCTAssertFalse(CallSettings.expectsCalls(hasCallRows: true))
+            XCTAssertFalse(CallSettings.expectsCalls(hasCallRows: true, enabled: false, proactive: p))
         }
     }
 
@@ -471,6 +498,88 @@ final class CallScriptTests: XCTestCase {
         XCTAssertFalse(CallSettings.isWithinWindow(date(2026, 9, 2, 12, 0), start: "22:00", end: "02:00", calendar: cal))
         XCTAssertTrue(CallSettings.isWithinWindow(date(2026, 9, 2, 3, 0), start: "09:00", end: "09:00", calendar: cal))
         XCTAssertTrue(CallSettings.isWithinWindow(date(2026, 9, 2, 3, 0), start: "junk", end: "09:00", calendar: cal))
+        // The minute form the pickers use is the same rule.
+        XCTAssertTrue(CallSettings.isWithinWindow(minuteOfDay: 1259, start: "08:00", end: "21:00"))
+        XCTAssertFalse(CallSettings.isWithinWindow(minuteOfDay: 1260, start: "08:00", end: "21:00"))
+        XCTAssertTrue(CallSettings.isWithinWindow(minuteOfDay: 60, start: "22:00", end: "02:00"))
+        XCTAssertTrue(CallSettings.isWithinWindow(minuteOfDay: 180, start: "09:00", end: "09:00"))
+    }
+
+    // MARK: will it ring here? (audit 2026-09-22, C12)
+
+    func testDeviceGuardRefusesOutsideThePhonesHoursAndWhenCallsAreOff() {
+        func guardAt(_ h: Int, _ m: Int, enabled: Bool = true, start: String = "08:00", end: String = "21:00") -> String? {
+            CallToolLogic.deviceGuard(date(2026, 9, 2, h, m), enabled: enabled, start: start, end: end, calendar: cal)
+        }
+        XCTAssertNil(guardAt(20, 59))
+        XCTAssertEqual(guardAt(21, 0), "error: 21:00 is outside this iPhone's call hours (08:00–21:00), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls",
+                       "end exclusive, like the receipt rule")
+        XCTAssertNotNil(guardAt(7, 59))
+        XCTAssertNil(guardAt(8, 0))
+        XCTAssertNil(guardAt(23, 30, start: "22:00", end: "02:00"), "overnight window")
+        XCTAssertNil(guardAt(3, 0, start: "09:00", end: "09:00"), "start == end → always")
+        // The switch is checked before the hours.
+        XCTAssertEqual(guardAt(12, 0, enabled: false), "error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first")
+        XCTAssertEqual(guardAt(22, 0, enabled: false), guardAt(12, 0, enabled: false))
+        // The default hours: the server's window, end exclusive on the phone.
+        XCTAssertNil(guardAt(6, 0, start: "06:00", end: "23:00"))
+        XCTAssertNil(guardAt(22, 59, start: "06:00", end: "23:00"))
+        XCTAssertNotNil(guardAt(23, 0, start: "06:00", end: "23:00"))
+    }
+
+    /// dispatch_proactive_calls (072) books at the first 5-minute tick in
+    /// [time, time+10) inside 06:00–23:00 inclusive.
+    func testProactiveRingMinuteIsTheDispatchersTick() {
+        XCTAssertEqual(CallSettings.proactiveRingMinute(8 * 60 + 30), 8 * 60 + 30)
+        XCTAssertEqual(CallSettings.proactiveRingMinute(7 * 60 + 32), 7 * 60 + 35)
+        XCTAssertEqual(CallSettings.proactiveRingMinute(5 * 60 + 51), 6 * 60, "booked at the 06:00 tick")
+        XCTAssertEqual(CallSettings.proactiveRingMinute(5 * 60 + 55), 6 * 60)
+        XCTAssertNil(CallSettings.proactiveRingMinute(5 * 60 + 50), "05:50 and 05:55 ticks are both before 06:00")
+        XCTAssertNil(CallSettings.proactiveRingMinute(5 * 60 + 45))
+        XCTAssertEqual(CallSettings.proactiveRingMinute(22 * 60 + 56), 23 * 60)
+        XCTAssertEqual(CallSettings.proactiveRingMinute(23 * 60), 23 * 60, "inclusive")
+        XCTAssertNil(CallSettings.proactiveRingMinute(23 * 60 + 1))
+        XCTAssertNil(CallSettings.proactiveRingMinute(23 * 60 + 59))
+    }
+
+    func testProactiveTimeWarningCoversTheServerWindowThePhonesHoursAndTheSwitch() {
+        func warn(_ t: String, enabled: Bool = true, start: String = "08:00", end: String = "21:00") -> String? {
+            CallSettings.proactiveTimeWarning(t, enabled: enabled, start: start, end: end)
+        }
+        // Never booked at all — even with Calls off, that's the first thing to say.
+        XCTAssertEqual(warn("05:45"), "Unstuck only calls between 06:00 and 23:00, so a call at 05:45 never rings.")
+        XCTAssertEqual(warn("05:45", enabled: false), warn("05:45"))
+        XCTAssertEqual(warn("23:15"), "Unstuck only calls between 06:00 and 23:00, so a call at 23:15 never rings.")
+        XCTAssertEqual(warn("23:01"), "Unstuck only calls between 06:00 and 23:00, so a call at 23:01 never rings.")
+        // Booked by the server — judged at the minute it really rings.
+        XCTAssertNil(warn("23:00", start: "00:00", end: "00:00"))
+        XCTAssertNil(warn("22:58", start: "00:00", end: "00:00"))
+        XCTAssertNil(warn("06:00", start: "00:00", end: "00:00"))
+        XCTAssertEqual(warn("05:55"), "Unstuck rings this call at about 06:00, outside this iPhone's allowed hours (08:00–21:00), so it's declined here — widen the hours above or pick another time.",
+                       "booked at 06:00, not 'never'")
+        XCTAssertNil(warn("05:55", start: "06:00", end: "23:00"))
+        XCTAssertEqual(warn("07:30"), "Unstuck rings this call at about 07:30, outside this iPhone's allowed hours (08:00–21:00), so it's declined here — widen the hours above or pick another time.")
+        XCTAssertNil(warn("07:58"), "rings at the 08:00 tick")
+        XCTAssertTrue(warn("20:58")?.contains("at about 21:00") == true, "booked at the 21:00 tick, declined every day")
+        XCTAssertTrue(warn("21:30")?.contains("at about 21:30") == true)
+        XCTAssertTrue(warn("20:55", end: "20:56")?.contains("at about 20:56") == true, "call-dispatch may ring a minute later")
+        XCTAssertTrue(warn("23:00", start: "06:00", end: "23:00")?.contains("at about 23:00") == true, "the default end is exclusive")
+        XCTAssertNil(warn("08:30"))
+        XCTAssertNil(warn("18:00"))
+        XCTAssertNil(warn("07:30", start: "07:00"))
+        XCTAssertEqual(warn("08:30", enabled: false), "Calls are off on this iPhone, so this call is declined here — switch them on above.")
+        XCTAssertNil(warn("junk"))
+    }
+
+    func testAfterBlockWarningWhenCallsAreOffOrTheHoursAreNarrower() {
+        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: false, start: "06:00", end: "23:00"),
+                       "Calls are off on this iPhone, so these check-ins are declined here — switch them on above.")
+        XCTAssertNil(CallSettings.afterBlockWarning(enabled: true, start: "06:00", end: "23:00"), "the defaults")
+        XCTAssertNil(CallSettings.afterBlockWarning(enabled: true, start: "05:00", end: "23:30"))
+        XCTAssertNil(CallSettings.afterBlockWarning(enabled: true, start: "00:00", end: "00:00"))
+        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: true, start: "08:00", end: "21:00"),
+                       "This iPhone only takes calls 08:00–21:00, so a check-in after a block that ends outside those hours is declined here.")
+        XCTAssertNotNil(CallSettings.afterBlockWarning(enabled: true, start: "22:00", end: "07:00"), "overnight misses the day")
     }
 
     func testServerWindowInclusive() {
@@ -657,11 +766,26 @@ final class CallToolsTests: XCTestCase {
     /// 2026-09-02 15:00 London.
     private var now: Date { date(2026, 9, 2, 15, 0) }
 
+    /// request_call / update_call read THIS phone's switch + hours
+    /// (CallToolLogic.deviceGuard): a throwaway store keeps them at the
+    /// defaults (on, 06:00–23:00) whatever the simulator's app has saved.
+    private var savedDefaults: UserDefaults!
+    private var suiteName = ""
+
     override func setUp() {
         super.setUp()
         api = FakeAssistantState(); api.today = "2026-09-02"; api.now = "15:00"
         scratch = TurnScratch()
         store = FakeCallStore()
+        suiteName = "CallToolsTests.\(UUID().uuidString)"
+        savedDefaults = CallSettings.defaults
+        CallSettings.defaults = UserDefaults(suiteName: suiteName)!
+    }
+
+    override func tearDown() {
+        CallSettings.defaults = savedDefaults
+        UserDefaults().removePersistentDomain(forName: suiteName)
+        super.tearDown()
     }
 
     private func run(_ name: String, _ args: [String: Any]) async -> String {
@@ -723,6 +847,91 @@ final class CallToolsTests: XCTestCase {
         await expect("request_call", ["label": "DENTIST", "when": "2026-09-02 20:00"], "error: a call is already booked for \"dentist\" at 2026-09-02 18:00 id=r2 — update_call or cancel_call it")
         // Standalone at the SAME minute as r2 with another label → fine (no same-minute rule).
         await expect("request_call", ["label": "call mum", "when": "2026-09-02 18:00"], "ok: call booked 2026-09-02 18:00 \"call mum\" (0 notes) id=new-1")
+    }
+
+    // MARK: this phone's switch + hours (audit 2026-09-22, C12)
+
+    /// "call me at 9pm" used to be answered "ok: call booked", then declined
+    /// quietly on receipt by the phone's hours.
+    func testRequestCallRefusesATimeThisIPhoneWouldDecline() async {
+        CallSettings.windowStart = "08:00"; CallSettings.windowEnd = "21:00"
+        await expect("request_call", ["label": "meds", "when": "2026-09-02 21:00"],
+                     "error: 21:00 is outside this iPhone's call hours (08:00–21:00), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls")
+        let early = await run("request_call", ["label": "meds", "when": "2026-09-03 07:30"])
+        XCTAssertTrue(early.hasPrefix("error: 07:30 is outside this iPhone's call hours"), early)
+        // Task-anchored: block start minus the lead is what's judged.
+        api.tasks = [task("t1", "Evening review")]
+        api.blocks = [CalBlock(id: "b1", taskId: "t1", taskName: "Evening review", startTime: "21:30", durationMinutes: 30, date: "2026-09-02")]
+        let anchored = await run("request_call", ["taskId": "t1", "leadMin": 15])
+        XCTAssertTrue(anchored.hasPrefix("error: 21:15 is outside this iPhone's call hours"), anchored)
+        // The server window still answers first.
+        await expect("request_call", ["label": "meds", "when": "2026-09-03 05:00"],
+                     "error: calls can only be booked between 06:00 and 23:00 — suggest a time inside that window")
+        XCTAssertTrue(store.booked.isEmpty, "nothing is booked on a refusal")
+        await expect("request_call", ["label": "meds", "when": "2026-09-02 20:59"],
+                     "ok: call booked 2026-09-02 20:59 \"meds\" (0 notes) id=new-1")
+    }
+
+    func testRequestCallRefusedWhileCallsAreOffOnThisIPhone() async {
+        CallSettings.enabled = false
+        await expect("request_call", ["label": "dentist", "when": "2026-09-02 18:00"],
+                     "error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first")
+        XCTAssertTrue(store.booked.isEmpty)
+        CallSettings.enabled = true
+        await expect("request_call", ["label": "dentist", "when": "2026-09-02 18:00"],
+                     "ok: call booked 2026-09-02 18:00 \"dentist\" (0 notes) id=new-1")
+    }
+
+    func testUpdateCallRefusesANewTimeOutsideThePhonesHoursButStillEditsNotes() async {
+        CallSettings.windowStart = "08:00"; CallSettings.windowEnd = "21:00"
+        store.rows = [CallRequest(id: "r1", taskId: "t1", blockId: "b1", callAt: CallsClient.iso(date(2026, 9, 2, 18, 0)),
+                                  leadMin: 15, label: "x", notes: ["A"])]
+        let late = await run("update_call", ["callId": "r1", "when": "2026-09-03 21:30"])
+        XCTAssertTrue(late.hasPrefix("error: 21:30 is outside this iPhone's call hours (08:00–21:00)"), late)
+        // Re-anchoring with a lead onto a block that starts too late.
+        api.blocks = [CalBlock(id: "b2", taskId: "t1", taskName: "x", startTime: "21:20", durationMinutes: 30, date: "2026-09-02")]
+        let lead = await run("update_call", ["callId": "r1", "leadMin": 5])
+        XCTAssertTrue(lead.hasPrefix("error: 21:15 is outside this iPhone's call hours"), lead)
+        XCTAssertTrue(store.patches.isEmpty, "nothing written on a refusal")
+        // Notes only: never refused — not even with Calls off here.
+        CallSettings.enabled = false
+        let notes = await run("update_call", ["callId": "r1", "notes": ["A", "B"]])
+        XCTAssertEqual(notes, "ok: updated call \"x\" — 2026-09-02 18:00, 2 notes id=r1")
+        XCTAssertEqual(store.patches.count, 1)
+        XCTAssertNil(store.patches[0].callAt)
+    }
+
+    // MARK: the microphone note (audit 2026-09-22, C13)
+
+    func testBookedCallCarriesAMicrophoneNoteOnlyWhenRefused() {
+        let booked = "ok: call booked 2026-09-03 16:50 \"Speak to James\" (1 note) id=new-1"
+        XCTAssertEqual(CallToolLogic.withMicrophoneNote(booked, micRefused: false), booked)
+        let annotated = CallToolLogic.withMicrophoneNote(booked, micRefused: true)
+        XCTAssertTrue(annotated.hasPrefix(booked))
+        XCTAssertTrue(annotated.hasSuffix(CallToolLogic.micRefusedNote))
+        XCTAssertTrue(annotated.hasPrefix("ok:"))
+        // The receipt (and its Undo id) reads the annotated line the same.
+        let plain = deriveReceipt(name: "request_call", args: ReceiptArgs(), result: booked, tasks: [])
+        XCTAssertNotNil(plain)
+        XCTAssertEqual(deriveReceipt(name: "request_call", args: ReceiptArgs(), result: annotated, tasks: []), plain)
+        XCTAssertEqual(plain?.undo, .cancelCall(id: "new-1"))
+        // update_call too.
+        let updated = "ok: updated call \"Speak to James\" — 2026-09-04 09:00, 2 notes id=r1"
+        let updatedNoted = CallToolLogic.withMicrophoneNote(updated, micRefused: true)
+        XCTAssertEqual(updatedNoted, updated + CallToolLogic.micRefusedNote)
+        let updatedReceipt = deriveReceipt(name: "update_call", args: ReceiptArgs(), result: updated, tasks: [])
+        XCTAssertNotNil(updatedReceipt)
+        XCTAssertEqual(deriveReceipt(name: "update_call", args: ReceiptArgs(), result: updatedNoted, tasks: []), updatedReceipt)
+        // Nothing booked → nothing added.
+        for r in ["error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first",
+                  "ok: no calls booked", "ok: cancelled the call about \"x\" (2026-09-02 18:00)"] {
+            XCTAssertEqual(CallToolLogic.withMicrophoneNote(r, micRefused: true), r)
+            XCTAssertFalse(CallToolLogic.booksACall(r))
+        }
+        XCTAssertTrue(CallToolLogic.booksACall(booked))
+        XCTAssertTrue(CallToolLogic.booksACall(updated))
+        XCTAssertFalse(CallToolLogic.micRefusedNote.contains("\""), "a quote would stretch the receipt's label match")
+        XCTAssertFalse(CallToolLogic.micRefusedNote.contains("—"))
     }
 
     // MARK: update_call / cancel_call

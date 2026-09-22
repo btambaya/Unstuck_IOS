@@ -32,6 +32,9 @@
 // are safe (ring), the outcome reporter buffers until a client is attached,
 // and an answer that lands before the voice launcher is attached waits a
 // short grace (`launcherGrace`) for `attach(launcher:)` before degrading.
+// The push also STARTS the app model (`bootApp` → AppModel.startWithoutScene)
+// right after the report: a launch with no scene (the app was swiped away)
+// never runs RootView's .task, so nothing else would ever attach them.
 
 import Foundation
 import UnstuckSync
@@ -46,7 +49,8 @@ final class CallCoordinator {
             launcher: NoopCallVoiceLauncher(), launcherAttached: false,
             notifier: SystemCallNotifier(), reporter: CallsOutcomeReporter(notifier: SystemCallNotifier()),
             clock: SystemCallClock(),
-            rearmVoip: { VoipPushRegistry.shared.rearm() })
+            rearmVoip: { VoipPushRegistry.shared.rearm() },
+            bootApp: { Task { await AppModel.shared.startWithoutScene() } })
         provider.coordinator = c
         return c
     }()
@@ -101,6 +105,9 @@ final class CallCoordinator {
     private let clock: CallClock
     /// Re-register for VoIP pushes (VoipPushRegistry.rearm in production).
     private let rearmVoip: @MainActor () -> Void
+    /// Start AppModel when a push arrives before it attached —
+    /// AppModel.startWithoutScene in production.
+    private let bootApp: @MainActor () -> Void
 
     private var ringTimer: CallTimer?
     private var graceTimer: CallTimer?
@@ -110,7 +117,8 @@ final class CallCoordinator {
     init(provider: CallProviding, controller: CallControlling, environment: CallEnvironment,
          launcher: CallVoiceLauncher, launcherAttached: Bool = true,
          notifier: CallNotifier, reporter: CallOutcomeReporting, clock: CallClock,
-         rearmVoip: @escaping @MainActor () -> Void = {}) {
+         rearmVoip: @escaping @MainActor () -> Void = {},
+         bootApp: @escaping @MainActor () -> Void = {}) {
         self.provider = provider
         self.controller = controller
         self.environment = environment
@@ -120,6 +128,7 @@ final class CallCoordinator {
         self.reporter = reporter
         self.clock = clock
         self.rearmVoip = rearmVoip
+        self.bootApp = bootApp
     }
 
     // MARK: - attach (late binding from AppModel / the integrator)
@@ -180,6 +189,18 @@ final class CallCoordinator {
         provider.reportIncoming(uuid: session.uuid, callerName: "Unstuck · \(session.label)") { [weak self] error in
             self?.reportCompleted(uuid: session.uuid, error: error)
         }
+
+        // No AppModel attached yet: a VoIP push to an app the user swiped
+        // away relaunches it with NO scene (iOS discarded the session), so
+        // RootView's .task never ran start() — the voice launcher and the
+        // outcome sender were never attached, the answer waited out the grace
+        // and failed, and the server re-rang the row (audit 2026-09-22, C16).
+        // Start it here, after the report (Apple's rule) and for every push
+        // outcome. Fire-and-forget: the rules below run on the killed-state
+        // environment and the attaches land a moment later, inside the grace.
+        // Idempotent where a scene does connect (start() guards on its
+        // coordinator); a duplicate push returned above, so it never boots twice.
+        if !environment.isSessionKnown { bootApp() }
 
         // Nobody signed in (a reactive sign-out left the VoIP token registered):
         // drop it at once — no ring, no outcome (no JWT to report with), and
@@ -418,8 +439,22 @@ final class CallCoordinator {
             return "ok: I'll call back in \(m) minutes — say a quick goodbye; the call ends now"
         }
         let m = min(180, max(1, minutes))
+        if let e = snoozeRefusal(minutes: m) { return e }
         endActiveCall(.snoozed(minutes: m))
         return "ok: I'll call back in \(m) minutes — say a quick goodbye; the call ends now"
+    }
+
+    /// A call-back is a booking too: "call me back in two hours" at 20:30
+    /// was answered ok, then declined quietly on receipt at 22:30 by this
+    /// phone's hours (audit 2026-09-22, C12). Refused here instead, with the
+    /// call left up. Only this CallKit path refuses: the server applies no
+    /// window to snoozes, and fallback B (the alert transport) never applies
+    /// the phone's hours, so a call-back there does arrive.
+    private func snoozeRefusal(minutes: Int) -> String? {
+        let m = min(180, max(1, minutes))
+        let at = clock.now.addingTimeInterval(TimeInterval(m * 60))
+        guard !environment.isWithinCallHours(at) else { return nil }
+        return "error: a call-back in \(m) minutes would ring at \(CallSettings.hhmm(at)), outside this iPhone's call hours (\(CallSettings.windowStart)–\(CallSettings.windowEnd)), so it would be declined — ask them for a shorter wait, or for a time inside those hours to book with request_call"
     }
 
     /// Fallback B: the user tapped the time-sensitive "call" alert (or its

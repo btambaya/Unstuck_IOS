@@ -13,6 +13,7 @@
 //  • the owner's local members merge after share / list;
 //  • the refused shared-list RPC message.
 
+import UIKit
 import XCTest
 import UnstuckCore
 import UnstuckData
@@ -72,6 +73,15 @@ final class WakeWindowSampleToSendTests: XCTestCase {
         let stale = sample("2026-06-07", "06:10")
         let now = sample("2026-06-08", "07:30")
         XCTAssertEqual(AppModel.wakeWindowSampleToSend(lastRecordedDate: nil, pending: stale, now: now), now)
+    }
+
+    /// A call ringing a locked phone boots the model in the background
+    /// (startWithoutScene, audit 2026-09-22 C16) — that's not the day's
+    /// first input.
+    func testABackgroundLaunchIsNeverTheDaysFirstInput() {
+        XCTAssertFalse(AppModel.isWakeSignal(.background))
+        XCTAssertTrue(AppModel.isWakeSignal(.active))
+        XCTAssertTrue(AppModel.isWakeSignal(.inactive))
     }
 }
 
