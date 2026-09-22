@@ -516,6 +516,9 @@ final class AppModel {
         guard !onboarded else { return }
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
+        // A first sign-in's call rows can land before this pin, and the
+        // microphone ask is gated on it (audit 2026-09-22, C13).
+        askForCallMicrophoneIfNeeded()
     }
 
     /// Once per sign-in (hydrate hook): the account-wide preferences the
@@ -855,10 +858,10 @@ final class AppModel {
     /// C16). A no-op once start() has run — where a scene does connect, its
     /// .task simply finds the work done. In the background the foreground
     /// pull stays off (no 60 s ticker racing the call's voice socket); the
-    /// scenePhase .active handler turns it on when a scene connects. Outcome
-    /// delivery for a DECLINED / MISSED ring on a killed app still has no
-    /// background time of its own (nothing keeps the process up once
-    /// CallKit's call ends) — the reporter keeps it queued for the next attach.
+    /// scenePhase .active handler turns it on when a scene connects. A
+    /// DECLINED / MISSED ring on a killed app ends CallKit's call at once;
+    /// the outcome reporter holds background time from that report until it
+    /// is sent, which covers this boot too (CallsOutcomeReporter).
     func startWithoutScene() async {
         guard coordinator == nil else { return }
         #if DEBUG

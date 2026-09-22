@@ -375,7 +375,9 @@ struct CallSettingsView: View {
             return
         }
         if !CallSettings.isWithinWindow(at) {
-            testState = .failed("\(CallSettings.hhmm(at)) is outside your allowed hours (\(CallSettings.windowStart)–\(CallSettings.windowEnd)) — the phone would decline it quietly. Widen the hours above to try it now.")
+            let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
+                                                refusing: CallSettings.minuteOfDay(at))
+            testState = .failed("\(CallSettings.hhmm(at)) is outside your allowed hours (\(hours)) — the phone would decline it quietly. Widen the hours above to try it now.")
             return
         }
         testState = .booking

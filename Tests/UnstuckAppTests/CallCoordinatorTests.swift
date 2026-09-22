@@ -1079,6 +1079,96 @@ final class CallsOutcomeReporterTests: XCTestCase {
         XCTAssertTrue(relaunch.queue.isEmpty)
     }
 
+    // MARK: background time while an outcome waits (audit 2026-09-22, C16)
+
+    @MainActor
+    final class FakeBackgroundTime {
+        var begun = 0
+        var released = 0
+        var expire: (@MainActor @Sendable () -> Void)?
+        func make() -> CallsOutcomeReporter.BackgroundTime {
+            { [self] expired in
+                begun += 1
+                expire = expired
+                return { [self] in released += 1 }
+            }
+        }
+    }
+
+    @MainActor
+    final class RetryGate { var open = false }
+
+    /// A ring declined on a killed app: the report is queued before AppModel
+    /// has attached a sender, and CallKit's call is already over — the hold
+    /// is what keeps the process up until the boot attaches and it's sent.
+    func testAReportHoldsBackgroundTimeFromTheMomentItIsQueuedUntilItIsSent() async {
+        let bg = FakeBackgroundTime()
+        let r = CallsOutcomeReporter(defaults: suite, backgroundTime: bg.make(), sleep: { _ in })
+        r.report(callId: "c1", callKitId: uuid, outcome: .declined, snoozeMinutes: nil, outcomeNotes: nil)
+        XCTAssertEqual(bg.begun, 1, "held before any sender exists")
+        XCTAssertEqual(bg.released, 0)
+        r.report(callId: "c2", callKitId: nil, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        XCTAssertEqual(bg.begun, 1, "one hold for the whole queue")
+        let rec = Recorder()
+        r.attach(send: rec.sender())
+        await settle(r)
+        XCTAssertEqual(rec.sent.map(\.callId), ["c1", "c2"])
+        XCTAssertEqual(bg.released, 1, "released once the queue is empty")
+        // The next report holds again.
+        r.report(callId: "c3", callKitId: nil, outcome: .done, snoozeMinutes: nil, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(bg.begun, 2)
+        XCTAssertEqual(bg.released, 2)
+    }
+
+    func testAFailedCycleKeepsHoldingUntilTheRetryLands() async {
+        let bg = FakeBackgroundTime()
+        // The backoff between attempts is instant; the retryLater wait holds
+        // until the test has looked.
+        let gate = RetryGate()
+        let firstRetry = CallsOutcomeReporter.retryLater[0]
+        let r = CallsOutcomeReporter(defaults: suite, backgroundTime: bg.make(), sleep: { s in
+            guard s >= firstRetry else { return }
+            while await MainActor.run(body: { !gate.open }) { try? await Task.sleep(nanoseconds: 1_000_000) }
+        })
+        let rec = Recorder(failures: 3)
+        r.attach(send: rec.sender())
+        r.report(callId: "c1", callKitId: uuid, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(r.queue.count, 1, "the first cycle gave up")
+        XCTAssertEqual(bg.released, 0, "still queued: held for the retry")
+        gate.open = true
+        let deadline = Date().addingTimeInterval(5)
+        while r.queue.count == 1, Date() < deadline { await Task.yield(); await settle(r) }
+        XCTAssertEqual(rec.sent.map(\.callId), ["c1"])
+        XCTAssertEqual(bg.begun, 1)
+        XCTAssertEqual(bg.released, 1)
+    }
+
+    func testAnExpiryLetsTheNextReportHoldAgainAndSignOutLetsGo() {
+        let bg = FakeBackgroundTime()
+        let r = CallsOutcomeReporter(defaults: suite, backgroundTime: bg.make(), sleep: { _ in })
+        r.report(callId: "c1", callKitId: uuid, outcome: .declined, snoozeMinutes: nil, outcomeNotes: nil)
+        XCTAssertEqual(bg.begun, 1)
+        // iOS takes the time back before a sender attached: the next report
+        // asks for more instead of believing it still holds some.
+        bg.expire?()
+        r.report(callId: "c2", callKitId: nil, outcome: .missed, snoozeMinutes: nil, outcomeNotes: nil)
+        XCTAssertEqual(bg.begun, 2)
+        XCTAssertEqual(bg.released, 0)
+        r.discardAll()
+        XCTAssertEqual(bg.released, 1, "sign-out empties the queue and lets go")
+    }
+
+    func testNoBackgroundTimeIsHeldWithoutAnythingQueued() async {
+        let bg = FakeBackgroundTime()
+        let r = CallsOutcomeReporter(defaults: suite, backgroundTime: bg.make(), sleep: { _ in })
+        r.attach(send: Recorder().sender())
+        r.discardAll()
+        XCTAssertEqual(bg.begun, 0)
+        XCTAssertEqual(bg.released, 0)
+    }
+
     func testShouldNotifyIsTheInverseOfRetry() {
         XCTAssertTrue(CallsOutcomeReporter.shouldNotify(retry: false))
         XCTAssertFalse(CallsOutcomeReporter.shouldNotify(retry: true))

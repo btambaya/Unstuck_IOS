@@ -116,8 +116,7 @@ enum CallSettings {
     /// (e.g. 22:00–02:00).
     static func isWithinWindow(_ date: Date, start: String = windowStart, end: String = windowEnd,
                                calendar: Calendar = .current) -> Bool {
-        let c = calendar.dateComponents([.hour, .minute], from: date)
-        return isWithinWindow(minuteOfDay: (c.hour ?? 0) * 60 + (c.minute ?? 0), start: start, end: end)
+        isWithinWindow(minuteOfDay: minuteOfDay(date, calendar: calendar), start: start, end: end)
     }
 
     /// The same rule on minutes since midnight (the HH:MM pickers).
@@ -126,6 +125,17 @@ enum CallSettings {
         if s == e { return true }
         if s < e { return t >= s && t < e }
         return t >= s || t < e
+    }
+
+    /// The allowed hours as a refusal names them, "08:00–21:00". The end is
+    /// exclusive, so refusing the end minute itself read as a contradiction —
+    /// "23:00 is outside this iPhone's call hours (06:00–23:00)" on untouched
+    /// defaults, where the server and the web take 23:00 — so that one case
+    /// also says the last minute that rings (audit 2026-09-22, C12).
+    static func hoursLabel(start: String, end: String, refusing t: Int) -> String {
+        guard let e = minutesOfDay(end), t == e else { return "\(start)–\(end)" }
+        let last = (e + 24 * 60 - 1) % (24 * 60)
+        return "\(start)–\(end); the latest it rings is \(String(format: "%02d:%02d", last / 60, last % 60))"
     }
 
     // MARK: will it ring here? (audit 2026-09-22, C12)
@@ -158,7 +168,7 @@ enum CallSettings {
             return "Calls are off on this iPhone, so this call is declined here — switch them on above."
         }
         if let outside = [ring, ring + 1].first(where: { !isWithinWindow(minuteOfDay: $0, start: start, end: end) }) {
-            return "Unstuck rings this call at about \(String(format: "%02d:%02d", outside / 60, outside % 60)), outside this iPhone's allowed hours (\(start)–\(end)), so it's declined here — widen the hours above or pick another time."
+            return "Unstuck rings this call at about \(String(format: "%02d:%02d", outside / 60, outside % 60)), outside this iPhone's allowed hours (\(hoursLabel(start: start, end: end, refusing: outside))), so it's declined here — widen the hours above or pick another time."
         }
         return nil
     }
@@ -198,6 +208,11 @@ enum CallSettings {
         let p = hhmm.split(separator: ":").compactMap { Int($0) }
         guard p.count == 2, (0..<24).contains(p[0]), (0..<60).contains(p[1]) else { return nil }
         return p[0] * 60 + p[1]
+    }
+
+    static func minuteOfDay(_ date: Date, calendar: Calendar = .current) -> Int {
+        let c = calendar.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 
     static func hhmm(_ date: Date, calendar: Calendar = .current) -> String {

@@ -52,7 +52,9 @@ struct CallMeSection: View {
         guard CallSettings.enabled else {
             return "Calls are off on this iPhone, so it would decline this call. Switch them on in Settings › Calls."
         }
-        return "\(CallSettings.hhmm(callAt)) is outside this iPhone's call hours (\(CallSettings.windowStart)–\(CallSettings.windowEnd)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Calls."
+        let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
+                                            refusing: CallSettings.minuteOfDay(callAt))
+        return "\(CallSettings.hhmm(callAt)) is outside this iPhone's call hours (\(hours)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Calls."
     }
     /// Booking, or changing the ring time (lead / slot), meets the hint;
     /// a notes-only edit of an existing row doesn't — update_call's rule.

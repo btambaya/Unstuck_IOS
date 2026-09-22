@@ -47,7 +47,9 @@ final class CallCoordinator {
             provider: provider, controller: CallKitController(),
             environment: AppCallEnvironment(model: nil),
             launcher: NoopCallVoiceLauncher(), launcherAttached: false,
-            notifier: SystemCallNotifier(), reporter: CallsOutcomeReporter(notifier: SystemCallNotifier()),
+            notifier: SystemCallNotifier(),
+            reporter: CallsOutcomeReporter(notifier: SystemCallNotifier(),
+                                           backgroundTime: CallsOutcomeReporter.systemBackgroundTime),
             clock: SystemCallClock(),
             rearmVoip: { VoipPushRegistry.shared.rearm() },
             bootApp: { Task { await AppModel.shared.startWithoutScene() } })
@@ -454,7 +456,9 @@ final class CallCoordinator {
         let m = min(180, max(1, minutes))
         let at = clock.now.addingTimeInterval(TimeInterval(m * 60))
         guard !environment.isWithinCallHours(at) else { return nil }
-        return "error: a call-back in \(m) minutes would ring at \(CallSettings.hhmm(at)), outside this iPhone's call hours (\(CallSettings.windowStart)–\(CallSettings.windowEnd)), so it would be declined — ask them for a shorter wait, or for a time inside those hours to book with request_call"
+        let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
+                                            refusing: CallSettings.minuteOfDay(at))
+        return "error: a call-back in \(m) minutes would ring at \(CallSettings.hhmm(at)), outside this iPhone's call hours (\(hours)), so it would be declined — ask them for a shorter wait, or for a time inside those hours to book with request_call"
     }
 
     /// Fallback B: the user tapped the time-sensitive "call" alert (or its

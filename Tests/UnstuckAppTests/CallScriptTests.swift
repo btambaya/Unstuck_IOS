@@ -512,9 +512,9 @@ final class CallScriptTests: XCTestCase {
             CallToolLogic.deviceGuard(date(2026, 9, 2, h, m), enabled: enabled, start: start, end: end, calendar: cal)
         }
         XCTAssertNil(guardAt(20, 59))
-        XCTAssertEqual(guardAt(21, 0), "error: 21:00 is outside this iPhone's call hours (08:00–21:00), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls",
-                       "end exclusive, like the receipt rule")
-        XCTAssertNotNil(guardAt(7, 59))
+        XCTAssertEqual(guardAt(21, 0), "error: 21:00 is outside this iPhone's call hours (08:00–21:00; the latest it rings is 20:59), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls",
+                       "end exclusive, like the receipt rule — and said so, since 21:00 is the end it names")
+        XCTAssertEqual(guardAt(7, 59), "error: 07:59 is outside this iPhone's call hours (08:00–21:00), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls")
         XCTAssertNil(guardAt(8, 0))
         XCTAssertNil(guardAt(23, 30, start: "22:00", end: "02:00"), "overnight window")
         XCTAssertNil(guardAt(3, 0, start: "09:00", end: "09:00"), "start == end → always")
@@ -524,7 +524,23 @@ final class CallScriptTests: XCTestCase {
         // The default hours: the server's window, end exclusive on the phone.
         XCTAssertNil(guardAt(6, 0, start: "06:00", end: "23:00"))
         XCTAssertNil(guardAt(22, 59, start: "06:00", end: "23:00"))
-        XCTAssertNotNil(guardAt(23, 0, start: "06:00", end: "23:00"))
+        XCTAssertEqual(guardAt(23, 0, start: "06:00", end: "23:00"), "error: 23:00 is outside this iPhone's call hours (06:00–23:00; the latest it rings is 22:59), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls",
+                       "the server takes 23:00, the phone doesn't — never '23:00 is outside 06:00–23:00' alone")
+    }
+
+    /// The end is exclusive, so a refusal of the end minute itself names the
+    /// last minute that rings; any other refused minute gets the plain hours.
+    func testHoursLabelNamesTheLastMinuteOnlyWhenTheEndItselfIsRefused() {
+        XCTAssertEqual(CallSettings.hoursLabel(start: "06:00", end: "23:00", refusing: 23 * 60),
+                       "06:00–23:00; the latest it rings is 22:59")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "06:00", end: "23:00", refusing: 23 * 60 + 30), "06:00–23:00")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "06:00", end: "23:00", refusing: 5 * 60 + 59), "06:00–23:00")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "22:00", end: "02:00", refusing: 2 * 60),
+                       "22:00–02:00; the latest it rings is 01:59", "overnight")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "08:00", end: "00:00", refusing: 0),
+                       "08:00–00:00; the latest it rings is 23:59", "an end at midnight")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "08:00", end: "junk", refusing: 0), "08:00–junk")
+        XCTAssertEqual(CallSettings.minuteOfDay(date(2026, 9, 2, 21, 15), calendar: cal), 21 * 60 + 15)
     }
 
     /// dispatch_proactive_calls (072) books at the first 5-minute tick in
@@ -558,12 +574,16 @@ final class CallScriptTests: XCTestCase {
         XCTAssertEqual(warn("05:55"), "Unstuck rings this call at about 06:00, outside this iPhone's allowed hours (08:00–21:00), so it's declined here — widen the hours above or pick another time.",
                        "booked at 06:00, not 'never'")
         XCTAssertNil(warn("05:55", start: "06:00", end: "23:00"))
-        XCTAssertEqual(warn("07:30"), "Unstuck rings this call at about 07:30, outside this iPhone's allowed hours (08:00–21:00), so it's declined here — widen the hours above or pick another time.")
+        XCTAssertEqual(warn("07:30"), "Unstuck rings this call at about 07:30, outside this iPhone's allowed hours (08:00–21:00), so it's declined here — widen the hours above or pick another time.",
+                       "not the end minute: the plain hours")
         XCTAssertNil(warn("07:58"), "rings at the 08:00 tick")
-        XCTAssertTrue(warn("20:58")?.contains("at about 21:00") == true, "booked at the 21:00 tick, declined every day")
+        XCTAssertEqual(warn("20:58"), "Unstuck rings this call at about 21:00, outside this iPhone's allowed hours (08:00–21:00; the latest it rings is 20:59), so it's declined here — widen the hours above or pick another time.",
+                       "booked at the 21:00 tick, declined every day")
         XCTAssertTrue(warn("21:30")?.contains("at about 21:30") == true)
-        XCTAssertTrue(warn("20:55", end: "20:56")?.contains("at about 20:56") == true, "call-dispatch may ring a minute later")
-        XCTAssertTrue(warn("23:00", start: "06:00", end: "23:00")?.contains("at about 23:00") == true, "the default end is exclusive")
+        XCTAssertTrue(warn("20:55", end: "20:56")?.contains("at about 20:56, outside this iPhone's allowed hours (08:00–20:56; the latest it rings is 20:55)") == true,
+                      "call-dispatch may ring a minute later")
+        XCTAssertEqual(warn("23:00", start: "06:00", end: "23:00"), "Unstuck rings this call at about 23:00, outside this iPhone's allowed hours (06:00–23:00; the latest it rings is 22:59), so it's declined here — widen the hours above or pick another time.",
+                       "the default end is exclusive")
         XCTAssertNil(warn("08:30"))
         XCTAssertNil(warn("18:00"))
         XCTAssertNil(warn("07:30", start: "07:00"))
@@ -856,7 +876,7 @@ final class CallToolsTests: XCTestCase {
     func testRequestCallRefusesATimeThisIPhoneWouldDecline() async {
         CallSettings.windowStart = "08:00"; CallSettings.windowEnd = "21:00"
         await expect("request_call", ["label": "meds", "when": "2026-09-02 21:00"],
-                     "error: 21:00 is outside this iPhone's call hours (08:00–21:00), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls")
+                     "error: 21:00 is outside this iPhone's call hours (08:00–21:00; the latest it rings is 20:59), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls")
         let early = await run("request_call", ["label": "meds", "when": "2026-09-03 07:30"])
         XCTAssertTrue(early.hasPrefix("error: 07:30 is outside this iPhone's call hours"), early)
         // Task-anchored: block start minus the lead is what's judged.
