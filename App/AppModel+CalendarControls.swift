@@ -63,6 +63,9 @@ extension AppModel {
     /// pull didn't finish (audit 2026-09-22, C18).
     @discardableResult
     func calendarDidConnect(_ response: CalendarClient.ConnectResponse) async -> Bool {
+        // First, so a /connections answer read before the server stored this
+        // connection can't land after the seed and delete it again.
+        await coordinator?.noteLocalConnectionsWrite()
         if let db, ((try? db.fetchById(CalendarConnection.self, id: response.id)) ?? nil) == nil {
             try? db.save(response.localConnection(connectedAt: Self.isoNow()))
         }
@@ -89,6 +92,9 @@ extension AppModel {
                 try? await calendar.disconnect(connectionId: conn.id)
                 // Drop the connection row + its external mirror blocks locally.
                 try? db.deleteById(CalendarConnection.self, id: conn.id)
+                // A /connections answer read before the revoke must not put
+                // the row back (audit 2026-09-22, C18).
+                await self.coordinator?.noteLocalConnectionsWrite()
                 let external = ((try? db.fetchExternalCalBlocks()) ?? [])
                     .filter { $0.externalConnectionId == conn.id }
                 for b in external {
@@ -97,10 +103,10 @@ extension AppModel {
             }
             await self.coordinator?.resetCalendarStatus()
             self.calendarSyncStatus = nil
-            // Re-read the server's post-disconnect list: a pull already in
-            // flight when Disconnect was tapped mirrors a /connections answer
-            // read before the revoke and puts the row (and its meetings) back
-            // (audit 2026-09-22, C18).
+            // Re-read the server's post-disconnect list: a pull whose
+            // /connections answer landed between the revoke and the local
+            // delete can still be importing that account's meetings; with no
+            // connection left this pull purges them (audit 2026-09-22, C18).
             await self.coordinator?.pullCalendar()
         }
     }

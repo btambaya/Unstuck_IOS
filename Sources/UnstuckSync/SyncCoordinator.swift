@@ -46,6 +46,30 @@ final class MutableFlag: @unchecked Sendable {
     }
 }
 
+/// Orders the /connections answers pullCalendar mirrors into
+/// calendar_connections. Pulls overlap (a foreground, sign-in, "Sync now", the
+/// post-connect and post-disconnect pulls), so an answer read BEFORE a server
+/// connect / revoke can land after a newer read — or after the app's own
+/// connect seed / disconnect delete — and write the old list back. Only an
+/// answer newer than everything already applied is taken (audit 2026-09-22,
+/// C18).
+struct CalendarConnectionsReadGate: Sendable {
+    private var sent = 0
+    private var applied = 0
+    /// A /connections request is about to go out: its generation.
+    mutating func begin() -> Int { sent += 1; return sent }
+    /// The answer to read `generation` arrived: true = apply it (and remember
+    /// it), false = a newer read or a local write already superseded it.
+    mutating func admit(_ generation: Int) -> Bool {
+        guard generation > applied else { return false }
+        applied = generation
+        return true
+    }
+    /// The app wrote calendar_connections itself: every read already sent is
+    /// older than that write.
+    mutating func supersedeReadsInFlight() { applied = sent }
+}
+
 public actor SyncCoordinator {
     // Sendable + immutable → safe to read synchronously from any actor
     // (the app's @MainActor UI reaches these directly).
@@ -313,6 +337,26 @@ public actor SyncCoordinator {
     /// How long a 429 silences the pull.
     static let calendarRateLimitBackoff: TimeInterval = 15 * 60
 
+    private var connectionsGate = CalendarConnectionsReadGate()
+
+    /// The app just wrote calendar_connections itself (the connect seed, a
+    /// disconnect's local delete): a /connections answer already in flight
+    /// was read before that and must not overwrite it (audit 2026-09-22, C18).
+    public func noteLocalConnectionsWrite() {
+        connectionsGate.supersedeReadsInFlight()
+    }
+
+    /// The server's connection rows differ from the stored ones in anything
+    /// but `lastSyncCursor`. /events re-stamps that cursor on every pull and
+    /// nothing on iOS reads it, so comparing it rewrote the table (and re-fired
+    /// its observers) on every foreground (audit 2026-09-22, C18).
+    static func connectionsChanged(_ remote: [CalendarConnection], from local: [CalendarConnection]) -> Bool {
+        func comparable(_ rows: [CalendarConnection]) -> [CalendarConnection] {
+            rows.map { var c = $0; c.lastSyncCursor = nil; return c }.sorted { $0.id < $1.id }
+        }
+        return comparable(remote) != comparable(local)
+    }
+
     /// Pull external Google events for [-7d, +30d] and reconcile them into
     /// local EXTERNAL g_ blocks — port of Android SyncCoordinator.pullCalendar.
     /// The own-event + all-day filters and the keep-set deletion reconcile
@@ -323,13 +367,15 @@ public actor SyncCoordinator {
     /// otherwise, and a 401 / invalid_grant flags it for "Reconnect Google".
     /// Also mirrors the server's connection list into the local
     /// calendar_connections table (the polling refresh RealtimeMirror relies
-    /// on). Returns false when /connections or /events could not be read (or
-    /// Google rate-limited us) — "Sync now" says so instead of ending silently.
+    /// on). Returns false when /connections or /events could not be read, or
+    /// Google answered for none of the connections (rate limit / outage) —
+    /// "Sync now" says so instead of ending silently.
     @discardableResult
     public func pullCalendar() async -> Bool {
         guard let uid = auth.currentUserId else { return true }
         if let until = calendarBackoffUntil, until > Date() { return true }
         let statuses: [CalendarClient.ConnectionStatus]
+        let generation = connectionsGate.begin()
         do { statuses = try await calendar.listConnectionStatuses() } catch { return false }
         // Every write below re-checks the user first: a sign-out or a user
         // switch can run on this actor at any suspension (the request above,
@@ -337,18 +383,20 @@ public actor SyncCoordinator {
         // rows every hydrate keeps — must never land in, or be deleted from,
         // the next user's store (audit 2026-09-22, C18).
         guard auth.currentUserId == uid else { return true }
+        // An answer read before a newer one (or before the app's own connect
+        // seed / disconnect delete) was already applied: it would put the old
+        // list back — and purge meetings a newer pull just imported. That
+        // newer read covers this pull (audit 2026-09-22, C18).
+        guard connectionsGate.admit(generation) else { return true }
         // calendar_connections is in neither realtime nor the catch-up, so
         // without this an in-session connect (or a disconnect on web/Android)
         // never reached the local table the bar and googleConnection(for:)
         // read until the next cold launch. Server-canonical like the hydrate,
-        // an empty list included; skipped when unchanged so a foreground
-        // doesn't re-fire every observer. A pull already in flight when
-        // Disconnect is tapped can still put the row back; disconnectCalendar
-        // re-pulls afterwards to overwrite it (audit 2026-09-22, C18).
-        let remoteConnections = statuses.map(\.connection).sorted { $0.id < $1.id }
-        let localConnections = ((try? Repository<CalendarConnection>(db, orderColumn: "connectedAt").all()) ?? [])
-            .sorted { $0.id < $1.id }
-        if remoteConnections != localConnections {
+        // an empty list included; skipped when only the sync cursor moved
+        // (audit 2026-09-22, C18).
+        let remoteConnections = statuses.map(\.connection)
+        let localConnections = (try? Repository<CalendarConnection>(db, orderColumn: "connectedAt").all()) ?? []
+        if Self.connectionsChanged(remoteConnections, from: localConnections) {
             try? db.replaceAll(CalendarConnection.self, with: remoteConnections)
         }
         guard !statuses.isEmpty else {
@@ -420,8 +468,14 @@ public actor SyncCoordinator {
             guard auth.currentUserId == uid else { return true }
             try? await write.deleteCalBlock(id: id, nowISO: now)
         }
+        guard auth.currentUserId == uid else { return true }
         publishCalendarStatus(status)
-        return true
+        // Google itself failed for every connection (429 / 5xx / 403 /
+        // unreachable) — the function still answers 200 with those in
+        // `failures`, so this used to end on "Synced" with no meetings. The
+        // back-off above is already set for a 429, which is what picks "Google
+        // is busy" over the connectivity caption (audit 2026-09-22, C18).
+        return !pull.readNothing(from: statuses.map(\.connection))
     }
 
     private func publishCalendarStatus(_ status: CalendarSyncStatus) {
@@ -567,7 +621,13 @@ public actor SyncCoordinator {
             // Cold start, after hydrate: seed the cursors and pick up anything
             // written between the hydrate's reads and the subscriptions landing.
             await freshness.report(.coldStart)
-            await pullCalendar()   // ingest Google events if connected (spec §1.7 step 4, best-effort)
+            // Ingest Google events if connected (spec §1.7 step 4, best-effort)
+            // OFF the auth loop: the pull now really waits on the network and
+            // on Google, and the loop handles one event at a time, so awaiting
+            // it here held a sign-out's teardown (and every later auth event)
+            // for as long as Google took. Its captured-uid guards make a late
+            // or overlapping pull safe (audit 2026-09-22, C18).
+            Task { [weak self] in _ = await self?.pullCalendar() }
 
         case .signedOut:
             await freshness.setUser(nil)

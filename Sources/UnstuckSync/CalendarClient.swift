@@ -157,6 +157,24 @@ public struct CalendarClient: Sendable {
         public init(events: [ExternalEvent], allDayEventIds: Set<String>, failures: [PullFailure]) {
             self.events = events; self.allDayEventIds = allDayEventIds; self.failures = failures
         }
+
+        /// True when Google answered for NONE of `connections`: each failed
+        /// whole (token mint / unreachable — calendarId "*") or on every
+        /// selected calendar, and not only for a dead token (the bar already
+        /// offers "Reconnect Google" for that). calendar-sync reports Google's
+        /// 429 / 5xx / 403 inside a 200's `failures`, never as an HTTP error,
+        /// so this is how "Sync now" learns it read nothing. One calendar
+        /// failing next to a readable one is not "nothing" (audit 2026-09-22,
+        /// C18).
+        public func readNothing(from connections: [CalendarConnection]) -> Bool {
+            guard !connections.isEmpty, !failures.isEmpty, !failures.allSatisfy(\.needsReauth) else { return false }
+            return connections.allSatisfy { conn in
+                let own = failures.filter { $0.connectionId == conn.id }
+                if own.contains(where: { ($0.calendarId ?? "*") == "*" }) { return true }
+                let failedCalendars = Set(own.compactMap(\.calendarId))
+                return !own.isEmpty && conn.selectedCalendarIds.allSatisfy(failedCalendars.contains)
+            }
+        }
     }
 
     /// An event plus the server's explicit `allDay` flag (the model has no slot

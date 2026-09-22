@@ -1,8 +1,8 @@
 // The calendar-sync failure verdicts the pull + push paths key on
 // (CalendarClient.classify), the per-connection `failures[]` flags, the
 // /connections row shape and the body-less GETs (a URLProtocol stub, no
-// network, no keychain), and the wake-window sample the first foreground of a
-// local day records.
+// network, no keychain), the connections mirror's compare + read ordering,
+// and the wake-window sample the first foreground of a local day records.
 
 import XCTest
 import Supabase
@@ -45,6 +45,42 @@ final class CalendarClientVerdictTests: XCTestCase {
         let flaky = CalendarClient.PullFailure(connectionId: "c", status: 503, reason: "upstream")
         XCTAssertFalse(flaky.needsReauth)
         XCTAssertFalse(flaky.rateLimited)
+    }
+
+    /// calendar-sync answers 200 even when Google failed every calendar, so
+    /// the pull must read "Google answered for nobody" out of `failures` —
+    /// else "Sync now" ends on "Synced" with no meetings (audit 2026-09-22, C18).
+    func testReadNothingOnlyWhenGoogleAnsweredForNoConnection() {
+        typealias F = CalendarClient.PullFailure
+        func pull(_ failures: [F]) -> CalendarClient.CalendarPull {
+            CalendarClient.CalendarPull(events: [], allDayEventIds: [], failures: failures)
+        }
+        let c1 = Self.serverConnection   // primary + team@group.calendar.google.com
+        let c2 = CalendarConnection(id: "c2", provider: .google, accountEmail: "d@e.f", displayName: "d@e.f",
+                                    selectedCalendarIds: ["primary"], colorSlot: 1, connectedAt: "T")
+        let team = "team@group.calendar.google.com"
+
+        XCTAssertFalse(pull([]).readNothing(from: [c1]), "a clean pull")
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: team, status: 404, reason: "not_found")])
+            .readNothing(from: [c1]), "one calendar failing next to a readable one still imported")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "primary", status: 429, reason: "rate_limited"),
+                            F(connectionId: "c1", calendarId: team, status: 429, reason: "rate_limited")])
+            .readNothing(from: [c1]), "Google rate-limited every selected calendar")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "*", status: 0, reason: "unreachable")])
+            .readNothing(from: [c1]), "the whole connection failed (token mint / network)")
+        XCTAssertTrue(pull([F(connectionId: "c1", status: 503)]).readNothing(from: [c1]),
+                      "no calendarId = the whole connection")
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: "*", status: 503, reason: "http_503")])
+            .readNothing(from: [c1, c2]), "c2 was read")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "*", status: 503, reason: "http_503"),
+                            F(connectionId: "c2", calendarId: "primary", status: 403, reason: "forbidden")])
+            .readNothing(from: [c1, c2]))
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: "*", status: 400, reason: "invalid_grant")])
+            .readNothing(from: [c1]), "a dead token alone is the bar's 'Reconnect Google', not a sync failure")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "*", status: 400, reason: "invalid_grant"),
+                            F(connectionId: "c2", calendarId: "*", status: 503, reason: "http_503")])
+            .readNothing(from: [c1, c2]), "a dead token next to an outage still read nothing")
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: "*", status: 503)]).readNothing(from: []))
     }
 
     func testEventsWireDecodesAllDayAndFailures() throws {
@@ -138,6 +174,54 @@ final class CalendarClientVerdictTests: XCTestCase {
         XCTAssertEqual(seeded.selectedCalendarIds, ["primary"])
         XCTAssertEqual(seeded.colorSlot, 0)
         XCTAssertEqual(seeded.displayName, "d@e.f")
+    }
+
+    // MARK: - the connections mirror
+
+    /// /events re-stamps last_sync_cursor on every pull, so a cursor-sensitive
+    /// compare rewrote calendar_connections on every foreground (audit
+    /// 2026-09-22, C18).
+    func testConnectionsMirrorIgnoresTheSyncCursorAndOrder() {
+        let c1 = Self.serverConnection
+        var c1Stamped = c1
+        c1Stamped.lastSyncCursor = "2026-09-23T08:00:00.000Z"
+        let c2 = CalendarConnection(id: "c2", provider: .google, accountEmail: "d@e.f", displayName: "d@e.f",
+                                    selectedCalendarIds: ["primary"], colorSlot: 1, connectedAt: "T")
+        XCTAssertFalse(SyncCoordinator.connectionsChanged([c1Stamped, c2], from: [c2, c1]))
+        XCTAssertFalse(SyncCoordinator.connectionsChanged([], from: []))
+        var narrowed = c1
+        narrowed.selectedCalendarIds = ["primary"]
+        XCTAssertTrue(SyncCoordinator.connectionsChanged([narrowed], from: [c1]), "a real change still writes")
+        XCTAssertTrue(SyncCoordinator.connectionsChanged([c1, c2], from: [c1]), "connected on web")
+        XCTAssertTrue(SyncCoordinator.connectionsChanged([], from: [c1]), "disconnected on web")
+    }
+
+    /// Overlapping pulls: an answer read before a newer one — or before the
+    /// app's own connect seed / disconnect delete — must not write the old
+    /// list back (audit 2026-09-22, C18).
+    func testConnectionsReadGateAppliesOnlyTheNewestRead() {
+        var gate = CalendarConnectionsReadGate()
+        // Two pulls overlap and the newer answer lands first.
+        let a = gate.begin(), b = gate.begin()
+        XCTAssertTrue(gate.admit(b))
+        XCTAssertFalse(gate.admit(a), "read before b, landed after it")
+        // In order, every answer applies.
+        let c = gate.begin()
+        XCTAssertTrue(gate.admit(c))
+        let d = gate.begin()
+        XCTAssertTrue(gate.admit(d))
+        // The connect seed lands while two reads are in flight: both were sent
+        // before the server stored the connection.
+        let e = gate.begin(), f = gate.begin()
+        gate.supersedeReadsInFlight()
+        XCTAssertFalse(gate.admit(f))
+        XCTAssertFalse(gate.admit(e))
+        let g = gate.begin()
+        XCTAssertTrue(gate.admit(g), "the post-connect pull applies")
+        // A newer read that failed never applied, so the older answer still does.
+        let h = gate.begin()
+        _ = gate.begin()   // offline — never admitted
+        XCTAssertTrue(gate.admit(h))
     }
 
     // MARK: - the GETs carry no body
