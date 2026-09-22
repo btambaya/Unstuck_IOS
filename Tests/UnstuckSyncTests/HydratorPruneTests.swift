@@ -18,13 +18,21 @@ import UnstuckData
 /// Read-side fake: returns scripted server rows for prune to compare against.
 private actor FakeReadGateway: SyncReadGatewayProtocol {
     private let taskRows: [TaskRow]
-    init(taskRows: [TaskRow]) { self.taskRows = taskRows }
+    /// Runs while the tasks read is "in flight" — lets a test queue an edit
+    /// between the prune's fetch and its rewrite.
+    private let onFetch: (@Sendable () async -> Void)?
+    init(taskRows: [TaskRow], onFetch: (@Sendable () async -> Void)? = nil) {
+        self.taskRows = taskRows
+        self.onFetch = onFetch
+    }
     func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] {
         if table == "tasks", let rows = taskRows as? [Row] { return rows }
         return []
     }
     func fetchAllRaw(table: String) async throws -> [Data] {
         guard table == "tasks" else { return [] }
+        await onFetch?()
+        try Task.checkCancellation()   // a cancelled GET throws, like URLSession's
         let encoder = JSONEncoder()
         return try taskRows.map { try encoder.encode($0) }
     }
@@ -246,5 +254,257 @@ final class HydratorPruneTests: XCTestCase {
         XCTAssertEqual(try box.count(), 0, "newer offline edit flushed")
         let upserts = await write.upserts
         XCTAssertEqual(upserts.map(\.name), ["offline-new"], "the newer offline edit reaches the server")
+    }
+
+    // MARK: - two or more queued edits to one task (audit 2026-09-22, C9)
+    //
+    // Every TaskEditor field change is its own op, and each op's base is the
+    // LOCAL row it was made on — so only the first op's base is a server stamp.
+    // These enqueue through the real WriteThrough, exactly as the app does.
+
+    private func edit(_ t: TaskItem, at: String, _ change: (inout TaskItem) -> Void) -> TaskItem {
+        var next = t
+        change(&next)
+        next.updatedAt = at
+        return next
+    }
+
+    private func row(_ op: OutboxOp?) throws -> TaskRow {
+        try JSONDecoder().decode(TaskRow.self, from: XCTUnwrap(op?.payload?.data(using: .utf8)))
+    }
+
+    /// Case A: two offline edits (a rename, then an estimate), THEN the web
+    /// completes the task. The second op used to be merged against the raw
+    /// server row: the name was unchanged versus ITS base, so it took the
+    /// server's old name and the rename was lost on the server and the phone.
+    func testTwoOfflineEditsBothSurviveAWebCompletionThatLandsAfterThem() async throws {
+        let s0 = TaskItem(id: "t1", name: "Call mom", estimateMin: 25,
+                          createdAt: "2026-05-21T08:00:00.000Z", updatedAt: "2026-05-21T09:00:00.000000+00:00")
+        try db.save(s0)
+        let write = WriteThrough(db: db)
+        let e1 = edit(s0, at: "2026-05-21T09:10:00.000Z") { $0.name = "Call mom re: birthday" }
+        try await write.upsertTask(e1, nowISO: e1.updatedAt)
+        let e2 = edit(e1, at: "2026-05-21T09:11:00.000Z") { $0.estimateMin = 10 }
+        try await write.upsertTask(e2, nowISO: e2.updatedAt)
+        let s1 = edit(s0, at: "2026-05-21T09:30:00.000000+00:00") {
+            $0.done = true
+            $0.completedAt = "2026-05-21T09:30:00.000Z"
+        }
+        let hydrator = Hydrator(gateway: FakeReadGateway(taskRows: [TaskRow(s1)]), db: db)
+
+        await hydrator.pruneStaleTaskOps()
+
+        let ops = try box.pending()
+        XCTAssertEqual(ops.count, 2, "both edits stay queued")
+        let op1 = try row(ops.first), op2 = try row(ops.last)
+        XCTAssertEqual(op1.name, "Call mom re: birthday")
+        XCTAssertEqual(op1.estimateMin, 25)
+        XCTAssertTrue(op1.done, "the web completion is kept in the first op")
+        XCTAssertEqual(op2.name, "Call mom re: birthday", "the second op must not revert the rename")
+        XCTAssertEqual(op2.estimateMin, 10)
+        XCTAssertTrue(op2.done)
+        XCTAssertEqual(op2.completedAt, "2026-05-21T09:30:00.000Z")
+        XCTAssertEqual(ops.map(\.baseUpdatedAt), [s1.updatedAt, s1.updatedAt], "both re-based on the server stamp")
+        let op2Base = try JSONDecoder().decode(TaskRow.self, from: XCTUnwrap(ops.last?.basePayload?.data(using: .utf8)))
+        XCTAssertEqual(op2Base.name, op1.name, "the second op's base is the first op's merged row")
+        XCTAssertEqual(op2Base.done, op1.done)
+        XCTAssertEqual(op2Base.estimateMin, op1.estimateMin)
+        let local = try XCTUnwrap(db.fetchById(TaskItem.self, id: "t1"))
+        XCTAssertEqual(local.name, "Call mom re: birthday")
+        XCTAssertEqual(local.estimateMin, 10)
+        XCTAssertTrue(local.done)
+
+        let recorder = RecordingGateway()
+        await OutboxFlusher(gateway: recorder, db: db).flush(userId: "u1")
+        let upserts = await recorder.upserts
+        XCTAssertEqual(upserts.map(\.name), ["Call mom re: birthday", "Call mom re: birthday"])
+    }
+
+    /// Case B: the web completed the task BEFORE the phone's two offline
+    /// edits. The second op's base was the first op's device stamp, later
+    /// than the web change, so it was judged "server unchanged" and flushed
+    /// its done=false over the completion.
+    func testTwoOfflineEditsDoNotReopenAnEarlierWebCompletion() async throws {
+        let s0 = TaskItem(id: "t1", name: "Call mom", estimateMin: 25,
+                          createdAt: "2026-05-21T07:00:00.000Z", updatedAt: "2026-05-21T08:00:00.000000+00:00")
+        try db.save(s0)
+        let write = WriteThrough(db: db)
+        let e1 = edit(s0, at: "2026-05-21T09:00:00.000Z") { $0.name = "Call mom re: birthday" }
+        try await write.upsertTask(e1, nowISO: e1.updatedAt)
+        let e2 = edit(e1, at: "2026-05-21T09:01:00.000Z") { $0.estimateMin = 10 }
+        try await write.upsertTask(e2, nowISO: e2.updatedAt)
+        let s1 = edit(s0, at: "2026-05-21T08:50:00.000000+00:00") {
+            $0.done = true
+            $0.completedAt = "2026-05-21T08:50:00.000Z"
+        }
+        let hydrator = Hydrator(gateway: FakeReadGateway(taskRows: [TaskRow(s1)]), db: db)
+
+        await hydrator.pruneStaleTaskOps()
+
+        let last = try row(box.pending().last)
+        XCTAssertTrue(last.done, "the last op to land must not re-open the web completion")
+        XCTAssertEqual(last.completedAt, "2026-05-21T08:50:00.000Z")
+        XCTAssertEqual(last.name, "Call mom re: birthday")
+        XCTAssertEqual(last.estimateMin, 10)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.done, true)
+    }
+
+    /// A slow device clock with an UNCHANGED server row: the second op's
+    /// device-stamped base (09:57) reads as earlier than the server's 10:00, so
+    /// it was judged a conflict and merged against the server row — reverting
+    /// the rename with no web edit at all. The head's server base says "keep".
+    func testASlowClockDoesNotMergeASecondEditAgainstAnUnchangedServerRow() async throws {
+        let s0 = TaskItem(id: "t1", name: "Call mom", estimateMin: 25,
+                          createdAt: "2026-05-21T08:00:00.000Z", updatedAt: "2026-05-21T10:00:00.000000+00:00")
+        try db.save(s0)
+        let write = WriteThrough(db: db)
+        let e1 = edit(s0, at: "2026-05-21T09:57:00.000Z") { $0.name = "Call mom re: birthday" }
+        try await write.upsertTask(e1, nowISO: e1.updatedAt)
+        let e2 = edit(e1, at: "2026-05-21T09:57:30.000Z") { $0.estimateMin = 10 }
+        try await write.upsertTask(e2, nowISO: e2.updatedAt)
+        let before = try box.pending()
+        let hydrator = Hydrator(gateway: FakeReadGateway(taskRows: [TaskRow(s0)]), db: db)
+
+        await hydrator.pruneStaleTaskOps()
+
+        XCTAssertEqual(try box.pending(), before, "an unmoved server row leaves the whole chain untouched")
+        let local = try XCTUnwrap(db.fetchById(TaskItem.self, id: "t1"))
+        XCTAssertEqual(local.name, "Call mom re: birthday")
+        XCTAssertEqual(local.estimateMin, 10)
+
+        let recorder = RecordingGateway()
+        await OutboxFlusher(gateway: recorder, db: db).flush(userId: "u1")
+        let upserts = await recorder.upserts
+        XCTAssertEqual(upserts.map(\.name), ["Call mom re: birthday", "Call mom re: birthday"])
+    }
+
+    /// Mark done, then Undo, while the web renamed the task. The first prune
+    /// merges both; then only the first op lands. The Undo must survive the
+    /// next prune — it used to be re-based on the RAW server row (not done),
+    /// so against the landed completion its done=false looked "unchanged".
+    func testAnUndoQueuedBehindAMergedCompletionSurvivesAPartialFlush() async throws {
+        let s0 = TaskItem(id: "t1", name: "Call mom", estimateMin: 25,
+                          createdAt: "2026-05-21T08:00:00.000Z", updatedAt: "2026-05-21T09:00:00.000000+00:00")
+        try db.save(s0)
+        let write = WriteThrough(db: db)
+        let done = edit(s0, at: "2026-05-21T09:10:00.000Z") {
+            $0.done = true
+            $0.completedAt = "2026-05-21T09:10:00.000Z"
+        }
+        try await write.upsertTask(done, nowISO: done.updatedAt)
+        let undo = edit(done, at: "2026-05-21T09:11:00.000Z") {
+            $0.done = false
+            $0.completedAt = nil
+        }
+        try await write.upsertTask(undo, nowISO: undo.updatedAt)
+        let s1 = edit(s0, at: "2026-05-21T09:30:00.000000+00:00") { $0.name = "Web name" }
+
+        await Hydrator(gateway: FakeReadGateway(taskRows: [TaskRow(s1)]), db: db).pruneStaleTaskOps()
+
+        let first = try box.pending()
+        XCTAssertEqual(try row(first.first).name, "Web name")
+        XCTAssertTrue(try row(first.first).done)
+        XCTAssertEqual(try row(first.last).name, "Web name")
+        XCTAssertFalse(try row(first.last).done)
+
+        // Only the completion lands; the server now holds it, stamped later.
+        let op1 = try XCTUnwrap(first.first)
+        var landed = try row(op1)
+        landed.updatedAt = "2026-05-21T09:40:00.000000+00:00"
+        try box.markDone(XCTUnwrap(op1.opSeq))
+
+        await Hydrator(gateway: FakeReadGateway(taskRows: [landed]), db: db).pruneStaleTaskOps()
+
+        let undoOp = try row(XCTUnwrap(box.pending().first))
+        XCTAssertFalse(undoOp.done, "the Undo must not be lost to the landed completion")
+        XCTAssertNil(undoOp.completedAt)
+        XCTAssertEqual(undoOp.name, "Web name")
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.done, false)
+    }
+
+    /// An edit queued WHILE the prune's server read is in flight. The prune
+    /// read the ops before the fetch and saved its merged row after it, so the
+    /// new edit's local row was overwritten and its op flushed unmerged.
+    func testAnEditQueuedWhileThePruneIsFetchingJoinsTheChain() async throws {
+        let s0 = TaskItem(id: "t1", name: "Call mom", estimateMin: 25,
+                          createdAt: "2026-05-21T08:00:00.000Z", updatedAt: "2026-05-21T09:00:00.000000+00:00")
+        try db.save(s0)
+        let write = WriteThrough(db: db)
+        let e1 = edit(s0, at: "2026-05-21T09:10:00.000Z") { $0.name = "Call mom re: birthday" }
+        try await write.upsertTask(e1, nowISO: e1.updatedAt)
+        let e2 = edit(e1, at: "2026-05-21T09:11:00.000Z") { $0.estimateMin = 10 }
+        let s1 = edit(s0, at: "2026-05-21T09:30:00.000000+00:00") {
+            $0.done = true
+            $0.completedAt = "2026-05-21T09:30:00.000Z"
+        }
+        let gateway = FakeReadGateway(taskRows: [TaskRow(s1)], onFetch: {
+            try? await write.upsertTask(e2, nowISO: e2.updatedAt)
+        })
+
+        await Hydrator(gateway: gateway, db: db).pruneStaleTaskOps()
+
+        let ops = try box.pending()
+        XCTAssertEqual(ops.count, 2)
+        let op2 = try row(ops.last)
+        XCTAssertTrue(op2.done, "the edit queued mid-fetch is merged too")
+        XCTAssertEqual(op2.name, "Call mom re: birthday")
+        XCTAssertEqual(op2.estimateMin, 10)
+        let local = try XCTUnwrap(db.fetchById(TaskItem.self, id: "t1"))
+        XCTAssertEqual(local.estimateMin, 10, "the local row follows the LAST op, not the first op's merge")
+        XCTAssertEqual(local.name, "Call mom re: birthday")
+        XCTAssertTrue(local.done)
+    }
+
+    // MARK: - the bounded sign-out drain (audit 2026-09-22, C9)
+
+    /// The sign-out drain prunes before it flushes, like every other flush.
+    func testASignOutDrainPrunesBeforeItFlushes() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "stale", updatedAt: "2026-05-21T10:00:00.000Z"),
+                            nowISO: "2026-05-21T10:00:00.000Z")
+        _ = try box.enqueue(table: "tasks", rowId: "t2", kind: .upsert,
+                            payload: try taskPayload(id: "t2", name: "made offline", updatedAt: "2026-05-21T10:02:00.000Z"),
+                            nowISO: "2026-05-21T10:02:00.000Z")
+        let read = FakeReadGateway(taskRows: [
+            TaskRow(TaskItem(id: "t1", name: "server-new", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:05:00.000Z"))
+        ])
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+
+        await SyncCoordinator.drainBeforeSignOut(timeoutNs: 5_000_000_000,
+                                                 prune: { await hydrator.pruneStaleTaskOps() },
+                                                 flush: { await flusher.flush(userId: "u1") })
+
+        let upserts = await write.upserts
+        XCTAssertEqual(upserts.map(\.id), ["t2"], "the stale op is pruned, the new row is sent")
+        XCTAssertEqual(try box.count(), 0)
+    }
+
+    /// The timeout fires while the prune's tasks GET is in flight (a slow
+    /// link): the GET is cancelled and the prune gives up. The drain went on
+    /// to flush anyway and sent the UNPRUNED op over the newer server row, so
+    /// a web completion was re-opened at sign-out. It must stay queued
+    /// instead, to be parked and pruned at the next sign-in.
+    func testASignOutDrainCutShortDuringThePruneSendsNothing() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "stale", updatedAt: "2026-05-21T10:00:00.000Z"),
+                            nowISO: "2026-05-21T10:00:00.000Z")
+        let read = FakeReadGateway(taskRows: [
+            TaskRow(TaskItem(id: "t1", name: "server-new", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:05:00.000Z"))
+        ], onFetch: { try? await Task.sleep(nanoseconds: 10_000_000_000) })
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+
+        await SyncCoordinator.drainBeforeSignOut(timeoutNs: 50_000_000,
+                                                 prune: { await hydrator.pruneStaleTaskOps() },
+                                                 flush: { await flusher.flush(userId: "u1") })
+
+        let upserts = await write.upserts
+        XCTAssertTrue(upserts.isEmpty, "the unpruned op must not be sent over the newer server row")
+        XCTAssertEqual(try box.count(), 1, "it stays queued, to be parked and pruned at the next sign-in")
     }
 }

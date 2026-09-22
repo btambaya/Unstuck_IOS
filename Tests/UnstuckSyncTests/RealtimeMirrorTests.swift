@@ -81,6 +81,16 @@ final class RealtimeMirrorTests: XCTestCase {
         XCTAssertFalse(RealtimeMirror.incomingTaskWins(echo, db: db))
     }
 
+    /// The owner must hear a join / leave on a list it OWNS: those membership
+    /// rows carry the member's user_id, so a `user_id = me` filter hid them and
+    /// the owner's phone kept treating a shared list as unshared (audit
+    /// 2026-09-22, C8). The singleton preference rows keep their filter.
+    func testCollectionMembersSignalIsUnfilteredSoTheOwnerHearsJoins() {
+        XCTAssertTrue(RealtimeMirror.unfilteredSignalTables.contains("collection_members"))
+        XCTAssertFalse(RealtimeMirror.unfilteredSignalTables.contains("notification_preferences"))
+        XCTAssertFalse(RealtimeMirror.unfilteredSignalTables.contains("user_preferences"))
+    }
+
     // MARK: - subscribe retry backoff (pure)
 
     func testRetryBackoffDoublesFromHalfSecond() {

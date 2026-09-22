@@ -41,46 +41,113 @@ public actor Hydrator {
     /// enqueued by an older build) still falls back to the device-clock
     /// compare, with a skew margin. Reads the server only when task ops are
     /// actually queued, so it's free in the common empty-outbox case.
+    ///
+    /// A row's queued edits are judged as ONE chain, by its oldest op (audit
+    /// 2026-09-22, C9). Only the first edit's base is a server stamp: every
+    /// later edit's base is the previous LOCAL edit (device clock). Judging
+    /// and merging each op on its own against the raw server row let a second
+    /// offline edit revert the first one's fields to the server's old values,
+    /// or skip the merge and re-open a task completed on the web. So the head
+    /// decides for the whole chain; on a conflict every later op's own diff is
+    /// merged onto the previous op's MERGED row. The ops are re-read inside
+    /// the write transaction, after the fetch, so an edit queued while the
+    /// fetch was in flight joins the chain instead of being overwritten.
     public func pruneStaleTaskOps() async {
         let ops = (try? box.pending()) ?? []
-        let taskOps = ops.filter { $0.tableName == "tasks" && $0.kind == .upsert && !$0.isQuarantined }
-        guard !taskOps.isEmpty else { return }
+        guard ops.contains(where: Self.isLiveTaskUpsert) else { return }
         // Per-row tolerant: one un-decodable server task must not make the whole
         // prune a no-op (which would let stale local ops re-push and clobber).
         guard let serverRows = try? await gateway.fetchAllTolerant(TaskRow.self, table: "tasks") else { return }
         var serverById: [String: TaskRow] = [:]
         for r in serverRows { serverById[r.id] = r }
-        for op in taskOps {
+        try? db.transaction { conn in
+            var chains: [String: [OutboxOp]] = [:]
+            var rowOrder: [String] = []
+            for op in try OutboxStore.pending(in: conn) where Self.isLiveTaskUpsert(op) {
+                if chains[op.rowId] == nil { rowOrder.append(op.rowId) }
+                chains[op.rowId, default: []].append(op)   // pending(in:) is op-seq order
+            }
+            for rowId in rowOrder {
+                guard let chain = chains[rowId], let server = serverById[rowId] else { continue }
+                // One row's failure must not roll back every other row's merge.
+                do {
+                    try conn.inSavepoint {
+                        try Self.reconcileTaskChain(chain, server: server, in: conn)
+                        return .commit
+                    }
+                } catch {
+                    print("[outbox] tasks op chain \(rowId) not reconciled: \(error)")
+                }
+            }
+        }
+    }
+
+    /// A `tasks` upsert the drain will still send.
+    static func isLiveTaskUpsert(_ op: OutboxOp) -> Bool {
+        op.tableName == "tasks" && op.kind == .upsert && !op.isQuarantined
+    }
+
+    /// Judge + merge one row's queued edits (op-seq order) against the server
+    /// row, on an open write transaction. See `pruneStaleTaskOps`.
+    private static func reconcileTaskChain(_ chain: [OutboxOp], server: TaskRow, in conn: Database) throws {
+        let decoder = JSONDecoder()
+        // Compare INSTANTS, not ISO strings: PostgREST emits microseconds +
+        // "+00:00" while local ops use millis + "Z". If the server stamp
+        // won't parse, DON'T prune (keep the op — it flushes and the server's
+        // own conflict resolution decides).
+        guard let serverMs = Time.parseMillis(server.updatedAt),
+              let serverData = try? JSONEncoder().encode(server),
+              let serverJSON = String(data: serverData, encoding: .utf8) else { return }
+        // Once the chain is in conflict: the previous op's merged row (what it
+        // will put on the server) — the next op's diff lands on THIS.
+        var onto: (data: Data, json: String)?
+        var previousPayload: Data?
+        var lastMerged: (seq: Int64, row: TaskRow)?
+        for op in chain {
             guard let seq = op.opSeq, let data = op.payload?.data(using: .utf8),
-                  let row = try? decoder.decode(TaskRow.self, from: data),
-                  let server = serverById[op.rowId] else { continue }
-            // Compare INSTANTS, not ISO strings: PostgREST emits microseconds +
-            // "+00:00" while local ops use millis + "Z". If the server stamp
-            // won't parse, DON'T prune (keep the op — it flushes and the server's
-            // own conflict resolution decides).
-            guard let serverMs = Time.parseMillis(server.updatedAt) else { continue }
+                  let row = try? decoder.decode(TaskRow.self, from: data) else { continue }
+            defer { previousPayload = data }
+            if let prev = onto {
+                // Re-base on the previous merged row. The server stamp is a lower
+                // bound: once the earlier op lands the server moves past it, so
+                // the next prune merges this op against what actually landed.
+                guard let base = op.basePayload?.data(using: .utf8) ?? previousPayload,
+                      let merged = SyncDecision.threeWayMergeRow(op: data, base: base, server: prev.data),
+                      let mergedRow = try? decoder.decode(TaskRow.self, from: merged),
+                      let mergedJSON = String(data: merged, encoding: .utf8) else { continue }
+                try OutboxStore.replacePayload(in: conn, seq, payload: mergedJSON,
+                                               baseUpdatedAt: server.updatedAt, basePayload: prev.json)
+                onto = (merged, mergedJSON)
+                lastMerged = (seq, mergedRow)
+                continue
+            }
+            // The chain's head — the only op whose base is a server stamp.
             let baseMs = op.baseUpdatedAt.flatMap(Time.parseMillis)
             switch SyncDecision.staleTaskOpDecision(serverUpdatedAtMs: serverMs, baseUpdatedAtMs: baseMs,
                                                     opUpdatedAtMs: Time.parseMillis(row.updatedAt)) {
             case .keep:
-                continue
+                return   // the server hasn't moved: every later edit sits on top of this one
             case .prune:
                 print("[outbox] pruning legacy stale tasks op \(op.rowId) — server is newer")
-                try? box.markDone(seq)
+                try OutboxStore.markDone(in: conn, seq)   // the next op becomes the head
             case .conflict:
                 guard let base = op.basePayload?.data(using: .utf8),
-                      let serverData = try? JSONEncoder().encode(server),
                       let merged = SyncDecision.threeWayMergeRow(op: data, base: base, server: serverData),
                       let mergedRow = try? decoder.decode(TaskRow.self, from: merged),
-                      let mergedJSON = String(data: merged, encoding: .utf8) else { continue }
+                      let mergedJSON = String(data: merged, encoding: .utf8) else { return }
                 print("[outbox] merging tasks op \(op.rowId) onto a newer server row (3-way)")
-                // Re-base on the server version we merged against; the local row
-                // follows so the UI shows the server's changes to the fields this
-                // device didn't touch.
-                try? box.replacePayload(seq, payload: mergedJSON, baseUpdatedAt: server.updatedAt,
-                                        basePayload: String(data: serverData, encoding: .utf8))
-                try? db.save(mergedRow.model())
+                // Re-base on the server version we merged against.
+                try OutboxStore.replacePayload(in: conn, seq, payload: mergedJSON,
+                                               baseUpdatedAt: server.updatedAt, basePayload: serverJSON)
+                onto = (merged, mergedJSON)
+                lastMerged = (seq, mergedRow)
             }
+        }
+        // The local row follows the chain's LAST op, so the UI shows the
+        // server's changes to the fields this device didn't touch — but only
+        // when that op was merged; otherwise the local row already is its intent.
+        if let lastMerged, lastMerged.seq == chain.last?.opSeq {
+            try lastMerged.row.model().upsert(conn)
         }
     }
 
@@ -184,6 +251,13 @@ public actor Hydrator {
     /// falls back to last-write-wins (the prune's 3-way merge normally
     /// re-bases the op before this runs). Rows without a pending op are
     /// server-canonical.
+    ///
+    /// The row's base is the NEWEST base over all its queued ops (quarantined
+    /// included) — the rule RealtimeMirror.incomingTaskWins uses. It was the
+    /// LAST op's base, which for a second queued edit is the device-clock
+    /// stamp of the first: a slow clock let the hydrate swap a pending chain's
+    /// local row for the server row, and the next edit, built on it, dropped
+    /// the earlier offline edits (audit 2026-09-22, C9).
     private func hydrateTasks() async {
         do {
             let remote = try await gateway.fetchAllTolerant(TaskRow.self, table: "tasks").map { $0.model() }
@@ -191,7 +265,11 @@ public actor Hydrator {
                 let ops = try OutboxStore.pending(in: conn).filter { $0.tableName == "tasks" && $0.kind == .upsert }
                 let pending = Set(ops.map(\.rowId))
                 var baseById: [String: String] = [:]
-                for op in ops { if let base = op.baseUpdatedAt { baseById[op.rowId] = base } }   // last op's base wins
+                for op in ops {
+                    guard let base = op.baseUpdatedAt, let ms = Time.parseMillis(base) else { continue }
+                    if let cur = baseById[op.rowId], let curMs = Time.parseMillis(cur), curMs >= ms { continue }
+                    baseById[op.rowId] = base
+                }
                 return SyncDecision.mergeHydratedRows(remote: remote, local: local, pendingIds: pending) { l, r in
                     SyncDecision.resolvePendingTask(local: l, remote: r, baseUpdatedAt: baseById[r.id])
                 }
@@ -309,37 +387,179 @@ public actor Hydrator {
         afterProfileFactsLocalRead = hook
     }
 
+    // Coalesce overlapping collections hydrates, like `hydrate()`. The
+    // collection_members realtime channel runs one per burst of events
+    // (RealtimeMirror.coalescedSignal), and that channel now carries the
+    // owner's lists too (a membership DELETE anywhere reaches every client:
+    // Realtime can't RLS-check a delete); the share / unshare / leave paths
+    // run one each. One run at a time, one trailing run for whatever arrived
+    // meanwhile, so two replaces never interleave. A caller that arrives
+    // mid-run returns only after the trailing run, so "awaited = re-read
+    // after my call" still holds for those paths. (audit 2026-09-22, C8)
+    private var collectionsInFlight = false
+    private var collectionsPendingUserId: String?
+    private var collectionsWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// True while the last membership read (a collections hydrate's or the
+    /// catch-up's) failed. Only a successful read clears it; until then every
+    /// catch-up re-reads, because a device that knew nothing (a fresh sign-in)
+    /// filled its lists with no members and the owner's edits would route as
+    /// unshared.
+    private var membershipUnresolved = false
+
     /// Collections + their membership. RLS returns own AND shared-with-me rows;
     /// `collection_members` (visible to member or owner) supplies each row's
     /// members[] + the current user's myRole. Mirrors hydrate.ts / the Android
     /// Hydrator. Also invoked standalone when a collection_members realtime
     /// event fires.
     public func hydrateCollections(userId: String) async {
+        guard !collectionsInFlight else {
+            collectionsPendingUserId = userId
+            await withCheckedContinuation { collectionsWaiters.append($0) }
+            return
+        }
+        collectionsInFlight = true
+        defer { collectionsInFlight = false }
+        var next: String? = userId
+        while let uid = next {
+            collectionsPendingUserId = nil
+            let covered = collectionsWaiters   // arrived before this run began
+            collectionsWaiters.removeAll()
+            await performHydrateCollections(userId: uid)
+            for waiter in covered { waiter.resume() }
+            next = collectionsPendingUserId
+        }
+    }
+
+    /// The catch-up's membership re-read. The server's collections row carries
+    /// no membership, and the catch-up (like realtime) carries the local
+    /// members forward — so migration 056 §4's `updated_at` bump on every
+    /// collection_members change is the owner's ONLY pull-side signal that a
+    /// list became shared (a join by link, an invite claimed at sign-up, a
+    /// share made on another device) or lost a member. Without this re-read
+    /// the owner's phone kept `members == []`, `isShared` stayed false, and
+    /// its item edits went out as whole-row upserts that deleted what the
+    /// members added (audit 2026-09-22, C8).
+    ///
+    /// It only PATCHES members/myRole onto the local rows: the pull right
+    /// before it already applied every newer collections row. A full
+    /// collections replace here (it runs after the user's own list edits too:
+    /// realtime never moves the cursor) raced the debounced flush. An edit
+    /// acked, or echoed, between its collections read and its write was
+    /// reverted to the older snapshot, and on an unshared list the owner's
+    /// next whole-row upsert, built on that row, deleted the edit on the
+    /// server. Rows are read and written in one transaction, so no content
+    /// can go back.
+    public func refreshCollectionMembership(userId: String, collectionsChanged: Bool) async {
+        guard collectionsChanged || membershipUnresolved else { return }
+        let memberRows: [MemberRow]
+        do {
+            memberRows = try await gateway.fetchAllTolerant(MemberRow.self, table: "collection_members")
+        } catch {
+            membershipUnresolved = true
+            print("[catchup] collection_members failed, retrying on the next catch-up: \(error)")
+            return
+        }
+        let byColl = Self.membersByCollection(memberRows)
+        do {
+            try db.transaction { conn in
+                for var c in try ItemCollection.fetchAll(conn) {
+                    let ms = byColl[c.id] ?? []
+                    let role = c.ownerId == userId ? "owner" : ms.first { $0.0 == userId }?.1
+                    // Someone else's list with no row for me: I can no longer see
+                    // it, and the reconcile / the members event removes it. Don't
+                    // strip its role in the meantime.
+                    guard c.ownerId == userId || role != nil else { continue }
+                    let members = ms.map { $0.0 }
+                    guard c.members != members || c.myRole != role else { continue }
+                    c.members = members
+                    c.myRole = role
+                    try c.update(conn)
+                }
+            }
+            membershipUnresolved = false
+        } catch {
+            membershipUnresolved = true
+            print("[catchup] collection membership not saved, retrying on the next catch-up: \(error)")
+        }
+    }
+
+    /// collectionId -> [(userId, role)], in server order.
+    private static func membersByCollection(_ rows: [MemberRow]) -> [String: [(String, String)]] {
+        var byColl: [String: [(String, String)]] = [:]
+        for m in rows {
+            byColl[m.collectionId, default: []].append((m.userId, m.role ?? "editor"))
+        }
+        return byColl
+    }
+
+    /// Test seam: callers parked behind an in-flight collections hydrate.
+    var collectionsHydrateWaiterCount: Int { collectionsWaiters.count }
+
+    private func performHydrateCollections(userId: String) async {
+        // A collections op queued now can be acked (and its row echoed) while
+        // the reads below are in flight, so their snapshot predates it and the
+        // replace finds nothing queued. Those rows count as pending anyway: an
+        // edit acked mid-read was reverted to the pre-edit snapshot (and the
+        // owner's next whole-row upsert, built on it, deleted the edit on the
+        // server), and a list deleted mid-read came back. This runs on every
+        // membership event now (audit 2026-09-22, C8).
+        let queuedAtStart = ((try? box.pending()) ?? []).filter { $0.tableName == "collections" }
         do {
             // Per-row tolerant decode (see replace()): a single bad collection
             // row mustn't drop the user's entire list of collections.
             let base = try await gateway.fetchAllTolerant(CollectionRow.self, table: "collections").map { $0.model() }
-            let memberRows = (try? await gateway.fetchAllTolerant(MemberRow.self, table: "collection_members")) ?? []
-            var byColl: [String: [(String, String)]] = [:]   // collectionId -> [(userId, role)]
-            for m in memberRows {
-                byColl[m.collectionId, default: []].append((m.userId, m.role ?? "editor"))
+            // A failed members read is NOT "nobody is a member": that emptied
+            // every list's members, so an owner's shared list read as unshared
+            // and its next edit shipped the whole `items` array over the
+            // members' edits. Keep what this device knew instead; only a
+            // successful read may empty `members` (web attachCollectionMembers /
+            // Android Hydrator parity; audit 2026-09-22, C8).
+            let memberRows: [MemberRow]?
+            do {
+                memberRows = try await gateway.fetchAllTolerant(MemberRow.self, table: "collection_members")
+            } catch {
+                print("[hydrate] collection_members failed, keeping the membership this device knows: \(error)")
+                memberRows = nil
             }
-            let enriched = base.map { c -> ItemCollection in
-                let ms = byColl[c.id] ?? []
-                var out = c
-                out.members = ms.map { $0.0 }
-                out.myRole = c.ownerId == userId ? "owner" : ms.first { $0.0 == userId }?.1
-                return out
-            }
+            let byColl = Self.membersByCollection(memberRows ?? [])
             // Preserve unsynced optimistic collections (those with a pending
             // collections upsert op in the outbox): a just-created/edited list
             // isn't in `enriched` yet, so the replace would wipe it off the UI
             // until the next flush (spec 02-sync-engine §1.3 localPending).
             try db.replaceAllAtomically(ItemCollection.self) { conn, local in
-                let pending = try Self.pendingUpsertIds(in: conn, table: "collections")
-                return SyncDecision.mergeHydratedRows(remote: enriched, local: local, pendingIds: pending) { l, _ in l }
+                let known = Dictionary(local.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+                let enriched = base.map { c -> ItemCollection in
+                    var out = c
+                    if memberRows == nil {
+                        out.members = known[c.id]?.members ?? []
+                        out.myRole = c.ownerId == userId ? "owner" : known[c.id]?.myRole
+                    } else {
+                        let ms = byColl[c.id] ?? []
+                        out.members = ms.map { $0.0 }
+                        out.myRole = c.ownerId == userId ? "owner" : ms.first { $0.0 == userId }?.1
+                    }
+                    return out
+                }
+                // A list whose DELETE is still queued stays gone: this now runs
+                // on every membership event, not only after a flush.
+                let ops = try OutboxStore.pending(in: conn).filter { $0.tableName == "collections" } + queuedAtStart
+                let pendingDeletes = Set(ops.filter { $0.kind == .delete }.map(\.rowId))
+                let pending = Set(ops.filter { $0.kind == .upsert || $0.kind == .rpc }.map(\.rowId))
+                // A queued row keeps its content intent but takes the membership
+                // just read: membership is server truth, never a local edit.
+                return SyncDecision.mergeHydratedRows(remote: enriched.filter { !pendingDeletes.contains($0.id) },
+                                                      local: local, pendingIds: pending) { l, r in
+                    var out = l
+                    out.members = r.members
+                    out.myRole = r.myRole
+                    return out
+                }
             }
+            membershipUnresolved = memberRows == nil
         } catch {
+            // The catch-up may have applied rows whose membership it can't know.
+            membershipUnresolved = true
             print("[hydrate] collections failed, leaving local intact: \(error)")
         }
     }
