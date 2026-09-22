@@ -111,6 +111,9 @@ final class UnifiedSharingTests: XCTestCase {
         XCTAssertEqual(shareResultLine(.accessChanged(name: "Maya", access: .view)), "Maya can now view.")
         XCTAssertEqual(shareResultLine(.removed(name: "Maya")), "Maya no longer has this.")
         XCTAssertEqual(shareResultLine(.inviteCancelled(email: "x@y.com")), "Invite to x@y.com cancelled.")
+        // Audit 2026-09-22, C10: a block is server-side and says what it did.
+        XCTAssertEqual(shareResultLine(.blocked(name: "Maya Chen")),
+                       "Blocked Maya — they can't share with you, and nothing is shared between you now.")
     }
 
     // MARK: failure mapping

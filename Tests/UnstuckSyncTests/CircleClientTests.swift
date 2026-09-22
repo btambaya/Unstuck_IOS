@@ -314,6 +314,40 @@ final class CircleClientTests: XCTestCase {
                        ["p_task_id", "p_done"])
     }
 
+    /// Audit 2026-09-22, C10 — the server-backed block + recipient-side
+    /// removal RPCs (migration 075) take exactly these keys.
+    func testBlockAndLeaveParamKeys() throws {
+        let user = try encodedObject(UserParams(p_user: "u9"))
+        XCTAssertEqual(Set(user.keys), ["p_user"])
+        XCTAssertEqual(user["p_user"]?.stringValue, "u9")
+        let share = try encodedObject(ShareIdParams(p_share_id: "s1"))
+        XCTAssertEqual(Set(share.keys), ["p_share_id"])
+        XCTAssertEqual(share["p_share_id"]?.stringValue, "s1")
+    }
+
+    /// block_user / block_task_sharer / unblock_user / task_share_leave return
+    /// a scalar boolean — TRUE only when the server says so.
+    func testBlockRPCsReadTheServersBoolean() {
+        XCTAssertTrue(CircleClient.decodeCancelPendingInvite(Data("true".utf8)))
+        XCTAssertTrue(CircleClient.decodeCancelPendingInvite(Data("[true]".utf8)))
+        XCTAssertFalse(CircleClient.decodeCancelPendingInvite(Data("false".utf8)))
+        XCTAssertFalse(CircleClient.decodeCancelPendingInvite(Data("null".utf8)))
+        XCTAssertFalse(CircleClient.decodeCancelPendingInvite(Data(#"{"code":"PGRST202"}"#.utf8)),
+                       "a server without 075 is never a success")
+    }
+
+    func testBlockedUserRowMapping() throws {
+        let b = try decode(BlockedUserRow.self,
+            #"{"user_id":"u9","name":"Sam Lee","created_at":"2026-09-22T10:00:00+00:00"}"#).model()
+        XCTAssertEqual(b, BlockedUser(userId: "u9", name: "Sam Lee", createdAt: "2026-09-22T10:00:00+00:00"))
+        XCTAssertEqual(b.id, "u9")
+        // A null / blank name never fails the row, and never shows blank.
+        XCTAssertEqual(try decode(BlockedUserRow.self, #"{"user_id":"u8","name":null,"created_at":null}"#).model().name, "Someone")
+        XCTAssertEqual(try decode(BlockedUserRow.self, #"{"user_id":"u7","name":"  "}"#).model().name, "Someone")
+        let rows = try decode([BlockedUserRow].self, #"[{"user_id":"a","name":"A"},{"user_id":"b","name":"B"}]"#)
+        XCTAssertEqual(rows.map { $0.model().userId }, ["a", "b"], "server order (newest first) is kept")
+    }
+
     func testTaskShareParamValues() throws {
         let obj = try encodedObject(TaskShareParams(p_task_id: "t1", p_user: "u1", p_level: ShareLevel.assign.rawValue))
         XCTAssertEqual(obj["p_task_id"]?.stringValue, "t1")

@@ -106,8 +106,10 @@ protocol ShareScreenTransport: AnyObject {
     func cancelCollectionInvite(collectionId: String, email: String) async -> Bool
     /// `share-collection link`.
     func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome
-    /// The device-local blocklist (App Store 1.2 safety).
-    func isBlocked(_ email: String) -> Bool
+    /// `block_user(p_user)` (migration 075, App Store 1.2 safety) — true only
+    /// when the server blocked them. Replaces the device-local blocklist that
+    /// nothing server-side read (audit 2026-09-22, C10).
+    func block(userId: String) async -> Bool
 }
 
 /// The live seam — AppModel's coordinator clients. A nil coordinator (demo /
@@ -168,7 +170,7 @@ final class LiveShareTransport: ShareScreenTransport {
     func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome {
         await model?.coordinator?.share.link(collectionId: collectionId, role: role) ?? .failed(reason: "not_configured")
     }
-    func isBlocked(_ email: String) -> Bool { model?.isBlocked(email) ?? false }
+    func block(userId: String) async -> Bool { await model?.blockUser(userId: userId) ?? false }
 }
 
 enum ShareTransportError: Error { case notSignedIn }
@@ -351,10 +353,25 @@ final class ShareScreenModel {
         }
     }
 
+    /// Block someone who has this item (task OR list). Server-side the block
+    /// cuts everything between you — the connection, task shares and list
+    /// memberships both ways — and refuses anything they share with you until
+    /// you unblock them in Settings › People. The old block was device-local,
+    /// lists-only, and reloaded BEFORE its removal ran with no failure path, so
+    /// the person often still showed "Can edit"; now the reload follows the
+    /// server's answer and a refusal is shown (audit 2026-09-22, C10).
+    func block(_ row: SharePersonRow) async {
+        guard busyId == nil else { return }
+        await perform(row.id) {
+            guard await self.transport.block(userId: row.userId) else { throw ShareActionError(.network) }
+            return .blocked(name: row.name)
+        }
+    }
+
     // MARK: someone new
 
-    /// Share with the typed email. Local guards first (shape, blocklist), then
-    /// the server's honest answer.
+    /// Share with the typed email. The address shape is checked locally; a
+    /// block is the server's answer (`blocked`), not a device-local list.
     func shareWithEmail() async {
         guard busyId == nil else { return }
         // Put the keyboard away first: it covers the result line, and the
@@ -363,7 +380,6 @@ final class ShareScreenModel {
         let addr = normalizedShareEmail(email)
         error = nil
         guard isEmailLike(addr) else { error = ShareFailure.invalidEmail.message; return }
-        guard !transport.isBlocked(addr) else { error = ShareFailure.blocked.message; return }
         switch target {
         case .task(let id, _):
             await perform(Self.emailBusyId) {
@@ -486,6 +502,8 @@ struct ShareScreen: View {
     @State private var vm: ShareScreenModel?
     @State private var linkToShare: ShareLinkItem?
     @State private var reportTarget: SharePersonRow?
+    /// The row whose "Block…" is awaiting its confirm.
+    @State private var blockTarget: SharePersonRow?
     /// The searchable "Choose someone" picker (Ahmad, 2026-09-17: never list
     /// everyone — ten people is a wall; a dropdown you can search).
     @State private var showPicker = false
@@ -543,6 +561,17 @@ struct ShareScreen: View {
             Button("Cancel", role: .cancel) { reportTarget = nil }
         } message: { row in
             Text("Send a report about \(row.email ?? row.name) to the Unstuck team. We review reports and take action.")
+        }
+        .confirmationDialog("Block \(blockTarget?.name ?? "them")?", isPresented: Binding(
+            get: { blockTarget != nil }, set: { if !$0 { blockTarget = nil } }),
+            titleVisibility: .visible, presenting: blockTarget) { row in
+            Button("Block", role: .destructive) {
+                blockTarget = nil
+                if let vm { Task { await vm.block(row) } }
+            }
+            Button("Cancel", role: .cancel) { blockTarget = nil }
+        } message: { _ in
+            Text("They won't be able to share tasks or lists with you, and everything shared between you stops. You can unblock them in Settings › People.")
         }
     }
 
@@ -731,9 +760,9 @@ struct ShareScreen: View {
 
     /// Name + the relationship label ("· Coach"). The email is NOT shown on
     /// the row: it only exists for a legacy list member, it is long, and it
-    /// already appears in the menu's "Block <email>" and in the report
-    /// dialog. One line at normal sizes — `layoutPriority(1)` (the OUTERMOST
-    /// modifier, or the HStack never sees it) makes the label truncate first.
+    /// already appears in the report dialog. One line at normal sizes —
+    /// `layoutPriority(1)` (the OUTERMOST modifier, or the HStack never sees
+    /// it) makes the label truncate first.
     /// At accessibility sizes the two STACK: side by side, a full-width name
     /// left the label one character wide, wrapping letter by letter.
     @ViewBuilder
@@ -797,7 +826,9 @@ struct ShareScreen: View {
     }
 
     /// The picker for someone who already has the item: Can edit ✓ / Can
-    /// view / Report… / Block <email> (lists) / Remove or "Take it back".
+    /// view / Report… / Block… / Remove or "Take it back". Block is offered
+    /// on EVERY shared row, task or list, and confirms first — it used to be
+    /// lists-with-an-email only (audit 2026-09-22, C10).
     /// System menus own their colours — not restyled.
     @ViewBuilder
     private func accessMenu(_ vm: ShareScreenModel, _ row: SharePersonRow) -> some View {
@@ -812,11 +843,8 @@ struct ShareScreen: View {
         if row.email != nil || target.kind == .task {
             Button { reportTarget = row } label: { Label("Report…", systemImage: "flag") }
         }
-        if case .collection(let cid, _) = target, let email = row.email {
-            Button(role: .destructive) {
-                model.blockUser(email: email, inCollection: cid, userId: row.userId)
-                Task { await vm.load() }
-            } label: { Label("Block \(email)", systemImage: "hand.raised") }
+        Button(role: .destructive) { blockTarget = row } label: {
+            Label("Block \(row.name)…", systemImage: "hand.raised")
         }
         Button(role: .destructive) {
             Task { await vm.setAccess(row, nil) }

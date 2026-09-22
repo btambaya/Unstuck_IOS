@@ -112,6 +112,25 @@ public struct PendingInvite: Codable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// Someone I blocked — a row of `my_blocked_users()` (migration 075), what
+/// Settings → People's "Blocked" section lists with an Unblock. The block is
+/// account-scoped on the server (it used to be a device-local email set that
+/// sign-out wiped and nothing server-side read — audit 2026-09-22, C10).
+/// `name` is the server-resolved display name, never an email.
+public struct BlockedUser: Codable, Equatable, Sendable, Identifiable {
+    public var userId: String
+    public var name: String
+    public var createdAt: String?
+
+    public var id: String { userId }
+
+    public init(userId: String, name: String, createdAt: String? = nil) {
+        self.userId = userId
+        self.name = name
+        self.createdAt = createdAt
+    }
+}
+
 /// One share ON a task I own — drives the share sheet's current state.
 /// Mirrors web `ShareForTask`.
 public struct ShareForTask: Codable, Equatable, Sendable, Identifiable {

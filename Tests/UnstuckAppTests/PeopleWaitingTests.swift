@@ -5,6 +5,10 @@
 // honest (and its line clears on the next refresh), a circle invite is never
 // listed twice, the roster stays whole on a server without the RPC, the collab
 // signals refresh the section, and every Copy link button names its invite.
+//
+// Audit 2026-09-22: removing a connection re-hydrates the lists and the
+// dialog says what removal really does (C11); "Remove and block", the Blocked
+// section and Unblock go through the server (C10).
 
 import XCTest
 import SwiftUI
@@ -19,12 +23,18 @@ private final class FakePeopleTransport: PeopleTransport {
     var circle: [CircleMember] = []
     var pending: [PendingInvite] = []
     var cancelOk = true
+    var blockOk = true
+    var unblockOk = true
+    var blockedList: [BlockedUser] = []
 
     // Recorded calls.
     var circleLoads = 0
     var pendingLoads = 0
     var cancelled: [(kind: PendingInviteKind, id: String)] = []
     var removed: [String] = []
+    var blockedIds: [String] = []
+    var unblockedIds: [String] = []
+    var blockedLoads = 0
 
     func listCircle() async -> [CircleMember] { circleLoads += 1; return circle }
     func invite(email: String?) async -> CircleInviteResult { CircleInviteResult(ok: true, emailed: true) }
@@ -43,7 +53,27 @@ private final class FakePeopleTransport: PeopleTransport {
         if kind == .circle { circle.removeAll { $0.id == id } }
         return true
     }
+    func block(userId: String) async -> Bool {
+        blockedIds.append(userId)
+        guard blockOk else { return false }
+        // block_user severs the connection both ways server-side.
+        let name = circle.first { $0.memberUserId == userId }?.memberName ?? "Someone"
+        circle.removeAll { $0.memberUserId == userId }
+        blockedList.insert(BlockedUser(userId: userId, name: name), at: 0)
+        return true
+    }
+    func blockedUsers() async -> [BlockedUser] { blockedLoads += 1; return blockedList }
+    func unblock(userId: String) async -> Bool {
+        unblockedIds.append(userId)
+        guard unblockOk else { return false }
+        blockedList.removeAll { $0.userId == userId }
+        return true
+    }
 }
+
+/// Counts hook calls from a @MainActor closure without capturing a mutable
+/// local (Swift 6 treats the hook as Sendable).
+private final class Counter: @unchecked Sendable { var n = 0 }
 
 // MARK: - the model
 
@@ -166,6 +196,118 @@ final class PeopleWaitingTests: XCTestCase {
         XCTAssertEqual(fake.removed, ["c1"])
         XCTAssertTrue(vm.roster.isEmpty)
         XCTAssertEqual(vm.waiting.count, 3, "the invites are untouched")
+    }
+
+    // MARK: removal takes the lists too (audit 2026-09-22, C11)
+
+    /// circle_remove now also ends the list memberships between the pair,
+    /// both ways (075). The owner's membership channel only carries MY rows,
+    /// so the lists are re-read at once — otherwise my own lists keep listing
+    /// the person I just removed.
+    func testRemovingAConnectionReHydratesTheLists() async {
+        let vm = model()
+        let calls = Counter()
+        vm.onConnectionRemoved = { calls.n += 1 }
+        await vm.refresh()
+        await vm.remove(id: "c1")   // active, memberUserId u1
+        XCTAssertEqual(fake.removed, ["c1"])
+        XCTAssertEqual(calls.n, 1)
+        XCTAssertTrue(vm.roster.isEmpty)
+    }
+
+    func testCancellingAPendingRosterInviteDoesNotReHydrateLists() async {
+        fake.pending = []   // c3 stays a real roster row (no Waiting-to-join twin)
+        let vm = model()
+        let calls = Counter()
+        vm.onConnectionRemoved = { calls.n += 1 }
+        await vm.refresh()
+        XCTAssertEqual(vm.roster.map(\.id), ["c1", "c3"])
+        await vm.remove(id: "c3")   // status invited, memberUserId nil
+        XCTAssertEqual(fake.removed, ["c3"], "still goes through circle_remove")
+        XCTAssertEqual(calls.n, 0, "a pending invite changes no list")
+    }
+
+    /// The dialog used to promise "will no longer see anything you've shared"
+    /// while every shared list stayed shared.
+    func testTheRemoveDialogSaysWhatRemovalDoes() {
+        let maya = fake.circle[0]
+        XCTAssertEqual(removeConnectionMessage(maya),
+                       "Maya Chen will no longer see the tasks and lists you've shared with them, and you'll lose access to the ones they shared with you.")
+        var unnamed = maya
+        unnamed.memberName = nil
+        XCTAssertEqual(removeConnectionMessage(unnamed),
+                       "They will no longer see the tasks and lists you've shared with them, and you'll lose access to the ones they shared with you.")
+        XCTAssertEqual(removeConnectionMessage(fake.circle[1]), "Cancels this pending invite to p@x.com.")
+        XCTAssertTrue(removeConnectionMessage(maya).contains("lists"))
+        XCTAssertFalse(removeConnectionMessage(maya).contains("anything you've shared"), "the C11 overclaim is gone")
+    }
+
+    // MARK: server-side block (audit 2026-09-22, C10)
+
+    func testRefreshLoadsTheBlockedList() async {
+        fake.blockedList = [BlockedUser(userId: "u7", name: "Sam", createdAt: "2026-09-22T09:00:00Z")]
+        let vm = model()
+        await vm.refresh()
+        XCTAssertEqual(fake.blockedLoads, 1)
+        XCTAssertEqual(vm.blocked.map(\.userId), ["u7"])
+    }
+
+    func testRemoveAndBlockBlocksTheMemberServerSide() async {
+        let vm = model()
+        let calls = Counter()
+        vm.onConnectionRemoved = { calls.n += 1 }
+        await vm.refresh()
+        let ok = await vm.block(vm.roster[0])
+        XCTAssertTrue(ok)
+        XCTAssertEqual(fake.blockedIds, ["u1"], "block_user takes the member's USER id, not the circle row id")
+        XCTAssertTrue(fake.removed.isEmpty, "the block severs the connection itself — no separate circle_remove")
+        XCTAssertTrue(vm.roster.isEmpty)
+        XCTAssertEqual(vm.blocked.map(\.name), ["Maya Chen"], "the refetch lists them under Blocked")
+        XCTAssertEqual(calls.n, 1, "a block also takes the lists + task shares between us — re-read them")
+        XCTAssertNil(vm.blockError)
+    }
+
+    func testARefusedBlockBringsTheRowBackAndSaysSo() async {
+        fake.blockOk = false
+        let vm = model()
+        let calls = Counter()
+        vm.onConnectionRemoved = { calls.n += 1 }
+        await vm.refresh()
+        let ok = await vm.block(vm.roster[0])
+        XCTAssertFalse(ok)
+        XCTAssertEqual(vm.roster.map(\.id), ["c1"], "the server still has the connection — the refetch shows it")
+        XCTAssertTrue(vm.blocked.isEmpty)
+        XCTAssertEqual(vm.blockError, "Couldn't block — try again.")
+        XCTAssertEqual(calls.n, 0)
+    }
+
+    func testAPendingRowCannotBeBlocked() async {
+        fake.pending = []
+        let vm = model()
+        await vm.refresh()
+        let ok = await vm.block(vm.roster[1])   // c3: invited, no user yet
+        XCTAssertFalse(ok)
+        XCTAssertTrue(fake.blockedIds.isEmpty)
+    }
+
+    func testUnblockLiftsTheBlockAndDropsTheRow() async {
+        fake.blockedList = [BlockedUser(userId: "u7", name: "Sam")]
+        let vm = model()
+        await vm.refresh()
+        let ok = await vm.unblock(vm.blocked[0])
+        XCTAssertTrue(ok)
+        XCTAssertEqual(fake.unblockedIds, ["u7"])
+        XCTAssertTrue(vm.blocked.isEmpty)
+
+        fake.blockedList = [BlockedUser(userId: "u8", name: "Kai")]
+        fake.unblockOk = false
+        await vm.refresh()
+        let refused = await vm.unblock(vm.blocked[0])
+        XCTAssertFalse(refused)
+        XCTAssertEqual(vm.blocked.map(\.userId), ["u8"], "a refused unblock keeps the row")
+        XCTAssertEqual(vm.blockError, "Couldn't unblock — try again.")
+        await vm.refresh()
+        XCTAssertNil(vm.blockError, "the next refresh clears the line")
     }
 
     // MARK: accessibility sizes

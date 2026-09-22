@@ -18,6 +18,10 @@
 // The model talks to the backend through PeopleTransport (a seam, like
 // ShareScreenTransport) so it is unit-tested with a fake; LivePeopleTransport
 // wires it to CircleClient via AppModel.makeCircleModel().
+//
+// Blocks (migration 075, audit 2026-09-22 C10): "Remove and block" on a
+// connection, and a "Blocked" section listing everyone I blocked with Unblock.
+// The block lives on the server — it used to be a device-local email set.
 
 import SwiftUI
 import UIKit
@@ -44,6 +48,12 @@ protocol PeopleTransport: AnyObject {
     func myPendingInvites() async -> [PendingInvite]
     /// `cancel_pending_invite(p_kind, p_id)` — true only when a row was deleted.
     func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool
+    /// `block_user(p_user)` — true only when the server blocked them.
+    func block(userId: String) async -> Bool
+    /// `my_blocked_users()` — everyone I blocked (tolerant → []).
+    func blockedUsers() async -> [BlockedUser]
+    /// `unblock_user(p_user)` — true only when a block was lifted.
+    func unblock(userId: String) async -> Bool
 }
 
 /// The live seam over the shared CircleClient. A nil client (unconfigured /
@@ -69,6 +79,9 @@ final class LivePeopleTransport: PeopleTransport {
     func cancelPendingInvite(kind: PendingInviteKind, id: String) async -> Bool {
         await client?.cancelPendingInvite(kind: kind, id: id) ?? false
     }
+    func block(userId: String) async -> Bool { await client?.blockUser(userId: userId) ?? false }
+    func blockedUsers() async -> [BlockedUser] { await client?.blockedUsers() ?? [] }
+    func unblock(userId: String) async -> Bool { await client?.unblockUser(userId: userId) ?? false }
 }
 
 // MARK: - model
@@ -92,6 +105,15 @@ final class CircleModel {
     var loading = true
     /// The line under Waiting to join after a refused cancel.
     private(set) var waitingError: String?
+    /// Everyone I blocked (`my_blocked_users()`), newest first.
+    private(set) var blocked: [BlockedUser] = []
+    /// The line under Blocked after a refused block / unblock.
+    private(set) var blockError: String?
+    /// Run after a real connection is removed or someone is blocked: the
+    /// server also took the task shares and list memberships between the two
+    /// of us, both ways (075), so AppModel re-reads them (audit 2026-09-22,
+    /// C11/C10). Not for a cancelled pending row — that changes no list.
+    @ObservationIgnored var onConnectionRemoved: (@MainActor () async -> Void)?
     @ObservationIgnored private var observers: [NSObjectProtocol] = []
 
     init(transport: any PeopleTransport) { self.transport = transport }
@@ -126,11 +148,14 @@ final class CircleModel {
     func refresh() async {
         let circle = await transport.listCircle()
         let pending = await transport.myPendingInvites()
+        let blocked = await transport.blockedUsers()
         members = circle
         let sections = composePeopleSections(circle: circle, pending: pending)
         roster = sections.roster
         waiting = sections.waiting
+        self.blocked = blocked
         waitingError = nil
+        blockError = nil
         loading = false
     }
 
@@ -152,12 +177,52 @@ final class CircleModel {
     }
 
     /// Remove someone (or cancel a pending roster row). Server-side this also
-    /// drops the task shares for the pair. Optimistic + refetch.
+    /// drops the task shares AND the list memberships between the two of us,
+    /// both directions (075; 066 left every shared list shared — audit
+    /// 2026-09-22, C11). A real connection then re-hydrates the lists through
+    /// `onConnectionRemoved`: the owner's collection_members channel is
+    /// filtered to my own rows and the collections echo carries the old
+    /// members forward, so nothing live would drop them. A pending-invite row
+    /// changes no list, so it doesn't. Optimistic + refetch.
     func remove(id: String) async {
+        let wasConnection = members.first { $0.id == id }?.memberUserId != nil
         members.removeAll { $0.id == id }
         roster.removeAll { $0.id == id }
         await transport.removeMember(id: id)
+        if wasConnection { await onConnectionRemoved?() }
         await refresh()
+    }
+
+    /// "Remove and block": block the person server-side (`block_user`), which
+    /// also cuts the connection, task shares and list memberships both ways
+    /// and stops them sharing with me again. Optimistic — the row leaves at
+    /// once — then the refetch shows the server's truth: a refused block
+    /// brings the row back with a line saying so. Returns whether the server
+    /// blocked them (audit 2026-09-22, C10).
+    @discardableResult
+    func block(_ m: CircleMember) async -> Bool {
+        guard let userId = m.memberUserId, !userId.isEmpty else { return false }
+        blockError = nil
+        members.removeAll { $0.id == m.id }
+        roster.removeAll { $0.id == m.id }
+        let ok = await transport.block(userId: userId)
+        if ok { await onConnectionRemoved?() }
+        await refresh()
+        if !ok { blockError = "Couldn't block — try again." }
+        return ok
+    }
+
+    /// Lift a block (`unblock_user`). Restores nothing the block removed —
+    /// they are simply able to share with me again. Optimistic + refetch;
+    /// returns whether the server lifted it.
+    @discardableResult
+    func unblock(_ b: BlockedUser) async -> Bool {
+        blockError = nil
+        blocked.removeAll { $0.id == b.id }
+        let ok = await transport.unblock(userId: b.userId)
+        await refresh()
+        if !ok { blockError = "Couldn't unblock — try again." }
+        return ok
     }
 
     /// Cancel a Waiting-to-join invite (`cancel_pending_invite`). Optimistic —
@@ -193,6 +258,19 @@ func circleInviteLink(_ code: String) -> String {
     "https://unstucknow.io/circle/join?code=\(code)"
 }
 
+/// What "Remove" does, in the Remove dialog. The old line promised the person
+/// "will no longer see anything you've shared" while circle_remove left every
+/// shared list shared; migration 075 now removes the list memberships between
+/// the two of you in both directions (066 already did tasks both ways), and
+/// the copy names exactly that. It deliberately does not claim items you both
+/// have in someone ELSE's list — those stay (audit 2026-09-22, C11).
+func removeConnectionMessage(_ m: CircleMember) -> String {
+    if m.status == "invited" {
+        return "Cancels this pending invite\(m.inviteeEmail.map { " to \($0)" } ?? "")."
+    }
+    return "\(m.memberName ?? "They") will no longer see the tasks and lists you've shared with them, and you'll lose access to the ones they shared with you."
+}
+
 // MARK: - Screen
 
 struct ConnectionsView: View {
@@ -209,6 +287,7 @@ struct ConnectionsView: View {
             if let vm {
                 RosterSection(vm: vm)
                 WaitingSection(vm: vm)
+                BlockedSection(vm: vm)
                 AddSomeoneSection(vm: vm).padding(.top, 22)
                 RedeemSection(vm: vm).padding(.top, 22)
             } else {
@@ -260,11 +339,17 @@ private struct RosterSection: View {
                 Task { await vm.remove(id: m.id) }
                 removeTarget = nil
             }
+            // A block is server-side (075): they also can't share with you
+            // again until you unblock them under Blocked (audit 2026-09-22, C10).
+            if m.status != "invited", m.memberUserId != nil {
+                Button("Remove and block", role: .destructive) {
+                    Task { await vm.block(m) }
+                    removeTarget = nil
+                }
+            }
             Button("Cancel", role: .cancel) { removeTarget = nil }
         } message: { m in
-            Text(m.status == "invited"
-                 ? "Cancels this pending invite\(m.inviteeEmail.map { " to \($0)" } ?? "")."
-                 : "\(m.memberName ?? "They") will no longer see anything you've shared, and any tasks you shared with them are revoked.")
+            Text(removeConnectionMessage(m))
         }
     }
 
@@ -428,6 +513,49 @@ private struct WaitingSection: View {
     }
 }
 
+// MARK: - Blocked (server-side blocks, migration 075)
+
+/// Everyone I blocked, each with Unblock (audit 2026-09-22, C10). Hidden while
+/// there is nobody and no refusal to report.
+private struct BlockedSection: View {
+    @Environment(\.uTheme) private var theme
+    let vm: CircleModel
+
+    var body: some View {
+        if !vm.blocked.isEmpty || vm.blockError != nil {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionLabel("Blocked · \(vm.blocked.count)")
+                Text("They can't share with you or add you to lists.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                if let err = vm.blockError {
+                    Text(err).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
+                }
+                if !vm.blocked.isEmpty {
+                    SettingsCard {
+                        ForEach(Array(vm.blocked.enumerated()), id: \.element.id) { idx, b in
+                            if idx > 0 { CardDivider() }
+                            HStack(spacing: 10) {
+                                Text(b.name)
+                                    .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                                    .lineLimit(1)
+                                Spacer()
+                                Button { Task { await vm.unblock(b) } } label: {
+                                    Text("Unblock").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                                        .frame(minHeight: 32).contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityLabel("Unblock \(b.name)")
+                            }
+                            .padding(.horizontal, 16).padding(.vertical, 12)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 22)
+        }
+    }
+}
+
 // MARK: - Add someone (email → invite / emailed, blank → shareable link)
 
 private struct AddSomeoneSection: View {
@@ -551,6 +679,7 @@ private struct AddSomeoneSection: View {
     private func friendlyInviteError(_ code: String?) -> String {
         switch code {
         case "circle_full": return "Your circle is full."
+        case "blocked": return "You've blocked that person."
         case "not_configured": return "Sign in to invite people."
         default: return "Could not create invite. Try again."
         }
