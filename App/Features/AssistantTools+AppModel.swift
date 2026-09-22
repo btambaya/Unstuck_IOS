@@ -347,51 +347,31 @@ final class AppModelAssistantState: AssistantAppState {
 
     func navigate(screen: String, id: String?) { _ = model.openScreen(screen, id: id) }
 
-    // MARK: areas + tags (rename/delete cascade like the web's use-life-areas / use-tags)
+    // MARK: areas + tags
+    //
+    // The rename/delete cascade onto tasks lives in AppModel, shared with the
+    // Settings rows, so there is one path (audit 2026-09-22, C19).
 
     func addArea(name: String, color: String?) async {
         let next = (getAreaRows().map(\.sortOrder).max() ?? -1) + 1
         await model.saveLifeAreaAwaiting(LifeArea(id: newUUID(), name: name, color: color ?? "indigo", sortOrder: next))
     }
     func updateArea(_ id: String, name: String?, color: String?) async {
-        guard let row = getAreaRows().first(where: { $0.id == id }) else { return }
-        await model.saveLifeAreaAwaiting(LifeArea(id: row.id, name: name ?? row.name, color: color ?? row.color, sortOrder: row.sortOrder))
-        if let name, name != row.name {
-            for var t in getTasks() where t.lifeArea == row.name {
-                t.lifeArea = name
-                t.updatedAt = AppModel.isoNow()
-                await model.saveTaskAwaiting(t)
-            }
+        if let name { await model.renameLifeAreaAwaiting(id, to: name) }
+        // Re-read after the rename so the colour write keeps the new name.
+        if let color, var row = getAreaRows().first(where: { $0.id == id }) {
+            row.color = color
+            await model.saveLifeAreaAwaiting(row)
         }
     }
-    func removeArea(_ id: String) async {
-        let row = getAreaRows().first { $0.id == id }
-        await model.deleteLifeAreaAwaiting(id)
-        // "its tasks keep everything else" — they just lose the label.
-        if let row {
-            for var t in getTasks() where t.lifeArea == row.name {
-                t.lifeArea = nil
-                t.updatedAt = AppModel.isoNow()
-                await model.saveTaskAwaiting(t)
-            }
-        }
-    }
+    /// AppModel clears the label off the area's tasks.
+    func removeArea(_ id: String) async { await model.deleteLifeAreaAwaiting(id) }
     func addTag(name: String) async {
         let next = (getTagRows().map(\.sortOrder).max() ?? -1) + 1
         await model.saveTagAwaiting(TagRow(id: newUUID(), name: name, color: nil, sortOrder: next))
     }
     func updateTag(_ id: String, name: String?) async {
-        guard let row = getTagRows().first(where: { $0.id == id }) else { return }
-        await model.saveTagAwaiting(TagRow(id: row.id, name: name ?? row.name, color: row.color, sortOrder: row.sortOrder))
-        if let name, name != row.name {
-            for var t in getTasks() where (t.tags ?? []).contains(where: { $0.caseInsensitiveCompare(row.name) == .orderedSame }) {
-                var seen = Set<String>()
-                t.tags = (t.tags ?? []).map { $0.caseInsensitiveCompare(row.name) == .orderedSame ? name : $0 }
-                    .filter { seen.insert($0.lowercased()).inserted }
-                t.updatedAt = AppModel.isoNow()
-                await model.saveTaskAwaiting(t)
-            }
-        }
+        if let name { await model.renameTagAwaiting(id, to: name) }
     }
     /// AppModel.deleteTag already strips the name from every task.
     func removeTag(_ id: String) async { await model.deleteTagAwaiting(id) }

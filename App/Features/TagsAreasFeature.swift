@@ -4,10 +4,14 @@
 // count — "<n> open" for areas (open, non-recurring tasks in that area) and a
 // usage count for tags (tasks whose `tags` contain the name). Add rejects
 // case-insensitive duplicates, and picks color = first-unused token +
-// sortOrder = max+1. Recolor/rename re-upsert the existing row (preserving id +
-// sortOrder) via the AppModel full-upsert (saveTag / saveLifeArea) — no new
-// AppModel methods. Tasks/areas are observed from the same tracked GRDB
-// snapshot the list uses, so a rename/recolor/count refreshes immediately.
+// sortOrder = max+1. Recolor re-upserts the existing row (preserving id +
+// sortOrder) via the AppModel full-upsert (saveTag / saveLifeArea). Rename and
+// delete go through AppModel's cascading renameLifeArea / renameTag /
+// deleteLifeArea / deleteTag, because tasks name their area and tags by string
+// and have to follow; a rename onto a name another row already has (ignoring
+// case) is refused (audit 2026-09-22, C19). Tasks/areas are observed from the
+// same tracked GRDB snapshot the list uses, so a rename/recolor/count
+// refreshes immediately.
 
 import SwiftUI
 import UnstuckCore
@@ -115,7 +119,8 @@ private struct AreasSection: View {
                 .padding(.bottom, 6)
 
             ForEach(vm.areas.sorted { $0.sortOrder < $1.sortOrder }) { area in
-                AreaRow(area: area, open: vm.openCount(area))
+                AreaRow(area: area, open: vm.openCount(area),
+                        otherNames: vm.areas.filter { $0.id != area.id }.map(\.name))
             }
 
             AddRow(placeholder: "New area", draft: $draft, onAdd: add)
@@ -145,9 +150,11 @@ private struct AreaRow: View {
     @Environment(\.uTheme) private var theme
     let area: LifeArea
     let open: Int
+    let otherNames: [String]
 
     @State private var editing = false
     @State private var nameDraft = ""
+    @State private var nameTaken = false
     @State private var showPalette = false
     @State private var showDelete = false
     @SwiftUI.FocusState private var nameFocused: Bool
@@ -170,20 +177,27 @@ private struct AreaRow: View {
             }
 
             if editing {
-                TextField("Area name", text: $nameDraft)
-                    .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                    .textFieldStyle(.plain)
-                    .focused($nameFocused)
-                    .submitLabel(.done)
-                    .onSubmit(commitRename)
-                    // Re-sync from the live name when not focused so a concurrent
-                    // rename isn't clobbered by a stale once-seeded draft.
-                    .onChange(of: area.name) { _, new in if !nameFocused { nameDraft = new } }
+                VStack(alignment: .leading, spacing: 2) {
+                    TextField("Area name", text: $nameDraft)
+                        .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                        .textFieldStyle(.plain)
+                        .focused($nameFocused)
+                        .submitLabel(.done)
+                        .onSubmit(commitRename)
+                        // Re-sync from the live name when not focused so a concurrent
+                        // rename isn't clobbered by a stale once-seeded draft.
+                        .onChange(of: area.name) { _, new in if !nameFocused { nameDraft = new } }
+                        .onChange(of: nameDraft) { _, _ in nameTaken = false }
+                    if nameTaken {
+                        Text("There's already an area with that name.")
+                            .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                    }
+                }
                 Button(action: commitRename) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.green)
                 }.buttonStyle(.plain)
-                Button { nameDraft = area.name; editing = false; nameFocused = false } label: {
+                Button { nameDraft = area.name; nameTaken = false; editing = false; nameFocused = false } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.ink3)
                 }.buttonStyle(.plain)
@@ -217,10 +231,22 @@ private struct AreaRow: View {
 
     private func commitRename() {
         let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != area.name else {
+            nameDraft = area.name; editing = false; nameFocused = false; return
+        }
+        // Keep the field open with the typed text and say why: tasks key areas
+        // by name, and the server's unique(user_id, name) would quarantine the
+        // row (audit 2026-09-22, C19). Return resigns the field, so refocus on
+        // the next runloop to keep the keyboard up.
+        if labelNameTaken(name, among: otherNames) {
+            nameTaken = true
+            Task { @MainActor in nameFocused = true }
+            return
+        }
         editing = false; nameFocused = false
-        guard !name.isEmpty else { nameDraft = area.name; return }
-        // Rename = re-upsert preserving id + sortOrder + color.
-        model.saveLifeArea(LifeArea(id: area.id, name: name, color: area.color, sortOrder: area.sortOrder))
+        // AppModel renames the row AND moves every task filed under the old
+        // name — the same path as the assistant's rename_area.
+        model.renameLifeArea(area.id, to: name)
     }
 }
 
@@ -242,7 +268,8 @@ private struct TagsSection: View {
                 .padding(.bottom, 6)
 
             ForEach(vm.tags.sorted { $0.sortOrder < $1.sortOrder }) { tag in
-                TagRowView(tag: tag, uses: vm.usageCount(tag))
+                TagRowView(tag: tag, uses: vm.usageCount(tag),
+                           otherNames: vm.tags.filter { $0.id != tag.id }.map(\.name))
             }
 
             AddRow(placeholder: "New tag", draft: $draft, onAdd: add)
@@ -269,9 +296,11 @@ private struct TagRowView: View {
     @Environment(\.uTheme) private var theme
     let tag: TagRow
     let uses: Int
+    let otherNames: [String]
 
     @State private var editing = false
     @State private var nameDraft = ""
+    @State private var nameTaken = false
     @State private var showPalette = false
     @State private var showDelete = false
     @SwiftUI.FocusState private var nameFocused: Bool
@@ -292,20 +321,27 @@ private struct TagRowView: View {
             }
 
             if editing {
-                TextField("Tag name", text: $nameDraft)
-                    .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                    .textFieldStyle(.plain)
-                    .focused($nameFocused)
-                    .submitLabel(.done)
-                    .onSubmit(commitRename)
-                    // Re-sync from the live name when not focused so a concurrent
-                    // rename isn't clobbered by a stale once-seeded draft.
-                    .onChange(of: tag.name) { _, new in if !nameFocused { nameDraft = new } }
+                VStack(alignment: .leading, spacing: 2) {
+                    TextField("Tag name", text: $nameDraft)
+                        .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                        .textFieldStyle(.plain)
+                        .focused($nameFocused)
+                        .submitLabel(.done)
+                        .onSubmit(commitRename)
+                        // Re-sync from the live name when not focused so a concurrent
+                        // rename isn't clobbered by a stale once-seeded draft.
+                        .onChange(of: tag.name) { _, new in if !nameFocused { nameDraft = new } }
+                        .onChange(of: nameDraft) { _, _ in nameTaken = false }
+                    if nameTaken {
+                        Text("There's already a tag with that name.")
+                            .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                    }
+                }
                 Button(action: commitRename) {
                     Image(systemName: "checkmark")
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.green)
                 }.buttonStyle(.plain)
-                Button { nameDraft = tag.name; editing = false; nameFocused = false } label: {
+                Button { nameDraft = tag.name; nameTaken = false; editing = false; nameFocused = false } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 15, weight: .semibold)).foregroundStyle(theme.palette.ink3)
                 }.buttonStyle(.plain)
@@ -339,9 +375,21 @@ private struct TagRowView: View {
 
     private func commitRename() {
         let name = nameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != tag.name else {
+            nameDraft = tag.name; editing = false; nameFocused = false; return
+        }
+        // Same refusal as AreaRow: a tag another row already has (ignoring
+        // case) would be quarantined by the server's unique(user_id, name)
+        // (audit 2026-09-22, C19).
+        if labelNameTaken(name, among: otherNames) {
+            nameTaken = true
+            Task { @MainActor in nameFocused = true }
+            return
+        }
         editing = false; nameFocused = false
-        guard !name.isEmpty else { nameDraft = tag.name; return }
-        model.saveTag(TagRow(id: tag.id, name: name, color: tag.color, sortOrder: tag.sortOrder))
+        // AppModel renames the row AND carries the new name onto every task
+        // that uses it — the same path as the assistant's rename_tag.
+        model.renameTag(tag.id, to: name)
     }
 }
 
