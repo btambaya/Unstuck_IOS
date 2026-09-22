@@ -18,7 +18,14 @@ import UnstuckShared
 final class TasksModel {
     var all: [TaskItem] = [] { didSet { recomputeSnapshot() } }
     var blocks: [CalBlock] = [] { didSet { recomputeSnapshot() } }
-    var areas: [LifeArea] = []
+    var areas: [LifeArea] = [] {
+        didSet {
+            // The selected area pill follows a rename and falls back to All on
+            // a delete (audit 2026-09-22, C19).
+            let next = areaFilterFollowing(activeArea, from: oldValue, to: areas)
+            if next != activeArea { activeArea = next }
+        }
+    }
     var view: TaskListView = .all { didSet { recomputeVisible() } }
     var activeArea: String? { didSet { recomputeVisible() } }
     var activeTag: String? { didSet { recomputeVisible() } }

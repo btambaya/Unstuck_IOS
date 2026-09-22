@@ -110,6 +110,18 @@ public func labelNameTaken(_ name: String, among others: [String]) -> Bool {
     others.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
 }
 
+/// Where an area filter (Today / Tasks pills, held by NAME) points after the
+/// area rows change: unchanged while an area still has that name, the row's
+/// new name when it was renamed, nil (All) when it was deleted. Now that the
+/// cascade moves every task off the old name, a filter left on it matched
+/// nothing — no pill lit and "Nothing in Personal right now." (audit
+/// 2026-09-22, C19).
+public func areaFilterFollowing(_ filter: String?, from old: [LifeArea], to new: [LifeArea]) -> String? {
+    guard let filter, !new.contains(where: { $0.name == filter }) else { return filter }
+    let ids = Set(old.filter { $0.name == filter }.map(\.id))
+    return new.first { ids.contains($0.id) }?.name
+}
+
 /// May a focus finish that resolved NO occurrence block flip THIS row's own
 /// `done`? Never for a recurring TEMPLATE.
 ///

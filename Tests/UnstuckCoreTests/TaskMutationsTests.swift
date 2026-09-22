@@ -104,6 +104,22 @@ final class LabelCascadeTests: XCTestCase {
         XCTAssertFalse(labelNameTaken("Garden", among: ["Home", "Work"]))
         XCTAssertFalse(labelNameTaken("Home", among: []))
     }
+
+    func testAnAreaFilterFollowsARenameAndFallsBackToAllOnADelete() {
+        let work = LifeArea(id: "a1", name: "Work", color: "indigo", sortOrder: 0)
+        let personal = LifeArea(id: "a2", name: "Personal", color: "green", sortOrder: 1)
+        var life = personal; life.name = "Life"
+        XCTAssertEqual(areaFilterFollowing("Personal", from: [work, personal], to: [work, life]), "Life",
+                       "a renamed area keeps its pill selected under the new name")
+        XCTAssertNil(areaFilterFollowing("Personal", from: [work, personal], to: [work]),
+                     "a deleted area falls back to All")
+        XCTAssertEqual(areaFilterFollowing("Work", from: [work, personal], to: [work, life]), "Work")
+        XCTAssertNil(areaFilterFollowing(nil, from: [work, personal], to: [work, life]))
+        var twin = work; twin.id = "a3"
+        var office = twin; office.name = "Office"
+        XCTAssertEqual(areaFilterFollowing("Work", from: [work, twin], to: [work, office]), "Work",
+                       "an area still named Work keeps the filter when its twin is renamed")
+    }
 }
 
 final class IsCompletedTodayBoundaryTests: XCTestCase {

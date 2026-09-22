@@ -2037,6 +2037,49 @@ final class AppModelAssistantStateTests: XCTestCase {
         XCTAssertNil(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea)
     }
 
+    /// The Today and Tasks area pills hold the area NAME. Once the cascade
+    /// moved every task off the old name, a pill left on it lit nothing and
+    /// read "Nothing in Work right now." — the filter now follows the rename
+    /// and falls back to All on a delete.
+    func testTheAreaPillsFollowARenameAndFallBackToAllOnADelete() async throws {
+        let live = try liveState()
+        let model = live.model
+        let repo = try XCTUnwrap(model.taskRepo)
+        let today = TodayModel(repo)
+        let tasks = TasksModel(repo)
+        let obs = Task { await today.observe() }
+        let obs2 = Task { await tasks.observe() }
+        defer { obs.cancel(); obs2.cancel() }
+        func settle(_ done: () -> Bool) async throws {
+            var tries = 0
+            while !done() && tries < 60 { try await Task.sleep(nanoseconds: 50_000_000); tries += 1 }
+        }
+        try await settle { today.areas.count == 3 && tasks.areas.count == 3 && !today.all.isEmpty }
+        today.areaFilter = "Work"
+        tasks.activeArea = "Work"
+        let shown = Set(today.rows(backlog: false, area: today.areaFilter, liveTaskId: nil).map(\.id))
+        let listed = Set(tasks.visible.map(\.id))
+        XCTAssertFalse(shown.isEmpty)
+        XCTAssertFalse(listed.isEmpty)
+
+        let ok = await model.renameLifeAreaAwaiting("area-Work", to: "Day job")
+        XCTAssertTrue(ok)
+        try await settle {
+            !today.areas.contains { $0.name == "Work" } && !tasks.areas.contains { $0.name == "Work" }
+                && !today.all.contains { $0.lifeArea == "Work" } && !tasks.all.contains { $0.lifeArea == "Work" }
+        }
+        XCTAssertEqual(today.areaFilter, "Day job", "Today's pill follows the rename")
+        XCTAssertEqual(tasks.activeArea, "Day job", "so does the Tasks pill")
+        XCTAssertEqual(Set(today.rows(backlog: false, area: today.areaFilter, liveTaskId: nil).map(\.id)), shown,
+                       "the same tasks stay on screen under the new name")
+        XCTAssertEqual(Set(tasks.visible.map(\.id)), listed)
+
+        await model.deleteLifeAreaAwaiting("area-Work")
+        try await settle { today.areas.count == 2 && tasks.areas.count == 2 }
+        XCTAssertNil(today.areaFilter, "a deleted area falls back to All")
+        XCTAssertNil(tasks.activeArea)
+    }
+
     /// Without a coordinator (offline boot) the usable-minutes budget can't
     /// reach the server, and the server IS the change — so no local cache is
     /// written and the outcome is false.

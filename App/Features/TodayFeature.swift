@@ -52,7 +52,18 @@ enum GreetingName {
 final class TodayModel {
     var all: [TaskItem] = [] { didSet { recomputeSnapshot() } }
     var blocks: [CalBlock] = [] { didSet { recomputeSnapshot() } }
-    var areas: [LifeArea] = []
+    var areas: [LifeArea] = [] {
+        didSet {
+            // The selected pill follows an area rename (Settings, the
+            // assistant, another device) and falls back to All on a delete
+            // (audit 2026-09-22, C19).
+            let next = areaFilterFollowing(areaFilter, from: oldValue, to: areas)
+            if next != areaFilter { areaFilter = next }
+        }
+    }
+    /// The selected area pill, by name (nil = All). Lives here, not in view
+    /// state, so it can follow the area rows as they change.
+    var areaFilter: String?
     var sessions: [Session] = []
     var captures: [Capture] = []
     private let repo: TaskRepository
@@ -234,7 +245,6 @@ struct TodayView: View {
     /// The row whose "Share…" context action opened the Share screen.
     @State private var shareTarget: ShareTarget?
     @State private var notifsEnabled = true
-    @State private var areaFilter: String?
     @State private var backlogActive = false
     /// Realtime "Talk" mode from the assistant input pill's mic — the same
     /// VoiceModeScreen cover the Assistant sheet presents for its Talk button.
@@ -393,7 +403,7 @@ struct TodayView: View {
             .padding(.horizontal, 18).padding(.top, 14).padding(.bottom, 8)
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
-                Button { backlogActive.toggle(); if backlogActive { areaFilter = nil } } label: {
+                Button { backlogActive.toggle(); if backlogActive { vm.areaFilter = nil } } label: {
                     HStack(spacing: 5) {
                         if !backlogActive { Circle().fill(theme.palette.amber).frame(width: 6, height: 6) }
                         Text("Backlog").font(UFont.sans(12, .medium))
@@ -402,10 +412,10 @@ struct TodayView: View {
                     .padding(.horizontal, 12).padding(.vertical, 6)
                     .background(backlogActive ? theme.palette.amberSoft : theme.palette.bg2, in: Capsule())
                 }.buttonStyle(.plain)
-                pill("All", selected: !backlogActive && areaFilter == nil, dot: nil) { backlogActive = false; areaFilter = nil }
+                pill("All", selected: !backlogActive && vm.areaFilter == nil, dot: nil) { backlogActive = false; vm.areaFilter = nil }
                 ForEach(vm.areas) { a in
-                    pill(a.name, selected: !backlogActive && areaFilter == a.name, dot: theme.palette.areaColor(a.color)) {
-                        backlogActive = false; areaFilter = (areaFilter == a.name) ? nil : a.name
+                    pill(a.name, selected: !backlogActive && vm.areaFilter == a.name, dot: theme.palette.areaColor(a.color)) {
+                        backlogActive = false; vm.areaFilter = (vm.areaFilter == a.name) ? nil : a.name
                     }
                 }
             }
@@ -433,7 +443,7 @@ struct TodayView: View {
         // Tasks I've assigned away leave the active buckets (they show in the
         // Delegated group instead) — mirrors the web today-list filter.
         let assignedOut = model.shareState.assignedOut
-        let rows = vm.rows(backlog: backlogActive, area: areaFilter, liveTaskId: liveId)
+        let rows = vm.rows(backlog: backlogActive, area: vm.areaFilter, liveTaskId: liveId)
             .filter { assignedOut[$0.id] == nil }
         // The in-progress focus session, surfaced at the top of the list (Android
         // TodayScreen LiveSessionCard) — resolved by liveTaskId from observed
@@ -458,14 +468,14 @@ struct TodayView: View {
             // when empty; a completed share leaves Today at once.
             SharedWithYouGroup(items: model.shareState.sharedWithMe,
                                mode: backlogActive ? .backlog : .today,
-                               activeArea: areaFilter,
+                               activeArea: vm.areaFilter,
                                makeCoFocus: { model.makeCoFocusModel(taskId: $0) },
                                suppressPresenceTaskId: liveId) { taskId, done in
                 Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
             }
             // Delegation stays a Today-only group, 1:1 with the web today-list.
             if !backlogActive {
-                DelegatedGroup(tasks: vm.all, assignedOut: assignedOut, activeArea: areaFilter,
+                DelegatedGroup(tasks: vm.all, assignedOut: assignedOut, activeArea: vm.areaFilter,
                                now: Date().timeIntervalSince1970 * 1000) { t in
                     model.router.detailTask = t
                 }
@@ -483,10 +493,10 @@ struct TodayView: View {
         // liveTask == null gate).
         let sharedShown = visibleShares(model.shareState.sharedWithMe,
                                         mode: backlogActive ? .backlog : .today,
-                                        todayISO: Clock.todayISO(), activeArea: areaFilter).count
-        if rows.isEmpty && liveTask == nil && sharedShown == 0 && (backlogActive || areaFilter != nil) {
+                                        todayISO: Clock.todayISO(), activeArea: vm.areaFilter).count
+        if rows.isEmpty && liveTask == nil && sharedShown == 0 && (backlogActive || vm.areaFilter != nil) {
             Text(backlogActive ? "Backlog's clear — nothing waiting."
-                 : "Nothing in \(areaFilter ?? "") right now.")
+                 : "Nothing in \(vm.areaFilter ?? "") right now.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                 .padding(.horizontal, 18).padding(.vertical, 28)
         } else if rows.isEmpty && liveTask == nil && sharedShown == 0 {
