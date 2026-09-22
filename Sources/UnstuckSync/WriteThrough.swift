@@ -42,9 +42,11 @@ public actor WriteThrough {
     /// Row save + outbox op, atomically.
     private func saveAndEnqueue<R: PersistableRecord>(_ row: R, table: String, rowId: String, payload: String,
                                                       dependsOn: String? = nil, nowISO: String,
-                                                      baseUpdatedAt: String? = nil, basePayload: String? = nil) throws {
+                                                      baseUpdatedAt: String? = nil, basePayload: String? = nil,
+                                                      extra: ((Database) throws -> Void)? = nil) throws {
         try db.transaction { conn in
             try row.upsert(conn)
+            try extra?(conn)
             try OutboxStore.enqueue(in: conn, table: table, rowId: rowId, kind: .upsert, payload: payload,
                                     dependsOn: dependsOn, nowISO: nowISO,
                                     baseUpdatedAt: baseUpdatedAt, basePayload: basePayload)
@@ -68,12 +70,22 @@ public actor WriteThrough {
     /// Tasks carry the BASE (the row as this device last saw it) on the op so
     /// the prune-before-flush can tell "the server moved underneath this edit"
     /// apart from device-clock skew, and 3-way merge instead of dropping.
+    ///
+    /// Every task write passes here, so the estimate is clamped to the server's
+    /// `estimate_min between 1 and 1440` CHECK first. A row outside it is
+    /// refused on every flush and quarantined, and as the FK parent it held all
+    /// of the task's blocks back behind it; build 80 only clamped two assistant
+    /// tools (audit 2026-09-22, C4). The fresh op supersedes a quarantined one
+    /// for the row (dropQuarantinedUpserts).
     public func upsertTask(_ t: TaskItem, nowISO: String) throws {
+        var t = t
+        t.estimateMin = clampEstimateMin(t.estimateMin)
         let payload = try jsonString(TaskRow(t))
         try db.transaction { conn in
             let existing = try TaskItem.fetchOne(conn, key: t.id)
             let basePayload = try existing.map { try jsonString(TaskRow($0)) }
             try t.upsert(conn)
+            try OutboxStore.dropQuarantinedUpserts(in: conn, table: "tasks", rowId: t.id)
             try OutboxStore.enqueue(in: conn, table: "tasks", rowId: t.id, kind: .upsert, payload: payload,
                                     nowISO: nowISO, baseUpdatedAt: existing?.updatedAt, basePayload: basePayload)
         }
@@ -88,9 +100,19 @@ public actor WriteThrough {
             try db.save(b)
             return
         }
+        // `duration_minutes between 5 and 1440` (migration 001): the local row
+        // and the op both carry what the server accepts. scheduleTaskAt, the
+        // assistant's scheduleTask / update_task and whole-row re-saves of a
+        // block stored before this fix all wrote the raw estimate, and a
+        // refused block was quarantined and lived on this phone only (audit
+        // 2026-09-22, C4). Google mirrors keep their real length (above).
+        var b = b
+        b.durationMinutes = clampDurationMin(b.durationMinutes)
         let dependsOn = b.taskId.flatMap { isUUID($0) ? $0 : nil }   // wait for the parent task op
-        try saveAndEnqueue(b, table: "cal_blocks", rowId: b.id, payload: try jsonString(CalBlockRow(b)),
-                           dependsOn: dependsOn, nowISO: nowISO)
+        let id = b.id
+        try saveAndEnqueue(b, table: "cal_blocks", rowId: id, payload: try jsonString(CalBlockRow(b)),
+                           dependsOn: dependsOn, nowISO: nowISO,
+                           extra: { try OutboxStore.dropQuarantinedUpserts(in: $0, table: "cal_blocks", rowId: id) })
     }
 
     public func upsertSession(_ s: Session, nowISO: String) throws {

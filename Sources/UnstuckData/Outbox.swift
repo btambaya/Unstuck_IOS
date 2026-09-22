@@ -198,6 +198,22 @@ public struct OutboxStore: Sendable {
             .deleteAll(db)
     }
 
+    /// Drop a row's QUARANTINED upserts, on an open connection, when a fresh
+    /// whole-row upsert of it is being queued in the same transaction. The new
+    /// op carries the complete current local row, so the refused one is
+    /// superseded — deleting it never re-sends stale bytes (unlike resetting
+    /// its attempts). Kept, it pinned the row against every hydrate and
+    /// catch-up and, for a task, held back all of its blocks via `dependsOn`
+    /// (audit 2026-09-22, C4).
+    public static func dropQuarantinedUpserts(in db: Database, table: String, rowId: String) throws {
+        _ = try OutboxOp
+            .filter(Column("tableName") == table)
+            .filter(Column("rowId") == rowId)
+            .filter(Column("kind") == OutboxKind.upsert.rawValue)
+            .filter(Column("attempts") >= quarantineCap)
+            .deleteAll(db)
+    }
+
     /// Record one SERVER REJECTION of an op (persisted, so the quarantine
     /// survives a relaunch). Returns the new count.
     @discardableResult

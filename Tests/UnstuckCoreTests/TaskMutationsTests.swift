@@ -77,3 +77,17 @@ final class IsCompletedTodayBoundaryTests: XCTestCase {
         XCTAssertFalse(isCompletedToday(mkTask(completedAt: localISO(2026, 5, 21, 0, 0)), now: now))
     }
 }
+
+// The server CHECK clamps live in Core (audit 2026-09-22, C4) so WriteThrough
+// and the wire codec apply the same rule as the assistant tools.
+final class ServerCheckClampTests: XCTestCase {
+    func testServerCheckClampsLiveInCore() {
+        XCTAssertEqual(clampEstimateMin(nil), 25)
+        XCTAssertEqual(clampEstimateMin(0), 1)
+        XCTAssertEqual(clampEstimateMin(2), 2, "a 1-4 minute task keeps its estimate")
+        XCTAssertEqual(clampEstimateMin(5000), 1440)
+        XCTAssertEqual(clampDurationMin(2), 5, "its block floors at 5")
+        XCTAssertEqual(clampDurationMin(nil, fallback: 60), 60)
+        XCTAssertEqual(clampDurationMin(99999), 1440)
+    }
+}

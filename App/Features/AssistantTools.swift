@@ -316,42 +316,69 @@ private func rejectPastTime(_ api: AssistantAppState, _ date: String, _ startTim
 
 /// Place (or move) the anchor block for a task at date+time, materialising the
 /// recurrence horizon when the task repeats. Returns the time the block landed
-/// on (callers report it honestly).
+/// on (callers report it honestly), or nil when a repeating task's occurrence
+/// on `date` is already done — nothing was placed.
 @MainActor
-private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?) async -> String {
+private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?) async -> String? {
     let blocks = api.getBlocks()
     // The anchor to move is the task's NEXT LIVE block — first-in-array grabbed
     // an old done/skipped occurrence on real accounts (tester round, 2026-09-01).
+    // A repeating task moves its occurrence ON the target date: "move
+    // tomorrow's gym to 7pm" took TODAY's occurrence to tomorrow, so today lost
+    // it and tomorrow showed Gym twice (audit 2026-09-22, C1).
     let today = api.todayIso()
     let live = blocks
         .filter { $0.taskId == task.id && !$0.done && !$0.skipped }
         .sorted { ($0.date + $0.startTime) < ($1.date + $1.startTime) }
-    let anchor = live.first { $0.date >= today } ?? live.last
+    let anchor = (task.recurrence != nil ? live.first { $0.date == date } : nil) ?? live.first { $0.date >= today } ?? live.last
     // Moving keeps the task's current time; a FIRST-EVER scheduling with no
     // time is refused upstream (the caller asks the user instead of guessing).
     let anchorTime = anchor.flatMap { $0.startTime.isEmpty ? nil : $0.startTime }
     let time = startTime ?? anchorTime ?? "09:00"
-    if let anchor {
-        var moved = anchor
-        moved.date = date
+    // A series with nothing live after today (a first placement, or one that
+    // lapsed) is being placed, so the time given sets the series' time.
+    let placesSeries = !live.contains { $0.date > today }
+    // The target day of a series: an occurrence already there is retimed (and
+    // un-skipped), a done one leaves the day alone; only an empty day moves
+    // the next occurrence onto it (audit 2026-09-22, C7).
+    let action: ChosenDateAction = task.recurrence == nil ? .mint
+        : recurrenceChosenDateAction(existing: blocks.filter { $0.taskId == task.id },
+                                     plan: RegenPlan(toUpsert: [], toDelete: []), iso: date, startTime: time)
+    switch action {
+    case .covered:
+        let open = blocks.contains { $0.taskId == task.id && isTaskBlock($0) && $0.date == date && !$0.done && !$0.skipped }
+        if !open { return nil }
+    case .retime(let b):
+        var moved = b
         moved.startTime = time
+        moved.skipped = false
         await api.upsertBlock(moved)
-        // Every UI reschedule bumps move_count (the slip detector's input).
-        if anchor.date != date {
-            let fresh = api.getTasks().first { $0.id == task.id } ?? task
-            await api.upsertTask(bumpMoveCount(fresh, nowISO: AppModel.isoNow()))
+    case .mint:
+        if let anchor {
+            var moved = anchor
+            moved.date = date
+            moved.startTime = time
+            await api.upsertBlock(moved)
+            // Every UI reschedule bumps move_count (the slip detector's input).
+            if anchor.date != date {
+                let fresh = api.getTasks().first { $0.id == task.id } ?? task
+                await api.upsertTask(bumpMoveCount(fresh, nowISO: AppModel.isoNow()))
+            }
+        } else {
+            // Clamped to the server's 5…1440 (audit 2026-09-22, C4) — also
+            // enforced in WriteThrough; here so the mirror and receipts match.
+            await api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: time,
+                                           durationMinutes: clampDurationMin(task.estimateMin), date: date, kind: .task))
         }
-    } else {
-        await api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: time,
-                                       durationMinutes: task.estimateMin, date: date, kind: .task))
     }
-    if let rec = task.recurrence {
-        // Only fill dates that DON'T already carry a block for this task.
-        let taken = Set(blocks.filter { $0.taskId == task.id }.map(\.date))
-        for occ in materializeOccurrences(rec, startDate: LocalDate.parse(date), startTime: time) {
-            if occ.date == date || taken.contains(occ.date) { continue }
-            await api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: occ.startTime,
-                                           durationMinutes: task.estimateMin, date: occ.date, kind: .task))
+    if task.recurrence != nil {
+        // Extend only the TAIL, shared with the launch top-up (audit
+        // 2026-09-22, C1): filling every open date from the moved date at the
+        // moved time brought back occurrences the user had deleted and
+        // stretched the series at a one-off time. Read after the move.
+        for b in recurrenceTopUp(task: task, existingBlocks: api.getBlocks(), todayIso: today,
+                                 seriesTime: placesSeries ? time : nil) {
+            await api.upsertBlock(b)
         }
     }
     return time
@@ -486,7 +513,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         var extras: [String] = []
         var note = ""
         if let date, let startTime {
-            let landed = await scheduleTask(api, t, date: date, startTime: startTime)
+            let landed = await scheduleTask(api, t, date: date, startTime: startTime) ?? startTime
             extras.append("scheduled \(date) \(landed)")
         } else if let date {
             note = " NOTE: it has a day (\(date)) but no time — left unscheduled. Ask ONE question suggesting a time, then schedule_task."
@@ -507,7 +534,9 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: needs a time — \"\(t.name)\" has no time yet and the user gave none. Do NOT pick one: ask ONE short question offering a suggestion (e.g. \"Friday — 9am, or a time you prefer?\"), then schedule when they answer."
         }
         if let pastTime = rejectPastTime(api, date, startTime ?? own?.startTime) { return pastTime }
-        let landed = await scheduleTask(api, t, date: date, startTime: startTime)
+        guard let landed = await scheduleTask(api, t, date: date, startTime: startTime) else {
+            return "error: \"\(t.name)\" is already done on \(date) — nothing changed"
+        }
         return "ok: scheduled \"\(t.name)\" \(date) \(landed)\(startTime == nil ? " (kept its existing time — say so)" : "")"
 
     case "update_task":
@@ -520,7 +549,9 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         var upd = t
         var changed: [String] = []
         if let nm = args.str("name"), nm != t.name { upd.name = nm; changed.append("name") }
-        if let est = args.int("estimateMin"), est != t.estimateMin { upd.estimateMin = est; changed.append("estimate") }
+        // Clamped first (audit 2026-09-22, C4), so 2000 on a 1440 task is an
+        // honest "nothing to change" rather than an estimate the server refuses.
+        if let est = args.int("estimateMin").map({ clampEstimateMin($0) }), est != t.estimateMin { upd.estimateMin = est; changed.append("estimate") }
         // "none" clears an area / a first step / a deadline (registry wording);
         // a JSON null on dueAt still clears it (older callers).
         if let la = args.str("lifeArea") {
@@ -545,8 +576,9 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         await api.upsertTask(upd)
         scratch.newTasks[upd.id] = upd
         // A new estimate resizes the live block, like the calendar editor does.
+        // A 3-minute task keeps its estimate; its block floors at 5 (C4).
         if upd.estimateMin != t.estimateMin, var blk = nextLiveBlock(api, taskId: t.id) {
-            blk.durationMinutes = upd.estimateMin
+            blk.durationMinutes = clampDurationMin(upd.estimateMin)
             await api.upsertBlock(blk)
         }
         return "ok: updated \"\(upd.name)\" (\(changed.joined(separator: ", ")))"
@@ -592,14 +624,20 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         scratch.newTasks[t.id] = t
         // Regenerate future blocks off the existing anchor, if scheduled.
         let blocks = api.getBlocks()
-        // The earliest LIVE block, never an arbitrary one — see recurrenceAnchor.
-        if let anchor = recurrenceAnchor(taskId: t.id, blocks: blocks, todayIso: api.todayIso()) {
+        // The earliest LIVE block, never an arbitrary one — see recurrenceAnchor —
+        // at the series' own time and day, never a one-off moved occurrence's
+        // (recurrenceEditStart, audit 2026-09-22, C1).
+        let start = recurrenceEditStart(taskId: t.id, recurrence: rec, blocks: blocks, todayIso: api.todayIso())
+        if let start {
             let plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: api.todayIso(),
-                                         startTime: anchor.startTime, startDate: LocalDate.parse(anchor.date))
+                                         startTime: start.startTime, startDate: LocalDate.parse(start.date),
+                                         horizonDays: start.horizonDays)
             for b in plan.toUpsert { await api.upsertBlock(b) }
             for id in plan.toDelete { await api.deleteBlock(id) }
         }
-        let anchored = blocks.contains { $0.taskId == t.id }
+        // Only a timed block anchors a series: with a timeless one the rule
+        // materialised nothing yet said a plain "ok" (audit 2026-09-22, C7).
+        let anchored = start != nil
         guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")" }
         let how = kind == "weekly" ? "weekly on \(weekdayNames(days))" : kind
         let till = until.map { " until \($0)" } ?? ""
@@ -628,7 +666,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         for (i, it) in items.enumerated() {
             guard let nm = it.str("name") else { notCreated.append("item \(i + 1) (no name)"); continue }
             if made.count >= cap { notCreated.append("\"\(nm)\" (over the \(cap) limit — call create_tasks again for the rest)"); continue }
-            let t = TaskItem(id: newUUID(), name: nm, estimateMin: it.int("estimateMin") ?? 25, totalFocused: 0, done: false,
+            let t = TaskItem(id: newUUID(), name: nm, estimateMin: clampEstimateMin(it.int("estimateMin")), totalFocused: 0, done: false,
                              tags: it.strList("tags"), lifeArea: it.str("lifeArea"),
                              firstPhysicalAction: it.str("firstPhysicalAction"), later: it.bool("later") ?? false,
                              createdAt: now(), updatedAt: now(), dueAt: it.str("dueAt"))
@@ -812,16 +850,6 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         return nil
     }
 }
-
-/// The server CHECK is `estimate_min between 1 and 1440` (migration 001). An
-/// out-of-range value is accepted locally, rejected by PostgREST on flush,
-/// retried five times and then quarantined — the row lives on that one phone
-/// for ever and the user is never told (audit 2026-09-21). Clamp instead.
-func clampEstimateMin(_ raw: Int?) -> Int { min(1440, max(1, raw ?? 25)) }
-
-/// `duration_minutes between 5 and 1440` (migration 001), so a 2-minute task
-/// would otherwise mint a block the server refuses.
-func clampDurationMin(_ raw: Int?, fallback: Int = 25) -> Int { min(1440, max(5, raw ?? fallback)) }
 
 /// A task with this exact name (case- and space-insensitive), still open, made
 /// within the last few minutes — including one created earlier in THIS turn.

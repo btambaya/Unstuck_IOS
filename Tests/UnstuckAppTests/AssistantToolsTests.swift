@@ -753,6 +753,106 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.blocks.count, 1)
     }
 
+    // MARK: repeating tasks on the calendar (audit 2026-09-22, C1 / C7)
+
+    /// A daily series' blocks at `time` on TODAY + each offset (ids "<task><offset>").
+    private func dailySeries(_ taskId: String, _ offsets: ClosedRange<Int>, _ time: String = "07:00") -> [CalBlock] {
+        offsets.map { block("\(taskId)\($0)", taskId, LocalDate.addDays(TODAY, $0), time) }
+    }
+
+    /// With the repeat left on, the horizon top-up rebuilt every removed slot
+    /// at the next launch or midnight although the result said they were gone.
+    /// Refused — even with no upcoming slot left — and the model asks which.
+    func testUnscheduleRefusesARepeatingTaskAndSaysWhatToAsk() async {
+        api.tasks = [task("r", "Gym", recurrence: .daily(until: nil))]
+        api.blocks = [block("past", "r", YESTERDAY, done: true), block("td", "r", TODAY), block("tm", "r", TOMORROW), block("nw", "r", NEXT_WEEK)]
+        let refusal = "error: \"Gym\" repeats — nothing changed. Ask the user which they mean: stop the whole series (set_task_recurrence kind none) or skip just one day (skip_occurrence with the date)."
+        let before = snapshot(api.tasks) + snapshot(api.blocks)
+        await eq("unschedule_task", #"{"taskId":"r"}"#, refusal)
+        XCTAssertEqual(snapshot(api.tasks) + snapshot(api.blocks), before, "an error changes nothing")
+        api.blocks = [block("past", "r", YESTERDAY, done: true)]
+        await eq("unschedule_task", #"{"taskId":"r"}"#, refusal)
+        XCTAssertEqual(api.tasks[0].recurrence, .daily(until: nil))
+    }
+
+    /// "Move tomorrow's gym to 7pm" retimes TOMORROW's occurrence. It used to
+    /// take TODAY's to tomorrow and refill every open date at 19:00, bringing
+    /// back a deleted one and stretching the tail at the one-off time.
+    func testScheduleTaskMovesOneOccurrenceWithoutRefillingTheSeries() async {
+        api.tasks = [task("r", "Gym", recurrence: .daily(until: nil))]
+        let deleted = LocalDate.addDays(TODAY, 10)
+        api.blocks = dailySeries("r", 0...55).filter { $0.date != deleted }
+        await eq("schedule_task", #"{"taskId":"r","date":"\#(TOMORROW)","startTime":"19:00"}"#, "ok: scheduled \"Gym\" \(TOMORROW) 19:00")
+        XCTAssertEqual(api.blocks.count, 55)
+        XCTAssertEqual(api.blocks.filter { $0.startTime == "19:00" }.map(\.id), ["r1"], "tomorrow's own occurrence moved")
+        XCTAssertEqual(api.blocks.first { $0.id == "r0" }?.startTime, "07:00", "today keeps its occurrence")
+        XCTAssertEqual(api.blocks.filter { $0.date == TOMORROW }.count, 1)
+        XCTAssertFalse(api.blocks.contains { $0.date == deleted }, "a deleted occurrence stays gone")
+        XCTAssertFalse(api.blocks.contains { $0.date > LocalDate.addDays(TODAY, 55) })
+        XCTAssertEqual(api.tasks[0].moveCount, nil, "a same-day re-time is not a slip")
+    }
+
+    func testScheduleTaskFirstPlacementStillMaterializesTheSeries() async {
+        api.tasks = [task("r", "Gym", recurrence: .daily(until: nil))]
+        await eq("schedule_task", #"{"taskId":"r","date":"\#(TOMORROW)","startTime":"07:00"}"#, "ok: scheduled \"Gym\" \(TOMORROW) 07:00")
+        XCTAssertEqual(api.blocks.map(\.date).sorted(), (1...55).map { LocalDate.addDays(TODAY, $0) })
+        XCTAssertTrue(api.blocks.allSatisfy { $0.startTime == "07:00" && $0.taskId == "r" })
+    }
+
+    /// A lapsed series re-placed at an explicit time takes THAT time for the
+    /// series — the history's 07:00 must not silently win.
+    func testReplacingALapsedSeriesSetsTheSeriesTime() async {
+        api.tasks = [task("r", "Gym", recurrence: .daily(until: nil))]
+        api.blocks = (1...29).map { block("h\($0)", "r", LocalDate.addDays(TODAY, -$0), "07:00", done: true) }
+        await eq("schedule_task", #"{"taskId":"r","date":"\#(TOMORROW)","startTime":"19:00"}"#, "ok: scheduled \"Gym\" \(TOMORROW) 19:00")
+        let upcoming = api.blocks.filter { $0.date > TODAY }
+        XCTAssertEqual(upcoming.count, 55)
+        XCTAssertTrue(upcoming.allSatisfy { $0.startTime == "19:00" })
+    }
+
+    /// A skipped day scheduled again comes back at the new time; the rest of
+    /// the series stays where it is (C7).
+    func testScheduleTaskOnARepeatingTasksSkippedDayUnskipsIt() async {
+        api.tasks = [task("r", "Walk", recurrence: .daily(until: nil))]
+        api.blocks = dailySeries("r", 0...55)
+        api.blocks[0].skipped = true
+        await eq("schedule_task", #"{"taskId":"r","date":"\#(TODAY)","startTime":"16:00"}"#, "ok: scheduled \"Walk\" \(TODAY) 16:00")
+        let today = api.blocks.first { $0.id == "r0" }
+        XCTAssertEqual(today?.startTime, "16:00")
+        XCTAssertEqual(today?.skipped, false)
+        XCTAssertEqual(api.blocks.first { $0.id == "r1" }?.date, TOMORROW, "tomorrow's occurrence is not pulled onto today")
+        XCTAssertEqual(api.blocks.count, 56)
+        // A day already ticked has nothing left to place.
+        api.blocks = dailySeries("r", 0...55)
+        api.blocks[0].done = true
+        let before = snapshot(api.blocks)
+        await eq("schedule_task", #"{"taskId":"r","date":"\#(TODAY)","startTime":"16:00"}"#, "error: \"Walk\" is already done on \(TODAY) — nothing changed")
+        XCTAssertEqual(snapshot(api.blocks), before)
+    }
+
+    /// An end-date edit on a day when the next occurrence was moved by hand
+    /// used to delete the whole series and rebuild it at the moved time.
+    func testSetTaskRecurrenceKeepsTheSeriesTimeOverAMovedOccurrence() async {
+        api.tasks = [task("r", "Gym", recurrence: .daily(until: nil))]
+        api.blocks = dailySeries("r", 1...55)
+        api.blocks[0].startTime = "18:00"
+        let until = LocalDate.addDays(TODAY, 90)
+        await eq("set_task_recurrence", #"{"taskId":"r","kind":"daily","until":"\#(until)"}"#, "ok: \"Gym\" now repeats daily until \(until)")
+        let ids = Set(api.blocks.map(\.id))
+        XCTAssertTrue((2...55).allSatisfy { ids.contains("r\($0)") }, "no 07:00 occurrence was deleted")
+        XCTAssertTrue(api.blocks.allSatisfy { $0.startTime == "07:00" }, "the series is not rebuilt at 18:00")
+    }
+
+    /// Only a TIMED block anchors a series: a timeless one used to get a plain
+    /// "ok" over a rule that materialised nothing (C7).
+    func testSetTaskRecurrenceOnATimelessTaskNudgesForASlot() async {
+        api.tasks = [task("a", "Alpha")]
+        api.blocks = [block("t1", "a", TOMORROW, "")]
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"daily"}"#,
+                 "ok: \"Alpha\" now repeats daily — it has no calendar slot yet; schedule_task it to place the first one")
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "ok: \"Alpha\" no longer repeats")
+    }
+
     func testSkipAndCompleteOccurrence() async {
         api.tasks = [task("a", "Alpha"), task("r", "Standup", recurrence: .daily(until: nil))]
         api.blocks = [block("td", "a", TODAY), block("tm", "a", TOMORROW), block("rtd", "r", TODAY), block("rtm", "r", TOMORROW)]
@@ -868,6 +968,39 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.tasks.first { $0.name == "Huge" }?.estimateMin, 1440)
         _ = await run("block_time", #"{"name":"Deep work","date":"\#(TOMORROW)","startTime":"09:00","durationMin":1}"#)
         XCTAssertEqual(api.blocks.first { $0.taskName == "Deep work" }?.durationMinutes, 5)
+    }
+
+    /// Every block the assistant mints or resizes is floored at the server's 5
+    /// minutes and every estimate held to 1…1440 (audit 2026-09-22, C4): a
+    /// "2-minute take meds" block was refused and quarantined, living on this
+    /// phone only.
+    func testShortAndHugeEstimatesNeverMintBlocksTheServerRefuses() async {
+        _ = await run("create_task", #"{"name":"Meds","estimateMin":2,"date":"\#(TOMORROW)","startTime":"08:00"}"#)
+        let meds = api.tasks.first { $0.name == "Meds" }
+        XCTAssertEqual(meds?.estimateMin, 2, "a short task keeps its estimate")
+        XCTAssertEqual(api.blocks.first { $0.taskId == meds?.id }?.durationMinutes, 5)
+
+        api.tasks.append(task("r", "Stretch", estimateMin: 3, recurrence: .daily(until: nil)))
+        _ = await run("schedule_task", #"{"taskId":"r","date":"\#(TOMORROW)","startTime":"07:00"}"#)
+        let stretch = api.blocks.filter { $0.taskId == "r" }
+        XCTAssertGreaterThan(stretch.count, 1)
+        XCTAssertTrue(stretch.allSatisfy { $0.durationMinutes == 5 })
+
+        api.tasks.append(task("a", "Alpha"))
+        api.blocks.append(block("live", "a", TOMORROW, "09:00"))
+        await eq("update_task", #"{"taskId":"a","estimateMin":3}"#, "ok: updated \"Alpha\" (estimate)")
+        XCTAssertEqual(api.tasks.first { $0.id == "a" }?.estimateMin, 3)
+        XCTAssertEqual(api.blocks.first { $0.id == "live" }?.durationMinutes, 5)
+        await eq("update_task", #"{"taskId":"a","estimateMin":99999}"#, "ok: updated \"Alpha\" (estimate)")
+        XCTAssertEqual(api.tasks.first { $0.id == "a" }?.estimateMin, 1440)
+        XCTAssertEqual(api.blocks.first { $0.id == "live" }?.durationMinutes, 1440)
+        await prefix("update_task", #"{"taskId":"a","estimateMin":5000}"#, "error: nothing to change")
+
+        _ = await run("create_tasks", #"{"tasks":[{"name":"Zero","estimateMin":0},{"name":"Big","estimateMin":99999,"date":"\#(TOMORROW)","startTime":"10:00"}]}"#)
+        XCTAssertEqual(api.tasks.first { $0.name == "Zero" }?.estimateMin, 1)
+        let big = api.tasks.first { $0.name == "Big" }
+        XCTAssertEqual(big?.estimateMin, 1440)
+        XCTAssertEqual(api.blocks.first { $0.taskId == big?.id }?.durationMinutes, 1440)
     }
 
     func testCompleteOccurrenceRefusesATaskAlreadyDone() async {

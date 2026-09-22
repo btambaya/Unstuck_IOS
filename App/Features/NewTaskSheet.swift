@@ -132,7 +132,14 @@ struct NewTaskSheet: View {
         return findConflicts(date: date, startTime: t, durationMin: estimate, blocks: blocks)
     }
 
-    private var canSubmit: Bool { !name.trimmingCharacters(in: .whitespaces).isEmpty }
+    /// A repeating task needs a day and a time, and a one-off for a later day
+    /// needs a time: every occurrence is a timed block and nothing can invent
+    /// the time later (audit 2026-09-22, C7 / tasks-ui#5).
+    private var needsTime: Bool {
+        newTaskNeedsTime(repeats: repeatKind != .none, date: effectiveDate, todayIso: todayIso, pickedTime: pickedTime)
+    }
+
+    private var canSubmit: Bool { !name.trimmingCharacters(in: .whitespaces).isEmpty && !needsTime }
 
     private var activeMembers: [CircleMember] {
         (circle?.members ?? []).filter { $0.status == "active" && $0.memberUserId != nil }
@@ -147,6 +154,12 @@ struct NewTaskSheet: View {
                     estimateSection
                     if !areas.isEmpty { areaSection }
                     moreOptionsSection
+                    if needsTime {
+                        Text(whenSel == "Later" && repeatKind != .none
+                             ? "A repeating task needs a day and a time — pick Today, Tomorrow or a date."
+                             : "Pick a time to add this task.")
+                            .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    }
                     UButton("Add task", kind: canSubmit ? .primary : .dark) { submit() }
                         .disabled(!canSubmit)
                         .padding(.top, 4)
@@ -181,7 +194,9 @@ struct NewTaskSheet: View {
             .sheet(isPresented: $showTimePicker) { timePickerSheet }
             .alert("Estimate (minutes)", isPresented: $showEstimate) {
                 TextField("Minutes", text: $estimateText).keyboardType(.numberPad)
-                Button("Save") { if let v = Int(estimateText), v > 0 { estimate = v } }
+                // Bounded to the server's 1…1440 (audit 2026-09-22, C4): the chip
+                // shows what is stored, and 2000 was refused on every flush.
+                Button("Save") { if let v = Int(estimateText), v > 0 { estimate = clampEstimateMin(v) } }
                 Button("Cancel", role: .cancel) {}
             }
         }
@@ -253,7 +268,9 @@ struct NewTaskSheet: View {
                 }
             }
             if slots.isEmpty && pickedTime == nil {
-                Text("No free slots that day — pick a custom time, or it'll be added without one.")
+                // "…added without one" is only true for a one-off today (C7).
+                Text(needsTime ? "No free slots that day — pick a custom time."
+                               : "No free slots that day — pick a custom time, or it'll be added without one.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
             if let c = conflicts.first {
@@ -772,7 +789,7 @@ struct NewTaskSheet: View {
 
     private func submit() {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !trimmed.isEmpty, canSubmit else { return }
         let now = AppModel.isoNow()
         let recurrence = buildRecurrence()
         let later = whenSel == "Later"

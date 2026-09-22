@@ -71,3 +71,18 @@ public func unparkedTaskForBlock(_ block: CalBlock, tasks: [TaskItem], nowISO: S
 /// The session's time still accrues on the template either way; only the
 /// completion flip is withheld.
 public func focusMayCompleteRow(_ task: TaskItem) -> Bool { task.recurrence == nil }
+
+/// The server CHECK is `estimate_min between 1 and 1440` (migration 001). An
+/// out-of-range value is accepted locally, rejected by PostgREST on flush,
+/// retried five times and then quarantined — the row lives on that one phone
+/// for ever and the user is never told (audit 2026-09-21). Clamp instead.
+/// The ONE rule for the estimate range: WriteThrough and the wire codec clamp
+/// with it too, so a writer that forgets can no longer strand a row (audit
+/// 2026-09-22, C4).
+public func clampEstimateMin(_ raw: Int?) -> Int { min(1440, max(1, raw ?? 25)) }
+
+/// `duration_minutes between 5 and 1440` (migration 001), so a 2-minute task
+/// would otherwise mint a block the server refuses. The ONE rule for a block's
+/// length: recurrence minting, WriteThrough and the wire codec all use it
+/// (audit 2026-09-22, C4).
+public func clampDurationMin(_ raw: Int?, fallback: Int = 25) -> Int { min(1440, max(5, raw ?? fallback)) }

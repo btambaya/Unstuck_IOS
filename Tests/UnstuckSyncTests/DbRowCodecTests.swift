@@ -183,6 +183,25 @@ final class DbRowCodecTests: XCTestCase {
         XCTAssertEqual(CalendarConnectionRow(conn).model(), conn)
     }
 
+    /// The OutboxFlusher.apply path: an op queued by build 80 or earlier holds
+    /// the raw value; it is decoded and RE-ENCODED on send, so the wire clamp
+    /// lands it instead of it being refused again (audit 2026-09-22, C4). The
+    /// decoders stay raw — assert on the re-encoded JSON.
+    func testWireClampsOutOfRangeEstimateAndDurationFromLegacyPayloads() throws {
+        func legacyBlock(_ minutes: Int) throws -> CalBlockRow {
+            let json = #"{"id":"b","task_id":null,"task_name":"Meds","start_time":"08:00","duration_minutes":\#(minutes),"date":"2026-05-21","kind":"task"}"#
+            return try JSONDecoder().decode(CalBlockRow.self, from: Data(json.utf8))
+        }
+        XCTAssertEqual(try legacyBlock(2).durationMinutes, 2, "the decoder is untouched")
+        XCTAssertEqual(try jsonObject(legacyBlock(2))["duration_minutes"] as? Int, 5)
+        XCTAssertEqual(try jsonObject(legacyBlock(3000))["duration_minutes"] as? Int, 1440)
+        XCTAssertEqual(try jsonObject(legacyBlock(25))["duration_minutes"] as? Int, 25)
+        func task(_ estimate: Int) -> TaskItem { TaskItem(id: "t", name: "N", estimateMin: estimate, createdAt: "c", updatedAt: "u") }
+        XCTAssertEqual(try jsonObject(TaskRow(task(2000)))["estimate_min"] as? Int, 1440)
+        XCTAssertEqual(try jsonObject(TaskRow(task(0)))["estimate_min"] as? Int, 1)
+        XCTAssertEqual(try jsonObject(TaskRow(task(2)))["estimate_min"] as? Int, 2)
+    }
+
     func testCalendarConnectionColumnsAreSnakeCase() throws {
         let conn = CalendarConnection(id: "cc", provider: .google, accountEmail: "a@b.com", displayName: "W",
                                       selectedCalendarIds: ["primary"], colorSlot: 2, lastSyncCursor: nil, connectedAt: "c")

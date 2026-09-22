@@ -1803,24 +1803,37 @@ final class AppModel {
     /// the task's earliest LIVE task-block (`recurrenceAnchor`) so a recurrence
     /// change keeps the series where the user put it instead of snapping it to
     /// 09:00 today — or, as the old "earliest block of any kind" did, back to
-    /// the time of some finished occurrence from weeks ago (audit 2026-09-21).
-    func saveTaskWithRecurrence(_ task: TaskItem, existingBlocks: [CalBlock]) {
+    /// the time of some finished occurrence from weeks ago (audit 2026-09-21) —
+    /// and at the series' OWN time and day, never a one-off moved occurrence's
+    /// (recurrenceEditStart, audit 2026-09-22, C1).
+    ///
+    /// Returns false, changing NOTHING, when a repeat is set on a task with no
+    /// timed block: a series needs a time of day, and the old 09:00-from-now
+    /// fallback built it from TOMORROW (regenerate skips today), so the task
+    /// left Today and came back at a time the user never chose (audit
+    /// 2026-09-22, C7 / tasks-ui#11). The caller asks for a day and a time and
+    /// starts the series with scheduleTaskAt.
+    @discardableResult
+    func saveTaskWithRecurrence(_ task: TaskItem, existingBlocks: [CalBlock]) -> Bool {
+        let today = Clock.todayISO()
+        let start = recurrenceEditStart(taskId: task.id, recurrence: task.recurrence,
+                                        blocks: existingBlocks, todayIso: today)
+        if task.recurrence != nil && start == nil { return false }
         saveTask(task)
-        guard let write = coordinator?.write else { return }
-        let anchor = recurrenceAnchor(taskId: task.id, blocks: existingBlocks, todayIso: Clock.todayISO())
-        let startTime = anchor?.startTime ?? "09:00"
-        let startDate: Date = anchor.flatMap { a in
-            let parts = a.date.split(separator: "-").compactMap { Int($0) }
-            return parts.count == 3 ? Time.civil(parts[0], parts[1], parts[2]) : nil
-        } ?? Date()
+        guard let write = coordinator?.write else { return true }
+        // Without a start we are clearing the repeat, where regenerateForTask
+        // ignores the time and date (it only deletes the future).
         let plan = regenerateForTask(
             task: task, recurrence: task.recurrence, existingBlocks: existingBlocks,
-            todayIso: Clock.todayISO(), startTime: startTime, startDate: startDate)
+            todayIso: today, startTime: start?.startTime ?? "09:00",
+            startDate: start.map { LocalDate.parse($0.date) } ?? Date(),
+            horizonDays: start?.horizonDays ?? RECURRENCE_HORIZON_DAYS)
         let now = Self.isoNow()
         Task {
             for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }
             for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
         }
+        return true
     }
 
     /// Extend every repeating task's occurrences back out to the horizon.
@@ -1833,26 +1846,22 @@ final class AppModel {
     /// (audit 2026-09-21). Run at launch and at a day rollover; the plan is a
     /// pure diff, so doing it repeatedly costs nothing and changes nothing.
     ///
-    /// ADDITIONS ONLY: this is maintenance, not an edit. Honouring the plan's
-    /// deletions here would let a background pass quietly remove occurrences
-    /// the user moved by hand.
+    /// TAIL ONLY (audit 2026-09-22, C1): this is maintenance, not an edit. It
+    /// used to anchor on the next open occurrence and add every missing
+    /// date|time, which rebuilt the whole series at a single moved
+    /// occurrence's time (~55 duplicates, synced everywhere) and brought back
+    /// deleted or unscheduled occurrences on every launch and at midnight. It
+    /// now only extends past the series' last occurrence, at the series'
+    /// usual time (recurrenceTopUp), and never deletes.
     func topUpRecurrenceHorizon() {
         guard let write = coordinator?.write, let repo = taskRepo else { return }
         let tasks = (try? repo.all()) ?? []
         let templates = tasks.filter { $0.recurrence != nil && !$0.done }
         guard !templates.isEmpty else { return }
-        let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+        // Grouped once: a per-template filter over every block was O(n·m).
+        let byTask = Dictionary(grouping: (try? db?.fetchAllCalBlocks()) ?? []) { $0.taskId ?? "" }
         let today = Clock.todayISO()
-        var toAdd: [CalBlock] = []
-        for t in templates {
-            guard let anchor = recurrenceAnchor(taskId: t.id, blocks: blocks, todayIso: today) else { continue }
-            let parts = anchor.date.split(separator: "-").compactMap { Int($0) }
-            guard parts.count == 3 else { continue }
-            let plan = regenerateForTask(
-                task: t, recurrence: t.recurrence, existingBlocks: blocks, todayIso: today,
-                startTime: anchor.startTime, startDate: Time.civil(parts[0], parts[1], parts[2]))
-            toAdd.append(contentsOf: plan.toUpsert)
-        }
+        let toAdd = templates.flatMap { recurrenceTopUp(task: $0, existingBlocks: byTask[$0.id] ?? [], todayIso: today) }
         guard !toAdd.isEmpty else { return }
         let now = Self.isoNow()
         Logger(subsystem: "io.unstucknow.app", category: "recurrence")
@@ -2002,25 +2011,39 @@ final class AppModel {
         }
 
         if let recurrence = task.recurrence {
+            let today = Clock.todayISO()
             let parts = iso.split(separator: "-").compactMap { Int($0) }
             let startDate = parts.count == 3 ? Time.civil(parts[0], parts[1], parts[2]) : Date()
             let plan = regenerateForTask(task: task, recurrence: recurrence, existingBlocks: existing,
-                                         todayIso: Clock.todayISO(), startTime: startTime, startDate: startDate)
+                                         todayIso: today, startTime: startTime, startDate: startDate)
             Task {
                 for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
                 for b in plan.toUpsert { try? await write.upsertCalBlock(b, nowISO: now) }
             }
             // Guarantee the chosen slot is materialized (the horizon regen skips
-            // today / off-pattern picks). Only when nothing already covers it —
-            // computed POST-plan by the pure helper (an existing block the regen
-            // is about to DELETE doesn't count, or the task would vanish from the
-            // day just scheduled).
-            let coversChosen = recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso)
-            if !coversChosen {
-                saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
-                                   startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))
+            // today / off-pattern picks), computed POST-plan by the pure helper:
+            // an open occurrence at another time (today's — regenerate never
+            // touches it) is moved, a skipped one is moved and un-skipped, and a
+            // done one leaves the day alone (audit 2026-09-22, C7).
+            switch recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: startTime) {
+            case .covered:
+                break
+            case .retime(let b):
+                var moved = b
+                moved.startTime = startTime
+                moved.skipped = false
+                saveBlock(moved)   // keeps its own length; PATCHes its Google event when pushed
+            case .mint:
+                // Clamped to the server's 5…1440 (audit 2026-09-22, C4) — also
+                // enforced in WriteThrough; here so the Google mirror matches.
+                saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: startTime,
+                                   durationMinutes: clampDurationMin(task.estimateMin), date: iso, kind: .task))
             }
-            if let anchor = earliest(existing), anchor.date != iso || anchor.startTime != startTime {
+            // Compared with the series' next occurrence: a template's earliest
+            // block is weeks-old history, so every re-schedule — even a no-op —
+            // bumped moveCount (audit 2026-09-22, C7).
+            if let anchor = recurrenceAnchor(taskId: task.id, blocks: existing, todayIso: today),
+               anchor.date != iso || anchor.startTime != startTime {
                 let bumped = bumpMoveCount(task, nowISO: now)
                 Task { try? await write.upsertTask(bumped, nowISO: now) }
             }
@@ -2040,7 +2063,7 @@ final class AppModel {
             }
         } else {
             saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
-                               startTime: startTime, durationMinutes: task.estimateMin, date: iso, kind: .task))
+                               startTime: startTime, durationMinutes: clampDurationMin(task.estimateMin), date: iso, kind: .task))
         }
     }
 
