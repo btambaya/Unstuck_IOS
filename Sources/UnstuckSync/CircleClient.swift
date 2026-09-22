@@ -56,10 +56,11 @@ public struct CircleRedeemResult: Decodable, Sendable, Equatable {
     public var grantedItem: Bool { grantedTaskId != nil || grantedCollectionId != nil }
 }
 
-/// Outcome of a `circle-invite` edge-fn call. Uniform shape (never reveals
-/// whether the email has an account): existing user → added; new person →
-/// emailed + link; blank email → link only. `error` carries a server code
-/// (e.g. "circle_full") on a non-2xx.
+/// Outcome of a `circle-invite` edge-fn call: existing user → added; new
+/// person → emailed + link; blank email → link only. (The shapes differ, so
+/// the answer does reveal an existing account — the old "uniform" claim was
+/// false; audit 2026-09-22, C10.) `error` carries a server code (e.g.
+/// "circle_full", or "blocked" when I blocked that person) on a non-2xx.
 public struct CircleInviteResult: Decodable, Sendable, Equatable {
     public var ok: Bool?
     public var added: Bool?
@@ -115,10 +116,20 @@ public struct CircleClient: Sendable {
         }
     }
 
-    /// Remove someone from your circle (also drops their task shares, server-side).
-    /// RPC: circle_remove(p_id). Best-effort.
-    public func removeMember(id: String) async {
-        _ = try? await client.rpc("circle_remove", params: IdParams(p_id: id)).execute()
+    /// Remove someone from your circle. Server-side this also drops the task
+    /// shares AND the list memberships between the two of you, in both
+    /// directions, releasing the promotions they held (migration 075 — 066
+    /// left every shared list shared; audit 2026-09-22, C11). A pending roster
+    /// row is just cancelled. RPC: circle_remove(p_id) → void, so TRUE means
+    /// it didn't throw; offline is false. The caller re-reads the shared
+    /// state only on true — an offline re-read comes back [] and would blank
+    /// Shared-with-you and the delegation badges (audit 2026-09-22, C11).
+    @discardableResult
+    public func removeMember(id: String) async -> Bool {
+        do {
+            _ = try await client.rpc("circle_remove", params: IdParams(p_id: id)).execute()
+            return true
+        } catch { return false }
     }
 
     /// Invite by email (we reach them ourselves) or blank for a shareable link.
@@ -322,6 +333,61 @@ public struct CircleClient: Sendable {
         } catch { return false }
     }
 
+    // ── Blocks + recipient-side removal (migration 075) ──────────────────────
+    // A block used to be a device-local email set that nothing on the server
+    // read, and a recipient had no way to drop a task shared with them (audit
+    // 2026-09-22, C10). These are the server-backed RPCs; every write is TRUE
+    // only when the server says so (the scalar boolean is read by the same
+    // parser as `cancel_pending_invite`), and a throw — offline, or a server
+    // without 075 — is false, so the UI never claims a block that didn't land.
+
+    /// Block someone by user id: the server cuts the connection, the task
+    /// shares and list memberships both ways, and their pending invites to
+    /// me, and refuses anything they share with me from then on.
+    /// RPC: block_user(p_user) → boolean.
+    @discardableResult
+    public func blockUser(userId: String) async -> Bool {
+        await booleanRPC("block_user", UserParams(p_user: userId))
+    }
+
+    /// Block the OWNER of a task shared with me — the recipient only knows the
+    /// share id. RPC: block_task_sharer(p_share_id) → boolean.
+    @discardableResult
+    public func blockTaskSharer(shareId: String) async -> Bool {
+        await booleanRPC("block_task_sharer", ShareIdParams(p_share_id: shareId))
+    }
+
+    /// Lift a block. Restores nothing that the block removed.
+    /// RPC: unblock_user(p_user) → boolean.
+    @discardableResult
+    public func unblockUser(userId: String) async -> Bool {
+        await booleanRPC("unblock_user", UserParams(p_user: userId))
+    }
+
+    /// Remove a task shared WITH me from my list (deletes MY recipient row;
+    /// the owner isn't told). RPC: task_share_leave(p_share_id) → boolean.
+    @discardableResult
+    public func leaveSharedTask(shareId: String) async -> Bool {
+        await booleanRPC("task_share_leave", ShareIdParams(p_share_id: shareId))
+    }
+
+    /// Everyone I blocked, newest first (display names only, never an email).
+    /// RPC: my_blocked_users() → table(user_id, name, created_at). Tolerant →
+    /// [] on any failure, including a server without 075.
+    public func blockedUsers() async -> [BlockedUser] {
+        do {
+            let rows: [BlockedUserRow] = try await client.rpc("my_blocked_users").execute().value
+            return rows.map { $0.model() }
+        } catch { return [] }
+    }
+
+    private func booleanRPC(_ fn: String, _ params: some Encodable) async -> Bool {
+        do {
+            let resp = try await client.rpc(fn, params: params).execute()
+            return Self.decodeCancelPendingInvite(resp.data)
+        } catch { return false }
+    }
+
     /// `my_pending_invites` body → models. Defensive by design (the RPC lands
     /// separately): the body must be a JSON array; an element that is not an
     /// object, has an unknown `kind`, or has no `id` is dropped WITHOUT taking
@@ -358,6 +424,23 @@ struct SetDoneParams: Encodable { let p_task_id: String; let p_done: Bool }
 struct LogSharedFocusParams: Encodable { let p_task_id: String; let p_actual_sec: Int; let p_session_id: String }
 struct SharedBlocksParams: Encodable { let p_from: String; let p_to: String }
 struct CancelPendingInviteParams: Encodable { let p_kind: String; let p_id: String }
+/// block_user / unblock_user (migration 075).
+struct UserParams: Encodable { let p_user: String }
+/// block_task_sharer / task_share_leave (migration 075).
+struct ShareIdParams: Encodable { let p_share_id: String }
+
+/// One `my_blocked_users()` row (migration 075). `name` is the server's
+/// `_display_name`; a null one reads "Someone" rather than failing the row.
+struct BlockedUserRow: Decodable {
+    let user_id: String
+    let name: String?
+    let created_at: String?
+
+    func model() -> BlockedUser {
+        let n = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return BlockedUser(userId: user_id, name: n.isEmpty ? "Someone" : n, createdAt: created_at)
+    }
+}
 
 /// One `my_pending_invites()` element — the contract's camelCase jsonb
 /// (`itemId`, `itemName`, `createdAt`) with snake_case twins accepted, every

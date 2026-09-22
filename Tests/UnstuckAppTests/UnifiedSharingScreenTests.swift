@@ -8,6 +8,7 @@
 // Runs on the in-memory AppModel (UI-test mode: GRDB in memory, no coordinator).
 
 import XCTest
+import Supabase
 import UnstuckCore
 import UnstuckData
 import UnstuckSync
@@ -21,7 +22,6 @@ private final class FakeShareTransport: ShareScreenTransport {
     var taskSharesById: [String: [ShareForTask]] = [:]
     var pendingTask: [TaskSharePendingInvite] = []
     var members: [CollectionMemberInfo] = []
-    var blocked: Set<String> = []
 
     // Scripted answers.
     var shareTaskError: Error?
@@ -29,6 +29,7 @@ private final class FakeShareTransport: ShareScreenTransport {
     var collectionOutcome: ShareOutcome = .ok
     var linkOutcome: ShareLinkOutcome = .ok(url: "https://unstucknow.io/circle/join?code=xyz")
     var unshareOk = true
+    var blockOk = true
 
     // Recorded calls.
     var sharedTask: [(taskId: String, userId: String, level: ShareLevel)] = []
@@ -41,6 +42,9 @@ private final class FakeShareTransport: ShareScreenTransport {
     var linkLevels: [ShareLevel] = []
     var linkRoles: [String] = []
     var loads = 0
+    /// Each block call's user id + how many loads had happened before it (so
+    /// a test can prove the reload came AFTER the server answered).
+    var blocks: [(userId: String, loadsBefore: Int)] = []
 
     func listCircle() async -> [CircleMember] { loads += 1; return circle }
     func taskShares(taskId: String) async -> [ShareForTask] { taskSharesById[taskId] ?? [] }
@@ -91,7 +95,15 @@ private final class FakeShareTransport: ShareScreenTransport {
         return true
     }
     func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome { linkRoles.append(role); return linkOutcome }
-    func isBlocked(_ email: String) -> Bool { blocked.contains(email) }
+    func block(userId: String) async -> Bool {
+        blocks.append((userId, loads))
+        guard blockOk else { return false }
+        // block_user severs everything between the pair server-side.
+        circle.removeAll { $0.memberUserId == userId }
+        members.removeAll { $0.userId == userId }
+        for k in taskSharesById.keys { taskSharesById[k] = taskSharesById[k]?.filter { $0.recipientUserId != userId } }
+        return true
+    }
 }
 
 private struct RPCError: LocalizedError {
@@ -283,11 +295,13 @@ final class ShareScreenModelTests: XCTestCase {
         XCTAssertEqual(vm.error, "That doesn't look like an email address.")
         XCTAssertTrue(fake.emailShares.isEmpty, "no round trip for a malformed address")
 
-        fake.blocked = ["bad@x.com"]
+        // A block is the SERVER's answer now (audit 2026-09-22, C10) — the
+        // device-local list that only this field read is gone.
+        fake.emailOutcome = .failed(reason: "blocked")
         vm.email = "bad@x.com"
         await vm.shareWithEmail()
         XCTAssertEqual(vm.error, "You've blocked that person.")
-        XCTAssertTrue(fake.emailShares.isEmpty)
+        XCTAssertEqual(fake.emailShares.map(\.1), ["bad@x.com"], "the server decides, so the round trip happens")
 
         fake.emailOutcome = .failed(reason: "self")
         vm.email = "me@x.com"
@@ -327,6 +341,62 @@ final class ShareScreenModelTests: XCTestCase {
         fake.collectionOutcome = .blocked
         await vm.shareWithEmail()
         XCTAssertEqual(vm.error, "You've blocked that person.")
+    }
+
+    /// Audit 2026-09-22, C10: a People tap on a list for someone who is no
+    /// longer connected (a stale row) answers `not_in_circle` since 075 — say
+    /// so, not "try again".
+    func testAListShareToAStaleConnectionSaysNotConnected() async {
+        fake.collectionOutcome = .notConnected
+        let vm = collectionModel()
+        await vm.load()
+        await vm.tap(vm.people[0])
+        XCTAssertEqual(vm.error, "You're not connected yet — share by email or a link below.")
+        XCTAssertNil(vm.result)
+    }
+
+    // MARK: Block (server-side, audit 2026-09-22 C10)
+
+    func testBlockingSomeoneOnATaskGoesToTheServerThenReloads() async {
+        fake.taskSharesById["t1"] = [ShareForTask(shareId: "s1", recipientUserId: "u1", recipientName: "Maya Chen", level: .partner)]
+        let vm = taskModel()
+        await vm.load()
+        let loads = fake.loads
+        await vm.block(vm.people[0])
+        XCTAssertEqual(fake.blocks.map(\.userId), ["u1"], "block_user takes the person's user id")
+        XCTAssertEqual(fake.blocks[0].loadsBefore, loads, "no reload BEFORE the server answered")
+        XCTAssertGreaterThan(fake.loads, loads, "reloaded after the block")
+        XCTAssertEqual(vm.result, "Blocked Maya — they can't share with you, and nothing is shared between you now.")
+        XCTAssertNil(vm.error)
+        XCTAssertFalse(vm.people.contains { $0.userId == "u1" }, "they are gone from the screen — the server cut them off")
+        XCTAssertNil(vm.busyId)
+    }
+
+    func testBlockingSomeoneOnAListBlocksTheirAccountNotAnEmail() async {
+        // The old list Block stored the member's EMAIL on this device and
+        // removed them from this one list; now the account is blocked
+        // server-side and the reload follows the answer.
+        fake.members = [CollectionMemberInfo(userId: "u2", email: "z@x.com", role: "editor", pending: false)]
+        let vm = collectionModel()
+        await vm.load()
+        let row = vm.people.first { $0.userId == "u2" }!
+        await vm.block(row)
+        XCTAssertEqual(fake.blocks.map(\.userId), ["u2"])
+        XCTAssertEqual(vm.result, "Blocked Zubair — they can't share with you, and nothing is shared between you now.")
+        XCTAssertFalse(vm.people.contains { $0.userId == "u2" })
+    }
+
+    func testARefusedBlockIsShownAndNeverClaimsSuccess() async {
+        fake.taskSharesById["t1"] = [ShareForTask(shareId: "s1", recipientUserId: "u1", recipientName: "Maya Chen", level: .partner)]
+        fake.blockOk = false
+        let vm = taskModel()
+        await vm.load()
+        await vm.block(vm.people[0])
+        // The refusal names the BLOCK — "Couldn't share" read as though a
+        // share had failed, on a safety action whose failure matters.
+        XCTAssertEqual(vm.error, "Couldn't block Maya — try again.")
+        XCTAssertNil(vm.result)
+        XCTAssertEqual(vm.people[0].access, .edit, "they still have it")
     }
 
     func testCancellingAPendingInvite() async {
@@ -488,6 +558,87 @@ final class SharedTaskDeepLinkTests: XCTestCase {
         model.routeDeepLink("unstuck://collections")
         XCTAssertEqual(model.router.openCollectionId, "col-9", "the bare tab link doesn't clear a parked id")
     }
+}
+
+// MARK: - recipient-side controls (audit 2026-09-22, C10)
+
+/// A recipient used to have no way to drop, report or block a task shared
+/// with them, and Block was a device-local email set. The confirms say what
+/// happens, the report names the share, and nothing claims success without
+/// the server.
+@MainActor
+final class RecipientShareControlsTests: XCTestCase {
+
+    func testTheConfirmsSayWhatHappens() {
+        XCTAssertEqual(RecipientShareAction.leave.title(owner: "maya@x.com"), "Remove from my list?")
+        XCTAssertEqual(RecipientShareAction.leave.message(owner: "maya@x.com"), "You'll stop seeing this task. maya isn't told.")
+        XCTAssertEqual(RecipientShareAction.leave.confirmLabel, "Remove")
+        XCTAssertEqual(RecipientShareAction.block.title(owner: "Maya Chen"), "Block Maya Chen?")
+        XCTAssertEqual(RecipientShareAction.block.message(owner: "Maya Chen"),
+                       "Maya Chen won't be able to share tasks or lists with you, and everything shared between you stops. You can unblock them in Settings › People.")
+        XCTAssertEqual(RecipientShareAction.block.confirmLabel, "Block")
+    }
+
+    func testTheReportNamesTheTaskTheShareAndTheOwner() {
+        XCTAssertEqual(AppModel.sharedTaskReportBody(taskId: "t1", shareId: "s1", ownerName: "Maya", reason: "Spam"),
+                       "⚠️ REPORT — task shared with me t1 (share s1) from Maya: Spam")
+        XCTAssertEqual(AppModel.sharedTaskReportBody(taskId: "t1", shareId: nil, ownerName: "Maya", reason: "Other"),
+                       "⚠️ REPORT — task shared with me t1 from Maya: Other")
+    }
+
+    func testWithoutAServerNothingClaimsSuccessOrDropsTheRow() async {
+        let model = AppModel()
+        model.startUITestMode()   // no coordinator
+        let row = SharedWithMe(shareId: "s1", taskId: "t1", ownerName: "Maya", level: .view, title: "Deck", done: false)
+        model.shareState.sharedWithMe = [row]
+        let left = await model.leaveSharedTask(shareId: "s1")
+        XCTAssertFalse(left)
+        XCTAssertEqual(model.shareState.sharedWithMe, [row], "a leave that never reached the server keeps the row")
+        let blockedSharer = await model.blockTaskSharer(shareId: "s1")
+        XCTAssertFalse(blockedSharer)
+        let blockedUser = await model.blockUser(userId: "u1")
+        XCTAssertFalse(blockedUser)
+    }
+
+    /// A refused leave used to count on the refetch to bring the row back —
+    /// offline that refetch reads [] too, so it blanked every Shared-with-you
+    /// row and delegation badge. The row now comes back in place and nothing
+    /// else is touched.
+    func testAnOfflineLeaveKeepsTheRowAndEverythingElse() async {
+        let share = ShareModel(client: Self.offlineCircle())
+        let a = SharedWithMe(shareId: "s1", taskId: "t1", ownerName: "Maya", level: .view, title: "Deck", done: false)
+        let b = SharedWithMe(shareId: "s2", taskId: "t2", ownerName: "Zubair", level: .partner, title: "Run", done: false)
+        share.sharedWithMe = [a, b]
+        share.badges = ["t9": [ShareBadge(taskId: "t9", level: .assign, recipientName: "Maya")]]
+        let revision = share.revision
+        let left = await share.leave(shareId: "s1")
+        XCTAssertFalse(left)
+        XCTAssertEqual(share.sharedWithMe, [a, b], "the row is back in place; the others were never touched")
+        XCTAssertEqual(share.assignedOutIds, ["t9"], "the delegation badge survives")
+        XCTAssertEqual(share.revision, revision, "no re-read")
+        // The re-read the old path ran really does blank it all offline.
+        await share.refresh()
+        XCTAssertTrue(share.sharedWithMe.isEmpty)
+        XCTAssertTrue(share.badges.isEmpty)
+    }
+
+    /// A CircleClient that fails every call fast, like an offline phone's:
+    /// nothing listens on this loopback port. The session lives in memory,
+    /// never the keychain.
+    private static func offlineCircle() -> CircleClient {
+        CircleClient(SupabaseClient(
+            supabaseURL: URL(string: "http://127.0.0.1:1")!, supabaseKey: "offline",
+            options: SupabaseClientOptions(auth: .init(storage: MemoryAuthStorage(), autoRefreshToken: false,
+                                                       emitLocalSessionAsInitialSession: true))))
+    }
+}
+
+private final class MemoryAuthStorage: AuthLocalStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    func store(key: String, value: Data) throws { lock.withLock { values[key] = value } }
+    func retrieve(key: String) throws -> Data? { lock.withLock { values[key] } }
+    func remove(key: String) throws { _ = lock.withLock { values.removeValue(forKey: key) } }
 }
 
 // MARK: - assistant email confirm

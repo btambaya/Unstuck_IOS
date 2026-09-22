@@ -111,6 +111,9 @@ final class UnifiedSharingTests: XCTestCase {
         XCTAssertEqual(shareResultLine(.accessChanged(name: "Maya", access: .view)), "Maya can now view.")
         XCTAssertEqual(shareResultLine(.removed(name: "Maya")), "Maya no longer has this.")
         XCTAssertEqual(shareResultLine(.inviteCancelled(email: "x@y.com")), "Invite to x@y.com cancelled.")
+        // Audit 2026-09-22, C10: a block is server-side and says what it did.
+        XCTAssertEqual(shareResultLine(.blocked(name: "Maya Chen")),
+                       "Blocked Maya — they can't share with you, and nothing is shared between you now.")
     }
 
     // MARK: failure mapping
@@ -129,6 +132,8 @@ final class UnifiedSharingTests: XCTestCase {
         XCTAssertEqual(ShareFailure(reason: "bad_request"), .invalidEmail)
         XCTAssertEqual(ShareFailure(reason: "not_in_circle"), .notConnected)
         XCTAssertEqual(ShareFailure.listNeedsEmail.message, "Lists can't be shared by name yet — enter their email below.")
+        // Audit 2026-09-22, C10: a refused Block says the block didn't land.
+        XCTAssertEqual(ShareFailure.blockFailed(name: "Maya Chen").message, "Couldn't block Maya — try again.")
         XCTAssertEqual(ShareFailure(reason: "not_configured"), .notSignedIn)
         XCTAssertEqual(ShareFailure(reason: nil), .network)
         XCTAssertEqual(ShareFailure(reason: "network").message, "Couldn't share — try again.")

@@ -741,7 +741,13 @@ extension AppModel {
     /// boot) degrades to an empty, read-only roster — mirrors the web
     /// `useCircle` no-`sb` guard.
     func makeCircleModel() -> CircleModel {
-        CircleModel(transport: LivePeopleTransport(client: coordinator?.circle))
+        let m = CircleModel(transport: LivePeopleTransport(client: coordinator?.circle))
+        // Removing a connection (circle_remove) or blocking someone now also
+        // ends the list memberships between the two of us, both ways (075):
+        // re-read so my lists stop listing them and the lists I was taken out
+        // of go (audit 2026-09-22, C11/C10).
+        m.onConnectionRemoved = { [weak self] in await self?.refreshAfterSevering() }
+        return m
     }
 
     // MARK: - co-focus presence (M5)
@@ -793,41 +799,71 @@ extension AppModel {
 
     // MARK: - Safety (App Store Guideline 1.2 — user-generated/shared content)
 
-    /// Device-local set of blocked collaborator emails (lowercased). A blocked
-    /// person is removed from your shared lists and can't be re-invited. Cleared
-    /// on sign-out alongside the other device-local state.
-    private static let blockedEmailsKey = "unstuck.blockedEmails"
+    // Blocks are server-backed (block_user / block_task_sharer, migration 075).
+    // The old block was a device-local email set: nothing on the server read
+    // it, it only guarded this device's "Someone new" field, sign-out wiped it,
+    // and the blocked person stayed connected and could keep sharing and
+    // pushing (audit 2026-09-22, C10). Its "unstuck.blockedEmails" key stays in
+    // the sign-out scrub so the legacy data is cleared.
 
-    var blockedEmails: Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: Self.blockedEmailsKey) ?? [])
+    /// Block someone by user id — a Share-screen row, a People row, the owner
+    /// of a list shared with me. TRUE only when the server confirmed; the
+    /// shared state is then re-read, because a block also cuts the connection,
+    /// the task shares and the list memberships between us, both ways.
+    @discardableResult
+    func blockUser(userId: String) async -> Bool {
+        guard let circle = coordinator?.circle, !userId.isEmpty else { return false }
+        let ok = await circle.blockUser(userId: userId)
+        if ok { await refreshAfterSevering() }
+        return ok
     }
 
-    func isBlocked(_ email: String) -> Bool {
-        blockedEmails.contains(email.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
+    /// Block the owner of a task shared WITH me (the recipient knows only the
+    /// share id). TRUE only when the server confirmed.
+    @discardableResult
+    func blockTaskSharer(shareId: String) async -> Bool {
+        guard let circle = coordinator?.circle, !shareId.isEmpty else { return false }
+        let ok = await circle.blockTaskSharer(shareId: shareId)
+        if ok { await refreshAfterSevering() }
+        return ok
     }
 
-    /// Block an abusive collaborator: add to the blocklist + remove them from
-    /// this shared collection (so they lose access immediately). The blocklist
-    /// is device-local and always takes effect; `onRemoveFailed` fires when the
-    /// server refused the REMOVAL, so the UI can say the person still has
-    /// access instead of showing them silently gone.
-    func blockUser(email: String, inCollection collectionId: String, userId: String?,
-                   onRemoveFailed: (@MainActor () -> Void)? = nil) {
-        var s = blockedEmails
-        s.insert(email.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))
-        UserDefaults.standard.set(Array(s), forKey: Self.blockedEmailsKey)
-        Task {
-            let ok = userId != nil
-                ? await unshareCollection(collectionId, userId: userId!)
-                : await cancelCollectionInvite(collectionId, email: email)
-            if !ok { onRemoveFailed?() }
-        }
+    /// Remove a task shared WITH me from my list (the owner isn't told).
+    /// TRUE only when the server confirmed.
+    func leaveSharedTask(shareId: String) async -> Bool {
+        await shareState.leave(shareId: shareId)
+    }
+
+    /// A block or a removed connection took task shares and list memberships
+    /// away server-side: re-read both at once. The owner's collection_members
+    /// channel is filtered to MY rows, so nothing live tells my device that
+    /// someone left one of my lists (audit 2026-09-22, C10/C11).
+    func refreshAfterSevering() async {
+        await shareState.refresh()
+        await coordinator?.rehydrateCollections()
+    }
+
+    /// Report a task someone shared WITH me — a recipient could only report
+    /// from a Share screen they owned (audit 2026-09-22, C10). Same channel as
+    /// `reportConcern`. False when the report didn't send.
+    @discardableResult
+    func reportSharedTask(taskId: String, shareId: String?, ownerName: String, reason: String) async -> Bool {
+        await sendFeedback(body: Self.sharedTaskReportBody(taskId: taskId, shareId: shareId,
+                                                           ownerName: ownerName, reason: reason),
+                           category: "report", screen: "shared-with-me")
+    }
+
+    /// Pure: the report row's body — which task, which share, from whom, why.
+    nonisolated static func sharedTaskReportBody(taskId: String, shareId: String?, ownerName: String, reason: String) -> String {
+        "⚠️ REPORT — task shared with me \(taskId)\(shareId.map { " (share \($0))" } ?? "") from \(ownerName): \(reason)"
     }
 
     /// Report objectionable content / a collaborator. Routes through the
     /// feedback channel (triaged in the Supabase dashboard) so we can act.
-    func reportConcern(collectionId: String, about email: String, reason: String) async {
-        _ = await sendFeedback(
+    /// False when the report didn't send.
+    @discardableResult
+    func reportConcern(collectionId: String, about email: String, reason: String) async -> Bool {
+        await sendFeedback(
             body: "⚠️ REPORT — shared collection \(collectionId), member \(email): \(reason)",
             category: "report", screen: "shared-collection")
     }

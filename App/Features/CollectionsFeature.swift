@@ -351,6 +351,13 @@ struct CollectionDetailView: View {
     /// instead of popping as though access were gone.
     @State private var leaveFailed = false
     @State private var leaving = false
+    /// A member's own controls next to Leave — Report… and Block the owner
+    /// (server-side, migration 075). A member used to have only Leave, and the
+    /// owner could simply add them back (audit 2026-09-22, C10).
+    @State private var showReport = false
+    @State private var reportNote: String?
+    @State private var confirmBlockOwner = false
+    @State private var blockFailed = false
     @State private var promoteTarget: CollectionItem?
     @State private var byTimeTarget: CollectionItem?
     @SwiftUI.FocusState private var addFocused: Bool
@@ -408,6 +415,43 @@ struct CollectionDetailView: View {
         } message: {
             Text("The server didn't accept it, so you still have access. Check your connection and try again.")
         }
+        .confirmationDialog("Report this list?", isPresented: $showReport, titleVisibility: .visible) {
+            ForEach(["Objectionable content", "Spam", "Harassment", "Other"], id: \.self) { reason in
+                Button(reason) {
+                    Task {
+                        let ok = await model.reportConcern(collectionId: id, about: "list owner", reason: reason)
+                        reportNote = ok ? "Report sent — we review every report." : "Couldn't send the report — try again."
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Send a report about this list to the Unstuck team. We review reports and take action.")
+        }
+        .alert(reportNote ?? "", isPresented: Binding(get: { reportNote != nil }, set: { if !$0 { reportNote = nil } })) {
+            Button("OK", role: .cancel) {}
+        }
+        .confirmationDialog("Block the owner?", isPresented: $confirmBlockOwner, titleVisibility: .visible) {
+            Button("Block", role: .destructive) {
+                guard let ownerId = collection?.ownerId else { return }
+                leaving = true
+                Task {
+                    // Pop only once the SERVER confirms — the block also takes
+                    // me out of this list (and every other list between us).
+                    let ok = await model.blockUser(userId: ownerId)
+                    leaving = false
+                    if ok { dismiss() } else { blockFailed = true }
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("They won't be able to share tasks or lists with you, and everything shared between you stops — this list too. You can unblock them in Settings › People.")
+        }
+        .alert("Couldn't block the owner", isPresented: $blockFailed) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("The server didn't accept it, so nothing changed. Check your connection and try again.")
+        }
     }
 
     @ViewBuilder
@@ -463,15 +507,25 @@ struct CollectionDetailView: View {
                                     .accessibilityLabel("Share")
                             }
                         } else {
-                            // Pop only once the SERVER confirms the leave — the
-                            // old immediate dismiss claimed access was gone
-                            // even when the call was refused, and the list
-                            // reappeared on the next hydrate unexplained.
-                            Button {
-                                leaving = true
-                                model.leaveCollection(col.id) { ok in
-                                    leaving = false
-                                    if ok { dismiss() } else { leaveFailed = true }
+                            // Leave / Report… / Block the owner (audit
+                            // 2026-09-22, C10). Pop only once the SERVER
+                            // confirms the leave — the old immediate dismiss
+                            // claimed access was gone even when the call was
+                            // refused, and the list reappeared on the next
+                            // hydrate unexplained.
+                            Menu {
+                                Button {
+                                    leaving = true
+                                    model.leaveCollection(col.id) { ok in
+                                        leaving = false
+                                        if ok { dismiss() } else { leaveFailed = true }
+                                    }
+                                } label: { Label("Leave", systemImage: "rectangle.portrait.and.arrow.right") }
+                                Button { showReport = true } label: { Label("Report…", systemImage: "flag") }
+                                if col.ownerId != nil {
+                                    Button(role: .destructive) { confirmBlockOwner = true } label: {
+                                        Label("Block the owner", systemImage: "hand.raised")
+                                    }
                                 }
                             } label: {
                                 Text(leaving ? "Leaving…" : "Leave")

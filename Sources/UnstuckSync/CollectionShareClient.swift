@@ -28,6 +28,12 @@ public enum ShareOutcome: Sendable, Equatable {
     case blocked     // the server's blocked-users mechanism refused
     case rateLimited // the per-user limiter refused (429)
     case invalid     // 400 bad_request (no / malformed email, or an id an older deployment can't resolve)
+    /// An add by user id for someone who is no longer (or never was) a
+    /// connection or member — `share-collection` answers `not_in_circle`
+    /// since migration 075 (a stale People row after the other side removed
+    /// you). Named so the Share screen says so instead of "try again"
+    /// (audit 2026-09-22, C10).
+    case notConnected
     case error       // unrecoverable
 
     /// The server reason code this outcome corresponds to (for the shared
@@ -40,6 +46,7 @@ public enum ShareOutcome: Sendable, Equatable {
         case .blocked: return "blocked"
         case .rateLimited: return "rate_limited"
         case .invalid: return "bad_request"
+        case .notConnected: return "not_in_circle"
         case .error: return "network"
         }
     }
@@ -197,6 +204,7 @@ public struct CollectionShareClient: Sendable {
             case "blocked": return ShareResult(outcome: .blocked, memberUserIds: members)
             case "rate_limited", "rate_limit", "too_many_requests": return ShareResult(outcome: .rateLimited, memberUserIds: members)
             case "bad_request", "invalid_email": return ShareResult(outcome: .invalid, memberUserIds: members)
+            case "not_in_circle": return ShareResult(outcome: .notConnected, memberUserIds: members)
             default: return ShareResult(outcome: .error, memberUserIds: members)
             }
         }

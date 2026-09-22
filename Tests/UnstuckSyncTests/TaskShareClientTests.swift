@@ -133,6 +133,21 @@ final class TaskShareClientTests: XCTestCase {
         XCTAssertNil(ShareOutcome.ok.failureReason)
     }
 
+    /// Audit 2026-09-22, C10: since 075 an add by user id for someone who is no
+    /// longer a connection or member (a stale People row) answers
+    /// `not_in_circle` — the Share screen must say "not connected", not the
+    /// generic "Couldn't share — try again."
+    func testCollectionAddNotInCircleIsNotConnected() {
+        let r = CollectionShareClient.decodeShareAdd(data(#"{"ok":false,"reason":"not_in_circle"}"#))
+        XCTAssertEqual(r.outcome, .notConnected)
+        XCTAssertEqual(CollectionShareClient.decodeShareAdd(data(#"{"error":"not_in_circle"}"#), thrown: true).outcome, .notConnected)
+        XCTAssertFalse(ShareOutcome.notConnected.isSuccess)
+        XCTAssertEqual(ShareOutcome.notConnected.failureReason, "not_in_circle")
+        XCTAssertEqual(ShareFailure(reason: ShareOutcome.notConnected.failureReason), .notConnected)
+        XCTAssertEqual(ShareFailure(reason: ShareOutcome.notConnected.failureReason).message,
+                       "You're not connected yet — share by email or a link below.")
+    }
+
     // MARK: circle_list gains invitee_email (optional both ways)
 
     func testCircleMemberRowDecodesInviteeEmailWhenPresentAndWithoutIt() throws {

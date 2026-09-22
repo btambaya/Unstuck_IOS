@@ -149,6 +149,31 @@ final class ShareModel {
         await refresh()
     }
 
+    /// Remove a task shared WITH me from my list: deletes MY recipient row
+    /// (task_share_leave, migration 075); the owner isn't told. A recipient
+    /// had no way to drop an unwanted share before (audit 2026-09-22, C10).
+    /// Optimistic — the row leaves every surface at once. A refusal puts the
+    /// row back HERE, not through a refetch: the likeliest refusal is being
+    /// offline, and then tasks_shared_with_me / my_task_share_badges read []
+    /// too, so a refetch would blank every Shared-with-you row and delegation
+    /// badge. Only a confirmed leave re-reads. TRUE only when it confirmed.
+    func leave(shareId: String) async -> Bool {
+        guard let client else { return false }
+        let index = sharedWithMe.firstIndex { $0.shareId == shareId }
+        let row = index.map { sharedWithMe[$0] }
+        let before = revision
+        sharedWithMe.removeAll { $0.shareId == shareId }
+        guard await client.leaveSharedTask(shareId: shareId) else {
+            // A refresh that landed meanwhile read the server's truth — keep it.
+            if let index, let row, revision == before {
+                sharedWithMe.insert(row, at: min(index, sharedWithMe.count))
+            }
+            return false
+        }
+        await refresh()
+        return true
+    }
+
     /// The shares currently on a task I own — drives the share sheet's picker.
     func sharesForTask(_ taskId: String) async -> [ShareForTask] {
         await client?.sharesForTask(taskId: taskId) ?? []
@@ -336,6 +361,38 @@ struct SharedDetailTarget: Identifiable, Equatable {
     }
 }
 
+/// What a recipient can do to a task shared WITH them that needs a confirm —
+/// the copy lives here so it is testable (audit 2026-09-22, C10).
+enum RecipientShareAction: Equatable {
+    /// task_share_leave — drop MY recipient row; the owner isn't told.
+    case leave
+    /// block_task_sharer — block the owner server-side.
+    case block
+
+    func title(owner: String) -> String {
+        switch self {
+        case .leave: return "Remove from my list?"
+        case .block: return "Block \(shortName(owner))?"
+        }
+    }
+
+    func message(owner: String) -> String {
+        switch self {
+        case .leave:
+            return "You'll stop seeing this task. \(shortName(owner)) isn't told."
+        case .block:
+            return "\(shortName(owner)) won't be able to share tasks or lists with you, and everything shared between you stops. You can unblock them in Settings › People."
+        }
+    }
+
+    var confirmLabel: String {
+        switch self {
+        case .leave: return "Remove"
+        case .block: return "Block"
+        }
+    }
+}
+
 // MARK: - Shared task read-only detail (T1) + shared focus entry (T3)
 
 /// The read-only detail of a task shared WITH me, built from shared_task_detail
@@ -359,10 +416,36 @@ struct SharedTaskDetailSheet: View {
     /// the shared focus on `onDisappear` (the focus cover lives on another host, so
     /// it can't present while this sheet is still dismissing).
     @State private var pendingFocus: SharedTaskDetail?
+    /// The recipient's own controls over the share, at EVERY level — Remove
+    /// from my list / Report… / Block. A recipient used to have none: an
+    /// unwanted share sat in Today for good (audit 2026-09-22, C10).
+    @State private var confirmAction: RecipientShareAction?
+    @State private var showReport = false
+    @State private var working = false
+    /// The line after a report / a refused remove or block.
+    @State private var note: (ok: Bool, text: String)?
+
+    /// The share this sheet is for — the calendar block carries it, else my
+    /// Shared-with-you row does. nil (nothing to act on) hides the menu.
+    private var shareId: String? {
+        block?.shareId ?? model.shareState.sharedWithMe.first { $0.taskId == taskId }?.shareId
+    }
+    private var ownerName: String {
+        detail?.ownerName ?? model.shareState.sharedWithMe.first { $0.taskId == taskId }?.ownerName
+            ?? block?.ownerName ?? "Someone"
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
+                if let note {
+                    Text(note.text).font(UFont.sans(12.5, .semibold))
+                        .foregroundStyle(note.ok ? theme.palette.greenInk : theme.palette.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20).padding(.top, 14)
+                        .accessibilityAddTraits(.updatesFrequently)
+                }
                 if let d = detail {
                     content(d)
                 } else if !loaded {
@@ -376,7 +459,31 @@ struct SharedTaskDetailSheet: View {
             .frame(maxWidth: .infinity)
             .background(theme.palette.bg.ignoresSafeArea())
             .navigationTitle("Shared task").navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .topBarLeading) {
+                    if shareId != nil { recipientMenu }
+                }
+            }
+            .confirmationDialog(confirmAction?.title(owner: ownerName) ?? "",
+                                isPresented: Binding(get: { confirmAction != nil }, set: { if !$0 { confirmAction = nil } }),
+                                titleVisibility: .visible, presenting: confirmAction) { action in
+                Button(action.confirmLabel, role: .destructive) {
+                    confirmAction = nil
+                    run(action)
+                }
+                Button("Cancel", role: .cancel) { confirmAction = nil }
+            } message: { action in
+                Text(action.message(owner: ownerName))
+            }
+            .confirmationDialog("Report this task?", isPresented: $showReport, titleVisibility: .visible) {
+                ForEach(["Objectionable content", "Spam", "Harassment", "Other"], id: \.self) { reason in
+                    Button(reason) { report(reason) }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Send a report about this task from \(shortName(ownerName)) to the Unstuck team. We review reports and take action.")
+            }
         }
         .presentationDetents([.medium, .large])
         .task {
@@ -385,6 +492,48 @@ struct SharedTaskDetailSheet: View {
         }
         // Start the shared focus AFTER this sheet is gone (cover on another host).
         .onDisappear { if let d = pendingFocus { model.beginSharedFocus(d) } }
+    }
+
+    /// "More" — the recipient's controls. Remove and Block confirm first; both
+    /// wait for the server and close the sheet only once it agreed.
+    private var recipientMenu: some View {
+        Menu {
+            Button(role: .destructive) { confirmAction = .leave } label: {
+                Label("Remove from my list", systemImage: "minus.circle")
+            }
+            Button { showReport = true } label: { Label("Report…", systemImage: "flag") }
+            Button(role: .destructive) { confirmAction = .block } label: {
+                Label("Block \(shortName(ownerName))", systemImage: "hand.raised")
+            }
+        } label: {
+            if working { ProgressView().controlSize(.small) } else { Image(systemName: "ellipsis.circle") }
+        }
+        .disabled(working)
+        .accessibilityLabel("More")
+    }
+
+    private func run(_ action: RecipientShareAction) {
+        guard let shareId, !working else { return }
+        working = true
+        note = nil
+        Task {
+            let ok: Bool
+            switch action {
+            case .leave: ok = await model.leaveSharedTask(shareId: shareId)
+            case .block: ok = await model.blockTaskSharer(shareId: shareId)
+            }
+            working = false
+            if ok { dismiss() } else { note = (false, "Couldn't do that — try again.") }
+        }
+    }
+
+    private func report(_ reason: String) {
+        let sid = shareId, owner = ownerName
+        note = nil
+        Task {
+            let ok = await model.reportSharedTask(taskId: taskId, shareId: sid, ownerName: owner, reason: reason)
+            note = ok ? (true, "Report sent — we review every report.") : (false, "Couldn't do that — try again.")
+        }
     }
 
     @ViewBuilder
