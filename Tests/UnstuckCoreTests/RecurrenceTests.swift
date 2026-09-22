@@ -491,6 +491,12 @@ final class RecurrenceTopUpTests: XCTestCase {
         let added = recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: today, seriesTime: "19:00")
         XCTAssertEqual(added.map(\.date), (2...55).map(day))
         XCTAssertTrue(added.allSatisfy { $0.startTime == "19:00" })
+        // Monthly: a lapsed series on the 15th re-placed on the 20th runs on the
+        // 20th, as the placed time does (the history's day must not win either).
+        let lapsed = ["2026-06-15", "2026-07-15", "2026-08-15"].map { mkBlock(id: $0, taskId: "gym", startTime: "07:00", date: $0) }
+            + [mkBlock(id: "placed", taskId: "gym", startTime: "07:00", date: "2026-10-20")]
+        XCTAssertEqual(recurrenceTopUp(task: gym(.monthly(until: nil)), existingBlocks: lapsed, todayIso: "2026-10-16",
+                                       seriesTime: "07:00").map(\.date), ["2026-11-20"])
     }
 
     // Monthly day of month (C1 critic / C22): from the series, not the frontier.
@@ -520,6 +526,68 @@ final class RecurrenceTopUpTests: XCTestCase {
         }
         XCTAssertEqual(recurrenceTopUp(task: gym(.monthly(until: nil)), existingBlocks: blocks, todayIso: "2026-03-10").map(\.date),
                        ["2026-04-30"])
+    }
+
+    // A moved occurrence still owns its month (audit 2026-09-22, C1 review).
+
+    /// The top-up run once a day from `from` through `to`, keeping what it adds.
+    private func dailyTopUps(_ task: TaskItem, _ blocks: [CalBlock], from: String, to: String) -> [CalBlock] {
+        var all = blocks
+        var d = from
+        while d <= to {
+            all += recurrenceTopUp(task: task, existingBlocks: all, todayIso: d)
+            d = LocalDate.addDays(d, 1)
+        }
+        return all
+    }
+    private func rentBlock(_ date: String, done: Bool = false) -> CalBlock {
+        var b = mkBlock(id: date, taskId: "gym", startTime: "07:00", date: date)
+        b.done = done
+        return b
+    }
+
+    func testMonthlyRePlanToALaterDayMintsNoStrayOldDay() {
+        // Rent on the 15th, re-planned on Oct 16 from Nov 15 to the 20th (or the
+        // 30th) in the Schedule sheet: regenerate builds 8 weeks from the new
+        // date, so its second occurrence lies past the horizon and the old vote
+        // read [15, 15, 20] and minted Dec 15 next to Dec 20.
+        let rent = gym(.monthly(until: nil))
+        let cases: [(history: [String], day: Int, expected: [String])] = [
+            (["2026-08-15", "2026-09-15", "2026-10-15"], 20, ["2026-11-20", "2026-12-20", "2027-01-20", "2027-02-20", "2027-03-20"]),
+            (["2026-10-15"], 20, ["2026-11-20", "2026-12-20", "2027-01-20", "2027-02-20", "2027-03-20"]),
+            (["2026-08-15", "2026-09-15", "2026-10-15"], 30, ["2026-11-30", "2026-12-30", "2027-01-30", "2027-02-28"]),
+        ]
+        for c in cases {
+            var blocks = c.history.map { rentBlock($0, done: true) } + [rentBlock("2026-11-15")]
+            let plan = regenerateForTask(task: rent, recurrence: rent.recurrence, existingBlocks: blocks, todayIso: "2026-10-16",
+                                         startTime: "07:00", startDate: LocalDate.parse("2026-11-\(c.day)"))
+            blocks = blocks.filter { !plan.toDelete.contains($0.id) } + plan.toUpsert
+            let after = dailyTopUps(rent, blocks, from: "2026-10-16", to: "2027-01-31")
+            XCTAssertEqual(after.map(\.date).filter { $0 > "2026-10-16" }.sorted(), c.expected, "re-planned to the \(c.day)th")
+        }
+    }
+
+    func testMonthlyFrontierMovedEarlierDoesNotBringTheOldDateBack() {
+        // On Oct 20 Nov 15 is the only upcoming occurrence; it is dragged to Nov 10.
+        let rent = gym(.monthly(until: nil))
+        let blocks = ["2026-08-15", "2026-09-15", "2026-10-15"].map { rentBlock($0, done: true) } + [rentBlock("2026-11-10")]
+        XCTAssertEqual(recurrenceTopUp(task: rent, existingBlocks: blocks, todayIso: "2026-10-20"), [], "Nov 15 does not come back")
+        let after = dailyTopUps(rent, blocks, from: "2026-10-20", to: "2027-01-31")
+        XCTAssertEqual(after.map(\.date).filter { $0 > "2026-10-20" }.sorted(),
+                       ["2026-11-10", "2026-12-15", "2027-01-15", "2027-02-15", "2027-03-15"], "the series keeps the 15th after it")
+    }
+
+    func testWeeklyFrontierMovedEarlierDoesNotBringTheOldDateBack() {
+        // Mondays; the last one in the horizon dragged to the Saturday before.
+        let mondays = gym(.weekly(daysOfWeek: [1], until: nil))
+        var blocks = (0...55).filter { LocalDate.dayOfWeek(day($0)) == 1 }.map { occ($0) }
+        let last = blocks.count - 1
+        let lastMonday = blocks[last].date
+        blocks[last].date = LocalDate.addDays(lastMonday, -2)
+        XCTAssertEqual(recurrenceTopUp(task: mondays, existingBlocks: blocks, todayIso: today), [], "that Monday does not come back")
+        let after = dailyTopUps(mondays, blocks, from: today, to: day(7))
+        XCTAssertFalse(after.contains { $0.date == lastMonday })
+        XCTAssertEqual(after.filter { $0.date > lastMonday }.map(\.date), [LocalDate.addDays(lastMonday, 7)], "the next week still comes")
     }
 }
 
@@ -571,6 +639,43 @@ final class RecurrenceEditStartTests: XCTestCase {
         }
         XCTAssertEqual(recurrenceEditStart(taskId: "task-1", recurrence: .monthly(until: nil), blocks: mondays, todayIso: today)?.date,
                        "2026-05-25")
+    }
+
+    /// The plan an edit applies: regenerate from the start, minus `keepId`.
+    private func editPlan(_ rec: Recurrence, _ blocks: [CalBlock], today: String) throws -> RegenPlan {
+        var t = mkTask(id: "task-1", name: "Rent")
+        t.recurrence = rec
+        let start = try XCTUnwrap(recurrenceEditStart(taskId: "task-1", recurrence: rec, blocks: blocks, todayIso: today))
+        var plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: today, startTime: start.startTime,
+                                     startDate: LocalDate.parse(start.date), horizonDays: start.horizonDays)
+        plan.toDelete.removeAll { $0 == start.keepId }
+        return plan
+    }
+    private func rent(_ date: String, _ time: String = "07:00", done: Bool = false) -> CalBlock {
+        var b = mkBlock(id: date, taskId: "task-1", startTime: time, date: date)
+        b.done = done
+        return b
+    }
+
+    func testMonthlyEditKeepsThisMonthsOccurrenceMovedOffAPassedDay() throws {
+        // Oct 15's rent pushed to Oct 20 at 18:00; on Oct 16 only the end date
+        // changes. The start is Oct 15 (passed), so regenerate wanted nothing in
+        // October and deleted Oct 20: the month lost its occurrence.
+        let blocks = [rent("2026-08-15", done: true), rent("2026-09-15", done: true), rent("2026-10-20", "18:00"), rent("2026-11-15")]
+        let plan = try editPlan(.monthly(until: "2027-06-30"), blocks, today: "2026-10-16")
+        XCTAssertEqual(plan, RegenPlan(toUpsert: [], toDelete: []), "Oct 20 stays; Nov 15 stays")
+        // An end date before it ends the series there: nothing is kept.
+        XCTAssertEqual(Set(try editPlan(.monthly(until: "2026-10-18"), blocks, today: "2026-10-16").toDelete),
+                       ["2026-10-20", "2026-11-15"])
+    }
+
+    func testMonthlyEditStillRealignsNextMonthsOccurrenceMovedEarlier() throws {
+        // Nov 15 dragged to Nov 10 is next month's, not October's: an explicit
+        // edit puts it back on the series day, as regenerate does everywhere.
+        let blocks = [rent("2026-08-15", done: true), rent("2026-09-15", done: true), rent("2026-10-15", done: true), rent("2026-11-10")]
+        let plan = try editPlan(.monthly(until: nil), blocks, today: "2026-10-16")
+        XCTAssertEqual(plan.toDelete, ["2026-11-10"])
+        XCTAssertEqual(plan.toUpsert.map(\.date), ["2026-11-15", "2026-12-15"])
     }
 }
 

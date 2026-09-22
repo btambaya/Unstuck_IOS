@@ -837,10 +837,45 @@ final class AssistantToolsTests: XCTestCase {
         api.blocks = dailySeries("r", 1...55)
         api.blocks[0].startTime = "18:00"
         let until = LocalDate.addDays(TODAY, 90)
-        await eq("set_task_recurrence", #"{"taskId":"r","kind":"daily","until":"\#(until)"}"#, "ok: \"Gym\" now repeats daily until \(until)")
+        await eq("set_task_recurrence", #"{"taskId":"r","kind":"daily","until":"\#(until)"}"#, "ok: \"Gym\" now repeats daily at 07:00 until \(until)")
         let ids = Set(api.blocks.map(\.id))
         XCTAssertTrue((2...55).allSatisfy { ids.contains("r\($0)") }, "no 07:00 occurrence was deleted")
         XCTAssertTrue(api.blocks.allSatisfy { $0.startTime == "07:00" }, "the series is not rebuilt at 18:00")
+    }
+
+    /// "Make Office every Monday at 11" on a series at 09:15 is schedule_task
+    /// on the next Monday, then set_task_recurrence. The vote kept 09:15 and put
+    /// the new 11:00 back while replying ok, so no tool could re-time a series
+    /// (C1 review). The occurrence placed this turn now sets the series' time.
+    func testScheduleThenSetRecurrenceRetimesTheWholeSeries() async {
+        api.tasks = [task("o", "Office", recurrence: .weekly(daysOfWeek: [1], until: nil))]
+        let mondays = (0...55).map { LocalDate.addDays(TODAY, $0) }.filter { LocalDate.dayOfWeek($0) == 1 }
+        api.blocks = mondays.map { block("o\($0)", "o", $0, "09:15") }
+        let next = mondays.first { $0 > TODAY }!
+        await eq("schedule_task", #"{"taskId":"o","date":"\#(next)","startTime":"11:00"}"#, "ok: scheduled \"Office\" \(next) 11:00")
+        await eq("set_task_recurrence", #"{"taskId":"o","kind":"weekly","daysOfWeek":[1]}"#, "ok: \"Office\" now repeats weekly on Mon at 11:00")
+        let upcoming = api.blocks.filter { $0.date > TODAY }
+        XCTAssertTrue(upcoming.allSatisfy { $0.startTime == "11:00" && LocalDate.dayOfWeek($0.date) == 1 }, "every Monday at 11")
+        XCTAssertEqual(Set(upcoming.map(\.date)).count, upcoming.count, "one per Monday")
+        XCTAssertTrue(mondays.filter { $0 > TODAY }.allSatisfy { d in upcoming.contains { $0.date == d } })
+        // A later turn (a fresh scratch) is an edit again: the series keeps 11:00.
+        scratch = TurnScratch()
+        api.blocks[api.blocks.firstIndex { $0.date == next }!].startTime = "18:00"
+        await eq("set_task_recurrence", #"{"taskId":"o","kind":"weekly","daysOfWeek":[1]}"#, "ok: \"Office\" now repeats weekly on Mon at 11:00")
+    }
+
+    /// October's rent pushed from the 15th to the 20th, then only the end date
+    /// edited on the 16th: the series day had passed, so regenerate deleted the
+    /// 20th and the month lost its occurrence (C1 review).
+    func testSetTaskRecurrenceKeepsThisMonthsMovedOccurrence() async {
+        api.today = "2026-10-16"
+        api.tasks = [task("m", "Rent", recurrence: .monthly(until: nil))]
+        api.blocks = [block("aug", "m", "2026-08-15", "07:00", done: true), block("sep", "m", "2026-09-15", "07:00", done: true),
+                      block("oct", "m", "2026-10-20", "18:00"), block("nov", "m", "2026-11-15", "07:00")]
+        let before = snapshot(api.blocks)
+        await eq("set_task_recurrence", #"{"taskId":"m","kind":"monthly","until":"2027-06-30"}"#,
+                 "ok: \"Rent\" now repeats monthly at 07:00 until 2027-06-30")
+        XCTAssertEqual(snapshot(api.blocks), before, "Oct 20 and Nov 15 both stay")
     }
 
     /// Only a TIMED block anchors a series: a timeless one used to get a plain

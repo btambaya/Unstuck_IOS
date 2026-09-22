@@ -220,6 +220,9 @@ let STAGED_TOOLS: Set<String> = ToolRegistry.staged
 final class TurnScratch {
     var newTasks: [String: TaskItem] = [:]
     var newLists: [String: ItemCollection] = [:]
+    /// Task id → the block schedule_task placed for it this turn, which a
+    /// set_task_recurrence after it takes as the series' day and time.
+    var placedBlocks: [String: String] = [:]
     init() {}
 }
 
@@ -317,9 +320,11 @@ private func rejectPastTime(_ api: AssistantAppState, _ date: String, _ startTim
 /// Place (or move) the anchor block for a task at date+time, materialising the
 /// recurrence horizon when the task repeats. Returns the time the block landed
 /// on (callers report it honestly), or nil when a repeating task's occurrence
-/// on `date` is already done — nothing was placed.
+/// on `date` is already done — nothing was placed. The placed block is noted
+/// in `scratch.placedBlocks`.
 @MainActor
-private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?) async -> String? {
+private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?,
+                          scratch: TurnScratch) async -> String? {
     let blocks = api.getBlocks()
     // The anchor to move is the task's NEXT LIVE block — first-in-array grabbed
     // an old done/skipped occurrence on real accounts (tester round, 2026-09-01).
@@ -346,19 +351,22 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
                                      plan: RegenPlan(toUpsert: [], toDelete: []), iso: date, startTime: time)
     switch action {
     case .covered:
-        let open = blocks.contains { $0.taskId == task.id && isTaskBlock($0) && $0.date == date && !$0.done && !$0.skipped }
-        if !open { return nil }
+        let open = blocks.first { $0.taskId == task.id && isTaskBlock($0) && $0.date == date && !$0.done && !$0.skipped }
+        guard let open else { return nil }
+        scratch.placedBlocks[task.id] = open.id
     case .retime(let b):
         var moved = b
         moved.startTime = time
         moved.skipped = false
         await api.upsertBlock(moved)
+        scratch.placedBlocks[task.id] = moved.id
     case .mint:
         if let anchor {
             var moved = anchor
             moved.date = date
             moved.startTime = time
             await api.upsertBlock(moved)
+            scratch.placedBlocks[task.id] = moved.id
             // Every UI reschedule bumps move_count (the slip detector's input).
             if anchor.date != date {
                 let fresh = api.getTasks().first { $0.id == task.id } ?? task
@@ -367,8 +375,10 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
         } else {
             // Clamped to the server's 5…1440 (audit 2026-09-22, C4) — also
             // enforced in WriteThrough; here so the mirror and receipts match.
-            await api.upsertBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: time,
-                                           durationMinutes: clampDurationMin(task.estimateMin), date: date, kind: .task))
+            let placed = CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: time,
+                                  durationMinutes: clampDurationMin(task.estimateMin), date: date, kind: .task)
+            await api.upsertBlock(placed)
+            scratch.placedBlocks[task.id] = placed.id
         }
     }
     if task.recurrence != nil {
@@ -513,7 +523,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         var extras: [String] = []
         var note = ""
         if let date, let startTime {
-            let landed = await scheduleTask(api, t, date: date, startTime: startTime) ?? startTime
+            let landed = await scheduleTask(api, t, date: date, startTime: startTime, scratch: scratch) ?? startTime
             extras.append("scheduled \(date) \(landed)")
         } else if let date {
             note = " NOTE: it has a day (\(date)) but no time — left unscheduled. Ask ONE question suggesting a time, then schedule_task."
@@ -534,7 +544,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: needs a time — \"\(t.name)\" has no time yet and the user gave none. Do NOT pick one: ask ONE short question offering a suggestion (e.g. \"Friday — 9am, or a time you prefer?\"), then schedule when they answer."
         }
         if let pastTime = rejectPastTime(api, date, startTime ?? own?.startTime) { return pastTime }
-        guard let landed = await scheduleTask(api, t, date: date, startTime: startTime) else {
+        guard let landed = await scheduleTask(api, t, date: date, startTime: startTime, scratch: scratch) else {
             return "error: \"\(t.name)\" is already done on \(date) — nothing changed"
         }
         return "ok: scheduled \"\(t.name)\" \(date) \(landed)\(startTime == nil ? " (kept its existing time — say so)" : "")"
@@ -624,14 +634,25 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         scratch.newTasks[t.id] = t
         // Regenerate future blocks off the existing anchor, if scheduled.
         let blocks = api.getBlocks()
-        // The earliest LIVE block, never an arbitrary one — see recurrenceAnchor —
-        // at the series' own time and day, never a one-off moved occurrence's
-        // (recurrenceEditStart, audit 2026-09-22, C1).
-        let start = recurrenceEditStart(taskId: t.id, recurrence: rec, blocks: blocks, todayIso: api.todayIso())
+        let today = api.todayIso()
+        // An occurrence schedule_task placed earlier in this turn sets the
+        // series' day and time: "make Office every Monday at 11" on a series
+        // at 09:15 is schedule_task(Mon, 11:00) then this call, and the vote
+        // below kept 09:15 and put the new 11:00 back while replying ok —
+        // leaving no tool that could re-time a series (audit 2026-09-22, C1).
+        let placed = scratch.placedBlocks[t.id].flatMap { id in
+            blocks.first { $0.id == id && !$0.done && !$0.skipped && !$0.startTime.isEmpty && $0.date >= today }
+        }
+        // Otherwise the earliest LIVE block, never an arbitrary one — see
+        // recurrenceAnchor — at the series' own time and day, never a one-off
+        // moved occurrence's (recurrenceEditStart, audit 2026-09-22, C1).
+        let start = placed.map { RecurrenceStart(date: $0.date, startTime: $0.startTime, horizonDays: RECURRENCE_HORIZON_DAYS) }
+            ?? recurrenceEditStart(taskId: t.id, recurrence: rec, blocks: blocks, todayIso: today)
         if let start {
-            let plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: api.todayIso(),
+            var plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: today,
                                          startTime: start.startTime, startDate: LocalDate.parse(start.date),
                                          horizonDays: start.horizonDays)
+            plan.toDelete.removeAll { $0 == start.keepId }   // this month's moved occurrence (see RecurrenceStart)
             for b in plan.toUpsert { await api.upsertBlock(b) }
             for id in plan.toDelete { await api.deleteBlock(id) }
         }
@@ -640,8 +661,11 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         let anchored = start != nil
         guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")" }
         let how = kind == "weekly" ? "weekly on \(weekdayNames(days))" : kind
+        // The time the series now runs at, so the reply can't claim a re-time
+        // that didn't happen (audit 2026-09-22, C1).
+        let at = start.map { " at \($0.startTime)" } ?? ""
         let till = until.map { " until \($0)" } ?? ""
-        return "ok: \"\(t.name)\" now repeats \(how)\(till)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
+        return "ok: \"\(t.name)\" now repeats \(how)\(at)\(till)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
 
     case "complete_task":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -680,7 +704,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             if let past {
                 needsTime.append("\"\(t.name)\" — " + past.replacingOccurrences(of: "error: ", with: "", options: .anchored))
             } else if let date, let startTime {
-                _ = await scheduleTask(api, t, date: date, startTime: startTime)
+                _ = await scheduleTask(api, t, date: date, startTime: startTime, scratch: scratch)
             } else if let date {
                 needsTime.append("\"\(t.name)\" (\(date))")
             }

@@ -202,6 +202,24 @@ private func recurrenceSeriesDay(_ blocks: [CalBlock]) -> (day: Int, votes: Int)
     return best
 }
 
+/// How many days either side of one of the series' dates a block still counts
+/// as that date's occurrence, moved: under half the gap to the neighbouring
+/// dates, so it is nearer that date than any other. A monthly date is at
+/// least 28 days from the next; a daily one has no room.
+private func occurrenceReach(_ r: Recurrence) -> Int {
+    switch r {
+    case .daily:
+        return 0
+    case .weekly(let days, _):
+        let sorted = Set(days.filter { (0...6).contains($0) }).sorted()
+        guard let first = sorted.first, let last = sorted.last else { return 0 }
+        let gaps = zip(sorted, sorted.dropFirst()).map { $1 - $0 } + [7 - last + first]
+        return ((gaps.min() ?? 7) - 1) / 2
+    case .monthly:
+        return 14
+    }
+}
+
 /// The nearest date on or before `iso` whose day of month is exactly `day`
 /// (materializeOccurrences takes a monthly series' day from its start date,
 /// so a clamped Feb 28 would turn a 31st series into a 28th one).
@@ -219,10 +237,14 @@ public struct RecurrenceStart: Equatable, Sendable {
     public let date: String       // YYYY-MM-DD, handed to regenerateForTask as startDate
     public let startTime: String  // HH:MM
     public let horizonDays: Int   // stretched so the horizon still ends 8 weeks after the anchor
-    public init(date: String, startTime: String, horizonDays: Int) {
+    /// A block the edit must NOT delete although the plan lists it: this
+    /// month's occurrence, moved later off a series day that has passed.
+    public let keepId: String?
+    public init(date: String, startTime: String, horizonDays: Int, keepId: String? = nil) {
         self.date = date
         self.startTime = startTime
         self.horizonDays = horizonDays
+        self.keepId = keepId
     }
 }
 
@@ -249,13 +271,23 @@ public func recurrenceEditStart(taskId: String, recurrence: Recurrence?, blocks:
         return RecurrenceStart(date: anchor.date, startTime: time, horizonDays: horizonDays)
     }
     let date = monthlyStart(day: series.day, onOrBefore: anchor.date)
-    return RecurrenceStart(date: date, startTime: time, horizonDays: horizonDays + LocalDate.daysUntil(date, anchor.date))
+    // The anchor is this month's occurrence moved later, and the series day it
+    // left has passed: regenerateForTask only wants dates after today, so it
+    // deleted the moved one and the month lost its occurrence (audit
+    // 2026-09-22, C1). Kept unless it is past `until` or too far out to be
+    // this month's (then it is next month's, moved earlier, and is re-aligned).
+    let ownsPassedDay = date <= todayIso && anchor.date > todayIso
+        && LocalDate.daysUntil(date, anchor.date) <= occurrenceReach(.monthly(until: nil))
+        && (recurrence?.untilDate.map { anchor.date <= $0 } ?? true)
+    return RecurrenceStart(date: date, startTime: time, horizonDays: horizonDays + LocalDate.daysUntil(date, anchor.date),
+                           keepId: ownsPassedDay ? anchor.id : nil)
 }
 
 /// The occurrences the horizon top-up adds for one repeating task: the TAIL
 /// only — dates after both its latest block (the frontier) and today, up to
 /// today + horizonDays - 1, at the series' own time (recurrenceSeriesTime, or
-/// `seriesTime` when the caller has just placed the series explicitly).
+/// `seriesTime` when the caller has just placed the series explicitly — the
+/// placed occurrence is then the frontier, and a monthly series keeps its day).
 ///
 /// Why (audit 2026-09-22, C1): the top-up used to rebuild the whole 8 weeks
 /// from the next open occurrence and add every missing date|time. The store
@@ -271,7 +303,15 @@ public func recurrenceEditStart(taskId: String, recurrence: Recurrence?, blocks:
 /// - The span starts at the frontier, so a series idle for more than 8 weeks
 ///   comes back from tomorrow (C95).
 /// - A monthly series keeps its day of month (recurrenceSeriesDay), not the
-///   frontier's, which may be a moved or clamped one (C22).
+///   frontier's, which may be a moved or clamped one (C22). The vote also
+///   reads the blocks up to a month past the horizon: a whole-series re-plan
+///   to a later day (the Schedule sheet, web, Android) puts its second
+///   occurrence there, and without it the vote read [old, old, new] and kept
+///   the old day. Blocks moved further out don't vote.
+/// - A date with one of the task's blocks within reach (occurrenceReach; any
+///   state, past the horizon too) already has its occurrence, moved: the
+///   frontier dragged a few days earlier, or a re-plan's next one. Minting it
+///   gave that month (or week) a second occurrence and a second reminder.
 /// - Today is never minted, matching regenerateForTask.
 public func recurrenceTopUp(task: TaskItem, existingBlocks: [CalBlock], todayIso: String, seriesTime: String? = nil,
                             horizonDays: Int = RECURRENCE_HORIZON_DAYS) -> [CalBlock] {
@@ -286,12 +326,18 @@ public func recurrenceTopUp(task: TaskItem, existingBlocks: [CalBlock], todayIso
     let floor = max(frontier, todayIso)
     guard floor < lastIso else { return [] }
     var start = frontier
-    if case .monthly = recurrence, let series = recurrenceSeriesDay(inHorizon) {
+    let voters = mine.filter { $0.date <= LocalDate.addDays(lastIso, 31) }
+    if seriesTime == nil, case .monthly = recurrence, let series = recurrenceSeriesDay(voters) {
         start = monthlyStart(day: series.day, onOrBefore: frontier)
     }
+    let reach = occurrenceReach(recurrence)
     return materializeOccurrences(recurrence, startDate: LocalDate.parse(start), startTime: time,
                                   horizonDays: LocalDate.daysUntil(start, lastIso) + 1)
         .filter { $0.date > floor }
+        .filter { o in
+            let (lo, hi) = (LocalDate.addDays(o.date, -reach), LocalDate.addDays(o.date, reach))
+            return !mine.contains { $0.date >= lo && $0.date <= hi }
+        }
         .map { occurrenceBlock(task, $0) }
 }
 

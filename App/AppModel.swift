@@ -1823,11 +1823,12 @@ final class AppModel {
         guard let write = coordinator?.write else { return true }
         // Without a start we are clearing the repeat, where regenerateForTask
         // ignores the time and date (it only deletes the future).
-        let plan = regenerateForTask(
+        var plan = regenerateForTask(
             task: task, recurrence: task.recurrence, existingBlocks: existingBlocks,
             todayIso: today, startTime: start?.startTime ?? "09:00",
             startDate: start.map { LocalDate.parse($0.date) } ?? Date(),
             horizonDays: start?.horizonDays ?? RECURRENCE_HORIZON_DAYS)
+        plan.toDelete.removeAll { $0 == start?.keepId }   // this month's moved occurrence (see RecurrenceStart)
         let now = Self.isoNow()
         Task {
             for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }
