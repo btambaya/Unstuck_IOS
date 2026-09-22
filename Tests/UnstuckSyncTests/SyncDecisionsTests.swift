@@ -155,3 +155,110 @@ final class PruneAndMergeDecisionTests: XCTestCase {
         XCTAssertEqual(SyncDecision.resolvePendingTask(local: local, remote: remote, baseUpdatedAt: nil).name, "server", "no base → LWW")
     }
 }
+
+// MARK: - the voice dial's fresh token (audit 2026-09-22, C14/C15)
+
+/// A call answered on the lock screen of an app suspended overnight dialled the
+/// voice proxy with last night's token (the SDK refreshes only while ACTIVE) and
+/// the proxy's 401 hung it up; a token with minutes left outlived the session
+/// and the proxy cut it as "daily voice limit reached". `resolveFreshToken`
+/// refreshes both, and `firstWithin` bounds the wait without sitting out a
+/// refresh that ignores cancellation.
+final class FreshAccessTokenTests: XCTestCase {
+    private final class Calls: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _current = 0
+        private var _refresh = 0
+        func current() { lock.withLock { _current += 1 } }
+        func refresh() { lock.withLock { _refresh += 1 } }
+        var currentCount: Int { lock.withLock { _current } }
+        var refreshCount: Int { lock.withLock { _refresh } }
+    }
+    private struct Boom: Error {}
+
+    private let now: TimeInterval = 1_000_000
+    private let minValidity: TimeInterval = 16 * 60
+
+    private func resolve(left: TimeInterval?, force: Bool = false, calls: Calls,
+                         topUp: TimeInterval = 5,
+                         refresh: @escaping @Sendable () async throws -> String = { "refreshed" }) async -> String? {
+        let now = self.now
+        return await AuthService.resolveFreshToken(
+            minValidity: minValidity, forceRefresh: force, topUpDeadline: topUp,
+            now: { now },
+            current: {
+                calls.current()
+                guard let left else { throw Boom() }
+                return ("stored", now + left)
+            },
+            refresh: { calls.refresh(); return try await refresh() })
+    }
+
+    func testATokenThatOutlivesTheSessionIsUsedAsItIs() async {
+        let calls = Calls()
+        let t = await resolve(left: 3600, calls: calls)
+        XCTAssertEqual(t, "stored")
+        XCTAssertEqual(calls.refreshCount, 0)
+    }
+
+    func testATokenThatWouldExpireMidSessionIsRefreshedFirst() async {
+        let calls = Calls()
+        let t = await resolve(left: 600, calls: calls)
+        XCTAssertEqual(t, "refreshed")
+        XCTAssertEqual(calls.refreshCount, 1)
+    }
+
+    func testAFailedTopUpFallsBackToTheStillValidToken() async {
+        let calls = Calls()
+        let t = await resolve(left: 600, calls: calls, refresh: { throw Boom() })
+        XCTAssertEqual(t, "stored", "still valid — auth.session refreshes anything inside its 30 s margin")
+        XCTAssertEqual(calls.refreshCount, 1)
+    }
+
+    func testAStalledTopUpDoesNotHoldTheDial() async {
+        let calls = Calls()
+        let started = Date()
+        let t = await resolve(left: 600, calls: calls, topUp: 0.1, refresh: {
+            try await Task.sleep(nanoseconds: 3_000_000_000); return "late"
+        })
+        XCTAssertEqual(t, "stored")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5)
+    }
+
+    func testAForcedRefreshNeverHandsBackTheStoredToken() async {
+        let calls = Calls()
+        let t = await resolve(left: 3600, force: true, calls: calls)
+        XCTAssertEqual(t, "refreshed")
+        XCTAssertEqual(calls.refreshCount, 1)
+        XCTAssertEqual(calls.currentCount, 0, "the stored token is the one the server refused")
+
+        let failed = Calls()
+        let none = await resolve(left: 3600, force: true, calls: failed, refresh: { throw Boom() })
+        XCTAssertNil(none)
+        XCTAssertEqual(failed.currentCount, 0)
+    }
+
+    func testNoReadableSessionIsNilWithoutARefresh() async {
+        let calls = Calls()
+        let t = await resolve(left: nil, calls: calls)
+        XCTAssertNil(t)
+        XCTAssertEqual(calls.refreshCount, 0)
+    }
+
+    func testFirstWithinGivesUpOnAStalledOperation() async {
+        let started = Date()
+        let v: String? = await AuthService.firstWithin(0.1) {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            return "late"
+        }
+        XCTAssertNil(v)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5, "the stalled refresh is not awaited")
+    }
+
+    func testFirstWithinReturnsAPromptAnswer() async {
+        let started = Date()
+        let v: String? = await AuthService.firstWithin(5) { "tok" }
+        XCTAssertEqual(v, "tok")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 1.5)
+    }
+}

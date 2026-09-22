@@ -710,10 +710,54 @@ final class AppModel {
     /// Prefer the token cached from the auth stream (see `cachedAccessToken`);
     /// fall back to the stored session only when the cache is cold (e.g. a
     /// caller that runs before the first authStateChanges event lands).
+    /// It may be EXPIRED (nothing refreshes it while the app is in the
+    /// background), so it is only the synchronous "signed in?" gate and the
+    /// fallback — a dial goes through `freshVoiceAccessToken` (audit 2026-09-22, C14).
     var voiceAccessToken: String? {
         if let t = cachedAccessToken, !t.isEmpty { return t }
         return coordinator?.auth.accessToken
     }
+
+    /// The token a voice dial sends: refreshed when it is expired OR would
+    /// expire before the session can end (audit 2026-09-22, C14/C15). A call
+    /// answered on the lock screen of an app suspended overnight otherwise
+    /// dialled with last night's token (the SDK refreshes only while ACTIVE)
+    /// and the proxy's 401 hung it up; and the proxy reuses the connect-time
+    /// token for the reply budget + turn log all session, so a token that
+    /// expired mid-session cut it as "daily voice limit reached".
+    /// Falls back to the stream-cached token when the auth read fails (an
+    /// unsigned build's keychain −34018 — the 2026-09-11 rationale above) or
+    /// the coordinator isn't started — but never after a FORCED refresh: that
+    /// follows the proxy's 401, and the cached token is the one it refused.
+    func freshVoiceAccessToken(forceRefresh: Bool = false) async -> String? {
+        let fresh = await coordinator?.auth.freshAccessToken(
+            minValidity: Self.voiceTokenMinValidity, forceRefresh: forceRefresh,
+            deadline: Self.voiceTokenDeadline, topUpDeadline: Self.voiceTokenTopUpDeadline)
+        return Self.voiceDialToken(fresh: fresh, cached: voiceAccessToken, forceRefresh: forceRefresh)
+    }
+
+    /// `freshVoiceAccessToken`'s fallback rule, pure for the tests.
+    nonisolated static func voiceDialToken(fresh: String?, cached: @autoclosure () -> String?,
+                                           forceRefresh: Bool) -> String? {
+        if let fresh, !fresh.isEmpty { return fresh }
+        if forceRefresh { return nil }
+        guard let cached = cached(), !cached.isEmpty else { return nil }
+        return cached
+    }
+
+    /// A dialled token must outlive the session: the voice proxy hard-closes
+    /// every session after MAX_SESSION_MS (15 min, workers/voice-proxy) and
+    /// keeps using the connect-time token until then (C15). 16 min = that cap
+    /// plus a minute for the connect itself. Change both together.
+    static let voiceTokenMinValidity: TimeInterval = 16 * 60
+    /// Bounds the wait for a refresh when the stored token is EXPIRED — a
+    /// healthy refresh is well under 1 s; this caps a lock-screen call's
+    /// silence and sits well inside the client's 15 s dial watchdog.
+    static let voiceTokenDeadline: TimeInterval = 5
+    /// A still-VALID token that is only short of `voiceTokenMinValidity` waits
+    /// this long for its top-up, then dials as it is — a dial must not sit
+    /// out a flaky network for a token it doesn't strictly need.
+    static let voiceTokenTopUpDeadline: TimeInterval = 1.5
 
     func sendSessionRecap(taskName: String, away: Bool = false) {
         guard let n = coordinator?.notifications else { return }

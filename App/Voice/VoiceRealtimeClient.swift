@@ -145,7 +145,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     static let primerDeleteEvent = "evt_primer_delete_0001"
 
     private let proxyURL: String          // wss://…workers.dev (token added as a header)
-    private let token: String             // Supabase access token (the Worker validates it)
+    private let token: String             // Supabase access token (the Worker validates it); the fallback when `freshToken` is set
+    /// Resolves the token at DIAL time (`forceRefresh` after a 401), so a
+    /// dial never goes out with a token cached before the app was suspended
+    /// (audit 2026-09-22, C14). MUST return within a few seconds — it is dead
+    /// air on a call, and the dial watchdog (`dialTimeout`) gives up on a dial
+    /// still waiting for it. nil (or no provider) = dial with `token`.
+    private let freshToken: (@Sendable (_ forceRefresh: Bool) async -> String?)?
     private let model: String
     private let instructions: String      // system prompt + live context
     /// What the assistant should DO the moment the session opens — sent as a
@@ -173,6 +179,18 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// this; a protocol-level `error` event (which only flips the state to
     /// `.error`) does NOT end the transport. Optional, so Talk mode is unchanged.
     var onTransportEnded: (@Sendable (_ error: String?) -> Void)?
+    /// Test seam: when set (before `start()`), a dial hands its request here
+    /// instead of opening a socket. Never set in the app.
+    var dialOverride: (@Sendable (URLRequest) -> Void)?
+    /// How long a dial may go unopened (token wait included) before start()'s
+    /// watchdog gives up, and how much longer the one redial after a 401 gets.
+    /// Settable (before `start()`) only so tests don't wait 15 s.
+    var dialTimeout: TimeInterval = 15
+    var authRedialGrace: TimeInterval = 5
+
+    /// What a 401 from the proxy tells the user (the token was refused even
+    /// after a forced refresh, or there is no provider to refresh it).
+    static let sessionExpiredMessage = "Your session expired — sign in again to use voice."
 
     // A per-session URLSession with `self` as the WebSocket delegate (so onOpen
     // fires only AFTER the handshake). It RETAINS the delegate until
@@ -210,6 +228,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// response.creates went out (the first + at most one retry).
     private var _anyResponse = false
     private var _openedOnce = false
+    /// The one forced refresh + redial after a pre-open 401 has been spent.
+    private var _authRetried = false
+    /// The token the current dial sent — a forced refresh that hands it back
+    /// is no answer to the proxy refusing it.
+    private var _dialedToken: String?
     /// The token bucket's reset, from the last `rate_limits.updated`.
     private var _tokenResetSec: Double?
 
@@ -253,7 +276,9 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// `holdToTalk`: turn_detection null; the caller drives `pttDown()` /
     /// `pttUp()` (default false — server VAD). `initialRoute`: skip the
     /// AVAudioSession read for the first profile. `now`: monotonic clock.
-    init(proxyURL: String, token: String, model: String, instructions: String, opening: String,
+    init(proxyURL: String, token: String,
+         freshToken: (@Sendable (_ forceRefresh: Bool) async -> String?)? = nil,
+         model: String, instructions: String, opening: String,
          tools: [[String: Any]], audio: VoiceAudioIO,
          runTool: @escaping @Sendable (_ name: String, _ argsJSON: String) async -> String,
          onState: @escaping @Sendable (VoiceState) -> Void,
@@ -269,6 +294,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         self.initialRoute = initialRoute
         self._bargeIn = BargeInController(profile: .forRoute(initialRoute ?? .speaker), holdToTalk: holdToTalk)
         self.token = token
+        self.freshToken = freshToken
         self.model = model
         self.instructions = instructions
         self.opening = opening
@@ -285,29 +311,72 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
 
     func start() {
         onState(.connecting)
-        // Strip any existing query, then add ?model= (matches the Android URL build).
-        let base = proxyURL.components(separatedBy: "?").first ?? proxyURL
-        guard let url = URL(string: base + "?model=" + model) else {
+        guard let url = dialURL else {
             transportEnded(error: "Bad voice proxy URL"); return
         }
-        var req = URLRequest(url: url)
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        voiceLog.notice("voice connect host=\(url.host ?? "nil", privacy: .public) model=\(self.model, privacy: .public) tokenLen=\(self.token.count, privacy: .public)")
-        let t = session.webSocketTask(with: req)
-        task = t
-        t.resume()
+        // Build the (lazy, not thread-safe) URLSession HERE, on the caller's
+        // thread: with a token provider the dial runs later on another one,
+        // and stop() touches the session too.
+        _ = session
         // Nothing in URLSession fails a dial that stalls after the TCP connect,
         // so a proxy that accepts and never upgrades would hang "Connecting…"
-        // for ever. 15 s, then we say so.
+        // for ever. 15 s, then we say so. Armed before the token wait so it
+        // bounds that too. The one redial after a 401 gets 5 s more (audit
+        // 2026-09-22, C14): it goes out only after a refused dial AND a forced
+        // refresh (itself up to 5 s, AppModel.voiceTokenDeadline), so the
+        // shared 15 s alone could run out mid-handshake on a slow link.
+        let timeout = dialTimeout, grace = authRedialGrace
         Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
             guard let self else { return }
+            if self.withLock({ !self._open && !self._stopped && self._authRetried }) {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, grace) * 1_000_000_000))
+            }
             let stuck = self.withLock { !self._open && !self._stopped }
             if stuck { self.transportEnded(error: "Couldn't reach the voice server. Check your connection and try again.") }
+        }
+        guard let freshToken else { dial(url, token: token); return }
+        // Resolve the token at dial time (audit 2026-09-22, C14): the one this
+        // client was built with may be hours expired (a call answered on the
+        // lock screen of a suspended app), and must outlive the session (C15).
+        let fallback = token
+        Task { [weak self] in
+            let fresh = await freshToken(false)
+            self?.dial(url, token: fresh.flatMap { $0.isEmpty ? nil : $0 } ?? fallback)
         }
         // onOpen() runs in the delegate's didOpenWithProtocol — only after the
         // handshake succeeds — so the mic/playback/"Listening" don't spin up on an
         // unreachable proxy or a rejected token. receiveLoop starts there too.
+    }
+
+    /// Strip any existing query, then add ?model= (matches the Android URL build).
+    private var dialURL: URL? {
+        let base = proxyURL.components(separatedBy: "?").first ?? proxyURL
+        return URL(string: base + "?model=" + model)
+    }
+
+    /// Open the socket with `token` — unless stop() (or a reported failure)
+    /// got there first, e.g. while the token was resolving.
+    private func dial(_ url: URL, token: String) {
+        var req = URLRequest(url: url)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let hook = dialOverride
+        // ONE lock for the check AND the task: stop() sets `_stopped` under it
+        // before it invalidates the session, so a task made here is always one
+        // stop() cancels — a task made on an invalidated URLSession raises an
+        // ObjC exception — and nothing is dialled (or reported) after stop().
+        let (go, socket): (Bool, URLSessionWebSocketTask?) = withLock {
+            if _stopped || _reportedError { return (false, nil) }
+            _dialedToken = token
+            if hook != nil { return (true, nil) }
+            let t = session.webSocketTask(with: req)
+            task = t
+            return (true, t)
+        }
+        guard go else { return }
+        voiceLog.notice("voice connect host=\(url.host ?? "nil", privacy: .public) model=\(self.model, privacy: .public) tokenLen=\(token.count, privacy: .public)")
+        if let hook { hook(req); return }
+        socket?.resume()
     }
 
     // URLSessionWebSocketDelegate: the socket finished its upgrade handshake.
@@ -331,12 +400,51 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         if let ns = error as NSError? {
             voiceLog.error("voice socket failed domain=\(ns.domain, privacy: .public) code=\(ns.code, privacy: .public) http=\(status, privacy: .public)")
         }
+        handshakeEnded(status: status, error: error)
+    }
+
+    /// A 401 before the socket ever opened, not yet retried — the one case
+    /// worth a forced refresh + redial.
+    static func shouldRetryUnauthorized(status: Int, openedOnce: Bool, retried: Bool) -> Bool {
+        status == 401 && !openedOnce && !retried
+    }
+
+    /// The connection ended with this HTTP `status` (-1 = none). Internal so
+    /// tests can drive a rejection without a socket.
+    func handshakeEnded(status: Int, error: (any Error)?) {
+        // A pre-open 401 is a token the proxy refused — usually one that
+        // expired while the app sat suspended, or a race with the refresh.
+        // Force ONE refresh and redial before telling a signed-in user to sign
+        // in again (audit 2026-09-22, C14). A 401 comes back before the proxy
+        // reserves a slot or charges the daily session, so the redial is free.
+        if let freshToken, let url = dialURL {
+            let (retry, rejected): (Bool, String?) = withLock {
+                guard Self.shouldRetryUnauthorized(status: status, openedOnce: _openedOnce, retried: _authRetried),
+                      !_stopped, !_reportedError else { return (false, nil) }
+                _authRetried = true
+                task = nil
+                return (true, _dialedToken)
+            }
+            if retry {
+                voiceLog.notice("voice handshake 401 — refreshing the session once and redialling")
+                Task { [weak self] in
+                    let fresh = await freshToken(true)
+                    guard let self else { return }
+                    // The token the proxy just refused is no answer.
+                    guard let fresh, !fresh.isEmpty, fresh != rejected else {
+                        self.transportEnded(error: Self.sessionExpiredMessage); return
+                    }
+                    self.dial(url, token: fresh)
+                }
+                return
+            }
+        }
         // CFNetwork collapses every rejection into -1011 ("bad response from the
         // server"), which tells the user nothing. The status distinguishes an
         // expired token from the proxy's concurrent-session cap.
         let friendly: String?
         switch status {
-        case 401: friendly = "Your session expired — sign in again to use voice."
+        case 401: friendly = Self.sessionExpiredMessage
         case 403: friendly = "Voice isn't available on this build."
         case 429: friendly = "A voice session is already running. Close it and try again in a moment."
         case let s where s >= 500: friendly = "The voice server is unavailable right now (\(s))."

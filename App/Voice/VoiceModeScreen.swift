@@ -122,6 +122,7 @@ final class VoiceSessionModel {
         failed = false
         let proxyURL = model.voiceProxyURL
         let modelId = model.voiceModel
+        let appModel = model
         let assistant = model.assistant
         assistant.resetVoiceScratch()
         var instructions = assistant.voiceInstructions()
@@ -160,8 +161,15 @@ final class VoiceSessionModel {
         }
         holdToTalk = VoiceRealtimeClient.holdToTalkPreferred
         pttPressed = false
+        // The dial resolves its own token (audit 2026-09-22, C14/C15): Talk
+        // right after a long background, the fallback-B take-over and every
+        // quiet reconnect each build a new client, so none of them dials with
+        // the token captured at start() — which may have expired meanwhile or
+        // expire mid-session. `token` is only the fallback.
         let rc = VoiceRealtimeClient(
-            proxyURL: proxyURL, token: token, model: modelId,
+            proxyURL: proxyURL, token: token,
+            freshToken: { force in await appModel.freshVoiceAccessToken(forceRefresh: force) },
+            model: modelId,
             instructions: instructions, opening: opening, tools: tools, audio: engine,
             runTool: runTool,
             onState: { [weak self] s in Task { @MainActor in

@@ -384,8 +384,17 @@ extension RealtimeCallVoiceLauncher.Deps {
                 // The escape hatch as a value, not `config` (non-Sendable) — the
                 // capture-mic failure below has always done this.
                 let ended = config.onTransportEnded
+                // The dial awaits a fresh token (audit 2026-09-22, C14/C15): a
+                // call answered on the lock screen of an app suspended overnight
+                // otherwise dialled with the token cached at the last foreground
+                // (the SDK refreshes only while ACTIVE) — racing the `.answered`
+                // report's refresh, which it now joins. `token` is the fallback;
+                // a stop() while it resolves means no dial, so nothing reaches
+                // the launcher after stop().
                 let client = VoiceRealtimeClient(
-                    proxyURL: model.voiceProxyURL, token: token, model: model.voiceModel,
+                    proxyURL: model.voiceProxyURL, token: token,
+                    freshToken: { [weak model] force in await model?.freshVoiceAccessToken(forceRefresh: force) },
+                    model: model.voiceModel,
                     instructions: config.instructions, opening: config.primer, tools: config.tools,
                     audio: audio, runTool: config.runTool,
                     onState: { _ in }, onCaption: { _, _, _ in },
