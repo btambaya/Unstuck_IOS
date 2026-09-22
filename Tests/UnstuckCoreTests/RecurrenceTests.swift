@@ -241,9 +241,9 @@ final class RegenerateForTaskTests: XCTestCase {
         XCTAssertEqual(recurrenceAnchor(taskId: "task-1", blocks: [skipped, live], todayIso: today)?.id, "live")
     }
 
-    /// The horizon top-up's contract: run again with nothing changed and the
-    /// plan adds nothing, so a launch-time pass is free and idempotent. Run it
-    /// when the horizon has moved on and it only ADDS.
+    /// Run again with nothing changed and the plan adds nothing; run it when
+    /// the horizon has moved on and it only ADDS. (The launch-time top-up no
+    /// longer uses this plan — see RecurrenceTopUpTests.)
     func testRegenerateIsIdempotentAndOnlyExtendsWhenTheHorizonMoves() {
         let anchorDate = Time.civil(2026, 5, 25)
         let first = regenerateForTask(task: t, recurrence: .weekly(daysOfWeek: [1], until: nil),
@@ -263,21 +263,22 @@ final class RegenerateForTaskTests: XCTestCase {
     }
 }
 
-// The post-plan coverage decision behind scheduleTaskAt's guarantee-upsert,
+// The post-plan decision behind scheduleTaskAt's guarantee on the chosen day,
 // extracted as a pure helper. A block the plan is about to DELETE must NOT count
 // as coverage (else the day silently ends up empty); a planned upsert DOES.
-final class RecurrenceCoversChosenDateTests: XCTestCase {
+final class RecurrenceChosenDateActionTests: XCTestCase {
     private let iso = "2026-05-25"
+    private let today = "2026-05-21"
 
     func testCoveredByPlannedUpsert() {
         let plan = RegenPlan(toUpsert: [mkBlock(id: "u1", taskId: "t", date: iso)], toDelete: [])
-        XCTAssertTrue(recurrenceCoversChosenDate(existing: [], plan: plan, iso: iso))
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [], plan: plan, iso: iso, startTime: "09:00"), .covered)
     }
 
     func testCoveredByExistingBlockNotBeingDeleted() {
         let existing = [mkBlock(id: "e1", taskId: "t", date: iso)]
         let plan = RegenPlan(toUpsert: [], toDelete: [])
-        XCTAssertTrue(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+        XCTAssertEqual(recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: "09:00"), .covered)
     }
 
     func testExistingBlockBeingDeletedDoesNotCount() {
@@ -285,20 +286,396 @@ final class RecurrenceCoversChosenDateTests: XCTestCase {
         // so the caller must mint a guarantee block (the bug this guards).
         let existing = [mkBlock(id: "e1", taskId: "t", date: iso)]
         let plan = RegenPlan(toUpsert: [], toDelete: ["e1"])
-        XCTAssertFalse(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+        XCTAssertEqual(recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: "09:00"), .mint)
     }
 
     func testDeletedExistingButPlannedUpsertOnSameDateIsCovered() {
         // The old block is deleted but the plan re-adds one on the same date.
         let existing = [mkBlock(id: "e1", taskId: "t", date: iso)]
         let plan = RegenPlan(toUpsert: [mkBlock(id: "u1", taskId: "t", date: iso)], toDelete: ["e1"])
-        XCTAssertTrue(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+        XCTAssertEqual(recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: "09:00"), .covered)
     }
 
     func testNothingOnChosenDateIsNotCovered() {
         let existing = [mkBlock(id: "e1", taskId: "t", date: "2026-05-26")]
         let plan = RegenPlan(toUpsert: [mkBlock(id: "u1", taskId: "t", date: "2026-06-01")], toDelete: [])
-        XCTAssertFalse(recurrenceCoversChosenDate(existing: existing, plan: plan, iso: iso))
+        XCTAssertEqual(recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: "09:00"), .mint)
+    }
+
+    // MARK: audit 2026-09-22, C7 / core-scheduling#8
+
+    /// regenerateForTask never touches today, so "schedule Walk today at 4pm"
+    /// used to leave today's occurrence at 07:00 (it counted as covering).
+    func testTodaysOpenOccurrenceAtAnotherTimeIsRetimed() {
+        let t = mkTask(id: "t", name: "Walk")
+        let walk = mkBlock(id: "walk", taskId: "t", startTime: "07:00", date: today)
+        let plan = regenerateForTask(task: t, recurrence: .daily(until: nil), existingBlocks: [walk], todayIso: today,
+                                     startTime: "16:00", startDate: Time.civil(2026, 5, 21), horizonDays: 7)
+        XCTAssertFalse(plan.toDelete.contains("walk"), "regenerate never touches today")
+        XCTAssertFalse(plan.toUpsert.contains { $0.date == today })
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [walk], plan: plan, iso: today, startTime: "16:00"), .retime(walk))
+    }
+
+    /// A skipped occurrence used to count as covering the day, so the day just
+    /// scheduled stayed hidden. It is retimed; the caller un-skips it.
+    func testASkippedOccurrenceNoLongerCoversItsDay() {
+        var skipped = mkBlock(id: "skip", taskId: "t", startTime: "07:00", date: today)
+        skipped.skipped = true
+        let none = RegenPlan(toUpsert: [], toDelete: [])
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [skipped], plan: none, iso: today, startTime: "16:00"), .retime(skipped))
+        // A future skipped block at the chosen time survives the plan (same key)
+        // and is still retimed, i.e. un-skipped.
+        var future = mkBlock(id: "fs", taskId: "t", startTime: "16:00", date: iso)
+        future.skipped = true
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [future], plan: none, iso: iso, startTime: "16:00"), .retime(future))
+    }
+
+    /// A done occurrence covers its day — never an open second copy — but an
+    /// open one beside it is the one that moves.
+    func testADoneOccurrenceCoversTheDay() {
+        var done = mkBlock(id: "done", taskId: "t", startTime: "07:00", date: today)
+        done.done = true
+        let none = RegenPlan(toUpsert: [], toDelete: [])
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [done], plan: none, iso: today, startTime: "16:00"), .covered)
+        var early = mkBlock(id: "early", taskId: "t", startTime: "06:00", date: today)
+        early.done = true
+        let open = mkBlock(id: "open", taskId: "t", startTime: "07:00", date: today)
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [early, open], plan: none, iso: today, startTime: "16:00"), .retime(open))
+    }
+
+    /// Starting a series on a blockless task places today's occurrence
+    /// (tasks-ui#5 / #11 end state): the plan only fills days after today.
+    func testStartingASeriesTodayMintsTodaysOccurrence() {
+        let t = mkTask(id: "t", name: "Stretch")
+        let plan = regenerateForTask(task: t, recurrence: .daily(until: nil), existingBlocks: [], todayIso: today,
+                                     startTime: "19:00", startDate: Time.civil(2026, 5, 21))
+        XCTAssertTrue(plan.toUpsert.allSatisfy { $0.date > today })
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [], plan: plan, iso: today, startTime: "19:00"), .mint)
+        // A timeless block on the day gets the chosen time instead of a twin.
+        let timeless = mkBlock(id: "none", taskId: "t", startTime: "", date: today)
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [timeless], plan: plan, iso: today, startTime: "19:00"), .retime(timeless))
+    }
+}
+
+// The create sheet's gate (audit 2026-09-22, C7 / tasks-ui#5): a series saved
+// without a time had zero occurrences and showed only in Tasks → Recurring.
+final class NewTaskNeedsTimeTests: XCTestCase {
+    private let today = "2026-05-21"
+    private let tomorrow = "2026-05-22"
+
+    func testRepeatingTasksNeedADayAndATime() {
+        XCTAssertTrue(newTaskNeedsTime(repeats: true, date: today, todayIso: today, pickedTime: nil))
+        XCTAssertFalse(newTaskNeedsTime(repeats: true, date: today, todayIso: today, pickedTime: "19:00"))
+        XCTAssertTrue(newTaskNeedsTime(repeats: true, date: nil, todayIso: today, pickedTime: nil), "Later + Repeat")
+    }
+
+    func testAOneOffNeedsATimeOnlyForALaterDay() {
+        XCTAssertFalse(newTaskNeedsTime(repeats: false, date: today, todayIso: today, pickedTime: nil), "still added without a time")
+        XCTAssertTrue(newTaskNeedsTime(repeats: false, date: tomorrow, todayIso: today, pickedTime: nil))
+        XCTAssertFalse(newTaskNeedsTime(repeats: false, date: tomorrow, todayIso: today, pickedTime: "10:00"))
+        XCTAssertFalse(newTaskNeedsTime(repeats: false, date: nil, todayIso: today, pickedTime: nil), "Later")
+    }
+
+    /// Why the evening reaches the gate: the free-slot finder stops at 18:00.
+    func testTheEveningHasNoFreeSlotToAutoPick() {
+        let evening = Time.civil(2026, 5, 21).addingTimeInterval(18.5 * 3600)
+        XCTAssertTrue(findFreeSlotsForDate([], durationMin: 25, isoDate: today, now: evening).isEmpty)
+    }
+}
+
+// The horizon top-up (audit 2026-09-22, C1): extend only the TAIL, at the
+// series' own time. It used to rebuild the whole 8 weeks from the next open
+// occurrence and add every missing date|time, so one moved occurrence copied
+// the series (~55 duplicates) and every deleted one came back.
+final class RecurrenceTopUpTests: XCTestCase {
+    private let today = "2026-05-21"
+
+    private func gym(_ recurrence: Recurrence? = .daily(until: nil), estimateMin: Int = 25) -> TaskItem {
+        var t = mkTask(id: "gym", name: "Gym", estimateMin: estimateMin)
+        t.recurrence = recurrence
+        return t
+    }
+    private func day(_ offset: Int) -> String { LocalDate.addDays(today, offset) }
+    private func occ(_ offset: Int, _ time: String = "07:00", done: Bool = false) -> CalBlock {
+        var b = mkBlock(id: "g\(offset)", taskId: "gym", taskName: "Gym", startTime: time, date: day(offset))
+        b.done = done
+        return b
+    }
+    private func series(_ offsets: ClosedRange<Int>, _ time: String = "07:00") -> [CalBlock] {
+        offsets.map { occ($0, time) }
+    }
+    private func slots(_ blocks: [CalBlock]) -> [String] { blocks.map { "\($0.date) \($0.startTime)" } }
+
+    func testMovedNextOccurrenceNeverCopiesTheSeries() {
+        // Today's Gym moved to 09:15 by the notification's Reschedule action.
+        var blocks = series(0...55)
+        blocks[0].startTime = "09:15"
+        XCTAssertEqual(recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: today), [],
+                       "a same-day relaunch adds nothing (was ~55 blocks at 09:15)")
+        XCTAssertEqual(slots(recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: day(1))), ["\(day(56)) 07:00"],
+                       "the next day extends the tail by one, at the series' time")
+        // Today ticked, and TOMORROW's is the moved one (calendar#3).
+        var other = series(0...55)
+        other[0].done = true
+        other[1].startTime = "18:00"
+        XCTAssertEqual(recurrenceTopUp(task: gym(), existingBlocks: other, todayIso: today), [])
+        XCTAssertEqual(slots(recurrenceTopUp(task: gym(), existingBlocks: other, todayIso: day(1))), ["\(day(56)) 07:00"])
+    }
+
+    func testDeletedAndMovedMidSeriesOccurrencesStayGone() {
+        var blocks = series(0...55).filter { $0.date != day(10) }            // deleted
+        blocks[blocks.firstIndex { $0.date == day(20) }!].startTime = "18:00"  // re-timed
+        blocks[blocks.firstIndex { $0.date == day(30) }!].date = day(31)       // moved a day on
+        XCTAssertEqual(slots(recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: day(1))), ["\(day(56)) 07:00"],
+                       "nothing comes back on +10, +20 @ 07:00 or +30")
+    }
+
+    func testSeriesTimeIsTheCommonTimeNotTheNextOpenOne() {
+        var moved = series(0...55)
+        moved[0].startTime = "09:15"
+        XCTAssertEqual(recurrenceSeriesTime(taskId: "gym", blocks: moved, frontierIso: day(55)), "07:00")
+        // A whole-series re-plan to 08:00 isn't outvoted by older history.
+        let replanned = series(-30...(-1)) + series(1...55, "08:00")
+        XCTAssertEqual(recurrenceSeriesTime(taskId: "gym", blocks: replanned, frontierIso: day(55)), "08:00")
+        // Monthly: one occurrence in the window each side of a move — history breaks the tie.
+        let monthly = [occ(-66), occ(-35), occ(-5), occ(25, "09:00")]
+        XCTAssertEqual(recurrenceSeriesTime(taskId: "gym", blocks: monthly, frontierIso: day(25)), "07:00")
+        XCTAssertNil(recurrenceSeriesTime(taskId: "gym", blocks: [occ(1, "")], frontierIso: day(1)), "timeless only")
+    }
+
+    func testRevivesALapsedSeries() {
+        // C95: a series idle for more than 8 weeks comes back from tomorrow.
+        let history = series(-90...(-70), "07:30")
+        let revived = recurrenceTopUp(task: gym(), existingBlocks: history, todayIso: today)
+        XCTAssertEqual(revived.map(\.date), (1...55).map(day))
+        XCTAssertTrue(revived.allSatisfy { $0.startTime == "07:30" })
+        let weekly = recurrenceTopUp(task: gym(.weekly(daysOfWeek: [1, 3], until: nil)), existingBlocks: history, todayIso: today)
+        XCTAssertFalse(weekly.isEmpty)
+        XCTAssertTrue(weekly.allSatisfy { [1, 3].contains(LocalDate.dayOfWeek($0.date)) }, "Mondays and Wednesdays only")
+    }
+
+    func testFarMovedOccurrenceDoesNotFreezeTheSeries() {
+        var blocks = series(0...55)
+        blocks[5].date = day(90)
+        XCTAssertEqual(slots(recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: day(1))), ["\(day(56)) 07:00"])
+    }
+
+    func testSeriesRePlannedBeyondTheHorizonIsLeftAlone() {
+        let blocks = series(-10...(-1)) + series(70...80)
+        XCTAssertEqual(recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: today), [])
+    }
+
+    func testUntilNilUnknownAndTimelessAddNothing() {
+        let blocks = series(0...10)
+        let capped = recurrenceTopUp(task: gym(.daily(until: day(30))), existingBlocks: blocks, todayIso: today)
+        XCTAssertEqual(capped.map(\.date), (11...30).map(day), "nothing after until")
+        XCTAssertEqual(recurrenceTopUp(task: gym(nil), existingBlocks: blocks, todayIso: today), [])
+        XCTAssertEqual(recurrenceTopUp(task: gym(.daily(until: Recurrence.UNKNOWN_UNTIL)), existingBlocks: blocks, todayIso: today), [])
+        XCTAssertEqual(recurrenceTopUp(task: gym(), existingBlocks: [occ(1, ""), occ(2, "")], todayIso: today), [])
+        XCTAssertEqual(recurrenceTopUp(task: gym(), existingBlocks: [], todayIso: today), [], "a blockless series has no time")
+    }
+
+    func testTopUpIsIdempotentAndClamped() {
+        let blocks = series(0...10)
+        let added = recurrenceTopUp(task: gym(estimateMin: 2), existingBlocks: blocks, todayIso: today)
+        XCTAssertEqual(added.map(\.date), (11...55).map(day))
+        XCTAssertTrue(added.allSatisfy { $0.durationMinutes == 5 }, "a 2-minute task mints blocks the server accepts")
+        XCTAssertTrue(added.allSatisfy { $0.taskId == "gym" && $0.kind == .task && $0.taskName == "Gym" })
+        XCTAssertEqual(Set(added.map(\.id)).count, added.count)
+        XCTAssertEqual(recurrenceTopUp(task: gym(), existingBlocks: blocks + added, todayIso: today), [], "idempotent")
+    }
+
+    func testExplicitSeriesTimeOverridesTheVote() {
+        // A lapsed series re-placed at 19:00: the history's 07:00 must not win.
+        let blocks = series(-29...(-1)) + [occ(1, "19:00")]
+        let added = recurrenceTopUp(task: gym(), existingBlocks: blocks, todayIso: today, seriesTime: "19:00")
+        XCTAssertEqual(added.map(\.date), (2...55).map(day))
+        XCTAssertTrue(added.allSatisfy { $0.startTime == "19:00" })
+        // Monthly: a lapsed series on the 15th re-placed on the 20th runs on the
+        // 20th, as the placed time does (the history's day must not win either).
+        let lapsed = ["2026-06-15", "2026-07-15", "2026-08-15"].map { mkBlock(id: $0, taskId: "gym", startTime: "07:00", date: $0) }
+            + [mkBlock(id: "placed", taskId: "gym", startTime: "07:00", date: "2026-10-20")]
+        XCTAssertEqual(recurrenceTopUp(task: gym(.monthly(until: nil)), existingBlocks: lapsed, todayIso: "2026-10-16",
+                                       seriesTime: "07:00").map(\.date), ["2026-11-20"])
+    }
+
+    // Monthly day of month (C1 critic / C22): from the series, not the frontier.
+
+    func testMonthlyCarriedOccurrenceDoesNotDoubleNextMonth() {
+        // Sept 15th's occurrence carried to the 16th.
+        let blocks = [mkBlock(id: "c", taskId: "gym", startTime: "07:00", date: "2026-09-16"),
+                      mkBlock(id: "n", taskId: "gym", startTime: "07:00", date: "2026-10-15")]
+        let monthly = gym(.monthly(until: nil))
+        XCTAssertEqual(recurrenceTopUp(task: monthly, existingBlocks: blocks, todayIso: "2026-09-15"), [])
+        XCTAssertEqual(recurrenceTopUp(task: monthly, existingBlocks: blocks, todayIso: "2026-09-21").map(\.date), ["2026-11-15"])
+    }
+
+    func testMonthlyMovedFrontierKeepsTheSeriesDay() {
+        // The only upcoming occurrence (Oct 15) moved to Oct 20.
+        let blocks = [mkBlock(id: "p", taskId: "gym", startTime: "07:00", date: "2026-09-15"),
+                      mkBlock(id: "m", taskId: "gym", startTime: "07:00", date: "2026-10-20")]
+        let monthly = gym(.monthly(until: nil))
+        XCTAssertEqual(recurrenceTopUp(task: monthly, existingBlocks: blocks, todayIso: "2026-09-19"), [])
+        XCTAssertEqual(recurrenceTopUp(task: monthly, existingBlocks: blocks, todayIso: "2026-10-16").map(\.date), ["2026-11-15"],
+                       "not 11-20")
+    }
+
+    func testMonthlyThirtyFirstRecoversFromAClampedMonth() {
+        let blocks = ["2026-01-31", "2026-02-28", "2026-03-31"].map {
+            mkBlock(id: $0, taskId: "gym", startTime: "07:00", date: $0)
+        }
+        XCTAssertEqual(recurrenceTopUp(task: gym(.monthly(until: nil)), existingBlocks: blocks, todayIso: "2026-03-10").map(\.date),
+                       ["2026-04-30"])
+    }
+
+    // A moved occurrence still owns its month (audit 2026-09-22, C1 review).
+
+    /// The top-up run once a day from `from` through `to`, keeping what it adds.
+    private func dailyTopUps(_ task: TaskItem, _ blocks: [CalBlock], from: String, to: String) -> [CalBlock] {
+        var all = blocks
+        var d = from
+        while d <= to {
+            all += recurrenceTopUp(task: task, existingBlocks: all, todayIso: d)
+            d = LocalDate.addDays(d, 1)
+        }
+        return all
+    }
+    private func rentBlock(_ date: String, done: Bool = false) -> CalBlock {
+        var b = mkBlock(id: date, taskId: "gym", startTime: "07:00", date: date)
+        b.done = done
+        return b
+    }
+
+    func testMonthlyRePlanToALaterDayMintsNoStrayOldDay() {
+        // Rent on the 15th, re-planned on Oct 16 from Nov 15 to the 20th (or the
+        // 30th) in the Schedule sheet: regenerate builds 8 weeks from the new
+        // date, so its second occurrence lies past the horizon and the old vote
+        // read [15, 15, 20] and minted Dec 15 next to Dec 20.
+        let rent = gym(.monthly(until: nil))
+        let cases: [(history: [String], day: Int, expected: [String])] = [
+            (["2026-08-15", "2026-09-15", "2026-10-15"], 20, ["2026-11-20", "2026-12-20", "2027-01-20", "2027-02-20", "2027-03-20"]),
+            (["2026-10-15"], 20, ["2026-11-20", "2026-12-20", "2027-01-20", "2027-02-20", "2027-03-20"]),
+            (["2026-08-15", "2026-09-15", "2026-10-15"], 30, ["2026-11-30", "2026-12-30", "2027-01-30", "2027-02-28"]),
+        ]
+        for c in cases {
+            var blocks = c.history.map { rentBlock($0, done: true) } + [rentBlock("2026-11-15")]
+            let plan = regenerateForTask(task: rent, recurrence: rent.recurrence, existingBlocks: blocks, todayIso: "2026-10-16",
+                                         startTime: "07:00", startDate: LocalDate.parse("2026-11-\(c.day)"))
+            blocks = blocks.filter { !plan.toDelete.contains($0.id) } + plan.toUpsert
+            let after = dailyTopUps(rent, blocks, from: "2026-10-16", to: "2027-01-31")
+            XCTAssertEqual(after.map(\.date).filter { $0 > "2026-10-16" }.sorted(), c.expected, "re-planned to the \(c.day)th")
+        }
+    }
+
+    func testMonthlyFrontierMovedEarlierDoesNotBringTheOldDateBack() {
+        // On Oct 20 Nov 15 is the only upcoming occurrence; it is dragged to Nov 10.
+        let rent = gym(.monthly(until: nil))
+        let blocks = ["2026-08-15", "2026-09-15", "2026-10-15"].map { rentBlock($0, done: true) } + [rentBlock("2026-11-10")]
+        XCTAssertEqual(recurrenceTopUp(task: rent, existingBlocks: blocks, todayIso: "2026-10-20"), [], "Nov 15 does not come back")
+        let after = dailyTopUps(rent, blocks, from: "2026-10-20", to: "2027-01-31")
+        XCTAssertEqual(after.map(\.date).filter { $0 > "2026-10-20" }.sorted(),
+                       ["2026-11-10", "2026-12-15", "2027-01-15", "2027-02-15", "2027-03-15"], "the series keeps the 15th after it")
+    }
+
+    func testWeeklyFrontierMovedEarlierDoesNotBringTheOldDateBack() {
+        // Mondays; the last one in the horizon dragged to the Saturday before.
+        let mondays = gym(.weekly(daysOfWeek: [1], until: nil))
+        var blocks = (0...55).filter { LocalDate.dayOfWeek(day($0)) == 1 }.map { occ($0) }
+        let last = blocks.count - 1
+        let lastMonday = blocks[last].date
+        blocks[last].date = LocalDate.addDays(lastMonday, -2)
+        XCTAssertEqual(recurrenceTopUp(task: mondays, existingBlocks: blocks, todayIso: today), [], "that Monday does not come back")
+        let after = dailyTopUps(mondays, blocks, from: today, to: day(7))
+        XCTAssertFalse(after.contains { $0.date == lastMonday })
+        XCTAssertEqual(after.filter { $0.date > lastMonday }.map(\.date), [LocalDate.addDays(lastMonday, 7)], "the next week still comes")
+    }
+}
+
+// Where a recurrence EDIT regenerates from (audit 2026-09-22, C1): the series'
+// own time and day, never a one-off moved occurrence's.
+final class RecurrenceEditStartTests: XCTestCase {
+    private let today = "2026-05-21"
+    private func day(_ offset: Int) -> String { LocalDate.addDays(today, offset) }
+
+    func testASingleLiveOccurrenceStillSetsTheTimeOverHistory() {
+        // The build-79 "Office every Monday at 11" fix must hold.
+        var doneOld = mkBlock(id: "old", taskId: "task-1", startTime: "09:15", date: "2026-05-04")
+        doneOld.done = true
+        let next = mkBlock(id: "next", taskId: "task-1", startTime: "11:00", date: "2026-05-25")
+        let start = recurrenceEditStart(taskId: "task-1", recurrence: .weekly(daysOfWeek: [1], until: nil),
+                                        blocks: [doneOld, next], todayIso: today)
+        XCTAssertEqual(start, RecurrenceStart(date: "2026-05-25", startTime: "11:00", horizonDays: 56))
+        XCTAssertNil(recurrenceEditStart(taskId: "task-1", recurrence: .daily(until: nil), blocks: [], todayIso: today))
+    }
+
+    func testEditingTheEndDateNeverRebuildsTheSeriesAtAMovedTime() throws {
+        let t = mkTask(id: "task-1", name: "Gym")
+        var blocks = (1...55).map { mkBlock(id: "b\($0)", taskId: "task-1", startTime: "07:00", date: day($0)) }
+        blocks[0].startTime = "18:00"   // tomorrow's moved by hand
+        let rec = Recurrence.daily(until: day(90))
+        let start = try XCTUnwrap(recurrenceEditStart(taskId: "task-1", recurrence: rec, blocks: blocks, todayIso: today))
+        XCTAssertEqual(start.startTime, "07:00", "the series' time, not the moved one's")
+        let plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: today,
+                                     startTime: start.startTime, startDate: LocalDate.parse(start.date), horizonDays: start.horizonDays)
+        let deleted = Set(plan.toDelete)
+        XCTAssertFalse(blocks.contains { $0.startTime == "07:00" && deleted.contains($0.id) }, "nothing at 07:00 is deleted")
+        XCTAssertFalse(plan.toUpsert.contains { $0.startTime != "07:00" })
+    }
+
+    func testMonthlyEditKeepsTheSeriesDayButAKindSwitchKeepsTheAnchors() {
+        var history = ["2026-03-15", "2026-04-15", "2026-05-15"].map {
+            mkBlock(id: $0, taskId: "task-1", startTime: "07:00", date: $0)
+        }
+        for i in history.indices { history[i].done = true }
+        let carried = mkBlock(id: "carried", taskId: "task-1", startTime: "07:00", date: "2026-06-16")
+        let next = mkBlock(id: "next", taskId: "task-1", startTime: "07:00", date: "2026-07-15")
+        let start = recurrenceEditStart(taskId: "task-1", recurrence: .monthly(until: "2026-12-31"),
+                                        blocks: history + [carried, next], todayIso: today)
+        XCTAssertEqual(start?.date, "2026-06-15", "the 15th, not the carried occurrence's 16th")
+        XCTAssertEqual(start?.horizonDays, 57, "the horizon still ends 8 weeks after the anchor")
+        // Weekly Mondays switched to monthly: no day has two votes → the anchor's.
+        let mondays = ["2026-05-25", "2026-06-01", "2026-06-08"].map {
+            mkBlock(id: $0, taskId: "task-1", startTime: "09:00", date: $0)
+        }
+        XCTAssertEqual(recurrenceEditStart(taskId: "task-1", recurrence: .monthly(until: nil), blocks: mondays, todayIso: today)?.date,
+                       "2026-05-25")
+    }
+
+    /// The plan an edit applies: regenerate from the start, minus `keepId`.
+    private func editPlan(_ rec: Recurrence, _ blocks: [CalBlock], today: String) throws -> RegenPlan {
+        var t = mkTask(id: "task-1", name: "Rent")
+        t.recurrence = rec
+        let start = try XCTUnwrap(recurrenceEditStart(taskId: "task-1", recurrence: rec, blocks: blocks, todayIso: today))
+        var plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: today, startTime: start.startTime,
+                                     startDate: LocalDate.parse(start.date), horizonDays: start.horizonDays)
+        plan.toDelete.removeAll { $0 == start.keepId }
+        return plan
+    }
+    private func rent(_ date: String, _ time: String = "07:00", done: Bool = false) -> CalBlock {
+        var b = mkBlock(id: date, taskId: "task-1", startTime: time, date: date)
+        b.done = done
+        return b
+    }
+
+    func testMonthlyEditKeepsThisMonthsOccurrenceMovedOffAPassedDay() throws {
+        // Oct 15's rent pushed to Oct 20 at 18:00; on Oct 16 only the end date
+        // changes. The start is Oct 15 (passed), so regenerate wanted nothing in
+        // October and deleted Oct 20: the month lost its occurrence.
+        let blocks = [rent("2026-08-15", done: true), rent("2026-09-15", done: true), rent("2026-10-20", "18:00"), rent("2026-11-15")]
+        let plan = try editPlan(.monthly(until: "2027-06-30"), blocks, today: "2026-10-16")
+        XCTAssertEqual(plan, RegenPlan(toUpsert: [], toDelete: []), "Oct 20 stays; Nov 15 stays")
+        // An end date before it ends the series there: nothing is kept.
+        XCTAssertEqual(Set(try editPlan(.monthly(until: "2026-10-18"), blocks, today: "2026-10-16").toDelete),
+                       ["2026-10-20", "2026-11-15"])
+    }
+
+    func testMonthlyEditStillRealignsNextMonthsOccurrenceMovedEarlier() throws {
+        // Nov 15 dragged to Nov 10 is next month's, not October's: an explicit
+        // edit puts it back on the series day, as regenerate does everywhere.
+        let blocks = [rent("2026-08-15", done: true), rent("2026-09-15", done: true), rent("2026-10-15", done: true), rent("2026-11-10")]
+        let plan = try editPlan(.monthly(until: nil), blocks, today: "2026-10-16")
+        XCTAssertEqual(plan.toDelete, ["2026-11-10"])
+        XCTAssertEqual(plan.toUpsert.map(\.date), ["2026-11-15", "2026-12-15"])
     }
 }
 

@@ -366,13 +366,17 @@ extension AppModel {
     }
 
     /// Set/clear a task's recurrence and realign its future cal_blocks
-    /// (regenerateForTask, anchored on the task's earliest existing block).
-    func setRecurrence(_ task: TaskItem, _ recurrence: Recurrence?) {
+    /// (regenerateForTask, anchored on the task's earliest LIVE timed block —
+    /// recurrenceAnchor). Returns false and changes nothing when a repeat is
+    /// set on a task with no timed block: the caller asks for a start day and
+    /// time and starts the series with scheduleTaskAt (audit 2026-09-22, C7).
+    @discardableResult
+    func setRecurrence(_ task: TaskItem, _ recurrence: Recurrence?) -> Bool {
         var next = task
         next.recurrence = recurrence
         next.updatedAt = Self.isoNow()
         let existing = (try? db?.blocks(forTask: task.id)) ?? []
-        saveTaskWithRecurrence(next, existingBlocks: existing)
+        return saveTaskWithRecurrence(next, existingBlocks: existing)
     }
 
     /// Fire the shared-item completion notification after a Focus session that

@@ -125,6 +125,13 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     // ── CALENDAR ──
     case "unschedule_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        // A repeating task is refused, even with no upcoming slot left: with
+        // the repeat still on, the horizon top-up rebuilt every removed slot at
+        // the next launch or midnight although the result said they were gone
+        // (audit 2026-09-22, C1). Which one the user means is theirs to say.
+        if t.recurrence != nil {
+            return "error: \"\(t.name)\" repeats — nothing changed. Ask the user which they mean: stop the whole series (set_task_recurrence kind none) or skip just one day (skip_occurrence with the date)."
+        }
         let today = api.todayIso()
         let live = api.getBlocks().filter { $0.taskId == t.id && !$0.done && !$0.skipped && $0.date >= today }
         if live.isEmpty { return "error: \"\(t.name)\" has no upcoming slot to remove" }

@@ -83,7 +83,11 @@ struct TaskRow: Codable, Sendable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(id, forKey: .id)
         try c.encode(name, forKey: .name)
-        try c.encode(estimateMin, forKey: .estimateMin)
+        // Clamped on the wire as well as in WriteThrough: an op queued by build
+        // 80 or earlier carries the raw value, and OutboxFlusher.apply decodes
+        // and re-encodes it here — so it lands instead of being refused again
+        // (audit 2026-09-22, C4).
+        try c.encode(clampEstimateMin(estimateMin), forKey: .estimateMin)
         try c.encode(totalFocused, forKey: .totalFocused)
         try c.encode(done, forKey: .done)
         try c.encode(priority, forKey: .priority)
@@ -218,7 +222,8 @@ struct CalBlockRow: Codable, Sendable {
         try c.encode(taskId, forKey: .taskId)
         try c.encode(taskName, forKey: .taskName)
         try c.encode(startTime, forKey: .startTime)
-        try c.encode(durationMinutes, forKey: .durationMinutes)
+        // Clamped on the wire too — see TaskRow.encode (audit 2026-09-22, C4).
+        try c.encode(clampDurationMin(durationMinutes), forKey: .durationMinutes)
         try c.encode(date, forKey: .date)
         try c.encode(externalEventId, forKey: .externalEventId)
         try c.encode(externalConnectionId, forKey: .externalConnectionId)

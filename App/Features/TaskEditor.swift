@@ -47,6 +47,9 @@ struct TaskEditor: View {
     @State private var showSchedule = false
     @State private var datePick = Date()
     @State private var timePick = Date()
+    /// A repeat chosen on a task with no timed block: held until the Schedule
+    /// sheet (titled "Start repeating") gives the series a day and a time.
+    @State private var pendingRecurrence: Recurrence?
 
     // Recurrence end-date picker.
     @State private var showUntil = false
@@ -173,15 +176,20 @@ struct TaskEditor: View {
             .task { await observe() }
             .alert("Estimate (minutes)", isPresented: $showEstimate) {
                 TextField("Minutes", text: $estimateText).keyboardType(.numberPad)
-                Button("Save") { if let v = Int(estimateText), v > 0 { update { $0.estimateMin = v } } }
+                // Bounded to the server's 1…1440 (audit 2026-09-22, C4): an estimate
+                // over 1440 was resent and refused by every later whole-row edit.
+                Button("Save") { if let v = Int(estimateText), v > 0 { update { $0.estimateMin = clampEstimateMin(v) } } }
                 Button("Cancel", role: .cancel) {}
             }
             .alert("Delete this task?", isPresented: $confirmDelete) {
                 Button("Delete", role: .destructive) { model.deleteTask(editTarget.id); dismiss() }
                 Button("Cancel", role: .cancel) {}
             } message: { Text("Its scheduled blocks and captures are removed too.") }
-            .sheet(isPresented: $showSchedule) { scheduleSheet }
-            .sheet(isPresented: $showUntil) { untilSheet }
+            // Cancel / swipe-down on "Start repeating" abandons the repeat.
+            .sheet(isPresented: $showSchedule, onDismiss: { pendingRecurrence = nil }) { scheduleSheet }
+            // A sheet presented while another is still dismissing is dropped,
+            // so the until sheet hands over to "Start repeating" here.
+            .sheet(isPresented: $showUntil, onDismiss: { if pendingRecurrence != nil { openSchedule() } }) { untilSheet }
         }
     }
 
@@ -373,10 +381,10 @@ struct TaskEditor: View {
         let until = rec?.untilDate
         return VStack(alignment: .leading, spacing: 8) {
             chipScroll {
-                chip("Never", selected: mode == .none) { model.setRecurrence(editTarget, nil) }
-                chip("Daily", selected: mode == .daily) { model.setRecurrence(editTarget, .daily(until: until)) }
-                chip("Weekly", selected: mode == .weekly) { model.setRecurrence(editTarget, .weekly(daysOfWeek: days.isEmpty ? [1] : days, until: until)) }
-                chip("Monthly", selected: mode == .monthly) { model.setRecurrence(editTarget, .monthly(until: until)) }
+                chip("Never", selected: mode == .none) { applyRecurrence(nil) }
+                chip("Daily", selected: mode == .daily) { applyRecurrence(.daily(until: until)) }
+                chip("Weekly", selected: mode == .weekly) { applyRecurrence(.weekly(daysOfWeek: days.isEmpty ? [1] : days, until: until)) }
+                chip("Monthly", selected: mode == .monthly) { applyRecurrence(.monthly(until: until)) }
             }
             if mode == .weekly {
                 HStack(spacing: 6) {
@@ -384,7 +392,7 @@ struct TaskEditor: View {
                         let on = days.contains(idx)
                         Button {
                             let next = on ? days.filter { $0 != idx } : (days + [idx]).sorted()
-                            model.setRecurrence(editTarget, .weekly(daysOfWeek: next.isEmpty ? [idx] : next, until: until))
+                            applyRecurrence(.weekly(daysOfWeek: next.isEmpty ? [idx] : next, until: until))
                         } label: {
                             Text(label).font(.system(size: 13, weight: .medium))
                                 .frame(width: 30, height: 30)
@@ -404,7 +412,7 @@ struct TaskEditor: View {
                         showUntil = true
                     }
                     if until != nil {
-                        Button("Clear") { model.setRecurrence(editTarget, withUntil(rec, nil)) }
+                        Button("Clear") { applyRecurrence(withUntil(rec, nil)) }
                             .font(UFont.sans(12)).foregroundStyle(theme.palette.primaryDeep).buttonStyle(.plain)
                     }
                 }
@@ -565,10 +573,12 @@ struct TaskEditor: View {
                 DatePicker("Day", selection: $datePick, in: Calendar.current.startOfDay(for: Date())..., displayedComponents: .date)
                 DatePicker("Time", selection: $timePick, displayedComponents: .hourAndMinute)
             }
-            .navigationTitle("Schedule").navigationBarTitleDisplayMode(.inline)
+            .navigationTitle(pendingRecurrence == nil ? "Schedule" : "Start repeating").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showSchedule = false } }
-                ToolbarItem(placement: .confirmationAction) { Button("OK") { commitSchedule() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("OK") { if let pending = pendingRecurrence { startRepeating(pending) } else { commitSchedule() } }
+                }
             }
         }
         .presentationDetents([.medium])
@@ -582,7 +592,11 @@ struct TaskEditor: View {
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showUntil = false } }
                     ToolbarItem(placement: .confirmationAction) {
-                        Button("OK") { model.setRecurrence(editTarget, withUntil(editTarget.recurrence, Self.ymd(untilDraft))); showUntil = false }
+                        Button("OK") {
+                            let r = withUntil(editTarget.recurrence, Self.ymd(untilDraft))
+                            if !model.setRecurrence(editTarget, r) { pendingRecurrence = r }   // → "Start repeating" on dismiss
+                            showUntil = false
+                        }
                     }
                 }
         }
@@ -702,10 +716,51 @@ struct TaskEditor: View {
         // range (the picker shows today but the stale past date persists until the
         // user scrolls). max(parsed, today) keeps the binding in range.
         let today = Calendar.current.startOfDay(for: Date())
-        let parsed = myBlocks.first.flatMap { Self.parseIso($0.date) } ?? Date()
+        // A series seeds from its NEXT occurrence at the series' own time, not
+        // from myBlocks.first — the oldest block, history at a time the series
+        // may have left long ago — so OK without changes never re-plans the
+        // series (audit 2026-09-22, C7). A repeat being started seeds its
+        // first matching day: Weekly (Mon) opened on a Tuesday would otherwise
+        // mint an off-pattern occurrence today.
+        var seed = myBlocks.first
+        var seedTime = seed?.startTime
+        var parsed = seed.flatMap { Self.parseIso($0.date) } ?? Date()
+        if let pending = pendingRecurrence {
+            parsed = materializeOccurrences(pending, startDate: today, startTime: "00:00", horizonDays: 35)
+                .first.flatMap { Self.parseIso($0.date) } ?? today
+        } else if editTarget.recurrence != nil {
+            let todayIso = Clock.todayISO()
+            seed = recurrenceAnchor(taskId: editTarget.id, blocks: myBlocks, todayIso: todayIso) ?? myBlocks.first
+            seedTime = recurrenceEditStart(taskId: editTarget.id, recurrence: editTarget.recurrence,
+                                           blocks: myBlocks, todayIso: todayIso)?.startTime ?? seed?.startTime
+            parsed = seed.flatMap { Self.parseIso($0.date) } ?? Date()
+        }
         datePick = max(parsed, today)
-        timePick = myBlocks.first.flatMap { Self.parseHHmm($0.startTime) } ?? Date()
+        timePick = seedTime.flatMap { Self.parseHHmm($0) } ?? Date()
         showSchedule = true
+    }
+
+    /// Commit "Start repeating": the task had no timed block, so the rule is
+    /// saved FIRST (awaited) and scheduleTaskAt then builds the series plus the
+    /// chosen day's occurrence — today's too when today is picked (audit
+    /// 2026-09-22, C7 / tasks-ui#11). The Later un-park rides in the same row:
+    /// a separate setLater would write the row back without the rule.
+    private func startRepeating(_ recurrence: Recurrence) {
+        let dateIso = Clock.dateISO(datePick)
+        let c = Calendar.current.dateComponents([.hour, .minute], from: timePick)
+        let timeIso = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
+        pendingRecurrence = nil
+        var next = editTarget
+        next.recurrence = recurrence
+        if next.later == true { next.later = false }
+        next.updatedAt = AppModel.isoNow()
+        Task {
+            guard await model.saveTaskAwaiting(next) else { return }
+            model.scheduleTaskAt(next, date: dateIso, startTime: timeIso)
+            ReminderScheduler.shared.resync()
+        }
+        scheduledLabel = "\(dateIso.suffix(5)) \(formatTime(timeIso))"
+        showSchedule = false
     }
 
     private func commitSchedule() {
@@ -720,6 +775,17 @@ struct TaskEditor: View {
     }
 
     // MARK: recurrence helpers
+
+    /// Set / change / clear the repeat. On a task with no timed block the model
+    /// refuses (a series needs a day and a time), so ask via the Schedule sheet
+    /// instead of inventing 09:00 from tomorrow and hiding the task from Today
+    /// (audit 2026-09-22, C7 / tasks-ui#11).
+    private func applyRecurrence(_ r: Recurrence?) {
+        if !model.setRecurrence(editTarget, r) {
+            pendingRecurrence = r
+            openSchedule()
+        }
+    }
 
     private enum RKind { case none, daily, weekly, monthly }
     private func kindOf(_ r: Recurrence?) -> RKind {
