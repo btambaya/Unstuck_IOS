@@ -311,7 +311,15 @@ private struct CalendarSyncBar: View {
 
     private func sync() {
         busy = true; error = nil
-        Task { await model.pullGoogleCalendar(); busy = false }
+        // A failed "Sync now" used to end silently (audit 2026-09-22, C18).
+        Task {
+            if !(await model.pullGoogleCalendar()) {
+                error = model.calendarSyncStatus?.backoffUntil != nil
+                    ? "Google is busy right now. Try again in a few minutes."
+                    : "Couldn't sync with Google. Check your connection and try again."
+            }
+            busy = false
+        }
     }
 
     private func connect() {
@@ -320,13 +328,18 @@ private struct CalendarSyncBar: View {
         Task {
             let controller = GoogleConnectController(calendar)
             let result = await controller.connect()
-            busy = false
             switch result {
-            // Drop the stale needs-reauth verdict + back-off BEFORE the pull,
-            // so a re-consent flips the bar back to "Synced" immediately.
-            case .success: model.calendarDidReconnect()
+            // Save the connection locally (the bar flips to "Synced" and new
+            // blocks mirror to Google at once), drop the stale needs-reauth
+            // verdict + back-off, then pull — `busy` holds until the first sync
+            // lands (audit 2026-09-22, C18).
+            case .success(let connection):
+                if !(await model.calendarDidConnect(connection)) {
+                    error = "Google is connected, but the first sync didn't finish. Tap Sync now."
+                }
             case .failure(let err): error = "Couldn't connect. \(err.localizedDescription)"
             }
+            busy = false
         }
     }
 }

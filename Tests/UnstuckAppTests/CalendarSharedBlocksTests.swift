@@ -2,10 +2,13 @@
 // the per-window cache the ShareModel keeps, the ISO window arithmetic the
 // Day/Week/Month surfaces request with, the own+shared merged lane layout, the
 // read-only gate every mutating path keys off, and the Month marks. Pure; no
-// UI, no store, no network.
+// UI, no store, no network. CalendarConnectSeedTests (the Google connect seed)
+// uses the UI-test in-memory store.
 
 import XCTest
 import UnstuckCore
+import UnstuckData
+import UnstuckSync
 @testable import Unstuck
 
 private func own(_ id: String, _ start: String, _ durationMin: Int, kind: CalBlockKind? = .task,
@@ -306,5 +309,49 @@ final class MonthDayMarksTests: XCTestCase {
         // External-only + skipped-only still reads empty.
         XCTAssertTrue(monthDayMarks(own: [own("g", "09:00", 30, kind: .external)],
                                     shared: [shared("s", "09:00", 30, skipped: true)]).isEmpty)
+    }
+}
+
+// MARK: - Google connect → local connection row
+
+/// A successful in-app connect wrote nothing locally, so the sync bar stayed
+/// "Connect" and googleConnection(for:) found nothing until relaunch (audit
+/// 2026-09-22, C18). UI-test mode: an in-memory store, no coordinator, and the
+/// demo seed has no connection.
+@MainActor
+final class CalendarConnectSeedTests: XCTestCase {
+    private func response(_ json: String) throws -> CalendarClient.ConnectResponse {
+        try JSONDecoder().decode(CalendarClient.ConnectResponse.self, from: Data(json.utf8))
+    }
+
+    private func connections(_ model: AppModel) throws -> [CalendarConnection] {
+        try Repository<CalendarConnection>(XCTUnwrap(model.db), orderColumn: "connectedAt").all()
+    }
+
+    func testConnectSeedsTheLocalConnection() async throws {
+        let model = AppModel()
+        model.startUITestMode()
+        XCTAssertTrue(try connections(model).isEmpty)
+        let ok = await model.calendarDidConnect(try response(
+            #"{"id":"c1","accountEmail":"a@b.c","calendars":[{"id":"primary","summary":"a@b.c","primary":true},{"id":"team@x","summary":"Team"}],"colorSlot":1}"#))
+        XCTAssertFalse(ok, "no coordinator, so the follow-up pull can't run")
+        let rows = try connections(model)
+        XCTAssertEqual(rows.map(\.id), ["c1"])
+        XCTAssertEqual(rows.first?.accountEmail, "a@b.c")
+        XCTAssertEqual(rows.first?.selectedCalendarIds, ["primary", "team@x"])
+        XCTAssertEqual(rows.first?.colorSlot, 1)
+    }
+
+    func testReconnectKeepsTheStoredRow() async throws {
+        let model = AppModel()
+        model.startUITestMode()
+        let db = try XCTUnwrap(model.db)
+        let stored = CalendarConnection(id: "c1", provider: .google, accountEmail: "a@b.c", displayName: "Work",
+                                        selectedCalendarIds: ["work@x"], colorSlot: 3,
+                                        connectedAt: "2026-09-01T00:00:00.000Z")
+        try db.save(stored)
+        await model.calendarDidConnect(try response(
+            #"{"id":"c1","accountEmail":"a@b.c","calendars":[{"id":"primary","summary":"a@b.c"},{"id":"other@x","summary":"Other"}],"colorSlot":3}"#))
+        XCTAssertEqual(try connections(model), [stored])
     }
 }

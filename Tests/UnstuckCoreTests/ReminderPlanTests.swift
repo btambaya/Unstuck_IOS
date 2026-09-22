@@ -102,6 +102,39 @@ final class PlanRemindersTests: XCTestCase {
         XCTAssertTrue(plans.isEmpty)
     }
 
+    // A recurring occurrence keeps the day's tick / skip on the BLOCK; the
+    // template's `done` never flips (audit 2026-09-22, C2).
+    func testDoneOccurrenceArmsNothingButTheNextDayStillArms() {
+        var tpl = mkTask(id: "tpl")
+        tpl.recurrence = .daily(until: nil)
+        var b1 = mkBlock(id: "b1", taskId: "tpl", startTime: "20:00", date: "2026-05-21")
+        b1.done = true
+        let b2 = mkBlock(id: "b2", taskId: "tpl", startTime: "20:00", date: "2026-05-22")
+        let plans = planReminders(blocks: [b1, b2], tasks: [tpl],
+                                  level: .coach, globalLeadMin: 10, now: now)
+        XCTAssertEqual(keys(plans), ["lead:b2", "atstart:b2", "drifted:b2"])
+    }
+
+    func testSkippedOccurrenceArmsNothing() {
+        var tpl = mkTask(id: "tpl")
+        tpl.recurrence = .daily(until: nil)
+        var b1 = mkBlock(id: "b1", taskId: "tpl", startTime: "20:00", date: "2026-05-21")
+        b1.skipped = true
+        let plans = planReminders(blocks: [b1], tasks: [tpl],
+                                  level: .coach, globalLeadMin: 10, now: now)
+        XCTAssertTrue(plans.isEmpty)
+    }
+
+    func testSkippedOneOffBlockArmsNothing() {
+        // carry_to_tomorrow's "tomorrow already has it — skip today" and
+        // skip_occurrence can set `skipped` on a one-off task's block too.
+        var b = mkBlock(id: "b1", taskId: "t1", startTime: "09:00", date: "2026-05-21")
+        b.skipped = true
+        let plans = planReminders(blocks: [b], tasks: [mkTask(id: "t1")],
+                                  level: .balanced, globalLeadMin: 10, now: now)
+        XCTAssertTrue(plans.isEmpty)
+    }
+
     func testExternalEventGetsOnlyALeadWithGlobalLead() {
         // External calendar events have a blank task id — the LEAD is keyed
         // off the block id, and atstart/drifted never arm.
@@ -209,6 +242,23 @@ final class UpcomingRemindersTests: XCTestCase {
         let up = upcomingReminders(blocks: blocks, tasks: tasks, now: now)
         XCTAssertEqual(up.map(\.name), ["Soon", "Later"])
         XCTAssertEqual(up.map(\.taskId), ["t1", "t2"])
+    }
+
+    func testDoneAndSkippedOccurrencesAreNotUpcoming() {
+        // A skipped twin at the same (task, time) is listed BEFORE the live
+        // block: it must not consume the de-dupe key (audit 2026-09-22, C2).
+        var tpl = mkTask(id: "tpl")
+        tpl.recurrence = .daily(until: nil)
+        var b1 = mkBlock(id: "b1", taskId: "tpl", taskName: "Done day", startTime: "09:00", date: "2026-05-21")
+        b1.done = true
+        var b2 = mkBlock(id: "b2", taskId: "tpl", taskName: "Skipped day", startTime: "10:00", date: "2026-05-21")
+        b2.skipped = true
+        var b3s = mkBlock(id: "b3s", taskId: "tpl", taskName: "Live", startTime: "11:00", date: "2026-05-21")
+        b3s.skipped = true
+        let b3 = mkBlock(id: "b3", taskId: "tpl", taskName: "Live", startTime: "11:00", date: "2026-05-21")
+        let up = upcomingReminders(blocks: [b1, b2, b3s, b3], tasks: [tpl], now: now)
+        XCTAssertEqual(up.map(\.name), ["Live"])
+        XCTAssertEqual(up.count, 1)
     }
 
     func testCapsAtTwenty() {
