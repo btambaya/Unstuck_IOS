@@ -469,6 +469,33 @@ private struct InterfaceSettingsView: View {
     /// button is held. A device-level preference, so UserDefaults, not the
     /// synced SettingsState.
     @AppStorage(VoiceRealtimeClient.holdToTalkKey) private var voiceHoldToTalk = false
+    /// nil = idle; otherwise the line shown under "Clear Assistant history".
+    @State private var clearHistoryResult: String?
+    @State private var clearing = false
+
+    private var clearHistoryState: String {
+        if clearing { return "Clearing…" }
+        return clearHistoryResult ?? "Delete what you've said to it (kept 90 days)"
+    }
+
+    /// Server-side delete of this user's stored conversations
+    /// (`delete_my_assistant_turns`, migration 074). Local chat threads are
+    /// untouched: this is the copy the backend keeps.
+    private func clearAssistantHistory() {
+        guard !clearing, let prefs = model.coordinator?.preferences else { return }
+        clearing = true
+        clearHistoryResult = nil
+        Task { @MainActor in
+            defer { clearing = false }
+            do {
+                let n = try await prefs.deleteAssistantHistory()
+                clearHistoryResult = n == 0 ? "Nothing was stored" : "Cleared \(n) stored line\(n == 1 ? "" : "s")"
+            } catch {
+                clearHistoryResult = "Couldn't clear it — try again"
+            }
+        }
+    }
+
     var body: some View {
         @Bindable var settings = model.settings
         SettingsScaffold(eyebrow: "Settings · Interface", title: "How things look.") {
@@ -500,6 +527,16 @@ private struct InterfaceSettingsView: View {
                     // Barge-in fallback for noisy rooms / open speakers: the mic
                     // opens only while the Talk screen's button is held.
                     ToggleRow(label: "Voice: hold to talk", isOn: $voiceHoldToTalk)
+                }
+                CardDivider()
+                // The control the privacy policy promises (§9.5, §17):
+                // conversations are kept 90 days, and the user can clear them
+                // now. Turning the Assistant off only stops FUTURE logging —
+                // before this there was no way to remove what was already
+                // stored short of deleting the account (audit 2026-09-21).
+                SettingTapRow(label: "Clear Assistant history",
+                              value: clearHistoryState, locked: model.tourRunning) {
+                    clearAssistantHistory()
                 }
             }
             Text("Turn the AI Assistant off to remove it completely — no launcher, no panel, no voice. Nothing is sent to the model unless you ask it something.")

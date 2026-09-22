@@ -63,11 +63,11 @@ final class SystemCallNotifier: CallNotifier {
         let content = UNMutableNotificationContent()
         content.title = n.title
         content.body = n.body
-        content.sound = .default
+        content.sound = n.quiet ? nil : .default
         content.threadIdentifier = n.threadId
         if let cat = n.categoryId { content.categoryIdentifier = cat }
         content.userInfo = n.userInfo
-        content.interruptionLevel = n.timeSensitive ? .timeSensitive : .active
+        content.interruptionLevel = n.quiet ? .passive : (n.timeSensitive ? .timeSensitive : .active)
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: n.id, content: content, trigger: nil))
     }
 }

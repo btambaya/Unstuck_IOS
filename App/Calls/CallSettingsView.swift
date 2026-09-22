@@ -10,6 +10,7 @@
 // cancelled first (Android's behaviour — the one-live-call-per-label rule
 // would refuse the retry otherwise).
 
+import AVFoundation
 import SwiftUI
 import UnstuckDesign
 import UnstuckSync
@@ -19,6 +20,9 @@ struct CallSettingsView: View {
     @Environment(\.uTheme) private var theme
 
     @State private var enabled = CallSettings.enabled
+    /// Set when the user has refused the microphone: the phone rings, but the
+    /// call cannot hear them.
+    @State private var micDenied = AVAudioApplication.shared.recordPermission == .denied
     @State private var windowStart = CallSettingsView.date(CallSettings.windowStart)
     @State private var windowEnd = CallSettingsView.date(CallSettings.windowEnd)
     @State private var lead = CallSettings.defaultLeadMin
@@ -27,6 +31,19 @@ struct CallSettingsView: View {
     @State private var nudgeRetried = false
 
     private enum TestState: Equatable { case idle, booking, booked(String), failed(String) }
+
+    /// Ask for the microphone if iOS has not been asked yet. A call answered
+    /// from the lock screen can never show this prompt — the app isn't in the
+    /// foreground — so the audio engine fails and EVERY call ends as
+    /// "couldn't start" for a user who never opened Talk (audit 2026-09-21).
+    /// Asking here, while they're looking at the Calls screen, is the fix.
+    static func ensureMicrophone(_ done: @escaping @MainActor (Bool) -> Void) {
+        switch AVAudioApplication.shared.recordPermission {
+        case .granted: done(true)
+        case .denied: done(false)
+        default: AVAudioApplication.requestRecordPermission { ok in Task { @MainActor in done(ok) } }
+        }
+    }
 
     /// The test call's label + note (the row the button books; the same
     /// label is what a retry cancels first).
@@ -95,15 +112,20 @@ struct CallSettingsView: View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Calls").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                Text(enabled ? "This iPhone rings for calls you book."
+                Text(enabled ? (micDenied ? "Calls need microphone access — turn it on in iOS Settings, or you'll ring but can't be heard."
+                                          : "This iPhone rings for calls you book.")
                              : "Off — a booked call is declined quietly here and you get the notes as a notification.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .font(UFont.sans(12)).foregroundStyle(micDenied && enabled ? theme.palette.red : theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
             Toggle("", isOn: Binding(get: { enabled }, set: { on in
                 enabled = on
                 CallSettings.enabled = on
+                // Ask for the microphone while the app is in front of them —
+                // see ensureMicrophone. Without this a user who never opens
+                // Talk rings, answers, and the engine fails every time.
+                if on { Self.ensureMicrophone { granted in micDenied = !granted } }
             }))
             .labelsHidden()
             .tint(theme.palette.primary)
@@ -292,6 +314,17 @@ struct CallSettingsView: View {
         }
         guard enabled else {
             testState = .failed("Calls are off on this iPhone — switch them on above to try it.")
+            return
+        }
+        // A test call that rings and then can't hear them is worse than none:
+        // the prompt can only appear while the app is in front of them.
+        if AVAudioApplication.shared.recordPermission != .granted {
+            Self.ensureMicrophone { granted in
+                micDenied = !granted
+                if granted { bookTestCall() } else {
+                    testState = .failed("Calls need microphone access — turn it on for Unstuck in iOS Settings.")
+                }
+            }
             return
         }
         // The same guards the assistant's request_call applies (server window

@@ -381,16 +381,28 @@ extension RealtimeCallVoiceLauncher.Deps {
                 // reading AVAudioSession before CallKit has settled the route;
                 // later route changes still re-profile through routeProvider.
                 // Never hold-to-talk: there is no press UI on the lock screen.
+                // The escape hatch as a value, not `config` (non-Sendable) — the
+                // capture-mic failure below has always done this.
+                let ended = config.onTransportEnded
                 let client = VoiceRealtimeClient(
                     proxyURL: model.voiceProxyURL, token: token, model: model.voiceModel,
                     instructions: config.instructions, opening: config.primer, tools: config.tools,
                     audio: audio, runTool: config.runTool,
-                    onState: { _ in }, onCaption: { _, _, _ in }, onError: { _ in },
+                    onState: { _ in }, onCaption: { _, _, _ in },
+                    // A provider failure mid-call was discarded, which on a
+                    // live phone call is dead air with no hang-up and no
+                    // explanation (audit 2026-09-21). End it the way a
+                    // transport failure does, so CallKit tears the call down
+                    // and the coordinator posts the "here's what it was about"
+                    // notification instead.
+                    onError: { message in
+                        voiceLog.error("voice call failed: \(message, privacy: .public)")
+                        ended(message)
+                    },
                     holdToTalk: false, initialRoute: .lowEcho)
                 client.onTransportEnded = config.onTransportEnded
                 // Mic acquisition failed (engine.start()) — the call can't
                 // proceed; degrade to the "here's what it was about" notification.
-                let ended = config.onTransportEnded
                 audio.onCaptureError = { ended("microphone unavailable") }
                 return client
             },

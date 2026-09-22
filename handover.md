@@ -17,10 +17,65 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (77) uploaded to TestFlight — calls greet once (the primer no longer quotes the opening); carry_to_tomorrow leaves a done task alone; a one-word answer is never dropped as echo. 2026-09-21.
 
+- Ship: 1.1.1 (78) uploaded to TestFlight — the pre-beta audit fixes: the "busy" message is actually shown, provider errors are plain words, calls ask for the microphone, a failure mid-call ends the call, declined-call notices are silent, travel re-pushes the timezone, and Settings can clear the Assistant history. 2026-09-22.
 
 
 
 
+
+
+
+## Where things stand (2026-09-22) — build 78: the pre-beta audit
+
+Five parallel read-only audits before letting strangers in (account/privacy,
+voice/calls/cost, data/sync, platform/App Store, backend). The full findings
+are in the session; what this build changes, and what is still open:
+
+**Fixed here (iOS):**
+- `VoiceModeScreen` — a note set while the session stays LIVE is now rendered
+  under the status line. The one message written for a rate-limited reply was
+  never displayed (it only rendered in the `.error` state), so the orb kept
+  pulsing and the user heard nothing. That is what "it just went quiet" was.
+- `VoiceRealtimeClient.friendlyError` — the user gets plain words; the
+  provider's text names the model and the organisation, which reads as broken
+  and contradicts the scope guardrail. Raw text goes to the device log.
+- `VoiceRealtimeClient.describe(_ event:)` — the barge-in log no longer prints
+  the event's description, which carried the user's transcript as `.public`
+  and travelled in any sysdiagnose a tester sends.
+- `CallSettingsView` — the microphone is requested when Calls is switched on
+  and before a test call. A call answered from the lock screen can never show
+  that prompt, so a user who never opened Talk failed EVERY call.
+- `RealtimeCallVoiceLauncher` — a provider failure mid-call ends the call
+  instead of leaving dead air on a live phone call.
+- `CallNotification.quiet` — "outside your hours" / "calls are off" notices
+  are silent and passive. They were time-sensitive with a sound, i.e. built to
+  break through Do Not Disturb, so the 3am guard woke people at 3am.
+- `AppModel` — `NSSystemTimeZoneDidChange` re-pushes the timezone. The server
+  anchors calls and briefs to it, so travel rang on the old zone's clock.
+- Settings › Interface — "Clear Assistant history" (`delete_my_assistant_turns`).
+
+**Fixed here (backend / proxy, unstuck repo ce0e273):** per-user daily voice
+budget (20 sessions, 150 replies) in the database, migration 074 (90-day
+prune + the user delete), and the privacy policy corrected to name the United
+States and to state what is stored and for how long.
+
+**Still open, Ahmad's:** OpenAI credit for Tier 3; ZeptoMail SPF + DKIM in
+Cloudflare DNS (there is no DKIM record at all today and SPF authorises only
+Microsoft, so real users' mail is unauthenticated); Supabase Pro for backups
+(free plan, PITR off, zero backups exist); the Time-Sensitive Notifications
+capability in the Apple portal plus regenerated profiles (the app sets that
+interruption level in five places without the entitlement, so iOS downgrades
+it — do NOT add it to `Unstuck.entitlements` before the portal has it or the
+archive will fail); Google OAuth consent screen published; App Privacy label
+and age rating; the policy's legal review.
+
+**Still open, code (P1, next):** recurring tasks stop after 8 weeks (no
+horizon top-up); `set_task_recurrence` anchors on an arbitrary block and
+rebuilds the series at the wrong time (Zubair's four "Office" tasks);
+`create_task` has no duplicate guard; `complete_occurrence` is missing the
+done-guard; unclamped estimates produce rows that never sync; the unpaginated
+hydrate (latent — the heaviest account today is 186 blocks against a 1,000
+cap); the 60-second full replace of `cal_blocks`.
 
 ## Where things stand (2026-09-21, evening) — build 77: Zubair's day on the new model
 

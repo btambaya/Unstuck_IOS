@@ -39,7 +39,12 @@ final class VoiceSessionModel {
     /// The user's last transcribed turn, shown briefly until the assistant's
     /// reply starts streaming — so a spoken request isn't silently discarded.
     var userTranscript: String { captions.userTranscript }
-    /// A local note (permission / config / mic error) shown in the ERROR state.
+    /// A short message for the user: a permission / config / mic error, or a
+    /// provider failure mid-session. Shown in the error state AS the status
+    /// line, and under the status line in every other state — a note set while
+    /// the session stays live (a rate-limited reply) used to be written and
+    /// never displayed, which is what "it just went quiet" was (audit
+    /// 2026-09-21). Cleared when the assistant speaks again.
     var note: String?
     /// The call this screen is running (fallback B), nil for a plain Talk.
     private(set) var callSession: CallSession?
@@ -161,6 +166,8 @@ final class VoiceSessionModel {
             runTool: runTool,
             onState: { [weak self] s in Task { @MainActor in
                 guard let self, !self.failed else { return }
+                // A reply is coming: whatever went wrong before is over.
+                if s == .speaking { self.note = nil }
                 self.state = s
             } },
             onCaption: { [weak self] role, text, done in
@@ -360,6 +367,17 @@ struct VoiceModeScreen: View {
                 .font(UFont.sans(15, .medium)).foregroundStyle(theme.palette.ink2)
                 .multilineTextAlignment(.center)
                 .accessibilityAddTraits(.updatesFrequently)
+            // A note while the session is still LIVE (the error state already
+            // shows it as the status line above). Without this the one message
+            // written for a rate-limited reply was never rendered and the orb
+            // just kept pulsing (audit 2026-09-21).
+            if session.state != .error, let note = session.note, !note.isEmpty {
+                Text(note)
+                    .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+                    .multilineTextAlignment(.center)
+                    .transition(.opacity)
+                    .accessibilityAddTraits(.updatesFrequently)
+            }
             // The user's just-spoken turn, shown until the reply starts streaming
             // (so a request isn't silently discarded). Dimmer + quote-marked to
             // distinguish it from the assistant's reply below.

@@ -508,13 +508,13 @@ enum CallNotifications {
     }
     static func outsideHours(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.hours.\(s.callId)", title: "I called about \(s.label)",
-             body: body(s.notes) + "\n(outside your call hours — Settings › Calls)")
+             body: body(s.notes) + "\n(outside your call hours — Settings › Calls)", quiet: true)
     }
     /// The master switch is off on this phone: declined quietly, the notes
     /// still land (Android's `enabled` rule) — with the honest reason.
     static func callsOff(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.off.\(s.callId)", title: "I called about \(s.label)",
-             body: body(s.notes) + "\n(calls are off on this iPhone — Settings › Calls)")
+             body: body(s.notes) + "\n(calls are off on this iPhone — Settings › Calls)", quiet: true)
     }
     static func voiceFailed(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.failed.\(s.callId)", title: "Couldn't start the call — here's what it was about", body: body(s.notes))
@@ -524,7 +524,7 @@ enum CallNotifications {
         notes.isEmpty ? "No notes on this one." : notes.joined(separator: "\n")
     }
 
-    private static func make(_ s: CallSession, id: String, title: String, body: String) -> CallNotification {
+    private static func make(_ s: CallSession, id: String, title: String, body: String, quiet: Bool = false) -> CallNotification {
         var info: [String: String] = ["kind": "call_missed", "callId": s.callId]
         if let t = s.taskId {
             info["taskId"] = t
@@ -537,6 +537,6 @@ enum CallNotifications {
         return CallNotification(
             id: id, title: title, body: body,
             categoryId: s.taskId != nil ? NotificationCategories.taskStarting : nil,
-            threadId: thread, userInfo: info, timeSensitive: true)
+            threadId: thread, userInfo: info, timeSensitive: !quiet, quiet: quiet)
     }
 }

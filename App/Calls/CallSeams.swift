@@ -112,6 +112,12 @@ struct CallNotification: Equatable, Sendable, Codable {
     var threadId: String
     var userInfo: [String: String]
     var timeSensitive: Bool
+    /// The call was DECLINED by a policy on this phone (outside the allowed
+    /// hours, or calls switched off). The notes still land, but silently and
+    /// at the lowest level: a time-sensitive alert with a sound is built to
+    /// break through Do Not Disturb, so "we didn't ring you because it's 3am"
+    /// was itself waking people at 3am (audit 2026-09-21).
+    var quiet: Bool = false
 }
 
 @MainActor

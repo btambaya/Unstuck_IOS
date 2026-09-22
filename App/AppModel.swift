@@ -101,6 +101,8 @@ final class AppModel {
     /// Guard for the timezone push — keyed on user + zone, so a re-sign-in
     /// no-ops but a device that has MOVED pushes the new zone once.
     @ObservationIgnored private var timezonePushedFor: String?
+    /// Lives as long as the model; the app has one AppModel for its lifetime.
+    @ObservationIgnored private var timezoneObserver: NSObjectProtocol?
     /// Generation counters so a push that succeeds can only clear the
     /// pending-push flag its own change set.
     @ObservationIgnored private var notifPrefsPushGen = 0
@@ -910,6 +912,21 @@ final class AppModel {
         // "Unstuck calls you" (C1): bind the CallKit coordinator to the live store + calls client.
         CallCoordinator.shared.attach(model: self, client: coord.calls)
         installCallVoiceLauncher()
+
+        // Travel. The server anchors every scheduled call, brief and reminder
+        // to `notification_preferences.timezone`, which the phone pushed at
+        // sign-in and after a hydrate — so a user who flew somewhere kept
+        // ringing on the old zone's wall clock until the next hydrate, which
+        // is one of the ways a call could land at 3am (audit 2026-09-21).
+        // A day rollover re-derives Today's buckets for the same reason.
+        timezoneObserver = NotificationCenter.default.addObserver(
+            forName: .NSSystemTimeZoneDidChange, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.timezonePushedFor = nil   // force the push: the zone changed
+                    self.pushTimezoneIfNeeded()
+                }
+            }
 
         // Register Live Activity per-update push tokens as they're issued.
         LiveActivityController.shared.onPushToken = { [weak self] activityId, token in

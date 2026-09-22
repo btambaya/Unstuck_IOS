@@ -290,6 +290,16 @@ public struct PreferencesClient: Sendable {
         return try await client.rpc("set_timezone", params: Params(p_tz: tz)).execute().value
     }
 
+    /// `delete_my_assistant_turns()` (migration 074): clears THIS user's stored
+    /// Assistant conversations and returns how many rows went. The privacy
+    /// policy (§9.5, §17) promises both a 90-day automatic purge and this
+    /// control; the function is scoped to `auth.uid()` server-side, so it can
+    /// only ever delete the caller's own rows.
+    @discardableResult
+    public func deleteAssistantHistory() async throws -> Int {
+        try await client.rpc("delete_my_assistant_turns").execute().value
+    }
+
     /// The usable-minutes budget as the server has it (nil fields = unset).
     public func usableMinutes(userId: String) async throws -> (perDay: Int?, weekend: Int?) {
         struct Row: Decodable { let usable_minutes_per_day: Int?; let usable_minutes_weekend: Int? }

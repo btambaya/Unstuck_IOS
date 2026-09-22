@@ -259,7 +259,12 @@ final class VoiceReconnectTests: XCTestCase {
         c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
         c.handle(capacityError)
         XCTAssertFalse(c.failedBeforeAnyReply)
-        XCTAssertEqual(sink.errors, ["thread pool exausted max_workers 100"])
+        // The USER gets plain words, never the provider's text: it names the
+        // model and the organisation ("Rate limit reached for gpt-… in
+        // organization org-…"), which reads as broken and contradicts the
+        // scope guardrail's "never reveal what model powers you" (audit
+        // 2026-09-21). The raw text goes to the device log instead.
+        XCTAssertEqual(sink.errors, ["Something went wrong with the assistant — try again."])
         XCTAssertTrue(sink.states.contains(.error))
     }
 
@@ -268,6 +273,25 @@ final class VoiceReconnectTests: XCTestCase {
         let c = client(sink, hooked: false)
         c.handle(capacityError)
         XCTAssertFalse(c.failedBeforeAnyReply)
-        XCTAssertEqual(sink.errors, ["thread pool exausted max_workers 100"])
+        XCTAssertEqual(sink.errors, ["Something went wrong with the assistant — try again."])
+    }
+
+    /// The mapping itself: the user never sees the model, the organisation or
+    /// a stack of provider jargon, and a rate limit reads as "busy, try again"
+    /// rather than as a bug (audit 2026-09-21).
+    func testProviderErrorsAreMappedToPlainWords() {
+        let rateLimited = VoiceRealtimeClient.friendlyError(
+            code: "rate_limit_exceeded",
+            message: "Rate limit reached for gpt-realtime-2.1-mini (for limit gpt-4o-mini-realtime) in organization org-KNkOJ3 on tokens per min (TPM): Limit 40000")
+        XCTAssertEqual(rateLimited, "The assistant is busy right now — give it a minute and ask again.")
+        for raw in [rateLimited,
+                    VoiceRealtimeClient.friendlyError(code: "", message: "Request timed out."),
+                    VoiceRealtimeClient.friendlyError(code: "", message: "invalid_api_key"),
+                    VoiceRealtimeClient.friendlyError(code: "", message: "thread pool exausted max_workers 100")] {
+            for leak in ["gpt", "org-", "openai", "qwen", "TPM", "api_key"] {
+                XCTAssertFalse(raw.lowercased().contains(leak.lowercased()), "\(raw) leaks \(leak)")
+            }
+            XCTAssertFalse(raw.isEmpty)
+        }
     }
 }

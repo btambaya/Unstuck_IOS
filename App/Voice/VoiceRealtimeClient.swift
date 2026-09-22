@@ -406,11 +406,14 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         let decisive = cmds.contains { c in
             switch c { case .duck, .restore, .sendCancel, .flushPlayback, .createResponse, .deleteItem: return true; default: return false }
         }
+        // NEVER the event's own description: `.transcription` carries the
+        // user's words, and a .public log line travels in any sysdiagnose a
+        // tester sends us (audit 2026-09-21). Shape only.
         switch event {
         case .speechStarted, .speechStopped, .transcription, .interruptPressed, .gateOpen, .gateClose:
-            voiceLog.notice("voice barge-in \(String(describing: event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]")
+            voiceLog.notice("voice barge-in \(Self.describe(event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]")
         default:
-            if decisive { voiceLog.notice("voice barge-in \(String(describing: event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]") }
+            if decisive { voiceLog.notice("voice barge-in \(Self.describe(event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]") }
         }
         execute(cmds)
     }
@@ -432,6 +435,48 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             }
         }
         return kinds.isEmpty ? "-" : kinds.joined(separator: ",")
+    }
+
+    /// An event's SHAPE for the log — never its payload. `.transcription`
+    /// carries what the user said; only its length and finality are loggable.
+    static func describe(_ e: BargeInEvent) -> String {
+        switch e {
+        case .transcription(let text, _, let final): return "transcription(chars: \(text.count), final: \(final))"
+        case .assistantTranscript(let d): return "assistantTranscript(chars: \(d.count))"
+        case .speechStarted: return "speechStarted"
+        case .speechStopped: return "speechStopped"
+        case .interruptPressed: return "interruptPressed"
+        case .gateOpen: return "gateOpen"
+        case .gateClose: return "gateClose"
+        case .responseCreated: return "responseCreated"
+        case .responseDone(_, let status): return "responseDone(\(status ?? "-"))"
+        case .responseRateLimited(let ms): return "responseRateLimited(\(ms)ms)"
+        case .playbackDrained: return "playbackDrained"
+        case .audioDelta: return "audioDelta"
+        case .tick: return "tick"
+        case .benignActiveResponseError: return "benignActiveResponseError"
+        case .routeChanged(let r): return "routeChanged(\(r))"
+        case .pttDown: return "pttDown"
+        case .pttUp: return "pttUp"
+        }
+    }
+
+    /// What the USER is told when the provider fails. The raw text names the
+    /// model and the organisation ("Rate limit reached for gpt-… in
+    /// organization org-…"), which both reads as broken and contradicts the
+    /// scope guardrail's "never reveal what model powers you" (audit
+    /// 2026-09-21). The raw text stays in the device log only.
+    static func friendlyError(code: String, message: String) -> String {
+        let m = message.lowercased()
+        if code == "rate_limit_exceeded" || m.contains("rate limit") || m.contains("quota") {
+            return "The assistant is busy right now — give it a minute and ask again."
+        }
+        if m.contains("timeout") || m.contains("timed out") { return "That took too long — try again." }
+        if m.contains("unauthorized") || m.contains("invalid_api_key") || m.contains("401") {
+            return "Voice isn't available right now — we're on it."
+        }
+        if m.contains("safety") || m.contains("content") { return "I can't help with that one." }
+        return "Something went wrong with the assistant — try again."
     }
 
     private func execute(_ cmds: [BargeInCommand]) {
@@ -718,12 +763,12 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                         let retries: Int = withLock { _bargeIn.rateLimitRetries }
                         voiceLog.notice("voice rate-limited: retry in \(ms, privacy: .public) ms (retry #\(retries + 1, privacy: .public))")
                         if retries + 1 > BargeInController.rateLimitMaxRetries {
-                            onError("The assistant is busy right now — give it a minute and ask again")
+                            onError(Self.friendlyError(code: code, message: message))
                         }
                         dispatch(.responseRateLimited(retryAfterMs: ms))
                         return
                     }
-                    if !message.isEmpty { onError(String(message.prefix(160))) }
+                    if !message.isEmpty { onError(Self.friendlyError(code: code, message: message)) }
                 }
                 // responseActive stays true until response.DONE (audio.done
                 // can precede function calls): the UI stays "speaking" while
@@ -781,7 +826,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             if let m, withLock({ _bargeIn.holdToTalk }), m.lowercased().contains("buffer") {
                 onState(withLock { _bargeIn.uiStateNow }); return
             }
-            if let m, !m.isEmpty { onError(String(m.prefix(160))) }
+            if let m, !m.isEmpty {
+                voiceLog.error("voice server error: \(String(m.prefix(200)), privacy: .public)")
+                onError(Self.friendlyError(code: (errObj?["code"] as? String) ?? "", message: m))
+            }
             onState(.error)
         default:
             break
