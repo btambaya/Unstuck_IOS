@@ -155,6 +155,40 @@ public func focusRowForId(_ id: String, tasks: [TaskItem], blocks: [CalBlock], t
     return taskForBlock(live, tasks: tasks) ?? task
 }
 
+/// The row a TASK deep link (`unstuck://task/<id>`) must open (audit
+/// 2026-09-22, C3). Reminders (local and server-pushed), the "Rescheduled"
+/// confirmation, Inbox "Open" on a capture filed on a series and the bell's
+/// logged reminder rows all carry the block's `taskId` — the hidden TEMPLATE
+/// for a series. Opening the template offered "Mark done" on the series
+/// itself, so "I took my meds" from a reminder tap ended the whole series and
+/// every reminder after it. A series opens through an OCCURRENCE row, as in
+/// `focusRowForId`, but chosen for a reminder tapped late:
+///  • today's occurrence, open or already ticked — a stale reminder tapped
+///    after the day was ticked shows today ticked, never tomorrow's row (whose
+///    Mark done would tick the wrong day);
+///  • else the most recent past occurrence while it is still open — the row
+///    Backlog shows as overdue (`projectOverdueOccurrences`), so last
+///    Friday's reminder tapped on Saturday opens Friday;
+///  • else the earliest open future occurrence;
+///  • else the template itself (it has no occurrence to open).
+/// A block id opens that exact day's row, a plain task id its task, and an
+/// unknown id nil (the caller treats it as shared with me).
+public func taskLinkRowForId(_ id: String, tasks: [TaskItem], blocks: [CalBlock], todayISO: String) -> TaskItem? {
+    guard let task = tasks.first(where: { $0.id == id }), task.recurrence != nil else {
+        return focusRowForId(id, tasks: tasks, blocks: blocks, todayISO: todayISO)
+    }
+    let mine = blocks
+        .filter { isTaskBlock($0) && $0.taskId == task.id }
+        .sorted { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
+    let latestPast = mine.last { $0.date < todayISO }
+    let pick = mine.first { $0.date == todayISO && !$0.skipped && !$0.done }
+        ?? mine.first { $0.date == todayISO && !$0.skipped }
+        ?? latestPast.flatMap { $0.done || $0.skipped ? nil : $0 }
+        ?? mine.first { $0.date > todayISO && !$0.skipped && !$0.done }
+    guard let pick else { return task }
+    return taskForBlock(pick, tasks: tasks) ?? task
+}
+
 /// The row to open when a calendar block is tapped: the per-day OCCURRENCE
 /// (id = block id) when the block belongs to a recurring template, else the
 /// normal task. Lets the detail screen treat it as an occurrence.

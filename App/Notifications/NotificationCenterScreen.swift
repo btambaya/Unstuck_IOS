@@ -231,7 +231,8 @@ enum NotificationQueueCards {
         if let call, !call.notes.isEmpty { body = call.notes.joined(separator: "\n") }
         else if let call, call.status == "missed" || call.status == "declined" { body = "You missed it — no notes on this one." }
         else { body = card.body }
-        let link = call?.taskId.map { "unstuck://task/\($0)" } ?? "unstuck://today"
+        // The receipt lives on the SERIES editor's "Call me" section (C3).
+        let link = call?.taskId.map { AppModel.exactTaskLink($0) } ?? "unstuck://today"
         return NotificationLog.Entry(id: "q_\(card.id)", kind: "call", title: title, body: body, deepLink: link, at: at)
     }
 

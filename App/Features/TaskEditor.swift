@@ -105,6 +105,9 @@ struct TaskEditor: View {
         return model.shareState.assignedOut[editTarget.id] != nil
     }
     private var assignedOutName: String { model.shareState.assignedOut[editTarget.id] ?? "" }
+    /// The editor is open on a repeating series itself (its TEMPLATE), not on
+    /// one day of it.
+    private var isSeries: Bool { !isOcc && editTarget.recurrence != nil }
 
     var body: some View {
         NavigationStack {
@@ -274,7 +277,11 @@ struct TaskEditor: View {
                     .buttonStyle(.plain)
                 }
                 // …and no Mark-done (T3). The Share controls stay live to take it back.
-                if !isAssignedOut {
+                // An OPEN series has no done of its own — Mark done there
+                // ended the whole series (audit 2026-09-22, C3), the reason the
+                // Recurring tab hides its circle. A series the old path already
+                // ended still shows "✓ Done", so it can be reopened.
+                if !isAssignedOut && !(isSeries && !editTarget.done) {
                     Button { toggleDone() } label: {
                         Text(isDone ? "✓ Done" : "Mark done").font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
                             .padding(.horizontal, 10).padding(.vertical, 11)
@@ -681,7 +688,12 @@ struct TaskEditor: View {
         // Defense-in-depth: a deep-link / command-palette must not start focus on
         // a task the owner has assigned out (the button is already hidden) (T3).
         guard !isAssignedOut else { return }
-        let t = editTarget
+        // Focus the day's OCCURRENCE row (audit 2026-09-22, C3): handed the
+        // template, FocusView attached no block and "Done" ticked nothing. An
+        // occurrence resolves to its own row (id = block id), a series to the
+        // day's occurrence, a plain task to itself.
+        let t = focusRowForId(isOcc ? initialTask.id : editTarget.id, tasks: tasks, blocks: blocks,
+                              todayISO: Clock.todayISO()) ?? editTarget
         dismiss()
         Task { try? await Task.sleep(nanoseconds: 350_000_000); model.router.beginFocus(t) }
     }
@@ -690,7 +702,12 @@ struct TaskEditor: View {
     /// owner has assigned out (T3). Re-enabled by downgrading / unsharing.
     private func toggleDone() {
         guard !isAssignedOut else { return }
-        model.toggleDone(initialTask)
+        // The LIVE row, never the open-time snapshot (audit 2026-09-22, C5):
+        // the snapshot reverted every edit made in this sheet, and its frozen
+        // `done` made a second tap re-complete instead of undo. An occurrence
+        // passes its own row id (the cal_block id) so the flip lands on the
+        // day's block — the template's id would target the whole series.
+        model.toggleDone(isOcc ? initialTask : editTarget)
     }
 
     private func openEstimate() { estimateText = String(displayEstimate); showEstimate = true }
@@ -767,8 +784,19 @@ struct TaskEditor: View {
         let dateIso = Clock.dateISO(datePick)
         let c = Calendar.current.dateComponents([.hour, .minute], from: timePick)
         let timeIso = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
-        model.scheduleTaskAt(initialTask, date: dateIso, startTime: timeIso)
-        if editTarget.later == true { model.setLater(editTarget, false) }
+        // Schedule the LIVE row (audit 2026-09-22, C5): the open-time snapshot
+        // routed on a stale recurrence (a Repeat set in this sheet took the
+        // one-off path) and its whole-row bump reverted this session's edits.
+        // The un-park is composed INTO the row handed on, so every whole-row
+        // write in the chain carries later=false and scheduleTaskAt's
+        // move-count bump is the last write — a trailing setLater built from
+        // the pre-schedule row used to land after it and undo the bump.
+        var target = editTarget
+        if target.later == true {
+            model.setLater(target, false)
+            target.later = false
+        }
+        model.scheduleTaskAt(target, date: dateIso, startTime: timeIso)
         scheduledLabel = "\(dateIso.suffix(5)) \(formatTime(timeIso))"
         ReminderScheduler.shared.resync()
         showSchedule = false

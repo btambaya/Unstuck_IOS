@@ -52,6 +52,8 @@ final class AppModelAssistantState: AssistantAppState {
     func removeTask(_ id: String) async { await model.deleteTaskAwaiting(id) }
     /// The UI's un-complete hook (AppModel.toggleDone → `.reopen`), best-effort.
     func notifyTaskReopenedIfShared(_ t: TaskItem) { model.notifyTaskReopenedIfShared(t) }
+    /// The UI's completion hook (AppModel.toggleDone / finishFocus → `.done`), best-effort.
+    func notifyTaskCompletedIfShared(_ t: TaskItem) { model.notifyTaskDoneIfShared(t) }
     func upsertBlock(_ b: CalBlock) async { await model.saveBlockAwaiting(b) }
     /// `unschedule` reconciles Google for a pushed task block, then deletes.
     func deleteBlock(_ id: String) async { await model.unscheduleAwaiting(id) }
@@ -287,7 +289,7 @@ final class AppModelAssistantState: AssistantAppState {
     /// a session on a task shared WITH me → `finalizeSharedFocus` (owner's
     /// ledger, optional completion by level); an own task → `finishFocus`
     /// (partner-shared → exactly-once ledger); a task row that's gone →
-    /// the bare Session. nil = nothing was running.
+    /// the bare Session, without the dead task id. nil = nothing was running.
     func finishFocus(markDone: Bool) async -> FocusFinishOutcome? {
         guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return nil }
         let now = Date().timeIntervalSince1970 * 1000
@@ -303,7 +305,9 @@ final class AppModelAssistantState: AssistantAppState {
         PausedCheckinScheduler.cancel()
         var markedDone = false
         if let level = cur.sharedFocusLevel {
-            markedDone = markDone && levelCanComplete(level)
+            // Never a repeating share: the server refuses that tick, so
+            // "task marked done" would be a claim of nothing (C3).
+            markedDone = markDone && levelCanComplete(level) && model.sharedTaskAllowsTick(cur.taskId)
             model.finalizeSharedFocus(taskId: cur.taskId, taskName: name, sessionId: session.id,
                                       elapsedSec: elapsed, estimateMin: cur.sessionEstimateMin,
                                       markDone: markedDone, showRecap: false)
@@ -316,7 +320,7 @@ final class AppModelAssistantState: AssistantAppState {
                               occurrenceBlockId: cur.occurrenceBlockId,
                               sharedLedger: model.accruesViaSharedLedger(cur, taskId: task.id))
         } else {
-            model.saveSession(session)
+            model.saveSession(AppModel.goneTaskSession(cur, elapsedSec: elapsed))
         }
         // A presented Focus screen would keep showing a clock the store no longer has.
         if model.router.focusTask != nil { model.router.focusTask = nil; model.router.sharedFocus = nil }

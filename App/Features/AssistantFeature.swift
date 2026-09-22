@@ -526,7 +526,16 @@ final class AssistantModel {
         case .deleteTasks(let ids): for id in ids { await removeTaskAndBlocks(id) }
         case .restoreTask(let task): await restore(task)
         case .restoreTasks(let tasks): for t in tasks { await restore(t) }
-        case .completeTask(let task): await api.upsertTask(task)
+        case .completeTask(let task):
+            // Undoing a "Reopened" re-completes — the shared-list `done` has
+            // to travel as the UI's tick sends it, since the reopen already
+            // went out (audit 2026-09-22, C6). A task the user re-ticked by
+            // hand meanwhile is already in the undo's target state and sent
+            // its own `done`; re-writing it would only re-stamp its real
+            // completion time to now.
+            if api.getTasks().first(where: { $0.id == task.id })?.done == true { return true }
+            await api.upsertTask(task)
+            api.notifyTaskCompletedIfShared(task)
         case .forgetFact(let id):
             guard api.removeProfileFact(id) else { return false }
         case .deleteCapture(let id): await api.removeCapture(id)

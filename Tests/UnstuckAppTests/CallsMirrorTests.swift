@@ -236,7 +236,7 @@ final class CallsMirrorTests: XCTestCase {
         XCTAssertEqual(e.kind, "call")
         XCTAssertEqual(e.title, "Unstuck called you about speak to James")
         XCTAssertEqual(e.body, "Ask about the invoice\nConfirm Friday", "the nearest call with that label, not the older one")
-        XCTAssertEqual(e.deepLink, "unstuck://task/t1")
+        XCTAssertEqual(e.deepLink, "unstuck://task/t1?exact", "the series editor itself, never a day's occurrence (C3)")
         XCTAssertEqual(e.at, Time.parseMillis("2026-09-20T14:45:03.000Z"))
     }
 

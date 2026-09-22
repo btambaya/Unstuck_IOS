@@ -285,7 +285,8 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(n.categoryId, NotificationCategories.taskStarting)
         XCTAssertEqual(n.userInfo["taskId"], "task-1")
         XCTAssertEqual(n.userInfo["blockId"], "block-1")
-        XCTAssertEqual(n.userInfo["deepLink"], "unstuck://task/task-1")
+        // The SERIES editor, where the call's receipt lives (audit 2026-09-22, C3).
+        XCTAssertEqual(n.userInfo["deepLink"], "unstuck://task/task-1?exact")
         XCTAssertTrue(n.timeSensitive)
     }
 

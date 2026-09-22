@@ -407,9 +407,11 @@ struct MonthDayPeekSheet: View {
                         // For a recurring occurrence completion lives on the block;
                         // for a one-off it lives on the task (same rule as the grids).
                         let t = vm.tasks.first { $0.id == b.taskId }
+                        // A series' day opens THAT day's occurrence (the block
+                        // id), not the series (audit 2026-09-22, C3).
                         return PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
                                        done: b.done || t?.done == true, tint: theme.palette.primaryDeep, dashed: false,
-                                       action: b.taskId.map { MonthPeekAction.task($0) })
+                                       action: b.taskId.map { MonthPeekAction.task(t?.recurrence != nil ? b.id : $0) })
                     })
                     section("Shared with you", shared.map { sb in
                         PeekRow(id: sb.blockId, title: sb.title, meta: "\(slotText(sb.startTime, sb.durationMinutes)) · \(sharerDisplayName(sb.ownerName))",

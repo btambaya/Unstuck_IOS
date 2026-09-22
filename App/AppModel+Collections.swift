@@ -311,18 +311,32 @@ extension AppModel {
             setOccurrenceDone(occ, done: !occ.done)
             return
         }
-        var flipped = task
-        flipped.done.toggle()
-        let stamped = applyCompletion(flipped, prior: task, nowISO: Self.isoNow())
-        saveTask(stamped)
-        if let cid = task.sourceCollectionId, let iid = task.sourceItemId, flipped.done != task.done {
-            let share = coordinator?.share
-            let by = currentUserName ?? "Someone"
-            // Un-completing has to travel too: the shared row stays ticked
-            // forever otherwise, with a task behind it that is no longer done.
-            let action: CollectionShareClient.TaskDoneAction = flipped.done ? .done : .reopen
-            Task { await share?.taskDone(collectionId: cid, itemId: iid, taskName: task.name, by: by, action: action) }
-        }
+        // Flip what the CALLER showed onto the STORED row (audit 2026-09-22,
+        // C5). Callers hand in a copy taken earlier — the editor's open-time
+        // snapshot, a list row — and saving that whole copy reverted every
+        // field edited since, on every device (the outbox base is the current
+        // row, so the old values went out as a fresh edit). Only done +
+        // completedAt are this tap's change. A row already in the target state
+        // (ticked elsewhere) needs no write, and a row that is gone (deleted
+        // elsewhere, or an occurrence whose block vanished) is never re-created
+        // from the copy. taskRepo is nil only when there is no writer either.
+        guard let prior = (try? taskRepo?.fetch(id: task.id)) ?? nil else { return }
+        let target = !task.done
+        // A repeating series' TEMPLATE never takes a done flip (audit
+        // 2026-09-22, C3): it ENDS the series — reminders, the horizon top-up
+        // and the server's calls all skip a done task. Judged on the STORED
+        // row, so a stale copy can't slip past. Occurrence rows (recurrence
+        // nil) were routed to their block above; a template that is ALREADY
+        // done may still be reopened, to recover a series the old path ended.
+        // Same rule as resolveHandsFreeCompletion.
+        if prior.recurrence != nil && target { return }
+        guard prior.done != target else { return }
+        var flipped = prior
+        flipped.done = target
+        saveTask(applyCompletion(flipped, prior: prior, nowISO: Self.isoNow()))
+        // Un-completing has to travel too: the shared row stays ticked
+        // forever otherwise, with a task behind it that is no longer done.
+        notifySharedItem(prior, action: target ? .done : .reopen)
     }
 
     /// Mark ONE day of a recurring series done / not done: the occurrence's
@@ -372,11 +386,32 @@ extension AppModel {
     /// time and starts the series with scheduleTaskAt (audit 2026-09-22, C7).
     @discardableResult
     func setRecurrence(_ task: TaskItem, _ recurrence: Recurrence?) -> Bool {
-        var next = task
-        next.recurrence = recurrence
-        next.updatedAt = Self.isoNow()
         let existing = (try? db?.blocks(forTask: task.id)) ?? []
-        return saveTaskWithRecurrence(next, existingBlocks: existing)
+        // "Never" carries today's ticked occurrence onto the task, and a
+        // repeat turned back on never leaves a DONE template (audit
+        // 2026-09-22, C3) — the same rule the assistant's set_task_recurrence
+        // follows.
+        let today = Clock.todayISO(), now = Self.isoNow()
+        var next = taskAfterSettingRecurrence(task, recurrence: recurrence, blocks: existing,
+                                              todayIso: today, nowISO: now)
+        next.updatedAt = now
+        // A refused repeat (no timed block to start from, C7) changes nothing,
+        // so the carry and the shared-list notice below only follow a save.
+        guard saveTaskWithRecurrence(next, existingBlocks: existing) else { return false }
+        // A done task made to repeat keeps the day it was done ticked on that
+        // day's occurrence (audit 2026-09-22, C3). Written straight through,
+        // not via saveBlock: its un-park reads the task row, which may not
+        // carry the repeat yet, and a stale plain row there is written back
+        // whole — reverting it. A done-only change has nothing for Google.
+        let carried = occurrencesCarryingTaskDone(task, recurrence: recurrence, blocks: existing,
+                                                  todayIso: today, nowISO: now)
+        if !carried.isEmpty, let write {
+            Task { for b in carried { try? await write.upsertCalBlock(b, nowISO: now) } }
+        }
+        // The done flip travels to a loop-promoted task's shared-list row,
+        // as the UI's toggle does — else it stays ticked over an open series.
+        if next.done != task.done { notifySharedItem(task, action: next.done ? .done : .reopen) }
+        return true
     }
 
     /// Fire the shared-item completion notification after a Focus session that
@@ -477,14 +512,27 @@ extension AppModel {
     func finishFocus(task: TaskItem, session: Session, elapsedSec: Int, markDone: Bool,
                      occurrenceBlockId: String? = nil,
                      sharedLedger: Bool = false, ledgerSec: Int? = nil) {
+        // Land only this finish's delta — totalFocused, plus done/completedAt
+        // on markDone — on the STORED row (audit 2026-09-22, C5). `task` is
+        // FocusView's copy from when Focus opened: writing it whole reverted
+        // renames, first steps, due dates or a completion made during the
+        // session, and re-created a task deleted meanwhile. A row that is gone
+        // gets no task write at all, and its Session goes up without the task
+        // id — sessions.task_id references tasks(id), so the dead id would
+        // fail the insert and quarantine the op (the minutes still count).
+        let stored = (try? taskRepo?.fetch(id: task.id)) ?? nil
+        var session = session
+        if stored == nil { session.taskId = nil }
         saveSession(session)
-        var focused = task
-        if !sharedLedger { focused.totalFocused += elapsedSec }
-        focused.updatedAt = Self.isoNow()
         // Resolve the exact task row this finish lands (completion stamping /
         // occurrence semantics), so the sharedLedger path below can write it
         // ITSELF, ordered before the flush + RPC.
-        var landedRow = focused
+        var landedRow: TaskItem?
+        if var focused = stored {
+            if !sharedLedger { focused.totalFocused += elapsedSec }
+            focused.updatedAt = Self.isoNow()
+            landedRow = focused
+        }
         if let occurrenceBlockId, let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == occurrenceBlockId }) {
             // Always accrue focus on the template; mark the DAY's block done.
             if markDone {
@@ -494,11 +542,13 @@ extension AppModel {
                 doneBlock.completedAt = Self.isoNow()
                 saveBlock(doneBlock)
             }
-        } else if markDone && focusMayCompleteRow(task) {
-            var done = focused
+        } else if markDone, let base = stored, var done = landedRow, focusMayCompleteRow(base), !base.done {
+            // Judged on the stored row: a repeat set elsewhere mid-session is
+            // respected, and a task already completed elsewhere is neither
+            // re-stamped nor announced to its shared list a second time.
             done.done = true
-            landedRow = applyCompletion(done, prior: task, nowISO: Self.isoNow())
-            notifyTaskDoneIfShared(task)
+            landedRow = applyCompletion(done, prior: base, nowISO: Self.isoNow())
+            notifyTaskDoneIfShared(base)
         }
         // markDone on a recurring TEMPLATE with no occurrence attached falls
         // through deliberately: flipping a template's own `done` ENDS the whole
@@ -521,18 +571,31 @@ extension AppModel {
             let sec = ledgerSec ?? elapsedSec
             let estimate = session.estimateMin ?? task.estimateMin
             Task {
-                try? await write?.upsertTask(row, nowISO: Self.isoNow())
+                if let row { try? await write?.upsertTask(row, nowISO: Self.isoNow()) }
                 await coord?.flushNow()
                 await self.logSharedFocusDurable(taskId: taskId, actualSec: sec,
                                                  estimateMin: estimate, sessionId: sessionId)
             }
-        } else {
+        } else if let landedRow {
             saveTask(landedRow)
         }
-        sendSessionRecap(taskName: task.name, away: false)
+        let name = stored?.name ?? task.name
+        sendSessionRecap(taskName: name, away: false)
         // Today's "Just now" recap card (Android: _lastRecap.value = RecapState(...)).
-        lastRecap = RecapState(taskName: task.name, focusedSec: elapsedSec,
+        lastRecap = RecapState(taskName: name, focusedSec: elapsedSec,
                                at: Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// The Session for a live focus whose task row is gone (deleted elsewhere
+    /// mid-session) — the fallback of the assistant's finish_focus, the
+    /// notification's End and the sign-out finalize. It carries NO task id
+    /// (audit 2026-09-22, C5), as finishFocus's own row-gone Session: the
+    /// dead id failed sessions.task_id's reference to tasks(id), and the op
+    /// sat quarantined in the outbox, so the minutes never reached insights
+    /// on any device. The column is nullable (`on delete set null`).
+    static func goneTaskSession(_ cur: LiveSession, elapsedSec: Int) -> Session {
+        Session(id: cur.id ?? newUUID(), taskId: nil, taskName: "Focus session",
+                estimateMin: cur.sessionEstimateMin, actualSec: elapsedSec, completedAt: isoNow())
     }
 
     // MARK: - shared focus (T3, Option B — recipient side)
@@ -573,6 +636,16 @@ extension AppModel {
         router.focusTask = synthesized
     }
 
+    /// May a finished shared session tick the owner's task done? Not a
+    /// repeating share (audit 2026-09-22, C3): its row is the owner's series,
+    /// the server refuses the tick ('recurring_series'), and the Focus screen /
+    /// assistant must not claim a completion that never happened. A share the
+    /// list doesn't know yet (not loaded) falls back to the level, which every
+    /// caller has already checked — the server still refuses a series.
+    func sharedTaskAllowsTick(_ taskId: String) -> Bool {
+        shareState.sharedWithMe.first { $0.taskId == taskId }.map(shareCanTickDone) ?? true
+    }
+
     /// Finalize a shared Focus session: accrue the recipient's focus onto the
     /// OWNER's task via log_shared_focus (partner/assign only, gated server-side),
     /// optionally mark it done, and — when the recipient explicitly ended it —
@@ -584,7 +657,7 @@ extension AppModel {
                              elapsedSec: Int, estimateMin: Int, markDone: Bool, showRecap: Bool) {
         Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: elapsedSec,
                                                 estimateMin: estimateMin, sessionId: sessionId) }
-        if markDone {
+        if markDone && sharedTaskAllowsTick(taskId) {
             Task { try? await shareState.completeSharedTask(taskId: taskId, done: true) }
         }
         if showRecap {

@@ -222,9 +222,27 @@ extension AppModel {
             return
         }
         if link.hasPrefix("unstuck://task/") {
-            let id = String(link.dropFirst("unstuck://task/".count))
+            var id = String(link.dropFirst("unstuck://task/".count))
+            let exact = id.hasSuffix(Self.exactTaskLinkSuffix)
+            if exact { id = String(id.dropLast(Self.exactTaskLinkSuffix.count)) }
             router.select(.today)
-            let local = (try? taskRepo?.fetch(id: id)) ?? nil
+            // RECURRING (audit 2026-09-22, C3): resolve the id through
+            // `taskLinkRowForId`, as the focus branch above does. Reminders
+            // (local + server-pushed), the "Rescheduled" confirmation, Inbox
+            // "Open" and the bell's logged reminder rows carry the block's
+            // taskId — the hidden TEMPLATE for a series — and the template
+            // editor's "Mark done" ended the whole series. The day's
+            // occurrence opens instead; a cal_block id (the month peek) opens
+            // that exact day. An `exactTaskLink` (a call's receipt, the
+            // assistant's open_screen) opens the series itself.
+            let local: TaskItem?
+            if exact {
+                local = (try? taskRepo?.fetch(id: id)) ?? nil
+            } else {
+                let tasks = (try? taskRepo?.all()) ?? []
+                let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+                local = taskLinkRowForId(id, tasks: tasks, blocks: blocks, todayISO: Clock.todayISO())
+            }
             switch Self.taskLinkRoute(id: id, isLocal: local != nil) {
             case .owner:
                 router.detailTask = local
@@ -316,7 +334,7 @@ extension AppModel {
             return
         }
         if let taskId = req?.taskId, let task = (try? taskRepo?.fetch(id: taskId)) ?? nil {
-            routeDeepLink("unstuck://task/\(task.id)")
+            routeDeepLink(Self.exactTaskLink(task.id))
             return
         }
         if assistantEnabled { openAssistant() } else { router.select(.today) }
@@ -331,6 +349,16 @@ extension AppModel {
         guard !trimmed.isEmpty else { return .today }
         return isLocal ? .owner : .shared
     }
+
+    /// `unstuck://task/<id>` that opens exactly `id`, never re-resolved to a
+    /// day's occurrence (audit 2026-09-22, C3). For the senders anchored to
+    /// the SERIES: a call's receipt lives in the series editor's "Call me"
+    /// section, which an occurrence row doesn't show (call links, the bell's
+    /// call rows, the missed-call alert), and the assistant's open_screen
+    /// names the task itself. Safe now that the series editor offers no
+    /// "Mark done" on an open series (owner decision).
+    nonisolated static let exactTaskLinkSuffix = "?exact"
+    nonisolated static func exactTaskLink(_ id: String) -> String { "unstuck://task/\(id)\(exactTaskLinkSuffix)" }
 
     /// The `<id>` of `unstuck://collections/<id>` (nil for the bare tab link,
     /// a trailing slash, or a query-only tail).
@@ -489,8 +517,7 @@ extension AppModel {
             finishFocus(task: task, session: session, elapsedSec: elapsed, markDone: false,
                         sharedLedger: sharedLedger, ledgerSec: sharedLedger ? capped : nil)
         } else {
-            saveSession(Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: "Focus session",
-                                estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+            saveSession(Self.goneTaskSession(cur, elapsedSec: elapsed))
         }
     }
 

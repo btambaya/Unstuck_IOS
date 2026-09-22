@@ -78,6 +78,81 @@ final class FocusRowResolutionTests: XCTestCase {
         XCTAssertNil(focusRowForId("nope", tasks: [t], blocks: [], todayISO: today))
         XCTAssertNil(focusRowForId("", tasks: [t], blocks: [], todayISO: today))
     }
+
+    // MARK: task links (audit 2026-09-22, C3)
+    //
+    // A reminder tap opens `unstuck://task/<templateId>`; the template's
+    // editor offered "Mark done" on the series itself, ending it. The link
+    // opens the day's occurrence instead — picked for a reminder tapped LATE.
+
+    private var yesterday: String { LocalDate.addDays(today, -1) }
+    private var lastWeek: String { LocalDate.addDays(today, -7) }
+
+    func testTaskLinkOpensTodaysOpenOccurrence() {
+        let blocks = [occ("b-today", today), occ("b-tomorrow", tomorrow)]
+        let row = taskLinkRowForId("tpl", tasks: [template()], blocks: blocks, todayISO: today)
+        XCTAssertEqual(row?.id, "b-today")
+        XCTAssertNil(row?.recurrence, "an occurrence row, never the series")
+        XCTAssertEqual(row?.done, false)
+    }
+
+    /// The one place it differs from focusRowForId: a stale reminder tapped
+    /// after the day was ticked shows TODAY ticked, never tomorrow's row
+    /// (whose Mark done would tick the wrong day).
+    func testTaskLinkShowsTodayTickedRatherThanOfferingTomorrow() {
+        let blocks = [occ("b-today", today, done: true), occ("b-tomorrow", tomorrow)]
+        let row = taskLinkRowForId("tpl", tasks: [template()], blocks: blocks, todayISO: today)
+        XCTAssertEqual(row?.id, "b-today")
+        XCTAssertEqual(row?.done, true)
+        XCTAssertEqual(focusRowForId("tpl", tasks: [template()], blocks: blocks, todayISO: today)?.id, "b-tomorrow",
+                       "focus still moves on to the next open day")
+    }
+
+    /// Nothing today: last Friday's reminder tapped on Saturday opens the
+    /// missed Friday (the row Backlog shows as overdue), not next Friday.
+    func testTaskLinkWithNothingTodayOpensTheOpenOverdueDay() {
+        let blocks = [occ("b-past", yesterday), occ("b-tomorrow", tomorrow)]
+        XCTAssertEqual(taskLinkRowForId("tpl", tasks: [template()], blocks: blocks, todayISO: today)?.id, "b-past")
+    }
+
+    /// …and once that latest past day is handled (ticked or skipped), the
+    /// next open future one — an older miss is never dredged up.
+    func testTaskLinkWithTheLatestPastHandledOpensTheNextOpenDay() {
+        let ticked = [occ("b-old", lastWeek), occ("b-past", yesterday, done: true), occ("b-tomorrow", tomorrow)]
+        XCTAssertEqual(taskLinkRowForId("tpl", tasks: [template()], blocks: ticked, todayISO: today)?.id, "b-tomorrow")
+        let skipped = [occ("b-past", yesterday, skipped: true), occ("b-tomorrow", tomorrow)]
+        XCTAssertEqual(taskLinkRowForId("tpl", tasks: [template()], blocks: skipped, todayISO: today)?.id, "b-tomorrow")
+    }
+
+    func testTaskLinkNeverPicksASkippedDay() {
+        let blocks = [occ("b-today", today, skipped: true), occ("b-tomorrow", tomorrow, skipped: true),
+                      occ("b-later", LocalDate.addDays(today, 2))]
+        XCTAssertEqual(taskLinkRowForId("tpl", tasks: [template()], blocks: blocks, todayISO: today)?.id, "b-later")
+    }
+
+    func testTaskLinkForASeriesWithNoOccurrenceOpensTheSeries() {
+        XCTAssertEqual(taskLinkRowForId("tpl", tasks: [template()], blocks: [], todayISO: today)?.id, "tpl")
+        let lapsed = [occ("b-past", yesterday, done: true)]
+        XCTAssertEqual(taskLinkRowForId("tpl", tasks: [template()], blocks: lapsed, todayISO: today)?.id, "tpl")
+    }
+
+    /// A block id (the month peek's planned row) opens THAT day, even a
+    /// future one.
+    func testTaskLinkBlockIdOpensThatExactDay() {
+        let blocks = [occ("b-today", today), occ("b-tomorrow", tomorrow)]
+        let row = taskLinkRowForId("b-tomorrow", tasks: [template()], blocks: blocks, todayISO: today)
+        XCTAssertEqual(row?.id, "b-tomorrow")
+        XCTAssertNil(row?.recurrence)
+    }
+
+    func testTaskLinkPlainAndUnknownIds() {
+        let t = mkTask(id: "t1")
+        let b = mkBlock(id: "b1", taskId: "t1", date: today)
+        XCTAssertEqual(taskLinkRowForId("t1", tasks: [t], blocks: [b], todayISO: today)?.id, "t1")
+        XCTAssertEqual(taskLinkRowForId("b1", tasks: [t], blocks: [b], todayISO: today)?.id, "t1")
+        XCTAssertNil(taskLinkRowForId("nope", tasks: [t], blocks: [], todayISO: today))
+        XCTAssertNil(taskLinkRowForId("", tasks: [t], blocks: [], todayISO: today))
+    }
 }
 
 final class RecurringVisibilityTests: XCTestCase {

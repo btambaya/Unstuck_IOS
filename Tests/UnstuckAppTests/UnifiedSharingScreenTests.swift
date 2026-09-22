@@ -696,3 +696,178 @@ final class AssistantEmailShareConfirmTests: XCTestCase {
         XCTAssertNil(ok.1, "success carries no failure message on the generic path")
     }
 }
+
+// MARK: - repeating series entry points (audit 2026-09-22, C3)
+//
+// Every path that used to hand the hidden TEMPLATE of a series to a screen
+// whose "Mark done" / "Done" then ended the whole series (or ticked nothing):
+// reminder task links, the month peek, the Today live card / PAUSED chip, and
+// the store-level toggleDone / setRecurrence rules behind the editor.
+
+@MainActor
+final class RecurringEntryPointTests: XCTestCase {
+    private var model: AppModel!
+    private var db: AppDatabase!
+    private let today = Clock.todayISO()
+    private var tomorrow: String { LocalDate.addDays(today, 1) }
+
+    override func setUp() async throws {
+        try await super.setUp()
+        model = AppModel()
+        model.startUITestMode()
+        db = try XCTUnwrap(model.db)
+    }
+
+    private func seedSeries(id: String = "c3-tpl", done: Bool = false, todayDone: Bool = false,
+                            blocks: Bool = true) throws -> TaskItem {
+        let tpl = TaskItem(id: id, name: "C3 meds", estimateMin: 10, done: done, recurrence: .daily(until: nil),
+                           createdAt: "2026-09-01T08:00:00.000Z", updatedAt: "2026-09-01T08:00:00.000Z")
+        try db.save(tpl)
+        if blocks {
+            try db.save(CalBlock(id: "\(id)-td", taskId: id, taskName: "C3 meds", startTime: "08:00", durationMinutes: 10,
+                                 date: today, kind: .task, done: todayDone,
+                                 completedAt: todayDone ? "\(today)T08:10:00.000Z" : nil))
+            try db.save(CalBlock(id: "\(id)-tm", taskId: id, taskName: "C3 meds", startTime: "08:00", durationMinutes: 10,
+                                 date: tomorrow, kind: .task))
+        }
+        return tpl
+    }
+
+    private func stored(_ id: String) throws -> TaskItem? { try model.taskRepo?.fetch(id: id) }
+
+    /// A reminder tap carries the template id: the day's OCCURRENCE opens,
+    /// so its Mark done ticks the day instead of ending the series.
+    func testAReminderLinkOpensTodaysOccurrenceNotTheSeries() throws {
+        _ = try seedSeries()
+        model.routeDeepLink("unstuck://task/c3-tpl")
+        XCTAssertEqual(model.router.detailTask?.id, "c3-tpl-td")
+        XCTAssertNil(model.router.detailTask?.recurrence)
+        XCTAssertNil(model.router.sharedDetail)
+    }
+
+    /// The month peek sends the day's block id: that exact day opens.
+    func testABlockIdLinkOpensThatDay() throws {
+        _ = try seedSeries()
+        model.routeDeepLink("unstuck://task/c3-tpl-tm")
+        XCTAssertEqual(model.router.detailTask?.id, "c3-tpl-tm")
+        XCTAssertNil(model.router.sharedDetail, "a block id is mine, never a share")
+    }
+
+    func testASeriesWithNoOccurrenceOpensTheSeries() throws {
+        _ = try seedSeries(blocks: false)
+        model.routeDeepLink("unstuck://task/c3-tpl")
+        XCTAssertEqual(model.router.detailTask?.id, "c3-tpl")
+    }
+
+    /// Owner decision: call-anchored links and open_screen keep opening the
+    /// SERIES (its "Call me" section) — the exact link is never re-resolved.
+    func testAnExactLinkOpensTheSeriesItself() throws {
+        _ = try seedSeries()
+        XCTAssertEqual(AppModel.exactTaskLink("c3-tpl"), "unstuck://task/c3-tpl?exact")
+        model.routeDeepLink(AppModel.exactTaskLink("c3-tpl"))
+        XCTAssertEqual(model.router.detailTask?.id, "c3-tpl")
+        XCTAssertNotNil(model.router.detailTask?.recurrence)
+        model.router.dismissAllPresentations()
+        XCTAssertTrue(model.openScreen("tasks", id: "c3-tpl"))
+        XCTAssertEqual(model.router.detailTask?.id, "c3-tpl", "the assistant's open_screen names the task itself")
+        model.router.dismissAllPresentations()
+        model.routeDeepLink(AppModel.exactTaskLink("someone-elses"))
+        XCTAssertEqual(model.router.sharedDetail?.id, "someone-elses", "the marker never leaks into the id")
+    }
+
+    /// Defense in depth behind the hidden button: an OPEN template never takes
+    /// a done flip; one the old path already ended can still be reopened.
+    func testToggleDoneNeverEndsASeriesButCanReopenAnEndedOne() async throws {
+        let open = try seedSeries()
+        model.toggleDone(open)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(try stored("c3-tpl")?.done, false)
+        XCTAssertTrue(try OutboxStore(db).pending().filter { $0.tableName == "tasks" && $0.rowId == "c3-tpl" }.isEmpty)
+
+        let ended = try seedSeries(id: "c3-ended", done: true, blocks: false)
+        model.toggleDone(ended)
+        for _ in 0..<60 {
+            if try stored("c3-ended")?.done == false { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertEqual(try stored("c3-ended")?.done, false, "a series the old path ended is recoverable")
+    }
+
+    /// "Never" on a ticked day carries the tick onto the task. (Block
+    /// regeneration needs the coordinator's writer, absent in this boot — the
+    /// pure regenerateForTask covers the future-block deletes.)
+    func testNeverOnATickedDayLeavesTheTaskDone() async throws {
+        let tpl = try seedSeries(todayDone: true)
+        model.setRecurrence(tpl, nil)
+        for _ in 0..<60 {
+            if try stored("c3-tpl")?.recurrence == nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let after = try XCTUnwrap(stored("c3-tpl"))
+        XCTAssertNil(after.recurrence)
+        XCTAssertTrue(after.done)
+        XCTAssertEqual(after.completedAt, "\(today)T08:10:00.000Z")
+    }
+
+    /// The other way round: a plain task ticked today, then made daily. The
+    /// series is open (a done template is an ended one) and today's slot keeps
+    /// the tick — it never reappears in Today to be done again.
+    func testMakingATaskDoneTodayRepeatKeepsTodaysTick() async throws {
+        let stamp = AppModel.isoNow()
+        let plain = TaskItem(id: "c3-stretch", name: "Stretch", estimateMin: 10, done: true, completedAt: stamp,
+                             createdAt: "2026-09-01T08:00:00.000Z", updatedAt: "2026-09-01T08:00:00.000Z")
+        try db.save(plain)
+        try db.save(CalBlock(id: "c3-stretch-td", taskId: "c3-stretch", taskName: "Stretch", startTime: "07:30",
+                             durationMinutes: 10, date: today, kind: .task))
+        func todaySlot() throws -> CalBlock? { try db.fetchAllCalBlocks().first { $0.id == "c3-stretch-td" } }
+
+        model.setRecurrence(plain, .daily(until: nil))
+        for _ in 0..<60 {
+            if try stored("c3-stretch")?.recurrence != nil, try todaySlot()?.done == true { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let after = try XCTUnwrap(stored("c3-stretch"))
+        XCTAssertEqual(after.recurrence, .daily(until: nil))
+        XCTAssertFalse(after.done, "a done template is an ended series")
+        let slot = try XCTUnwrap(todaySlot())
+        XCTAssertTrue(slot.done, "today's slot keeps the tick")
+        XCTAssertEqual(slot.completedAt, stamp)
+        XCTAssertEqual(slot.startTime, "07:30")
+        XCTAssertEqual(projectOccurrences([after], [slot], fromISO: today).first?.done, true,
+                       "Today shows the day ticked, not open")
+    }
+
+    /// The Today live card / PAUSED chip hold the TEMPLATE of a paused
+    /// occurrence session: reopening lands on the session's OWN day, so
+    /// FocusModel re-attaches the paused session instead of resuming it.
+    func testReopeningAPausedOccurrenceSessionOpensItsOwnDay() throws {
+        let tpl = try seedSeries()
+        let store = try XCTUnwrap(model.liveStore)
+        let now = Date().timeIntervalSince1970 * 1000
+        let started = FocusTimer.start(FocusTimer.empty, taskId: "c3-tpl", estimateMin: 10, now: now - 60_000,
+                                       occurrenceBlockId: "c3-tpl-td")
+        let paused = FocusTimer.pause(started, now: now)
+        try store.set(paused)
+        model.refreshLiveSession()
+
+        model.reopenLiveFocus(tpl)
+        XCTAssertEqual(model.router.focusTask?.id, "c3-tpl-td")
+        XCTAssertNil(model.router.focusTask?.recurrence)
+        let live = try XCTUnwrap(store.get())
+        XCTAssertTrue(FocusModel.reopensExistingSession(live, focusId: "c3-tpl", occurrenceBlockId: "c3-tpl-td"),
+                      "the paused session re-attaches as-is")
+    }
+
+    /// A repeating share's finish never claims (or sends) a tick the server
+    /// refuses; a plain partner share still may.
+    func testASharedRepeatingTaskNeverTakesAFocusTick() {
+        model.shareState.sharedWithMe = [
+            SharedWithMe(shareId: "s1", taskId: "rep", ownerName: "Anna", level: .partner, title: "Gym", done: false,
+                         recurrence: .weekly(daysOfWeek: [1, 3, 5], until: nil)),
+            SharedWithMe(shareId: "s2", taskId: "plain", ownerName: "Anna", level: .partner, title: "Tax", done: false),
+        ]
+        XCTAssertFalse(model.sharedTaskAllowsTick("rep"))
+        XCTAssertTrue(model.sharedTaskAllowsTick("plain"))
+        XCTAssertTrue(model.sharedTaskAllowsTick("not-loaded-yet"), "the level (checked by every caller) decides")
+    }
+}

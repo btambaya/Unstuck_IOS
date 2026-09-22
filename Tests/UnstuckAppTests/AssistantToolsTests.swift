@@ -107,6 +107,12 @@ final class FakeAssistantState: AssistantAppState {
         guard let cid = t.sourceCollectionId, let iid = t.sourceItemId else { return }
         reopenedShared.append("\(cid):\(iid)")
     }
+    /// `collection_task_done` `done` sends — the mirror of `reopenedShared`.
+    var completedShared: [String] = []
+    func notifyTaskCompletedIfShared(_ t: TaskItem) {
+        guard let cid = t.sourceCollectionId, let iid = t.sourceItemId else { return }
+        completedShared.append("\(cid):\(iid)")
+    }
     func upsertBlock(_ b: CalBlock) async {
         await commit()
         if let i = blocks.firstIndex(where: { $0.id == b.id }) { blocks[i] = b } else { blocks.append(b) }
@@ -443,9 +449,94 @@ final class AssistantToolsTests: XCTestCase {
         // The partial is SPELLED OUT (rules §1): what was and was not done.
         XCTAssertEqual(r, "ok: completed 2 tasks ids=a,b — \"One\", \"Two\". Not done: \"Done already\" (already done)")
         XCTAssertTrue(api.tasks.allSatisfy(\.done))
+        // Only the flipped rows are stamped (audit 2026-09-22, C6).
+        XCTAssertNotNil(api.tasks[0].completedAt)
+        XCTAssertNotNil(api.tasks[1].completedAt)
+        XCTAssertNil(api.tasks[2].completedAt)
+        XCTAssertEqual(api.completedShared, [], "plain tasks have no shared-list row to tick")
         let receipt = assistantReceipt(name: "complete_tasks", args: ToolArgs(json: "{}"), result: r, tasks: api.tasks, facts: [])
         XCTAssertEqual(receipt?.label, "Completed 2 tasks")
         XCTAssertEqual(receipt?.undo, .uncompleteTasks(ids: ["a", "b"]))
+    }
+
+    /// complete_task completes like the UI's tick (audit 2026-09-22, C6): the
+    /// completedAt stamp is what Today's done-today list, the evening call's
+    /// "done today" line and insights key on — without it a voice completion
+    /// vanished and the call said "nothing ticked off yet".
+    func testCompleteTaskStampsCompletedAtLikeTheUIToggle() async {
+        api.tasks = [task("a", "Alpha")]
+        api.blocks = [block("a_td", "a", TODAY, "09:00")]
+        await eq("complete_task", #"{"taskId":"a"}"#, "ok: completed \"Alpha\" id=a")
+        let t = api.tasks[0]
+        XCTAssertTrue(t.done)
+        XCTAssertNotNil(t.completedAt)
+        XCTAssertEqual(t.completedAt, t.updatedAt, "applyCompletion's shape")
+        XCTAssertTrue(isCompletedToday(t, now: Date().timeIntervalSince1970 * 1000))
+        XCTAssertNotNil(scratch.newTasks["a"]?.completedAt)
+        let evening = CallDayContext.lines(kind: .evening, tasks: api.tasks, blocks: api.blocks, today: TODAY, nowHM: "19:00")
+        XCTAssertEqual(evening[1], "done today (1): Alpha")
+    }
+
+    /// A loop-promoted shared-list task completed by voice ticks the shared
+    /// row for the other members — once, and only for a real open → done.
+    func testCompleteTaskAndCompleteTasksTickTheSharedListRowForALoopPromotedTask() async {
+        var p = task("p", "Buy milk"); p.sourceCollectionId = "c1"; p.sourceItemId = "i1"
+        var q = task("q", "Buy eggs"); q.sourceCollectionId = "c1"; q.sourceItemId = "i2"
+        api.tasks = [p, q, task("b", "Plain")]
+        await eq("complete_task", #"{"taskId":"p"}"#, "ok: completed \"Buy milk\" id=p")
+        XCTAssertEqual(api.completedShared, ["c1:i1"])
+        await eq("complete_task", #"{"taskId":"p"}"#, "error: \"Buy milk\" is already done — nothing changed")
+        XCTAssertEqual(api.completedShared, ["c1:i1"])
+        let r = await run("complete_tasks", #"{"taskIds":["q","b","q"]}"#)
+        XCTAssertTrue(r.hasPrefix("ok: completed 2 tasks ids=q,b"), r)
+        XCTAssertEqual(api.completedShared, ["c1:i1", "c1:i2"], "a repeated id sends once; a plain task never")
+        XCTAssertEqual(api.reopenedShared, [])
+    }
+
+    /// complete_occurrence stamps the block (a repeating day becomes a
+    /// done-today win) and, for a one-off, the task too — never the template.
+    func testCompleteOccurrenceStampsTheBlockAndTheOneOffTask() async {
+        var shared = task("s", "Return books"); shared.sourceCollectionId = "c1"; shared.sourceItemId = "i9"
+        api.tasks = [task("a", "Alpha"), task("r", "Standup", recurrence: .daily(until: nil)), shared]
+        api.blocks = [block("a_td", "a", TODAY), block("r_td", "r", TODAY), block("r_tm", "r", TOMORROW),
+                      block("s_td", "s", TODAY)]
+        await eq("complete_occurrence", #"{"taskId":"a"}"#, "ok: marked \"Alpha\" done for \(TODAY)")
+        let aBlock = api.blocks.first { $0.id == "a_td" }!
+        XCTAssertTrue(aBlock.done)
+        XCTAssertNotNil(aBlock.completedAt)
+        XCTAssertFalse(aBlock.skipped)
+        XCTAssertTrue(api.tasks[0].done)
+        XCTAssertNotNil(api.tasks[0].completedAt)
+
+        await eq("complete_occurrence", #"{"taskId":"r"}"#, "ok: marked \"Standup\" done for \(TODAY) (series continues)")
+        XCTAssertNotNil(api.blocks.first { $0.id == "r_td" }!.completedAt)
+        XCTAssertFalse(api.tasks[1].done, "the template is never touched")
+        XCTAssertNil(api.tasks[1].completedAt)
+        XCTAssertFalse(api.blocks.first { $0.id == "r_tm" }!.done)
+        let occ = projectOccurrences(api.tasks, api.blocks, fromISO: TODAY).first { $0.id == "r_td" }
+        XCTAssertTrue(occ.map { isCompletedToday($0, now: Date().timeIntervalSince1970 * 1000) } ?? false,
+                      "today's occurrence lands in the done-today wins")
+
+        await eq("complete_occurrence", #"{"taskId":"s"}"#, "ok: marked \"Return books\" done for \(TODAY)")
+        XCTAssertEqual(api.completedShared, ["c1:i9"])
+    }
+
+    /// markTaskDone applies its delta to the COMMITTED row: a caller's copy
+    /// that is still open while the store already has it done writes nothing
+    /// and sends nothing.
+    func testMarkTaskDoneLeavesARowTheStoreAlreadyHasDone() async {
+        var p = task("p", "Buy milk", done: true, completedAt: "\(TODAY)T08:00:00.000Z")
+        p.sourceCollectionId = "c1"; p.sourceItemId = "i1"
+        api.tasks = [p]
+        var stale = p
+        stale.done = false
+        stale.completedAt = nil
+        let before = snapshot(api.tasks)
+        let out = await markTaskDone(stale, api: api, scratch: scratch)
+        XCTAssertTrue(out.done)
+        XCTAssertEqual(out.completedAt, "\(TODAY)T08:00:00.000Z")
+        XCTAssertEqual(snapshot(api.tasks), before)
+        XCTAssertEqual(api.completedShared, [])
     }
 
     func testCompleteTasksErrorsOnEmptyOrUnmatchedIds() async {
@@ -569,12 +660,23 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.tasks.map(\.done), [false, false, false])
         XCTAssertEqual(api.reopenedShared, ["c1:i1", "c1:i1"])
 
-        // Undo of an uncomplete (→ done again) never sends a reopen.
+        XCTAssertEqual(api.completedShared, [], "a reopen never sends done")
+
+        // Undo of an uncomplete (→ done again) never sends a reopen — it sends
+        // the `done` the UI's tick would (audit 2026-09-22, C6).
         let redo = planReceiptUndo(.completeTask(id: "p"), tasks: api.tasks, nowISO: now)!
         let redoOk = await AssistantModel.applyLocalUndo(redo, api: api)
         XCTAssertTrue(redoOk)
         XCTAssertTrue(api.tasks[0].done)
+        XCTAssertEqual(api.tasks[0].completedAt, now)
         XCTAssertEqual(api.reopenedShared, ["c1:i1", "c1:i1"])
+        XCTAssertEqual(api.completedShared, ["c1:i1"])
+        // Already done again (re-ticked by hand): nothing more is written or sent.
+        let again = planReceiptUndo(.completeTask(id: "p"), tasks: api.tasks, nowISO: "2026-09-02T10:00:00.000Z")!
+        let againOk = await AssistantModel.applyLocalUndo(again, api: api)
+        XCTAssertTrue(againOk)
+        XCTAssertEqual(api.tasks[0].completedAt, now, "the real completion time is kept")
+        XCTAssertEqual(api.completedShared, ["c1:i1"])
     }
 
     func testSetLaterAndRecurrence() async {
@@ -1975,6 +2077,204 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(api.blocks.first { $0.id == "b_td" }!.skipped)
         XCTAssertEqual(assistantReceipt(name: "carry_to_tomorrow", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])?.label, "Nothing moved — skipped today instead")
     }
+
+    // MARK: the committed row, never a stale scratch copy (audit 2026-09-22, C5)
+
+    /// "add call mom" → focus → "I'm done, finish it" → "rename it Call Mum":
+    /// finish_focus writes done + totalFocused to the STORE only, so a
+    /// scratch-first lookup handed update_task the pre-finish copy and the
+    /// rename reopened the task and wiped its focus time.
+    func testWriteToolsReadTheCommittedRowNotTheSessionScratch() async {
+        let made = await run("create_task", #"{"name":"Call mom"}"#)
+        let id = made.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        api.live = liveSession(id)
+        let fin = await run("finish_focus", #"{"markDone":true}"#)
+        XCTAssertTrue(fin.hasSuffix("task marked done"), fin)
+        let focused = api.tasks[0].totalFocused
+        XCTAssertGreaterThan(focused, 0)
+        await eq("update_task", #"{"taskId":"\#(id)","name":"Call Mum"}"#, "ok: updated \"Call Mum\" (name)")
+        XCTAssertEqual(api.tasks[0].name, "Call Mum")
+        XCTAssertTrue(api.tasks[0].done, "the rename must not reopen the finished task")
+        XCTAssertEqual(api.tasks[0].totalFocused, focused, "…nor wipe its focus time")
+    }
+
+    /// A completion that lands after create_task (the web, by realtime) is seen
+    /// — no stale done=false write, no receipt over a no-op.
+    func testCompleteTaskSeesACompletionThatLandedAfterCreate() async {
+        let made = await run("create_task", #"{"name":"Pay rent"}"#)
+        let id = made.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        api.tasks[0].done = true
+        api.tasks[0].completedAt = "\(TODAY)T08:00:00.000Z"
+        let before = snapshot(api.tasks)
+        await eq("complete_task", #"{"taskId":"\#(id)"}"#, "error: \"Pay rent\" is already done — nothing changed")
+        XCTAssertEqual(snapshot(api.tasks), before)
+    }
+
+    /// Scratch stays the fallback for a row the store doesn't have.
+    func testFindTaskFallsBackToTheScratchWhenTheStoreLacksTheRow() async {
+        scratch.newTasks["n"] = task("n", "Gym shoes")
+        await eq("set_task_reminder", #"{"taskId":"n","minutes":5}"#,
+                 "ok: \"Gym shoes\" reminds 5 minutes before it starts (it isn't on the calendar yet — the reminder applies once it is scheduled)")
+    }
+
+    /// The duplicate guard reads the committed row too: a task finished since
+    /// it was created this session is no longer an open twin.
+    func testCreateTaskAfterFinishingATwinIsNotRefusedAsADuplicate() async {
+        let made = await run("create_task", #"{"name":"Call mom"}"#)
+        let id = made.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        api.live = liveSession(id)
+        _ = await run("finish_focus", #"{"markDone":true}"#)
+        XCTAssertTrue(api.tasks[0].done)
+        let again = await run("create_task", #"{"name":"Call mom"}"#)
+        XCTAssertTrue(again.hasPrefix("ok: created"), again)
+        XCTAssertEqual(api.tasks.count, 2)
+    }
+
+    // MARK: repeating series — today's occurrence, never the series (audit 2026-09-22, C3)
+
+    private func seedSeries() {
+        api.tasks = [task("a", "One"), task("r", "Standup", recurrence: .daily(until: nil))]
+        api.blocks = [block("rtd", "r", TODAY), block("rtm", "r", TOMORROW)]
+    }
+
+    /// "I took my meds" by voice set the TEMPLATE's done — every reminder for
+    /// the series stopped and today's row stayed open.
+    func testCompleteTaskOnASeriesTicksTodaysOccurrenceNotTheSeries() async {
+        seedSeries()
+        let r = await run("complete_task", #"{"taskId":"r"}"#)
+        XCTAssertEqual(r, "ok: marked \"Standup\" done for \(TODAY) (series continues)")
+        XCTAssertFalse(api.tasks[1].done, "the series is never ended")
+        XCTAssertNil(api.tasks[1].completedAt)
+        XCTAssertNil(scratch.newTasks["r"], "the template is never written")
+        let rtd = api.blocks.first { $0.id == "rtd" }!
+        XCTAssertTrue(rtd.done)
+        XCTAssertNotNil(rtd.completedAt)
+        XCTAssertFalse(api.blocks.first { $0.id == "rtm" }!.done)
+        let receipt = assistantReceipt(name: "complete_task", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Done for today: Standup")
+        XCTAssertNil(receipt?.undo)
+
+        await eq("complete_task", #"{"taskId":"r"}"#, "error: \"Standup\" is already done on \(TODAY) — nothing changed")
+    }
+
+    func testCompleteTaskOnASeriesWithNothingTodayChangesNothingAndNamesTheRightTool() async {
+        api.tasks = [task("r", "Standup", recurrence: .daily(until: nil))]
+        api.blocks = [block("rtm", "r", TOMORROW)]
+        let before = snapshot(api.blocks)
+        let r = await run("complete_task", #"{"taskId":"r"}"#)
+        XCTAssertTrue(r.hasPrefix("error:") && r.contains("complete_occurrence"), r)
+        XCTAssertEqual(snapshot(api.blocks), before)
+        XCTAssertFalse(api.tasks[0].done)
+    }
+
+    /// The bulk close ticks a series' today and keeps it out of ids=, so the
+    /// receipt's Undo reopens only the plain tasks.
+    func testCompleteTasksTicksASeriesTodayAndKeepsItOutOfTheUndo() async {
+        seedSeries()
+        let r = await run("complete_tasks", #"{"taskIds":["a","r"]}"#)
+        XCTAssertEqual(r, "ok: completed 2 tasks ids=a — \"One\", \"Standup\" (today — series continues)")
+        XCTAssertTrue(api.tasks[0].done)
+        XCTAssertFalse(api.tasks[1].done)
+        XCTAssertTrue(api.blocks.first { $0.id == "rtd" }!.done)
+        let receipt = assistantReceipt(name: "complete_tasks", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Completed 2 tasks")
+        XCTAssertEqual(receipt?.undo, .uncompleteTasks(ids: ["a"]))
+    }
+
+    func testCompleteTasksWithOnlyASeriesOffersNoUndo() async {
+        seedSeries()
+        let r = await run("complete_tasks", #"{"taskIds":["r"]}"#)
+        XCTAssertEqual(r, "ok: completed 1 tasks ids= — \"Standup\" (today — series continues)")
+        XCTAssertNil(assistantReceipt(name: "complete_tasks", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])?.undo)
+        let again = await run("complete_tasks", #"{"taskIds":["r"]}"#)
+        XCTAssertEqual(again, "error: none completed — \"Standup\" (already done today)")
+    }
+
+    /// "Untick that" after a voice tick reopens TODAY's occurrence — with no
+    /// id=, so the card has no Undo that would complete (end) the series.
+    func testUncompleteTaskOnASeriesReopensTodaysOccurrence() async {
+        seedSeries()
+        _ = await run("complete_task", #"{"taskId":"r"}"#)
+        let r = await run("uncomplete_task", #"{"taskId":"r"}"#)
+        XCTAssertEqual(r, "ok: reopened \"Standup\" for \(TODAY) (series continues)")
+        let rtd = api.blocks.first { $0.id == "rtd" }!
+        XCTAssertFalse(rtd.done)
+        XCTAssertNil(rtd.completedAt)
+        XCTAssertFalse(api.tasks[1].done)
+        XCTAssertNil(assistantReceipt(name: "uncomplete_task", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])?.undo)
+        await eq("uncomplete_task", #"{"taskId":"r"}"#, "error: \"Standup\" repeats and isn't done on \(TODAY) — nothing changed")
+    }
+
+    /// A series the old path ended (template done) is reopened — and its
+    /// card has no Undo either, which would end it again.
+    func testUncompleteTaskReopensASeriesTheOldPathEnded() async {
+        api.tasks = [task("r", "Standup", done: true, recurrence: .daily(until: nil))]
+        let r = await run("uncomplete_task", #"{"taskId":"r"}"#)
+        XCTAssertEqual(r, "ok: reopened \"Standup\" — its repeating series runs again")
+        XCTAssertFalse(api.tasks[0].done)
+        XCTAssertNil(assistantReceipt(name: "uncomplete_task", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])?.undo)
+    }
+
+    /// "Stop repeating" on a ticked day carries the tick onto the task
+    /// instead of bringing today back unticked; an open day leaves it open.
+    func testStopRepeatingCarriesTodaysTickOntoTheTask() async {
+        seedSeries()
+        _ = await run("complete_task", #"{"taskId":"r"}"#)
+        let r = await run("set_task_recurrence", #"{"taskId":"r","kind":"none"}"#)
+        XCTAssertEqual(r, "ok: \"Standup\" no longer repeats (future occurrences removed) — today's occurrence was already done, so the task is now marked done")
+        XCTAssertNil(api.tasks[1].recurrence)
+        XCTAssertTrue(api.tasks[1].done)
+        XCTAssertNotNil(api.tasks[1].completedAt)
+
+        seedSeries()
+        let open = await run("set_task_recurrence", #"{"taskId":"r","kind":"none"}"#)
+        XCTAssertEqual(open, "ok: \"Standup\" no longer repeats (future occurrences removed)")
+        XCTAssertFalse(api.tasks[1].done, "an open day leaves the task open")
+    }
+
+    /// Turning a repeat on for a done task never leaves a DONE template.
+    func testStartRepeatingADoneTaskReopensIt() async {
+        api.tasks = [task("d", "Stretch", done: true, completedAt: "\(TODAY)T08:00:00.000Z")]
+        await eq("set_task_recurrence", #"{"taskId":"d","kind":"daily"}"#,
+                 "ok: \"Stretch\" now repeats daily (it was done — now open again) — it has no calendar slot yet; schedule_task it to place the first one")
+        XCTAssertFalse(api.tasks[0].done)
+        XCTAssertNil(api.tasks[0].completedAt)
+    }
+
+    /// Ticked this morning, then "make it daily": today's slot keeps the tick
+    /// (never "open again" over it), and a loop-promoted task's shared-list
+    /// row un-ticks with the task, as the UI's reopen does.
+    func testStartRepeatingATaskDoneTodayKeepsTodaysTick() async {
+        var t = task("d", "Stretch", done: true, completedAt: AppModel.isoNow())
+        t.sourceCollectionId = "c1"
+        t.sourceItemId = "i1"
+        api.tasks = [t]
+        api.blocks = [block("dtd", "d", TODAY, "07:30")]
+        await eq("set_task_recurrence", #"{"taskId":"d","kind":"daily"}"#,
+                 "ok: \"Stretch\" now repeats daily (it was done — today's occurrence stays done)")
+        XCTAssertFalse(api.tasks[0].done, "an open series")
+        let slot = api.blocks.first { $0.id == "dtd" }!
+        XCTAssertTrue(slot.done)
+        XCTAssertEqual(slot.completedAt, t.completedAt)
+        XCTAssertEqual(slot.startTime, "07:30")
+        XCTAssertTrue(api.blocks.contains { $0.taskId == "d" && $0.date == TOMORROW && !$0.done }, "tomorrow is a new day")
+        XCTAssertEqual(api.reopenedShared, ["c1:i1"])
+        XCTAssertTrue(api.completedShared.isEmpty)
+    }
+
+    /// And back: "stop repeating" on a ticked day marks the task done, and
+    /// its shared-list row ticks with it.
+    func testStopRepeatingATickedLoopPromotedSeriesTicksTheListRow() async {
+        seedSeries()
+        api.tasks[1].sourceCollectionId = "c1"
+        api.tasks[1].sourceItemId = "i1"
+        _ = await run("complete_task", #"{"taskId":"r"}"#)
+        XCTAssertTrue(api.completedShared.isEmpty, "a day's tick is not the task's")
+        _ = await run("set_task_recurrence", #"{"taskId":"r","kind":"none"}"#)
+        XCTAssertTrue(api.tasks[1].done)
+        XCTAssertEqual(api.completedShared, ["c1:i1"])
+        XCTAssertTrue(api.reopenedShared.isEmpty)
+    }
 }
 
 
@@ -2248,6 +2548,55 @@ final class AppModelAssistantStateTests: XCTestCase {
         XCTAssertNil(tasks.activeArea)
     }
 
+    /// create_task(later, date, time) is un-parked by the scheduling write
+    /// (saveBlockAwaiting): the result must not claim "in Later", and a later
+    /// update_task in the same session must not re-park it from a stale
+    /// scratch copy (audit 2026-09-22, C5).
+    func testCreateLaterTaskWithASlotIsReportedUnparkedAndStaysUnparked() async throws {
+        let live = try liveState()
+        let (state, model) = (live.state, live.model)
+        let scratch = TurnScratch()
+        let tomorrow = LocalDate.addDays(Clock.todayISO(), 1)
+        let made = await runAssistantTool(name: "create_task",
+                                          args: ToolArgs(json: #"{"name":"C5 dentist","later":true,"date":"\#(tomorrow)","startTime":"10:00"}"#),
+                                          api: state, scratch: scratch)
+        XCTAssertTrue(made.contains("(scheduled \(tomorrow) 10:00"), made)
+        XCTAssertFalse(made.contains("in Later"), made)
+        let id = made.components(separatedBy: "id=")[1].components(separatedBy: " ")[0]
+        XCTAssertEqual(try model.taskRepo?.fetch(id: id)?.later, false)
+        let upd = await runAssistantTool(name: "update_task", args: ToolArgs(json: #"{"taskId":"\#(id)","name":"C5 dentist visit"}"#),
+                                         api: state, scratch: scratch)
+        XCTAssertEqual(upd, "ok: updated \"C5 dentist visit\" (name)")
+        let stored = try XCTUnwrap(model.taskRepo?.fetch(id: id))
+        XCTAssertEqual(stored.name, "C5 dentist visit")
+        XCTAssertEqual(stored.later, false, "the rename did not re-park it")
+    }
+
+    /// complete_occurrence on a parked one-off: the block write un-parks it
+    /// (saveBlockAwaiting), and the completion then lands on THAT committed row
+    /// — stamped, and without writing the pre-block copy's later=true back
+    /// (audit 2026-09-22, C6). Nothing between the executor and GRDB strips
+    /// the stamp.
+    func testCompleteOccurrenceOnAParkedOneOffStampsAndKeepsTheUnpark() async throws {
+        let live = try liveState()
+        let (state, db, model) = (live.state, live.db, live.model)
+        let today = Clock.todayISO()
+        try db.save(TaskItem(id: "c6-park", name: "C6 parked", estimateMin: 25, later: true,
+                             createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        try db.save(CalBlock(id: "c6-park-td", taskId: "c6-park", taskName: "C6 parked", startTime: "23:30",
+                             durationMinutes: 25, date: today, kind: .task))
+        let r = await runAssistantTool(name: "complete_occurrence", args: ToolArgs(json: #"{"taskId":"c6-park"}"#),
+                                       api: state, scratch: TurnScratch())
+        XCTAssertEqual(r, "ok: marked \"C6 parked\" done for \(today)")
+        let stored = try XCTUnwrap(model.taskRepo?.fetch(id: "c6-park"))
+        XCTAssertTrue(stored.done)
+        XCTAssertNotNil(stored.completedAt)
+        XCTAssertEqual(stored.later, false, "the un-park is kept")
+        let blk = try XCTUnwrap(db.fetchAllCalBlocks().first { $0.id == "c6-park-td" })
+        XCTAssertTrue(blk.done)
+        XCTAssertNotNil(blk.completedAt)
+    }
+
     /// Without a coordinator (offline boot) the usable-minutes budget can't
     /// reach the server, and the server IS the change — so no local cache is
     /// written and the outcome is false.
@@ -2285,5 +2634,188 @@ final class AppModelAssistantStateTests: XCTestCase {
         XCTAssertFalse(model.onboarded)
         XCTAssertFalse(model.onboardingResolved)
         XCTAssertTrue(model.archivedCaptureIds.isEmpty)
+    }
+}
+
+// MARK: - whole-row writes land on the STORED row (audit 2026-09-22, C5)
+//
+// AppModel.toggleDone / finishFocus are handed a copy taken earlier (the
+// editor's open-time snapshot, FocusView's row from when Focus opened). They
+// must apply only their own delta to the committed row — the outbox base is
+// the current row, so a stale copy went out as a fresh edit and reverted
+// changes on every device. The XCUITest demo boot (in-memory GRDB + a
+// local-only WriteThrough) is the seam; saveTask is fire-and-forget, so the
+// asserts poll.
+
+@MainActor
+final class StoredRowWriteTests: XCTestCase {
+    private var model: AppModel!
+    private var db: AppDatabase!
+
+    override func setUp() async throws {
+        try await super.setUp()
+        model = AppModel()
+        model.startUITestMode()
+        db = try XCTUnwrap(model.db)
+    }
+
+    private func stored(_ id: String) throws -> TaskItem? { try model.taskRepo?.fetch(id: id) }
+
+    /// Poll (60 × 50 ms) until `done` holds.
+    private func settle(_ done: () throws -> Bool) async throws {
+        for _ in 0..<60 {
+            if try done() { return }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private func taskOps(_ id: String) throws -> [OutboxOp] {
+        try OutboxStore(db).pending().filter { $0.tableName == "tasks" && $0.rowId == id }
+    }
+
+    private func row(_ id: String, _ name: String, done: Bool = false, completedAt: String? = nil,
+                     recurrence: Recurrence? = nil) -> TaskItem {
+        TaskItem(id: id, name: name, estimateMin: 25, totalFocused: 0, done: done, completedAt: completedAt,
+                 recurrence: recurrence, createdAt: PAST_CREATED, updatedAt: PAST_CREATED)
+    }
+
+    private func session(_ taskId: String, sec: Int) -> UnstuckCore.Session {
+        Session(id: "s-\(taskId)", taskId: taskId, taskName: "x", estimateMin: 25, actualSec: sec,
+                completedAt: AppModel.isoNow())
+    }
+
+    /// Mark done from the editor keeps the fields edited in the sheet, and a
+    /// second tap (the live row, now done) undoes it.
+    func testToggleDoneFlipsTheStoredRowNotTheCallersSnapshot() async throws {
+        let snapshot = row("c5-mail", "Email landlord")
+        var edited = snapshot
+        edited.estimateMin = 45
+        edited.tags = ["home"]
+        edited.firstPhysicalAction = "Open mail"
+        try db.save(edited)
+
+        model.toggleDone(snapshot)
+        try await settle { try self.stored("c5-mail")?.done == true }
+        let done = try XCTUnwrap(stored("c5-mail"))
+        XCTAssertTrue(done.done)
+        XCTAssertNotNil(done.completedAt)
+        XCTAssertEqual(done.estimateMin, 45, "the sheet's edits survive Mark done")
+        XCTAssertEqual(done.tags, ["home"])
+        XCTAssertEqual(done.firstPhysicalAction, "Open mail")
+
+        model.toggleDone(done)
+        try await settle { try self.stored("c5-mail")?.done == false }
+        let undone = try XCTUnwrap(stored("c5-mail"))
+        XCTAssertFalse(undone.done, "a second tap undoes it")
+        XCTAssertNil(undone.completedAt)
+        XCTAssertEqual(undone.estimateMin, 45)
+    }
+
+    /// Ticked on the web meanwhile: the stale tap has nothing to do.
+    func testToggleDoneDoesNothingWhenTheStoredRowIsAlreadyInThatState() async throws {
+        let t0 = "2026-09-20T08:00:00.000Z"
+        try db.save(row("c5-web", "Pay rent", done: true, completedAt: t0))
+        model.toggleDone(row("c5-web", "Pay rent"))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(try taskOps("c5-web").count, 0, "no write queued")
+        XCTAssertEqual(try stored("c5-web")?.done, true)
+        XCTAssertEqual(try stored("c5-web")?.completedAt, t0)
+    }
+
+    /// A row deleted elsewhere (or an occurrence whose block vanished, whose
+    /// row id is a block id) is never re-created from the caller's copy.
+    func testToggleDoneNeverRecreatesAMissingRow() async throws {
+        model.toggleDone(row("c5-gone", "Deleted on the web"))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNil(try stored("c5-gone"))
+        XCTAssertEqual(try taskOps("c5-gone").count, 0)
+    }
+
+    /// Renamed / given a first step and a due date on the web mid-session:
+    /// finishing lands only the focus time on the stored row.
+    func testFinishFocusLandsOnlyTheDeltaOnTheStoredRow() async throws {
+        let snapshot = row("c5-report", "Write report")
+        var current = snapshot
+        current.name = "Write report v2"
+        current.firstPhysicalAction = "Open the doc"
+        current.dueAt = "2026-09-30"
+        current.totalFocused = 600
+        try db.save(current)
+
+        model.finishFocus(task: snapshot, session: session("c5-report", sec: 300), elapsedSec: 300, markDone: false)
+        try await settle { try self.stored("c5-report")?.totalFocused == 900 }
+        let after = try XCTUnwrap(stored("c5-report"))
+        XCTAssertEqual(after.totalFocused, 900)
+        XCTAssertEqual(after.name, "Write report v2")
+        XCTAssertEqual(after.firstPhysicalAction, "Open the doc")
+        XCTAssertEqual(after.dueAt, "2026-09-30")
+        XCTAssertEqual(model.lastRecap?.taskName, "Write report v2", "the recap names the task as it is now")
+    }
+
+    /// Completed from the widget mid-session: "End for now" never reopens it.
+    func testFinishFocusNeverReopensATaskCompletedDuringTheSession() async throws {
+        let t0 = "2026-09-20T08:00:00.000Z"
+        try db.save(row("c5-widget", "Stretch", done: true, completedAt: t0))
+        model.finishFocus(task: row("c5-widget", "Stretch"), session: session("c5-widget", sec: 120),
+                          elapsedSec: 120, markDone: false)
+        try await settle { try self.stored("c5-widget")?.totalFocused == 120 }
+        let after = try XCTUnwrap(stored("c5-widget"))
+        XCTAssertTrue(after.done)
+        XCTAssertEqual(after.completedAt, t0)
+        XCTAssertEqual(after.totalFocused, 120)
+    }
+
+    /// A repeat set on the web mid-session makes the row a template: "Mark
+    /// complete" must not end the new series (the time still accrues).
+    func testFinishFocusMarkDoneRespectsARepeatSetDuringTheSession() async throws {
+        try db.save(row("c5-rep", "Walk dog", recurrence: .daily(until: nil)))
+        model.finishFocus(task: row("c5-rep", "Walk dog"), session: session("c5-rep", sec: 60),
+                          elapsedSec: 60, markDone: true)
+        try await settle { try self.stored("c5-rep")?.totalFocused == 60 }
+        let after = try XCTUnwrap(stored("c5-rep"))
+        XCTAssertEqual(after.totalFocused, 60)
+        XCTAssertFalse(after.done, "the series is not ended")
+        XCTAssertNil(after.completedAt)
+    }
+
+    /// Deleted on the web mid-session: finishing (even with Mark complete)
+    /// re-creates nothing, but the recap still shows.
+    func testFinishFocusDoesNotRecreateADeletedTask() async throws {
+        model.finishFocus(task: row("c5-deleted", "Gone"), session: session("c5-deleted", sec: 300),
+                          elapsedSec: 300, markDone: true)
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNil(try stored("c5-deleted"))
+        XCTAssertEqual(try taskOps("c5-deleted").count, 0)
+        XCTAssertEqual(model.lastRecap?.focusedSec, 300)
+    }
+
+    /// The other row-gone finishes — the assistant's finish_focus, the
+    /// notification's End, the sign-out finalize — save this Session: the
+    /// minutes, never the dead task id (sessions.task_id references tasks(id),
+    /// so the insert failed and the op sat quarantined).
+    func testASessionForAGoneTaskCarriesNoTaskId() {
+        let s = AppModel.goneTaskSession(liveSession("c5-gone", estimate: 30), elapsedSec: 420)
+        XCTAssertNil(s.taskId)
+        XCTAssertEqual(s.id, "live-1", "the live session's id")
+        XCTAssertEqual(s.taskName, "Focus session")
+        XCTAssertEqual(s.estimateMin, 30)
+        XCTAssertEqual(s.actualSec, 420)
+    }
+
+    /// "I'm done" by voice after the task was deleted elsewhere: the session
+    /// ends, nothing re-creates the task, and nothing claims it was completed.
+    func testAssistantFinishOnADeletedTaskEndsTheSessionWithoutATaskWrite() async throws {
+        let store = try XCTUnwrap(model.liveStore)
+        try store.set(liveSession("c5-gone"))
+        model.refreshLiveSession()
+        let state = AppModelAssistantState(model: model, assistant: model.assistant)
+        let finished = await state.finishFocus(markDone: true)
+        let outcome = try XCTUnwrap(finished)
+        XCTAssertEqual(outcome.taskName, "Focus session")
+        XCTAssertFalse(outcome.markedDone)
+        XCTAssertNil(try store.get()?.sessionStart, "the session is over")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNil(try stored("c5-gone"))
+        XCTAssertEqual(try taskOps("c5-gone").count, 0)
     }
 }

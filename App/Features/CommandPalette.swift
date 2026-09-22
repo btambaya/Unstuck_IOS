@@ -35,7 +35,13 @@ struct CommandPalette: View {
                     // like navigation otherwise). Mirrors the explicit "Focus:" action.
                     Section("Start focus on…") {
                         ForEach(filtered) { task in
-                            Button { dismiss(); model.router.beginFocus(task) } label: {
+                            // A series picked by name focuses the day's
+                            // occurrence, so Done ticks it (audit 2026-09-22, C3).
+                            Button {
+                                dismiss()
+                                model.router.beginFocus(focusRowForId(task.id, tasks: tasks, blocks: blocks,
+                                                                      todayISO: Clock.todayISO()) ?? task)
+                            } label: {
                                 Label(task.name, systemImage: "timer").foregroundStyle(.primary)
                             }
                         }

@@ -664,7 +664,19 @@ extension AppModel {
                                                     level: level)
             router.focusTask = task
         } else {
-            router.beginFocus(task)
+            // A recurring session's card holds the TEMPLATE (live.taskId), so
+            // FocusView found no occurrence, minted — resuming a paused session
+            // — and "Done" ticked nothing (audit 2026-09-22, C3). Open the
+            // session's OWN day (its block id, never "today's open" one, which
+            // would re-point and resume it), so the session re-attaches as-is.
+            var row = task
+            if let live = cachedLiveSession, live.sessionStart != nil, live.taskId == task.id,
+               let bid = live.occurrenceBlockId {
+                let tasks = (try? taskRepo?.all()) ?? []
+                let blocks = (try? db?.fetchAllCalBlocks()) ?? []
+                row = focusRowForId(bid, tasks: tasks, blocks: blocks, todayISO: Clock.todayISO()) ?? task
+            }
+            router.beginFocus(row)
         }
     }
 

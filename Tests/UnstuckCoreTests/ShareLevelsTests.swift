@@ -20,6 +20,20 @@ final class ShareLevelsTests: XCTestCase {
         XCTAssertTrue(levelCanComplete(.assign))
     }
 
+    /// A repeating share's row is the owner's TEMPLATE: ticking it ended the
+    /// owner's whole series, so no level may tick it (audit 2026-09-22, C3).
+    func testARepeatingShareCanNeverBeTicked() {
+        func share(_ level: ShareLevel, _ rec: Recurrence?) -> SharedWithMe {
+            SharedWithMe(shareId: "s", taskId: "t", ownerName: "Anna", level: level, title: "Gym", done: false, recurrence: rec)
+        }
+        XCTAssertTrue(shareCanTickDone(share(.partner, nil)))
+        XCTAssertTrue(shareCanTickDone(share(.assign, nil)))
+        XCTAssertFalse(shareCanTickDone(share(.partner, .daily(until: nil))))
+        XCTAssertFalse(shareCanTickDone(share(.assign, .weekly(daysOfWeek: [1, 3, 5], until: nil))))
+        XCTAssertFalse(shareCanTickDone(share(.view, nil)))
+        XCTAssertFalse(shareCanTickDone(share(.view, .daily(until: nil))))
+    }
+
     // MARK: shareStatusLabel (recipient side)
 
     func testDoneWinsForAnyLevel() {

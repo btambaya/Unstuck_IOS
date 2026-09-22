@@ -568,7 +568,8 @@ enum CallNotifications {
         if let t = s.taskId {
             info["taskId"] = t
             info["taskName"] = s.taskName ?? s.label
-            info["deepLink"] = "unstuck://task/\(t)"
+            // The call's task itself — a series opens its own editor (C3).
+            info["deepLink"] = AppModel.exactTaskLink(t)
             if let b = s.blockId { info["blockId"] = b }
         } else {
             info["deepLink"] = "unstuck://today"
