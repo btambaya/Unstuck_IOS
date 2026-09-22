@@ -148,9 +148,9 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private let token: String             // Supabase access token (the Worker validates it); the fallback when `freshToken` is set
     /// Resolves the token at DIAL time (`forceRefresh` after a 401), so a
     /// dial never goes out with a token cached before the app was suspended
-    /// (audit 2026-09-22, C14). MUST return within a few seconds — the 15 s
-    /// dial watchdog covers this wait, and it is dead air on a call. nil (or
-    /// no provider) = dial with `token`.
+    /// (audit 2026-09-22, C14). MUST return within a few seconds — it is dead
+    /// air on a call, and the dial watchdog (`dialTimeout`) gives up on a dial
+    /// still waiting for it. nil (or no provider) = dial with `token`.
     private let freshToken: (@Sendable (_ forceRefresh: Bool) async -> String?)?
     private let model: String
     private let instructions: String      // system prompt + live context
@@ -182,6 +182,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// Test seam: when set (before `start()`), a dial hands its request here
     /// instead of opening a socket. Never set in the app.
     var dialOverride: (@Sendable (URLRequest) -> Void)?
+    /// How long a dial may go unopened (token wait included) before start()'s
+    /// watchdog gives up, and how much longer the one redial after a 401 gets.
+    /// Settable (before `start()`) only so tests don't wait 15 s.
+    var dialTimeout: TimeInterval = 15
+    var authRedialGrace: TimeInterval = 5
 
     /// What a 401 from the proxy tells the user (the token was refused even
     /// after a forced refresh, or there is no provider to refresh it).
@@ -316,10 +321,17 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         // Nothing in URLSession fails a dial that stalls after the TCP connect,
         // so a proxy that accepts and never upgrades would hang "Connecting…"
         // for ever. 15 s, then we say so. Armed before the token wait so it
-        // bounds that too (and the one redial after a 401).
+        // bounds that too. The one redial after a 401 gets 5 s more (audit
+        // 2026-09-22, C14): it goes out only after a refused dial AND a forced
+        // refresh (itself up to 5 s, AppModel.voiceTokenDeadline), so the
+        // shared 15 s alone could run out mid-handshake on a slow link.
+        let timeout = dialTimeout, grace = authRedialGrace
         Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
             guard let self else { return }
+            if self.withLock({ !self._open && !self._stopped && self._authRetried }) {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, grace) * 1_000_000_000))
+            }
             let stuck = self.withLock { !self._open && !self._stopped }
             if stuck { self.transportEnded(error: "Couldn't reach the voice server. Check your connection and try again.") }
         }

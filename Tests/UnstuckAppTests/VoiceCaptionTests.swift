@@ -327,12 +327,16 @@ final class VoiceDialTokenTests: XCTestCase {
         private let normal: String?
         private let forced: String?
         private let delayNs: UInt64
-        init(normal: String?, forced: String? = nil, delayNs: UInt64 = 0) {
+        private let forcedDelayNs: UInt64
+        /// `forcedDelayNs` defaults to `delayNs`.
+        init(normal: String?, forced: String? = nil, delayNs: UInt64 = 0, forcedDelayNs: UInt64? = nil) {
             self.normal = normal; self.forced = forced; self.delayNs = delayNs
+            self.forcedDelayNs = forcedDelayNs ?? delayNs
         }
         func token(_ force: Bool) async -> String? {
             lock.withLock { _asks.append(force) }
-            if delayNs > 0 { try? await Task.sleep(nanoseconds: delayNs) }
+            let delay = force ? forcedDelayNs : delayNs
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
             return force ? forced : normal
         }
         var asks: [Bool] { lock.withLock { _asks } }
@@ -357,8 +361,8 @@ final class VoiceDialTokenTests: XCTestCase {
     }
 
     /// Polls `cond` (the dial runs on a Task) — true once it holds.
-    private func eventually(_ cond: @escaping () -> Bool) async -> Bool {
-        for _ in 0..<200 {
+    private func eventually(tries: Int = 200, _ cond: @escaping () -> Bool) async -> Bool {
+        for _ in 0..<tries {
             if cond() { return true }
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -500,6 +504,66 @@ final class VoiceDialTokenTests: XCTestCase {
         XCTAssertEqual(rec.dials.count, 1)
         XCTAssertEqual(rec.errors, [])
         XCTAssertEqual(rec.ended.count, 0)
+    }
+
+    // The dial watchdog (audit 2026-09-22, C14): it bounds the token wait and
+    // the forced refresh too, and the one redial after a 401 gets its grace.
+
+    private static let unreachable = "Couldn't reach the voice server. Check your connection and try again."
+
+    func testAStalledTokenWaitEndsOnceAndItsLateTokenIsNeverDialled() async throws {
+        let rec = Recorder(), p = Provider(normal: "fresh", delayNs: 800_000_000)
+        let c = client(rec, p)
+        c.dialTimeout = 0.2
+        c.authRedialGrace = 30   // no 401, so no grace: the end must come at dialTimeout
+        c.start()
+        let ended = await eventually { !rec.ended.isEmpty }
+        XCTAssertTrue(ended)
+        try await Task.sleep(nanoseconds: 1_000_000_000)   // the provider answers meanwhile
+        XCTAssertEqual(rec.ended, [Self.unreachable])
+        XCTAssertEqual(rec.errors, [Self.unreachable])
+        XCTAssertEqual(rec.dials, [], "nothing is dialled once the dial was given up")
+        c.stop()
+    }
+
+    /// Before the grace, a redial that went out late in the shared window
+    /// (after a refused dial and a forced refresh) was given up mid-handshake.
+    func testTheRedialAfterA401IsNotCutAtTheDialTimeout() async throws {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: "fresh-2")
+        let c = client(rec, p)
+        c.dialTimeout = 0.3
+        c.authRedialGrace = 2
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        _ = await eventually { rec.dials.count == 2 }
+        try await Task.sleep(nanoseconds: 900_000_000)   // well past dialTimeout
+        XCTAssertEqual(rec.ended.count, 0, "the redial is still inside its grace")
+        // It never opens here, so the watchdog ends it — once — at dialTimeout + grace.
+        let ended = await eventually(tries: 500) { !rec.ended.isEmpty }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(rec.ended, [Self.unreachable])
+        XCTAssertEqual(rec.dials, ["Bearer fresh-1", "Bearer fresh-2"])
+        c.stop()
+    }
+
+    func testAStalledForcedRefreshIsBoundedAndItsLateTokenIsNeverDialled() async throws {
+        let rec = Recorder()
+        let p = Provider(normal: "fresh-1", forced: "fresh-2", forcedDelayNs: 1_200_000_000)
+        let c = client(rec, p)
+        c.dialTimeout = 0.2
+        c.authRedialGrace = 0.3
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        let ended = await eventually { !rec.ended.isEmpty }
+        XCTAssertTrue(ended)
+        try await Task.sleep(nanoseconds: 1_300_000_000)   // the forced refresh answers meanwhile
+        XCTAssertEqual(rec.ended, [Self.unreachable])
+        XCTAssertEqual(rec.errors, [Self.unreachable])
+        XCTAssertEqual(rec.dials, ["Bearer fresh-1"], "no redial after the dial was given up")
+        XCTAssertEqual(p.asks, [false, true])
+        c.stop()
     }
 
     func testOnlyAPreOpen401IsRetriedAndOnlyOnce() {
