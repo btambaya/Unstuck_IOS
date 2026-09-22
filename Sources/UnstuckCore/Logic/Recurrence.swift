@@ -197,3 +197,34 @@ public func recurrenceLabel(_ r: Recurrence?) -> String {
     }
     return base
 }
+
+/// A task with its repeat turned on or off (audit 2026-09-22, C3). A series'
+/// TEMPLATE carries no done of its own — each day's done lives on its
+/// occurrence block — so the done state has to cross over when the repeat
+/// changes:
+///  • OFF ("Never", set_task_recurrence none): the ex-template is bucketed as
+///    a plain task, whose done is task-level, so a ticked today reappeared
+///    unticked. When today's occurrences are all ticked, the tick carries onto
+///    the task (done, with the latest of their completedAt). An open or absent
+///    today leaves it open — no silent completion (owner decision); its kept
+///    history puts it in Backlog as overdue.
+///  • ON for a plain task that is done: the done is cleared. A done TEMPLATE
+///    is an ended series — no reminders, no horizon top-up, no server calls —
+///    and "Daily → Never → Daily" on a ticked day would otherwise make one.
+/// Changing one repeat rule for another leaves the done state as it is.
+public func taskAfterSettingRecurrence(_ task: TaskItem, recurrence: Recurrence?, blocks: [CalBlock],
+                                       todayIso: String, nowISO: String) -> TaskItem {
+    var next = task
+    next.recurrence = recurrence
+    if recurrence == nil, task.recurrence != nil, !task.done {
+        let today = blocks.filter { $0.taskId == task.id && isTaskBlock($0) && $0.date == todayIso && !$0.skipped }
+        if !today.isEmpty && today.allSatisfy(\.done) {
+            next.done = true
+            next.completedAt = today.compactMap(\.completedAt).max() ?? nowISO
+        }
+    } else if recurrence != nil, task.recurrence == nil, task.done {
+        next.done = false
+        next.completedAt = nil
+    }
+    return next
+}

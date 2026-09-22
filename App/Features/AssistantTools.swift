@@ -62,6 +62,12 @@ protocol AssistantAppState: AnyObject {
     /// the UI's un-complete path fires, or the shared row stays ticked forever
     /// with an open task behind it. No-op for any other task.
     func notifyTaskReopenedIfShared(_ t: TaskItem)
+    /// The mirror image (audit 2026-09-22, C6): a task that just went open →
+    /// done and was promoted from a shared list ticks the collection row for
+    /// the other members (collection-task-done `done`) — the hook the UI's
+    /// toggleDone and finishFocus fire. Without it a voice completion left
+    /// every member seeing the item open or overdue. No-op for any other task.
+    func notifyTaskCompletedIfShared(_ t: TaskItem)
     func upsertBlock(_ b: CalBlock) async
     func deleteBlock(_ id: String) async
     // ── lists ──
@@ -304,6 +310,60 @@ func nextLiveBlock(_ api: AssistantAppState, taskId: String) -> CalBlock? {
         .first
 }
 
+/// Complete a task the way the UI's toggleDone does (audit 2026-09-22, C6):
+/// completedAt stamped, the shared-list `done` sent. The assistant used to set
+/// only done/updatedAt, and nothing downstream stamps completed_at (no server
+/// trigger) — so Today's done-today wins, the evening call's "done today"
+/// line, get_tasks view=completed's newest-first order and insights all
+/// missed every voice completion. Only the done + completedAt delta is applied
+/// to the COMMITTED row: a block write in between (saveBlockAwaiting's
+/// un-park) must not be reverted by the caller's earlier copy, and a row that
+/// is already done is returned as-is — no write, no second shared notice.
+@MainActor
+func markTaskDone(_ t: TaskItem, api: AssistantAppState, scratch: TurnScratch) async -> TaskItem {
+    let prior = api.getTasks().first { $0.id == t.id } ?? t
+    if prior.done { return prior }
+    var flipped = prior
+    flipped.done = true
+    let stamped = applyCompletion(flipped, prior: prior, nowISO: AppModel.isoNow())
+    await api.upsertTask(stamped)
+    api.notifyTaskCompletedIfShared(stamped)
+    scratch.newTasks[stamped.id] = stamped
+    return stamped
+}
+
+/// Tick one day's occurrence block the way the UI's setOccurrenceDone does
+/// (audit 2026-09-22, C6): un-skipped and completion-stamped, so the day
+/// counts as a done-today win through projectOccurrences.
+@MainActor
+func markOccurrenceDone(_ b: CalBlock, api: AssistantAppState) async {
+    var next = b
+    next.done = true
+    next.skipped = false
+    next.completedAt = AppModel.isoNow()
+    await api.upsertBlock(next)
+}
+
+/// What `completeSeriesToday` did with a repeating task's day.
+enum SeriesDayResult { case ticked, nothingToday, alreadyDone }
+
+/// "I did X" for a repeating series ticks TODAY's occurrence — never the
+/// series (audit 2026-09-22, C3). The model only ever sees a series by its
+/// TEMPLATE id (the context, get_tasks, find_tasks), and complete_task /
+/// complete_tasks set the template's done, which ENDS the series: every
+/// reminder stopped, the horizon top-up and the server's calls skip a done
+/// task, and today's row stayed open. The earliest open occurrence today is
+/// ticked the way the UI ticks one; the template is never written.
+@MainActor
+func completeSeriesToday(_ t: TaskItem, api: AssistantAppState) async -> SeriesDayResult {
+    let today = api.todayIso()
+    let day = api.getBlocks().filter { $0.taskId == t.id && $0.date == today && !$0.skipped }
+    if day.isEmpty { return .nothingToday }
+    guard let open = day.filter({ !$0.done }).min(by: { $0.startTime < $1.startTime }) else { return .alreadyDone }
+    await markOccurrenceDone(open, api: api)
+    return .ticked
+}
+
 @MainActor
 private func rejectPastDate(_ api: AssistantAppState, _ date: String) -> String? {
     rejectPastDate(today: api.todayIso(), date: date)
@@ -433,13 +493,20 @@ func weekdayNames(_ days: [Int]) -> String {
     days.sorted().map { WEEKDAY_NAMES_CAP[max(0, min(6, $0))].prefix(3) }.map(String.init).joined(separator: ", ")
 }
 
-/// Resolve a task id: scratch map first (the live store lags the optimistic
-/// write), then the live store.
+/// Resolve a task id: the committed store first, the turn's scratch copy only
+/// for a row the store doesn't have.
+///
+/// Store writes are awaited, so the committed row is always at least as fresh
+/// as the scratch copy — and scratch went STALE behind writes that don't
+/// refresh it (saveBlockAwaiting's un-park, scheduleTask's move-count bump,
+/// finish_focus). Every write tool upserts the whole row it gets back, so a
+/// rename after "finish it" reopened the finished task and wiped its focus
+/// time (audit 2026-09-22, C5).
 @MainActor
 func findTask(_ id: String?, api: AssistantAppState, scratch: TurnScratch) -> TaskItem? {
     guard let id else { return nil }
-    if let t = scratch.newTasks[id] { return t }
-    return api.getTasks().first { $0.id == id }
+    if let t = api.getTasks().first(where: { $0.id == id }) { return t }
+    return scratch.newTasks[id]
 }
 
 @MainActor
@@ -491,7 +558,11 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         } else if let date {
             note = " NOTE: it has a day (\(date)) but no time — left unscheduled. Ask ONE question suggesting a time, then schedule_task."
         }
-        if t.later == true { extras.append("in Later") }
+        // From the COMMITTED row: scheduling un-parks a Later task in
+        // saveBlockAwaiting, so the pre-schedule copy said "in Later" over a
+        // task that no longer was (audit 2026-09-22, C5).
+        let committed = api.getTasks().first { $0.id == t.id } ?? t
+        if committed.later == true { extras.append("in Later") }
         if let due = t.dueAt { extras.append("due \(due)") }
         return "ok: created task id=\(t.id) name=\"\(t.name)\"\(extras.isEmpty ? "" : " (\(extras.joined(separator: ", ")))")\(note)"
 
@@ -586,7 +657,13 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         case "monthly": rec = .monthly(until: until)
         default: rec = nil
         }
-        t.recurrence = rec
+        // The editor's rule (audit 2026-09-22, C3): "stop repeating" carries a
+        // ticked today onto the task, and a repeat turned on never leaves a
+        // DONE template (an ended series).
+        let wasDone = t.done
+        t = taskAfterSettingRecurrence(t, recurrence: rec, blocks: api.getBlocks(), todayIso: api.todayIso(), nowISO: now())
+        let doneNote = !wasDone && t.done ? " — today's occurrence was already done, so the task is now marked done"
+            : (wasDone && !t.done ? " (it was done — now open again)" : "")
         t.updatedAt = now()
         await api.upsertTask(t)
         scratch.newTasks[t.id] = t
@@ -600,20 +677,32 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             for id in plan.toDelete { await api.deleteBlock(id) }
         }
         let anchored = blocks.contains { $0.taskId == t.id }
-        guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")" }
+        guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")\(doneNote)" }
         let how = kind == "weekly" ? "weekly on \(weekdayNames(days))" : kind
         let till = until.map { " until \($0)" } ?? ""
-        return "ok: \"\(t.name)\" now repeats \(how)\(till)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
+        return "ok: \"\(t.name)\" now repeats \(how)\(till)\(doneNote)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
 
     case "complete_task":
-        guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        // A repeating series: today's occurrence, never the series (C3). The
+        // result is complete_occurrence's line, whose receipt has no Undo —
+        // a name-matched Undo could reopen some other task of that name.
+        if t.recurrence != nil {
+            let day = api.todayIso()
+            switch await completeSeriesToday(t, api: api) {
+            case .ticked:
+                return "ok: marked \"\(t.name)\" done for \(day) (series continues)"
+            case .alreadyDone:
+                return "error: \"\(t.name)\" is already done on \(day) — nothing changed"
+            case .nothingToday:
+                return "error: \"\(t.name)\" repeats and has nothing on \(day) — nothing changed. complete_task only ticks TODAY's occurrence of a repeating task and never ends the series; use complete_occurrence with the day, or set_task_recurrence kind none to stop it repeating"
+            }
+        }
         // Already done → error, not ok: an "ok: completed" receipt's Undo would
         // REOPEN something the user finished earlier (web parity).
         if t.done { return "error: \"\(t.name)\" is already done — nothing changed" }
-        t.done = true
-        t.updatedAt = now()
-        await api.upsertTask(t)
-        scratch.newTasks[t.id] = t
+        // Stamped + shared-list notice, like the UI's tick (audit 2026-09-22, C6).
+        _ = await markTaskDone(t, api: api, scratch: scratch)
         // id in the result: the receipt's undo must target THIS task.
         return "ok: completed \"\(t.name)\" id=\(t.id)"
 
@@ -662,19 +751,31 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // exactly these — and name every id that was NOT (already done / not
         // found), so the model repeats it instead of saying "all done".
         var flipped: [TaskItem] = []
+        // Repeating series whose TODAY was ticked (C3) — named, but kept out
+        // of ids=, so the receipt's Undo reopens only plain tasks and never
+        // targets a series.
+        var ticked: [String] = []
         var notDone: [String] = []
         for id in ids {
-            guard var t = findTask(id, api: api, scratch: scratch) else { notDone.append("\(id) (not found)"); continue }
+            guard let t = findTask(id, api: api, scratch: scratch) else { notDone.append("\(id) (not found)"); continue }
+            if t.recurrence != nil {
+                switch await completeSeriesToday(t, api: api) {
+                case .ticked: ticked.append(t.name)
+                case .alreadyDone: notDone.append("\"\(t.name)\" (already done today)")
+                case .nothingToday: notDone.append("\"\(t.name)\" (repeats — nothing today)")
+                }
+                continue
+            }
             if t.done { notDone.append("\"\(t.name)\" (already done)"); continue }
-            t.done = true
-            t.updatedAt = now()
-            await api.upsertTask(t)
-            scratch.newTasks[t.id] = t
-            flipped.append(t)
+            // Stamped + shared-list notice (audit 2026-09-22, C6). The store
+            // is re-read per id, so a repeated id is "already done" the second
+            // time and never sends a second notice.
+            flipped.append(await markTaskDone(t, api: api, scratch: scratch))
         }
-        if flipped.isEmpty { return "error: none completed — \(notDone.joined(separator: ", "))" }
+        if flipped.isEmpty && ticked.isEmpty { return "error: none completed — \(notDone.joined(separator: ", "))" }
         let skipped = notDone.isEmpty ? "" : ". Not done: \(notDone.joined(separator: ", "))"
-        return "ok: completed \(flipped.count) tasks ids=\(flipped.map(\.id).joined(separator: ",")) — \(flipped.map { "\"\($0.name)\"" }.joined(separator: ", "))\(skipped)"
+        let names = flipped.map { "\"\($0.name)\"" } + ticked.map { "\"\($0)\" (today — series continues)" }
+        return "ok: completed \(flipped.count + ticked.count) tasks ids=\(flipped.map(\.id).joined(separator: ",")) — \(names.joined(separator: ", "))\(skipped)"
 
     case "delete_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -832,7 +933,13 @@ func recentDuplicateTask(named name: String, api: AssistantAppState, scratch: Tu
     guard !key.isEmpty else { return nil }
     let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let plain = ISO8601DateFormatter(); plain.formatOptions = [.withInternetDateTime]
-    let candidates = Array(scratch.newTasks.values) + api.getTasks()
+    // The committed rows first, scratch only for what the store lacks: a
+    // stale scratch copy (done=false after finish_focus completed it, or a
+    // completion from the web) blocked a new task as a "duplicate" of a
+    // finished one (audit 2026-09-22, C5).
+    let store = api.getTasks()
+    let stored = Set(store.map(\.id))
+    let candidates = store + scratch.newTasks.values.filter { !stored.contains($0.id) }
     return candidates.first { t in
         guard !t.done, t.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == key else { return false }
         guard let made = iso.date(from: t.createdAt) ?? plain.date(from: t.createdAt) else { return false }

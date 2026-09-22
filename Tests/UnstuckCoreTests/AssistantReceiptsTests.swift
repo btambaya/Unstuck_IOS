@@ -255,6 +255,35 @@ final class AssistantReceiptsTests: XCTestCase {
         XCTAssertNil(planReceiptUndo(.completeTask(id: "gone"), tasks: [], nowISO: "n"))
     }
 
+    // MARK: repeating series (audit 2026-09-22, C3)
+
+    /// complete_task on a series ticks TODAY's occurrence: complete_occurrence's
+    /// card, no Undo — the name fallback would otherwise reopen an unrelated
+    /// done task of the same name.
+    func testCompleteTaskOnASeriesIsADoneForTodayCardWithNoUndo() {
+        let sameName = task(id: "x", name: "Meds", done: true)
+        let card = r("complete_task", "ok: marked \"Meds\" done for 2026-09-22 (series continues)", tasks: [sameName])
+        XCTAssertEqual(card, Receipt(icon: .check, label: "Done for today: Meds"))
+        XCTAssertNil(card?.undo)
+        // A plain completion keeps its Undo.
+        XCTAssertEqual(r("complete_task", "ok: completed \"X\" id=x", tasks: [sameName])?.undo, .uncompleteTask(id: "x"))
+    }
+
+    /// uncomplete_task on a series reopens TODAY's occurrence and carries no
+    /// id=, so its card has no Undo (whose `.completeTask` would end the series).
+    func testUncompleteOnASeriesHasNoUndo() {
+        XCTAssertNil(r("uncomplete_task", "ok: reopened \"Meds\" for 2026-09-22 (series continues)")?.undo)
+        XCTAssertNil(r("uncomplete_task", "ok: reopened \"Meds\" — its repeating series runs again")?.undo)
+    }
+
+    /// An older persisted "Reopened" receipt on a series' template never
+    /// plans a completion of the template.
+    func testCompleteUndoNeverTargetsASeriesTemplate() {
+        var tpl = task(id: "tpl", name: "Meds")
+        tpl.recurrence = .daily(until: nil)
+        XCTAssertNil(planReceiptUndo(.completeTask(id: "tpl"), tasks: [tpl], nowISO: "n"))
+    }
+
     func testReceiptsRoundTripThroughTheThreadPersistence() throws {
         let r = Receipt(icon: .check, label: "Completed “Report”", undo: .uncompleteTask(id: "x9"), undone: true)
         let back = try JSONDecoder().decode(Receipt.self, from: JSONEncoder().encode(r))

@@ -435,7 +435,10 @@ struct AssistantSheet: View {
         switch destination {
         case .tasks: model.router.tab = .tasks
         case .calendar: model.router.tab = .calendar
-        case .focus(let task): model.router.beginFocus(task)
+        // The PAUSED chip holds the live session's task — the TEMPLATE for a
+        // recurring one — so it reopens the way the Today live card does,
+        // on the session's own day (audit 2026-09-22, C3).
+        case .focus(let task): model.reopenLiveFocus(task)
         }
     }
 

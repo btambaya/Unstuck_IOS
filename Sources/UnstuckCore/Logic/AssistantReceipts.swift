@@ -180,6 +180,11 @@ public func deriveReceipt(
 
     case "complete_task":
         let nm = quotedFragment(result) ?? "task"
+        // A repeating task: complete_task ticked TODAY's occurrence (audit
+        // 2026-09-22, C3) — complete_occurrence's card, with no Undo. The
+        // name fallback below could otherwise attach an Undo that reopens an
+        // unrelated done task of the same name.
+        if result.contains("(series continues)") { return Receipt(icon: .check, label: "Done for today: \(nm)") }
         // Prefer the executor's id — resolving by NAME un-completed the wrong
         // duplicate (flow review, 2026-08-30). Name fallback keeps legacy
         // persisted results working.
@@ -407,7 +412,10 @@ public func planReceiptUndo(_ undo: ReceiptUndo, tasks: [TaskItem], nowISO: Stri
     case .deleteCapture(let id):
         return .deleteCapture(id: id)
     case .completeTask(let id):
-        guard var t = tasks.first(where: { $0.id == id }) else { return nil }
+        // Never onto a repeating series' template: its done ENDS the series
+        // (audit 2026-09-22, C3). New results for a series carry no id=, so
+        // only an older persisted "Reopened" receipt can land here.
+        guard var t = tasks.first(where: { $0.id == id }), t.recurrence == nil else { return nil }
         t.done = true
         t.completedAt = nowISO
         t.updatedAt = nowISO

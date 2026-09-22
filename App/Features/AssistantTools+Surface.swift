@@ -35,6 +35,21 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     // ── TASKS ──
     case "uncomplete_task":
         guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        // An open repeating series: "untick that" means TODAY's occurrence —
+        // the day complete_task now ticks (audit 2026-09-22, C3). No id= in
+        // the result, so the receipt offers no Undo: its `.completeTask` would
+        // set the series' own done and end it.
+        if t.recurrence != nil && !t.done {
+            let today = api.todayIso()
+            guard var b = api.getBlocks().filter({ $0.taskId == t.id && $0.date == today && !$0.skipped && $0.done })
+                .max(by: { $0.startTime < $1.startTime }) else {
+                return "error: \"\(t.name)\" repeats and isn't done on \(today) — nothing changed"
+            }
+            b.done = false
+            b.completedAt = nil
+            await api.upsertBlock(b)
+            return "ok: reopened \"\(t.name)\" for \(today) (series continues)"
+        }
         // Already open → error, never "ok: reopened": that receipt's Undo would
         // COMPLETE a task the user never finished (web parity).
         if !t.done { return "error: \"\(t.name)\" is already open — nothing changed" }
@@ -47,6 +62,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         // upsert would leave the shared row ticked with an open task behind it).
         api.notifyTaskReopenedIfShared(t)
         scratch.newTasks[t.id] = t
+        // A series the old path ended is running again — no id= either, for
+        // the same reason: its Undo would end it once more (C3).
+        if t.recurrence != nil { return "ok: reopened \"\(t.name)\" — its repeating series runs again" }
         return "ok: reopened \"\(t.name)\" id=\(t.id)"
 
     case "get_tasks":
@@ -144,9 +162,9 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         return "ok: skipped \"\(t.name)\" on \(date) (the task and its other days stay)"
 
     case "complete_occurrence":
-        guard var t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
+        guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
         let date = args.str("date") ?? api.todayIso()
-        guard var b = api.getBlocks().first(where: { $0.taskId == t.id && $0.date == date && !$0.skipped }) else {
+        guard let b = api.getBlocks().first(where: { $0.taskId == t.id && $0.date == date && !$0.skipped }) else {
             return "error: \"\(t.name)\" has nothing on \(date)"
         }
         // Already done that day → error, not a second "Done for today" receipt.
@@ -158,14 +176,12 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         if t.recurrence == nil, t.done {
             return "error: \"\(t.name)\" is already done — nothing changed"
         }
-        b.done = true
-        await api.upsertBlock(b)
-        if t.recurrence == nil {
-            t.done = true
-            t.updatedAt = now()
-            await api.upsertTask(t)
-            scratch.newTasks[t.id] = t
-        }
+        // Stamped like the UI's tick (audit 2026-09-22, C6): the block gets
+        // its completedAt (a repeating day then counts as done today), and a
+        // one-off task its completedAt + shared-list notice. The template of a
+        // series is never touched.
+        await markOccurrenceDone(b, api: api)
+        if t.recurrence == nil { _ = await markTaskDone(t, api: api, scratch: scratch) }
         return "ok: marked \"\(t.name)\" done for \(date)\(t.recurrence != nil ? " (series continues)" : "")"
 
     case "block_time":

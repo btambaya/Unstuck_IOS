@@ -331,3 +331,93 @@ final class RecurrenceLabelTests: XCTestCase {
         XCTAssertEqual(recurrenceLabel(.weekly(daysOfWeek: [1, 3, 5], until: nil)), "Repeats Mon/Wed/Fri")
     }
 }
+
+// A repeat turned off / on moves the day's done across (audit 2026-09-22, C3):
+// a series' template carries no done of its own, a plain task's done is
+// task-level. "Never" on a ticked day used to bring today back unticked, and
+// Daily → Never → Daily must not leave a DONE template (an ended series).
+final class TaskAfterSettingRecurrenceTests: XCTestCase {
+    private let today = "2026-09-22"
+    private let now = "2026-09-22T18:00:00.000Z"
+
+    private func series(done: Bool = false, completedAt: String? = nil) -> TaskItem {
+        var t = mkTask(id: "tpl", name: "Meditate", done: done)
+        t.recurrence = .daily(until: nil)
+        t.completedAt = completedAt
+        return t
+    }
+
+    private func day(_ id: String, _ date: String, done: Bool = false, skipped: Bool = false,
+                     completedAt: String? = nil, at startTime: String = "07:00") -> CalBlock {
+        CalBlock(id: id, taskId: "tpl", taskName: "Meditate", startTime: startTime, durationMinutes: 20,
+                 date: date, kind: .task, done: done, skipped: skipped, completedAt: completedAt)
+    }
+
+    func testNeverOnATickedDayCarriesTheTickOntoTheTask() {
+        let blocks = [day("b0", "2026-09-21", done: true, completedAt: "2026-09-21T07:20:00.000Z"),
+                      day("b1", today, done: true, completedAt: "2026-09-22T07:20:00.000Z"),
+                      day("b2", "2026-09-23")]
+        let out = taskAfterSettingRecurrence(series(), recurrence: nil, blocks: blocks, todayIso: today, nowISO: now)
+        XCTAssertNil(out.recurrence)
+        XCTAssertTrue(out.done)
+        XCTAssertEqual(out.completedAt, "2026-09-22T07:20:00.000Z", "the day's own completion time")
+    }
+
+    func testATickWithNoStampFallsBackToNow() {
+        let out = taskAfterSettingRecurrence(series(), recurrence: nil, blocks: [day("b1", today, done: true)],
+                                             todayIso: today, nowISO: now)
+        XCTAssertTrue(out.done)
+        XCTAssertEqual(out.completedAt, now)
+    }
+
+    /// Owner decision: an open or absent today leaves the task OPEN — no
+    /// silent completion.
+    func testNeverWithTodayOpenOrAbsentLeavesTheTaskOpen() {
+        let open = taskAfterSettingRecurrence(series(), recurrence: nil, blocks: [day("b1", today)],
+                                              todayIso: today, nowISO: now)
+        XCTAssertFalse(open.done)
+        XCTAssertNil(open.completedAt)
+        let twins = [day("b1", today, done: true, completedAt: now), day("b2", today, at: "19:00")]
+        XCTAssertFalse(taskAfterSettingRecurrence(series(), recurrence: nil, blocks: twins, todayIso: today, nowISO: now).done,
+                       "one of two occurrences today is still open")
+        let skippedOnly = [day("b1", today, done: true, skipped: true)]
+        XCTAssertFalse(taskAfterSettingRecurrence(series(), recurrence: nil, blocks: skippedOnly, todayIso: today, nowISO: now).done)
+        let historyOnly = [day("b0", "2026-09-21", done: true, completedAt: "2026-09-21T07:20:00.000Z")]
+        XCTAssertFalse(taskAfterSettingRecurrence(series(), recurrence: nil, blocks: historyOnly, todayIso: today, nowISO: now).done)
+    }
+
+    func testASeriesAlreadyDoneKeepsItsDone() {
+        let t0 = "2026-09-17T09:00:00.000Z"
+        let out = taskAfterSettingRecurrence(series(done: true, completedAt: t0), recurrence: nil, blocks: [day("b1", today)],
+                                             todayIso: today, nowISO: now)
+        XCTAssertTrue(out.done)
+        XCTAssertEqual(out.completedAt, t0)
+    }
+
+    /// Daily → Never (ticked today, so done) → Daily must give an OPEN series.
+    func testTurningARepeatBackOnReopensTheTask() {
+        let blocks = [day("b1", today, done: true, completedAt: "2026-09-22T07:20:00.000Z")]
+        let off = taskAfterSettingRecurrence(series(), recurrence: nil, blocks: blocks, todayIso: today, nowISO: now)
+        XCTAssertTrue(off.done)
+        let on = taskAfterSettingRecurrence(off, recurrence: .daily(until: nil), blocks: blocks, todayIso: today, nowISO: now)
+        XCTAssertEqual(on.recurrence, .daily(until: nil))
+        XCTAssertFalse(on.done, "a done template is an ended series")
+        XCTAssertNil(on.completedAt)
+    }
+
+    func testOtherChangesOnlySetTheRecurrence() {
+        let plain = mkTask(id: "tpl", name: "Meditate")
+        let on = taskAfterSettingRecurrence(plain, recurrence: .weekly(daysOfWeek: [1], until: nil), blocks: [],
+                                            todayIso: today, nowISO: now)
+        XCTAssertEqual(on.recurrence, .weekly(daysOfWeek: [1], until: nil))
+        XCTAssertFalse(on.done)
+        let ended = series(done: true, completedAt: "2026-09-17T09:00:00.000Z")
+        let retimed = taskAfterSettingRecurrence(ended, recurrence: .weekly(daysOfWeek: [2], until: nil), blocks: [],
+                                                 todayIso: today, nowISO: now)
+        XCTAssertTrue(retimed.done, "one rule for another leaves the done state as it is")
+        var plainDone = mkTask(id: "p", name: "Plain", done: true)
+        plainDone.completedAt = "2026-09-20T09:00:00.000Z"
+        let stillPlain = taskAfterSettingRecurrence(plainDone, recurrence: nil, blocks: [], todayIso: today, nowISO: now)
+        XCTAssertEqual(stillPlain, plainDone)
+    }
+}

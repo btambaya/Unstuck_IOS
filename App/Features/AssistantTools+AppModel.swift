@@ -52,6 +52,8 @@ final class AppModelAssistantState: AssistantAppState {
     func removeTask(_ id: String) async { await model.deleteTaskAwaiting(id) }
     /// The UI's un-complete hook (AppModel.toggleDone → `.reopen`), best-effort.
     func notifyTaskReopenedIfShared(_ t: TaskItem) { model.notifyTaskReopenedIfShared(t) }
+    /// The UI's completion hook (AppModel.toggleDone / finishFocus → `.done`), best-effort.
+    func notifyTaskCompletedIfShared(_ t: TaskItem) { model.notifyTaskDoneIfShared(t) }
     func upsertBlock(_ b: CalBlock) async { await model.saveBlockAwaiting(b) }
     /// `unschedule` reconciles Google for a pushed task block, then deletes.
     func deleteBlock(_ id: String) async { await model.unscheduleAwaiting(id) }
@@ -303,7 +305,9 @@ final class AppModelAssistantState: AssistantAppState {
         PausedCheckinScheduler.cancel()
         var markedDone = false
         if let level = cur.sharedFocusLevel {
-            markedDone = markDone && levelCanComplete(level)
+            // Never a repeating share: the server refuses that tick, so
+            // "task marked done" would be a claim of nothing (C3).
+            markedDone = markDone && levelCanComplete(level) && model.sharedTaskAllowsTick(cur.taskId)
             model.finalizeSharedFocus(taskId: cur.taskId, taskName: name, sessionId: session.id,
                                       elapsedSec: elapsed, estimateMin: cur.sessionEstimateMin,
                                       markDone: markedDone, showRecap: false)

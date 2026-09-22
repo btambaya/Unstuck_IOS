@@ -466,6 +466,16 @@ public func levelCanComplete(_ level: ShareLevel) -> Bool {
     level == .partner || level == .assign
 }
 
+/// Can the recipient TICK this shared task done? Partner / assign, and not a
+/// repeating series (audit 2026-09-22, C3): a repeating share's row is the
+/// owner's TEMPLATE, and ticking it ENDED their whole series — every reminder
+/// and call for it stopped. shared_task_set_done refuses that tick server-side
+/// ('recurring_series', migration 075); the owner ticks each day. Focus
+/// availability keeps using levelCanComplete.
+public func shareCanTickDone(_ s: SharedWithMe) -> Bool {
+    levelCanComplete(s.level) && s.recurrence == nil
+}
+
 /// The quiet chip on a "shared with you" row, from the RECIPIENT's side.
 /// Unified sharing v1 (spec §2, "One vocabulary"): the recipient reads the
 /// SAME words the sender picked — "can edit" / "can view" — not the storage

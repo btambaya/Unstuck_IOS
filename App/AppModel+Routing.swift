@@ -28,7 +28,9 @@ extension AppModel {
             router.select(.today)
         case "tasks":
             if let id, let task = (try? taskRepo?.fetch(id: id)) ?? nil {
-                routeDeepLink("unstuck://task/\(task.id)")
+                // The task the model named — a series opens its own editor
+                // (owner decision, audit 2026-09-22 C3).
+                routeDeepLink(Self.exactTaskLink(task.id))
             } else {
                 dismissForNavigation()
                 router.select(.tasks)

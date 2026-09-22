@@ -273,7 +273,8 @@ struct SharedWithYouGroup: View {
     }
 
     private func row(_ s: SharedWithMe, todayISO: String) -> some View {
-        let canComplete = levelCanComplete(s.level)
+        // No tick on a repeating share (C3): it would end the owner's series.
+        let canComplete = shareCanTickDone(s)
         // The owner's slot, in words — "Sat 04:30 · 45m · from Anna" — so a
         // shared task reads like your own scheduled row; just "from Anna" when
         // nothing is planned (or against a pre-052 server).
@@ -480,23 +481,28 @@ struct SharedTaskDetailSheet: View {
             // Optimistic, with a ROLLBACK: shared_task_set_done can reject
             // (e.g. the owner revoked the share, or offline) — reverting the flip
             // keeps the chip honest instead of showing a "done" that never landed.
-            Button {
-                let next = !d.done
-                detail?.done = next          // optimistic
-                Task {
-                    do { try await model.shareState.completeSharedTask(taskId: d.taskId, done: next) }
-                    catch { detail?.done = !next }   // revert on RPC failure
-                }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: d.done ? "arrow.uturn.left" : "checkmark")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text(d.done ? "Reopen" : "Complete").font(UFont.sans(13, .semibold))
-                }
-                .foregroundStyle(d.done ? theme.palette.ink2 : theme.palette.bg)
-                .padding(.horizontal, 16).padding(.vertical, 10)
-                .background(d.done ? AnyShapeStyle(theme.palette.bg2) : AnyShapeStyle(theme.palette.primary), in: Capsule())
-            }.buttonStyle(.plain)
+            // Hidden on an OPEN repeating share (audit 2026-09-22, C3): the
+            // row is the owner's series, and the server refuses the tick.
+            // Reopen stays, to recover a series the old path ended.
+            if d.done || (model.shareState.sharedWithMe.first { $0.taskId == d.taskId }.map(shareCanTickDone) ?? true) {
+                Button {
+                    let next = !d.done
+                    detail?.done = next          // optimistic
+                    Task {
+                        do { try await model.shareState.completeSharedTask(taskId: d.taskId, done: next) }
+                        catch { detail?.done = !next }   // revert on RPC failure
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: d.done ? "arrow.uturn.left" : "checkmark")
+                            .font(.system(size: 12, weight: .semibold))
+                        Text(d.done ? "Reopen" : "Complete").font(UFont.sans(13, .semibold))
+                    }
+                    .foregroundStyle(d.done ? theme.palette.ink2 : theme.palette.bg)
+                    .padding(.horizontal, 16).padding(.vertical, 10)
+                    .background(d.done ? AnyShapeStyle(theme.palette.bg2) : AnyShapeStyle(theme.palette.primary), in: Capsule())
+                }.buttonStyle(.plain)
+            }
 
             // Focus with them (partner) / Focus (assign) — a real session whose
             // time reflects onto the owner's task via log_shared_focus (T3).
