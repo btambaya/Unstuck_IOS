@@ -33,6 +33,19 @@ public struct CalendarClient: Sendable {
         public let accountEmail: String
         public let calendars: [GoogleCalendar]
         public let colorSlot: Int?
+
+        /// The local calendar_connections row this connect implies, shaped like
+        /// the server's insert (handleConnect: every returned calendar, else
+        /// "primary"; iOS sends no displayName, so it stores the email). A
+        /// successful connect used to write nothing locally, so the bar stayed
+        /// "Connect" and googleConnection(for:) found nothing until relaunch; this
+        /// stands in until the next /connections read replaces it with the
+        /// stored row (audit 2026-09-22, C18).
+        public func localConnection(connectedAt: String) -> CalendarConnection {
+            CalendarConnection(id: id, provider: .google, accountEmail: accountEmail, displayName: accountEmail,
+                               selectedCalendarIds: calendars.isEmpty ? ["primary"] : calendars.map(\.id),
+                               colorSlot: colorSlot ?? 0, lastSyncCursor: nil, connectedAt: connectedAt)
+        }
     }
 
     /// Step 1: ask the server for the Google consent URL + signed state.
@@ -77,7 +90,14 @@ public struct CalendarClient: Sendable {
     struct ConnectionWire: Decodable, Sendable {
         let status: ConnectionStatus
         init(from decoder: Decoder) throws {
-            let connection = try CalendarConnection(from: decoder)
+            // The function returns the raw `select('*')` rows (snake_case). The
+            // synthesized camelCase decode threw keyNotFound(accountEmail) on
+            // every one and pullCalendar's `try?` swallowed it, so nothing was
+            // ever imported. Read the hydrate's own snake_case DTO first; keep
+            // camelCase as the fallback, like web's normalizeConnection
+            // (audit 2026-09-22, C18).
+            let connection = try (try? CalendarConnectionRow(from: decoder))?.model()
+                ?? CalendarConnection(from: decoder)
             let c = try decoder.container(keyedBy: DynamicKey.self)
             let needs = Self.bool(c, "needsReauth") ?? Self.bool(c, "needs_reauth") ?? false
             let err = Self.string(c, "lastError") ?? Self.string(c, "last_error")
@@ -96,9 +116,12 @@ public struct CalendarClient: Sendable {
     struct ConnectionsWire: Decodable, Sendable { let connections: [ConnectionWire] }
 
     public func listConnectionStatuses() async throws -> [ConnectionStatus] {
+        // Body-less: `body: Empty()` put "{}" in httpBody, and URLSession refuses
+        // a GET that carries a body (-1103), so the call never left the phone
+        // (audit 2026-09-22, C18).
         let r: ConnectionsWire = try await client.functions.invoke(
             "calendar-sync/connections",
-            options: FunctionInvokeOptions(method: .get, body: Empty()))
+            options: FunctionInvokeOptions(method: .get))
         return r.connections.map(\.status)
     }
 
@@ -134,6 +157,24 @@ public struct CalendarClient: Sendable {
         public init(events: [ExternalEvent], allDayEventIds: Set<String>, failures: [PullFailure]) {
             self.events = events; self.allDayEventIds = allDayEventIds; self.failures = failures
         }
+
+        /// True when Google answered for NONE of `connections`: each failed
+        /// whole (token mint / unreachable — calendarId "*") or on every
+        /// selected calendar, and not only for a dead token (the bar already
+        /// offers "Reconnect Google" for that). calendar-sync reports Google's
+        /// 429 / 5xx / 403 inside a 200's `failures`, never as an HTTP error,
+        /// so this is how "Sync now" learns it read nothing. One calendar
+        /// failing next to a readable one is not "nothing" (audit 2026-09-22,
+        /// C18).
+        public func readNothing(from connections: [CalendarConnection]) -> Bool {
+            guard !connections.isEmpty, !failures.isEmpty, !failures.allSatisfy(\.needsReauth) else { return false }
+            return connections.allSatisfy { conn in
+                let own = failures.filter { $0.connectionId == conn.id }
+                if own.contains(where: { ($0.calendarId ?? "*") == "*" }) { return true }
+                let failedCalendars = Set(own.compactMap(\.calendarId))
+                return !own.isEmpty && conn.selectedCalendarIds.allSatisfy(failedCalendars.contains)
+            }
+        }
     }
 
     /// An event plus the server's explicit `allDay` flag (the model has no slot
@@ -163,9 +204,10 @@ public struct CalendarClient: Sendable {
         var query = [URLQueryItem(name: "from", value: from), URLQueryItem(name: "to", value: to)]
         if let connectionId { query.append(URLQueryItem(name: "connectionId", value: connectionId)) }
         do {
+            // Body-less GET, as for /connections (audit 2026-09-22, C18).
             let r: EventsWire = try await client.functions.invoke(
                 "calendar-sync/events",
-                options: FunctionInvokeOptions(method: .get, query: query, body: Empty()))
+                options: FunctionInvokeOptions(method: .get, query: query))
             return CalendarPull(events: r.events.map(\.event),
                                 allDayEventIds: Set(r.events.filter(\.allDay).map(\.event.id)),
                                 failures: r.failures ?? [])

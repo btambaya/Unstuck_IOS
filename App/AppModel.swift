@@ -2155,11 +2155,18 @@ final class AppModel {
     /// last verdict + any 429 back-off first — a fresh consent must clear
     /// "Reconnect Google" as soon as the server's `needs_reauth` is clear (the
     /// pull re-reads the flag, so a still-dead token simply re-flags itself).
-    func pullGoogleCalendar() async {
-        guard let coord = coordinator else { return }
+    /// False = Google / the server could not be read, so the bar says so
+    /// instead of ending silently (audit 2026-09-22, C18).
+    @discardableResult
+    func pullGoogleCalendar() async -> Bool {
+        guard let coord = coordinator else { return false }
         await coord.resetCalendarStatus()
         calendarSyncStatus = nil
-        await coord.pullCalendar()
+        let ok = await coord.pullCalendar()
+        // Read the verdict now rather than waiting for the status hook's hop to
+        // the main actor: the bar's caption keys a 429 off `backoffUntil`.
+        calendarSyncStatus = await coord.calendarStatus
+        return ok
     }
 
     func saveSession(_ session: Session) {

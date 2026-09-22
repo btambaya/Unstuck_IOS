@@ -11,6 +11,7 @@
 import Foundation
 import UnstuckCore
 import UnstuckData
+import UnstuckSync
 
 extension AppModel {
 
@@ -52,12 +53,23 @@ extension AppModel {
     /// The server's last reason (e.g. `invalid_grant`), for the bar's caption.
     var calendarLastError: String? { calendarSyncStatus?.lastError }
 
-    /// After a successful (re)connect: drop the stale verdict + any back-off so
-    /// the next pull runs immediately.
-    func calendarDidReconnect() {
-        calendarSyncStatus = nil
-        guard let coord = coordinator else { return }
-        Task { await coord.resetCalendarStatus(); await coord.pullCalendar() }
+    /// After a successful (re)connect: save the connection locally, then pull
+    /// (which drops the stale verdict + any back-off first). A connect used to
+    /// write nothing locally — calendar_connections is only filled by the full
+    /// hydrate — so the bar stayed "Connect" and every block scheduled that
+    /// session skipped the Google mirror until relaunch. The seed only lands
+    /// when the id isn't stored yet, so a reconnect keeps the stored selection;
+    /// the pull then replaces it with the server's own row. False = the first
+    /// pull didn't finish (audit 2026-09-22, C18).
+    @discardableResult
+    func calendarDidConnect(_ response: CalendarClient.ConnectResponse) async -> Bool {
+        // First, so a /connections answer read before the server stored this
+        // connection can't land after the seed and delete it again.
+        await coordinator?.noteLocalConnectionsWrite()
+        if let db, ((try? db.fetchById(CalendarConnection.self, id: response.id)) ?? nil) == nil {
+            try? db.save(response.localConnection(connectedAt: Self.isoNow()))
+        }
+        return await pullGoogleCalendar()
     }
 
     // MARK: - Google disconnect (CalendarSyncBar · destructive)
@@ -80,6 +92,9 @@ extension AppModel {
                 try? await calendar.disconnect(connectionId: conn.id)
                 // Drop the connection row + its external mirror blocks locally.
                 try? db.deleteById(CalendarConnection.self, id: conn.id)
+                // A /connections answer read before the revoke must not put
+                // the row back (audit 2026-09-22, C18).
+                await self.coordinator?.noteLocalConnectionsWrite()
                 let external = ((try? db.fetchExternalCalBlocks()) ?? [])
                     .filter { $0.externalConnectionId == conn.id }
                 for b in external {
@@ -88,6 +103,11 @@ extension AppModel {
             }
             await self.coordinator?.resetCalendarStatus()
             self.calendarSyncStatus = nil
+            // Re-read the server's post-disconnect list: a pull whose
+            // /connections answer landed between the revoke and the local
+            // delete can still be importing that account's meetings; with no
+            // connection left this pull purges them (audit 2026-09-22, C18).
+            await self.coordinator?.pullCalendar()
         }
     }
 }

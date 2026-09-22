@@ -95,6 +95,8 @@ public func blockStartMillis(_ b: CalBlock) -> EpochMillis? {
 /// should exist right now. Pure port of Android ReminderScheduler.sync():
 ///  - task blocks + EXTERNAL calendar events are eligible; placeholders skipped
 ///  - done tasks schedule nothing
+///  - done / skipped task blocks schedule nothing — a recurring occurrence's
+///    per-day state (033; server parity 054/070)
 ///  - externals use the global lead; tasks the per-task override (else global)
 ///  - LEAD only when lead > 0; ATSTART gated Balanced+; DRIFTED gated Coach
 ///  - only fire times in (now, now + 48h] are armed
@@ -126,6 +128,16 @@ public func planReminders(
         guard let startMs = blockStartMillis(b) else { continue }
         let taskId = b.taskId ?? ""
         if isTask, tasks.first(where: { $0.id == taskId })?.done == true { continue }
+        // A recurring occurrence records the day's tick and "Skip this day" on
+        // the BLOCK (migration 033) — the template's `done` never flips — so a
+        // day already handled must not ring "Coming up" / "Time to start" /
+        // "Didn't get to it?". Same predicate as the server dispatcher
+        // (`not coalesce(cb.done,false) and not coalesce(cb.skipped,false)`,
+        // 054, kept in 070); it also covers skip_occurrence and
+        // carry_to_tomorrow's skip-today on a one-off block. ReminderScheduler's
+        // prev − now diff cancels the already-armed requests on the next
+        // re-sync (audit 2026-09-22, C2).
+        if isTask && (b.done || b.skipped) { continue }
 
         // A1 pre-task — every level. External events use the global lead;
         // tasks the per-task override.
@@ -184,7 +196,8 @@ public struct UpcomingReminder: Equatable, Sendable, Identifiable {
 
 /// Scheduled task reminders in the next 2 days, computed live from the
 /// blocks (Android NotificationCenterScreen): task blocks whose start is
-/// within [now, now+48h] and whose task isn't done, de-duped by
+/// within [now, now+48h] whose task isn't done and whose block (a recurring
+/// occurrence's day) isn't done or skipped, de-duped by
 /// (taskId, at), sorted ascending, capped at 20.
 public func upcomingReminders(blocks: [CalBlock], tasks: [TaskItem], now: EpochMillis) -> [UpcomingReminder] {
     var seen = Set<String>()
@@ -193,6 +206,11 @@ public func upcomingReminders(blocks: [CalBlock], tasks: [TaskItem], now: EpochM
         guard let ms = blockStartMillis(b), ms >= now, ms <= now + REMINDER_HORIZON_MS else { continue }
         let taskId = b.taskId ?? ""
         if tasks.first(where: { $0.id == taskId })?.done == true { continue }
+        // The day's own tick / skip lives on the block, so a finished or
+        // skipped day is not "Upcoming". Checked BEFORE the de-dupe insert so a
+        // skipped twin at the same (task, time) can't hide the live block
+        // (audit 2026-09-22, C2).
+        if b.done || b.skipped { continue }
         let key = "\(taskId):\(ms)"
         if seen.insert(key).inserted {
             out.append(UpcomingReminder(taskId: taskId, name: b.taskName, at: ms))

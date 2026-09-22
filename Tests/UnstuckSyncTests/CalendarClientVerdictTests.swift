@@ -1,8 +1,13 @@
 // The calendar-sync failure verdicts the pull + push paths key on
-// (CalendarClient.classify), the per-connection `failures[]` flags, and the
-// wake-window sample the first foreground of a local day records.
+// (CalendarClient.classify), the per-connection `failures[]` flags, the
+// /connections row shape and the body-less GETs (a URLProtocol stub, no
+// network, no keychain), the connections mirror's compare + read ordering,
+// and the wake-window sample the first foreground of a local day records.
 
 import XCTest
+import Supabase
+import Auth
+import UnstuckCore
 @testable import UnstuckSync
 
 final class CalendarClientVerdictTests: XCTestCase {
@@ -42,6 +47,42 @@ final class CalendarClientVerdictTests: XCTestCase {
         XCTAssertFalse(flaky.rateLimited)
     }
 
+    /// calendar-sync answers 200 even when Google failed every calendar, so
+    /// the pull must read "Google answered for nobody" out of `failures` —
+    /// else "Sync now" ends on "Synced" with no meetings (audit 2026-09-22, C18).
+    func testReadNothingOnlyWhenGoogleAnsweredForNoConnection() {
+        typealias F = CalendarClient.PullFailure
+        func pull(_ failures: [F]) -> CalendarClient.CalendarPull {
+            CalendarClient.CalendarPull(events: [], allDayEventIds: [], failures: failures)
+        }
+        let c1 = Self.serverConnection   // primary + team@group.calendar.google.com
+        let c2 = CalendarConnection(id: "c2", provider: .google, accountEmail: "d@e.f", displayName: "d@e.f",
+                                    selectedCalendarIds: ["primary"], colorSlot: 1, connectedAt: "T")
+        let team = "team@group.calendar.google.com"
+
+        XCTAssertFalse(pull([]).readNothing(from: [c1]), "a clean pull")
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: team, status: 404, reason: "not_found")])
+            .readNothing(from: [c1]), "one calendar failing next to a readable one still imported")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "primary", status: 429, reason: "rate_limited"),
+                            F(connectionId: "c1", calendarId: team, status: 429, reason: "rate_limited")])
+            .readNothing(from: [c1]), "Google rate-limited every selected calendar")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "*", status: 0, reason: "unreachable")])
+            .readNothing(from: [c1]), "the whole connection failed (token mint / network)")
+        XCTAssertTrue(pull([F(connectionId: "c1", status: 503)]).readNothing(from: [c1]),
+                      "no calendarId = the whole connection")
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: "*", status: 503, reason: "http_503")])
+            .readNothing(from: [c1, c2]), "c2 was read")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "*", status: 503, reason: "http_503"),
+                            F(connectionId: "c2", calendarId: "primary", status: 403, reason: "forbidden")])
+            .readNothing(from: [c1, c2]))
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: "*", status: 400, reason: "invalid_grant")])
+            .readNothing(from: [c1]), "a dead token alone is the bar's 'Reconnect Google', not a sync failure")
+        XCTAssertTrue(pull([F(connectionId: "c1", calendarId: "*", status: 400, reason: "invalid_grant"),
+                            F(connectionId: "c2", calendarId: "*", status: 503, reason: "http_503")])
+            .readNothing(from: [c1, c2]), "a dead token next to an outage still read nothing")
+        XCTAssertFalse(pull([F(connectionId: "c1", calendarId: "*", status: 503)]).readNothing(from: []))
+    }
+
     func testEventsWireDecodesAllDayAndFailures() throws {
         let json = #"""
         {"events":[
@@ -69,10 +110,15 @@ final class CalendarClientVerdictTests: XCTestCase {
     }
 
     func testConnectionsWireReadsNeedsReauthInEitherCase() throws {
+        // c1 is the function's REAL row (snake_case `select('*')` minus
+        // credentials); c2 keeps the camelCase fallback. The old fixture was
+        // camelCase only, a shape the server never sends — it hid the bug
+        // (audit 2026-09-22, C18).
         let json = #"""
         {"connections":[
-          {"id":"c1","provider":"google","accountEmail":"a@b.c","displayName":"A","selectedCalendarIds":["primary"],
-           "colorSlot":0,"connectedAt":"2026-06-01T00:00:00Z","needs_reauth":true,"last_error":"invalid_grant"},
+          {"id":"c1","user_id":"u1","provider":"google","account_email":"a@b.c","display_name":"A",
+           "selected_calendar_ids":["primary"],"color_slot":0,"last_sync_cursor":null,
+           "connected_at":"2026-06-01T00:00:00Z","needs_reauth":true,"last_error":"invalid_grant"},
           {"id":"c2","provider":"google","accountEmail":"d@e.f","displayName":"D","selectedCalendarIds":["primary"],
            "colorSlot":1,"connectedAt":"2026-06-01T00:00:00Z","needsReauth":false}
         ]}
@@ -82,6 +128,135 @@ final class CalendarClientVerdictTests: XCTestCase {
         XCTAssertEqual(statuses.map(\.needsReauth), [true, false])
         XCTAssertEqual(statuses[0].lastError, "invalid_grant")
         XCTAssertEqual(statuses.map(\.connection.id), ["c1", "c2"])
+        XCTAssertEqual(statuses[0].connection.accountEmail, "a@b.c")
+        XCTAssertEqual(statuses[1].connection.colorSlot, 1)
+    }
+
+    /// Exactly what handleListConnections returns. Before the fix this threw
+    /// keyNotFound(accountEmail) and pullCalendar gave up in silence.
+    static let serverConnectionsJSON = #"""
+    {"connections":[{"id":"c1","user_id":"u1","provider":"google","account_email":"a@b.c","display_name":"a@b.c",
+      "selected_calendar_ids":["primary","team@group.calendar.google.com"],"color_slot":2,"last_sync_cursor":null,
+      "connected_at":"2026-09-20T10:00:00.123456+00:00","needs_reauth":false,"last_error":null}]}
+    """#
+
+    static let serverConnection = CalendarConnection(
+        id: "c1", provider: .google, accountEmail: "a@b.c", displayName: "a@b.c",
+        selectedCalendarIds: ["primary", "team@group.calendar.google.com"], colorSlot: 2,
+        lastSyncCursor: nil, connectedAt: "2026-09-20T10:00:00.123456+00:00")
+
+    func testConnectionsWireDecodesTheFunctionsRealRows() throws {
+        let wire = try JSONDecoder().decode(CalendarClient.ConnectionsWire.self,
+                                            from: Data(Self.serverConnectionsJSON.utf8))
+        let statuses = wire.connections.map(\.status)
+        XCTAssertEqual(statuses.count, 1)
+        XCTAssertEqual(statuses[0].connection, Self.serverConnection)
+        XCTAssertFalse(statuses[0].needsReauth)
+        XCTAssertNil(statuses[0].lastError)
+    }
+
+    // MARK: - connect → local row
+
+    func testConnectResponseSeedsTheLocalRowLikeTheServerInsert() throws {
+        let body = #"""
+        {"id":"c1","accountEmail":"a@b.c","calendars":[{"id":"primary","summary":"a@b.c","primary":true},
+          {"id":"team@x","summary":"Team"}],"colorSlot":1,"reconnected":false}
+        """#
+        let r = try JSONDecoder().decode(CalendarClient.ConnectResponse.self, from: Data(body.utf8))
+        XCTAssertEqual(r.localConnection(connectedAt: "T"),
+                       CalendarConnection(id: "c1", provider: .google, accountEmail: "a@b.c", displayName: "a@b.c",
+                                          selectedCalendarIds: ["primary", "team@x"], colorSlot: 1,
+                                          lastSyncCursor: nil, connectedAt: "T"))
+        // No calendars listed and no slot: the server's insert defaults.
+        let bare = try JSONDecoder().decode(CalendarClient.ConnectResponse.self,
+                                            from: Data(#"{"id":"c2","accountEmail":"d@e.f","calendars":[]}"#.utf8))
+        let seeded = bare.localConnection(connectedAt: "T")
+        XCTAssertEqual(seeded.selectedCalendarIds, ["primary"])
+        XCTAssertEqual(seeded.colorSlot, 0)
+        XCTAssertEqual(seeded.displayName, "d@e.f")
+    }
+
+    // MARK: - the connections mirror
+
+    /// /events re-stamps last_sync_cursor on every pull, so a cursor-sensitive
+    /// compare rewrote calendar_connections on every foreground (audit
+    /// 2026-09-22, C18).
+    func testConnectionsMirrorIgnoresTheSyncCursorAndOrder() {
+        let c1 = Self.serverConnection
+        var c1Stamped = c1
+        c1Stamped.lastSyncCursor = "2026-09-23T08:00:00.000Z"
+        let c2 = CalendarConnection(id: "c2", provider: .google, accountEmail: "d@e.f", displayName: "d@e.f",
+                                    selectedCalendarIds: ["primary"], colorSlot: 1, connectedAt: "T")
+        XCTAssertFalse(SyncCoordinator.connectionsChanged([c1Stamped, c2], from: [c2, c1]))
+        XCTAssertFalse(SyncCoordinator.connectionsChanged([], from: []))
+        var narrowed = c1
+        narrowed.selectedCalendarIds = ["primary"]
+        XCTAssertTrue(SyncCoordinator.connectionsChanged([narrowed], from: [c1]), "a real change still writes")
+        XCTAssertTrue(SyncCoordinator.connectionsChanged([c1, c2], from: [c1]), "connected on web")
+        XCTAssertTrue(SyncCoordinator.connectionsChanged([], from: [c1]), "disconnected on web")
+    }
+
+    /// Overlapping pulls: an answer read before a newer one — or before the
+    /// app's own connect seed / disconnect delete — must not write the old
+    /// list back (audit 2026-09-22, C18).
+    func testConnectionsReadGateAppliesOnlyTheNewestRead() {
+        var gate = CalendarConnectionsReadGate()
+        // Two pulls overlap and the newer answer lands first.
+        let a = gate.begin(), b = gate.begin()
+        XCTAssertTrue(gate.admit(b))
+        XCTAssertFalse(gate.admit(a), "read before b, landed after it")
+        // In order, every answer applies.
+        let c = gate.begin()
+        XCTAssertTrue(gate.admit(c))
+        let d = gate.begin()
+        XCTAssertTrue(gate.admit(d))
+        // The connect seed lands while two reads are in flight: both were sent
+        // before the server stored the connection.
+        let e = gate.begin(), f = gate.begin()
+        gate.supersedeReadsInFlight()
+        XCTAssertFalse(gate.admit(f))
+        XCTAssertFalse(gate.admit(e))
+        let g = gate.begin()
+        XCTAssertTrue(gate.admit(g), "the post-connect pull applies")
+        // A newer read that failed never applied, so the older answer still does.
+        let h = gate.begin()
+        _ = gate.begin()   // offline — never admitted
+        XCTAssertTrue(gate.admit(h))
+    }
+
+    // MARK: - the GETs carry no body
+
+    func testConnectionsAndEventsAreBodylessGETs() async throws {
+        CalendarStubProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CalendarStubProtocol.self]
+        let client = SupabaseClient(
+            supabaseURL: URL(string: "https://stub.invalid")!, supabaseKey: "anon",
+            options: .init(auth: .init(storage: StubAuthStorage(), autoRefreshToken: false),
+                           global: .init(session: URLSession(configuration: config))))
+        let calendar = CalendarClient(client)
+
+        let statuses = try await calendar.listConnectionStatuses()
+        XCTAssertEqual(statuses.map(\.connection), [Self.serverConnection],
+                       "decoded end to end through the SDK's functions decoder")
+        let pull = try await calendar.pullEvents(from: "2026-09-15T00:00:00Z", to: "2026-10-23T00:00:00Z")
+        XCTAssertTrue(pull.events.isEmpty)
+
+        let requests = CalendarStubProtocol.recorded()
+        XCTAssertEqual(requests.count, 2)
+        for r in requests {
+            XCTAssertEqual(r.httpMethod, "GET")
+            // Inside a URLProtocol a body shows up as a stream, so check both.
+            XCTAssertNil(r.httpBody, "URLSession refuses a GET that carries a body (-1103)")
+            XCTAssertNil(r.httpBodyStream)
+            XCTAssertNil(r.value(forHTTPHeaderField: "Content-Type"))
+        }
+        XCTAssertEqual(requests.first?.url?.path, "/functions/v1/calendar-sync/connections")
+        let events = try XCTUnwrap(requests.last?.url)
+        XCTAssertEqual(events.path, "/functions/v1/calendar-sync/events")
+        let items = URLComponents(url: events, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(items.first { $0.name == "from" }?.value, "2026-09-15T00:00:00Z")
+        XCTAssertEqual(items.first { $0.name == "to" }?.value, "2026-10-23T00:00:00Z")
     }
 
     // MARK: - wake-window sample
@@ -102,4 +277,40 @@ final class CalendarClientVerdictTests: XCTestCase {
         XCTAssertEqual(la.firstInputLocal, "22:10")
         XCTAssertEqual(la.weekday, 6)
     }
+}
+
+/// Answers the calendar-sync GETs from fixtures and records every request.
+private final class CalendarStubProtocol: URLProtocol, @unchecked Sendable {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var requests: [URLRequest] = []
+
+    static func reset() { lock.withLock { requests = [] } }
+    static func recorded() -> [URLRequest] { lock.withLock { requests } }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lock.withLock { Self.requests.append(request) }
+        let path = request.url?.path ?? ""
+        let body = path.hasSuffix("/calendar-sync/connections")
+            ? CalendarClientVerdictTests.serverConnectionsJSON
+            : #"{"events":[],"failures":[]}"#
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(body.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+/// Session storage that lives and dies with the test — NOT the keychain.
+private final class StubAuthStorage: AuthLocalStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    func store(key: String, value: Data) throws { lock.withLock { values[key] = value } }
+    func retrieve(key: String) throws -> Data? { lock.withLock { values[key] } }
+    func remove(key: String) throws { _ = lock.withLock { values.removeValue(forKey: key) } }
 }
