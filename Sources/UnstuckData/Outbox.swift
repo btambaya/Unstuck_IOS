@@ -12,6 +12,9 @@
 //    compares the SERVER's updated_at with this base — both server clocks,
 //    so device-clock skew can't misjudge an offline edit — and, on a real
 //    conflict, does a 3-way field merge instead of dropping the whole op.
+//    A SECOND queued edit's base is the first edit's local row (device
+//    clock), so the prune judges a row's queued edits as one chain, by its
+//    oldest op (audit 2026-09-22, C9).
 //  • `attempts` counts SERVER REJECTIONS only (never offline / 5xx / auth
 //    failures). At `OutboxStore.quarantineCap` rejections the op is
 //    quarantined: kept in the outbox (so hydrate keeps the local row and a
@@ -177,7 +180,12 @@ public struct OutboxStore: Sendable {
     }
 
     public func markDone(_ opSeq: Int64) throws {
-        _ = try db.writer.write { try OutboxOp.deleteOne($0, key: opSeq) }
+        try db.writer.write { try Self.markDone(in: $0, opSeq) }
+    }
+
+    /// Same, on an OPEN connection (see `enqueue(in:…)`).
+    public static func markDone(in db: Database, _ opSeq: Int64) throws {
+        _ = try OutboxOp.deleteOne(db, key: opSeq)
     }
 
     /// Drop any queued upsert (and rpc-mutation) ops for a row about to be
@@ -213,13 +221,20 @@ public struct OutboxStore: Sendable {
     /// Replace an op's payload + base in place (the prune's 3-way merge
     /// rewrites a conflicting task op as "local diff on top of the server row").
     public func replacePayload(_ opSeq: Int64, payload: String, baseUpdatedAt: String?, basePayload: String?) throws {
-        try db.writer.write { db in
-            guard var op = try OutboxOp.fetchOne(db, key: opSeq) else { return }
-            op.payload = payload
-            op.baseUpdatedAt = baseUpdatedAt
-            op.basePayload = basePayload
-            try op.update(db)
+        try db.writer.write {
+            try Self.replacePayload(in: $0, opSeq, payload: payload, baseUpdatedAt: baseUpdatedAt, basePayload: basePayload)
         }
+    }
+
+    /// Same, on an OPEN connection (see `enqueue(in:…)`) — the prune rewrites
+    /// a row's whole chain of queued edits in one transaction.
+    public static func replacePayload(in db: Database, _ opSeq: Int64, payload: String,
+                                      baseUpdatedAt: String?, basePayload: String?) throws {
+        guard var op = try OutboxOp.fetchOne(db, key: opSeq) else { return }
+        op.payload = payload
+        op.baseUpdatedAt = baseUpdatedAt
+        op.basePayload = basePayload
+        try op.update(db)
     }
 
     public func count() throws -> Int {

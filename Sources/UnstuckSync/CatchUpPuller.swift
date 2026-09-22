@@ -57,6 +57,13 @@ public actor CatchUpPuller {
         public var seededRowsApplied = 0
         /// Tables that were pulled in full because they had no cursor.
         public var seededTables: [String] = []
+        /// A `collections` row this device had not seen (strictly newer than
+        /// the cursor the pull started from, or the table was being seeded)
+        /// was applied or skipped. The server row carries no membership, and
+        /// migration 056 §4 bumps `updated_at` on every collection_members
+        /// change — so this is what tells the catch-up to re-read membership
+        /// (audit 2026-09-22, C8). The inclusive boundary re-read never sets it.
+        public var collectionsChanged = false
 
         public var changed: Bool { rowsApplied > 0 || idsDropped > 0 }
         public init() {}
@@ -88,18 +95,25 @@ public actor CatchUpPuller {
     private let box: OutboxStore
     /// Full-replace fallback for the two tables the server gives no cursor for.
     private let fullFallback: @Sendable (String) async -> Bool
+    /// Collections membership re-read, run right after the collections pull:
+    /// `(userId, collectionsChanged)`, and the Hydrator decides (it also
+    /// retries a membership read that failed earlier). Injected like
+    /// `fullFallback`.
+    private let refreshCollections: @Sendable (String, Bool) async -> Void
     private let decoder = JSONDecoder()
 
     static let pageSize = 500
     static let idPageSize = 1000
 
     public init(gateway: any SyncReadGatewayProtocol, db: AppDatabase,
-                fullFallback: @escaping @Sendable (String) async -> Bool) {
+                fullFallback: @escaping @Sendable (String) async -> Bool,
+                refreshCollections: @escaping @Sendable (String, Bool) async -> Void = { _, _ in }) {
         self.gateway = gateway
         self.db = db
         self.cursors = SyncCursorStore(db)
         self.box = OutboxStore(db)
         self.fullFallback = fullFallback
+        self.refreshCollections = refreshCollections
     }
 
     /// Tables with no monotonic server column — pulled by full replace.
@@ -113,6 +127,12 @@ public actor CatchUpPuller {
         var outcome = Outcome()
         for table in Self.deltaTables {
             await pull(table, userId: userId, into: &outcome)
+            // Right after the collections page, not after every table: an edit
+            // made while the rest of the pull runs would still route on the
+            // stale membership.
+            if table.name == "collections" {
+                await refreshCollections(userId, outcome.collectionsChanged)
+            }
         }
         for name in Self.fullReplaceTables {
             if await fullFallback(name) {
@@ -137,6 +157,7 @@ public actor CatchUpPuller {
         // health of the realtime channel.
         let seeding = startCursor == nil
         if seeding { outcome.seededTables.append(table.name) }
+        let startMs = startCursor.flatMap(Time.parseMillis)
         var after = startCursor
         var seenIds = Set<String>()
         var highWater: String?
@@ -161,6 +182,8 @@ public actor CatchUpPuller {
                 guard let id = Self.stringField("id", in: raw) else { continue }
                 guard seenIds.insert(id).inserted else { continue }   // page-boundary tie
                 let stamp = Self.stringField(table.column, in: raw)
+                let stampMs = stamp.flatMap(Time.parseMillis)
+                let newerThanStart = stampMs.flatMap { ms in startMs.map { ms > $0 } } ?? false
                 // A row this device DELETED whose delete hasn't reached the
                 // server yet is still on the server, so the pull carries it.
                 // Applying it would resurrect something the user removed; the
@@ -173,8 +196,7 @@ public actor CatchUpPuller {
                     outcome.rowsApplied += 1
                     if seeding {
                         outcome.seededRowsApplied += 1
-                    } else if let ms = stamp.flatMap(Time.parseMillis),
-                              let startCursor, let startMs = Time.parseMillis(startCursor), ms > startMs {
+                    } else if newerThanStart, let ms = stampMs {
                         // ONLY rows strictly newer than the mark we asked from.
                         // The pull is inclusive (`>= cursor`) on purpose — every
                         // tick re-reads the boundary row of every table — and
@@ -189,6 +211,10 @@ public actor CatchUpPuller {
                 case .failed:
                     // Don't move the cursor past a row we couldn't take.
                     blocked = true
+                }
+                // Skipped rows count too: the cursor still moves past them.
+                if table.name == "collections", verdict != .failed, seeding || newerThanStart {
+                    outcome.collectionsChanged = true
                 }
                 if blocked { break }
                 if let stamp { lastStamp = stamp }
@@ -316,6 +342,9 @@ public actor CatchUpPuller {
                        }
                        // members/myRole are client-only and the server row
                        // carries neither — preserve them (realtime mirror parity).
+                       // catchUp re-reads them right after this table's pull
+                       // (`refreshCollections`), which also gives a newly
+                       // visible foreign list its real myRole (audit 2026-09-22, C8).
                        var merged = row.model()
                        let existing = try? db.fetchById(ItemCollection.self, id: merged.id)
                        merged.members = existing?.members ?? []

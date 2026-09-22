@@ -80,6 +80,25 @@ final class OutboxTests: XCTestCase {
         XCTAssertEqual(after.basePayload, "{\"v\":2}")
     }
 
+    /// The prune rewrites a row's whole chain of queued edits inside ONE write
+    /// transaction (audit 2026-09-22, C9), so both rewrites work on an open
+    /// connection too.
+    func testPayloadRewriteAndMarkDoneWorkOnAnOpenConnection() throws {
+        let op = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert, payload: "{\"v\":2}", nowISO: now,
+                                 baseUpdatedAt: "2026-05-21T09:00:00.000Z", basePayload: "{\"v\":1}")
+        let other = try box.enqueue(table: "tasks", rowId: "t2", kind: .upsert, payload: "{\"v\":9}", nowISO: now)
+        try db.writer.write { conn in
+            try OutboxStore.replacePayload(in: conn, op.opSeq!, payload: "{\"v\":3}",
+                                           baseUpdatedAt: "2026-05-21T10:00:00.000Z", basePayload: "{\"v\":2}")
+            try OutboxStore.markDone(in: conn, other.opSeq!)
+        }
+        let left = try box.pending()
+        XCTAssertEqual(left.map(\.rowId), ["t1"], "markDone(in:) removed only its op")
+        XCTAssertEqual(left.first?.payload, "{\"v\":3}")
+        XCTAssertEqual(left.first?.baseUpdatedAt, "2026-05-21T10:00:00.000Z")
+        XCTAssertEqual(left.first?.basePayload, "{\"v\":2}")
+    }
+
     // MARK: - parking (sign-out while offline)
 
     func testParkMovesEveryOpUnderTheUserAndRestoreBringsOnlyTheirsBack() throws {

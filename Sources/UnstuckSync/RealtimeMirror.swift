@@ -197,8 +197,10 @@ public actor RealtimeMirror {
         await subscribe("call_requests", CallRequest.self, userId: userId,
                         onUpsert: { [db] row in try? CallRequestsMirror(db).upsert(row) },
                         onDelete: { [db] in try? db.deleteById(CallRequest.self, id: $0) })
-        // Membership changes for ME — a new share or a revocation. Re-hydrate
-        // collections so the freshly-shared list appears / the revoked one drops.
+        // Membership changes for ME (a new share or a revocation) AND on lists
+        // I OWN (someone joined or left). Re-hydrate collections so the
+        // freshly-shared list appears / the revoked one drops, and the owner's
+        // members[] (what routes item edits through the RPCs) stays current.
         await subscribeMembers(userId: userId, onChanged: onMembersChanged)
         await subscribePreferences(userId: userId)
     }
@@ -298,10 +300,18 @@ public actor RealtimeMirror {
         streamTasks.append(Task { await Self.subscribeWithRetry(channel, table: table) })
     }
 
-    /// collection_members for ME (filtered user_id=eq). Any insert/update/delete
-    /// → re-hydrate collections via [onChanged] (RLS decides which rows return).
-    /// Doesn't mirror rows itself — membership lives in the collection's
+    /// collection_members, UNFILTERED — RLS ("member or owner") decides
+    /// delivery, so rows for me AND rows on lists I own arrive. Any
+    /// insert/update/delete → re-hydrate collections via [onChanged]. Doesn't
+    /// mirror rows itself — membership lives in the collection's
     /// members[]/myRole, refreshed by the hydrate.
+    /// It was filtered to user_id = me, so the owner never heard a join by
+    /// link, an invite claimed at sign-up, a share made on another device or a
+    /// member leaving: its list kept `members == []`, read as unshared, and its
+    /// item edits went out as whole-row upserts over the members' RPC edits
+    /// (audit 2026-09-22, C8; web realtime.ts / Android RealtimeMirror parity).
+    /// Cost: Realtime can't RLS-check a DELETE, so every membership delete
+    /// anywhere costs one (coalesced) hydrateCollections.
     private func subscribeMembers(userId: String, onChanged: @escaping @Sendable () async -> Void) async {
         let report = onRealtimeEvent ?? {}
         await subscribeSignal(table: "collection_members", userId: userId) {
@@ -328,12 +338,19 @@ public actor RealtimeMirror {
         }
     }
 
-    /// A signal-only channel: any INSERT/UPDATE/DELETE for this user runs
-    /// `onChanged`. Nothing is mirrored into the local store.
+    /// Signal tables subscribed WITHOUT the user_id filter (RLS decides who
+    /// hears a row). The preference tables are singleton rows per user and
+    /// keep theirs.
+    static let unfilteredSignalTables: Set<String> = ["collection_members"]
+
+    /// A signal-only channel: any INSERT/UPDATE/DELETE for this user (or, for
+    /// `unfilteredSignalTables`, any row RLS delivers) runs `onChanged`.
+    /// Nothing is mirrored into the local store.
     private func subscribeSignal(table: String, userId: String,
                                  onChanged: @escaping @Sendable () async -> Void) async {
         let channel = client.channel("unstuck_\(table)_\(userId)")
-        let filter = RealtimePostgresFilter.eq("user_id", value: userId)
+        let filter: RealtimePostgresFilter? = Self.unfilteredSignalTables.contains(table)
+            ? nil : .eq("user_id", value: userId)
         let inserts = channel.postgresChange(InsertAction.self, schema: "public", table: table, filter: filter)
         let updates = channel.postgresChange(UpdateAction.self, schema: "public", table: table, filter: filter)
         let deletes = channel.postgresChange(DeleteAction.self, schema: "public", table: table, filter: filter)

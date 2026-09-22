@@ -119,6 +119,10 @@ public actor SyncCoordinator {
         let catchUpPuller = CatchUpPuller(gateway: gateway, db: db,
                                           fullFallback: { table in
                                               await hydrator.hydrateFullReplaceTable(table)
+                                          },
+                                          refreshCollections: { uid, changed in
+                                              await hydrator.refreshCollectionMembership(userId: uid,
+                                                                                         collectionsChanged: changed)
                                           })
         self.hydrator = hydrator
         self.flusher = flusher
@@ -442,8 +446,15 @@ public actor SyncCoordinator {
         if let uid = auth.currentUserId {
             let auth = self.auth
             let flusher = self.flusher
+            let hydrator = self.hydrator
             await withTaskGroup(of: Void.self) { group in
-                group.addTask { await flusher.flush(userId: uid, currentUserId: { auth.currentUserId }) }
+                // Prune first, like every other flush: this was the one drain
+                // that could push a queued task edit over a newer web change
+                // (audit 2026-09-22, C9). Whatever the 5s can't drain is parked.
+                group.addTask {
+                    await hydrator.pruneStaleTaskOps()
+                    await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
+                }
                 group.addTask { try? await Task.sleep(nanoseconds: 5_000_000_000) }
                 _ = await group.next()   // whichever finishes first: drain or timeout
                 group.cancelAll()
