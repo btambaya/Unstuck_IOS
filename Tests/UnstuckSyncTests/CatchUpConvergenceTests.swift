@@ -25,6 +25,12 @@ private actor FakeServer: SyncReadGatewayProtocol {
     private(set) var fullReadsByTable: [String: Int] = [:]
     /// Full reads of a table that time out before one succeeds.
     private var failingFullReads: [String: Int] = [:]
+    /// Runs as a full read of that table starts (a write landing mid-read).
+    private var onFullRead: [String: @Sendable () -> Void] = [:]
+
+    func setOnFullRead(_ table: String, _ hook: @escaping @Sendable () -> Void) {
+        onFullRead[table] = hook
+    }
 
     func put(_ table: String, _ data: Data) {
         guard let id = CatchUpPuller.stringField("id", in: data) else { return }
@@ -47,6 +53,7 @@ private actor FakeServer: SyncReadGatewayProtocol {
     func fetchAllRaw(table: String) async throws -> [Data] {
         fullTableReads += 1
         fullReadsByTable[table, default: 0] += 1
+        onFullRead[table]?()
         if let left = failingFullReads[table], left > 0 {
             failingFullReads[table] = left - 1
             throw URLError(.timedOut)
@@ -384,9 +391,9 @@ final class CatchUpConvergenceTests: XCTestCase {
         return try JSONSerialization.data(withJSONObject: obj)
     }
 
-    private func memberRow(_ collectionId: String, _ userId: String) throws -> Data {
+    private func memberRow(_ collectionId: String, _ userId: String, role: String = "editor") throws -> Data {
         try JSONSerialization.data(withJSONObject: ["id": "m-\(collectionId)-\(userId)", "collection_id": collectionId,
-                                                    "user_id": userId, "role": "editor"])
+                                                    "user_id": userId, "role": role])
     }
 
     /// The puller wired exactly as SyncCoordinator wires it.
@@ -469,6 +476,60 @@ final class CatchUpConvergenceTests: XCTestCase {
         _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
         let reads = await membershipReads()
         XCTAssertEqual(reads, readsAfterFix, "once resolved, quiet ticks stop re-reading")
+    }
+
+    /// The re-read also runs after the user's OWN list edits (realtime never
+    /// moves the cursor), so it must never touch content. A full collections
+    /// read + replace here raced the debounced flush: an edit acked or echoed
+    /// between that read and the write went back to the older snapshot, and
+    /// the owner's next whole-row upsert, built on it, deleted it on the server.
+    func testTheCatchUpMembershipReReadNeverRevertsAListEdit() async throws {
+        try db.save(ItemCollection(id: "c1", name: "Groceries", color: "indigo", items: [], sortOrder: 0,
+                                   ownerId: uid, members: [], myRole: "owner"))
+        await server.put("collections", try listRow("c1", owner: uid, updatedAt: "2026-09-12T09:00:00.000000+00:00"))
+        let puller = makeMembershipPuller(Hydrator(gateway: server, db: db))
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)   // seeds the cursors
+
+        // The partner joins (056 §4 bumps the list), and while the membership
+        // read is in flight the owner's "milk" lands: the flush acked it and
+        // the realtime echo wrote it locally.
+        await server.put("collection_members", try memberRow("c1", partner))
+        await server.put("collections", try listRow("c1", owner: uid, updatedAt: "2026-09-12T09:05:00.000000+00:00"))
+        let db = self.db!
+        await server.setOnFullRead("collection_members") {
+            guard var c1 = try? db.fetchById(ItemCollection.self, id: "c1") else { return }
+            c1.items = [CollectionItem(id: "i-milk", body: "milk", at: "2026-09-12T09:06:00.000Z")]
+            try? db.save(c1)
+        }
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+
+        let c1 = try XCTUnwrap(db.fetchById(ItemCollection.self, id: "c1"))
+        XCTAssertEqual(c1.items.map(\.id), ["i-milk"], "the edit that landed mid-read is kept")
+        XCTAssertEqual(c1.members, [partner], "and the list now reads as shared")
+        let listReads = await server.fullReadsByTable["collections"] ?? 0
+        XCTAssertEqual(listReads, 0, "the pull already applied the list: only membership is read")
+    }
+
+    /// A list shared WITH me arrives through the pull with no role (the server
+    /// row carries none); the membership re-read gives it the real one, so a
+    /// viewer doesn't get edit controls.
+    func testAListSharedWithMeGetsItsRoleFromTheCatchUp() async throws {
+        try db.save(ItemCollection(id: "c1", name: "Groceries", color: "indigo", items: [], sortOrder: 0,
+                                   ownerId: uid, members: [], myRole: "owner"))
+        await server.put("collections", try listRow("c1", owner: uid, updatedAt: "2026-09-12T09:00:00.000000+00:00"))
+        let puller = makeMembershipPuller(Hydrator(gateway: server, db: db))
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)   // seeds the cursors
+
+        await server.put("collection_members", try memberRow("c9", uid, role: "viewer"))
+        await server.put("collections", try listRow("c9", owner: partner, updatedAt: "2026-09-12T09:05:00.000000+00:00"))
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+
+        let c9 = try XCTUnwrap(db.fetchById(ItemCollection.self, id: "c9"))
+        XCTAssertEqual(c9.myRole, "viewer")
+        XCTAssertEqual(c9.members, [uid])
+        XCTAssertEqual(try db.fetchById(ItemCollection.self, id: "c1")?.myRole, "owner", "my own list is untouched")
     }
 
     /// Every gap trigger must also re-read the account-wide preference rows —

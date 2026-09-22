@@ -447,21 +447,34 @@ public actor SyncCoordinator {
             let auth = self.auth
             let flusher = self.flusher
             let hydrator = self.hydrator
-            await withTaskGroup(of: Void.self) { group in
-                // Prune first, like every other flush: this was the one drain
-                // that could push a queued task edit over a newer web change
-                // (audit 2026-09-22, C9). Whatever the 5s can't drain is parked.
-                group.addTask {
-                    await hydrator.pruneStaleTaskOps()
-                    await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
-                }
-                group.addTask { try? await Task.sleep(nanoseconds: 5_000_000_000) }
-                _ = await group.next()   // whichever finishes first: drain or timeout
-                group.cancelAll()
-            }
+            await Self.drainBeforeSignOut(timeoutNs: 5_000_000_000,
+                                          prune: { await hydrator.pruneStaleTaskOps() },
+                                          flush: { await flusher.flush(userId: uid, currentUserId: { auth.currentUserId }) })
         }
         if let deviceId { try? await push.unregister(deviceId: deviceId) }
         await auth.signOut()
+    }
+
+    /// The bounded pre-sign-out drain: prune, then flush, until the timeout.
+    /// Prune first, like every other flush: this was the one drain that could
+    /// push a queued task edit over a newer web change (audit 2026-09-22, C9).
+    /// If the timeout fires during the prune, its tasks GET is cancelled and it
+    /// gives up, so flushing then would send the UNPRUNED ops. They are
+    /// skipped instead: parked at sign-out, restored and pruned at the next
+    /// sign-in.
+    static func drainBeforeSignOut(timeoutNs: UInt64,
+                                   prune: @escaping @Sendable () async -> Void,
+                                   flush: @escaping @Sendable () async -> Void) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                await prune()
+                guard !Task.isCancelled else { return }
+                await flush()
+            }
+            group.addTask { try? await Task.sleep(nanoseconds: timeoutNs) }
+            _ = await group.next()   // whichever finishes first: drain or timeout
+            group.cancelAll()
+        }
     }
 
     private func handle(event: AuthChangeEvent, session: Supabase.Session?) async {

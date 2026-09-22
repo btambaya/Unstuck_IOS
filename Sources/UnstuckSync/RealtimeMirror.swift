@@ -311,7 +311,8 @@ public actor RealtimeMirror {
     /// item edits went out as whole-row upserts over the members' RPC edits
     /// (audit 2026-09-22, C8; web realtime.ts / Android RealtimeMirror parity).
     /// Cost: Realtime can't RLS-check a DELETE, so every membership delete
-    /// anywhere costs one (coalesced) hydrateCollections.
+    /// anywhere reaches this channel; a burst costs at most two
+    /// hydrateCollections (`coalescedSignal`).
     private func subscribeMembers(userId: String, onChanged: @escaping @Sendable () async -> Void) async {
         let report = onRealtimeEvent ?? {}
         await subscribeSignal(table: "collection_members", userId: userId) {
@@ -355,11 +356,29 @@ public actor RealtimeMirror {
         let updates = channel.postgresChange(UpdateAction.self, schema: "public", table: table, filter: filter)
         let deletes = channel.postgresChange(DeleteAction.self, schema: "public", table: table, filter: filter)
         channels.append(channel)
-        streamTasks.append(Task { for await _ in inserts { await onChanged() } })
-        streamTasks.append(Task { for await _ in updates { await onChanged() } })
-        streamTasks.append(Task { for await _ in deletes { await onChanged() } })
+        // Each stream used to await `onChanged` once per event, so N buffered
+        // collection_members deletes (a list deleted with N members, an
+        // account deletion's cascade; the channel is unfiltered now) ran N
+        // back-to-back collections hydrates. One consumer for all three
+        // streams, and whatever lands while it runs is one trailing run
+        // (audit 2026-09-22, C8).
+        let (signal, consumer) = Self.coalescedSignal(onChanged)
+        streamTasks.append(consumer)
+        streamTasks.append(Task { for await _ in inserts { signal() } })
+        streamTasks.append(Task { for await _ in updates { signal() } })
+        streamTasks.append(Task { for await _ in deletes { signal() } })
         streamTasks.append(channelStatusObserver(channel, table: table))
         streamTasks.append(Task { await Self.subscribeWithRetry(channel, table: table) })
+    }
+
+    /// `signal()` never waits. `onChanged` runs once for every signal that
+    /// arrived before that run started: a burst costs one run plus at most
+    /// one trailing run. Cancelling `consumer` stops it.
+    static func coalescedSignal(_ onChanged: @escaping @Sendable () async -> Void)
+        -> (signal: @Sendable () -> Void, consumer: Task<Void, Never>) {
+        let (signals, continuation) = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        let consumer = Task { for await _ in signals { await onChanged() } }
+        return ({ continuation.yield() }, consumer)
     }
 
     /// Subscribe a channel, retrying on failure with capped exponential

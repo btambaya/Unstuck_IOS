@@ -387,30 +387,31 @@ public actor Hydrator {
         afterProfileFactsLocalRead = hook
     }
 
-    // Coalesce overlapping collections hydrates, like `hydrate()`. Every
-    // collection_members realtime event runs one, and that channel now carries
-    // the owner's lists too (a membership DELETE anywhere reaches every client:
-    // Realtime can't RLS-check a delete), plus the catch-up's refresh below.
-    // One run at a time, one trailing run for whatever arrived meanwhile, so a
-    // burst costs at most two pulls and two replaces never interleave. A caller
-    // that arrives mid-run returns only after the trailing run, so "awaited =
-    // re-read after my call" still holds for the share / unshare / leave paths.
-    // (audit 2026-09-22, C8)
+    // Coalesce overlapping collections hydrates, like `hydrate()`. The
+    // collection_members realtime channel runs one per burst of events
+    // (RealtimeMirror.coalescedSignal), and that channel now carries the
+    // owner's lists too (a membership DELETE anywhere reaches every client:
+    // Realtime can't RLS-check a delete); the share / unshare / leave paths
+    // run one each. One run at a time, one trailing run for whatever arrived
+    // meanwhile, so two replaces never interleave. A caller that arrives
+    // mid-run returns only after the trailing run, so "awaited = re-read
+    // after my call" still holds for those paths. (audit 2026-09-22, C8)
     private var collectionsInFlight = false
     private var collectionsPendingUserId: String?
     private var collectionsWaiters: [CheckedContinuation<Void, Never>] = []
 
-    /// True while the last collections hydrate could not read membership. Only
-    /// a successful read clears it; until then every catch-up re-reads, because
-    /// a device that knew nothing (a fresh sign-in) filled its lists with no
-    /// members and the owner's edits would route as unshared.
+    /// True while the last membership read (a collections hydrate's or the
+    /// catch-up's) failed. Only a successful read clears it; until then every
+    /// catch-up re-reads, because a device that knew nothing (a fresh sign-in)
+    /// filled its lists with no members and the owner's edits would route as
+    /// unshared.
     private var membershipUnresolved = false
 
     /// Collections + their membership. RLS returns own AND shared-with-me rows;
     /// `collection_members` (visible to member or owner) supplies each row's
     /// members[] + the current user's myRole. Mirrors hydrate.ts / the Android
     /// Hydrator. Also invoked standalone when a collection_members realtime
-    /// event fires, and by the catch-up (`refreshCollectionMembership`).
+    /// event fires.
     public func hydrateCollections(userId: String) async {
         guard !collectionsInFlight else {
             collectionsPendingUserId = userId
@@ -439,15 +440,71 @@ public actor Hydrator {
     /// the owner's phone kept `members == []`, `isShared` stayed false, and
     /// its item edits went out as whole-row upserts that deleted what the
     /// members added (audit 2026-09-22, C8).
+    ///
+    /// It only PATCHES members/myRole onto the local rows: the pull right
+    /// before it already applied every newer collections row. A full
+    /// collections replace here (it runs after the user's own list edits too:
+    /// realtime never moves the cursor) raced the debounced flush. An edit
+    /// acked, or echoed, between its collections read and its write was
+    /// reverted to the older snapshot, and on an unshared list the owner's
+    /// next whole-row upsert, built on that row, deleted the edit on the
+    /// server. Rows are read and written in one transaction, so no content
+    /// can go back.
     public func refreshCollectionMembership(userId: String, collectionsChanged: Bool) async {
         guard collectionsChanged || membershipUnresolved else { return }
-        await hydrateCollections(userId: userId)
+        let memberRows: [MemberRow]
+        do {
+            memberRows = try await gateway.fetchAllTolerant(MemberRow.self, table: "collection_members")
+        } catch {
+            membershipUnresolved = true
+            print("[catchup] collection_members failed, retrying on the next catch-up: \(error)")
+            return
+        }
+        let byColl = Self.membersByCollection(memberRows)
+        do {
+            try db.transaction { conn in
+                for var c in try ItemCollection.fetchAll(conn) {
+                    let ms = byColl[c.id] ?? []
+                    let role = c.ownerId == userId ? "owner" : ms.first { $0.0 == userId }?.1
+                    // Someone else's list with no row for me: I can no longer see
+                    // it, and the reconcile / the members event removes it. Don't
+                    // strip its role in the meantime.
+                    guard c.ownerId == userId || role != nil else { continue }
+                    let members = ms.map { $0.0 }
+                    guard c.members != members || c.myRole != role else { continue }
+                    c.members = members
+                    c.myRole = role
+                    try c.update(conn)
+                }
+            }
+            membershipUnresolved = false
+        } catch {
+            membershipUnresolved = true
+            print("[catchup] collection membership not saved, retrying on the next catch-up: \(error)")
+        }
+    }
+
+    /// collectionId -> [(userId, role)], in server order.
+    private static func membersByCollection(_ rows: [MemberRow]) -> [String: [(String, String)]] {
+        var byColl: [String: [(String, String)]] = [:]
+        for m in rows {
+            byColl[m.collectionId, default: []].append((m.userId, m.role ?? "editor"))
+        }
+        return byColl
     }
 
     /// Test seam: callers parked behind an in-flight collections hydrate.
     var collectionsHydrateWaiterCount: Int { collectionsWaiters.count }
 
     private func performHydrateCollections(userId: String) async {
+        // A collections op queued now can be acked (and its row echoed) while
+        // the reads below are in flight, so their snapshot predates it and the
+        // replace finds nothing queued. Those rows count as pending anyway: an
+        // edit acked mid-read was reverted to the pre-edit snapshot (and the
+        // owner's next whole-row upsert, built on it, deleted the edit on the
+        // server), and a list deleted mid-read came back. This runs on every
+        // membership event now (audit 2026-09-22, C8).
+        let queuedAtStart = ((try? box.pending()) ?? []).filter { $0.tableName == "collections" }
         do {
             // Per-row tolerant decode (see replace()): a single bad collection
             // row mustn't drop the user's entire list of collections.
@@ -465,10 +522,7 @@ public actor Hydrator {
                 print("[hydrate] collection_members failed, keeping the membership this device knows: \(error)")
                 memberRows = nil
             }
-            var byColl: [String: [(String, String)]] = [:]   // collectionId -> [(userId, role)]
-            for m in memberRows ?? [] {
-                byColl[m.collectionId, default: []].append((m.userId, m.role ?? "editor"))
-            }
+            let byColl = Self.membersByCollection(memberRows ?? [])
             // Preserve unsynced optimistic collections (those with a pending
             // collections upsert op in the outbox): a just-created/edited list
             // isn't in `enriched` yet, so the replace would wipe it off the UI
@@ -488,11 +542,10 @@ public actor Hydrator {
                     return out
                 }
                 // A list whose DELETE is still queued stays gone: this now runs
-                // from the catch-up and on every membership event, not only
-                // after a flush.
-                let pendingDeletes = Set(try OutboxStore.pending(in: conn)
-                    .filter { $0.tableName == "collections" && $0.kind == .delete }.map(\.rowId))
-                let pending = try Self.pendingUpsertIds(in: conn, table: "collections")
+                // on every membership event, not only after a flush.
+                let ops = try OutboxStore.pending(in: conn).filter { $0.tableName == "collections" } + queuedAtStart
+                let pendingDeletes = Set(ops.filter { $0.kind == .delete }.map(\.rowId))
+                let pending = Set(ops.filter { $0.kind == .upsert || $0.kind == .rpc }.map(\.rowId))
                 // A queued row keeps its content intent but takes the membership
                 // just read: membership is server truth, never a local edit.
                 return SyncDecision.mergeHydratedRows(remote: enriched.filter { !pendingDeletes.contains($0.id) },

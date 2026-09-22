@@ -32,6 +32,7 @@ private actor FakeReadGateway: SyncReadGatewayProtocol {
     func fetchAllRaw(table: String) async throws -> [Data] {
         guard table == "tasks" else { return [] }
         await onFetch?()
+        try Task.checkCancellation()   // a cancelled GET throws, like URLSession's
         let encoder = JSONEncoder()
         return try taskRows.map { try encoder.encode($0) }
     }
@@ -452,5 +453,58 @@ final class HydratorPruneTests: XCTestCase {
         XCTAssertEqual(local.estimateMin, 10, "the local row follows the LAST op, not the first op's merge")
         XCTAssertEqual(local.name, "Call mom re: birthday")
         XCTAssertTrue(local.done)
+    }
+
+    // MARK: - the bounded sign-out drain (audit 2026-09-22, C9)
+
+    /// The sign-out drain prunes before it flushes, like every other flush.
+    func testASignOutDrainPrunesBeforeItFlushes() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "stale", updatedAt: "2026-05-21T10:00:00.000Z"),
+                            nowISO: "2026-05-21T10:00:00.000Z")
+        _ = try box.enqueue(table: "tasks", rowId: "t2", kind: .upsert,
+                            payload: try taskPayload(id: "t2", name: "made offline", updatedAt: "2026-05-21T10:02:00.000Z"),
+                            nowISO: "2026-05-21T10:02:00.000Z")
+        let read = FakeReadGateway(taskRows: [
+            TaskRow(TaskItem(id: "t1", name: "server-new", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:05:00.000Z"))
+        ])
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+
+        await SyncCoordinator.drainBeforeSignOut(timeoutNs: 5_000_000_000,
+                                                 prune: { await hydrator.pruneStaleTaskOps() },
+                                                 flush: { await flusher.flush(userId: "u1") })
+
+        let upserts = await write.upserts
+        XCTAssertEqual(upserts.map(\.id), ["t2"], "the stale op is pruned, the new row is sent")
+        XCTAssertEqual(try box.count(), 0)
+    }
+
+    /// The timeout fires while the prune's tasks GET is in flight (a slow
+    /// link): the GET is cancelled and the prune gives up. The drain went on
+    /// to flush anyway and sent the UNPRUNED op over the newer server row, so
+    /// a web completion was re-opened at sign-out. It must stay queued
+    /// instead, to be parked and pruned at the next sign-in.
+    func testASignOutDrainCutShortDuringThePruneSendsNothing() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "stale", updatedAt: "2026-05-21T10:00:00.000Z"),
+                            nowISO: "2026-05-21T10:00:00.000Z")
+        let read = FakeReadGateway(taskRows: [
+            TaskRow(TaskItem(id: "t1", name: "server-new", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:05:00.000Z"))
+        ], onFetch: { try? await Task.sleep(nanoseconds: 10_000_000_000) })
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+
+        await SyncCoordinator.drainBeforeSignOut(timeoutNs: 50_000_000,
+                                                 prune: { await hydrator.pruneStaleTaskOps() },
+                                                 flush: { await flusher.flush(userId: "u1") })
+
+        let upserts = await write.upserts
+        XCTAssertTrue(upserts.isEmpty, "the unpruned op must not be sent over the newer server row")
+        XCTAssertEqual(try box.count(), 1, "it stays queued, to be parked and pruned at the next sign-in")
     }
 }

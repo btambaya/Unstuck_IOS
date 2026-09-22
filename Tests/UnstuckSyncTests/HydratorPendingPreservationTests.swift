@@ -20,9 +20,12 @@ private actor FakeRawGateway: SyncReadGatewayProtocol {
     private let rowsByTable: [String: [Data]]
     /// Tables whose read times out (a flaky link between two back-to-back GETs).
     private let failing: Set<String>
-    init(rowsByTable: [String: [Data]], failing: Set<String> = []) {
+    /// Runs as a table's read starts — lets a test land a flush between reads.
+    private let onRead: (@Sendable (String) -> Void)?
+    init(rowsByTable: [String: [Data]], failing: Set<String> = [], onRead: (@Sendable (String) -> Void)? = nil) {
         self.rowsByTable = rowsByTable
         self.failing = failing
+        self.onRead = onRead
     }
     func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] {
         if failing.contains(table) { throw URLError(.timedOut) }
@@ -30,6 +33,7 @@ private actor FakeRawGateway: SyncReadGatewayProtocol {
         return (rowsByTable[table] ?? []).compactMap { try? dec.decode(Row.self, from: $0) }
     }
     func fetchAllRaw(table: String) async throws -> [Data] {
+        onRead?(table)
         if failing.contains(table) { throw URLError(.timedOut) }
         return rowsByTable[table] ?? []
     }
@@ -328,6 +332,37 @@ final class HydratorPendingPreservationTests: XCTestCase {
         XCTAssertNil(try db.fetchById(ItemCollection.self, id: "c1"))
     }
 
+    /// The debounced flush acks a list edit and a list delete BETWEEN the
+    /// hydrate's collections read and its replace: the snapshot predates both
+    /// and nothing is queued any more. The edit must not revert (the owner's
+    /// next whole-row upsert would be built on the reverted row and delete it
+    /// on the server), and the list must not come back.
+    func testAListWriteAckedWhileTheHydrateReadsIsNotReverted() async throws {
+        let milk = CollectionItem(id: "i-milk", body: "milk", at: "2026-05-21T10:01:00.000Z")
+        let edited = list("c1", owner: "u1", members: [], role: "owner", items: [milk])
+        try db.save(edited)
+        let edit = try box.enqueue(table: "collections", rowId: "c1", kind: .upsert,
+                                   payload: String(data: try json(CollectionRow(edited)), encoding: .utf8),
+                                   nowISO: "2026-05-21T10:01:00.000Z")
+        let delete = try box.enqueue(table: "collections", rowId: "c2", kind: .delete, nowISO: "2026-05-21T10:01:00.000Z")
+        let ackedSeqs = [try XCTUnwrap(edit.opSeq), try XCTUnwrap(delete.opSeq)]
+        let db = self.db!
+        let gateway = FakeRawGateway(rowsByTable: ["collections": [try listJSON(list("c1", owner: "u1")),
+                                                                   try listJSON(list("c2", owner: "u1"))],
+                                                   "collection_members": []],
+                                     onRead: { table in
+                                         guard table == "collection_members" else { return }
+                                         for seq in ackedSeqs { try? OutboxStore(db).markDone(seq) }
+                                     })
+
+        await Hydrator(gateway: gateway, db: db).hydrateCollections(userId: "u1")
+
+        XCTAssertEqual(try box.count(), 0, "both ops were acked mid-hydrate")
+        XCTAssertEqual(try db.fetchById(ItemCollection.self, id: "c1")?.items.map(\.id), ["i-milk"],
+                       "an edit acked mid-read is not reverted to the older snapshot")
+        XCTAssertNil(try db.fetchById(ItemCollection.self, id: "c2"), "a delete acked mid-read stays deleted")
+    }
+
     /// A burst of membership events (the channel is unfiltered now) costs at
     /// most two pulls, and a caller that arrived mid-run returns only after a
     /// run that STARTED after its call.
@@ -364,5 +399,36 @@ final class HydratorPendingPreservationTests: XCTestCase {
         }
         let reads = await gateway.collectionsReads
         XCTAssertEqual(reads, 2, "one run + one trailing run for the whole burst")
+    }
+
+    /// The realtime side of the burst: the members channel's consumer used to
+    /// await one hydrate per event, so five buffered DELETEs (a list deleted
+    /// with five members) ran five full hydrates back to back. Driven through
+    /// the consumer the mirror now builds.
+    func testABurstOfMembershipEventsCostsOneRunAndOneTrailingRun() async throws {
+        let gateway = GatedCollectionsGateway()
+        let hydrator = Hydrator(gateway: gateway, db: db)
+        let (signal, consumer) = RealtimeMirror.coalescedSignal { await hydrator.hydrateCollections(userId: "u1") }
+        defer { consumer.cancel() }
+
+        signal()
+        var spins = 0
+        while !(await gateway.isHolding), spins < 5_000 {
+            spins += 1
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let isHolding = await gateway.isHolding
+        XCTAssertTrue(isHolding, "the first event's hydrate is in flight")
+        for _ in 0..<4 { signal() }   // four more DELETEs land meanwhile
+        await gateway.release()
+
+        spins = 0
+        while await gateway.collectionsReads < 2, spins < 5_000 {
+            spins += 1
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)   // room for any extra run
+        let reads = await gateway.collectionsReads
+        XCTAssertEqual(reads, 2, "the events that landed mid-run share ONE trailing run")
     }
 }
