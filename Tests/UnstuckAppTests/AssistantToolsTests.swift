@@ -2251,7 +2251,7 @@ final class AssistantToolsTests: XCTestCase {
         api.tasks = [t]
         api.blocks = [block("dtd", "d", TODAY, "07:30")]
         await eq("set_task_recurrence", #"{"taskId":"d","kind":"daily"}"#,
-                 "ok: \"Stretch\" now repeats daily (it was done — today's occurrence stays done)")
+                 "ok: \"Stretch\" now repeats daily at 07:30 (it was done — today's occurrence stays done)")
         XCTAssertFalse(api.tasks[0].done, "an open series")
         let slot = api.blocks.first { $0.id == "dtd" }!
         XCTAssertTrue(slot.done)
