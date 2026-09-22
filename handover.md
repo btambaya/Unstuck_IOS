@@ -21,12 +21,52 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (79) uploaded to TestFlight — the recurrence + duplicate fixes from the audit: the series anchors on the next LIVE occurrence, the horizon is topped up, duplicate task creation is refused, estimates/durations are clamped, complete_occurrence has the done-guard. 2026-09-22.
 
+- Ship: 1.1.1 (80) uploaded to TestFlight — the token diet: voice tool schemas compacted (~36 % off the block, no tool or value removed) and a route change no longer re-uploads the whole session. 2026-09-22.
 
 
 
 
 
 
+
+
+
+## Where things stand (2026-09-22, afternoon) — build 80: the token diet
+
+Why it matters more than it sounds: a realtime reply re-reads the whole
+session prefix EVERY time, and the tool schemas are ~75 % of it. That prefix
+is what fills the account's tokens-per-minute bucket, so it decides how many
+replies a conversation gets before the assistant goes quiet — which is what
+both testers actually hit. Cheaper prefix = longer conversations AND lower
+cost, without touching the tier.
+
+- `App/Features/VoiceToolCompaction.swift` (new) — the voice/call tool lists
+  are compacted at runtime: a tool description keeps its capped first
+  sentence; a parameter description goes when an `enum` already states the
+  values, or when it merely restates the parameter name ("name: The task's
+  title"); it is KEPT, shortened, when it carries a format, default, unit or
+  permitted value ("local 'YYYY-MM-DD HH:MM'", "defaults to today", "0 = off")
+  — those change what the model sends. Every tool, parameter, type, enum and
+  required flag survives, asserted field by field against the real registry.
+  Measured 35.5 KB → ~22.7 KB, about 36 % off the schema block.
+  Wired in `AssistantModel.voiceTools()` / `callTools()`.
+  NOT done in `scripts/gen-tool-registry.mjs` on purpose: that generator also
+  writes the web, Android and server copies, and iOS is the only platform
+  being changed right now. Port it there when those catch up.
+- `VoiceRealtimeClient` — a route change sends ONLY `turn_detection`, not the
+  whole `session.update`. It was re-uploading the instructions and all 70 tool
+  schemas, ~11k tokens, and invalidating the cached prefix, on every headset
+  plug, unplug or CallKit speaker toggle. Both the proxy and the OpenAI
+  adapter already supported a partial update.
+- Both new files were added to the pbxproj BY HAND (xcodegen is broken on this
+  machine); `plutil -lint` passes.
+
+759 tests green bar the known CrashBreadcrumbs simulator flake.
+
+Not taken from the audit's token-diet list: trimming the state snapshot for
+voice (tasks 60 → 20, week → today+tomorrow). It would save a further
+~1,500 tokens but it changes what the model can see without a tool call, so
+it wants a real conversation to validate rather than a unit test.
 
 ## Where things stand (2026-09-22, later) — build 79: the recurrence + duplicate bugs
 

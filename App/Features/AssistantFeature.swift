@@ -694,10 +694,16 @@ final class AssistantModel {
     /// (ToolRegistry.generated.swift, from lib/assistant/tool-registry.json),
     /// never a hand-maintained copy (2026-09-20 tooling rewrite). A parity
     /// test proves every name here has an executor case.
-    func voiceTools() -> [[String: Any]] { ToolRegistry.voice }
+    /// COMPACTED for speech (VoiceToolCompaction): the same tools, parameters
+    /// and enums, shorter prose. The schemas are ~75 % of what a realtime reply
+    /// re-reads EVERY time, and that prefix is what fills the account's
+    /// per-minute token bucket — i.e. it decides how long a conversation runs
+    /// before the assistant goes quiet (beta audit 2026-09-21).
+    func voiceTools() -> [[String: Any]] { VoiceToolCompaction.compact(ToolRegistry.voice) }
 
-    /// Call-mode extras (snooze_call) — the registry's `call` surface.
-    func callTools() -> [[String: Any]] { ToolRegistry.call }
+    /// Call-mode extras (snooze_call) — the registry's `call` surface,
+    /// compacted the same way: a call is a spoken session too.
+    func callTools() -> [[String: Any]] { VoiceToolCompaction.compact(ToolRegistry.call) }
 }
 
 /// Transport when the edge function client isn't available (signed-out demo

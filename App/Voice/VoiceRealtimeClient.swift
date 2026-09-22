@@ -500,11 +500,17 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                     guard let self, self.withLock({ self._open }) else { return }
                     self.dispatch(.tick)
                 }
-            case .updateTurnDetection:
-                // session.update is allowed mid-session; re-send the whole
-                // thing (instructions/tools unchanged) so a backend that
-                // replaces rather than merges keeps them.
-                send(sessionUpdate())
+            case .updateTurnDetection(let td):
+                // ONLY the field that changed. Re-sending the whole session
+                // re-uploads the instructions AND all 70 tool schemas, about
+                // 11k tokens, and invalidates the cached prefix — on every
+                // headset plug, unplug or CallKit speaker toggle, which is
+                // common mid-call (audit 2026-09-21). A partial update is
+                // supported on both paths: the proxy's enforceGuardrail
+                // deliberately leaves the instructions alone when the update
+                // doesn't carry them, and the OpenAI adapter maps whatever
+                // fields are present.
+                send(["type": "session.update", "session": ["turn_detection": TurnDetection.json(td)]])
             case .updateGate(let ctx): audio.setGateContext(ctx)
             case .clearCaption:
                 // A completed EMPTY user caption = "new turn": the screen
