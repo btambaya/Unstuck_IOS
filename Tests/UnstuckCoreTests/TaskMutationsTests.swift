@@ -57,6 +57,55 @@ final class BumpMoveCountTests: XCTestCase {
     }
 }
 
+/// Tasks key areas and tags by NAME, so a rename/delete of the vocabulary row
+/// rewrites the tasks that carry it (audit 2026-09-22, C19).
+final class LabelCascadeTests: XCTestCase {
+    private let now = "2026-09-22T12:00:00.000Z"
+
+    func testAreaRenameMovesOnlyAnExactMatch() {
+        let moved = relabelingArea(mkTask(lifeArea: "Personal"), from: "Personal", to: "Life", nowISO: now)
+        XCTAssertEqual(moved?.lifeArea, "Life")
+        XCTAssertEqual(moved?.updatedAt, now)
+        XCTAssertNil(relabelingArea(mkTask(lifeArea: "Work"), from: "Personal", to: "Life", nowISO: now))
+        XCTAssertNil(relabelingArea(mkTask(lifeArea: nil), from: "Personal", to: "Life", nowISO: now))
+        XCTAssertNil(relabelingArea(mkTask(lifeArea: "personal"), from: "Personal", to: "Life", nowISO: now),
+                     "exact match, like the web/Android cascade and the Today filter")
+    }
+
+    func testAreaDeleteClearsTheLabel() {
+        let cleared = relabelingArea(mkTask(lifeArea: "Work"), from: "Work", to: nil, nowISO: now)
+        XCTAssertNotNil(cleared)
+        XCTAssertNil(cleared?.lifeArea)
+        XCTAssertEqual(cleared?.updatedAt, now)
+    }
+
+    func testTagRenameIsCaseInsensitiveAndNeverDuplicates() {
+        let renamed = renamingTag(mkTask(tags: ["DEEP", "x"]), from: "deep", to: "Focus", nowISO: now)
+        XCTAssertEqual(renamed?.tags, ["Focus", "x"])
+        XCTAssertEqual(renamed?.updatedAt, now)
+        XCTAssertEqual(renamingTag(mkTask(tags: ["deep", "focus"]), from: "deep", to: "focus", nowISO: now)?.tags, ["focus"],
+                       "a task already carrying the new name keeps one copy")
+        XCTAssertNil(renamingTag(mkTask(tags: ["x"]), from: "deep", to: "Focus", nowISO: now))
+        XCTAssertNil(renamingTag(mkTask(tags: nil), from: "deep", to: "Focus", nowISO: now))
+    }
+
+    func testTagDeleteStripsEveryCaseAndEmptiesToNil() {
+        let stripped = strippingTag(mkTask(tags: ["Deep", "x", "deep"]), name: "deep", nowISO: now)
+        XCTAssertEqual(stripped?.tags, ["x"])
+        XCTAssertEqual(stripped?.updatedAt, now)
+        let emptied = strippingTag(mkTask(tags: ["deep"]), name: "DEEP", nowISO: now)
+        XCTAssertNotNil(emptied)
+        XCTAssertNil(emptied?.tags, "an emptied list is nil, not []")
+        XCTAssertNil(strippingTag(mkTask(tags: ["x"]), name: "deep", nowISO: now))
+    }
+
+    func testLabelNameTakenIgnoresCase() {
+        XCTAssertTrue(labelNameTaken("home", among: ["Home", "Work"]))
+        XCTAssertFalse(labelNameTaken("Garden", among: ["Home", "Work"]))
+        XCTAssertFalse(labelNameTaken("Home", among: []))
+    }
+}
+
 final class IsCompletedTodayBoundaryTests: XCTestCase {
     // Wed 2026-05-20 10:00 local.
     private let now = localDT(2026, 5, 20, 10, 0).timeIntervalSince1970 * 1000

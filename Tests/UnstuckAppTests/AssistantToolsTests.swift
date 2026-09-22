@@ -1198,6 +1198,35 @@ final class AssistantToolsTests: XCTestCase {
         await eq("rename_tag", #"{"name":"deep"}"#, "error: newName required")
     }
 
+    /// Tasks key areas by name and the server has unique(user_id, name): a
+    /// rename onto another area's name was quarantined while its task relabels
+    /// synced, and the tool still said ok (audit 2026-09-22, C19).
+    func testRenameAreaRefusesATakenNameButAllowsACaseOnlyChange() async {
+        api.areas = [LifeArea(id: "ar0", name: "Work", color: "indigo", sortOrder: 0),
+                     LifeArea(id: "ar1", name: "Garden", color: "green", sortOrder: 1)]
+        await eq("rename_area", #"{"name":"garden","newName":"WORK"}"#, "error: area \"Work\" already exists — nothing changed")
+        XCTAssertEqual(api.areas.map(\.name), ["Work", "Garden"])
+        await eq("rename_area", #"{"name":"work","newName":"Work"}"#, "error: area \"Work\" already has that name — nothing changed")
+        await eq("rename_area", #"{"name":"work","newName":"WORK"}"#, "ok: renamed area \"work\" → \"WORK\" (tasks updated)")
+        XCTAssertEqual(api.areas[0].name, "WORK", "a case-only rename of the same area is allowed")
+        await eq("rename_area", #"{"name":" garden ","newName":"  Allotment "}"#, "ok: renamed area \"garden\" → \"Allotment\" (tasks updated)")
+        XCTAssertEqual(api.areas[1].name, "Allotment", "stored trimmed")
+        await eq("create_area", #"{"name":" allotment "}"#, "error: area \"allotment\" already exists")
+        XCTAssertEqual(api.areas.count, 2)
+    }
+
+    func testRenameTagRefusesATakenName() async {
+        api.tagRows = [TagRow(id: "tg0", name: "deep", sortOrder: 0), TagRow(id: "tg1", name: "focus", sortOrder: 1)]
+        await eq("rename_tag", #"{"name":"deep","newName":"FOCUS"}"#, "error: tag \"focus\" already exists — nothing changed")
+        XCTAssertEqual(api.tagRows.map(\.name), ["deep", "focus"])
+        await eq("rename_tag", #"{"name":"deep","newName":"Deep"}"#, "ok: renamed tag \"deep\" → \"Deep\"")
+        await eq("rename_tag", #"{"name":"Deep","newName":"Deep"}"#, "error: tag \"Deep\" already has that name — nothing changed")
+        await eq("rename_tag", #"{"name":"deep","newName":" Shallow "}"#, "ok: renamed tag \"deep\" → \"Shallow\"")
+        XCTAssertEqual(api.tagRows.map(\.name), ["Shallow", "focus"])
+        await eq("create_tag", #"{"name":" shallow "}"#, "error: tag \"Shallow\" already exists — nothing changed")
+        XCTAssertEqual(api.tagRows.count, 2)
+    }
+
     // MARK: people
 
     func testUnshareTaskResolvesOneMatchingPerson() async {
@@ -1854,6 +1883,158 @@ final class AppModelAssistantStateTests: XCTestCase {
         XCTAssertNil(try db.captureArchivedAt(id: "cap-1"))
         let restore = try XCTUnwrap(OutboxStore(db).pending().last { $0.tableName == "captures" && $0.rowId == "cap-1" })
         XCTAssertTrue(restore.payload?.contains("\"archived_at\":null") == true, "an unarchive reaches the server as an explicit null")
+    }
+
+    // MARK: area/tag rename + delete cascade (audit 2026-09-22, C19)
+    //
+    // DemoSeed: areas Work/Personal/Health (ids area-<name>), tags
+    // deep-work/quick/errand (ids tag-<name>). Tasks key both by NAME, so the
+    // Settings rows and the assistant (one AppModel path) must carry every
+    // task along — the Settings rename used to write only the row.
+
+    private func pendingRowIds(_ db: AppDatabase, _ table: String) throws -> Set<String> {
+        Set(try OutboxStore(db).pending().filter { $0.tableName == table }.map(\.rowId))
+    }
+
+    func testRenamingAnAreaCarriesEveryTaskAndQueuesTheirOps() async throws {
+        let live = try liveState()
+        let (model, db) = (live.model, live.db)
+        let repo = try XCTUnwrap(model.taskRepo)
+        let before = Set(try repo.all().filter { $0.lifeArea == "Work" }.map(\.id))
+        XCTAssertEqual(before, ["t-proposal", "t-sarah", "t-inbox", "t-review"])
+        let ok = await model.renameLifeAreaAwaiting("area-Work", to: " Day job ")
+        XCTAssertTrue(ok)
+        let row = try XCTUnwrap(try db.fetchById(LifeArea.self, id: "area-Work"))
+        XCTAssertEqual(row.name, "Day job", "trimmed")
+        XCTAssertEqual(row.color, "indigo")
+        XCTAssertEqual(row.sortOrder, 0)
+        let tasks = try repo.all()
+        XCTAssertFalse(tasks.contains { $0.lifeArea == "Work" }, "no task is left on the old name")
+        XCTAssertEqual(Set(tasks.filter { $0.lifeArea == "Day job" }.map(\.id)), before)
+        XCTAssertEqual(try repo.fetch(id: "t-walk")?.lifeArea, "Health")
+        XCTAssertEqual(try repo.fetch(id: "t-dentist")?.lifeArea, "Personal")
+        XCTAssertEqual(try pendingRowIds(db, "tasks"), before, "every moved task reaches the server")
+        XCTAssertEqual(try pendingRowIds(db, "life_areas"), ["area-Work"])
+    }
+
+    func testRenamingAnAreaOntoAnotherAreasNameIsRefusedAndWritesNothing() async throws {
+        let live = try liveState()
+        let (model, db) = (live.model, live.db)
+        let taken = await model.renameLifeAreaAwaiting("area-Work", to: "personal")
+        XCTAssertFalse(taken)
+        let unchanged = await model.renameLifeAreaAwaiting("area-Work", to: " Work ")
+        XCTAssertFalse(unchanged, "an unchanged name is not a rename")
+        let blank = await model.renameLifeAreaAwaiting("area-Work", to: "  ")
+        XCTAssertFalse(blank)
+        XCTAssertEqual(try db.fetchById(LifeArea.self, id: "area-Work")?.name, "Work")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "Work")
+        XCTAssertTrue(try pendingRowIds(db, "life_areas").isEmpty)
+        XCTAssertTrue(try pendingRowIds(db, "tasks").isEmpty)
+    }
+
+    func testACaseOnlyAreaRenameIsAllowedAndCarriesTheTasks() async throws {
+        let live = try liveState()
+        let model = live.model
+        let ok = await model.renameLifeAreaAwaiting("area-Work", to: "WORK")
+        XCTAssertTrue(ok)
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "WORK")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-sarah")?.lifeArea, "WORK")
+    }
+
+    func testDeletingAnAreaClearsItsLabelFromTasks() async throws {
+        let live = try liveState()
+        let (model, db) = (live.model, live.db)
+        await model.deleteLifeAreaAwaiting("area-Health")
+        XCTAssertNil(try db.fetchById(LifeArea.self, id: "area-Health"))
+        let walk = try XCTUnwrap(try model.taskRepo?.fetch(id: "t-walk"), "the task itself stays")
+        XCTAssertNil(walk.lifeArea, "what the delete alert promises: they just lose this area label")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "Work")
+        XCTAssertEqual(try pendingRowIds(db, "tasks"), ["t-walk"])
+    }
+
+    func testRenamingATagCarriesItsTasksAndRefusesATakenName() async throws {
+        let live = try liveState()
+        let (model, db) = (live.model, live.db)
+        let ok = await model.renameTagAwaiting("tag-deep-work", to: "Deep")
+        XCTAssertTrue(ok)
+        XCTAssertEqual(try db.fetchById(TagRow.self, id: "tag-deep-work")?.name, "Deep")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.tags, ["Deep"])
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-review")?.tags, ["Deep"])
+        let taken = await model.renameTagAwaiting("tag-quick", to: "ERRAND")
+        XCTAssertFalse(taken)
+        XCTAssertEqual(try db.fetchById(TagRow.self, id: "tag-quick")?.name, "quick")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-sarah")?.tags, ["quick"])
+    }
+
+    func testDeletingATagStripsItFromItsTasks() async throws {
+        let live = try liveState()
+        let (model, db) = (live.model, live.db)
+        await model.deleteTagAwaiting("tag-quick")
+        XCTAssertNil(try db.fetchById(TagRow.self, id: "tag-quick"))
+        let sarah = try XCTUnwrap(try model.taskRepo?.fetch(id: "t-sarah"))
+        XCTAssertNil(sarah.tags, "an emptied tag list is nil")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.tags, ["deep-work"])
+        XCTAssertEqual(try pendingRowIds(db, "tasks"), ["t-sarah"])
+    }
+
+    /// The old unchecked rename left some devices with two same-named rows
+    /// (the quarantined op keeps the renamed local row alive through every
+    /// pull). Tidying the twin up must not move or strip the real row's tasks.
+    func testATwinLeftByTheOldRenameKeepsTheRealRowsTasksWhenTidiedUp() async throws {
+        let live = try liveState()
+        let (model, db) = (live.model, live.db)
+        try db.save(LifeArea(id: "area-Work2", name: "Work", color: "amber", sortOrder: 9))
+        let ok = await model.renameLifeAreaAwaiting("area-Work2", to: "Errands")
+        XCTAssertTrue(ok)
+        XCTAssertEqual(try db.fetchById(LifeArea.self, id: "area-Work2")?.name, "Errands")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "Work", "the real Work area keeps its tasks")
+
+        try db.save(LifeArea(id: "area-Work3", name: "Work", color: "amber", sortOrder: 10))
+        await model.deleteLifeAreaAwaiting("area-Work3")
+        XCTAssertNil(try db.fetchById(LifeArea.self, id: "area-Work3"))
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "Work")
+
+        try db.save(TagRow(id: "tag-Quick2", name: "Quick", color: nil, sortOrder: 9))
+        let renamedTwin = await model.renameTagAwaiting("tag-Quick2", to: "fast")
+        XCTAssertTrue(renamedTwin)
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-sarah")?.tags, ["quick"])
+        try db.save(TagRow(id: "tag-Quick3", name: "QUICK", color: nil, sortOrder: 10))
+        await model.deleteTagAwaiting("tag-Quick3")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-sarah")?.tags, ["quick"], "the tag \"quick\" still exists")
+        XCTAssertTrue(try pendingRowIds(db, "tasks").isEmpty, "no task was rewritten")
+    }
+
+    /// Settings fires and forgets, so two renames of one area can overlap.
+    /// The cascades run one after the other: the tasks always end on the
+    /// area's final name, never on a name no area has.
+    func testOverlappingAreaRenamesNeverStrandTasksOnAGoneName() async throws {
+        let live = try liveState()
+        let model = live.model
+        async let first = model.renameLifeAreaAwaiting("area-Work", to: "Day job")
+        async let second = model.renameLifeAreaAwaiting("area-Work", to: "Office")
+        let results = await [first, second]
+        XCTAssertEqual(results, [true, true])
+        let finalName = try XCTUnwrap(try live.db.fetchById(LifeArea.self, id: "area-Work")?.name)
+        for id in ["t-proposal", "t-sarah", "t-inbox", "t-review"] {
+            XCTAssertEqual(try model.taskRepo?.fetch(id: id)?.lifeArea, finalName, id)
+        }
+    }
+
+    /// The assistant's rename_area/delete_area now go through the same
+    /// AppModel cascade, refusal included.
+    func testTheAreaToolsGoThroughTheCascadeOnTheLiveStore() async throws {
+        let live = try liveState()
+        let (model, state) = (live.model, live.state)
+        let scratch = TurnScratch()
+        let taken = await runAssistantTool(name: "rename_area", args: ToolArgs(json: #"{"name":"Work","newName":"health"}"#), api: state, scratch: scratch)
+        XCTAssertEqual(taken, "error: area \"Health\" already exists — nothing changed")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "Work")
+        let renamed = await runAssistantTool(name: "rename_area", args: ToolArgs(json: #"{"name":"Work","newName":"Day job"}"#), api: state, scratch: scratch)
+        XCTAssertEqual(renamed, "ok: renamed area \"Work\" → \"Day job\" (tasks updated)")
+        XCTAssertEqual(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea, "Day job")
+        let deleted = await runAssistantTool(name: "delete_area", args: ToolArgs(json: #"{"name":"Day job"}"#), api: state, scratch: scratch)
+        XCTAssertTrue(deleted.hasPrefix("ok: deleted area"), deleted)
+        XCTAssertNil(try model.taskRepo?.fetch(id: "t-proposal")?.lifeArea)
     }
 
     /// Without a coordinator (offline boot) the usable-minutes budget can't

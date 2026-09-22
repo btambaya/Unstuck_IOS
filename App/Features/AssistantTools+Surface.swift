@@ -459,18 +459,29 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
 
     // ── AREAS & TAGS ──
     case "create_area":
-        guard let nm = args.str("name") else { return "error: name required" }
+        // `str` hands back the untrimmed text: " Home " slipped past the
+        // duplicate check below (audit 2026-09-22, C19).
+        guard let nm = args.str("name")?.trimmingCharacters(in: .whitespacesAndNewlines) else { return "error: name required" }
         if api.getAreaRows().contains(where: { $0.name.lowercased() == nm.lowercased() }) { return "error: area \"\(nm)\" already exists" }
         await api.addArea(name: nm, color: args.str("color"))
         return "ok: created area \"\(nm)\""
 
     case "rename_area":
-        let from = args.str("name")
-        let to = args.str("newName")
+        let from = args.str("name")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let to = args.str("newName")?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let row = api.getAreaRows().first(where: { $0.name.lowercased() == (from ?? "").lowercased() }) else {
             return "error: no area named \"\(from ?? "")\" — areas: \(api.getAreas().joined(separator: ", "))"
         }
         guard let to else { return "error: newName required" }
+        // Tasks key areas by name and the server has unique(user_id, name): a
+        // rename onto another area's name was quarantined by the outbox while
+        // the task relabels synced, and the tool still said ok. Refuse rather
+        // than merge (Android parity; audit 2026-09-22, C19). A case-only
+        // rename of the same area is fine.
+        if to == row.name { return "error: area \"\(row.name)\" already has that name — nothing changed" }
+        if let taken = api.getAreaRows().first(where: { $0.id != row.id && $0.name.caseInsensitiveCompare(to) == .orderedSame }) {
+            return "error: area \"\(taken.name)\" already exists — nothing changed"
+        }
         await api.updateArea(row.id, name: to, color: nil)
         return "ok: renamed area \"\(from ?? "")\" → \"\(to)\" (tasks updated)"
 
@@ -483,7 +494,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         return "ok: deleted area \"\(from ?? "")\" (its tasks keep everything else)"
 
     case "create_tag":
-        guard let nm = args.str("name") else { return "error: name required" }
+        guard let nm = args.str("name")?.trimmingCharacters(in: .whitespacesAndNewlines) else { return "error: name required" }
         // "The result says if it already exists" (registry) — a second
         // "ready" over an existing tag read as a fresh creation.
         if let existing = api.getTagRows().first(where: { $0.name.lowercased() == nm.lowercased() }) {
@@ -493,12 +504,18 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         return "ok: created tag \"\(nm)\""
 
     case "rename_tag":
-        let from = args.str("name")
-        let to = args.str("newName")
+        let from = args.str("name")?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let to = args.str("newName")?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let row = api.getTagRows().first(where: { $0.name.lowercased() == (from ?? "").lowercased() }) else {
             return "error: no tag named \"\(from ?? "")\""
         }
         guard let to else { return "error: newName required" }
+        // Same unique(user_id, name) quarantine as rename_area (audit
+        // 2026-09-22, C19).
+        if to == row.name { return "error: tag \"\(row.name)\" already has that name — nothing changed" }
+        if let taken = api.getTagRows().first(where: { $0.id != row.id && $0.name.caseInsensitiveCompare(to) == .orderedSame }) {
+            return "error: tag \"\(taken.name)\" already exists — nothing changed"
+        }
         await api.updateTag(row.id, name: to)
         return "ok: renamed tag \"\(from ?? "")\" → \"\(to)\""
 

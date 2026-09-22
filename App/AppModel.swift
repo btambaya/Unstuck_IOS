@@ -74,6 +74,9 @@ final class AppModel {
     // rapid edits to the same shared collection can't reach the server out of
     // order (replaces Android's collectionMutex).
     private var collectionRPCChains: [String: Task<Void, Never>] = [:]
+    /// The last area/tag rename or delete; the next one waits for it (see
+    /// afterPreviousLabelCascade).
+    @ObservationIgnored private var labelCascadeTail: Task<Void, Never>?
 
     /// Enqueue a shared-collection RPC, ordered after any pending RPC for the
     /// same collection.
@@ -1673,20 +1676,44 @@ final class AppModel {
         try? await write.upsertTag(tag, nowISO: Self.isoNow())
     }
 
-    /// `deleteTag`, awaited through the whole cascade.
+    /// `deleteTag`, awaited through the whole cascade. No strip runs over a
+    /// failed delete, and a same-named twin left by the old unchecked rename
+    /// keeps its tasks (audit 2026-09-22, C19).
     func deleteTagAwaiting(_ id: String) async {
-        guard let write else { return }
-        var name: String?
-        if let db, let fetched = try? db.fetchById(TagRow.self, id: id) { name = fetched.name }
-        let tasks = (try? taskRepo?.all()) ?? []
-        try? await write.deleteTag(id: id, nowISO: Self.isoNow())
-        guard let name else { return }
-        for t in tasks where (t.tags ?? []).contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) {
-            var next = t
-            let stripped = (t.tags ?? []).filter { $0.caseInsensitiveCompare(name) != .orderedSame }
-            next.tags = stripped.isEmpty ? nil : stripped
-            next.updatedAt = Self.isoNow()
-            try? await write.upsertTask(next, nowISO: Self.isoNow())
+        await afterPreviousLabelCascade {
+            guard let write = self.write else { return }
+            let rows = (try? self.db?.fetchAllTags()) ?? []
+            let name = rows.first { $0.id == id }?.name
+            do { try await write.deleteTag(id: id, nowISO: Self.isoNow()) } catch { return }
+            guard let name, !labelNameTaken(name, among: rows.filter { $0.id != id }.map(\.name)) else { return }
+            await self.relabelTasks { strippingTag($0, name: name, nowISO: Self.isoNow()) }
+        }
+    }
+
+    /// Rename a tag and carry the new name onto every task that carries the
+    /// old one (case-insensitive, Android renameTag parity). Tasks key tags by
+    /// NAME, so the row-only rename Settings used to do orphaned them. A name
+    /// another tag already has (ignoring case) is refused: the server's
+    /// unique(user_id, name) rejects it and the outbox quarantines the row
+    /// while the task relabels still sync (audit 2026-09-22, C19).
+    /// True once the row and its tasks are committed.
+    @discardableResult
+    func renameTagAwaiting(_ id: String, to newName: String) async -> Bool {
+        await afterPreviousLabelCascade {
+            guard let write = self.write, let db = self.db else { return false }
+            let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rows = (try? db.fetchAllTags()) ?? []
+            let others = rows.filter { $0.id != id }.map(\.name)
+            guard !name.isEmpty, let row = rows.first(where: { $0.id == id }), name != row.name,
+                  !labelNameTaken(name, among: others) else { return false }
+            var renamed = row
+            renamed.name = name
+            do { try await write.upsertTag(renamed, nowISO: Self.isoNow()) } catch { return false }
+            // A twin the old unchecked rename left behind still owns the old
+            // name; moving its tasks would empty that tag.
+            guard !labelNameTaken(row.name, among: others) else { return true }
+            await self.relabelTasks { renamingTag($0, from: row.name, to: name, nowISO: Self.isoNow()) }
+            return true
         }
     }
 
@@ -1695,9 +1722,74 @@ final class AppModel {
         try? await write.upsertLifeArea(area, nowISO: Self.isoNow())
     }
 
+    /// Rename a life area and move every task filed under the old name onto
+    /// the new one (exact match, like the web and Android). Tasks key areas by
+    /// NAME, so the row-only rename Settings used to do left them behind: the
+    /// new pill showed nothing, the count read 0, and web/Android still showed
+    /// the old name. A name another area already has (ignoring case) is
+    /// refused: the server's unique(user_id, name) rejects it and the outbox
+    /// quarantines the row while the task relabels still sync (audit
+    /// 2026-09-22, C19). True once the row and its tasks are committed.
+    @discardableResult
+    func renameLifeAreaAwaiting(_ id: String, to newName: String) async -> Bool {
+        await afterPreviousLabelCascade {
+            guard let write = self.write, let db = self.db else { return false }
+            let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let rows = (try? db.fetchAllLifeAreas()) ?? []
+            guard !name.isEmpty, let row = rows.first(where: { $0.id == id }), name != row.name,
+                  !labelNameTaken(name, among: rows.filter { $0.id != id }.map(\.name)) else { return false }
+            var renamed = row
+            renamed.name = name
+            do { try await write.upsertLifeArea(renamed, nowISO: Self.isoNow()) } catch { return false }
+            // A twin the old unchecked rename left behind still owns the old
+            // name; its tasks stay where they are.
+            guard !rows.contains(where: { $0.id != id && $0.name == row.name }) else { return true }
+            await self.relabelTasks { relabelingArea($0, from: row.name, to: name, nowISO: Self.isoNow()) }
+            return true
+        }
+    }
+
+    /// Delete a life area and clear its label off every task filed under it,
+    /// which is what the Settings delete alert promises ("they just lose this
+    /// area label") and what web/Android do (audit 2026-09-22, C19). No
+    /// relabel runs over a failed delete, and a same-named twin keeps its
+    /// tasks.
     func deleteLifeAreaAwaiting(_ id: String) async {
-        guard let write else { return }
-        try? await write.deleteLifeArea(id: id, nowISO: Self.isoNow())
+        await afterPreviousLabelCascade {
+            guard let write = self.write else { return }
+            let rows = (try? self.db?.fetchAllLifeAreas()) ?? []
+            let name = rows.first { $0.id == id }?.name
+            do { try await write.deleteLifeArea(id: id, nowISO: Self.isoNow()) } catch { return }
+            guard let name, !rows.contains(where: { $0.id != id && $0.name == name }) else { return }
+            await self.relabelTasks { relabelingArea($0, from: name, to: nil, nowISO: Self.isoNow()) }
+        }
+    }
+
+    /// Rewrite every task `transform` touches. Each match is re-read right
+    /// before its write: the upsert sends the WHOLE row, so a snapshot taken
+    /// before an earlier await would revert an edit that landed in between
+    /// and push it as a fresh local change (audit 2026-09-22, C19).
+    private func relabelTasks(_ transform: (TaskItem) -> TaskItem?) async {
+        guard let write, let repo = taskRepo else { return }
+        for t in (try? repo.all()) ?? [] where transform(t) != nil {
+            guard let fresh = (try? repo.fetch(id: t.id)) ?? nil, let next = transform(fresh) else { continue }
+            try? await write.upsertTask(next, nowISO: Self.isoNow())
+        }
+    }
+
+    /// Runs one label rename/delete after the previous one has finished. The
+    /// cascades yield at every task write, so a rename A→B still relabelling
+    /// while a delete of B (or a rename B→C) reads the task list would skip
+    /// the tasks not yet moved, and the first cascade would then park them on
+    /// a name no area has (audit 2026-09-22, C19).
+    private func afterPreviousLabelCascade<T: Sendable>(_ body: @escaping @MainActor @Sendable () async -> T) async -> T {
+        let previous = labelCascadeTail
+        let run = Task { @MainActor in
+            await previous?.value
+            return await body()
+        }
+        labelCascadeTail = Task { _ = await run.value }
+        return await run.value
     }
 
     /// `saveBlock`, returning once the local row is committed; the Google
@@ -1873,9 +1965,21 @@ final class AppModel {
     func deleteTag(_ id: String) {
         Task { await deleteTagAwaiting(id) }
     }
+    /// Rename a tag and carry the new name onto every task that uses it
+    /// (audit 2026-09-22, C19).
+    func renameTag(_ id: String, to name: String) {
+        Task { await renameTagAwaiting(id, to: name) }
+    }
     func saveLifeArea(_ area: LifeArea) {
         Task { await saveLifeAreaAwaiting(area) }
     }
+    /// Rename an area and move every task filed under the old name (audit
+    /// 2026-09-22, C19).
+    func renameLifeArea(_ id: String, to name: String) {
+        Task { await renameLifeAreaAwaiting(id, to: name) }
+    }
+    /// Delete an area and clear its label off every task filed under it,
+    /// mirroring the web/Android deleteLifeArea (audit 2026-09-22, C19).
     func deleteLifeArea(_ id: String) {
         Task { await deleteLifeAreaAwaiting(id) }
     }

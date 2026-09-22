@@ -59,6 +59,57 @@ public func unparkedTaskForBlock(_ block: CalBlock, tasks: [TaskItem], nowISO: S
     return next
 }
 
+// MARK: label cascades (area / tag rename + delete)
+//
+// Tasks carry their life area and tags as plain NAME strings, not row ids, so
+// renaming or deleting the vocabulary row has to follow onto every task that
+// names it. Settings used to write only the row: after "Personal" → "Life" the
+// Life pill showed nothing, its count read 0, and web/Android still said
+// Personal (audit 2026-09-22, C19). Each returns the rewritten task, or nil
+// when the task doesn't carry the label (nothing to write).
+
+/// Area rename (`new` = the new name) or delete (`new` = nil). EXACT match,
+/// like the web's cascadeRenameTaskArea, Android's renameLifeArea /
+/// deleteLifeArea and the Today pill filter.
+public func relabelingArea(_ task: TaskItem, from old: String, to new: String?, nowISO: String) -> TaskItem? {
+    guard task.lifeArea == old else { return nil }
+    var next = task
+    next.lifeArea = new
+    next.updatedAt = nowISO
+    return next
+}
+
+/// Tag rename. Case-insensitive, like the tag filter and Android's renameTag;
+/// a task that already carries the new name keeps a single copy.
+public func renamingTag(_ task: TaskItem, from old: String, to new: String, nowISO: String) -> TaskItem? {
+    let tags = task.tags ?? []
+    guard tags.contains(where: { $0.caseInsensitiveCompare(old) == .orderedSame }) else { return nil }
+    var seen = Set<String>()
+    var next = task
+    next.tags = tags.map { $0.caseInsensitiveCompare(old) == .orderedSame ? new : $0 }
+        .filter { seen.insert($0.lowercased()).inserted }
+    next.updatedAt = nowISO
+    return next
+}
+
+/// Tag delete: strip every case-insensitive match; an emptied list is nil.
+public func strippingTag(_ task: TaskItem, name: String, nowISO: String) -> TaskItem? {
+    let tags = task.tags ?? []
+    guard tags.contains(where: { $0.caseInsensitiveCompare(name) == .orderedSame }) else { return nil }
+    let stripped = tags.filter { $0.caseInsensitiveCompare(name) != .orderedSame }
+    var next = task
+    next.tags = stripped.isEmpty ? nil : stripped
+    next.updatedAt = nowISO
+    return next
+}
+
+/// Does another row already use `name`, ignoring case? The same rule as the
+/// Settings Add check; the server's unique(user_id, name) would reject the
+/// exact-case twin and quarantine the row.
+public func labelNameTaken(_ name: String, among others: [String]) -> Bool {
+    others.contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+}
+
 /// May a focus finish that resolved NO occurrence block flip THIS row's own
 /// `done`? Never for a recurring TEMPLATE.
 ///
