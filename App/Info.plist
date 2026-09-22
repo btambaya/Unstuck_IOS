@@ -68,7 +68,7 @@
 	<key>VOICE_PROXY_URL</key>
 	<string>$(VOICE_PROXY_URL)</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Unstuck uses the microphone for the voice assistant (talk to plan your day).</string>
+	<string>Unstuck uses the microphone when you talk to the assistant or dictate, and during calls from Unstuck so it can hear you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Unstuck transcribes your speech on-device so you can dictate to the assistant.</string>
 	<key>UILaunchScreen</key>

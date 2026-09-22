@@ -82,7 +82,12 @@ private struct TypeScale: ViewModifier {
 struct UnstuckApp: App {
     @UIApplicationDelegateAdaptor(PushAppDelegate.self) private var pushDelegate
     @Environment(\.scenePhase) private var scenePhase
-    @State private var model = AppModel()
+    /// The shared instance: a VoIP push that launches the app with no scene
+    /// starts THIS model (CallCoordinator.bootApp → startWithoutScene), so the
+    /// store, sync engine and call wiring it built are the ones shown when a
+    /// scene connects; the .task below then finds start() done (audit
+    /// 2026-09-22, C16).
+    @State private var model = AppModel.shared
 
     init() {
         // Arm the crash/hang trail before anything else runs, so a fault during
@@ -155,6 +160,10 @@ struct UnstuckApp: App {
                         // (Add task / Capture / Start focus / Open today). No-ops
                         // until repos exist — start() consumes it on cold launch.
                         model.consumePendingSiriRoute()
+                        // Calls booked on the web / Android / by the server
+                        // ring here too: ask for the microphone while the app
+                        // is in front of them (audit 2026-09-22, C13).
+                        model.askForCallMicrophoneIfNeeded()
                     }
                     // Stop the safety-net pull whenever we leave the foreground
                     // (it restarts on the next .active).

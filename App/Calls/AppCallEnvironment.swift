@@ -5,6 +5,7 @@
 
 import ActivityKit
 import Foundation
+import UIKit
 import UnstuckCore
 import UnstuckShared
 import UnstuckSync
@@ -97,7 +98,14 @@ final class SystemCallNotifier: CallNotifier {
 ///     re-ring is coming either way) — and swallowed on `retry: true`, the
 ///     server's one automatic ring-back 5 min later (calls build-out §5).
 ///     The flag arrives asynchronously, so the coordinator never posts it at
-///     the 30 s timeout itself.
+///     the 30 s timeout itself;
+///   • from the moment a report is queued until the queue is empty it holds
+///     background time (`backgroundTime`, UIApplication's background task in
+///     production). A ring declined or missed on an app the user swiped away
+///     ends its CallKit call at once, and nothing then kept the process up
+///     while AppModel booted and the report went out — the row stayed
+///     'calling' and dispatch_calls re-rang it (audit 2026-09-22, C16). Past
+///     iOS's limit the item simply waits, persisted, as before.
 /// Injectable sleep + sender so the ordering / retry / persistence rules run
 /// in XCTest without a network (CallCoordinatorTests).
 @MainActor
@@ -131,6 +139,17 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     }
     /// Sends one report; returns what the server answered (`retry`).
     typealias Sender = @Sendable (Item) async throws -> CallOutcomeReceipt
+    /// Begins background time and returns its release; `expired` runs if iOS
+    /// takes it back first.
+    typealias BackgroundTime = @MainActor (_ expired: @escaping @MainActor @Sendable () -> Void) -> (@MainActor () -> Void)
+
+    /// Production `BackgroundTime`: a UIApplication background task, ended
+    /// exactly once (released or expired).
+    static let systemBackgroundTime: BackgroundTime = { expired in
+        let task = OutcomeBackgroundTask()
+        task.begin(expired: expired)
+        return { task.end() }
+    }
 
     static let queueKey = "unstuck.calls.outcomeQueue"
     static let maxAttempts = 3
@@ -145,6 +164,9 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     /// Posts a report's `notification` once the server has settled it.
     private let notifier: CallNotifier?
     private var send: Sender?
+    /// nil = none held (tests that don't inject one).
+    private let backgroundTime: BackgroundTime?
+    private var releaseBackgroundTime: (@MainActor () -> Void)?
     private(set) var queue: [Item] = []
     private(set) var flushTask: Task<Void, Never>?
     private var retryTimer: Task<Void, Never>?
@@ -153,13 +175,14 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private(set) var dropped: [(item: Item, error: Error)] = []
 
     init(defaults: UserDefaults = .standard, key: String = CallsOutcomeReporter.queueKey,
-         notifier: CallNotifier? = nil,
+         notifier: CallNotifier? = nil, backgroundTime: BackgroundTime? = nil,
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { s in
              try? await Task.sleep(nanoseconds: UInt64(max(0, s) * 1_000_000_000))
          }) {
         self.defaults = defaults
         self.key = key
         self.notifier = notifier
+        self.backgroundTime = backgroundTime
         self.sleep = sleep
         if let data = defaults.data(forKey: key),
            let saved = try? JSONDecoder().decode([Item].self, from: data) {
@@ -185,6 +208,7 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
         queue.append(Item(callId: callId, callKitId: callKitId?.uuidString.lowercased(), outcome: outcome,
                           snooze: snoozeMinutes, notes: outcomeNotes, notification: notifyUnlessRetry))
         persist()
+        holdBackgroundTime()
         flush()
     }
 
@@ -195,6 +219,7 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
         failedCycles = 0
         queue.removeAll()
         persist()
+        releaseBackgroundTimeIfIdle()
     }
 
     /// A refusal that no retry can fix (see `CallOutcomeRejected`).
@@ -215,10 +240,26 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private func flush() {
         guard send != nil, flushTask == nil, !queue.isEmpty else { return }
         retryTimer?.cancel(); retryTimer = nil
+        holdBackgroundTime()
         flushTask = Task { [weak self] in
             await self?.drain()
             self?.flushTask = nil
+            // Still queued (a failed cycle): keep holding for the retry until
+            // iOS takes the time back.
+            self?.releaseBackgroundTimeIfIdle()
         }
+    }
+
+    /// See the type's doc: background time while something is queued.
+    private func holdBackgroundTime() {
+        guard releaseBackgroundTime == nil, !queue.isEmpty, let backgroundTime else { return }
+        releaseBackgroundTime = backgroundTime { [weak self] in self?.releaseBackgroundTime = nil }
+    }
+
+    private func releaseBackgroundTimeIfIdle() {
+        guard queue.isEmpty else { return }
+        releaseBackgroundTime?()
+        releaseBackgroundTime = nil
     }
 
     private func drain() async {
@@ -285,6 +326,25 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
             self?.retryTimer = nil
             self?.flush()
         }
+    }
+}
+
+/// One UIApplication background task for `CallsOutcomeReporter`.
+@MainActor
+private final class OutcomeBackgroundTask {
+    private var id = UIBackgroundTaskIdentifier.invalid
+
+    func begin(expired: @escaping @MainActor @Sendable () -> Void) {
+        id = UIApplication.shared.beginBackgroundTask(withName: "unstuck.call-outcome") { [self] in
+            expired()
+            end()
+        }
+    }
+
+    func end() {
+        guard id != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(id)
+        id = .invalid
     }
 }
 

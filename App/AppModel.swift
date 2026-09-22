@@ -15,6 +15,12 @@ import WidgetKit
 @MainActor
 @Observable
 final class AppModel {
+    /// The process's one AppModel: UnstuckApp's @State holds it, and a VoIP
+    /// push that launches the app with no scene starts it
+    /// (startWithoutScene), so the wiring that boot builds is the one the UI
+    /// shows later (audit 2026-09-22, C16). Tests build their own.
+    static let shared = AppModel()
+
     let router = AppRouter()
     /// Device-local user preferences (theme / focus / sound / accessibility),
     /// UserDefaults-backed. Single shared instance the whole app observes.
@@ -513,6 +519,9 @@ final class AppModel {
         guard !onboarded else { return }
         UserDefaults.standard.set(true, forKey: "unstuck.onboarded")
         onboarded = true
+        // A first sign-in's call rows can land before this pin, and the
+        // microphone ask is gated on it (audit 2026-09-22, C13).
+        askForCallMicrophoneIfNeeded()
     }
 
     /// Once per sign-in (hydrate hook): the account-wide preferences the
@@ -777,6 +786,7 @@ final class AppModel {
     /// time later in the day, never a later one. Called on every foreground
     /// sync + launch.
     func recordWakeWindowIfNeeded(now: Date = Date()) {
+        guard Self.isWakeSignal(UIApplication.shared.applicationState) else { return }
         guard let coord = coordinator, let uid = coord.auth.currentUserId else { return }
         let d = UserDefaults.standard
         let doneKey = "unstuck.wakeWindow.lastDate.\(uid)"
@@ -807,6 +817,15 @@ final class AppModel {
         if lastRecordedDate == now.localDate { return nil }
         if let pending, pending.localDate == now.localDate { return pending }
         return now
+    }
+
+    /// A launch in the BACKGROUND (a call ringing a locked phone boots the
+    /// model — startWithoutScene) is not the day's first input: start(),
+    /// syncNow() and the auth observer all record the sample, and a ring
+    /// would pull the morning-brief window to whenever it happened. The
+    /// first real foreground records it through syncNow (audit 2026-09-22, C16).
+    nonisolated static func isWakeSignal(_ state: UIApplication.State) -> Bool {
+        state != .background
     }
 
     #if DEBUG
@@ -876,6 +895,30 @@ final class AppModel {
         }
     }
     #endif
+
+    /// start() for a VoIP push that arrived before AppModel attached
+    /// (CallCoordinator.reportIncoming → bootApp). A push to an app the user
+    /// swiped away relaunches it with NO scene (iOS discarded the session),
+    /// so RootView's .task never ran start(): the voice launcher and the
+    /// outcome sender were never attached, the answer waited out the 8 s
+    /// grace and failed, and the server re-rang the row (audit 2026-09-22,
+    /// C16). A no-op once start() has run — where a scene does connect, its
+    /// .task simply finds the work done. In the background the foreground
+    /// pull stays off (no 60 s ticker racing the call's voice socket); the
+    /// scenePhase .active handler turns it on when a scene connects. A
+    /// DECLINED / MISSED ring on a killed app ends CallKit's call at once;
+    /// the outcome reporter holds background time from that report until it
+    /// is sent, which covers this boot too (CallsOutcomeReporter).
+    func startWithoutScene() async {
+        guard coordinator == nil else { return }
+        #if DEBUG
+        if ProcessInfo.processInfo.environment["UITEST_SEED"] == "1" { return }
+        #endif
+        let state = UIApplication.shared.applicationState
+        NSLog("[launch] AppModel.start() without a scene (app state %ld)", state.rawValue)
+        if state == .background { foregroundVisible = false }
+        await start()
+    }
 
     func start() async {
         guard coordinator == nil else { return }
@@ -1039,6 +1082,9 @@ final class AppModel {
         refreshWidgetSnapshot()
         consumePendingSiriRoute()
         if drained { syncNow() }
+        // The microphone for calls booked elsewhere (C13) — the scenePhase
+        // hook no-ops on a cold launch, for the same reason as the route above.
+        startCallMicrophoneBackstop()
     }
 
     /// Foreground/manual sync trigger (scenePhase .active, BG refresh):

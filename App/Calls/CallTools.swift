@@ -13,8 +13,14 @@
 //   error: <HH:MM> today is already past (it's <now> now). Ask for a later time or another day — free today: <windows>.
 // The past-date / past-time refusals are the SHARED UnstuckCore strings
 // (rejectPastDate / rejectPastTime — the same repair hints every other tool
-// gives); the only iOS-local strings are the network failure and the
-// "changed underneath me" compare-and-set miss.
+// gives); the only iOS-local strings are the network failure, the
+// "changed underneath me" compare-and-set miss, and this phone's own switch
+// and hours (CallToolLogic.deviceGuard — it would decline the call on receipt):
+//   error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first
+//   error: <HH:MM> is outside this iPhone's call hours (<start>–<end>), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls
+//     (refusing the end minute itself, the hours read "<start>–<end>; the latest it rings is <end − 1 min>")
+// On iOS a request_call / update_call `ok:` line may also end with
+// CallToolLogic.micRefusedNote (dispatch only — `run` never adds it).
 //
 // ENTRY POINTS. The executor (runAssistantTool) calls
 //   runCallTool(name:args:api:scratch:)
@@ -178,7 +184,16 @@ enum CallTools {
               let userId = coord.auth.currentUserId else {
             return "error: calls aren't available right now — sign in on the phone first"
         }
-        return await run(name: name, args: args, api: api, scratch: scratch, store: coord.callStore, userId: userId)
+        let result = await run(name: name, args: args, api: api, scratch: scratch, store: coord.callStore, userId: userId)
+        // A call booked or changed by typing never asked for the microphone,
+        // and a lock-screen answer can't show the prompt — so the first call
+        // couldn't hear them (audit 2026-09-22, C13). Ask now, while the
+        // assistant is in front of them; a refusal goes into the ok: line so
+        // the model tells them. Not with Calls off here: this phone declines
+        // the call, so asking would be noise and "will ring" untrue.
+        guard CallToolLogic.booksACall(result), CallSettings.enabled else { return result }
+        let allowed = await CallSettingsView.microphoneAllowedAfterBooking()
+        return CallToolLogic.withMicrophoneNote(result, micRefused: !allowed)
     }
 
     static func run(name: String, args: [String: Any], api: AssistantAppState, scratch: TurnScratch,
@@ -246,6 +261,7 @@ enum CallTools {
         }
 
         if let e = CallToolLogic.timeGuard(callAt, now: now, blocks: api.getBlocks(), calendar: calendar) { return e }
+        if let e = CallToolLogic.deviceGuard(callAt, calendar: calendar) { return e }
 
         // One live call per anchor: the task when given, else the label (web rule).
         let live = try await store.liveCalls()
@@ -318,6 +334,9 @@ enum CallTools {
             blockPatch = .some(block.id)
         }
         if let callAt, let e = CallToolLogic.timeGuard(callAt, now: now, blocks: api.getBlocks(), calendar: calendar) { return e }
+        // Only a NEW time meets this phone's switch and hours; a notes- or
+        // label-only edit is never refused here.
+        if let callAt, let e = CallToolLogic.deviceGuard(callAt, calendar: calendar) { return e }
 
         guard let r = try await store.patch(id: id, callAt: callAt, blockId: blockPatch, leadMin: leadPatch,
                                             label: label, notes: notes) else { return changedUnderneath }
@@ -417,6 +436,42 @@ enum CallToolLogic {
             return "error: calls can only be booked between \(CallSettings.serverWindowStart) and \(CallSettings.serverWindowEnd) — suggest a time inside that window"
         }
         return nil
+    }
+
+    /// THIS phone's Calls switch and allowed hours → the error string, or nil
+    /// when it would ring. Runs after timeGuard wherever this phone picks a
+    /// ring time (request_call, update_call with a new time, the task
+    /// editor). The switch and hours used to be applied only on receipt
+    /// (CallCoordinator.reportIncoming), which turned an "ok: call booked"
+    /// into a quiet decline at ring time (audit 2026-09-22, C12). Kept apart
+    /// from timeGuard so the web-contract window string stays as it is. The
+    /// wording makes the model ASK for another time, never pick one.
+    static func deviceGuard(_ callAt: Date, enabled: Bool = CallSettings.enabled,
+                            start: String = CallSettings.windowStart, end: String = CallSettings.windowEnd,
+                            calendar: Calendar = .current) -> String? {
+        if !enabled {
+            return "error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first"
+        }
+        if !CallSettings.isWithinWindow(callAt, start: start, end: end, calendar: calendar) {
+            let hours = CallSettings.hoursLabel(start: start, end: end, refusing: CallSettings.minuteOfDay(callAt, calendar: calendar))
+            return "error: \(CallSettings.hhmm(callAt, calendar: calendar)) is outside this iPhone's call hours (\(hours)), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls"
+        }
+        return nil
+    }
+
+    /// Appended to a booked / updated call's `ok:` line when the microphone
+    /// is refused (audit 2026-09-22, C13). No quotes and no em-dash, so the
+    /// receipt patterns (AssistantReceipts CALL_BOOKED_RE / CALL_UPDATED_RE,
+    /// anchored at the start) still read the line and its id.
+    static let micRefusedNote = " NOTE: microphone access is off for Unstuck on this iPhone, so the call will ring but can't hear them. Tell them to turn it on in iOS Settings › Unstuck › Microphone."
+
+    /// The results that leave a call booked to ring.
+    static func booksACall(_ r: String) -> Bool {
+        r.hasPrefix("ok: call booked") || r.hasPrefix("ok: updated call")
+    }
+
+    static func withMicrophoneNote(_ r: String, micRefused: Bool) -> String {
+        micRefused && booksACall(r) ? r + micRefusedNote : r
     }
 
     /// One live call per anchor — the web rule exactly: with a task, any live

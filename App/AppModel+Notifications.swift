@@ -5,7 +5,9 @@
 // reminder-lead setters (re-sync alarms + best-effort server mirror), and
 // the background one-tap reschedule (Android ScheduleCommands).
 
+import AVFoundation
 import Foundation
+import UIKit
 import UnstuckCore
 import UnstuckData
 import UnstuckShared
@@ -522,7 +524,48 @@ extension AppModel {
     func applyServerCallProactivePrefs(_ server: CallProactivePrefs) {
         guard !CallSettings.pendingProactivePush else { return }
         if CallSettings.proactive != server { CallSettings.proactive = server }
-        if callProactivePrefs != server { callProactivePrefs = server }
+        if callProactivePrefs != server {
+            callProactivePrefs = server
+            // A proactive call switched on elsewhere now rings here (C13).
+            askForCallMicrophoneIfNeeded()
+        }
+    }
+
+    // MARK: the microphone for calls (audit 2026-09-22, C13)
+
+    /// Ask for the microphone once a call can ring on this phone. Calls
+    /// booked on the web, on Android or by the server (proactive, after a
+    /// block, retries) ring here without iOS ever asking, and a lock-screen
+    /// answer can't show the prompt — so the first answered call couldn't
+    /// hear them. Only while the app is ACTIVE (never from a scene-less VoIP
+    /// boot or the background), signed in, onboarded, Calls on here, and
+    /// still undetermined: iOS shows the prompt once ever, so afterwards
+    /// this is a cheap read. The mirror counts rows of any status, so a
+    /// first failed call still asks on the next open.
+    func askForCallMicrophoneIfNeeded() {
+        guard UIApplication.shared.applicationState == .active,
+              AVAudioApplication.shared.recordPermission == .undetermined,
+              signedIn, onboarded, let coord = coordinator, coord.auth.currentUserId != nil,
+              CallSettings.expectsCalls(hasCallRows: (try? coord.callsMirror.isEmpty()) == false) else { return }
+        CallSettingsView.ensureMicrophone { _ in }
+    }
+
+    /// The moments scenePhase can't give askForCallMicrophoneIfNeeded: a
+    /// cold launch (.active can land before start() built the coordinator —
+    /// the observation's first value is that check) and call rows that land
+    /// while the app is open (a first sign-in's hydrate, a call booked on
+    /// the web just now). Ends once iOS has an answer.
+    func startCallMicrophoneBackstop() {
+        guard let mirror = coordinator?.callsMirror,
+              AVAudioApplication.shared.recordPermission == .undetermined else { return }
+        Task { [weak self] in
+            do {
+                for try await _ in mirror.observeLive() {
+                    guard let self, AVAudioApplication.shared.recordPermission == .undetermined else { return }
+                    self.askForCallMicrophoneIfNeeded()
+                }
+            } catch {}
+        }
     }
 
     /// Settings › Calls opened: re-read the server row (best-effort) so a

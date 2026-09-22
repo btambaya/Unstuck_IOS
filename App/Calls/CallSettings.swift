@@ -4,7 +4,8 @@
 // hours path), the allowed hours the phone applies on receipt (outside → the
 // call ends as `declined` silently + a notification), and the default lead
 // for task-anchored calls. The SERVER window is 06:00–23:00 (request_call
-// refuses outside it); this client window is the user's own, narrower guard.
+// refuses outside it); this client window is the user's own guard, and it
+// defaults to those same hours.
 //
 // The three PROACTIVE calls (morning plan / evening wrap-up / check-in after a
 // block) are ACCOUNT-wide: `notification_preferences.call_*` (migration 072)
@@ -28,8 +29,12 @@ enum CallSettings {
     static let userContentKeys = [enabledKey, windowStartKey, windowEndKey, defaultLeadKey,
                                   proactiveKey, pendingProactivePushKey, voipNudgeDismissedKey]
 
-    static let defaultWindowStart = "08:00"
-    static let defaultWindowEnd = "21:00"
+    /// The server's 06:00–23:00, like Android's DEFAULT_HOURS_*: the old
+    /// 08:00–21:00 default quietly declined calls the server and the web had
+    /// booked for 07:30 or 21:15 (audit 2026-09-22, C12). Only users who
+    /// never changed their hours see the difference.
+    static let defaultWindowStart = "06:00"
+    static let defaultWindowEnd = "23:00"
     static let leadOptions = [5, 10, 15, 30]
     static let defaultLead = 15
 
@@ -111,12 +116,84 @@ enum CallSettings {
     /// (e.g. 22:00–02:00).
     static func isWithinWindow(_ date: Date, start: String = windowStart, end: String = windowEnd,
                                calendar: Calendar = .current) -> Bool {
+        isWithinWindow(minuteOfDay: minuteOfDay(date, calendar: calendar), start: start, end: end)
+    }
+
+    /// The same rule on minutes since midnight (the HH:MM pickers).
+    static func isWithinWindow(minuteOfDay t: Int, start: String, end: String) -> Bool {
         guard let s = minutesOfDay(start), let e = minutesOfDay(end) else { return true }
-        let c = calendar.dateComponents([.hour, .minute], from: date)
-        let t = (c.hour ?? 0) * 60 + (c.minute ?? 0)
         if s == e { return true }
         if s < e { return t >= s && t < e }
         return t >= s || t < e
+    }
+
+    /// The allowed hours as a refusal names them, "08:00–21:00". The end is
+    /// exclusive, so refusing the end minute itself read as a contradiction —
+    /// "23:00 is outside this iPhone's call hours (06:00–23:00)" on untouched
+    /// defaults, where the server and the web take 23:00 — so that one case
+    /// also says the last minute that rings (audit 2026-09-22, C12).
+    static func hoursLabel(start: String, end: String, refusing t: Int) -> String {
+        guard let e = minutesOfDay(end), t == e else { return "\(start)–\(end)" }
+        let last = (e + 24 * 60 - 1) % (24 * 60)
+        return "\(start)–\(end); the latest it rings is \(String(format: "%02d:%02d", last / 60, last % 60))"
+    }
+
+    // MARK: will it ring here? (audit 2026-09-22, C12)
+    //
+    // Every booking path used to check only the server window, while the
+    // phone applied its switch and hours on receipt — so a call the app had
+    // confirmed was declined quietly at ring time, every day for a proactive
+    // time outside the hours. These say so where the time is picked.
+
+    /// The minute dispatch_proactive_calls (072) actually books a morning /
+    /// evening call picked for minute `t`: its cron runs every 5 minutes and
+    /// books at the first tick in [t, t+10) that is also inside 06:00–23:00
+    /// (inclusive). nil = no tick qualifies, so the call never happens.
+    static func proactiveRingMinute(_ t: Int) -> Int? {
+        guard let s = minutesOfDay(serverWindowStart), let e = minutesOfDay(serverWindowEnd) else { return t }
+        let first = (t + 4) / 5 * 5
+        return [first, first + 5].first { $0 >= s && $0 <= e }
+    }
+
+    /// The amber line under a proactive call's time picker, or nil when it
+    /// will ring here. Judged at the minute the dispatcher really books it
+    /// (proactiveRingMinute) and the minute after — call-dispatch runs every
+    /// minute — against this phone's switch and hours.
+    static func proactiveTimeWarning(_ hhmm: String, enabled: Bool, start: String, end: String) -> String? {
+        guard let t = minutesOfDay(hhmm) else { return nil }
+        guard let ring = proactiveRingMinute(t) else {
+            return "Unstuck only calls between \(serverWindowStart) and \(serverWindowEnd), so a call at \(hhmm) never rings."
+        }
+        if !enabled {
+            return "Calls are off on this iPhone, so this call is declined here — switch them on above."
+        }
+        if let outside = [ring, ring + 1].first(where: { !isWithinWindow(minuteOfDay: $0, start: start, end: end) }) {
+            return "Unstuck rings this call at about \(String(format: "%02d:%02d", outside / 60, outside % 60)), outside this iPhone's allowed hours (\(hoursLabel(start: start, end: end, refusing: outside))), so it's declined here — widen the hours above or pick another time."
+        }
+        return nil
+    }
+
+    /// The amber line under "Check in after a block" (it rings at the tick
+    /// after a block ends, any time 06:00–23:00), or nil when every such
+    /// call rings here. The 23:00 minute itself is left out: the default
+    /// hours end there (exclusive), and one edge minute is not worth a
+    /// warning on every untouched phone.
+    static func afterBlockWarning(enabled: Bool, start: String, end: String) -> String? {
+        if !enabled {
+            return "Calls are off on this iPhone, so these check-ins are declined here — switch them on above."
+        }
+        guard let s = minutesOfDay(serverWindowStart), let e = minutesOfDay(serverWindowEnd) else { return nil }
+        if (s..<e).allSatisfy({ isWithinWindow(minuteOfDay: $0, start: start, end: end) }) { return nil }
+        return "This iPhone only takes calls \(start)–\(end), so a check-in after a block that ends outside those hours is declined here."
+    }
+
+    /// Can a call actually ring on this phone? Calls on here, and a
+    /// call_requests row mirrored (any platform, any status) or a proactive
+    /// call switched on — the moment to ask for the microphone (audit
+    /// 2026-09-22, C13).
+    static func expectsCalls(hasCallRows: Bool, enabled: Bool = Self.enabled,
+                             proactive: CallProactivePrefs = Self.proactive) -> Bool {
+        enabled && (hasCallRows || proactive.morningEnabled || proactive.eveningEnabled || proactive.afterBlockEnabled)
     }
 
     /// Server booking window check (inclusive 06:00 … 23:00).
@@ -131,6 +208,11 @@ enum CallSettings {
         let p = hhmm.split(separator: ":").compactMap { Int($0) }
         guard p.count == 2, (0..<24).contains(p[0]), (0..<60).contains(p[1]) else { return nil }
         return p[0] * 60 + p[1]
+    }
+
+    static func minuteOfDay(_ date: Date, calendar: Calendar = .current) -> Int {
+        let c = calendar.dateComponents([.hour, .minute], from: date)
+        return (c.hour ?? 0) * 60 + (c.minute ?? 0)
     }
 
     static func hhmm(_ date: Date, calendar: Calendar = .current) -> String {

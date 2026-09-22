@@ -13,6 +13,7 @@
 // runs only when the mirror is still empty. Writes go through the same
 // MirrorFirstCallStore the assistant's tools use.
 
+import AVFoundation
 import SwiftUI
 import UnstuckCore
 import UnstuckDesign
@@ -32,6 +33,8 @@ struct CallMeSection: View {
     @State private var notesText = ""
     @State private var busy = false
     @State private var error: String?
+    /// The microphone was refused: the call still rings, but can't hear them.
+    @State private var micDenied = AVAudioApplication.shared.recordPermission == .denied
 
     private var store: MirrorFirstCallStore? { model.coordinator?.callStore }
     private var mirror: CallRequestsMirror? { model.coordinator?.callsMirror }
@@ -40,6 +43,25 @@ struct CallMeSection: View {
     private var canBook: Bool { blockStart != nil && task.later != true }
     private var notes: [String] { CallToolLogic.notes(notesText) }
     private var callAt: Date? { blockStart?.addingTimeInterval(TimeInterval(-lead * 60)) }
+    /// This phone would decline the call at `callAt` (Calls off here, or
+    /// outside its allowed hours) — worded for the editor. Also flags a row
+    /// booked on the web, or moved with its block, into hours this phone
+    /// declines (audit 2026-09-22, C12).
+    private var hoursHint: String? {
+        guard let callAt, CallToolLogic.deviceGuard(callAt) != nil else { return nil }
+        guard CallSettings.enabled else {
+            return "Calls are off on this iPhone, so it would decline this call. Switch them on in Settings › Calls."
+        }
+        let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
+                                            refusing: CallSettings.minuteOfDay(callAt))
+        return "\(CallSettings.hhmm(callAt)) is outside this iPhone's call hours (\(hours)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Calls."
+    }
+    /// Booking, or changing the ring time (lead / slot), meets the hint;
+    /// a notes-only edit of an existing row doesn't — update_call's rule.
+    private var changesTime: Bool {
+        guard let row else { return true }
+        return row.leadMin != lead || row.blockId != nextBlock?.id
+    }
 
     var body: some View {
         if store != nil {
@@ -61,6 +83,11 @@ struct CallMeSection: View {
                 } else if loaded {
                     Text("Your phone rings before it starts and reads your notes back.")
                         .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if canBook, enabled, micDenied, CallSettings.enabled {
+                    Text("Calls need microphone access — turn it on for Unstuck in iOS Settings, or it will ring but can't hear you.")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let error {
@@ -103,7 +130,11 @@ struct CallMeSection: View {
                         .background(theme.palette.ink, in: Capsule())
                 }
                 .buttonStyle(.plain)
-                .disabled(busy || !dirty)
+                .disabled(busy || !dirty || (hoursHint != nil && changesTime))
+            }
+            if let hoursHint {
+                Text(hoursHint).font(UFont.sans(12)).foregroundStyle(theme.palette.amber)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(12)
@@ -138,6 +169,9 @@ struct CallMeSection: View {
             if let existing { try? store.mirror.upsert(existing) }
         }
         apply(existing)
+        // Re-read each time the editor opens: the mic may have been turned
+        // on in iOS Settings since (audit 2026-09-22, C13).
+        micDenied = AVAudioApplication.shared.recordPermission == .denied
         loaded = true
     }
 
@@ -196,30 +230,52 @@ struct CallMeSection: View {
             error = e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst
             return
         }
+        // The button is disabled while the hint applies to a booking or a
+        // time change, but CallSettings isn't observed, so the render can be
+        // stale — the same check again before anything is written (audit
+        // 2026-09-22, C12).
+        if changesTime, let hint = hoursHint {
+            error = hint
+            return
+        }
         error = nil
         busy = true
         let leadNow = lead
         let notesNow = notes
-        Task {
-            do {
-                if let row {
-                    if let updated = try await store.patch(id: row.id, callAt: callAt, blockId: .some(block.id),
-                                                           leadMin: .some(leadNow), label: nil, notes: notesNow) {
-                        self.row = updated
+        func write() {
+            Task {
+                do {
+                    if let row {
+                        if let updated = try await store.patch(id: row.id, callAt: callAt, blockId: .some(block.id),
+                                                               leadMin: .some(leadNow), label: nil, notes: notesNow) {
+                            self.row = updated
+                        } else {
+                            // Zero rows: the call rang / was cancelled underneath us.
+                            self.error = "That call changed underneath you — reloaded."
+                            await load()
+                        }
                     } else {
-                        // Zero rows: the call rang / was cancelled underneath us.
-                        self.error = "That call changed underneath you — reloaded."
-                        await load()
+                        self.row = try await store.book(userId: uid, taskId: task.id, blockId: block.id,
+                                                        callAt: callAt, leadMin: leadNow,
+                                                        label: task.name, notes: notesNow)
                     }
-                } else {
-                    self.row = try await store.book(userId: uid, taskId: task.id, blockId: block.id,
-                                                    callAt: callAt, leadMin: leadNow,
-                                                    label: task.name, notes: notesNow)
+                } catch {
+                    self.error = "Couldn't book the call — check your connection and try again."
                 }
-            } catch {
-                self.error = "Couldn't book the call — check your connection and try again."
+                busy = false
             }
-            busy = false
+        }
+        // "Call me about this" never asked for the microphone, and a
+        // lock-screen answer can't show the prompt — so the first call
+        // couldn't hear them (audit 2026-09-22, C13). Ask now, while the
+        // editor is in front of them. A refusal still books (the ring is
+        // still the reminder) and the red line says it can't hear them.
+        // `busy` keeps the button off while the prompt is up. Not with Calls
+        // off here: this phone declines the call anyway.
+        guard CallSettings.enabled else { write(); return }
+        CallSettingsView.ensureMicrophone { granted in
+            micDenied = !granted
+            write()
         }
     }
 }
