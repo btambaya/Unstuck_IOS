@@ -150,11 +150,91 @@ public struct AuthService: Sendable {
         client.auth.currentSession?.user.id.uuidString.lowercased()
     }
 
-    /// The current session's JWT access token. The voice realtime proxy (CF
-    /// Worker) validates it before bridging to DashScope, so the realtime client
-    /// sends it as the `Authorization: Bearer` header.
+    /// The STORED session's JWT access token (`currentSession`) — it may be
+    /// hours expired: the SDK refreshes only while the app is ACTIVE. A caller
+    /// that hands the JWT to a service itself (the voice proxy) dials with
+    /// `freshAccessToken` instead (audit 2026-09-22, C14).
     public var accessToken: String? {
         client.auth.currentSession?.accessToken
+    }
+
+    /// A JWT that is valid NOW and still has `minValidity` seconds left, for a
+    /// caller that hands it to a service itself rather than going through the
+    /// SDK (the voice proxy, which validates it at connect and keeps using it
+    /// for the whole session). Why (audit 2026-09-22, C14/C15): supabase-swift
+    /// auto-refreshes only while the app is ACTIVE, and a call answered on the
+    /// lock screen never activates it, so the stored token can be hours
+    /// expired; and `auth.session` alone refreshes only inside its 30 s
+    /// margin, so a session could still outlive its token.
+    ///
+    /// `forceRefresh` (after the server rejected the token) always refreshes
+    /// and never returns the stored token. nil = no session, a failed forced
+    /// refresh, or `deadline` passed; a refresh that loses the deadline keeps
+    /// running and still lands through `.tokenRefreshed`. A still-valid token
+    /// that is only short of `minValidity` waits at most `topUpDeadline` for
+    /// its top-up, then is used as it is.
+    public func freshAccessToken(minValidity: TimeInterval, forceRefresh: Bool = false,
+                                 deadline: TimeInterval, topUpDeadline: TimeInterval) async -> String? {
+        let client = self.client
+        return await Self.firstWithin(deadline) {
+            await Self.resolveFreshToken(
+                minValidity: minValidity, forceRefresh: forceRefresh, topUpDeadline: topUpDeadline,
+                now: { Date().timeIntervalSince1970 },
+                // `auth.session` refreshes an expired token (or one inside
+                // its 30 s margin) and joins a refresh already in flight.
+                current: { let s = try await client.auth.session; return (s.accessToken, s.expiresAt) },
+                // NO argument: the refresh token is read at call time. Passing
+                // one read earlier could race a rotation into
+                // `refresh_token_already_used`, which the SDK treats as a sign-out.
+                refresh: { try await client.auth.refreshSession().accessToken })
+        }
+    }
+
+    /// The rules of `freshAccessToken`, over injected closures so they are
+    /// testable without a server. `expiresAt` is the session's `expires_at`
+    /// (the JWT's `exp`), in epoch seconds like `now`.
+    static func resolveFreshToken(
+        minValidity: TimeInterval, forceRefresh: Bool, topUpDeadline: TimeInterval,
+        now: @escaping @Sendable () -> TimeInterval,
+        current: @escaping @Sendable () async throws -> (token: String, expiresAt: TimeInterval),
+        refresh: @escaping @Sendable () async throws -> String
+    ) async -> String? {
+        // The server just refused the stored token — never hand it back.
+        if forceRefresh {
+            guard let t = try? await refresh(), !t.isEmpty else { return nil }
+            return t
+        }
+        guard let cur = try? await current(), !cur.token.isEmpty else { return nil }
+        if cur.expiresAt - now() >= minValidity { return cur.token }
+        // Valid (`current` refreshes anything inside the SDK's 30 s margin),
+        // just short of `minValidity`: top it up, but never make a dial wait
+        // long for a token it doesn't strictly need.
+        let topped = await firstWithin(topUpDeadline) { try? await refresh() }
+        if let topped, !topped.isEmpty { return topped }
+        return cur.token
+    }
+
+    /// `op`'s answer, or nil once `seconds` pass — whichever comes first. Not
+    /// a task group (AppModel's `withDeadline`): the SDK's refresh is awaited
+    /// through `inFlightRefreshTask.value`, which ignores cancellation, so a
+    /// group would sit out the whole stalled refresh (URLSession's 60 s × the
+    /// SDK's retries). The losing `op` keeps running; its result is dropped.
+    static func firstWithin<T: Sendable>(_ seconds: TimeInterval,
+                                         _ op: @escaping @Sendable () async -> T?) async -> T? {
+        let claimed = MutableFlag(false)
+        return await withCheckedContinuation { (cont: CheckedContinuation<T?, Never>) in
+            let sleeper = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                if !claimed.swap(true) { cont.resume(returning: nil) }
+            }
+            Task {
+                let value = await op()
+                if !claimed.swap(true) {
+                    sleeper.cancel()
+                    cont.resume(returning: value)
+                }
+            }
+        }
     }
 
     /// Signed-in user's email (denormalized into feedback + "who's on it" labels).

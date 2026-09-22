@@ -295,3 +295,244 @@ final class VoiceReconnectTests: XCTestCase {
         }
     }
 }
+
+// MARK: - the dial's token (audit 2026-09-22, C14)
+
+/// A call answered on the lock screen of an app suspended overnight dialled
+/// with the token cached at the last foreground (the SDK refreshes only while
+/// ACTIVE); the proxy's 401 hung it up and told a signed-in user to sign in
+/// again. The client now resolves the token at dial time and, on a 401 before
+/// the socket ever opened, forces ONE refresh and redials.
+final class VoiceDialTokenTests: XCTestCase {
+    /// What the client did: each dial's Authorization header, errors, and
+    /// transport ends.
+    private final class Recorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _dials: [String] = []
+        private var _errors: [String] = []
+        private var _ended: [String?] = []
+        func dial(_ auth: String) { lock.withLock { _dials.append(auth) } }
+        func error(_ m: String) { lock.withLock { _errors.append(m) } }
+        func ended(_ e: String?) { lock.withLock { _ended.append(e) } }
+        var dials: [String] { lock.withLock { _dials } }
+        var errors: [String] { lock.withLock { _errors } }
+        var ended: [String?] { lock.withLock { _ended } }
+    }
+
+    /// The fresh-token provider: `normal` for a dial, `forced` after a 401;
+    /// records every ask (its forceRefresh flag).
+    private final class Provider: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _asks: [Bool] = []
+        private let normal: String?
+        private let forced: String?
+        private let delayNs: UInt64
+        init(normal: String?, forced: String? = nil, delayNs: UInt64 = 0) {
+            self.normal = normal; self.forced = forced; self.delayNs = delayNs
+        }
+        func token(_ force: Bool) async -> String? {
+            lock.withLock { _asks.append(force) }
+            if delayNs > 0 { try? await Task.sleep(nanoseconds: delayNs) }
+            return force ? forced : normal
+        }
+        var asks: [Bool] { lock.withLock { _asks } }
+    }
+
+    private func client(_ rec: Recorder, _ provider: Provider?) -> VoiceRealtimeClient {
+        var fresh: (@Sendable (Bool) async -> String?)?
+        if let provider { fresh = { force in await provider.token(force) } }
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "cached", freshToken: fresh, model: "m",
+            instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
+            runTool: { _, _ in "ok" },
+            onState: { _ in },
+            onCaption: { _, _, _ in },
+            onError: { rec.error($0) },
+            initialRoute: .speaker,
+            routeProvider: { .speaker },
+            now: { 0 })
+        c.dialOverride = { req in rec.dial(req.value(forHTTPHeaderField: "Authorization") ?? "") }
+        c.onTransportEnded = { rec.ended($0) }
+        return c
+    }
+
+    /// Polls `cond` (the dial runs on a Task) — true once it holds.
+    private func eventually(_ cond: @escaping () -> Bool) async -> Bool {
+        for _ in 0..<200 {
+            if cond() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return cond()
+    }
+
+    func testTheDialSendsTheFreshTokenNotTheCachedOne() async {
+        let rec = Recorder(), p = Provider(normal: "fresh")
+        let c = client(rec, p)
+        c.start()
+        let dialled = await eventually { rec.dials.count == 1 }
+        XCTAssertTrue(dialled)
+        XCTAssertEqual(rec.dials, ["Bearer fresh"])
+        XCTAssertEqual(p.asks, [false])
+        c.stop()
+    }
+
+    func testNoFreshTokenFallsBackToTheCachedOne() async {
+        let rec = Recorder(), p = Provider(normal: nil)
+        let c = client(rec, p)
+        c.start()
+        let dialled = await eventually { rec.dials.count == 1 }
+        XCTAssertTrue(dialled)
+        XCTAssertEqual(rec.dials, ["Bearer cached"])
+        c.stop()
+    }
+
+    func testWithNoProviderTheDialIsImmediateWithTheCachedToken() {
+        let rec = Recorder()
+        let c = client(rec, nil)
+        c.start()
+        XCTAssertEqual(rec.dials, ["Bearer cached"], "the legacy path is unchanged")
+        c.stop()
+    }
+
+    func testA401BeforeOpenRefreshesOnceAndRedials() async {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: "fresh-2")
+        let c = client(rec, p)
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        let redialled = await eventually { rec.dials.count == 2 }
+        XCTAssertTrue(redialled)
+        XCTAssertEqual(rec.dials, ["Bearer fresh-1", "Bearer fresh-2"])
+        XCTAssertEqual(p.asks, [false, true])
+        XCTAssertEqual(rec.errors, [], "a signed-in user is not told to sign in again")
+        XCTAssertEqual(rec.ended.count, 0, "the call is not hung up")
+        c.stop()
+    }
+
+    func testASecond401TellsTheUserToSignInAgain() async {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: "fresh-2")
+        let c = client(rec, p)
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        _ = await eventually { rec.dials.count == 2 }
+        c.handshakeEnded(status: 401, error: nil)
+        let reported = await eventually { !rec.errors.isEmpty }
+        XCTAssertTrue(reported)
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.sessionExpiredMessage])
+        XCTAssertEqual(rec.ended, [VoiceRealtimeClient.sessionExpiredMessage])
+        XCTAssertEqual(p.asks, [false, true], "one forced refresh, never a loop")
+        XCTAssertEqual(rec.dials.count, 2)
+        c.stop()
+    }
+
+    func testAFailedForcedRefreshEndsWithoutRedialling() async {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: nil)
+        let c = client(rec, p)
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        let reported = await eventually { !rec.errors.isEmpty }
+        XCTAssertTrue(reported)
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.sessionExpiredMessage])
+        XCTAssertEqual(rec.dials, ["Bearer fresh-1"], "no second dial with the refused token")
+        c.stop()
+    }
+
+    func testAForcedRefreshHandingBackTheRefusedTokenIsNoAnswer() async {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: "fresh-1")
+        let c = client(rec, p)
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        let reported = await eventually { !rec.errors.isEmpty }
+        XCTAssertTrue(reported)
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.sessionExpiredMessage])
+        XCTAssertEqual(rec.dials.count, 1)
+        c.stop()
+    }
+
+    func testWithNoProviderA401IsReportedAtOnce() {
+        let rec = Recorder()
+        let c = client(rec, nil)
+        c.start()
+        c.handshakeEnded(status: 401, error: nil)
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.sessionExpiredMessage])
+        XCTAssertEqual(rec.ended.count, 1)
+        XCTAssertEqual(rec.dials.count, 1)
+        c.stop()
+    }
+
+    func testOtherRejectionsAreNotRetried() async {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: "fresh-2")
+        let c = client(rec, p)
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 429, error: nil)
+        XCTAssertEqual(rec.errors, ["A voice session is already running. Close it and try again in a moment."])
+        XCTAssertEqual(p.asks, [false], "no forced refresh for a busy proxy")
+        XCTAssertEqual(rec.dials.count, 1)
+        c.stop()
+    }
+
+    /// The launcher's END CONTRACT: nothing after stop(), even while the
+    /// token is still resolving.
+    func testStopWhileTheTokenResolvesNeverDials() async throws {
+        let rec = Recorder(), p = Provider(normal: "fresh", delayNs: 300_000_000)
+        let c = client(rec, p)
+        c.start()
+        c.stop()
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertEqual(p.asks, [false])
+        XCTAssertEqual(rec.dials, [])
+        XCTAssertEqual(rec.errors, [])
+        XCTAssertEqual(rec.ended.count, 0)
+    }
+
+    func testStopDuringTheForcedRefreshNeverRedials() async throws {
+        let rec = Recorder(), p = Provider(normal: "fresh-1", forced: "fresh-2", delayNs: 300_000_000)
+        let c = client(rec, p)
+        c.start()
+        _ = await eventually { rec.dials.count == 1 }
+        c.handshakeEnded(status: 401, error: nil)
+        c.stop()
+        try await Task.sleep(nanoseconds: 600_000_000)
+        XCTAssertEqual(rec.dials.count, 1)
+        XCTAssertEqual(rec.errors, [])
+        XCTAssertEqual(rec.ended.count, 0)
+    }
+
+    func testOnlyAPreOpen401IsRetriedAndOnlyOnce() {
+        XCTAssertTrue(VoiceRealtimeClient.shouldRetryUnauthorized(status: 401, openedOnce: false, retried: false))
+        XCTAssertFalse(VoiceRealtimeClient.shouldRetryUnauthorized(status: 401, openedOnce: false, retried: true))
+        XCTAssertFalse(VoiceRealtimeClient.shouldRetryUnauthorized(status: 401, openedOnce: true, retried: false))
+        for status in [-1, 101, 403, 429, 500] {
+            XCTAssertFalse(VoiceRealtimeClient.shouldRetryUnauthorized(status: status, openedOnce: false, retried: false))
+        }
+    }
+
+    /// AppModel's fallback: the stream-cached token stands in when the fresh
+    /// read fails (an unsigned build's keychain) — but never after a FORCED
+    /// refresh, which follows the proxy refusing exactly that token.
+    func testTheCachedTokenIsNeverTheAnswerToAForcedRefresh() {
+        XCTAssertEqual(AppModel.voiceDialToken(fresh: "f", cached: "c", forceRefresh: false), "f")
+        XCTAssertEqual(AppModel.voiceDialToken(fresh: "f", cached: "c", forceRefresh: true), "f")
+        XCTAssertEqual(AppModel.voiceDialToken(fresh: nil, cached: "c", forceRefresh: false), "c")
+        XCTAssertEqual(AppModel.voiceDialToken(fresh: "", cached: "c", forceRefresh: false), "c")
+        XCTAssertNil(AppModel.voiceDialToken(fresh: nil, cached: "c", forceRefresh: true))
+        XCTAssertNil(AppModel.voiceDialToken(fresh: nil, cached: nil, forceRefresh: false))
+        XCTAssertNil(AppModel.voiceDialToken(fresh: nil, cached: "", forceRefresh: false))
+    }
+
+    /// The proxy hard-closes a session at 15 min and keeps using the
+    /// connect-time token until then (voice-proxy MAX_SESSION_MS, C15).
+    @MainActor
+    func testADialledTokenOutlivesTheProxysSessionCap() {
+        let minValidity = AppModel.voiceTokenMinValidity
+        let deadline = AppModel.voiceTokenDeadline
+        let topUp = AppModel.voiceTokenTopUpDeadline
+        XCTAssertGreaterThan(minValidity, 15 * 60)
+        XCTAssertLessThan(topUp, deadline)
+        XCTAssertLessThan(deadline, 15, "inside the client's dial watchdog")
+    }
+}
