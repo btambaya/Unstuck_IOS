@@ -211,6 +211,7 @@ public func recurrenceLabel(_ r: Recurrence?) -> String {
 ///  • ON for a plain task that is done: the done is cleared. A done TEMPLATE
 ///    is an ended series — no reminders, no horizon top-up, no server calls —
 ///    and "Daily → Never → Daily" on a ticked day would otherwise make one.
+///    The day it was done keeps its tick (`occurrencesCarryingTaskDone`).
 /// Changing one repeat rule for another leaves the done state as it is.
 public func taskAfterSettingRecurrence(_ task: TaskItem, recurrence: Recurrence?, blocks: [CalBlock],
                                        todayIso: String, nowISO: String) -> TaskItem {
@@ -227,4 +228,29 @@ public func taskAfterSettingRecurrence(_ task: TaskItem, recurrence: Recurrence?
         next.completedAt = nil
     }
     return next
+}
+
+/// The occurrence blocks a done task's tick moves onto when its repeat is
+/// turned ON (audit 2026-09-22, C3). A plain task's done lives on the TASK —
+/// its blocks stay open — and taskAfterSettingRecurrence clears it, so the
+/// day it was done became an open occurrence: "Stretch" ticked this morning,
+/// made daily, and today's 07:30 row was back in Today to tick again (the
+/// evening call counting it open); ticked on yesterday's slot, and that slot
+/// showed in Backlog as overdue. The tick lands on the day it fulfilled — the
+/// task's latest scheduled day on or before the day it was done — stamped
+/// with the task's completedAt, the shape setOccurrenceDone writes. A slot
+/// after that day (done early) stays that day's open occurrence. Empty for
+/// every other change, and for a day already ticked.
+public func occurrencesCarryingTaskDone(_ task: TaskItem, recurrence: Recurrence?, blocks: [CalBlock],
+                                        todayIso: String, nowISO: String) -> [CalBlock] {
+    guard recurrence != nil, task.recurrence == nil, task.done else { return [] }
+    let doneDay = min(task.completedAt.map(isoToLocalYmd) ?? todayIso, todayIso)
+    let slots = blocks.filter { $0.taskId == task.id && isTaskBlock($0) && !$0.skipped && $0.date <= doneDay }
+    guard let day = slots.map(\.date).max() else { return [] }
+    return slots.filter { $0.date == day && !$0.done }.map { b in
+        var next = b
+        next.done = true
+        next.completedAt = task.completedAt ?? nowISO
+        return next
+    }
 }

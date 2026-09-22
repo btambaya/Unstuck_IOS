@@ -660,10 +660,8 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // The editor's rule (audit 2026-09-22, C3): "stop repeating" carries a
         // ticked today onto the task, and a repeat turned on never leaves a
         // DONE template (an ended series).
-        let wasDone = t.done
+        let before = t
         t = taskAfterSettingRecurrence(t, recurrence: rec, blocks: api.getBlocks(), todayIso: api.todayIso(), nowISO: now())
-        let doneNote = !wasDone && t.done ? " — today's occurrence was already done, so the task is now marked done"
-            : (wasDone && !t.done ? " (it was done — now open again)" : "")
         t.updatedAt = now()
         await api.upsertTask(t)
         scratch.newTasks[t.id] = t
@@ -675,6 +673,27 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
                                          startTime: anchor.startTime, startDate: LocalDate.parse(anchor.date))
             for b in plan.toUpsert { await api.upsertBlock(b) }
             for id in plan.toDelete { await api.deleteBlock(id) }
+        }
+        // A done task made to repeat keeps the day it was done ticked, and the
+        // done flip reaches a loop-promoted task's shared-list row — as in the
+        // editor (AppModel.setRecurrence).
+        for b in occurrencesCarryingTaskDone(before, recurrence: rec, blocks: blocks, todayIso: api.todayIso(), nowISO: now()) {
+            await api.upsertBlock(b)
+        }
+        if before.done != t.done {
+            if t.done { api.notifyTaskCompletedIfShared(t) } else { api.notifyTaskReopenedIfShared(t) }
+        }
+        let todays = api.getBlocks().filter { $0.taskId == t.id && isTaskBlock($0) && $0.date == api.todayIso() && !$0.skipped }
+        let todayDone = !todays.isEmpty && todays.allSatisfy(\.done)
+        let doneNote: String
+        if !before.done && t.done {
+            doneNote = " — today's occurrence was already done, so the task is now marked done"
+        } else if before.done && !t.done {
+            // Never "open again" over a day that stays ticked: the user would
+            // be told to do today's again.
+            doneNote = todayDone ? " (it was done — today's occurrence stays done)" : " (it was done — now open again)"
+        } else {
+            doneNote = ""
         }
         let anchored = blocks.contains { $0.taskId == t.id }
         guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")\(doneNote)" }

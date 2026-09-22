@@ -289,7 +289,7 @@ final class AppModelAssistantState: AssistantAppState {
     /// a session on a task shared WITH me → `finalizeSharedFocus` (owner's
     /// ledger, optional completion by level); an own task → `finishFocus`
     /// (partner-shared → exactly-once ledger); a task row that's gone →
-    /// the bare Session. nil = nothing was running.
+    /// the bare Session, without the dead task id. nil = nothing was running.
     func finishFocus(markDone: Bool) async -> FocusFinishOutcome? {
         guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return nil }
         let now = Date().timeIntervalSince1970 * 1000
@@ -320,7 +320,7 @@ final class AppModelAssistantState: AssistantAppState {
                               occurrenceBlockId: cur.occurrenceBlockId,
                               sharedLedger: model.accruesViaSharedLedger(cur, taskId: task.id))
         } else {
-            model.saveSession(session)
+            model.saveSession(AppModel.goneTaskSession(cur, elapsedSec: elapsed))
         }
         // A presented Focus screen would keep showing a clock the store no longer has.
         if model.router.focusTask != nil { model.router.focusTask = nil; model.router.sharedFocus = nil }

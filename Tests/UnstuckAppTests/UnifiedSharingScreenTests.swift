@@ -658,6 +658,34 @@ final class RecurringEntryPointTests: XCTestCase {
         XCTAssertEqual(after.completedAt, "\(today)T08:10:00.000Z")
     }
 
+    /// The other way round: a plain task ticked today, then made daily. The
+    /// series is open (a done template is an ended one) and today's slot keeps
+    /// the tick — it never reappears in Today to be done again.
+    func testMakingATaskDoneTodayRepeatKeepsTodaysTick() async throws {
+        let stamp = AppModel.isoNow()
+        let plain = TaskItem(id: "c3-stretch", name: "Stretch", estimateMin: 10, done: true, completedAt: stamp,
+                             createdAt: "2026-09-01T08:00:00.000Z", updatedAt: "2026-09-01T08:00:00.000Z")
+        try db.save(plain)
+        try db.save(CalBlock(id: "c3-stretch-td", taskId: "c3-stretch", taskName: "Stretch", startTime: "07:30",
+                             durationMinutes: 10, date: today, kind: .task))
+        func todaySlot() throws -> CalBlock? { try db.fetchAllCalBlocks().first { $0.id == "c3-stretch-td" } }
+
+        model.setRecurrence(plain, .daily(until: nil))
+        for _ in 0..<60 {
+            if try stored("c3-stretch")?.recurrence != nil, try todaySlot()?.done == true { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let after = try XCTUnwrap(stored("c3-stretch"))
+        XCTAssertEqual(after.recurrence, .daily(until: nil))
+        XCTAssertFalse(after.done, "a done template is an ended series")
+        let slot = try XCTUnwrap(todaySlot())
+        XCTAssertTrue(slot.done, "today's slot keeps the tick")
+        XCTAssertEqual(slot.completedAt, stamp)
+        XCTAssertEqual(slot.startTime, "07:30")
+        XCTAssertEqual(projectOccurrences([after], [slot], fromISO: today).first?.done, true,
+                       "Today shows the day ticked, not open")
+    }
+
     /// The Today live card / PAUSED chip hold the TEMPLATE of a paused
     /// occurrence session: reopening lands on the session's OWN day, so
     /// FocusModel re-attaches the paused session instead of resuming it.

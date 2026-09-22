@@ -2043,6 +2043,41 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertFalse(api.tasks[0].done)
         XCTAssertNil(api.tasks[0].completedAt)
     }
+
+    /// Ticked this morning, then "make it daily": today's slot keeps the tick
+    /// (never "open again" over it), and a loop-promoted task's shared-list
+    /// row un-ticks with the task, as the UI's reopen does.
+    func testStartRepeatingATaskDoneTodayKeepsTodaysTick() async {
+        var t = task("d", "Stretch", done: true, completedAt: AppModel.isoNow())
+        t.sourceCollectionId = "c1"
+        t.sourceItemId = "i1"
+        api.tasks = [t]
+        api.blocks = [block("dtd", "d", TODAY, "07:30")]
+        await eq("set_task_recurrence", #"{"taskId":"d","kind":"daily"}"#,
+                 "ok: \"Stretch\" now repeats daily (it was done — today's occurrence stays done)")
+        XCTAssertFalse(api.tasks[0].done, "an open series")
+        let slot = api.blocks.first { $0.id == "dtd" }!
+        XCTAssertTrue(slot.done)
+        XCTAssertEqual(slot.completedAt, t.completedAt)
+        XCTAssertEqual(slot.startTime, "07:30")
+        XCTAssertTrue(api.blocks.contains { $0.taskId == "d" && $0.date == TOMORROW && !$0.done }, "tomorrow is a new day")
+        XCTAssertEqual(api.reopenedShared, ["c1:i1"])
+        XCTAssertTrue(api.completedShared.isEmpty)
+    }
+
+    /// And back: "stop repeating" on a ticked day marks the task done, and
+    /// its shared-list row ticks with it.
+    func testStopRepeatingATickedLoopPromotedSeriesTicksTheListRow() async {
+        seedSeries()
+        api.tasks[1].sourceCollectionId = "c1"
+        api.tasks[1].sourceItemId = "i1"
+        _ = await run("complete_task", #"{"taskId":"r"}"#)
+        XCTAssertTrue(api.completedShared.isEmpty, "a day's tick is not the task's")
+        _ = await run("set_task_recurrence", #"{"taskId":"r","kind":"none"}"#)
+        XCTAssertTrue(api.tasks[1].done)
+        XCTAssertEqual(api.completedShared, ["c1:i1"])
+        XCTAssertTrue(api.reopenedShared.isEmpty)
+    }
 }
 
 
@@ -2360,5 +2395,35 @@ final class StoredRowWriteTests: XCTestCase {
         XCTAssertNil(try stored("c5-deleted"))
         XCTAssertEqual(try taskOps("c5-deleted").count, 0)
         XCTAssertEqual(model.lastRecap?.focusedSec, 300)
+    }
+
+    /// The other row-gone finishes — the assistant's finish_focus, the
+    /// notification's End, the sign-out finalize — save this Session: the
+    /// minutes, never the dead task id (sessions.task_id references tasks(id),
+    /// so the insert failed and the op sat quarantined).
+    func testASessionForAGoneTaskCarriesNoTaskId() {
+        let s = AppModel.goneTaskSession(liveSession("c5-gone", estimate: 30), elapsedSec: 420)
+        XCTAssertNil(s.taskId)
+        XCTAssertEqual(s.id, "live-1", "the live session's id")
+        XCTAssertEqual(s.taskName, "Focus session")
+        XCTAssertEqual(s.estimateMin, 30)
+        XCTAssertEqual(s.actualSec, 420)
+    }
+
+    /// "I'm done" by voice after the task was deleted elsewhere: the session
+    /// ends, nothing re-creates the task, and nothing claims it was completed.
+    func testAssistantFinishOnADeletedTaskEndsTheSessionWithoutATaskWrite() async throws {
+        let store = try XCTUnwrap(model.liveStore)
+        try store.set(liveSession("c5-gone"))
+        model.refreshLiveSession()
+        let state = AppModelAssistantState(model: model, assistant: model.assistant)
+        let finished = await state.finishFocus(markDone: true)
+        let outcome = try XCTUnwrap(finished)
+        XCTAssertEqual(outcome.taskName, "Focus session")
+        XCTAssertFalse(outcome.markedDone)
+        XCTAssertNil(try store.get()?.sessionStart, "the session is over")
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertNil(try stored("c5-gone"))
+        XCTAssertEqual(try taskOps("c5-gone").count, 0)
     }
 }

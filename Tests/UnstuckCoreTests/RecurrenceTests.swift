@@ -420,4 +420,85 @@ final class TaskAfterSettingRecurrenceTests: XCTestCase {
         let stillPlain = taskAfterSettingRecurrence(plainDone, recurrence: nil, blocks: [], todayIso: today, nowISO: now)
         XCTAssertEqual(stillPlain, plainDone)
     }
+
+    // MARK: occurrencesCarryingTaskDone — a done task made to repeat keeps its tick
+    //
+    // Stamps sit at 11:00Z so the local day is the literal's in any timezone
+    // from UTC-11 to UTC+12 (isoToLocalYmd reads the device's zone).
+
+    private func plain(done: Bool = true, completedAt: String? = "2026-09-22T11:00:00.000Z") -> TaskItem {
+        var t = mkTask(id: "tpl", name: "Meditate", done: done)
+        t.completedAt = completedAt
+        return t
+    }
+
+    /// Ticked this morning, made daily: today's slot keeps the tick, so it is
+    /// not back in Today to do again. Tomorrow's is a new day.
+    func testADoneTaskMadeToRepeatKeepsTodaysTick() {
+        let blocks = [day("b1", today, at: "07:30"), day("b2", "2026-09-23", at: "07:30")]
+        let carried = occurrencesCarryingTaskDone(plain(), recurrence: .daily(until: nil), blocks: blocks,
+                                                  todayIso: today, nowISO: now)
+        XCTAssertEqual(carried.map(\.id), ["b1"])
+        XCTAssertTrue(carried[0].done)
+        XCTAssertEqual(carried[0].completedAt, "2026-09-22T11:00:00.000Z", "the task's own completion time")
+        XCTAssertEqual(carried[0].startTime, "07:30", "only the done state changes")
+        // With the task cleared, the day reads done exactly as a ticked occurrence.
+        let tpl = taskAfterSettingRecurrence(plain(), recurrence: .daily(until: nil), blocks: blocks,
+                                             todayIso: today, nowISO: now)
+        let rows = projectOccurrences([tpl], [carried[0], blocks[1]], fromISO: today)
+        XCTAssertEqual(rows.first { $0.id == "b1" }?.done, true)
+        XCTAssertEqual(rows.first { $0.id == "b2" }?.done, false)
+    }
+
+    /// The tick lands on the slot it fulfilled — the latest scheduled day on
+    /// or before the day it was done — so that slot is never an overdue miss.
+    func testTheTickLandsOnTheSlotItFulfilled() {
+        // Scheduled yesterday, done today (late): yesterday's slot.
+        let late = occurrencesCarryingTaskDone(plain(), recurrence: .daily(until: nil),
+                                               blocks: [day("b0", "2026-09-21")], todayIso: today, nowISO: now)
+        XCTAssertEqual(late.map(\.id), ["b0"])
+        let tpl = taskAfterSettingRecurrence(plain(), recurrence: .daily(until: nil), blocks: late,
+                                             todayIso: today, nowISO: now)
+        XCTAssertEqual(projectOverdueOccurrences([tpl], [day("b0", "2026-09-21")], todayISO: today).count, 1,
+                       "left open, the slot showed as a missed day")
+        XCTAssertTrue(projectOverdueOccurrences([tpl], late, todayISO: today).isEmpty,
+                      "no overdue row for a day that was done")
+        // Done yesterday on its slot: that slot. Today's is a new day, still open.
+        let early = occurrencesCarryingTaskDone(plain(completedAt: "2026-09-21T11:00:00.000Z"), recurrence: .daily(until: nil),
+                                                blocks: [day("b0", "2026-09-21"), day("b1", today)], todayIso: today, nowISO: now)
+        XCTAssertEqual(early.map(\.id), ["b0"])
+        // Done yesterday, scheduled only today: nothing at or before the done day.
+        XCTAssertTrue(occurrencesCarryingTaskDone(plain(completedAt: "2026-09-21T11:00:00.000Z"), recurrence: .daily(until: nil),
+                                                  blocks: [day("b1", today)], todayIso: today, nowISO: now).isEmpty)
+        // Two slots on the day: both; a skipped or already-ticked one is left alone.
+        let twins = occurrencesCarryingTaskDone(plain(), recurrence: .daily(until: nil),
+                                                blocks: [day("b1", today), day("b2", today, at: "19:00"),
+                                                         day("b3", today, done: true, at: "12:00"),
+                                                         day("b4", today, skipped: true, at: "13:00")],
+                                                todayIso: today, nowISO: now)
+        XCTAssertEqual(Set(twins.map(\.id)), ["b1", "b2"])
+    }
+
+    func testAStamplessDoneCountsAsToday() {
+        let carried = occurrencesCarryingTaskDone(plain(completedAt: nil), recurrence: .weekly(daysOfWeek: [2], until: nil),
+                                                  blocks: [day("b1", today)], todayIso: today, nowISO: now)
+        XCTAssertEqual(carried.map(\.completedAt), [now])
+    }
+
+    func testNothingCarriesForAnyOtherChange() {
+        let blocks = [day("b1", today)]
+        XCTAssertTrue(occurrencesCarryingTaskDone(plain(done: false), recurrence: .daily(until: nil), blocks: blocks,
+                                                  todayIso: today, nowISO: now).isEmpty, "an open task has no tick")
+        XCTAssertTrue(occurrencesCarryingTaskDone(plain(), recurrence: nil, blocks: blocks,
+                                                  todayIso: today, nowISO: now).isEmpty, "no repeat turned on")
+        XCTAssertTrue(occurrencesCarryingTaskDone(series(done: true, completedAt: "2026-09-22T11:00:00.000Z"),
+                                                  recurrence: .weekly(daysOfWeek: [1], until: nil), blocks: blocks,
+                                                  todayIso: today, nowISO: now).isEmpty, "one rule for another")
+        XCTAssertTrue(occurrencesCarryingTaskDone(plain(), recurrence: .daily(until: nil), blocks: [day("b1", today, done: true)],
+                                                  todayIso: today, nowISO: now).isEmpty, "a day already ticked")
+        var other = day("x", today)
+        other.taskId = "someone-else"
+        XCTAssertTrue(occurrencesCarryingTaskDone(plain(), recurrence: .daily(until: nil), blocks: [other],
+                                                  todayIso: today, nowISO: now).isEmpty)
+    }
 }

@@ -72,8 +72,7 @@ extension AppModel {
         guard let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else {
             // Row gone (deleted elsewhere mid-session): keep the minutes in
             // insights under a generic name, as the notification-end path does.
-            saveSession(Session(id: sessionId, taskId: cur.taskId, taskName: "Focus session",
-                                estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+            saveSession(Self.goneTaskSession(cur, elapsedSec: elapsed))
             return nil
         }
         saveSession(Session(id: sessionId, taskId: task.id, taskName: task.name,

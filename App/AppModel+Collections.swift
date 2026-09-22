@@ -387,9 +387,23 @@ extension AppModel {
         // repeat turned back on never leaves a DONE template (audit
         // 2026-09-22, C3) — the same rule the assistant's set_task_recurrence
         // follows.
+        let today = Clock.todayISO(), now = Self.isoNow()
         var next = taskAfterSettingRecurrence(task, recurrence: recurrence, blocks: existing,
-                                              todayIso: Clock.todayISO(), nowISO: Self.isoNow())
-        next.updatedAt = Self.isoNow()
+                                              todayIso: today, nowISO: now)
+        next.updatedAt = now
+        // A done task made to repeat keeps the day it was done ticked on that
+        // day's occurrence (audit 2026-09-22, C3). Written straight through,
+        // not via saveBlock: its un-park reads the task row, which may not
+        // carry the repeat yet, and a stale plain row there is written back
+        // whole — reverting it. A done-only change has nothing for Google.
+        let carried = occurrencesCarryingTaskDone(task, recurrence: recurrence, blocks: existing,
+                                                  todayIso: today, nowISO: now)
+        if !carried.isEmpty, let write {
+            Task { for b in carried { try? await write.upsertCalBlock(b, nowISO: now) } }
+        }
+        // The done flip travels to a loop-promoted task's shared-list row,
+        // as the UI's toggle does — else it stays ticked over an open series.
+        if next.done != task.done { notifySharedItem(task, action: next.done ? .done : .reopen) }
         saveTaskWithRecurrence(next, existingBlocks: existing)
     }
 
@@ -563,6 +577,18 @@ extension AppModel {
         // Today's "Just now" recap card (Android: _lastRecap.value = RecapState(...)).
         lastRecap = RecapState(taskName: name, focusedSec: elapsedSec,
                                at: Date().timeIntervalSince1970 * 1000)
+    }
+
+    /// The Session for a live focus whose task row is gone (deleted elsewhere
+    /// mid-session) — the fallback of the assistant's finish_focus, the
+    /// notification's End and the sign-out finalize. It carries NO task id
+    /// (audit 2026-09-22, C5), as finishFocus's own row-gone Session: the
+    /// dead id failed sessions.task_id's reference to tasks(id), and the op
+    /// sat quarantined in the outbox, so the minutes never reached insights
+    /// on any device. The column is nullable (`on delete set null`).
+    static func goneTaskSession(_ cur: LiveSession, elapsedSec: Int) -> Session {
+        Session(id: cur.id ?? newUUID(), taskId: nil, taskName: "Focus session",
+                estimateMin: cur.sessionEstimateMin, actualSec: elapsedSec, completedAt: isoNow())
     }
 
     // MARK: - shared focus (T3, Option B — recipient side)

@@ -515,8 +515,7 @@ extension AppModel {
             finishFocus(task: task, session: session, elapsedSec: elapsed, markDone: false,
                         sharedLedger: sharedLedger, ledgerSec: sharedLedger ? capped : nil)
         } else {
-            saveSession(Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: "Focus session",
-                                estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+            saveSession(Self.goneTaskSession(cur, elapsedSec: elapsed))
         }
     }
 
