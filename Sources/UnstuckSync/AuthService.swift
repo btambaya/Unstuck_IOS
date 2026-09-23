@@ -13,6 +13,15 @@ public enum AuthOutcome: Sendable, Equatable {
     case alreadyExists
 }
 
+/// The result of an app-confirm email link (see AppConfirmLink).
+public enum EmailLinkOutcome: Sendable, Equatable {
+    /// A session came back; the SDK has emitted `.signedIn`.
+    case signedIn
+    /// The email is confirmed but there's no session — sign in.
+    case confirmedNoSession
+    case failed(EmailLinkFailure)
+}
+
 public struct AuthService: Sendable {
     let client: SupabaseClient
 
@@ -35,26 +44,38 @@ public struct AuthService: Sendable {
                 let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
                 return trimmed.isEmpty ? nil : ["full_name": .string(trimmed), "display_name": .string(trimmed)]
             }
-            let response = try await client.auth.signUp(email: email, password: password, data: data)
-            let user = response.user
-            let hasSession = client.auth.currentSession != nil
-            // Supabase's anti-enumeration returns a "successful" obfuscated user for an
-            // already-registered email (no session, empty identities). Surface it instead
-            // of the misleading "check your email" — otherwise a returning user is stuck.
-            let exists = detectSignupAlreadyExists(
-                identitiesCount: user.identities?.count,
-                emailConfirmedAt: user.emailConfirmedAt.map { "\($0)" },
-                lastSignInAt: user.lastSignInAt.map { "\($0)" },
-                hasSession: hasSession)
-            if exists { return .alreadyExists }
-            // A genuine new sign-up with no session yet needs email confirmation; with a
-            // session (instant confirm) the auth-state stream navigates into the app.
-            return hasSession ? .ok : .needsConfirmation
+            // The app-confirm redirect: the confirmation email then links to
+            // https://unstucknow.io/auth/app-confirm/?token_hash=… — the app on a
+            // phone, a web page on a computer (AppConfirmLink).
+            let response = try await client.auth.signUp(email: email, password: password, data: data,
+                                                        redirectTo: AppConfirmLink.redirectURL)
+            return Self.signUpOutcome(user: response.user, hasSession: client.auth.currentSession != nil)
         } catch { return .error(friendly(error)) }
     }
 
+    /// What a sign-up response means. Supabase's anti-enumeration answers an
+    /// ALREADY-registered, confirmed email with 200, NO session, NO email sent,
+    /// and an obfuscated user whose `identities` is `[]` (GoTrue sanitizeUser;
+    /// a genuine new sign-up has one identity). supabase-swift decodes that
+    /// body as `AuthResponse.user` with `identities == []` (User.init(from:)
+    /// uses decodeIfPresent, so a missing key is nil — which must NOT count).
+    /// Surfaced as `.alreadyExists` instead of the dead-end "check your email".
+    static func signUpOutcome(user: User, hasSession: Bool) -> AuthOutcome {
+        let exists = detectSignupAlreadyExists(
+            identitiesCount: user.identities?.count,
+            emailConfirmedAt: user.emailConfirmedAt.map { "\($0)" },
+            lastSignInAt: user.lastSignInAt.map { "\($0)" },
+            hasSession: hasSession)
+        if exists { return .alreadyExists }
+        // A genuine new sign-up with no session yet needs email confirmation; with a
+        // session (instant confirm) the auth-state stream navigates into the app.
+        return hasSession ? .ok : .needsConfirmation
+    }
+
+    /// Same app-confirm redirect as sign-up (a magic link for a new address
+    /// is sent as the sign-up confirmation).
     public func sendMagicLink(email: String) async -> AuthOutcome {
-        do { try await client.auth.signInWithOTP(email: email); return .ok }
+        do { try await client.auth.signInWithOTP(email: email, redirectTo: AppConfirmLink.redirectURL); return .ok }
         catch { return .error(friendly(error)) }
     }
 
@@ -77,6 +98,8 @@ public struct AuthService: Sendable {
         } catch { return .error(friendly(error)) }
     }
 
+    /// Keeps the client default `unstuck://auth-callback` (the PKCE `?code`
+    /// link + the JWT `amr` recovery probe) — deliberately NOT app-confirm.
     public func resetPassword(email: String) async -> AuthOutcome {
         do { try await client.auth.resetPasswordForEmail(email); return .ok }
         catch { return .error(friendly(error)) }
@@ -129,6 +152,47 @@ public struct AuthService: Sendable {
     public func handleCallback(url: URL) async -> AuthOutcome {
         do { _ = try await client.auth.session(from: url); return .ok }
         catch { return .error(friendly(error)) }
+    }
+
+    /// Trade an app-confirm link's token hash for a session
+    /// (verifyOTP(tokenHash:type:) — needs no PKCE verifier, so it works
+    /// whichever device asked for the email). On success the SDK stores the
+    /// session and emits `.signedIn`, exactly as the auth-callback exchange does.
+    public func verifyEmailLink(tokenHash: String, kind: EmailLinkKind) async -> EmailLinkOutcome {
+        let type: EmailOTPType
+        switch kind {
+        case .signup: type = .signup
+        case .magiclink: type = .magiclink
+        case .email: type = .email
+        }
+        do {
+            let response = try await client.auth.verifyOTP(tokenHash: tokenHash, type: type)
+            return response.session != nil ? .signedIn : .confirmedNoSession
+        } catch {
+            return .failed(classifyEmailLinkVerifyError(Self.errorInfo(error)))
+        }
+    }
+
+    /// Supabase's own PKCE redirect to `unstuck://auth-confirm?code=…` (a
+    /// template that still used {{ .ConfirmationURL }}). A code means the
+    /// server already confirmed the email, so a failed exchange (no verifier
+    /// here — the email was asked for elsewhere) is "confirmed, sign in"
+    /// unless it looks like the network.
+    public func exchangeEmailLinkCode(url: URL) async -> EmailLinkOutcome {
+        do { _ = try await client.auth.session(from: url); return .signedIn }
+        catch { return Self.isNetworkError(error) ? .failed(.retry) : .confirmedNoSession }
+    }
+
+    /// The SDK error in the shape `classifyEmailLinkVerifyError` reads.
+    static func errorInfo(_ error: Error) -> AuthErrorInfo {
+        guard let e = error as? AuthError else { return AuthErrorInfo(message: "\(error)") }
+        var status: Int?
+        if case let .api(_, _, _, response) = e { status = response.statusCode }
+        return AuthErrorInfo(code: e.errorCode.rawValue, message: e.message, status: status)
+    }
+
+    static func isNetworkError(_ error: Error) -> Bool {
+        error is URLError || (error as NSError).domain == NSURLErrorDomain
     }
 
     /// The ordinary Sign out row signs out THIS device only. The SDK default

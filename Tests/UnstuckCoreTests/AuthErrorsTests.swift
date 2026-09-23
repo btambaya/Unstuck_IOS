@@ -96,4 +96,22 @@ final class DetectSignupAlreadyExistsTests: XCTestCase {
     func testConfirmedWithSessionIsNewlyVerified() {
         XCTAssertFalse(detectSignupAlreadyExists(identitiesCount: 1, emailConfirmedAt: "2026-01-01T00:00:00Z", lastSignInAt: nil, hasSession: true))
     }
+    /// GoTrue's sanitizeUser (an already-registered, confirmed email): a fresh
+    /// id, NO confirmed / last-sign-in dates, identities [] — only the empty
+    /// identities tell, so they alone must be enough (owner report 2026-09-23).
+    func testSanitizedUserShapeIsExists() {
+        XCTAssertTrue(detectSignupAlreadyExists(identitiesCount: 0, emailConfirmedAt: nil, lastSignInAt: nil, hasSession: false))
+    }
+    /// nil identities (the key absent) is "unknown", never "exists" — even
+    /// with no session, which every email sign-up has.
+    func testNilIdentitiesWithNoSessionIsNotExists() {
+        XCTAssertFalse(detectSignupAlreadyExists(identitiesCount: nil, emailConfirmedAt: nil, lastSignInAt: nil, hasSession: false))
+        XCTAssertFalse(detectSignupAlreadyExists(identitiesCount: nil, emailConfirmedAt: nil, lastSignInAt: nil, hasSession: true))
+    }
+    func testAlreadyExistsLineSendsThemToSignIn() {
+        XCTAssertEqual(signupAlreadyExistsMessage, "An account with this email already exists. Sign in instead.")
+    }
+    func testSeveralIdentitiesIsNotExists() {
+        XCTAssertFalse(detectSignupAlreadyExists(identitiesCount: 2, emailConfirmedAt: nil, lastSignInAt: nil, hasSession: false))
+    }
 }

@@ -43,6 +43,43 @@ phases land. Newest status at the top.
 
 
 
+## App-confirm links (pending build 88) — branch feat/app-confirm-links, not shipped
+
+**Why** (owner decision 2026-09-23, "Proper fix in the apps"): an app sign-up's email carried Supabase's own link, which ends
+at `unstuck://auth-callback?code=…`. A phone opens that; a COMPUTER can't — dead end. Shared contract with web + Android:
+
+- **Requests:** sign-up and magic link now pass redirect **`unstuck://auth-confirm`** (exact string, `AppConfirmLink.redirectTo`,
+  on the Supabase allow list). iOS has no sign-up "resend" button, so there is no third request here. **Password reset keeps
+  `unstuck://auth-callback`** (PKCE `?code` + the JWT `amr` recovery probe) and Google sign-in is untouched.
+- **Email link:** the templates (other agent) turn that redirect into
+  `https://unstucknow.io/auth/app-confirm/?token_hash=<hash>&type=<signup|magiclink>`. The AASA claims `/auth/app-confirm` and
+  `/auth/app-confirm/*` for M9ULD6M5Z3.io.unstucknow.app (existing `applinks:unstucknow.io` entitlement; NOT `/auth/confirm`).
+  On a computer the same URL is a web page: "confirmed — open the app".
+- **In the app:** the Universal Link arrives through `onContinueUserActivity` → `AppModel.handleDeepLink` → `AppConfirmLink.parse`
+  (UnstuckCore: path with/without trailing slash, hash 1…1024 chars, type signup|magiclink|email, extra params ignored; an error
+  redirect `#error_code=otp_expired` = "used"; `unstuck://auth-confirm?token_hash=…` accepted too, and `unstuck://auth-confirm?code=…`
+  — what an old template would produce — is exchanged like auth-callback). Signed out → "Checking your link…" on the sign-in
+  screen → `AuthService.verifyEmailLink` = `auth.verifyOTP(tokenHash:type:)` (no PKCE verifier needed) → the SDK emits `.signedIn`
+  → observeAuth + SyncCoordinator land it exactly like an auth-callback exchange (hydrate, onboarding gate, push). Failure →
+  the sign-in banner: used/expired ("already been used or has expired … just sign in"), incomplete, or network ("tap the link
+  again"); the wait is capped at 20 s, never a hang. A cold launch stashes the URL and replays it at the end of `start()`.
+- **Already signed in when a link lands:** the link is NOT used (verifying would replace the session with whichever account it
+  belongs to); an "Already signed in" alert says sign out first, then tap it again. For contrast, the OLD auth-callback path has
+  no such guard: it exchanges whenever this phone holds the PKCE verifier (i.e. the email was asked for on this phone) and the
+  session is replaced in place (SyncCoordinator parks + wipes the old user's cache; AppModel's device-local scrub does NOT run);
+  with no matching verifier it fails silently. Left as is.
+- **Also in this branch — sign-up with an already-registered email** (owner, 2026-09-23): GoTrue answers 200, no session, no
+  email sent, user `identities: []`. supabase-swift decodes that as `AuthResponse.user` with `identities == []` (checked in the
+  SDK source + `SignUpResponseTests` through the SDK's own decoder); nil identities never counts. The sign-up screen now says
+  "An account with this email already exists. Sign in instead." with **Sign in instead** (keeps email + password) and
+  **Forgot password?** right under it, instead of the dead-end "check your email".
+- **Device test (new build):** (1) sign up with a real inbox in the app → tap the email ON THE PHONE → the app opens signed in
+  (onboarding). (2) Sign up again with another inbox, open that email ON A COMPUTER → the web page says confirmed / open the app;
+  then sign in in the app with the password. (3) Tap the phone link a second time while signed in → "Already signed in" alert;
+  sign out and tap it → "already been used … just sign in". (4) An email from an OLDER build (auth-callback link) still opens the
+  app signed in. (5) Forgot password still opens "Set a new password". (6) Sign up with an address that already has an account →
+  the "already exists" line + Sign in instead / Forgot password. Never use made-up addresses on prod; delete test accounts after.
+
 ## Where things stand (2026-09-23, night) — build 87: daily voice minutes
 
 - **Ahmad's decision** (DECISIONS.md "Voice minutes"): ONE allowance for Talk AND assistant calls, 10 min per user per LOCAL day
