@@ -54,6 +54,9 @@ protocol CallRealtimeSession: AnyObject, Sendable {
     func start()
     func stop()
     func setMicMuted(_ muted: Bool)
+    /// Set when today's voice minutes ended the session — the plain line
+    /// for the post-call notice (VoiceRealtimeClient.minutesUsedNote).
+    var minutesUsedNote: String? { get }
 }
 
 extension VoiceRealtimeClient: CallRealtimeSession {}
@@ -324,6 +327,13 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
     }
 
     private func transportEnded(_ error: String?, generation gen: Int) {
+        // Today's voice minutes ran out (Ahmad 2026-09-23): the call did not
+        // fail — it ends normally, and the notice after it says why in plain
+        // words instead of "Couldn't start the call".
+        if error != nil, let a = active, a.generation == gen, let note = a.realtime.minutesUsedNote {
+            finish(.outOfMinutes(note), generation: gen)
+            return
+        }
         finish(error.map { .failed($0) } ?? .hungUp, generation: gen)
     }
 
@@ -410,6 +420,8 @@ extension RealtimeCallVoiceLauncher.Deps {
                     },
                     holdToTalk: false, initialRoute: .lowEcho)
                 client.onTransportEnded = config.onTransportEnded
+                // The account keys the allowance the out-of-minutes line names.
+                client.minutesAccount = model.coordinator?.auth.currentUserId
                 // Mic acquisition failed (engine.start()) — the call can't
                 // proceed; degrade to the "here's what it was about" notification.
                 audio.onCaptureError = { ended("microphone unavailable") }

@@ -20,6 +20,8 @@ final class FakeRealtimeSession: CallRealtimeSession, @unchecked Sendable {
     var starts = 0
     var stops = 0
     var mutes: [Bool] = []
+    /// What VoiceRealtimeClient sets when today's voice minutes end it.
+    var minutesUsedNote: String?
     init(_ config: CallVoiceSessionConfig) { self.config = config }
     func start() { starts += 1 }
     func stop() { stops += 1 }
@@ -308,6 +310,23 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         live.drop(nil)
         XCTAssertEqual(ended, [.hungUp])
         XCTAssertEqual(live.stops, 1)
+    }
+
+    /// Today's voice minutes ran out mid-call (the proxy's 1008 "daily voice
+    /// limit reached", Ahmad 2026-09-23): a normal end with the plain line —
+    /// never `.failed` ("Couldn't start the call — here's what it was about").
+    func testRunningOutOfMinutesEndsTheCallNormallyWithThePlainLine() {
+        let live = start()
+        let line = VoiceMinutes.usedMessage(allowanceMinutes: 10)
+        live.minutesUsedNote = line
+        live.drop(line)   // the client's onError → the launcher's escape hatch
+        live.drop(line)   // …and its onTransportEnded: still one end
+        XCTAssertEqual(ended, [.outOfMinutes("You've used today's 10 voice minutes. They reset at midnight.")])
+        XCTAssertEqual(live.stops, 1)
+        // Any other failure is still a failure.
+        let other = start()
+        other.drop("socket closed")
+        XCTAssertEqual(ended.last, .failed("socket closed"))
     }
 
     func testNothingAfterStop() async {

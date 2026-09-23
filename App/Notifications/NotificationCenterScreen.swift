@@ -136,11 +136,16 @@ struct NotificationCenterView: View {
         case "invite_claimed": return "Someone joined"
         case "shared_task_done": return "Shared task done"
         case "call", "call_missed": return "Call from Unstuck"
+        case NotificationQueueCards.skippedKind: return "Call skipped"
         default: return "Notification"
         }
     }
 
     private func accentColor(_ kind: String) -> Color {
+        // A call skipped for the day's voice minutes is a note, not an
+        // alert: the neutral ink, never the coral the calls use (Ahmad
+        // 2026-09-23 — "a quiet note says it was skipped").
+        if kind == NotificationQueueCards.skippedKind { return theme.palette.ink3 }
         switch notificationAccent(kind: kind) {
         case .amber: return theme.palette.amber
         case .green: return theme.palette.green
@@ -196,6 +201,27 @@ enum NotificationQueueCards {
     static let nearMs: Double = 5 * 60 * 1000
     static let cap = 20
 
+    /// dispatch_calls' card for a due call it did NOT ring because today's
+    /// voice minutes were used (migration 077, Ahmad 2026-09-23): moment
+    /// `call`, title "Call skipped", body "Unstuck didn't call about <label>
+    /// — today's voice minutes are used.", no push. Shown as written, as a
+    /// quiet entry of its own kind.
+    static let skippedKind = "call_skipped"
+    static let skippedBodyPrefix = "Unstuck didn't call about "
+    static let skippedBodySuffix = " — today's voice minutes are used."
+
+    /// "Unstuck didn't call about ring the bank — today's voice minutes are
+    /// used." → "ring the bank"; nil for any other body. Curly apostrophes
+    /// read the same.
+    static func skippedLabel(fromBody body: String) -> String? {
+        let t = body.replacingOccurrences(of: "’", with: "'").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard t.hasPrefix(skippedBodyPrefix), t.hasSuffix(skippedBodySuffix),
+              t.count > skippedBodyPrefix.count + skippedBodySuffix.count else { return nil }
+        let label = String(t.dropFirst(skippedBodyPrefix.count).dropLast(skippedBodySuffix.count))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return label.isEmpty ? nil : label
+    }
+
     /// "Unstuck is calling about speak to James" → "speak to James"; nil for
     /// any other body.
     static func callLabel(fromBody body: String) -> String? {
@@ -224,6 +250,15 @@ enum NotificationQueueCards {
     /// no call matches), the anchored task as the destination (else Today).
     static func entry(from card: NotificationQueueCard, calls: [CallRequest]) -> NotificationLog.Entry {
         let at = Time.parseMillis(card.createdAt) ?? 0
+        if let skipped = skippedLabel(fromBody: card.body) {
+            // The card's own plain words; a tap opens the call's task, as
+            // any call card does.
+            let call = matchingCall(label: skipped, cardAtMs: at, in: calls)
+            let link = call?.taskId.map { AppModel.exactTaskLink($0) } ?? "unstuck://today"
+            return NotificationLog.Entry(id: "q_\(card.id)", kind: skippedKind,
+                                         title: card.title.isEmpty ? "Call skipped" : card.title,
+                                         body: card.body, deepLink: link, at: at)
+        }
         let label = callLabel(fromBody: card.body)
         let call = label.flatMap { matchingCall(label: $0, cardAtMs: at, in: calls) }
         let title = label.map { "Unstuck called you about \($0)" } ?? (card.title.isEmpty ? "Unstuck called you" : card.title)

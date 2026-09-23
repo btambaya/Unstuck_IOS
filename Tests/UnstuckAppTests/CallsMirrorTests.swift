@@ -256,6 +256,37 @@ final class CallsMirrorTests: XCTestCase {
         XCTAssertEqual(NotificationQueueCards.callLabel(fromBody: "  Unstuck is calling about ring the bank "), "ring the bank")
     }
 
+    /// dispatch_calls' card for a call it didn't ring because today's voice
+    /// minutes were used (migration 077, Ahmad 2026-09-23): shown as the
+    /// server wrote it, as a quiet entry of its own kind — never dressed up
+    /// as "Unstuck called you about …".
+    func testASkippedCallCardIsAQuietPlainEntry() {
+        let calls = [call("c1", label: "ring the bank", status: "cancelled", taskId: "t9",
+                          callAt: "2026-09-23T17:00:00.000Z", updatedAt: "2026-09-23T17:00:05.000Z")]
+        let card = NotificationQueueCard(id: "q9", moment: "call", title: "Call skipped",
+                                         body: "Unstuck didn't call about ring the bank — today's voice minutes are used.",
+                                         createdAt: "2026-09-23T17:00:04.000Z")
+        let e = NotificationQueueCards.entry(from: card, calls: calls)
+        XCTAssertEqual(e.kind, NotificationQueueCards.skippedKind)
+        XCTAssertEqual(e.kind, "call_skipped")
+        XCTAssertEqual(e.title, "Call skipped")
+        XCTAssertEqual(e.body, "Unstuck didn't call about ring the bank — today's voice minutes are used.", "the card's own words")
+        XCTAssertEqual(e.deepLink, "unstuck://task/t9?exact", "a tap opens the call's task, as any call card")
+        XCTAssertEqual(e.id, "q_q9")
+        // No call mirrored for it: still the same plain entry, to Today.
+        let bare = NotificationQueueCards.entry(from: card, calls: [])
+        XCTAssertEqual(bare.kind, "call_skipped")
+        XCTAssertEqual(bare.deepLink, "unstuck://today")
+        // The label parse: exact copy, curly apostrophes too; nothing else.
+        XCTAssertEqual(NotificationQueueCards.skippedLabel(fromBody: "Unstuck didn’t call about a – b — today’s voice minutes are used."), "a – b")
+        XCTAssertNil(NotificationQueueCards.skippedLabel(fromBody: "Unstuck didn't call about  — today's voice minutes are used."))
+        XCTAssertNil(NotificationQueueCards.skippedLabel(fromBody: "Unstuck is calling about ring the bank"))
+        // The ordinary call card is unchanged.
+        let ringing = NotificationQueueCard(id: "q1", moment: "call", title: "Unstuck is calling",
+                                            body: "Unstuck is calling about ring the bank", createdAt: "2026-09-23T17:00:04.000Z")
+        XCTAssertEqual(NotificationQueueCards.entry(from: ringing, calls: []).kind, "call")
+    }
+
     func testMergeRecentIsTheWebRule() {
         func entry(_ id: String, kind: String, title: String, body: String, at: Double) -> NotificationLog.Entry {
             NotificationLog.Entry(id: id, kind: kind, title: title, body: body, deepLink: nil, at: at)

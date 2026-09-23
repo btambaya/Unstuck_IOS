@@ -2120,4 +2120,145 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(core(lost.handle(.responseDone(id: "r1", status: "completed"), now: 2.4)), [.startConfirmTimer(ms: 2701)])
         XCTAssertEqual(count(core(lost.handle(.tick, now: 5.2)), .createResponse), 1)
     }
+
+    // MARK: 30 — the minutes notice (Ahmad 2026-09-23)
+    //
+    // At about a minute of today's voice minutes left the proxy sends
+    // warn:true, and the assistant says so once, in its own voice — through
+    // the turn-taking: after whatever is on air or being created, never over
+    // the user, and after the pause in which they usually answer.
+
+    private func notices(_ cmds: [BargeInCommand]) -> Int { count(cmds, .speakMinutesNotice) }
+    /// Anything that would cut, duck or silence what is playing.
+    private func cuts(_ cmds: [BargeInCommand]) -> Int {
+        cmds.filter { [.sendCancel, .flushPlayback, .duck].contains($0) }.count
+    }
+
+    func test30a_theNoticeWaitsForTheReplyOnAirThenAQuietMoment_once() {
+        var c = speaking(.speaker)
+        let warned = core(c.handle(.minutesWarning, now: 1))
+        XCTAssertEqual(warned, [], "a reply is on air: nothing is cut or asked")
+        XCTAssertEqual(cuts(c.handle(.responseDone(id: "r1", status: "completed"), now: 2)), 0)
+        XCTAssertEqual(core(c.handle(.playbackDrained, now: 3)), [.uiState(.listening), .startConfirmTimer(ms: 1201)],
+                       "drained: the pause they answer in comes first")
+        XCTAssertEqual(core(c.handle(.tick, now: 3.6)), [.startConfirmTimer(ms: 601)], "too soon")
+        XCTAssertEqual(core(c.handle(.tick, now: 4.2)), [.speakMinutesNotice])
+        XCTAssertNil(c.noticeOwedSince)
+        XCTAssertTrue(c.noticeAsked)
+        // One per session: a second warning, or a later tick, says nothing.
+        XCTAssertEqual(core(c.handle(.minutesWarning, now: 5)), [])
+        XCTAssertEqual(notices(c.handle(.tick, now: 9)), 0)
+        // All quiet when it comes: at once.
+        var idle = BargeInController(profile: .lowEcho)
+        XCTAssertEqual(core(idle.handle(.minutesWarning, now: 30)), [.speakMinutesNotice])
+    }
+
+    func test30b_neverOverTheUser_theirTurnIsAnsweredFirst() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 0)
+        XCTAssertEqual(core(c.handle(.minutesWarning, now: 0.5)), [], "they're talking")
+        XCTAssertEqual(notices(c.handle(.speechStopped, now: 1.0)), 0)
+        XCTAssertEqual(notices(c.handle(.transcription(text: "what's on today", itemId: "u", final: true), now: 1.2)), 0)
+        XCTAssertEqual(core(c.handle(.tick, now: 1.7)), [.createResponse, .uiState(.thinking)], "their turn is asked for, not the notice")
+        XCTAssertEqual(notices(c.handle(.tick, now: 2.2)), 0, "its reply is being created")
+        _ = c.handle(.responseCreated(id: "r1"), now: 2.5)
+        _ = c.handle(.audioDelta(id: "r1"), now: 3)
+        XCTAssertEqual(notices(c.handle(.responseDone(id: "r1", status: "completed"), now: 4)), 0, "still on air")
+        XCTAssertEqual(notices(c.handle(.playbackDrained, now: 6)), 0)
+        // They answer inside the pause: held again.
+        _ = c.handle(.speechStarted(itemId: "v"), now: 6.8)
+        XCTAssertEqual(notices(c.handle(.tick, now: 7.2)), 0, "the quiet timer's tick finds them talking")
+        _ = c.handle(.speechStopped, now: 7.5)
+        _ = c.handle(.transcription(text: "and tomorrow", itemId: "v", final: true), now: 7.6)
+        XCTAssertEqual(count(core(c.handle(.tick, now: 8.1)), .createResponse), 1)
+        _ = c.handle(.responseCreated(id: "r2"), now: 8.4)
+        _ = c.handle(.audioDelta(id: "r2"), now: 8.6)
+        _ = c.handle(.responseDone(id: "r2", status: "completed"), now: 9)
+        XCTAssertEqual(core(c.handle(.playbackDrained, now: 10)), [.uiState(.listening), .startConfirmTimer(ms: 1201)])
+        XCTAssertEqual(core(c.handle(.tick, now: 11.2)), [.speakMinutesNotice], "their pause, at last")
+    }
+
+    func test30c_neverIntoTheClientsOwnCreatesOrARunningTool() {
+        var c = BargeInController(profile: .lowEcho)
+        _ = c.handle(.clientCreate, now: 0)   // the opening
+        XCTAssertEqual(core(c.handle(.minutesWarning, now: 0.1)), [.startConfirmTimer(ms: 2901)], "the opening's reply is on its way")
+        _ = c.handle(.responseCreated(id: "r0"), now: 0.8)
+        _ = c.handle(.audioDelta(id: "r0"), now: 1)
+        _ = c.handle(.toolStarted, now: 1.5)   // the reply calls a tool
+        _ = c.handle(.responseDone(id: "r0", status: "completed"), now: 2)
+        XCTAssertEqual(core(c.handle(.playbackDrained, now: 3)), [.uiState(.listening)], "a tool is out: its reply comes first")
+        XCTAssertEqual(core(c.handle(.tick, now: 10)), [], "however long it runs")
+        XCTAssertEqual(core(c.handle(.toolFinished, now: 11)), [.startConfirmTimer(ms: 3001)], "its continuation is created next")
+        _ = c.handle(.clientCreate, now: 11.12)
+        _ = c.handle(.responseCreated(id: "r1"), now: 11.5)
+        _ = c.handle(.audioDelta(id: "r1"), now: 12)
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 13)
+        XCTAssertEqual(notices(c.handle(.playbackDrained, now: 14)), 0)
+        XCTAssertEqual(core(c.handle(.tick, now: 15.2)), [.speakMinutesNotice])
+        // The integrity corrective, sent outside the controller on a done.
+        var k = speaking(.speaker)
+        _ = k.handle(.minutesWarning, now: 0.5)
+        _ = k.handle(.clientCreate, now: 1)
+        _ = k.handle(.responseDone(id: "r1", status: "completed"), now: 1)
+        XCTAssertEqual(core(k.handle(.playbackDrained, now: 1.2)), [.uiState(.listening), .startConfirmTimer(ms: 2801)])
+        // Hold-to-talk: never while held, nor into the release's own create.
+        var h = BargeInController(profile: .speaker, holdToTalk: true)
+        _ = h.handle(.pttDown, now: 0)
+        XCTAssertEqual(core(h.handle(.minutesWarning, now: 0.5)), [], "the button is held")
+        XCTAssertEqual(notices(h.handle(.pttUp, now: 2)), 0)
+        XCTAssertEqual(core(h.handle(.tick, now: 3)), [.startConfirmTimer(ms: 2001)])
+        _ = h.handle(.responseCreated(id: "p1"), now: 3.2)
+        _ = h.handle(.audioDelta(id: "p1"), now: 3.4)
+        _ = h.handle(.responseDone(id: "p1", status: "completed"), now: 4)
+        _ = h.handle(.playbackDrained, now: 5)
+        XCTAssertEqual(core(h.handle(.tick, now: 6.2)), [.speakMinutesNotice])
+    }
+
+    func test30d_aConversationWithNoPauseGetsItAtTheFirstClearMomentAfter20s() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.responseCreated(id: "r0"), now: 0)
+        _ = c.handle(.audioDelta(id: "r0"), now: 0)
+        _ = c.handle(.minutesWarning, now: 0)
+        var t = 0.0, k = 0
+        var fired: TimeInterval?
+        while fired == nil && t < 60 {
+            XCTAssertEqual(notices(c.handle(.responseDone(id: "r\(k)", status: "completed"), now: t + 1)), 0)
+            if notices(c.handle(.playbackDrained, now: t + 2)) > 0 { fired = t + 2; break }
+            // They answer 0.6 s after each reply — inside the pause it waits for.
+            _ = c.handle(.speechStarted(itemId: "u\(k)"), now: t + 2.6)
+            XCTAssertEqual(notices(c.handle(.tick, now: t + 3.2)), 0, "never over them")
+            _ = c.handle(.speechStopped, now: t + 3.5)
+            _ = c.handle(.transcription(text: "and then what", itemId: "u\(k)", final: true), now: t + 3.6)
+            XCTAssertEqual(count(core(c.handle(.tick, now: t + 4.1)), .createResponse), 1, "their turn, as ever")
+            k += 1
+            _ = c.handle(.responseCreated(id: "r\(k)"), now: t + 4.4)
+            _ = c.handle(.audioDelta(id: "r\(k)"), now: t + 4.6)
+            t += 4.6
+        }
+        XCTAssertNotNil(fired)
+        XCTAssertGreaterThanOrEqual(fired ?? 0, 20, "held for a pause while one could still come")
+        XCTAssertLessThan(fired ?? 99, 26, "then at the first moment nothing is on air")
+    }
+
+    func test30e_aTurnTakenWhileTheNoticeIsInFlightIsAnsweredAfterIt_neverDropped() {
+        var c = BargeInController(profile: .speaker)
+        XCTAssertEqual(core(c.handle(.minutesWarning, now: 10)), [.speakMinutesNotice])
+        _ = c.handle(.speechStarted(itemId: "u"), now: 10.2)
+        _ = c.handle(.speechStopped, now: 10.8)
+        _ = c.handle(.transcription(text: "ok thanks", itemId: "u", final: true), now: 11.0)
+        XCTAssertEqual(count(core(c.handle(.tick, now: 11.5)), .createResponse), 0, "the notice's create is in flight")
+        _ = c.handle(.responseCreated(id: "n"), now: 11.6)
+        XCTAssertTrue(c.pendingCreate, "their turn is not the notice's to answer")
+        _ = c.handle(.audioDelta(id: "n"), now: 12)
+        XCTAssertEqual(count(core(c.handle(.responseDone(id: "n", status: "completed"), now: 13)), .createResponse), 1)
+        // Words while the notice plays are theirs, as over any reply: it is cut for them.
+        var cut = BargeInController(profile: .speaker)
+        _ = cut.handle(.minutesWarning, now: 0)
+        _ = cut.handle(.responseCreated(id: "n"), now: 0.4)
+        _ = cut.handle(.audioDelta(id: "n"), now: 0.6)
+        _ = cut.handle(.assistantTranscript(delta: "We've got about a minute left today."), now: 0.6)
+        _ = cut.handle(.speechStarted(itemId: "w"), now: 0.9)
+        let words = core(cut.handle(.transcription(text: "hang on what about Friday", itemId: "w", final: false), now: 1.3))
+        XCTAssertEqual(count(words, .sendCancel), 1)
+    }
 }

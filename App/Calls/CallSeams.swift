@@ -25,6 +25,10 @@ enum CallEndReason: Equatable, Sendable {
     /// Voice couldn't start or dropped (socket, proxy, mic) — the user still
     /// gets the notes as a notification.
     case failed(String)
+    /// Today's voice minutes ran out (the proxy's 1008 "daily voice limit
+    /// reached", Ahmad 2026-09-23) — a normal end, not a failure; the
+    /// post-call notice carries this plain line.
+    case outOfMinutes(String)
 }
 
 /// How the coordinator tells CallKit a call ended (maps 1:1 onto

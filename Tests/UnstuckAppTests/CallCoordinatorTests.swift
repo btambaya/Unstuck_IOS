@@ -710,6 +710,25 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(notifier.posted[0].body, "Ask about the invoice\nConfirm Friday")
     }
 
+    /// Today's voice minutes ended the call (Ahmad 2026-09-23): reported
+    /// `done` with dispatch_calls' own note, and the notice after it says so
+    /// plainly, then what the call was about — an ordinary alert, not the
+    /// "Couldn't start the call" of a failure.
+    func testRunningOutOfMinutesIsANormalEndWithAPlainNotice() {
+        answerAndActivate()
+        launcher.end(.outOfMinutes(VoiceMinutes.usedMessage(allowanceMinutes: 60)))
+        controller.flush()
+        XCTAssertEqual(reporter.outcomes, [.answered, .done])
+        XCTAssertEqual(reporter.reports.last?.notes, ["voice minutes used today"])
+        XCTAssertEqual(notifier.posted.count, 1)
+        let n = notifier.posted[0]
+        XCTAssertEqual(n.title, "I called about speak to James")
+        XCTAssertEqual(n.body, "You've used today's 60 voice minutes. They reset at midnight.\nAsk about the invoice\nConfirm Friday")
+        XCTAssertFalse(n.timeSensitive, "nothing is ringing")
+        XCTAssertFalse(n.quiet, "a passive notice shows no banner — they were just on the call")
+        XCTAssertNil(sut.active)
+    }
+
     func testEndTransactionFailureSettlesLocally() {
         answerAndActivate()
         controller.failNext = true

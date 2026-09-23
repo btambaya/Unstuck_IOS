@@ -366,6 +366,11 @@ final class CallCoordinator {
             case .failed(let why):
                 report(session, .done, outcomeNotes: ["voice failed: \(why)"])
                 notifier.post(CallNotifications.voiceFailed(session))
+            case .outOfMinutes(let line):
+                // The same outcome note dispatch_calls writes on a call it
+                // skips for the minutes (077), so the row reads alike.
+                report(session, .done, outcomeNotes: [CallNotifications.minutesUsedOutcome])
+                notifier.post(CallNotifications.minutesUsed(session, line: line))
             }
         }
         return true
@@ -577,12 +582,25 @@ enum CallNotifications {
     static func voiceFailed(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.failed.\(s.callId)", title: "Couldn't start the call — here's what it was about", body: body(s.notes))
     }
+    /// The call ended because today's voice minutes ran out (Ahmad
+    /// 2026-09-23): the plain line first ("You've used today's 10 voice
+    /// minutes. They reset at midnight."), then what it was about. A normal
+    /// alert — neither time-sensitive (nothing is ringing) nor passive: they
+    /// were on the call a moment ago, and a passive one shows no banner.
+    static func minutesUsed(_ s: CallSession, line: String) -> CallNotification {
+        make(s, id: "unstuck.call.minutes.\(s.callId)", title: "I called about \(s.label)",
+             body: s.notes.isEmpty ? line : line + "\n" + s.notes.joined(separator: "\n"), timeSensitive: false)
+    }
+    /// call_requests.outcome_notes for such a call — dispatch_calls' own words
+    /// for a call it skipped (migration 077).
+    static let minutesUsedOutcome = "voice minutes used today"
 
     private static func body(_ notes: [String]) -> String {
         notes.isEmpty ? "No notes on this one." : notes.joined(separator: "\n")
     }
 
-    private static func make(_ s: CallSession, id: String, title: String, body: String, quiet: Bool = false) -> CallNotification {
+    private static func make(_ s: CallSession, id: String, title: String, body: String, quiet: Bool = false,
+                             timeSensitive: Bool? = nil) -> CallNotification {
         var info: [String: String] = ["kind": "call_missed", "callId": s.callId]
         if let t = s.taskId {
             info["taskId"] = t
@@ -596,6 +614,6 @@ enum CallNotifications {
         return CallNotification(
             id: id, title: title, body: body,
             categoryId: s.taskId != nil ? NotificationCategories.taskStarting : nil,
-            threadId: thread, userInfo: info, timeSensitive: !quiet, quiet: quiet)
+            threadId: thread, userInfo: info, timeSensitive: timeSensitive ?? !quiet, quiet: quiet)
     }
 }

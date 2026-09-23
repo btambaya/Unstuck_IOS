@@ -55,6 +55,12 @@ final class VoiceSessionModel {
     private(set) var holdToTalk = false
     /// Hold-to-talk: the button is currently down (drives the state label).
     private(set) var pttPressed = false
+    /// Today's voice minutes as the proxy last told them, and when (Ahmad
+    /// 2026-09-23: "the Talk screen shows the minutes left") — counted down
+    /// on screen while the session is live. nil until this connection's
+    /// first `unstuck.voice_budget` (none while the proxy couldn't read them).
+    private(set) var minutes: VoiceMinutes?
+    private(set) var minutesAt = Date()
 
     private let model: AppModel
     /// One engine per connection: a stopped client shuts its engine down, and
@@ -161,6 +167,7 @@ final class VoiceSessionModel {
         }
         holdToTalk = VoiceRealtimeClient.holdToTalkPreferred
         pttPressed = false
+        minutes = nil
         // The dial resolves its own token (audit 2026-09-22, C14/C15): Talk
         // right after a long background, the fallback-B take-over and every
         // quiet reconnect each build a new client, so none of them dials with
@@ -192,6 +199,17 @@ final class VoiceSessionModel {
         // The proxy's 15-minute cap ends the session cleanly ("Ended"): say
         // why, instead of a bare "Ended" (audit 2026-09-22, C47).
         rc.onServerEnded = { [weak self] note in Task { @MainActor in self?.note = note } }
+        // What is left of today's minutes, for the quiet line up top; the
+        // account keys the allowance the out-of-minutes line names.
+        rc.minutesAccount = model.coordinator?.auth.currentUserId
+        rc.onMinutes = { [weak self, weak rc] m in
+            let at = Date()
+            Task { @MainActor in
+                guard let self, let rc, self.client === rc else { return }
+                self.minutes = m
+                self.minutesAt = at
+            }
+        }
         // Dead on arrival (the server failed before any reply): reconnect,
         // twice at most, before telling the user anything.
         rc.onTransportEnded = { [weak self, weak rc] error in
@@ -226,6 +244,14 @@ final class VoiceSessionModel {
     /// The model is generating or its audio is still playing — the Interrupt
     /// button's enablement (BargeInController.modelBusy as the UI sees it).
     var canInterrupt: Bool { state == .speaking || state == .thinking }
+
+    /// The minutes line at `date`, while a session is on — nothing while
+    /// connecting, once it has ended, or at none left (the limit's own
+    /// message says that).
+    func minutesLabel(at date: Date) -> String? {
+        guard isLive, state != .connecting, let minutes else { return nil }
+        return VoiceMinutes.label(remainingMs: minutes.remainingMs(after: date.timeIntervalSince(minutesAt)))
+    }
 
     /// Hold-to-talk: press — cancels a playing reply and opens the mic.
     func pttDown() {
@@ -293,9 +319,11 @@ struct VoiceModeScreen: View {
         ZStack {
             theme.palette.bg.ignoresSafeArea()
 
-            // Close (X)
+            // Close (X), and today's voice minutes opposite it — small and
+            // quiet (Ahmad 2026-09-23).
             VStack {
                 HStack {
+                    if let session { MinutesLeftLine(session: session) }
                     Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
@@ -436,6 +464,26 @@ struct VoiceModeScreen: View {
         case .speaking: return "Speaking…"
         case .error: return s.note ?? "Something went wrong."
         case .closed: return "Ended"
+        }
+    }
+}
+
+/// What is left of today's voice minutes (Ahmad 2026-09-23), counted down
+/// between the proxy's figures: "9 min left today", then "Under a minute
+/// left today". Muted type in the secondary ink — information, not a warning;
+/// the warning is the assistant's own spoken line.
+private struct MinutesLeftLine: View {
+    @Environment(\.uTheme) private var theme
+    let session: VoiceSessionModel
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            if let label = session.minutesLabel(at: ctx.date) {
+                Text(label)
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .accessibilityLabel(label.replacingOccurrences(of: " min left", with: " minutes of voice left")
+                        .replacingOccurrences(of: "a minute left", with: "a minute of voice left"))
+            }
         }
     }
 }
