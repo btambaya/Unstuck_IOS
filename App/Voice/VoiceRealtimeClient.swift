@@ -208,16 +208,21 @@ struct VoiceMinutes: Equatable, Sendable {
         "You've used today's \(allowanceMinutes) voice minutes. They reset at midnight."
     }
 
-    /// A 1008 "daily voice limit reached" is today's minutes only when the
-    /// last figure has run down to (about) nothing by now: the proxy sends
-    /// that same close for its daily REPLY budget too, with minutes to spare,
-    /// and with no figure at all (the read at connect failed — capped, never
-    /// told out of minutes — or a proxy from before 077) it can't be the
-    /// minutes. The tolerance covers the round trip: the proxy's clock
-    /// started before the 101, ours at the event.
+    /// A 1008 "daily voice limit reached" is today's minutes when the last
+    /// figure has run down to (about) nothing by now: the proxy sends that
+    /// same close for its daily REPLY budget too, with minutes to spare. The
+    /// tolerance covers the round trip: the proxy's clock started before the
+    /// 101, ours at the event.
+    /// With no figure it is the minutes only before any reply: the reply
+    /// budget is counted on a response.created the proxy relays first, so
+    /// the close that comes before one is the refusal at connect — whose
+    /// `remaining_ms: 0` a send failing on the closed socket can beat to the
+    /// report. After a reply, no figure means the read failed (that session
+    /// is capped and closed 1000, never told out of minutes) or a proxy from
+    /// before 077: the reply budget.
     static let closeToleranceMs = 10_000
-    static func endedByMinutes(last: VoiceMinutes?, elapsed: TimeInterval) -> Bool {
-        guard let last else { return false }
+    static func endedByMinutes(last: VoiceMinutes?, elapsed: TimeInterval, anyReply: Bool) -> Bool {
+        guard let last else { return !anyReply }
         return last.remainingMs(after: elapsed) <= closeToleranceMs
     }
 
@@ -666,9 +671,14 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// figure has run out by now, else nil (see `endedByMinutes`).
     private func minutesUsedMessage() -> String? {
         let t = now()
-        let (last, at, largest) = withLock { (_minutes, _minutesAt, _largestMinutesMs) }
-        guard VoiceMinutes.endedByMinutes(last: last, elapsed: t - at) else { return nil }
-        return VoiceMinutes.usedMessage(allowanceMinutes: VoiceMinutes.allowanceMinutes(largestSeenMs: largest))
+        let (last, at, largest, anyReply) = withLock { (_minutes, _minutesAt, _largestMinutesMs, _anyResponse) }
+        guard VoiceMinutes.endedByMinutes(last: last, elapsed: t - at, anyReply: anyReply) else { return nil }
+        // The account's other sessions today count too — also when this one
+        // was refused before its figure was read.
+        let remembered = minutesAccount.map {
+            VoiceMinutesMemory(account: $0, defaults: minutesDefaults).largestSeenMs(day: Clock.todayISO())
+        } ?? 0
+        return VoiceMinutes.usedMessage(allowanceMinutes: VoiceMinutes.allowanceMinutes(largestSeenMs: max(largest, remembered)))
     }
 
     /// A 401 before the socket ever opened, not yet retried — the one case

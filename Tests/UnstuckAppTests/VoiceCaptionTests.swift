@@ -868,14 +868,17 @@ final class VoiceLimitTests: XCTestCase {
 
     /// The budget ran out on the first reply of a session: before, that looked
     /// dead on arrival — swallowed, redialled twice (each dial a session unit),
-    /// then "The voice server dropped the session twice".
+    /// then "The voice server dropped the session twice". Since the voice
+    /// minutes (Ahmad 2026-09-23) a close before ANY reply is the refusal at
+    /// connect — today's minutes (VoiceMinutesTests); the reply budget's comes
+    /// after the response.created it counted.
     func testADailyLimitCloseIsToldAndNeverQuietlyRedialled() {
         let rec = Rec()
         let c = openClient(rec)
         c.serverClosed(code: 1008, reason: "daily voice limit reached")
         XCTAssertFalse(c.failedBeforeAnyReply, "a limit is not dead on arrival — redialling meets it again")
-        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.dailyLimitMessage])
-        XCTAssertEqual(rec.ended, [VoiceRealtimeClient.dailyLimitMessage])
+        XCTAssertEqual(rec.errors, [VoiceMinutes.usedMessage(allowanceMinutes: 10)])
+        XCTAssertEqual(rec.ended, [VoiceMinutes.usedMessage(allowanceMinutes: 10)])
         XCTAssertTrue(rec.states.contains(.error))
         // An early server error swallowed for the reconnect doesn't hide it either.
         let rec2 = Rec()
@@ -884,8 +887,15 @@ final class VoiceLimitTests: XCTestCase {
         XCTAssertTrue(c2.failedBeforeAnyReply)
         c2.serverClosed(code: 1008, reason: "daily voice limit reached")
         XCTAssertFalse(c2.failedBeforeAnyReply)
-        XCTAssertEqual(rec2.errors, [VoiceRealtimeClient.dailyLimitMessage])
-        c.stop(); c2.stop()
+        XCTAssertEqual(rec2.errors, [VoiceMinutes.usedMessage(allowanceMinutes: 10)])
+        // The reply budget, on the first reply: its own line, never redialled.
+        let rec3 = Rec()
+        let c3 = openClient(rec3)
+        c3.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c3.serverClosed(code: 1008, reason: "daily voice limit reached")
+        XCTAssertFalse(c3.failedBeforeAnyReply)
+        XCTAssertEqual(rec3.errors, [VoiceRealtimeClient.dailyLimitMessage])
+        c.stop(); c2.stop(); c3.stop()
     }
 
     /// The 15-minute cap is a clean end: Talk says why under "Ended"; a call
@@ -1229,9 +1239,31 @@ final class VoiceMinutesTests: XCTestCase {
         let rec2 = Rec()
         let c2 = client(rec2, Wire(), Clock())
         open(c2)
+        c2.handle(json(["type": "response.created", "response": ["id": "r1"]]))
         c2.serverClosed(code: 1008, reason: "daily voice limit reached")
         XCTAssertEqual(rec2.errors, [VoiceRealtimeClient.dailyLimitMessage])
         XCTAssertNil(c2.minutesUsedNote)
         c2.stop()
+    }
+
+    /// The refusal's `remaining_ms: 0` and its close are queued together; a
+    /// send failing on the closed socket can report the close first. Before
+    /// any reply, with no figure, that close is still the minutes — named with
+    /// the account's allowance from earlier today.
+    func testARefusalReportedBeforeItsFigureIsStillTheMinutes() {
+        let memory = defaults()
+        VoiceMinutesMemory(account: "team", defaults: memory).record(3_600_000, day: UnstuckCore.Clock.todayISO())
+        let rec = Rec()
+        let c = client(rec, Wire(), Clock(), account: "team", memory: memory)
+        open(c)
+        c.serverClosed(code: 1008, reason: "daily voice limit reached")
+        XCTAssertEqual(rec.errors, ["You've used today's 60 voice minutes. They reset at midnight."])
+        XCTAssertNotNil(c.minutesUsedNote)
+        XCTAssertFalse(c.failedBeforeAnyReply)
+        c.stop()
+        XCTAssertFalse(VoiceMinutes.endedByMinutes(last: nil, elapsed: 0, anyReply: true))
+        XCTAssertTrue(VoiceMinutes.endedByMinutes(last: nil, elapsed: 0, anyReply: false))
+        XCTAssertTrue(VoiceMinutes.endedByMinutes(last: VoiceMinutes(remainingMs: 30_000, warn: true), elapsed: 21, anyReply: true))
+        XCTAssertFalse(VoiceMinutes.endedByMinutes(last: VoiceMinutes(remainingMs: 30_000, warn: true), elapsed: 19, anyReply: true))
     }
 }
