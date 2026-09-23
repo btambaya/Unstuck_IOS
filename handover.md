@@ -27,6 +27,7 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (82) uploaded to TestFlight (delivery 1ed15995) — three fixes the web/Android audits found on iOS too: a repeating task's day starts focus at zero, calls ring about tasks not yet synced here, Google connect disclosure. 2026-09-23.
 
+- Ship: 1.1.1 (83) uploaded to TestFlight (delivery 06ef3e9c) — a reply cut on air is truncated to what the user heard (conversation.item.truncate), so 'carry on' resumes the same point. Server: missed calls re-ring every 5 min, 4 rings (migration 076). 2026-09-23.
 
 
 
@@ -34,6 +35,25 @@ phases land. Newest status at the top.
 
 
 
+
+
+## Where things stand (2026-09-23, late morning) — build 83: the interrupted reply is truncated; missed calls ring back
+
+Ahmad's morning feedback, all iOS:
+- **"When the AI gets interrupted it drops the thread and starts again."** Confirmed in Zubair's session 94011b35 at 05:05:56–05:06:17 UTC. He talked over a reply that had already finished GENERATING, then said "Carry on", and the model opened a new topic. The cause: no client ever sent `conversation.item.truncate`, so the server kept the whole unheard reply and the model believed it had said all of it.
+  - Now every real cut-off of audio on air sends the truncate with the milliseconds actually heard. That covers talk-over (by words or by voice energy), the Interrupt button and a hold-to-talk press. Echo, a restored blip, a "thinking" reply and a fully played reply send nothing.
+  - How it works: the truncate is a pure command in BargeIn, `AudioTruncation.plan`, which works out the milliseconds and never goes past what was received. `PlaybackLedger` in VoiceAudioEngine maps the player's timeline to each audio delta's item_id. The truncate is sent after the cancel and before the flush. A refused truncate is logged, not shown as an error.
+  - Calls use the same client, so they get the fix too. The proxy already passes the event through unchanged.
+  - Device log lines: "voice truncate at N ms of M ms" and "voice truncate skipped".
+  - Not yet ported: web and Android have the same gap, so it goes into the parity work.
+- **Missed morning check-in.** Zubair's 08:00 call rang, re-rang once at 08:05 (the phone confirmed it arrived) and stopped: 072's one-retry rule working as written. Ahmad's choice was every 5 min, 4 rings. Migration 076 changes dispatch_calls (redefined from its live body) and call-outcome/retry.ts to MAX_CALL_RETRIES = 3.
+  - A call-back is only booked if it rings before 23:00 in the user's timezone.
+  - Only a row still 'calling' is re-booked.
+  - No client change: the apps read only the retry flag.
+- **"Google hasn't verified this app".** This needs Ahmad's action in Google Cloud Console: support email set to support@, publish, and sensitive-scope verification. It is not code.
+- support@unstucknow.io now exists, which closes C20.
+
+906 app tests green.
 
 ## Where things stand (2026-09-23, morning) — build 82: three fixes from the web/Android audits
 
