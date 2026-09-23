@@ -8,7 +8,9 @@
 // UnstuckCoreTests.
 
 import XCTest
+import Supabase
 import UnstuckCore
+import UnstuckShared
 import UnstuckSync
 @testable import Unstuck
 
@@ -286,4 +288,221 @@ final class AssistantShareConfirmTests: XCTestCase {
         // The card renders its "SHARED" state off this and drops both buttons.
         XCTAssertNotEqual(resolved.outcome, .dismissed)
     }
+}
+
+// MARK: - the AI-consent gate (AIConsent, guideline 5.1.2(i))
+//
+// AppModel.withAIConsent is the ONE gate in front of everything that sends
+// the user's words or voice to OpenAI. These drive it the way the sheet does
+// (ask → agree / "Not now" → the sheet goes away) on throwaway defaults, plus
+// the backstops that hold when a surface didn't ask.
+
+@MainActor
+final class AIConsentGateTests: XCTestCase {
+    private var suite: UserDefaults!
+    private var savedConsentDefaults: UserDefaults!
+    private var savedCallDefaults: UserDefaults!
+    private var app: AppModel!
+
+    private let granted = AIConsent.Record(at: "2026-09-24T08:00:00.000Z", version: AIConsent.version)
+
+    override func setUp() async throws {
+        try await super.setUp()
+        suite = UserDefaults(suiteName: "ai-consent-gate-tests")
+        suite.removePersistentDomain(forName: "ai-consent-gate-tests")
+        savedConsentDefaults = AIConsentStore.defaults
+        savedCallDefaults = CallSettings.defaults
+        AIConsentStore.defaults = suite
+        CallSettings.defaults = suite
+        app = AppModel()
+    }
+
+    override func tearDown() async throws {
+        app = nil
+        AIConsentStore.defaults = savedConsentDefaults
+        CallSettings.defaults = savedCallDefaults
+        suite.removePersistentDomain(forName: "ai-consent-gate-tests")
+        try await super.tearDown()
+    }
+
+    func testWithTheOKTheActionRunsAtOnce() {
+        app.aiConsentCache = AIConsent.Cache(userId: "u1", record: granted, pending: false)
+        var ran = 0
+        app.withAIConsent(.chat, from: .assistant) { ran += 1 }
+        XCTAssertEqual(ran, 1, "synchronously — the send path is unchanged")
+        XCTAssertNil(app.aiConsentAsk)
+    }
+
+    func testWithoutItTheSheetAsksAndAgreeRunsTheActionOnceTheSheetIsGone() async {
+        XCTAssertFalse(app.aiConsentGranted)
+        var ran = 0
+        await app.askForAIConsent(.chat, from: .assistant) { ran += 1 }
+        XCTAssertEqual(app.aiConsentAsk?.host, .assistant)
+        XCTAssertEqual(app.aiConsentAsk?.action, .chat)
+        XCTAssertEqual(ran, 0, "nothing sent while it asks")
+
+        app.agreeAIConsent(now: Date(timeIntervalSince1970: 1_790_000_000))
+        XCTAssertNil(app.aiConsentAsk)
+        XCTAssertEqual(ran, 0, "a Talk cover can only present once the sheet has gone")
+        app.aiConsentSheetDismissed()
+        XCTAssertEqual(ran, 1)
+        app.aiConsentSheetDismissed()
+        XCTAssertEqual(ran, 1, "once")
+
+        XCTAssertTrue(app.aiConsentGranted)
+        XCTAssertEqual(app.aiConsentCache?.record, AIConsent.Record(at: "2026-09-21T14:13:20.000Z", version: AIConsent.version))
+        XCTAssertEqual(app.aiConsentCache?.pending, true, "no account to write to here — sent on the next open")
+        XCTAssertEqual(AIConsentStore.load(), app.aiConsentCache, "kept for offline + a call ringing before the app is up")
+        XCTAssertNil(app.aiConsentNote)
+    }
+
+    func testAnOKForAnOlderVersionAsksAgain() async {
+        app.aiConsentCache = AIConsent.Cache(userId: "u1", record: .init(at: "2026-01-01T00:00:00.000Z", version: "2026-01-01"),
+                                             pending: false)
+        XCTAssertFalse(app.aiConsentGranted)
+        await app.askForAIConsent(.talk, from: .today) {}
+        XCTAssertEqual(app.aiConsentAsk?.host, .today)
+    }
+
+    func testNotNowSkipsTheActionAndSaysWhyWhereItWasAsked() async {
+        CallSettings.enabled = true
+        var ran = 0, declined = 0
+        await app.askForAIConsent(.talk, from: .today, onDecline: { declined += 1 }) { ran += 1 }
+        app.declineAIConsent()
+        XCTAssertNil(app.aiConsentAsk)
+        app.aiConsentSheetDismissed()
+        XCTAssertEqual(ran, 0)
+        XCTAssertEqual(declined, 1)
+        XCTAssertEqual(app.aiConsentNote, AIConsentNote(host: .today, text: AIConsent.decline(.talk).note))
+        XCTAssertFalse(app.aiConsentGranted)
+        XCTAssertNil(app.aiConsentCache, "nothing recorded")
+        XCTAssertTrue(CallSettings.enabled, "nothing else changes")
+        // The next try clears the line and asks again.
+        app.withAIConsent(.talk, from: .today) {}
+        XCTAssertNil(app.aiConsentNote)
+    }
+
+    func testSwipingTheSheetAwayCountsAsNotNow() async {
+        var ran = 0
+        await app.askForAIConsent(.chat, from: .assistant) { ran += 1 }
+        app.aiConsentSheetDismissed()
+        XCTAssertEqual(ran, 0)
+        XCTAssertNil(app.aiConsentAsk)
+        XCTAssertEqual(app.aiConsentNote?.host, .assistant)
+    }
+
+    func testOneSheetAtATime() async {
+        await app.askForAIConsent(.chat, from: .assistant) {}
+        let first = app.aiConsentAsk?.id
+        await app.askForAIConsent(.talk, from: .today) {}
+        XCTAssertEqual(app.aiConsentAsk?.id, first)
+        XCTAssertEqual(app.aiConsentAsk?.host, .assistant)
+    }
+
+    func testCallsCountAsOnOnlyWhenSomethingCanRing() {
+        CallSettings.enabled = true
+        XCTAssertFalse(app.callsAreOnForAIConsent, "the switch is on by default — alone it rings nothing")
+        var prefs = CallProactivePrefs.defaults
+        prefs.eveningEnabled = true
+        app.setCallProactivePrefs(prefs)
+        XCTAssertTrue(app.callsAreOnForAIConsent)
+        CallSettings.enabled = false
+        XCTAssertFalse(app.callsAreOnForAIConsent)
+    }
+
+    func testNotNowOnAppOpenTurnsCallsOffAndSaysSo() {
+        CallSettings.enabled = true
+        var prefs = CallProactivePrefs.defaults
+        prefs.morningEnabled = true
+        prefs.afterBlockEnabled = true
+        app.setCallProactivePrefs(prefs)
+        app.aiConsentAsk = AIConsentAsk(action: .callsOnOpen, host: .root, onAgree: {}, onDecline: {})
+        app.declineAIConsent()
+        XCTAssertFalse(CallSettings.enabled)
+        XCTAssertFalse(app.callProactivePrefs.morningEnabled)
+        XCTAssertFalse(app.callProactivePrefs.eveningEnabled)
+        XCTAssertFalse(app.callProactivePrefs.afterBlockEnabled)
+        XCTAssertEqual(CallSettings.proactive, app.callProactivePrefs, "the account's proactive calls go off too")
+        XCTAssertFalse(app.callsAreOnForAIConsent)
+        app.aiConsentSheetDismissed()
+        XCTAssertEqual(app.aiConsentNote, AIConsentNote(host: .root, text: AIConsent.callsTurnedOffNote))
+    }
+
+    func testAgreeOnAppOpenLeavesCallsOn() {
+        CallSettings.enabled = true
+        app.aiConsentAsk = AIConsentAsk(action: .callsOnOpen, host: .root, onAgree: {}, onDecline: {})
+        app.agreeAIConsent()
+        app.aiConsentSheetDismissed()
+        XCTAssertTrue(CallSettings.enabled)
+        XCTAssertTrue(app.aiConsentGranted)
+    }
+
+    func testTurningItOffInSettingsClearsTheOKAndTurnsCallsOff() {
+        app.aiConsentCache = AIConsent.Cache(userId: "u1", record: granted, pending: false)
+        CallSettings.enabled = true
+        var prefs = CallProactivePrefs.defaults
+        prefs.morningEnabled = true
+        app.setCallProactivePrefs(prefs)
+        app.revokeAIConsent()
+        XCTAssertFalse(app.aiConsentGranted)
+        XCTAssertNil(app.aiConsentCache?.record.at)
+        XCTAssertEqual(app.aiConsentCache?.pending, true, "sent to the account (ai_consent_at: null) on the next open")
+        XCTAssertFalse(CallSettings.enabled)
+        XCTAssertFalse(app.callProactivePrefs.morningEnabled)
+        XCTAssertEqual(app.aiConsentNote, AIConsentNote(host: .settings, text: AIConsent.revokedNote))
+    }
+
+    func testTheAccountsAnswerIsAdopted() {
+        app.adoptAIConsent(granted, userId: "u1", source: .fresh)
+        XCTAssertTrue(app.aiConsentGranted)
+        // Turned off on the web: the next fresh read turns it off here.
+        app.adoptAIConsent(AIConsent.revoked(granted), userId: "u1", source: .fresh)
+        XCTAssertFalse(app.aiConsentGranted)
+        // A saved launch session never overrides the copy.
+        app.adoptAIConsent(granted, userId: "u1", source: .stored)
+        XCTAssertFalse(app.aiConsentGranted)
+    }
+
+    // MARK: backstops (a path that didn't ask)
+
+    func testTheAssistantSendsNothingWithoutTheOK() async {
+        AssistantModel.scrubPersisted()
+        let assistant = AssistantModel(model: app, client: AssistantClient(Self.offlineClient()))
+        assistant.send("plan my day")
+        XCTAssertEqual(assistant.error, "consent")
+        XCTAssertFalse(assistant.sending)
+        XCTAssertTrue(assistant.turns.isEmpty, "not even into the thread")
+        XCTAssertEqual(assistantFriendlyError("consent"), AIConsent.decline(.chat).note)
+        guard case .err("consent") = await assistant.tourAsk(messages: [], stepId: "s", stepTitle: "t") else {
+            return XCTFail("the tour answers from its script instead")
+        }
+        assistant.clear()
+    }
+
+    func testTheSiriPromptWaitsInTheComposerWithoutTheOK() throws {
+        try XCTSkipUnless(app.assistantEnabled, "the AI kill-switch drops the link before the gate")
+        AppGroup.setPendingAssistantPrompt("probe")
+        try XCTSkipUnless(AppGroup.consumePendingAssistantPrompt() == "probe", "no App Group container in this host")
+        AppGroup.setPendingAssistantPrompt("book the dentist")
+        app.routeDeepLink("unstuck://assistant")
+        XCTAssertTrue(app.router.showAssistant)
+        XCTAssertEqual(app.assistant.takeComposerRequest()?.draft, "book the dentist")
+        XCTAssertTrue(app.assistant.turns.isEmpty, "nothing sent")
+        app.router.showAssistant = false
+    }
+
+    private static func offlineClient() -> SupabaseClient {
+        SupabaseClient(
+            supabaseURL: URL(string: "http://127.0.0.1:1")!, supabaseKey: "offline",
+            options: SupabaseClientOptions(auth: .init(storage: ConsentMemoryAuthStorage(), autoRefreshToken: false,
+                                                       emitLocalSessionAsInitialSession: true)))
+    }
+}
+
+private final class ConsentMemoryAuthStorage: AuthLocalStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    func store(key: String, value: Data) throws { lock.withLock { values[key] = value } }
+    func retrieve(key: String) throws -> Data? { lock.withLock { values[key] } }
+    func remove(key: String) throws { lock.withLock { _ = values.removeValue(forKey: key) } }
 }

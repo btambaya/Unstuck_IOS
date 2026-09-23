@@ -417,6 +417,18 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         XCTAssertTrue(sessions.isEmpty)
     }
 
+    func testNoAIConsentOKNeverConnects() {
+        // The OK was turned off between the ring and the answer: nothing
+        // reaches the assistant (the receipt rule declines the usual case).
+        var d = deps()
+        d.hasAIConsent = { false }
+        launcher.bind(d)
+        startDegraded()
+        XCTAssertEqual(ended, [.failed("no AI consent")])
+        XCTAssertTrue(sessions.isEmpty)
+        XCTAssertEqual(sessionStarts, 0)
+    }
+
     func testMakeSessionNilFailsWithoutStartingTheTalkScratch() {
         var d = deps()
         d.makeSession = { _ in nil }

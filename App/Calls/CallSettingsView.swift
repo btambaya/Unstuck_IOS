@@ -72,6 +72,7 @@ struct CallSettingsView: View {
                 explainer
 
                 masterSwitch.padding(.top, 14)
+                AIConsentNoteLine(host: .callSettings).padding(.top, 8)
                 if showVoipNudge { voipNudge.padding(.top, 10) }
 
                 SectionLabel("Allowed hours").padding(.top, 22).padding(.bottom, 8)
@@ -110,6 +111,9 @@ struct CallSettingsView: View {
         .background(theme.palette.bg.ignoresSafeArea())
         .navigationTitle("Calls from Unstuck")
         .navigationBarTitleDisplayMode(.inline)
+        // A call is a conversation with the assistant: switching Calls on,
+        // a proactive call or a test call asks for the AI-consent OK first.
+        .aiConsentSheet(.callSettings)
         .task {
             model.refreshCallProactivePrefs()
             // The nudge: no VoIP token 10 s after a signed-in launch, once.
@@ -129,19 +133,29 @@ struct CallSettingsView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Calls").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
                 Text(enabled ? (micDenied ? "Calls need microphone access — turn it on in iOS Settings, or you'll ring but can't be heard."
-                                          : "This iPhone rings for calls you book.")
+                                          : model.aiConsentGranted ? "This iPhone rings for calls you book."
+                                          : "Calls use the assistant, so they need your OK for AI data sharing — until then a call arrives as a notification.")
                              : "Off — a booked call is declined quietly here and you get the notes as a notification.")
                     .font(UFont.sans(12)).foregroundStyle(micDenied && enabled ? theme.palette.red : theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
             Toggle("", isOn: Binding(get: { enabled }, set: { on in
-                enabled = on
-                CallSettings.enabled = on
-                // Ask for the microphone while the app is in front of them —
-                // see ensureMicrophone. Without this a user who never opens
-                // Talk rings, answers, and the engine fails every time.
-                if on { Self.ensureMicrophone { granted in micDenied = !granted } }
+                guard on else {
+                    enabled = false
+                    CallSettings.enabled = false
+                    return
+                }
+                // On asks for the AI-consent OK first; "Not now" leaves it off.
+                model.withAIConsent(.callsOn, from: .callSettings) {
+                    enabled = true
+                    CallSettings.enabled = true
+                    // Ask for the microphone while the app is in front of
+                    // them — see ensureMicrophone. Without this a user who
+                    // never opens Talk rings, answers, and the engine fails
+                    // every time.
+                    Self.ensureMicrophone { granted in micDenied = !granted }
+                }
             }))
             .labelsHidden()
             .tint(theme.palette.primary)
@@ -157,17 +171,17 @@ struct CallSettingsView: View {
         return VStack(spacing: 0) {
             proactiveRow("Morning planning call", sub: "Rings to walk through the day and plan it with you.",
                          isOn: prefs.morningEnabled, time: prefs.morningTime,
-                         setOn: { var p = prefs; p.morningEnabled = $0; model.setCallProactivePrefs(p) },
+                         setOn: { var p = model.callProactivePrefs; p.morningEnabled = $0; model.setCallProactivePrefs(p) },
                          setTime: { var p = prefs; p.morningTime = $0; model.setCallProactivePrefs(p) })
             Rectangle().fill(theme.palette.line).frame(height: 1)
             proactiveRow("Evening wrap-up call", sub: "Rings to go over what got done and what moves to tomorrow.",
                          isOn: prefs.eveningEnabled, time: prefs.eveningTime,
-                         setOn: { var p = prefs; p.eveningEnabled = $0; model.setCallProactivePrefs(p) },
+                         setOn: { var p = model.callProactivePrefs; p.eveningEnabled = $0; model.setCallProactivePrefs(p) },
                          setTime: { var p = prefs; p.eveningTime = $0; model.setCallProactivePrefs(p) })
             Rectangle().fill(theme.palette.line).frame(height: 1)
             proactiveRow("Check in after a block", sub: "Rings when a block ends without its task marked done — how did it go?",
                          isOn: prefs.afterBlockEnabled, time: nil,
-                         setOn: { var p = prefs; p.afterBlockEnabled = $0; model.setCallProactivePrefs(p) },
+                         setOn: { var p = model.callProactivePrefs; p.afterBlockEnabled = $0; model.setCallProactivePrefs(p) },
                          setTime: { _ in })
         }
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -185,12 +199,16 @@ struct CallSettingsView: View {
                 }
                 Spacer(minLength: 0)
                 Toggle("", isOn: Binding(get: { isOn }, set: { on in
-                    setOn(on)
-                    // A proactive call rings a phone that was never asked
-                    // for the microphone — Calls default on, so the master
-                    // switch's prompt never ran (audit 2026-09-22, C13). Not
-                    // while Calls is off here: this phone declines them.
-                    if on, enabled { Self.ensureMicrophone { granted in micDenied = !granted } }
+                    guard on else { setOn(false); return }
+                    // On asks for the AI-consent OK first; "Not now" leaves it off.
+                    model.withAIConsent(.callsOn, from: .callSettings) {
+                        setOn(true)
+                        // A proactive call rings a phone that was never asked
+                        // for the microphone — Calls default on, so the master
+                        // switch's prompt never ran (audit 2026-09-22, C13).
+                        // Not while Calls is off here: this phone declines them.
+                        if enabled { Self.ensureMicrophone { granted in micDenied = !granted } }
+                    }
                 }))
                     .labelsHidden()
                     .tint(theme.palette.primary)
@@ -318,7 +336,7 @@ struct CallSettingsView: View {
             Text("Book a test call for one minute from now. Lock your phone — it rings through the real path (server → push → call screen).")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
                 .fixedSize(horizontal: false, vertical: true)
-            Button { bookTestCall() } label: {
+            Button { model.withAIConsent(.callsOn, from: .callSettings) { bookTestCall() } } label: {
                 HStack(spacing: 8) {
                     if testState == .booking { ProgressView().tint(.white) }
                     Image(systemName: "phone.fill").font(.system(size: 13, weight: .semibold))

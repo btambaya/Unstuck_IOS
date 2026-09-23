@@ -43,6 +43,32 @@ phases land. Newest status at the top.
 
 
 
+## AI-consent gate (branch launch/ai-consent-ios, 2026-09-24) — not shipped yet
+
+**Why:** Apple guideline 5.1.2(i) — disclose and get explicit permission before personal data goes to a third-party AI.
+Until now only small print in the memory screens said "our AI provider". Shared contract with the web (same copy, keys, version):
+
+- **Storage:** Supabase auth `user_metadata { ai_consent_at: <ISO>, ai_consent_version: "2026-09-24" }` via
+  `auth.update(user: UserAttributes(data:))` (`AuthService.setAIConsent`; off sends `ai_consent_at: null`, which GoTrue deletes).
+  It counts only while the version matches `AIConsent.version` (bump it on a provider change → everyone is asked again).
+  Device copy: `AIConsentStore` (UserDefaults `unstuck.aiConsent`, `{userId, record, pending}`), wiped at sign-out. Merge rule
+  (`AIConsent.merge`): a change made here that hasn't landed wins and is re-sent; the session saved at launch only fills an empty
+  copy; a fresh read (`GET /user` at launch, sign-in, each foreground ≤1/min, and before every ask) replaces it.
+- **The one gate:** `AppModel.withAIConsent(action, from: host) { … }`. Granted → runs now. Otherwise one quick account read
+  (≤1.5 s), then the sheet (`AIConsentSheet`, AssistantSheet.swift) from the surface that asked (`.aiConsentSheet(host)` on
+  AssistantSheet / TodayView / CallSettingsView / CallMeSection / Settings › Interface / MainTabScaffold). Agree runs the action
+  once the sheet is gone; "Not now" (or swipe) skips it and the surface shows `AIConsent.decline(action).note`.
+- **Gated:** assistant send + chips + dictation auto-send, Talk (sheet button + Today's mic), Siri "Ask Unstuck" (prompt waits in
+  the composer), Calls master switch on, proactive calls on, test call, a task's "Call me about this". Backstops: `AssistantModel.send`
+  (error `consent`, nothing sent), `tourAsk` (canned answers), `VoiceSessionModel.start`, the call launcher.
+- **Calls:** app open with Calls on for the account (this phone's switch AND a proactive call or a live booked call) and no OK
+  → asked once per launch; "Not now" turns Calls off (switch + proactive, account-wide) and an alert says so. An incoming call
+  without the OK is declined on receipt (`CallEnvironment.hasAIConsent`, after the calls-off rule) with a quiet notification
+  carrying the notes; a fallback-B tap is declined the same way.
+- **Settings › Interface › "AI data sharing":** shows On/Off; off = clear + Calls off; on = the sheet.
+- **Not done:** no server-side enforcement (older builds must keep working) — follow-up. Android needs the same gate.
+  UI tests boot with the OK granted (`UITEST_AI_CONSENT=0` boots without it).
+
 ## App-confirm links (build 88) — shipped 2026-09-23
 
 **Why** (owner decision 2026-09-23, "Proper fix in the apps"): an app sign-up's email carried Supabase's own link, which ends

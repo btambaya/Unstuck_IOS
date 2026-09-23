@@ -538,6 +538,9 @@ private struct InterfaceSettingsView: View {
                               value: clearHistoryState, locked: model.tourRunning) {
                     clearAssistantHistory()
                 }
+                CardDivider()
+                // The OK to send what they type or say to OpenAI (AIConsent).
+                AIDataSharingRow()
             }
             Text("Turn the AI Assistant off to remove it completely — no launcher, no panel, no voice. Nothing is sent to the model unless you ask it something.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
@@ -548,6 +551,38 @@ private struct InterfaceSettingsView: View {
                     .padding(.top, 6)
             }
         }
+        // AI data sharing → on asks with the same sheet as everywhere else.
+        .aiConsentSheet(.settings)
+    }
+}
+
+/// "AI data sharing" (AIConsent, guideline 5.1.2(i)): whether the account has
+/// agreed to its words and voice going to OpenAI. Off clears the OK on every
+/// device and turns Calls off; on shows the consent sheet.
+private struct AIDataSharingRow: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+
+    var body: some View {
+        let on = model.aiConsentGranted
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(isOn: Binding(get: { on }, set: { want in
+                if want { model.withAIConsent(.settings, from: .settings) {} } else { model.revokeAIConsent() }
+            })) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("AI data sharing").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                    Text(on ? "On — what you ask the assistant goes to OpenAI so it can answer."
+                            : "Off — the assistant asks before anything is sent.")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .tint(theme.palette.primary)
+            .disabled(model.tourRunning)
+            .accessibilityIdentifier("settings-ai-data-sharing")
+            AIConsentNoteLine(host: .settings)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 10)
     }
 }
 

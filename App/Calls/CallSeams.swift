@@ -102,11 +102,16 @@ protocol CallEnvironment: AnyObject {
     /// `enabled`). Off → a call that lands ends as `declined` quietly + the
     /// notes as a notification, exactly like the outside-hours rule.
     var isCallsEnabled: Bool { get }
+    /// The account has agreed to AI data sharing (AIConsent). A call is a
+    /// conversation with the assistant — without the OK it never connects:
+    /// it ends as `declined` quietly and the notes land as a notification.
+    var hasAIConsent: Bool { get }
 }
 
 extension CallEnvironment {
     var isSessionKnown: Bool { true }
     var isCallsEnabled: Bool { true }
+    var hasAIConsent: Bool { true }
 }
 
 /// A local notification the coordinator wants posted. Codable so the outcome

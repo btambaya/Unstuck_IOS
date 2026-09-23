@@ -164,6 +164,10 @@ struct UnstuckApp: App {
                         // ring here too: ask for the microphone while the app
                         // is in front of them (audit 2026-09-22, C13).
                         model.askForCallMicrophoneIfNeeded()
+                        // The AI-consent OK follows the account: re-read it
+                        // (at most once a minute), re-send a change that
+                        // didn't land, then app open's one look at Calls.
+                        Task { await model.refreshAIConsent() }
                     }
                     // Stop the safety-net pull whenever we leave the foreground
                     // (it restarts on the next .active).

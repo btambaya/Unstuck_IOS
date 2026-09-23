@@ -78,6 +78,13 @@ final class AppCallEnvironment: CallEnvironment {
     func isWithinCallHours(_ date: Date) -> Bool { CallSettings.isWithinWindow(date) }
 
     var isCallsEnabled: Bool { CallSettings.enabled }
+
+    /// The device copy of the account's OK — readable before AppModel is up
+    /// (sign-out wipes it, so it can only be the last account's).
+    var hasAIConsent: Bool {
+        if let m = model { return m.aiConsentGranted }
+        return AIConsent.isGranted(AIConsentStore.load(), userId: nil)
+    }
 }
 
 /// Posts the coordinator's notifications through UNUserNotificationCenter.

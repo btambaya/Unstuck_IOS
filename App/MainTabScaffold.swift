@@ -81,6 +81,16 @@ struct MainTabScaffold: View {
             } message: { msg in
                 Text(msg)
             }
+            // App open with Calls on for this account and no AI-consent OK
+            // (AppModel.askAboutCallsOnOpenIfNeeded): the ask — and on "Not
+            // now", the line that says Calls went off.
+            .aiConsentSheet(.root)
+            .alert(AIConsent.callsTurnedOffTitle, isPresented: rootConsentNoteShown) {
+                Button("OK") { model.aiConsentNote = nil }
+            } message: {
+                Text(model.aiConsentNote?.text ?? "")
+            }
+            .task { model.askAboutCallsOnOpenIfNeeded() }
             // Guided product tour — lives in its OWN always-on-top passthrough
             // window so the spotlight + panel render above every sheet and the
             // focus fullScreenCover (a root overlay here would be covered).
@@ -116,6 +126,12 @@ struct MainTabScaffold: View {
         Binding(
             get: { model.router.showAssistant && model.assistantEnabled },
             set: { model.router.showAssistant = $0 })
+    }
+
+    private var rootConsentNoteShown: Binding<Bool> {
+        Binding(
+            get: { model.aiConsentNote?.host == .root },
+            set: { shown in if !shown, model.aiConsentNote?.host == .root { model.aiConsentNote = nil } })
     }
 
     // MARK: - invite-prompt bindings (confirm + result over circleInvitePrompt)

@@ -197,6 +197,10 @@ final class AssistantModel {
     func send(_ text: String) {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
+        // Nothing reaches the AI provider without the account's OK
+        // (AIConsent). The surfaces ask first (AppModel.withAIConsent); this
+        // is the backstop for a path that didn't — nothing is sent.
+        if client != nil, !model.aiConsentGranted { error = "consent"; return }
         if sending { queued.append(QueuedSend(id: newUUID(), text: t)); return }
         startTurn(t)
     }
@@ -622,6 +626,9 @@ final class AssistantModel {
     /// error/timeout (see Tour/TourAsk.swift).
     func tourAsk(messages: [ChatMessage], stepId: String, stepTitle: String) async -> AssistantResult {
         guard let client else { return .err("not_configured") }
+        // Without the AI-consent OK the tour answers from its canned script
+        // (sendTourAsk's fallback) — the question never leaves the phone.
+        guard model.aiConsentGranted else { return .err("consent") }
         var context = buildAssistantContext(api)
         context["tour"] = .object(["step": .string(stepId), "title": .string(stepTitle)])
         return await client.ask(messages: messages, context: context)
@@ -740,6 +747,7 @@ private final class NotConfiguredTransport: AssistantTransport {
 func assistantFriendlyError(_ code: String) -> String {
     switch code {
     case "not_configured": return "The assistant isn't set up yet."
+    case "consent": return AIConsent.decline(.chat).note
     case "network": return "Couldn't reach the assistant — check your connection."
     case "timeout", "upstream_timeout": return "That took too long — try again."
     case "upstream", "server_error": return "The assistant had a hiccup. Try again."
