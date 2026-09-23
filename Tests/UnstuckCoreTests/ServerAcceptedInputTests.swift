@@ -89,4 +89,15 @@ final class ServerAcceptedInputTests: XCTestCase {
         XCTAssertLessThanOrEqual(clamped.unicodeScalars.count, maxCaptureBodyLength)
         XCTAssertTrue(clamped.hasSuffix("🇳🇬"), "no half flag at the end")
     }
+
+    /// The capture sheets and Siri tell the user when the clamp will cut the
+    /// note, judged on the trimmed text they actually save (C28 re-review).
+    func testTheCapturePathsKnowWhenTheClampWillCutTheNote() {
+        XCTAssertFalse(captureBodyWillBeClamped("short"))
+        XCTAssertFalse(captureBodyWillBeClamped(String(repeating: "x", count: maxCaptureBodyLength)))
+        XCTAssertFalse(captureBodyWillBeClamped("  \n" + String(repeating: "x", count: maxCaptureBodyLength) + "\n "),
+                       "whitespace the save trims away doesn't count")
+        XCTAssertTrue(captureBodyWillBeClamped(String(repeating: "x", count: maxCaptureBodyLength + 1)))
+        XCTAssertTrue(captureBodyWillBeClamped(String(repeating: "🇳🇬", count: 2049)), "counted in scalars, as Postgres does")
+    }
 }

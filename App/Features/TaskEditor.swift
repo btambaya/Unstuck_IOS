@@ -575,6 +575,7 @@ struct TaskEditor: View {
                     .buttonStyle(.plain)
                 }
             }
+            CaptureLengthNote(text: captureBody)
             CaptureTagPicker(selection: $captureTag)
         }
         .padding(12)

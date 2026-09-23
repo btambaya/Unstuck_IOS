@@ -170,3 +170,11 @@ public func clampCaptureBody(_ body: String) -> String {
     }
     return out
 }
+
+/// True when saving `body` — trimmed, as every capture path saves it — keeps
+/// only its first `maxCaptureBodyLength` characters. The capture sheets and
+/// Siri say so; the clamp alone cut a long paste silently (audit 2026-09-22,
+/// C28).
+public func captureBodyWillBeClamped(_ body: String) -> Bool {
+    body.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.count > maxCaptureBodyLength
+}
