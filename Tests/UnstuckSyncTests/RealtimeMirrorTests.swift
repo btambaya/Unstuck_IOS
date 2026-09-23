@@ -150,6 +150,56 @@ final class RealtimeMirrorTests: XCTestCase {
                                                        droppedSinceJoin: true))
     }
 
+    /// A channel whose subscribe is still running — a fresh one, or one in a
+    /// retry's back-off sleep — reads `.unsubscribed` without having given up.
+    /// Read as dead, a floor tick right after a rebuild restarted the set
+    /// (C30 re-review).
+    func testAChannelStillJoiningIsNotDead() {
+        let comingUp = [RealtimeHealPolicy.effectiveStatus(.unsubscribed, joining: true),
+                        RealtimeHealPolicy.effectiveStatus(.subscribed, joining: false)]
+        XCTAssertFalse(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: comingUp, droppedSinceJoin: false))
+        let gaveUp = [RealtimeHealPolicy.effectiveStatus(.unsubscribed, joining: false), .subscribed]
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: gaveUp, droppedSinceJoin: false))
+        XCTAssertEqual(RealtimeHealPolicy.effectiveStatus(.subscribed, joining: true), .subscribed)
+    }
+
+    /// Only the whole set going live resets the back-off: one channel that
+    /// keeps failing beside ten live ones rebuilt all eleven on every floor
+    /// tick (C30 re-review).
+    func testOnlyAWhollyLiveSetResetsTheBackOff() {
+        XCTAssertTrue(RealtimeHealPolicy.isLive([.subscribed, .subscribed]))
+        XCTAssertFalse(RealtimeHealPolicy.isLive([.subscribed, .unsubscribed]))
+        XCTAssertFalse(RealtimeHealPolicy.isLive([.subscribed, .subscribing]))
+        XCTAssertFalse(RealtimeHealPolicy.isLive([]))
+    }
+
+    /// The socket stream replays its current status to each new listener, and
+    /// the mirror starts one after every rebuild. The replay is read against
+    /// how the set was joined, so `.connected` on a set joined open is nothing
+    /// — it used to read as a first connect and rebuild the set again.
+    func testTheReplayedSocketStatusIsNotAnEvent() {
+        var joinedOpen = SocketWatch(joinedOpen: true)
+        XCTAssertEqual(joinedOpen.see(.connected), .none, "the replay after a rebuild")
+        XCTAssertEqual(joinedOpen.see(.disconnected), .dropped)
+        XCTAssertEqual(joinedOpen.see(.connecting), .dropped)
+        XCTAssertEqual(joinedOpen.see(.connected), .reconnected)
+        XCTAssertEqual(joinedOpen.see(.connected), .none)
+
+        var builtOffline = SocketWatch(joinedOpen: false)
+        XCTAssertEqual(builtOffline.see(.disconnected), .none, "the replay")
+        XCTAssertEqual(builtOffline.see(.connecting), .none)
+        XCTAssertEqual(builtOffline.see(.connected), .firstConnected)
+        XCTAssertEqual(builtOffline.see(.disconnected), .dropped)
+        XCTAssertEqual(builtOffline.see(.connected), .reconnected)
+
+        // Opened between the rebuild and its listener: bring the set up.
+        var openedMeanwhile = SocketWatch(joinedOpen: false)
+        XCTAssertEqual(openedMeanwhile.see(.connected), .firstConnected)
+        // Dropped between the joins and the listener: the set is stale.
+        var droppedMeanwhile = SocketWatch(joinedOpen: true)
+        XCTAssertEqual(droppedMeanwhile.see(.disconnected), .dropped)
+    }
+
     /// Rebuilds that don't bring the set live back off (5, 10, 20 … 300 s), so
     /// a persistent failure can't churn joins; a live channel or the network
     /// coming back resets that.

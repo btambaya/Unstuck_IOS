@@ -35,9 +35,9 @@ public struct RealtimeHealPolicy: Sendable, Equatable {
     public init() {}
 
     /// True when the channels can't be delivering and only a rebuild brings
-    /// them back. `channels` is every channel of the set (an empty set counts
-    /// as dead). A connect already in flight is left to finish: its
-    /// `.connected` is observed and re-asks.
+    /// them back. `channels` is every channel of the set, read through
+    /// `effectiveStatus` (an empty set counts as dead). A connect already in
+    /// flight is left to finish: its `.connected` is observed and re-asks.
     public static func needsRebuild(socket: RealtimeClientStatus, channels: [RealtimeChannelStatus],
                                     droppedSinceJoin: Bool) -> Bool {
         switch socket {
@@ -50,6 +50,22 @@ public struct RealtimeHealPolicy: Sendable, Equatable {
         @unknown default:
             return false
         }
+    }
+
+    /// A channel as `needsRebuild` reads it. One whose subscribe is still
+    /// running (a fresh channel before its first try, or a retry's back-off
+    /// sleep) reads `.unsubscribed` too, but it hasn't given up: it counts as
+    /// joining. Read as dead, a floor tick or a foreground restarted a set
+    /// that was still coming up (audit 2026-09-22, C30).
+    public static func effectiveStatus(_ status: RealtimeChannelStatus, joining: Bool) -> RealtimeChannelStatus {
+        joining && status == .unsubscribed ? .subscribing : status
+    }
+
+    /// The whole set is delivering: only then did a rebuild work. One channel
+    /// going live beside one that keeps failing used to reset the back-off,
+    /// so the set was rebuilt on every floor tick (C30).
+    public static func isLive(_ channels: [RealtimeChannelStatus]) -> Bool {
+        !channels.isEmpty && channels.allSatisfy { $0 == .subscribed }
     }
 
     /// Seconds to wait after `failures` rebuilds that didn't bring the set
@@ -65,13 +81,13 @@ public struct RealtimeHealPolicy: Sendable, Equatable {
         return now.timeIntervalSince(last) >= max(Self.minSpacing, Self.backoff(afterFailures: failedHeals))
     }
 
-    /// A rebuild is starting. Counted as failed until a channel reports live.
+    /// A rebuild is starting. Counted as failed until the set reports live.
     public mutating func recordHeal(now: Date) {
         lastHealAt = now
         failedHeals += 1
     }
 
-    /// A channel reached `.subscribed`: the set is live again.
+    /// The set is live again (`isLive`).
     public mutating func recordLive() {
         failedHeals = 0
     }
@@ -104,5 +120,48 @@ public struct RealtimeHealPolicy: Sendable, Equatable {
         }
         if realtime.status == .disconnected { await realtime.connect() }
         return realtime.status == .connected
+    }
+}
+
+/// What the shared socket's statuses mean to a channel set. `statusChange`
+/// REPLAYS the current status to every new listener, and RealtimeMirror starts
+/// a new listener after every rebuild: the replayed `.connected` read as a
+/// first connect and asked `ensureLive` to rebuild the set just built (audit
+/// 2026-09-22, C30). So the watch starts from what the owner already knows —
+/// whether the set was joined on an open socket — and only a change from that
+/// counts.
+public struct SocketWatch: Sendable {
+    public enum Event: Sendable, Equatable {
+        case none
+        /// Open, and the set was built without a socket: bring it up.
+        case firstConnected
+        /// Open again after a drop: the set is stale (rebuild + report the gap).
+        case reconnected
+        /// Down (or reopening) after the set had a socket.
+        case dropped
+    }
+
+    private var last: RealtimeClientStatus
+    private var everConnected: Bool
+
+    /// `joinedOpen`: the set's channels were joined on an open socket.
+    public init(joinedOpen: Bool) {
+        last = joinedOpen ? .connected : .disconnected
+        everConnected = joinedOpen
+    }
+
+    public mutating func see(_ status: RealtimeClientStatus) -> Event {
+        guard status != last else { return .none }
+        last = status
+        switch status {
+        case .connected:
+            let event: Event = everConnected ? .reconnected : .firstConnected
+            everConnected = true
+            return event
+        case .disconnected, .connecting:
+            return everConnected ? .dropped : .none
+        @unknown default:
+            return .none
+        }
     }
 }
