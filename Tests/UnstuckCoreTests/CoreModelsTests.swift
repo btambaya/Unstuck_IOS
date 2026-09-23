@@ -2,6 +2,7 @@
 // (lib/cal-block-kind.ts), and Recurrence JSON round-trips (the tagged
 // union must match the web's JSONB shape exactly).
 
+import CryptoKit
 import XCTest
 @testable import UnstuckCore
 
@@ -109,5 +110,50 @@ final class UUIDTests: XCTestCase {
     func testIsUUIDRejectsGarbage() {
         XCTAssertFalse(isUUID("not-a-uuid"))
         XCTAssertFalse(isUUID(""))
+    }
+
+    /// The shared vectors (deterministic-occurrence-ids.md §1.5): web and
+    /// Android must produce these exact strings too, or two devices minting
+    /// the same day would land on two rows (C21).
+    func testOccurrenceIdVectors() {
+        XCTAssertEqual(OCCURRENCE_ID_NAMESPACE, "acd13342-1379-568a-9f73-6acb660047d5")
+        let a = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+        let b = "b0d8e7c6-1a2b-4c3d-8e9f-0a1b2c3d4e5f"
+        let vectors: [(String, String, String)] = [
+            (a, "2026-09-24", "f8f5c8e7-0bb2-58d7-bc30-2701a2c9e1be"),
+            (a, "2026-09-25", "94be29ab-5eb6-52f4-bade-486972b834ae"),
+            (a.uppercased(), "2026-09-24", "f8f5c8e7-0bb2-58d7-bc30-2701a2c9e1be"),
+            (a, "2028-02-29", "101e2d03-3451-56d1-83b8-5f8e3d482db3"),
+            (b, "2026-12-31", "5bfa0f7f-0aea-502e-9b9d-40acfdf8cb3d"),
+            (b, "2027-01-01", "72f3d112-a4f9-5197-89f8-192492309c27"),
+            ("00000000-0000-0000-0000-000000000000", "2026-01-01", "33b3ff38-ce8b-5bfa-96a2-960ee8ea4a94"),
+            // #8 pins the trim: space, tab, VT, FF before; CR LF after; upper case.
+            (" \t\u{0B}\u{0C}\(a.uppercased())\r\n", "2026-09-24", "f8f5c8e7-0bb2-58d7-bc30-2701a2c9e1be"),
+        ]
+        for (i, v) in vectors.enumerated() {
+            let id = occurrenceId(taskId: v.0, date: v.1)
+            XCTAssertEqual(id, v.2, "vector #\(i + 1)")
+            XCTAssertTrue(isUUID(id))
+            XCTAssertEqual(id, id.lowercased())
+            let chars = Array(id)
+            XCTAssertEqual(chars[14], "5", "version nibble, vector #\(i + 1)")
+            XCTAssertTrue("89ab".contains(chars[19]), "variant nibble, vector #\(i + 1)")
+        }
+        XCTAssertNotEqual(occurrenceId(taskId: a, date: "2026-09-24"), occurrenceId(taskId: a, date: "2026-09-25"),
+                          "consecutive days differ")
+        // `.whitespaces` would have kept the newline (the critique's trap).
+        XCTAssertNotEqual(occurrenceId(taskId: a + "\n", date: "2026-09-24"), "20d80b18-cc95-5836-83dc-4597fa48e5db")
+    }
+
+    /// The hard-coded namespace IS uuid5(NAMESPACE_URL, the occurrence URL).
+    func testOccurrenceNamespaceDerivation() {
+        let nsURL = UUID(uuidString: "6ba7b811-9dad-11d1-80b4-00c04fd430c8")!.uuid
+        var bytes = withUnsafeBytes(of: nsURL) { Array($0) }
+        bytes += Array("https://unstucknow.io/ns/cal-block-occurrence".utf8)
+        var h = Array(Insecure.SHA1.hash(data: bytes).prefix(16))
+        h[6] = (h[6] & 0x0F) | 0x50
+        h[8] = (h[8] & 0x3F) | 0x80
+        let derived = UUID(uuid: h.withUnsafeBytes { $0.load(as: uuid_t.self) }).uuidString.lowercased()
+        XCTAssertEqual(derived, OCCURRENCE_ID_NAMESPACE)
     }
 }
