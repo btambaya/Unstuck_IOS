@@ -25,6 +25,7 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (81) uploaded to TestFlight (delivery d3874e6a) — the 20 P0/P1 fixes from the pre-launch audit (C1–C20, see the entry below); backend migration 075 + seven edge functions + the voice-proxy Worker deployed first. 2026-09-23.
 
+- Ship: 1.1.1 (82) uploaded to TestFlight (delivery 1ed15995) — three fixes the web/Android audits found on iOS too: a repeating task's day starts focus at zero, calls ring about tasks not yet synced here, Google connect disclosure. 2026-09-23.
 
 
 
@@ -32,6 +33,18 @@ phases land. Newest status at the top.
 
 
 
+
+
+## Where things stand (2026-09-23, morning) — build 82: three fixes from the web/Android audits
+
+Overnight the web and Android apps were brought level with build 81, then each got its own pre-launch audit, and all of their P0/P1 findings were fixed and shipped (web 841cd8c; Android vc101). Everything is in `audit/parity-2026-09-23/`: RESUME.md, DECISIONS.md, web-audit/ and android-audit/. Three of those bugs were also present on iOS:
+- **Focus prior** (web W10 / Android A13). A day of a repeating task, or the series template, used to seed the timer with the series' LIFETIME totalFocused. The session opened over its estimate, and the over-time prompt and the coach fired at once. There is now one rule, `FocusModel.seededPriorSec(task:isOccurrence:partnerShared:)`: 0 for a series day or template, and the task's own total for a plain task. The assistant's start_focus uses it too. The task sheet reads "Not started" for an untouched day.
+- **Stale call drop** (Android A6). `AppCallEnvironment.anchorIsLive` returned false when the anchored task or block was not in the local store yet (made on web or Android and not synced). The call ended silently as stale. It now rings with the payload's own label, and is retired only for what this phone knows is over: done, skipped, or a delete still queued in the outbox.
+- **Google disclosure** (web W14 / Android A19). Connect and Reconnect now show an alert first: each task you schedule becomes an event on your main Google Calendar. No toggle; the owner's call is in DECISIONS.md.
+
+888 app tests green.
+
+Still for Ahmad: stage 2, same id for same day (`audit/parity-2026-09-23/deterministic-occurrence-ids.md` §6 has 4 questions, and §5 needs a staging check).
 
 ## Where things stand (2026-09-23) — build 81: the 20 pre-launch fixes
 
