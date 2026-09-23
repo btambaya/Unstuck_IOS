@@ -219,8 +219,8 @@ public struct AuthService: Sendable {
     /// through `inFlightRefreshTask.value`, which ignores cancellation, so a
     /// group would sit out the whole stalled refresh (URLSession's 60 s × the
     /// SDK's retries). The losing `op` keeps running; its result is dropped.
-    static func firstWithin<T: Sendable>(_ seconds: TimeInterval,
-                                         _ op: @escaping @Sendable () async -> T?) async -> T? {
+    public static func firstWithin<T: Sendable>(_ seconds: TimeInterval,
+                                                _ op: @escaping @Sendable () async -> T?) async -> T? {
         let claimed = MutableFlag(false)
         return await withCheckedContinuation { (cont: CheckedContinuation<T?, Never>) in
             let sleeper = Task {

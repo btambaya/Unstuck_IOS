@@ -115,6 +115,18 @@ final class PlanRemindersTests: XCTestCase {
         XCTAssertEqual(keys(plans), ["lead:b2", "atstart:b2", "drifted:b2"])
     }
 
+    /// A block whose task is gone from the store — deleted on this phone
+    /// before the server's cascade echoes back — arms nothing. It used to read
+    /// as "not done" and ring "Time to start" for the deleted task
+    /// (audit 2026-09-22, C23).
+    func testABlockWhoseTaskIsGoneArmsNothing() {
+        let orphan = mkBlock(id: "b1", taskId: "deleted", startTime: "09:00", date: "2026-05-21")
+        let live = mkBlock(id: "b2", taskId: "t1", startTime: "10:00", date: "2026-05-21")
+        let plans = planReminders(blocks: [orphan, live], tasks: [mkTask(id: "t1")],
+                                  level: .coach, globalLeadMin: 10, now: now)
+        XCTAssertEqual(keys(plans), ["lead:b2", "atstart:b2", "drifted:b2"])
+    }
+
     func testSkippedOccurrenceArmsNothing() {
         var tpl = mkTask(id: "tpl")
         tpl.recurrence = .daily(until: nil)
@@ -259,6 +271,13 @@ final class UpcomingRemindersTests: XCTestCase {
         let up = upcomingReminders(blocks: [b1, b2, b3s, b3], tasks: [tpl], now: now)
         XCTAssertEqual(up.map(\.name), ["Live"])
         XCTAssertEqual(up.count, 1)
+    }
+
+    /// A deleted task's leftover block is not "Upcoming" (C23).
+    func testABlockWhoseTaskIsGoneIsNotUpcoming() {
+        let blocks = [mkBlock(id: "b1", taskId: "deleted", taskName: "Gone", startTime: "09:00", date: "2026-05-21"),
+                      mkBlock(id: "b2", taskId: "t1", taskName: "Here", startTime: "10:00", date: "2026-05-21")]
+        XCTAssertEqual(upcomingReminders(blocks: blocks, tasks: [mkTask(id: "t1")], now: now).map(\.name), ["Here"])
     }
 
     func testCapsAtTwenty() {

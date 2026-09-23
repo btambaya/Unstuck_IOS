@@ -133,6 +133,8 @@ public actor SyncCoordinator {
     private let prevUserKey = "unstuck.prevUserId"
     private var observeTask: Task<Void, Never>?
     private var flushKick: Task<Void, Never>?
+    /// Held by every post-write flush (`setFlushBackgroundTime`); nil = none.
+    private var flushBackgroundTime: BackgroundTime?
 
     public init(provider: SupabaseClientProvider, db: AppDatabase) {
         let gateway = SyncGateway(provider.client)
@@ -298,6 +300,16 @@ public actor SyncCoordinator {
     /// Fired on the flusher's executor: hop to the app's actor for real work.
     public func setOnInsertResolved(_ hook: @escaping @Sendable (InsertResolution) -> Void) async {
         await flusher.setOnInsertResolved(hook)
+    }
+
+    /// Begins background time and returns its release, callable once from
+    /// anywhere. The app's is a UIApplication background task, which iOS
+    /// takes back (ending it) about 30 s after the app leaves the screen.
+    public typealias BackgroundTime = @Sendable () async -> @Sendable () async -> Void
+
+    /// Background time for the post-write flush (see `debouncedFlush`).
+    public func setFlushBackgroundTime(_ hold: BackgroundTime?) {
+        flushBackgroundTime = hold
     }
 
     /// The last `cal_blocks` read that succeeded this session (nil = none yet).
@@ -573,9 +585,24 @@ public actor SyncCoordinator {
     /// are actually queued, so it's free in the common empty-outbox case.
     public func flushNow() async {
         guard let uid = auth.currentUserId else { return }
-        let auth = self.auth
-        await hydrator.pruneStaleTaskOps()
-        await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
+        let auth = self.auth, hydrator = self.hydrator, flusher = self.flusher
+        await Self.pruneThenFlush(prune: { await hydrator.pruneStaleTaskOps() },
+                                  flush: { await flusher.flush(userId: uid, currentUserId: { auth.currentUserId }) })
+    }
+
+    /// Prune, then flush — unless the flush was cancelled on the way. The
+    /// post-write flush is cancelled by the next write (`scheduleDebouncedFlush`)
+    /// even once it has started: the cancel reached the prune's tasks GET, the
+    /// prune gave up, and the drain, an unstructured task the cancel never
+    /// reaches, then sent the UNPRUNED task edits over a newer change from the
+    /// web — two edits a second or two apart on a slow link, the first after
+    /// a spell offline, were enough. The flush that replaced it prunes and
+    /// sends them instead (audit 2026-09-22, C31 review; the sign-out drain's
+    /// C9 hazard, where this rule came from).
+    static func pruneThenFlush(prune: @Sendable () async -> Void, flush: @Sendable () async -> Void) async {
+        await prune()
+        guard !Task.isCancelled else { return }
+        await flush()
     }
 
     /// Schedule the debounced post-write flush from OUTSIDE the WriteThrough
@@ -647,11 +674,25 @@ public actor SyncCoordinator {
 
     private func scheduleDebouncedFlush() {
         flushKick?.cancel()
+        let hold = flushBackgroundTime
         flushKick = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard !Task.isCancelled else { return }
-            await self?.flushNow()
+            await Self.debouncedFlush(delayNs: 1_500_000_000, hold: hold) { [weak self] in await self?.flushNow() }
         }
+    }
+
+    /// The post-write flush: after the debounce, unless a newer write replaced
+    /// it (cancelled). It holds background time from the write until that
+    /// flush is done or replaced (audit 2026-09-22, C31). Nothing asked iOS for
+    /// time before, so a tick, a lock-screen Reschedule or a focus End made
+    /// just before the app was suspended sat in the outbox until the next
+    /// open while the web, the other phone and the server's calls read the
+    /// old row. A replaced flush lets go; the one replacing it holds its own.
+    /// Past iOS's limit the ops simply wait in the outbox, as before.
+    static func debouncedFlush(delayNs: UInt64, hold: BackgroundTime?, flush: @Sendable () async -> Void) async {
+        let release = await hold?()
+        try? await Task.sleep(nanoseconds: delayNs)
+        if !Task.isCancelled { await flush() }
+        await release?()
     }
 
     /// Sign out, but first: (1) drain queued offline writes (bounded 5s,
@@ -686,11 +727,7 @@ public actor SyncCoordinator {
                                    prune: @escaping @Sendable () async -> Void,
                                    flush: @escaping @Sendable () async -> Void) async {
         await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await prune()
-                guard !Task.isCancelled else { return }
-                await flush()
-            }
+            group.addTask { await Self.pruneThenFlush(prune: prune, flush: flush) }
             group.addTask { try? await Task.sleep(nanoseconds: timeoutNs) }
             _ = await group.next()   // whichever finishes first: drain or timeout
             group.cancelAll()

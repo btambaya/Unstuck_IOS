@@ -171,6 +171,11 @@ struct UnstuckApp: App {
                         model.stopForegroundSafetyNet()
                     }
                     if phase == .background {
+                        // Push the outbox now, inside background time: the
+                        // post-write debounce alone was suspended with the
+                        // app, so an edit made just before locking waited for
+                        // the next open (audit 2026-09-22, C31).
+                        model.flushOnBackground()
                         BackgroundSync.schedule()
                         // A RUNNING guided tour checkpoints { paused, index,
                         // mode } now, so a jetsam kill relaunches into the

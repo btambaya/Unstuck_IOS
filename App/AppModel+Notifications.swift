@@ -395,6 +395,11 @@ extension AppModel {
             routeDeepLink("unstuck://focus/\(taskId)")
         case .reschedule(let taskId, let blockId, let taskName, _):
             await rescheduleToNextSlot(blockId: blockId, taskId: taskId, taskName: taskName)
+            // The move reaches the server before the system's completion is
+            // called — until then the web and the server's calls kept the old
+            // slot, and an after-block call rang about a block the user had
+            // moved (audit 2026-09-22, C31; Android: the drain inside goAsync).
+            await flushHoldingBackgroundTime(limit: Self.shadeActionFlushLimit)
         case .resumeSession:
             resumeLiveSessionFromNotification()
         case .snoozeCheckin(let taskName):
@@ -405,6 +410,10 @@ extension AppModel {
             armPausedCheckin(taskName: taskName)
         case .endSession:
             await endLiveSessionFromNotification()
+            // The Session row and the focus minutes, likewise (C31). Writes
+            // finishFocus queues a moment later ride the post-write flush,
+            // which holds its own background time.
+            await flushHoldingBackgroundTime(limit: Self.shadeActionFlushLimit)
         }
     }
 

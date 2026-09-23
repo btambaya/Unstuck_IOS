@@ -124,7 +124,14 @@ final class SystemCallNotifier: CallNotifier {
 ///     ends its CallKit call at once, and nothing then kept the process up
 ///     while AppModel booted and the report went out — the row stayed
 ///     'calling' and dispatch_calls re-rang it (audit 2026-09-22, C16). Past
-///     iOS's limit the item simply waits, persisted, as before.
+///     iOS's limit the item simply waits, persisted, as before;
+///   • a `snoozed` report carries the instant the user asked to be rung
+///     (`snoozeUntil`) and goes up as the minutes LEFT to it (`onTheWire`).
+///     call-outcome books `now + snoozeMinutes` when the report ARRIVES, so a
+///     report a dead network held back rang that much late — an evening's
+///     "call me back in 20" rang the next morning. One whose instant passed
+///     more than the ring window ago goes up `stale` instead (audit
+///     2026-09-22, C31).
 /// Injectable sleep + sender so the ordering / retry / persistence rules run
 /// in XCTest without a network (CallCoordinatorTests).
 @MainActor
@@ -137,14 +144,18 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
         let notes: [String]?
         /// Posted once the server answers without `retry` (see above).
         var notification: CallNotification?
+        /// A snooze's ring instant, stamped when it is queued (nil for any
+        /// other outcome, and for a snooze persisted by an older build).
+        let snoozeUntil: Date?
 
         init(callId: String, callKitId: String?, outcome: CallOutcome, snooze: Int?, notes: [String]?,
-             notification: CallNotification? = nil) {
+             notification: CallNotification? = nil, snoozeUntil: Date? = nil) {
             self.callId = callId; self.callKitId = callKitId; self.outcome = outcome
             self.snooze = snooze; self.notes = notes; self.notification = notification
+            self.snoozeUntil = snoozeUntil
         }
 
-        enum CodingKeys: String, CodingKey { case callId, callKitId, outcome, snooze, notes, notification }
+        enum CodingKeys: String, CodingKey { case callId, callKitId, outcome, snooze, notes, notification, snoozeUntil }
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -154,6 +165,24 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
             snooze = try c.decodeIfPresent(Int.self, forKey: .snooze)
             notes = try c.decodeIfPresent([String].self, forKey: .notes)
             notification = try c.decodeIfPresent(CallNotification.self, forKey: .notification)
+            snoozeUntil = try c.decodeIfPresent(Date.self, forKey: .snoozeUntil)
+        }
+
+        /// What goes up for this report at `now` (see the type's doc): a
+        /// snooze asks for the minutes left to its instant (at least 1, the
+        /// server's floor); past the ring window it is `stale`, the outcome
+        /// dispatch_calls gives a ring that never went out inside its ten
+        /// minutes (migration 072). Anything else goes up as queued.
+        func onTheWire(at now: Date) -> Item {
+            guard outcome == .snoozed, let until = snoozeUntil else { return self }
+            let left = until.timeIntervalSince(now)
+            if left < -CallsOutcomeReporter.snoozeRingWindow {
+                return Item(callId: callId, callKitId: callKitId, outcome: .stale, snooze: nil, notes: notes,
+                            notification: notification, snoozeUntil: until)
+            }
+            return Item(callId: callId, callKitId: callKitId, outcome: outcome,
+                        snooze: max(1, Int((left / 60).rounded(.up))), notes: notes,
+                        notification: notification, snoozeUntil: until)
         }
     }
     /// Sends one report; returns what the server answered (`retry`).
@@ -164,13 +193,21 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
 
     /// Production `BackgroundTime`: a UIApplication background task, ended
     /// exactly once (released or expired).
-    static let systemBackgroundTime: BackgroundTime = { expired in
-        let task = OutcomeBackgroundTask()
-        task.begin(expired: expired)
-        return { task.end() }
+    static let systemBackgroundTime: BackgroundTime = systemBackgroundTime(named: "unstuck.call-outcome")
+
+    /// The same task under another name: the outbox flushes and the shade's
+    /// background actions hold one too (audit 2026-09-22, C31).
+    static func systemBackgroundTime(named name: String) -> BackgroundTime {
+        { expired in
+            let task = OutcomeBackgroundTask()
+            task.begin(name: name, expired: expired)
+            return { task.end() }
+        }
     }
 
     static let queueKey = "unstuck.calls.outcomeQueue"
+    /// A snooze sent this long after its instant is `stale` (072's ring window).
+    nonisolated static let snoozeRingWindow: TimeInterval = 10 * 60
     static let maxAttempts = 3
     /// Between the attempts of one cycle.
     static let backoff: [TimeInterval] = [2, 5]
@@ -180,6 +217,7 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     private let defaults: UserDefaults
     private let key: String
     private let sleep: @Sendable (TimeInterval) async -> Void
+    private let now: @Sendable () -> Date
     /// Posts a report's `notification` once the server has settled it.
     private let notifier: CallNotifier?
     private var send: Sender?
@@ -197,12 +235,14 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
          notifier: CallNotifier? = nil, backgroundTime: BackgroundTime? = nil,
          sleep: @escaping @Sendable (TimeInterval) async -> Void = { s in
              try? await Task.sleep(nanoseconds: UInt64(max(0, s) * 1_000_000_000))
-         }) {
+         },
+         now: @escaping @Sendable () -> Date = { Date() }) {
         self.defaults = defaults
         self.key = key
         self.notifier = notifier
         self.backgroundTime = backgroundTime
         self.sleep = sleep
+        self.now = now
         if let data = defaults.data(forKey: key),
            let saved = try? JSONDecoder().decode([Item].self, from: data) {
             queue = saved
@@ -224,8 +264,10 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
 
     func report(callId: String, callKitId: UUID?, outcome: CallOutcome, snoozeMinutes: Int?, outcomeNotes: [String]?,
                 notifyUnlessRetry: CallNotification?) {
+        let snoozeUntil = outcome == .snoozed ? now().addingTimeInterval(TimeInterval(snoozeMinutes ?? 10) * 60) : nil
         queue.append(Item(callId: callId, callKitId: callKitId?.uuidString.lowercased(), outcome: outcome,
-                          snooze: snoozeMinutes, notes: outcomeNotes, notification: notifyUnlessRetry))
+                          snooze: snoozeMinutes, notes: outcomeNotes, notification: notifyUnlessRetry,
+                          snoozeUntil: snoozeUntil))
         persist()
         holdBackgroundTime()
         flush()
@@ -288,7 +330,7 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
             var rejected: Error?
             for attempt in 0..<Self.maxAttempts {
                 do {
-                    receipt = try await send(head)
+                    receipt = try await send(head.onTheWire(at: now()))
                     sent = true
                     break
                 } catch {
@@ -348,13 +390,14 @@ final class CallsOutcomeReporter: CallOutcomeReporting {
     }
 }
 
-/// One UIApplication background task for `CallsOutcomeReporter`.
+/// One UIApplication background task for `CallsOutcomeReporter` (and, by
+/// name, the outbox flushes and the shade's background actions).
 @MainActor
 private final class OutcomeBackgroundTask {
     private var id = UIBackgroundTaskIdentifier.invalid
 
-    func begin(expired: @escaping @MainActor @Sendable () -> Void) {
-        id = UIApplication.shared.beginBackgroundTask(withName: "unstuck.call-outcome") { [self] in
+    func begin(name: String, expired: @escaping @MainActor @Sendable () -> Void) {
+        id = UIApplication.shared.beginBackgroundTask(withName: name) { [self] in
             expired()
             end()
         }

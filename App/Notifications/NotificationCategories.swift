@@ -4,6 +4,7 @@
 // keep matching their action handlers.
 
 import Foundation
+import UnstuckSync
 import UserNotifications
 
 enum NotificationCategories {
@@ -85,17 +86,64 @@ enum PushAction: Sendable {
     case resumeSession
     case snoozeCheckin(taskName: String)
     case endSession
+
+    /// Registered without `.foreground` (NotificationCategories.registerAll):
+    /// iOS runs it with the app in the background, launching it with no
+    /// scene if it isn't running.
+    var runsInBackground: Bool {
+        switch self {
+        case .reschedule, .resumeSession, .snoozeCheckin, .endSession: return true
+        case .open, .startFocus: return false
+        }
+    }
 }
 
 @MainActor
 final class PushActionHub {
     static let shared = PushActionHub()
-    private var pending: [PushAction] = []
+    /// Buffered until start() wires the handler; `handled` is resumed once it
+    /// has run (a background action's poster waits on it).
+    private var pending: [(action: PushAction, handled: CheckedContinuation<Void, Never>?)] = []
     private var handler: (@MainActor (PushAction) async -> Void)?
+    /// Starts the app model for a background action that found none (a test
+    /// seam; production: the one a VoIP push starts, C16).
+    var bootApp: @MainActor () -> Void = { Task { await AppModel.shared.startWithoutScene() } }
+    /// Background time for a background action (a test seam; production: a
+    /// UIApplication background task).
+    var backgroundTime: CallsOutcomeReporter.BackgroundTime =
+        CallsOutcomeReporter.systemBackgroundTime(named: "unstuck.shade-action")
+    /// How long a background action may keep the system's completion waiting
+    /// to be applied — the model's boot and the action's flush included.
+    var deadline: TimeInterval = 20
 
-    /// Dispatch now if AppModel is wired, else buffer for start().
+    /// Dispatch now if AppModel is wired, else buffer for start(). A
+    /// background action returns only once it has been applied, or at
+    /// `deadline`, holding background time throughout (audit 2026-09-22,
+    /// C31): it was buffered in memory and the completion called at once, so
+    /// with no scene to run start() the app was suspended — often killed —
+    /// before an End or a Reschedule ever happened. The caller calls the
+    /// system's completion after this returns.
     func post(_ action: PushAction) async {
-        if let handler { await handler(action) } else { pending.append(action) }
+        guard action.runsInBackground else {
+            if let handler { await handler(action) } else { pending.append((action, nil)) }
+            return
+        }
+        let release = backgroundTime { }
+        if handler == nil { bootApp() }
+        _ = await AuthService.firstWithin(deadline) { [self] in
+            await apply(action)
+            return true
+        }
+        release()
+    }
+
+    /// Run the action now, or once start() wires the handler.
+    private func apply(_ action: PushAction) async {
+        if let handler {
+            await handler(action)
+            return
+        }
+        await withCheckedContinuation { pending.append((action, $0)) }
     }
 
     /// Wire the consumer + drain anything buffered during launch.
@@ -103,6 +151,11 @@ final class PushActionHub {
         handler = h
         let buffered = pending
         pending = []
-        Task { for a in buffered { await h(a) } }
+        Task {
+            for p in buffered {
+                await h(p.action)
+                p.handled?.resume()
+            }
+        }
     }
 }

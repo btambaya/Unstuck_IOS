@@ -86,6 +86,25 @@ final class ReminderScheduler {
         }
     }
 
+    /// Cancel every armed reminder for these blocks at once (a deleted task's
+    /// blocks, audit 2026-09-22 C23), ahead of the debounced re-plan that
+    /// would drop them too. The signature is cleared so that re-plan rebuilds
+    /// rather than assuming they are still armed.
+    func cancel(blockIds: [String]) {
+        let ids = Self.identifiers(blockIds: blockIds)
+        guard !ids.isEmpty else { return }
+        lastSignature = nil
+        UNUserNotificationCenter.current().removePendingNotificationRequests(withIdentifiers: ids)
+    }
+
+    /// Every request identifier a block's reminders can be armed under.
+    static func identifiers(blockIds: [String]) -> [String] {
+        blockIds.flatMap { id in
+            ReminderKind.allCases.map { idPrefix + PlannedReminder(kind: $0, blockId: id, taskId: "", taskName: "",
+                                                                   fireAt: 0, leadMinutes: 0).key }
+        }
+    }
+
     /// Cancel every scheduled reminder (sign-out: the next account on this
     /// device must not inherit the previous user's task reminders).
     func cancelAll() async {

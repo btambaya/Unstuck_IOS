@@ -507,4 +507,81 @@ final class HydratorPruneTests: XCTestCase {
         XCTAssertTrue(upserts.isEmpty, "the unpruned op must not be sent over the newer server row")
         XCTAssertEqual(try box.count(), 1, "it stays queued, to be parked and pruned at the next sign-in")
     }
+
+    // MARK: - the post-write flush holds background time (audit 2026-09-22, C31)
+
+    private actor Events {
+        var log: [String] = []
+        func add(_ e: String) { log.append(e) }
+    }
+
+    /// A tick right before the phone locks: the flush it kicks runs inside
+    /// background time, begun at the write and let go only once it's done.
+    func testAPostWriteFlushHoldsBackgroundTimeUntilItIsDone() async {
+        let events = Events()
+        await SyncCoordinator.debouncedFlush(delayNs: 1_000_000,
+                                             hold: {
+                                                 await events.add("hold")
+                                                 return { await events.add("release") }
+                                             },
+                                             flush: { await events.add("flush") })
+        let log = await events.log
+        XCTAssertEqual(log, ["hold", "flush", "release"])
+    }
+
+    /// A newer write replaces the pending flush: the replaced one never
+    /// flushes and lets its time go (the newer one holds its own).
+    func testAReplacedPostWriteFlushLetsGoWithoutFlushing() async {
+        let events = Events()
+        let kick = Task {
+            await SyncCoordinator.debouncedFlush(delayNs: 10_000_000_000,
+                                                 hold: {
+                                                     await events.add("hold")
+                                                     return { await events.add("release") }
+                                                 },
+                                                 flush: { await events.add("flush") })
+        }
+        while await events.log.isEmpty { await Task.yield() }
+        kick.cancel()
+        await kick.value
+        let log = await events.log
+        XCTAssertEqual(log, ["hold", "release"])
+    }
+
+    /// Back online after a spell offline, the user edits twice a second or
+    /// two apart. The second write replaces the first's flush while that
+    /// flush's prune is still fetching (a slow link): the GET is cancelled,
+    /// the prune gives up, and the stale queued op must NOT then go out over
+    /// the newer server row — the replacing flush prunes and sends (audit
+    /// 2026-09-22, C31 review).
+    func testAPostWriteFlushReplacedDuringItsPruneSendsNothing() async throws {
+        _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
+                            payload: try taskPayload(id: "t1", name: "stale", updatedAt: "2026-05-21T10:00:00.000Z"),
+                            nowISO: "2026-05-21T10:00:00.000Z")
+        let events = Events()
+        let read = FakeReadGateway(taskRows: [
+            TaskRow(TaskItem(id: "t1", name: "server-new", estimateMin: 25,
+                             createdAt: "2026-05-21T09:00:00.000Z", updatedAt: "2026-05-21T10:05:00.000Z"))
+        ], onFetch: {
+            await events.add("fetching")
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+        })
+        let hydrator = Hydrator(gateway: read, db: db)
+        let write = RecordingGateway()
+        let flusher = OutboxFlusher(gateway: write, db: db)
+        let kick = Task {
+            await SyncCoordinator.debouncedFlush(delayNs: 1_000_000, hold: nil) {
+                await SyncCoordinator.pruneThenFlush(prune: { await hydrator.pruneStaleTaskOps() },
+                                                     flush: { await flusher.flush(userId: "u1") })
+            }
+        }
+        while await events.log.isEmpty { await Task.yield() }
+
+        kick.cancel()   // the next write's flush replaces it
+        await kick.value
+
+        let upserts = await write.upserts
+        XCTAssertTrue(upserts.isEmpty, "the unpruned op must not be sent over the newer server row")
+        XCTAssertEqual(try box.count(), 1, "it stays queued for the flush that replaced this one")
+    }
 }

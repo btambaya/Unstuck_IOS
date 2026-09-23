@@ -2970,6 +2970,79 @@ final class StoredRowWriteTests: XCTestCase {
         XCTAssertNil(try stored("c5-gone"))
         XCTAssertEqual(try taskOps("c5-gone").count, 0)
     }
+
+    /// The editor's Delete ("Its scheduled blocks and captures are removed
+    /// too"): the task's blocks and captures leave this phone with it, and
+    /// each block goes the way a single block's delete sends it — its Google
+    /// event included. Only the tasks row used to go (audit 2026-09-22, C23).
+    func testDeletingATaskRemovesItsBlocksCapturesAndGoogleEvents() async throws {
+        let tid = "77777777-7777-4777-8777-777777777777"
+        try db.save(row(tid, "Dentist call"))
+        let pushed = CalBlock(id: "88888888-8888-4888-8888-888888888888", taskId: tid, taskName: "Dentist call",
+                              startTime: "14:00", durationMinutes: 30, date: Clock.todayISO(),
+                              externalEventId: "evt-1", externalConnectionId: "conn-1", kind: .task)
+        let plain = CalBlock(id: "99999999-9999-4999-8999-999999999999", taskId: tid, taskName: "Dentist call",
+                             startTime: "16:00", durationMinutes: 30, date: LocalDate.addDays(Clock.todayISO(), 1), kind: .task)
+        try db.save(pushed)
+        try db.save(plain)
+        try db.save(Capture(id: "c23-cap", taskId: tid, sessionId: nil, tag: .idea, body: "ask about Tuesday", at: PAST_CREATED))
+        var googleDeletes: [String] = []
+        model.onGoogleDeleteDispatched = { googleDeletes.append($0.id) }
+
+        let deleted = await model.deleteTaskAwaiting(tid)
+        await model.awaitGoogleMirrors()
+
+        XCTAssertTrue(deleted)
+        XCTAssertNil(try stored(tid))
+        XCTAssertTrue(try db.fetchAllCalBlocks().filter { $0.taskId == tid }.isEmpty, "no block left to ring")
+        XCTAssertNil(try db.fetchById(Capture.self, id: "c23-cap"))
+        XCTAssertEqual(Set(googleDeletes), [pushed.id, plain.id])
+        let ours: Set<String> = [pushed.id, plain.id, "c23-cap", tid]
+        let ops = try OutboxStore(db).pending().filter { ours.contains($0.rowId) }
+        XCTAssertEqual(ops.map(\.tableName), ["cal_blocks", "cal_blocks", "captures", "tasks"])
+        XCTAssertTrue(ops.allSatisfy { $0.kind == .delete })
+    }
+
+    /// "Turn that capture into a task", then Undo on the receipt: the task
+    /// goes and the thought stays, unlinked and back in the inbox. The Undo
+    /// is a task delete, the delete now takes the task's captures (C23), and
+    /// promote_capture had linked this one to the new task, so the Undo
+    /// deleted the user's capture here and on the server (C23 review).
+    func testUndoingAPromotedCaptureKeepsTheCapture() async throws {
+        let state = AppModelAssistantState(model: model, assistant: model.assistant)
+        let cap = Capture(id: "c23-undo", taskId: nil, sessionId: nil, tag: .idea, body: "call mum about Sunday", at: PAST_CREATED)
+        try db.save(cap)
+        let result = await runAssistantTool(name: "promote_capture", args: ToolArgs(json: #"{"captureId":"c23-undo"}"#),
+                                            api: state, scratch: TurnScratch())
+        let receipt = try XCTUnwrap(deriveReceipt(name: "promote_capture", args: ReceiptArgs(), result: result,
+                                                  tasks: state.getTasks()), result)
+        guard case .deleteTask(let taskId)? = receipt.undo else { return XCTFail("no task undo: \(result)") }
+        XCTAssertEqual(try db.fetchById(Capture.self, id: cap.id)?.taskId, taskId, "the promote linked it")
+        try await settle { try self.db.captureArchivedAt(id: cap.id) != nil }
+        XCTAssertNotNil(try db.captureArchivedAt(id: cap.id), "the promote took it out of the inbox")
+
+        let action = try XCTUnwrap(planReceiptUndo(.deleteTask(id: taskId), tasks: state.getTasks(), nowISO: AppModel.isoNow()))
+        let undone = await AssistantModel.applyLocalUndo(action, api: state)
+
+        XCTAssertTrue(undone)
+        XCTAssertNil(try stored(taskId), "the task the promote made is gone")
+        let kept = try XCTUnwrap(db.fetchById(Capture.self, id: cap.id), "the user's thought survives the Undo")
+        XCTAssertNil(kept.taskId, "unlinked from the removed task")
+        XCTAssertEqual(kept.body, cap.body)
+        try await settle { try self.db.captureArchivedAt(id: cap.id) == nil && !self.model.archivedCaptureIds.contains(cap.id) }
+        XCTAssertNil(try db.captureArchivedAt(id: cap.id), "back in the inbox, where the promote took it from")
+        XCTAssertFalse(model.archivedCaptureIds.contains(cap.id))
+        let ops = try OutboxStore(db).pending().filter { $0.rowId == cap.id }
+        XCTAssertFalse(ops.isEmpty)
+        XCTAssertTrue(ops.allSatisfy { $0.kind == .upsert }, "no captures delete reaches the server")
+    }
+
+    /// The immediate cancel covers every reminder a block can be armed under
+    /// (the scheduler's own identifier scheme).
+    func testReminderIdentifiersForABlockCoverEveryKind() {
+        XCTAssertEqual(ReminderScheduler.identifiers(blockIds: ["b1"]),
+                       ["unstuck.rem.lead:b1", "unstuck.rem.atstart:b1", "unstuck.rem.drifted:b1"])
+    }
 }
 
 
