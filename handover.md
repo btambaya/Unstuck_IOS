@@ -33,6 +33,7 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (85) uploaded (delivery f1ff0fe0) — STAGE 2, same id for same day (C21): deterministic occurrence ids, insert-if-absent, rules A/B/G/H, serialised top-up after a good pull; every minted occurrence mirrored to Google after a confirmed insert (Ahmad: 'every day, everywhere'). 2026-09-23.
 
+- Ship: 1.1.1 (86) uploaded (delivery 020de96f) — THE BETA BUILD: audit P2 batches 1–5 (C23 C24 C25 C26 C28 C29 C30 C31 C35 C36 C37 C38 C39 C41 C42 C43 C44 C46 C47) + Gregorian stored dates. 2026-09-23.
 
 
 
@@ -40,6 +41,35 @@ phases land. Newest status at the top.
 
 
 
+
+
+## Where things stand (2026-09-23, evening) — build 86: the beta build (audit P2 batches 1–5 + Gregorian dates)
+
+Ahmad: "work on 1 to 5, then I will do all that's required to start beta testing by end of day". Six groups, each implemented → adversarially reviewed → fixed up (results: audit/prelaunch-2026-09-22/p2-batch-results.json; evidence: p2-batch-input.json). Merge conflicts were resolved by hand:
+- **Sign-out warning.** privacy's `AppModel.unsyncedSignOutWarning` is kept and fed `max(quarantinedSyncCount, stuckChanges)` from C28; sync's second alert is dropped.
+- **Notification actions.** They carry focus's session ids (C38) plus life's `runsInBackground` and background-time flush (C31).
+- **Task delete.** It is life's one-transaction `WriteThrough.deleteTask` returning the removed blocks, and each block goes through `forgetDeletedBlock`: mirror gate, Google pushes/backlog, Google delete of the row as deleted, pending-insert abandon, reminder cancel. google's read-back of the blocks after the delete would have found none.
+
+What each batch did:
+- **Sync (C28, C29, C30).**
+  - C28: a Today card says "N changes couldn't be saved — only on this phone" with Try again and Discard. The quarantine is released once per build. Name-clash 23505s adopt the server row. Capture bodies are clamped. Dates and times are validated before writing.
+  - C29: sessions and reason_logs page by the server's updated_at. The id sweep also takes rows the server has that this device lacks, and stamp-different rows with no queued write.
+  - C30: RealtimeHealPolicy rebuilds channels that never subscribed or survived a socket drop, with 5 s→300 s back-off. `connect()` is called only when the socket is down.
+- **Lifecycle (C23, C31).** Deleting a task cascades locally (blocks, captures) in one transaction and cancels reminders. Background time now wraps the flush, the lock-screen actions (Reschedule, End) and cold launches from a notification action.
+- **Privacy (C35, C36).** Sign-out scrubs notifications, the widget, the Live Activity, assistant threads and App Group keys, and wipes before announcing the change of user. It unregisters the APNs and VoIP tokens. A push for a signed-out user is dropped; a VoIP push is still reported to CallKit, then ended. C36 is partial: device_tokens isn't tied to the auth session on the server — backend follow-up.
+- **Focus (C37, C38, C39, C43, C44).** Actions from outside the Focus screen keep it in sync. Check-in actions carry their session id. Time in the pause-reason dialog doesn't count. An overlong session is capped with a discard option. Captures from sessions that write no Session row get a real task id.
+- **Google (C24, C25, C26).** A Google write-back backlog survives offline and relaunch. Deletes remove the event of the row as it was deleted. Pull fixes for paging, all-day and cancelled events. Disconnect reports a failure.
+- **Voice (C41, C42, C46, C47).** On-device speech hands back audio focus (.notifyOthersOnDeactivation), with no orphaned hot mic. The CallKit call owns the audio. Turn-taking fixes preserve the build-83 truncate and the echo verdict. Limit and close messages are plain words. Still open: a wrap-up warning before the 15-minute cap needs a product decision.
+- **Gregorian dates.** New `Time.calendar` (Gregorian, keeping the device's zone, locale and week start) replaces Calendar.current at 59 sites. A Buddhist/Japanese calendar phone used to store "2569-…"/"0008-…".
+
+Tests: 1016 app (plus the known CrashBreadcrumbs order flake) and 1270 package tests, all green.
+
+DEVICE CHECKS — the full lists are in p2-batch-results.json, under device_checks per group:
+- An offline launch, then a web edit, arrives live.
+- Delete a scheduled task and lock at once: no reminder fires, and its Google event is gone.
+- Sign-out leaves no old notifications, and no calls reach the signed-out phone.
+- Focus Resume/End from the lock screen keeps one Session.
+- Music resumes after dictation.
 
 ## Where things stand (2026-09-23, afternoon) — builds 84 + 85: list-item gestures, the reconnect card, stage 2
 
