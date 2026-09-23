@@ -59,12 +59,20 @@ public actor WriteThrough {
                                                                            nowISO: String,
                                                                            extra: ((Database) throws -> Void)? = nil) throws {
         try db.transaction { conn in
-            _ = try type.deleteOne(conn, key: id)
-            try extra?(conn)
-            try OutboxStore.cancelPendingUpserts(in: conn, table: table, rowId: id)
-            try OutboxStore.enqueue(in: conn, table: table, rowId: id, kind: .delete, nowISO: nowISO)
+            try Self.deleteAndEnqueue(in: conn, type, table: table, id: id, nowISO: nowISO, extra: extra)
         }
         onEnqueue?()
+    }
+
+    /// Same, on an OPEN connection — `deleteTask` removes a task and its
+    /// children in one transaction.
+    private static func deleteAndEnqueue<R: PersistableRecord & FetchableRecord>(in conn: Database, _ type: R.Type,
+                                                                                  table: String, id: String, nowISO: String,
+                                                                                  extra: ((Database) throws -> Void)? = nil) throws {
+        _ = try type.deleteOne(conn, key: id)
+        try extra?(conn)
+        try OutboxStore.cancelPendingUpserts(in: conn, table: table, rowId: id)
+        try OutboxStore.enqueue(in: conn, table: table, rowId: id, kind: .delete, nowISO: nowISO)
     }
 
     /// Tasks carry the BASE (the row as this device last saw it) on the op so
@@ -390,8 +398,41 @@ public actor WriteThrough {
         try deleteAndEnqueue(CalBlock.self, table: "cal_blocks", id: id, nowISO: nowISO)
     }
 
-    public func deleteTask(id: String, nowISO: String) throws {
-        try deleteAndEnqueue(TaskItem.self, table: "tasks", id: id, nowISO: nowISO)
+    /// A task goes with its blocks and captures, in ONE transaction (audit
+    /// 2026-09-22, C23). The local store has no FK cascade, so deleting the
+    /// tasks row alone left its cal_blocks behind: their reminders stayed
+    /// armed for a deleted task, and a block op still queued (scheduled or
+    /// minted offline) waited forever on a parent that would never exist
+    /// locally again, so the hydrate kept that block on this phone for good.
+    /// The server cascades cal_blocks and only nulls captures.task_id; the web
+    /// and the assistant delete both first, and the editor's dialog promises
+    /// it. Each child's queued upsert or insert is cancelled and its delete
+    /// queued BEFORE the task's, the order they send in; a delete of a row
+    /// the server never received is a no-op there. Returns the removed
+    /// blocks: their Google events and armed reminders are the app's to clear.
+    @discardableResult
+    public func deleteTask(id: String, nowISO: String) throws -> [CalBlock] {
+        let blocks = try db.transaction { conn -> [CalBlock] in
+            let blocks = try CalBlock.filter(Column("taskId") == id).fetchAll(conn)
+            for b in blocks {
+                // External g_ rows aren't ours: local delete only (deleteCalBlock).
+                if b.id.hasPrefix("g_") {
+                    _ = try CalBlock.deleteOne(conn, key: b.id)
+                } else {
+                    try Self.deleteAndEnqueue(in: conn, CalBlock.self, table: "cal_blocks", id: b.id, nowISO: nowISO)
+                }
+            }
+            for c in try Capture.filter(Column("taskId") == id).fetchAll(conn) {
+                // A deleted capture takes its archive state with it (deleteCapture).
+                try Self.deleteAndEnqueue(in: conn, Capture.self, table: "captures", id: c.id, nowISO: nowISO) {
+                    try AppDatabase.setCaptureArchived(in: $0, id: c.id, archivedAt: nil)
+                }
+            }
+            try Self.deleteAndEnqueue(in: conn, TaskItem.self, table: "tasks", id: id, nowISO: nowISO)
+            return blocks
+        }
+        onEnqueue?()
+        return blocks
     }
 
     public func deleteTag(id: String, nowISO: String) throws {

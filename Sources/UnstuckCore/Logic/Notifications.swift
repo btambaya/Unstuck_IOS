@@ -94,7 +94,8 @@ public func blockStartMillis(_ b: CalBlock) -> EpochMillis? {
 /// The ReminderScheduler decision: which LEAD / ATSTART / DRIFTED alarms
 /// should exist right now. Pure port of Android ReminderScheduler.sync():
 ///  - task blocks + EXTERNAL calendar events are eligible; placeholders skipped
-///  - done tasks schedule nothing
+///  - done tasks schedule nothing, and neither does a task block whose task
+///    is gone from the store (deleted)
 ///  - done / skipped task blocks schedule nothing — a recurring occurrence's
 ///    per-day state (033; server parity 054/070)
 ///  - externals use the global lead; tasks the per-task override (else global)
@@ -114,6 +115,7 @@ public func planReminders(
     now: EpochMillis
 ) -> [PlannedReminder] {
     var out: [PlannedReminder] = []
+    let doneById = taskDoneById(tasks)
 
     func arm(_ b: CalBlock, _ kind: ReminderKind, fireAt: EpochMillis, lead: Int) {
         guard fireAt > now, fireAt <= now + REMINDER_HORIZON_MS else { return }
@@ -127,7 +129,13 @@ public func planReminders(
         if !isTask && !isExternal { continue }
         guard let startMs = blockStartMillis(b) else { continue }
         let taskId = b.taskId ?? ""
-        if isTask, tasks.first(where: { $0.id == taskId })?.done == true { continue }
+        // A task block rings only for a task that is still here and open. A
+        // missing task used to read as "not done", so the blocks a delete
+        // left behind kept ringing "Time to start" for the deleted task until
+        // the server's cascade echoed back — never, offline (audit 2026-09-22,
+        // C23). Every cal_blocks row is the user's own (RLS), so its task is
+        // in this store unless it was deleted.
+        if isTask, doneById[taskId] ?? true { continue }
         // A recurring occurrence records the day's tick and "Skip this day" on
         // the BLOCK (migration 033) — the template's `done` never flips — so a
         // day already handled must not ring "Coming up" / "Time to start" /
@@ -153,6 +161,11 @@ public func planReminders(
         if isTask && level.drifted && !focused { arm(b, .drifted, fireAt: startMs + REMINDER_DRIFT_MS, lead: 0) }
     }
     return out
+}
+
+/// `done` per task id — one lookup per block instead of a scan of `tasks`.
+private func taskDoneById(_ tasks: [TaskItem]) -> [String: Bool] {
+    Dictionary(tasks.map { ($0.id, $0.done) }, uniquingKeysWith: { a, _ in a })
 }
 
 // MARK: - notification copy (Android ReminderReceiver / NotificationRenderer)
@@ -196,16 +209,18 @@ public struct UpcomingReminder: Equatable, Sendable, Identifiable {
 
 /// Scheduled task reminders in the next 2 days, computed live from the
 /// blocks (Android NotificationCenterScreen): task blocks whose start is
-/// within [now, now+48h] whose task isn't done and whose block (a recurring
-/// occurrence's day) isn't done or skipped, de-duped by
+/// within [now, now+48h] whose task is still here and isn't done and whose
+/// block (a recurring occurrence's day) isn't done or skipped, de-duped by
 /// (taskId, at), sorted ascending, capped at 20.
 public func upcomingReminders(blocks: [CalBlock], tasks: [TaskItem], now: EpochMillis) -> [UpcomingReminder] {
     var seen = Set<String>()
     var out: [UpcomingReminder] = []
+    let doneById = taskDoneById(tasks)
     for b in blocks where isTaskBlock(b) {
         guard let ms = blockStartMillis(b), ms >= now, ms <= now + REMINDER_HORIZON_MS else { continue }
         let taskId = b.taskId ?? ""
-        if tasks.first(where: { $0.id == taskId })?.done == true { continue }
+        // A deleted task's leftover block is not upcoming (planReminders, C23).
+        if doneById[taskId] ?? true { continue }
         // The day's own tick / skip lives on the block, so a finished or
         // skipped day is not "Upcoming". Checked BEFORE the de-dupe insert so a
         // skipped twin at the same (task, time) can't hide the live block

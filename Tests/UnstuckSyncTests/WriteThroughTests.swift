@@ -132,6 +132,49 @@ final class WriteThroughTests: XCTestCase {
         XCTAssertEqual(ops.map(\.kind), [.delete], "the held-back upsert can't resurrect the row after the delete")
     }
 
+    /// "Buy milk" created, scheduled and repeated offline, a capture taken on
+    /// it, then deleted — all before the phone reconnects. The task's blocks
+    /// and capture go in the same transaction; every queued upsert or insert
+    /// for them is cancelled (they would wait forever on the missing parent,
+    /// and the hydrate keeps a row with a queued op: a ghost block for good);
+    /// the children's deletes queue BEFORE the task's. Another task's block
+    /// is untouched (audit 2026-09-22, C23).
+    func testDeletingATaskTakesItsBlocksAndCapturesWithItInOneGo() async throws {
+        let tid = "33333333-3333-4333-8333-333333333333"
+        let other = "44444444-4444-4444-8444-444444444444"
+        try await write.upsertTask(TaskItem(id: tid, name: "Buy milk", estimateMin: 25, createdAt: now, updatedAt: now), nowISO: now)
+        try await write.upsertTask(TaskItem(id: other, name: "Keep", estimateMin: 25, createdAt: now, updatedAt: now), nowISO: now)
+        let scheduled = CalBlock(id: "55555555-5555-4555-8555-555555555555", taskId: tid, taskName: "Buy milk",
+                                 startTime: "17:00", durationMinutes: 25, date: "2026-05-21", kind: .task)
+        try await write.upsertCalBlock(scheduled, nowISO: now)
+        let minted = CalBlock(id: occurrenceId(taskId: tid, date: "2026-05-22"), taskId: tid, taskName: "Buy milk",
+                              startTime: "17:00", durationMinutes: 25, date: "2026-05-22", kind: .task)
+        try await write.insertCalBlockIfAbsent(minted, retimeIfTaken: false, nowISO: now)
+        let kept = CalBlock(id: "66666666-6666-4666-8666-666666666666", taskId: other, taskName: "Keep",
+                            startTime: "09:00", durationMinutes: 25, date: "2026-05-21", kind: .task)
+        try await write.upsertCalBlock(kept, nowISO: now)
+        let capture = Capture(id: "c-milk", taskId: tid, sessionId: nil, tag: .idea, body: "semi-skimmed", at: now)
+        try await write.upsertCapture(capture, nowISO: now)
+        _ = try await write.setCaptureArchived(id: capture.id, archivedAt: now, nowISO: now)
+
+        let removed = try await write.deleteTask(id: tid, nowISO: now)
+
+        XCTAssertEqual(Set(removed.map(\.id)), [scheduled.id, minted.id], "the removed blocks, for the app's Google + reminder cleanup")
+        XCTAssertNil(try db.fetchById(TaskItem.self, id: tid))
+        XCTAssertEqual(try db.fetchAllCalBlocks().map(\.id), [kept.id], "no ghost block left on this phone")
+        XCTAssertNil(try db.fetchById(Capture.self, id: capture.id))
+        XCTAssertNil(try db.captureArchivedAt(id: capture.id))
+        let ops = try box.pending()
+        let gone = [scheduled.id, minted.id, capture.id, tid]
+        XCTAssertTrue(ops.filter { gone.contains($0.rowId) }.allSatisfy { $0.kind == .delete },
+                      "no upsert or insert left to re-create a row, or to wait on the missing parent")
+        let deletes = ops.filter { $0.kind == .delete }.map(\.tableName)
+        XCTAssertEqual(deletes, ["cal_blocks", "cal_blocks", "captures", "tasks"], "the children go before the task")
+        XCTAssertEqual(ops.filter { $0.rowId == kept.id }.map(\.kind), [.upsert], "another task's block is untouched")
+        let flushable = try box.nextFlushable().map(\.rowId)
+        XCTAssertTrue(Set(gone).isSubset(of: Set(flushable)), "nothing of the deleted task is held back")
+    }
+
     func testCaptureArchiveRidesOnTheCaptureRowAsArchivedAt() async throws {
         let c = Capture(id: "c1", taskId: nil, sessionId: nil, tag: .idea, body: "x", at: now)
         try await write.upsertCapture(c, nowISO: now)

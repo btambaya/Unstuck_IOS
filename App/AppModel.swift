@@ -1806,7 +1806,15 @@ final class AppModel {
         // collection item leaves that item ticked with nothing behind it unless
         // we un-tick it for the other members.
         let promoted = (try? taskRepo?.fetch(id: id)) ?? nil
-        do { try await write.deleteTask(id: id, nowISO: Self.isoNow()) } catch { return false }
+        // The delete takes the task's blocks and captures with it (audit
+        // 2026-09-22, C23). Each removed block then goes the way
+        // deleteBlockAwaiting sends one: its Google event, rule G's gate, and
+        // its armed reminders now, not after the re-plan's debounce, which a
+        // phone locked right after the delete may never run.
+        let blocks: [CalBlock]
+        do { blocks = try await write.deleteTask(id: id, nowISO: Self.isoNow()) } catch { return false }
+        for block in blocks { forgetDeletedBlock(block) }
+        ReminderScheduler.shared.cancel(blockIds: blocks.map(\.id))
         if let promoted { notifyTaskReopenedIfShared(promoted) }
         return true
     }
@@ -2099,6 +2107,12 @@ final class AppModel {
     func deleteBlockAwaiting(_ block: CalBlock) async {
         guard let write else { return }
         try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
+        forgetDeletedBlock(block)
+    }
+
+    /// The app's half of a block's local delete (a single block, or a task's
+    /// blocks going with it — deleteTaskAwaiting).
+    private func forgetDeletedBlock(_ block: CalBlock) {
         mirrorGate?.forget(rowId: block.id)   // its cancelled insert will never resolve
         googlePushes.removeAll { $0.blockId == block.id }   // nothing left to push
         queueGoogleDelete(block)

@@ -2926,6 +2926,45 @@ final class StoredRowWriteTests: XCTestCase {
         XCTAssertNil(try stored("c5-gone"))
         XCTAssertEqual(try taskOps("c5-gone").count, 0)
     }
+
+    /// The editor's Delete ("Its scheduled blocks and captures are removed
+    /// too"): the task's blocks and captures leave this phone with it, and
+    /// each block goes the way a single block's delete sends it — its Google
+    /// event included. Only the tasks row used to go (audit 2026-09-22, C23).
+    func testDeletingATaskRemovesItsBlocksCapturesAndGoogleEvents() async throws {
+        let tid = "77777777-7777-4777-8777-777777777777"
+        try db.save(row(tid, "Dentist call"))
+        let pushed = CalBlock(id: "88888888-8888-4888-8888-888888888888", taskId: tid, taskName: "Dentist call",
+                              startTime: "14:00", durationMinutes: 30, date: Clock.todayISO(),
+                              externalEventId: "evt-1", externalConnectionId: "conn-1", kind: .task)
+        let plain = CalBlock(id: "99999999-9999-4999-8999-999999999999", taskId: tid, taskName: "Dentist call",
+                             startTime: "16:00", durationMinutes: 30, date: LocalDate.addDays(Clock.todayISO(), 1), kind: .task)
+        try db.save(pushed)
+        try db.save(plain)
+        try db.save(Capture(id: "c23-cap", taskId: tid, sessionId: nil, tag: .idea, body: "ask about Tuesday", at: PAST_CREATED))
+        var googleDeletes: [String] = []
+        model.onGoogleDeleteDispatched = { googleDeletes.append($0.id) }
+
+        let deleted = await model.deleteTaskAwaiting(tid)
+        await model.awaitGoogleMirrors()
+
+        XCTAssertTrue(deleted)
+        XCTAssertNil(try stored(tid))
+        XCTAssertTrue(try db.fetchAllCalBlocks().filter { $0.taskId == tid }.isEmpty, "no block left to ring")
+        XCTAssertNil(try db.fetchById(Capture.self, id: "c23-cap"))
+        XCTAssertEqual(Set(googleDeletes), [pushed.id, plain.id])
+        let ours: Set<String> = [pushed.id, plain.id, "c23-cap", tid]
+        let ops = try OutboxStore(db).pending().filter { ours.contains($0.rowId) }
+        XCTAssertEqual(ops.map(\.tableName), ["cal_blocks", "cal_blocks", "captures", "tasks"])
+        XCTAssertTrue(ops.allSatisfy { $0.kind == .delete })
+    }
+
+    /// The immediate cancel covers every reminder a block can be armed under
+    /// (the scheduler's own identifier scheme).
+    func testReminderIdentifiersForABlockCoverEveryKind() {
+        XCTAssertEqual(ReminderScheduler.identifiers(blockIds: ["b1"]),
+                       ["unstuck.rem.lead:b1", "unstuck.rem.atstart:b1", "unstuck.rem.drifted:b1"])
+    }
 }
 
 
