@@ -17,6 +17,12 @@
 //    stay held back behind it. Offline / timeout / 5xx / auth-refresh
 //    failures are TRANSIENT: they never count — the old cap counted plain
 //    airplane-mode failures and silently dropped valid writes after five.
+//  • the insert family (stage 2, deterministic occurrence ids): `insert` /
+//    `insert_or_retime` go out as INSERT … ON CONFLICT (id) DO NOTHING, an
+//    ignored `insert_or_retime` falls back to rule H's conditional retime,
+//    and every resolution is reported after markDone (`InsertResolution`),
+//    bracketed by rule G's `InsertMirrorGate`. Never coalesced, never sent
+//    as a plain upsert.
 
 import Foundation
 import Supabase

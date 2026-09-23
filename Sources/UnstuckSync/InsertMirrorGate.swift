@@ -75,6 +75,16 @@ public final class InsertMirrorGate: @unchecked Sendable {
         }
     }
 
+    /// A MINT is about to be written and wants its push once the insert
+    /// resolves. Recorded BEFORE the op is queued, so a flush that resolves
+    /// the insert before the writer gets back to ask can't slip past the gate
+    /// (it finds the mark and consumes it). Returns true when the mark is new
+    /// — the caller undoes it with `forget` if nothing was written.
+    @discardableResult
+    public func expectMirror(rowId: String) -> Bool {
+        lock.withLock { wanted.insert(rowId).inserted }
+    }
+
     /// True while an insert-family op for `rowId` is queued or being sent.
     public func isUnresolved(rowId: String) -> Bool {
         lock.withLock { unresolvedLocked(rowId) }

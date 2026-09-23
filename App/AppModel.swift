@@ -78,10 +78,13 @@ final class AppModel {
     /// Rule G's gate for the XCUITest / unit-test boot (no coordinator, so no
     /// flusher owns one). Production reads the flusher's via the coordinator.
     var uiTestMirrorGate: InsertMirrorGate?
-    /// The Google pushes that waited for their insert (rule G), run one at a
-    /// time so a top-up's worth of confirmations can't fire dozens of
-    /// concurrent calendar calls.
-    @ObservationIgnored private var googleMirrorTail: Task<Void, Never>?
+    /// Every Google call for a cal_block (push or delete) runs on ONE serial
+    /// chain. Since stage 2 every minted occurrence is mirrored, so a series
+    /// edit, a Schedule or a top-up pushes dozens of rows at once; fired as
+    /// concurrent calendar-sync calls they would trip Google's rate limit.
+    /// Serial also means a push reads the row after the previous one stamped
+    /// it, instead of two quick saves both INSERTing an event.
+    @ObservationIgnored private var googleTail: Task<Void, Never>?
     /// Test seam: every Google push of a cal_block that actually goes out.
     @ObservationIgnored var onGoogleMirrorDispatched: ((CalBlock) -> Void)?
     // Per-collection serial RPC queue. The optimistic local write happens
@@ -1950,8 +1953,13 @@ final class AppModel {
            let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
             try? await write.upsertTask(unparked, nowISO: nowISO)
         }
+        // "Mirror wanted" goes on BEFORE the op is queued: a flush that
+        // resolved the insert before this await returned would otherwise let
+        // a later push through for an insert the server ignored (rule G).
+        let gate = isTaskBlock(block) ? mirrorGate : nil
+        let expected = gate?.expectMirror(rowId: block.id) ?? false
         let wrote = (try? await write.insertCalBlockIfAbsent(block, retimeIfTaken: retimeIfTaken, nowISO: Self.isoNow())) ?? false
-        if wrote { requestGoogleMirror(block) }
+        if !wrote, expected { gate?.forget(rowId: block.id) }
         return wrote
     }
 
@@ -1964,28 +1972,39 @@ final class AppModel {
     private func requestGoogleMirror(_ block: CalBlock) {
         guard isTaskBlock(block) else { return }
         if let gate = mirrorGate, !gate.requestMirror(rowId: block.id) { return }
-        onGoogleMirrorDispatched?(block)
-        Task { await self.mirrorBlockToGoogle(block) }
+        pushToGoogleWhenItsTurn(block.id)
     }
 
     /// An insert-family op resolved. A push that waited on it goes out once,
     /// from the row as it is NOW (a `retimed` row already carries the other
-    /// device's Google mapping, so this PATCHes that event), one at a time.
+    /// device's Google mapping, so this PATCHes that event).
     func handleInsertResolved(_ resolution: InsertResolution) {
         guard resolution.table == "cal_blocks", resolution.mirrorWanted, resolution.outcome.isConfirmed else { return }
-        let previous = googleMirrorTail
-        googleMirrorTail = Task { @MainActor [weak self] in
-            await previous?.value
-            guard let self, let fresh = (try? self.db?.fetchById(CalBlock.self, id: resolution.rowId)) ?? nil,
+        pushToGoogleWhenItsTurn(resolution.rowId)
+    }
+
+    /// Queue a Google push of `blockId` on the serial chain; it pushes the row
+    /// as it is when its turn comes (gone = nothing to push).
+    private func pushToGoogleWhenItsTurn(_ blockId: String) {
+        enqueueGoogleCall { [weak self] in
+            guard let self, let fresh = (try? self.db?.fetchById(CalBlock.self, id: blockId)) ?? nil,
                   isTaskBlock(fresh) else { return }
             self.onGoogleMirrorDispatched?(fresh)
             await self.mirrorBlockToGoogle(fresh)
         }
     }
 
-    /// Test seam: the queued rule-G pushes have all run.
+    private func enqueueGoogleCall(_ call: @escaping @MainActor () async -> Void) {
+        let previous = googleTail
+        googleTail = Task { @MainActor in
+            await previous?.value
+            await call()
+        }
+    }
+
+    /// Test seam: the queued Google calls have all run.
     func awaitGoogleMirrors() async {
-        await googleMirrorTail?.value
+        await googleTail?.value
     }
 
     /// `deleteBlock`, returning once the local row is committed. The Google
@@ -1995,7 +2014,7 @@ final class AppModel {
         guard let write else { return }
         try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
         mirrorGate?.forget(rowId: block.id)   // its cancelled insert will never resolve
-        Task { await self.deleteGoogleEvent(for: block) }
+        enqueueGoogleCall { [weak self] in await self?.deleteGoogleEvent(for: block) }
     }
 
     /// `unschedule` (AppModel+CalendarControls), awaited: reconcile Google for a

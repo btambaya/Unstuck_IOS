@@ -636,6 +636,27 @@ final class OutboxFlusherTests: XCTestCase {
         XCTAssertTrue(gate.requestMirror(rowId: ours.id), "resolved: later edits push normally")
     }
 
+    /// A mint marks "mirror wanted" BEFORE its op is queued, so a flush that
+    /// resolves the insert before the writer asks is still caught: a confirmed
+    /// insert carries the mark (mirror once), an ignored one consumes it.
+    func testRuleGAMintMarkedBeforeItsOpIsResolvedByTheFlush() async throws {
+        let gate = flusher.mirrorGate
+        let fresh = mintBlock("2026-09-24"), taken = mintBlock("2026-09-25")
+        await gateway.seed(serverBlock(taken))
+        XCTAssertTrue(gate.expectMirror(rowId: fresh.id))
+        XCTAssertTrue(gate.expectMirror(rowId: taken.id))
+        XCTAssertFalse(gate.expectMirror(rowId: taken.id), "already marked: the caller must not undo someone else's mark")
+        try enqueueMint(fresh, .insertOrRetime)
+        try enqueueMint(taken, .insert)
+        let recorder = ResolutionRecorder()
+        await flusher.setOnInsertResolved { recorder.add($0) }
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(recorder.of(fresh.id)?.mirrorWanted, true)
+        XCTAssertEqual(recorder.of(taken.id)?.mirrorWanted, false)
+        XCTAssertFalse(gate.isMirrorWanted(rowId: fresh.id))
+        XCTAssertFalse(gate.isMirrorWanted(rowId: taken.id))
+    }
+
     /// A push the flusher could not deliver (offline) stays deferred: the op is
     /// still queued, so the row is still unresolved.
     func testRuleGKeepsATransientlyFailedInsertUnresolved() async throws {

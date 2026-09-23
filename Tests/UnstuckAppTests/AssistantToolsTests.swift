@@ -2931,8 +2931,9 @@ final class DeterministicOccurrenceAppTests: XCTestCase {
     func testRuleGMirrorsAMintOnlyAfterTheServerConfirmsIt() async throws {
         let (model, _, db) = try liveModel()
         let gate = try XCTUnwrap(model.mirrorGate)
-        var dispatched: [String] = []
-        model.onGoogleMirrorDispatched = { dispatched.append($0.id) }
+        var pushed: [CalBlock] = []
+        model.onGoogleMirrorDispatched = { pushed.append($0) }
+        var dispatched: [String] { pushed.map(\.id) }
         try db.save(TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
                              createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
         let d1 = LocalDate.addDays(Clock.todayISO(), 1), d2 = LocalDate.addDays(Clock.todayISO(), 2)
@@ -2946,22 +2947,28 @@ final class DeterministicOccurrenceAppTests: XCTestCase {
         var edited = ours
         edited.startTime = "08:00"
         await model.saveBlockAwaiting(edited)   // an edit before the flush
+        await model.awaitGoogleMirrors()
         XCTAssertEqual(dispatched, [], "nothing is pushed while the inserts are unresolved")
         XCTAssertTrue(gate.isMirrorWanted(rowId: ours.id))
 
         let plain = CalBlock(id: newUUID(), taskId: seriesId, taskName: "Gym", startTime: "12:00",
                              durationMinutes: 30, date: d1, kind: .task)
         await model.saveBlockAwaiting(plain)
+        await model.awaitGoogleMirrors()
         XCTAssertEqual(dispatched, [plain.id], "a block with no insert pushes at once")
 
         // The server: another device already minted d2.
         let flusher = OutboxFlusher(gateway: OccurrenceServer(existing: [theirs.id]), db: db, mirrorGate: gate)
         await flusher.setOnInsertResolved { r in Task { @MainActor in model.handleInsertResolved(r) } }
         await flusher.flush(userId: "u1")
-        for _ in 0..<100 where !dispatched.contains(ours.id) { try await Task.sleep(nanoseconds: 10_000_000) }
+        for _ in 0..<100 where !dispatched.contains(ours.id) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            await model.awaitGoogleMirrors()
+        }
         await model.awaitGoogleMirrors()
 
         XCTAssertEqual(dispatched.filter { $0 == ours.id }.count, 1, "the confirmed mint is mirrored once")
+        XCTAssertEqual(pushed.first { $0.id == ours.id }?.startTime, "08:00", "pushed as it is now, the edit included")
         XCTAssertFalse(dispatched.contains(theirs.id), "the ignored insert is never mirrored")
         XCTAssertFalse(gate.isMirrorWanted(rowId: theirs.id))
         XCTAssertEqual(try OutboxStore(db).count(), 0)
