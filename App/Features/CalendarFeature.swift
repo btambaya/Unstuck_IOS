@@ -240,7 +240,9 @@ struct CalendarView: View {
 /// CalendarSyncBar. Not connected: a "＋ Connect Google Calendar" pill.
 /// Connected: the synced account(s) + a "Sync now" action (pulls via
 /// AppModel.pullGoogleCalendar) + a destructive "Disconnect" behind a confirm
-/// alert (drops all synced events — AppModel.disconnectCalendar).
+/// alert (drops all synced events — AppModel.disconnectCalendar). Connect and
+/// Reconnect first say what connecting does (GoogleConnectCopy), then open
+/// Google's consent.
 private struct CalendarSyncBar: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
@@ -248,12 +250,16 @@ private struct CalendarSyncBar: View {
     @State private var busy = false
     @State private var error: String?
     @State private var confirmDisconnect = false
+    /// Connect / Reconnect asked for: the disclosure is up (`reconnecting`
+    /// picks its title).
+    @State private var showDisclosure = false
+    @State private var reconnecting = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
                 if vm.connections.isEmpty {
-                    Button { connect() } label: {
+                    Button { reconnecting = false; showDisclosure = true } label: {
                         Text(busy ? "Connecting…" : "＋ Connect Google Calendar")
                             .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
                             .padding(.horizontal, 12).padding(.vertical, 8)
@@ -273,7 +279,7 @@ private struct CalendarSyncBar: View {
                     // over the SAME account (the server returns the same
                     // connection id and clears the flag).
                     if model.calendarNeedsReauth {
-                        Button { connect() } label: {
+                        Button { reconnecting = true; showDisclosure = true } label: {
                             Text("Reconnect Google")
                                 .font(UFont.sans(12, .semibold))
                                 .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
@@ -306,6 +312,17 @@ private struct CalendarSyncBar: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Synced events are removed from your calendar. Your tasks are unaffected.")
+        }
+        // Said BEFORE Google's consent: every task block is written to the
+        // PRIMARY Google Calendar under the task's name (AppModel
+        // .mirrorBlockToGoogle, calendarId "primary"), and nothing on iOS
+        // said so — the pill went straight to consent (web/Android audit
+        // 2026-09-23, W14/A19; owner call: honest copy now, no toggle).
+        .alert(GoogleConnectCopy.title(reconnect: reconnecting), isPresented: $showDisclosure) {
+            Button("Continue to Google") { connect() }
+            Button("Not now", role: .cancel) {}
+        } message: {
+            Text(GoogleConnectCopy.disclosure)
         }
     }
 

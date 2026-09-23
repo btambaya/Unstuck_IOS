@@ -13,6 +13,25 @@ import AuthenticationServices
 import UIKit
 import UnstuckSync
 
+/// What connecting Google Calendar does, said before Google's consent opens
+/// (CalendarSyncBar). Unstuck pulls the user's Google events AND writes every
+/// scheduled task block to their PRIMARY calendar with the task's name as the
+/// event title (AppModel.mirrorBlockToGoogle) — the connect pill used to go
+/// straight to consent without a word about the writing. Web's words
+/// (sync-flow.tsx, W14), as on Android (A19) (web/Android audit 2026-09-23,
+/// W14/A19).
+enum GoogleConnectCopy {
+    static let disclosure =
+        "Unstuck shows your Google events here, so your plans fit around them.\n\n"
+        + "Each task you schedule becomes an event on your main Google Calendar, and moves or disappears "
+        + "when you change it here. Anyone who can see that calendar sees the task’s name."
+
+    /// The disclosure's title for a first connect or a reconnect.
+    static func title(reconnect: Bool) -> String {
+        reconnect ? "Reconnect Google Calendar?" : "Connect Google Calendar?"
+    }
+}
+
 @MainActor
 final class GoogleConnectController: NSObject, ASWebAuthenticationPresentationContextProviding {
     private let calendar: CalendarClient

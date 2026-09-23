@@ -355,3 +355,28 @@ final class CalendarConnectSeedTests: XCTestCase {
         XCTAssertEqual(try connections(model), [stored])
     }
 }
+
+// MARK: - what connecting Google does, said before consent (web/Android audit 2026-09-23, W14/A19)
+//
+// Every scheduled task block is written to the PRIMARY Google Calendar under
+// the task's name (AppModel.mirrorBlockToGoogle), and the connect pill went
+// straight to Google's consent without a word about it. Owner call: honest
+// copy now, no toggle — the same words as web (sync-flow.tsx) and Android.
+
+final class GoogleConnectDisclosureTests: XCTestCase {
+    func testTheDisclosureSaysScheduledTasksAreAddedToTheMainGoogleCalendar() {
+        let text = GoogleConnectCopy.disclosure
+        XCTAssertTrue(text.contains("Each task you schedule becomes an event on your main Google Calendar"))
+        XCTAssertTrue(text.contains("moves or disappears when you change it here"))
+        XCTAssertTrue(text.contains("Anyone who can see that calendar sees the task\u{2019}s name"))
+        XCTAssertTrue(text.contains("Unstuck shows your Google events here"), "the reading half is said too")
+        for promise in ["read-only", "read only", "never write", "never add", "only read"] {
+            XCTAssertFalse(text.lowercased().contains(promise), "no read-only promise: \(promise)")
+        }
+    }
+
+    func testTheTitleNamesAConnectOrAReconnect() {
+        XCTAssertEqual(GoogleConnectCopy.title(reconnect: false), "Connect Google Calendar?")
+        XCTAssertEqual(GoogleConnectCopy.title(reconnect: true), "Reconnect Google Calendar?")
+    }
+}
