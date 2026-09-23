@@ -254,6 +254,10 @@ public actor WriteThrough {
     /// The capture row travels with its CURRENT archive state (`archived_at`,
     /// migration 053) so a re-save can't un-archive it server-side.
     public func upsertCapture(_ c: Capture, nowISO: String) throws {
+        // The row here and the op both carry what the server accepts (4096
+        // characters): every capture path writes through here (C28).
+        var c = c
+        c.body = clampCaptureBody(c.body)
         try db.transaction { conn in
             let archivedAt = try String.fetchOne(conn, sql: "SELECT archivedAt FROM capture_archive WHERE captureId = ?", arguments: [c.id])
             try c.upsert(conn)

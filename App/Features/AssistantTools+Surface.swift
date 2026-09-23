@@ -194,11 +194,16 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
     case "block_time":
         let nm = args.str("name")
         let date = args.str("date")
-        let startTime = args.str("startTime")
+        let rawStart = args.str("startTime")
         // Clamped to the server's CHECK (5…1440): an out-of-range block is
         // accepted locally, refused on flush and quarantined in silence.
         let dur = clampDurationMin(args.int("durationMin"), fallback: 60)
-        guard let nm, let date, let startTime else { return "error: name, date and startTime are all required for block_time" }
+        guard let nm, let date, let rawStart else { return "error: name, date and startTime are all required for block_time" }
+        // '9:00' or '7:30pm' failed the server's HH:MM check and was
+        // quarantined while this said "blocked" (audit 2026-09-22, C28).
+        guard let startTime = normalizeClockTime(rawStart) else {
+            return (rejectBadStartTime(rawStart) ?? "error: startTime must be 24-hour HH:MM.") + " Nothing was blocked."
+        }
         if let past = rejectPastDate(today: api.todayIso(), date: date)
             ?? rejectPastTime(blocks: api.getBlocks(), today: api.todayIso(), date: date, startTime: startTime, nowHM: api.nowHM()) {
             return past

@@ -19,6 +19,15 @@
 // The app layer adds a 4th: a ~60s foreground safety-net hydrate for the
 // continuously-foregrounded case (see UnstuckApp/AppModel). Decode failures
 // are logged, never swallowed, so the black box stays debuggable.
+//
+// Those three never covered two shapes (audit 2026-09-22, C30): an OFFLINE
+// launch (every subscribe exhausts its retries, nothing reconnects the socket,
+// and 2 needs a socket that was once connected) and a socket that dropped and
+// came back (the SDK's rejoin no-ops on a channel still reading `.subscribed`
+// from before the drop). `ensureLive` — asked by the freshness owner on network
+// back / foreground / the floor tick — and a rebuild on every reconnect close
+// them; RealtimeHealPolicy holds the rules. Rebuilds are serialised, so two can
+// never register the same topic twice.
 
 import Foundation
 import Supabase
@@ -51,6 +60,21 @@ public actor RealtimeMirror {
     /// internal `rebuildSubscriptions` deliberately does NOT bump it, so the
     /// heal's own teardown isn't mistaken for a session change.
     private var sessionGeneration = 0
+    /// The last rebuild queued. Each rebuild waits for the one before it: two
+    /// interleaving at their awaits would each register every topic, and
+    /// `client.channel` hands the second the first's instance — every event
+    /// applied twice (audit 2026-09-22, C30).
+    private var rebuildTail: Task<Void, Never>?
+    /// Rebuilds queued or running; `ensureLive` leaves the set alone meanwhile.
+    private var rebuildsInFlight = 0
+    /// The socket went down after the channels joined: they still read
+    /// `.subscribed` but are dead on the new socket (C30).
+    private var droppedSinceJoin = false
+    /// When `ensureLive` may rebuild again (C30).
+    private var healPolicy = RealtimeHealPolicy()
+    /// Channels whose subscribe is still running (`startJoin`): they read
+    /// `.unsubscribed` without having given up (C30).
+    private var joining: Set<ObjectIdentifier> = []
 
     // MARK: - reporting into the freshness owner
     //
@@ -99,6 +123,7 @@ public actor RealtimeMirror {
         // self-heal from a prior session aborts instead of hydrating over the
         // new one (see performHeal / BUG-1 guard).
         sessionGeneration &+= 1
+        healPolicy = RealtimeHealPolicy()
         await rebuildSubscriptions(userId: userId, onMembersChanged: onMembersChanged, onResync: onResync)
     }
 
@@ -110,10 +135,31 @@ public actor RealtimeMirror {
     private func rebuildSubscriptions(userId: String,
                                       onMembersChanged: @escaping @Sendable () async -> Void,
                                       onResync: @escaping @Sendable () async -> Void) async {
+        let previous = rebuildTail
+        let generation = sessionGeneration
+        rebuildsInFlight += 1
+        let rebuild = Task { [weak self] in
+            await previous?.value
+            await self?.performRebuild(userId: userId, generation: generation,
+                                       onMembersChanged: onMembersChanged, onResync: onResync)
+        }
+        rebuildTail = rebuild
+        await rebuild.value
+        rebuildsInFlight -= 1
+    }
+
+    private func performRebuild(userId: String, generation: Int,
+                                onMembersChanged: @escaping @Sendable () async -> Void,
+                                onResync: @escaping @Sendable () async -> Void) async {
+        // A sign-out / user switch since this rebuild was queued owns the set
+        // now; checked again after every await below (C30).
+        guard generation == sessionGeneration else { return }
         await teardown()
+        guard generation == sessionGeneration else { return }
         currentUserId = userId
         self.onMembersChanged = onMembersChanged
         self.onResync = onResync
+        droppedSinceJoin = false
         // Open the socket ONCE, and wait for it, before any channel subscribes.
         // subscribeChannels fans ~11 subscribes out into detached Tasks; each one
         // lazily calls connect(), and on supabase-swift 2.46 those parallel
@@ -123,9 +169,19 @@ public actor RealtimeMirror {
         // only the foreground pull brought remote changes in. CoFocusPresenceClient
         // already does exactly this (CoFocusPresenceClient.swift:713).
         // Diagnosis 2026-09-12.
-        await client.realtimeV2.connect()
-        await subscribeChannels(userId: userId, onMembersChanged: onMembersChanged)
-        observeSocketStatus()
+        // Never re-open a socket that is up or opening (connectIfNeeded): a
+        // second connect() silences the socket, and this now runs on every
+        // reconnect. With no socket there are no joins either — each subscribe
+        // would call connect() itself, racing — and ensureLive rebuilds once
+        // one can open (audit 2026-09-22, C30).
+        let connected = await RealtimeHealPolicy.connectIfNeeded(client.realtimeV2)
+        guard generation == sessionGeneration else { return }
+        if connected {
+            await subscribeChannels(userId: userId, onMembersChanged: onMembersChanged)
+        } else {
+            print("[realtime] socket not open — channels wait for ensureLive")
+        }
+        observeSocketStatus(joinedOpen: connected)
     }
 
     private func subscribeChannels(userId: String, onMembersChanged: @escaping @Sendable () async -> Void) async {
@@ -305,7 +361,7 @@ public actor RealtimeMirror {
         streamTasks.append(channelStatusObserver(channel, table: table))
         // Subscribe with bounded backoff, off the subscribeAll path so a slow /
         // retrying network subscribe doesn't stall sign-in.
-        streamTasks.append(Task { await Self.subscribeWithRetry(channel, table: table) })
+        startJoin(channel, table: table)
     }
 
     /// collection_members, UNFILTERED — RLS ("member or owner") decides
@@ -376,7 +432,23 @@ public actor RealtimeMirror {
         streamTasks.append(Task { for await _ in updates { signal() } })
         streamTasks.append(Task { for await _ in deletes { signal() } })
         streamTasks.append(channelStatusObserver(channel, table: table))
-        streamTasks.append(Task { await Self.subscribeWithRetry(channel, table: table) })
+        startJoin(channel, table: table)
+    }
+
+    /// Subscribe `channel` (subscribeWithRetry) in its own task, marked as
+    /// joining until that returns: until then `.unsubscribed` means "not yet",
+    /// and `ensureLive` must not rebuild the set over it (audit 2026-09-22, C30).
+    private func startJoin(_ channel: RealtimeChannelV2, table: String) {
+        let id = ObjectIdentifier(channel)
+        joining.insert(id)
+        streamTasks.append(Task { [weak self] in
+            await Self.subscribeWithRetry(channel, table: table)
+            await self?.joinSettled(id)
+        })
+    }
+
+    private func joinSettled(_ id: ObjectIdentifier) {
+        joining.remove(id)
     }
 
     /// `signal()` never waits. `onChanged` runs once for every signal that
@@ -445,36 +517,73 @@ public actor RealtimeMirror {
     }
 
     /// Watch the shared realtime socket. On a RE-connect (a `.connected` after
-    /// we've already been connected once — the SDK re-joins channels itself),
-    /// run the full hydrate to backfill events missed while the socket was down.
-    private func observeSocketStatus() {
+    /// we've already been connected once) rebuild the channels and backfill
+    /// the events missed while the socket was down. The SDK's own rejoin is
+    /// not enough: a drop leaves each channel reading `.subscribed`, and its
+    /// rejoin no-ops on that — the channels stayed deaf until the silence rule
+    /// fired, minutes later (audit 2026-09-22, C30). A first `.connected` for
+    /// a set built without a socket (an offline launch) asks `ensureLive`.
+    private func observeSocketStatus(joinedOpen: Bool) {
         let realtime = client.realtimeV2
         socketStatusTask = Task { [weak self] in
-            var everConnected = false
+            // The stream replays the current status first; the watch reads it
+            // against how the set was joined, so a rebuild's own listener
+            // doesn't ask for another rebuild (SocketWatch, C30).
+            var watch = SocketWatch(joinedOpen: joinedOpen)
             for await status in realtime.statusChange {
                 if Task.isCancelled { return }
                 print("[realtime] socket status: \(status)")
-                switch status {
-                case .connected:
-                    if everConnected { await self?.onSocketReconnected() }
-                    everConnected = true
-                case .disconnected, .connecting:
-                    break
-                @unknown default:
-                    break
+                switch watch.see(status) {
+                case .reconnected: await self?.onSocketReconnected()
+                case .firstConnected: await self?.ensureLive()
+                case .dropped: await self?.noteSocketDropped()
+                case .none: break
                 }
             }
         }
     }
 
+    private func noteSocketDropped() {
+        droppedSinceJoin = true
+    }
+
     private func onSocketReconnected() async {
-        print("[realtime] socket reconnected — reporting the gap to the freshness owner")
-        await (onResync ?? {})()
+        print("[realtime] socket reconnected — rebuilding the channels and reporting the gap")
+        scheduleHeal(reason: "socket reconnected")
     }
 
     private func reportSubscribed() {
+        if RealtimeHealPolicy.isLive(channels.map(\.status)) { healPolicy.recordLive() }
         onChannelsSubscribed?()
     }
+
+    /// Rebuild the channels when they can't be delivering — the socket is
+    /// down or parked, a channel gave up (an offline launch exhausts every
+    /// subscribe's retries), or the socket dropped since they joined — with
+    /// RealtimeHealPolicy's back-off between rebuilds that don't bring them
+    /// live. Asked by the freshness owner on network back / foreground / the
+    /// floor tick; a no-op for a healthy set, while signed out, and while a
+    /// rebuild is already queued. No pull of its own: the channels reaching
+    /// `.subscribed` report the gap (audit 2026-09-22, C30).
+    public func ensureLive(networkRegained: Bool = false) async {
+        guard let uid = currentUserId, rebuildsInFlight == 0 else { return }
+        if networkRegained { healPolicy.resetBackoff() }
+        let statuses = channels.map {
+            RealtimeHealPolicy.effectiveStatus($0.status, joining: joining.contains(ObjectIdentifier($0)))
+        }
+        guard RealtimeHealPolicy.needsRebuild(socket: client.realtimeV2.status, channels: statuses,
+                                              droppedSinceJoin: droppedSinceJoin) else { return }
+        let now = Date()
+        guard healPolicy.mayHeal(now: now) else { return }
+        healPolicy.recordHeal(now: now)
+        print("[realtime] channels not live (socket \(client.realtimeV2.status)) — rebuilding (attempt \(healPolicy.failedHeals))")
+        let members = onMembersChanged ?? {}
+        let resync = onResync ?? {}
+        await rebuildSubscriptions(userId: uid, onMembersChanged: members, onResync: resync)
+    }
+
+    /// The last rebuild's policy state (tests).
+    var healPolicyForTesting: RealtimeHealPolicy { healPolicy }
 
     /// Coalesced, rate-limited self-heal: rebuild every subscription and
     /// hydrate. Guarded on the still-current user so a heal queued before a
@@ -551,8 +660,16 @@ public actor RealtimeMirror {
         socketStatusTask = nil
         for t in streamTasks { t.cancel() }
         streamTasks.removeAll()
-        for ch in channels { await client.removeChannel(ch) }
+        // All at once: removing a channel that went stale in a socket drop
+        // waits the SDK's 10 s for a close the new socket never sends, so one
+        // at a time held a reconnect heal for ~2 minutes (audit 2026-09-22, C30).
+        let doomed = channels
         channels.removeAll()
+        joining.removeAll()
+        let client = self.client
+        await withTaskGroup(of: Void.self) { group in
+            for ch in doomed { group.addTask { await client.removeChannel(ch) } }
+        }
         currentUserId = nil
         onMembersChanged = nil
         onResync = nil

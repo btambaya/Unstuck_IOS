@@ -106,6 +106,24 @@ public protocol SyncReadGatewayProtocol: Sendable {
     /// page at a time, ordered by id. A hard delete is invisible to a cursor
     /// pull, so the only way to see one is to ask what still exists.
     func fetchIdPage(table: String, afterId: String?, limit: Int) async throws -> [String]
+
+    /// The SWEEP read: the id-page read plus, when `stampColumn` is given,
+    /// each row's value of it — what the sweep compares with the local copy
+    /// to find rows the cursor could not see (audit 2026-09-22, C29).
+    func fetchIdStampPage(table: String, stampColumn: String?, afterId: String?, limit: Int) async throws -> [IdStamp]
+
+    /// Whole rows by id (per-row JSON) — the sweep takes what it found missing.
+    func fetchRowsByIds(table: String, ids: [String]) async throws -> [Data]
+}
+
+/// One row of the sweep read: its id and, when asked for, its stamp.
+public struct IdStamp: Sendable, Equatable {
+    public let id: String
+    public let stamp: String?
+    public init(id: String, stamp: String?) {
+        self.id = id
+        self.stamp = stamp
+    }
 }
 
 public extension SyncReadGatewayProtocol {
@@ -115,6 +133,15 @@ public extension SyncReadGatewayProtocol {
         throw CatchUpUnsupportedError(table: table)
     }
     func fetchIdPage(table: String, afterId: String?, limit: Int) async throws -> [String] {
+        throw CatchUpUnsupportedError(table: table)
+    }
+    /// Gateways that only list ids still drive the deletion sweep; with no
+    /// stamps the sweep only takes rows missing here.
+    func fetchIdStampPage(table: String, stampColumn: String?, afterId: String?, limit: Int) async throws -> [IdStamp] {
+        try await fetchIdPage(table: table, afterId: afterId, limit: limit).map { IdStamp(id: $0, stamp: nil) }
+    }
+    /// No by-id read → the sweep takes nothing (it still deletes).
+    func fetchRowsByIds(table: String, ids: [String]) async throws -> [Data] {
         throw CatchUpUnsupportedError(table: table)
     }
 }
@@ -174,6 +201,25 @@ public struct SyncGateway: Sendable, SyncGatewayProtocol, SyncReadGatewayProtoco
         if let afterId { query = query.gt("id", value: afterId) }
         let rows: [IdRow] = try await query.order("id", ascending: true).limit(limit).execute().value
         return rows.map(\.id)
+    }
+
+    /// `select=id[,stampColumn]`, ordered by id — the id page plus the stamp.
+    public func fetchIdStampPage(table: String, stampColumn: String?, afterId: String?, limit: Int) async throws -> [IdStamp] {
+        var query = client.from(table).select(stampColumn.map { "id,\($0)" } ?? "id")
+        if let afterId { query = query.gt("id", value: afterId) }
+        let rows: [AnyJSON] = try await query.order("id", ascending: true).limit(limit).execute().value
+        return rows.compactMap { row in
+            guard case .object(let obj) = row, let id = obj["id"]?.stringValue else { return nil }
+            return IdStamp(id: id, stamp: stampColumn.flatMap { obj[$0]?.stringValue })
+        }
+    }
+
+    /// `id=in.(…)`: the rows themselves, RLS-scoped like every other read.
+    public func fetchRowsByIds(table: String, ids: [String]) async throws -> [Data] {
+        guard !ids.isEmpty else { return [] }
+        let rows: [AnyJSON] = try await client.from(table).select().in("id", values: ids).execute().value
+        let encoder = JSONEncoder()
+        return try rows.map { try encoder.encode($0) }
     }
 
     public func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {

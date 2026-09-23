@@ -10,6 +10,7 @@
 
 import AppIntents
 import Foundation
+import UnstuckCore
 import UnstuckShared
 
 /// "Add a task in UnstuckNow to call the bank."
@@ -48,6 +49,11 @@ struct CaptureThoughtIntent: AppIntent {
         guard !body.isEmpty else { return .result(dialog: "I didn't catch that.") }
         AppGroup.enqueueWrite(PendingWrite(
             id: UUID().uuidString, kind: .capture, text: body, createdAt: Date()))
+        // A capture keeps its first 4,096 characters (WriteThrough clamps it):
+        // a long Shortcuts input is told, not cut silently (audit 2026-09-22, C28).
+        if captureBodyWillBeClamped(body) {
+            return .result(dialog: "Saved the first \(maxCaptureBodyLength.formatted()) characters to your inbox.")
+        }
         return .result(dialog: "Saved to your inbox.")
     }
 }

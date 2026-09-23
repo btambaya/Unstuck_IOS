@@ -151,7 +151,11 @@ public extension AppDatabase {
 
     /// Every locally-held primary-key id for a synced table — what the
     /// catch-up's deletion reconcile compares against the server's surviving
-    /// id set. Unknown tables answer empty (never "delete everything").
+    /// id set, and what its sweep reads as "this device has it". Unknown
+    /// tables answer empty (never "delete everything"). `profile_facts` is
+    /// here for the sweep only (its tombstones are never reconciled away):
+    /// without it every server fact read as missing and was re-taken, over
+    /// newer local saves, on every sweep (audit 2026-09-22, C29).
     func localIds(table: String) throws -> Set<String> {
         try writer.read { db in
             switch table {
@@ -164,6 +168,7 @@ public extension AppDatabase {
             case "captures":     return Set(try String.fetchAll(db, sql: "SELECT id FROM captures"))
             case "cal_blocks":   return Set(try String.fetchAll(db, sql: "SELECT id FROM cal_blocks"))
             case "call_requests": return Set(try String.fetchAll(db, sql: "SELECT id FROM call_requests"))
+            case "profile_facts": return Set(try String.fetchAll(db, sql: "SELECT id FROM profile_facts"))
             default:             return []
             }
         }

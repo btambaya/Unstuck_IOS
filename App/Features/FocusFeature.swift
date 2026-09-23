@@ -904,6 +904,7 @@ struct FocusView: View {
                 .padding(12).background(theme.palette.surface)
                 .clipShape(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
                 .overlay(RoundedRectangle(cornerRadius: Radius.sm, style: .continuous).stroke(theme.palette.line))
+            CaptureLengthNote(text: captureText)
             // Tag chips — Android CaptureSheet has the same five-tag row; we
             // were silently saving everything as `idea` before.
             CaptureTagPicker(selection: $captureTag)

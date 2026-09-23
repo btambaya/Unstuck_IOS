@@ -605,7 +605,15 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
     case "create_task":
         guard let nm = args.str("name") else { return "error: name required" }
         let date = args.str("date")
-        let startTime = args.str("startTime")
+        // A time or deadline the server can't store ('9:00', 'Friday 5pm') is
+        // refused before anything is written: accepted, it failed the whole
+        // row's upsert and was quarantined on this phone while this said
+        // "created" (audit 2026-09-22, C28).
+        if let bad = rejectBadStartTime(args.str("startTime")) ?? rejectBadDueAt(args.str("dueAt")) {
+            return bad + " The task was NOT created."
+        }
+        let startTime = args.str("startTime").flatMap(normalizeClockTime)
+        let dueAt = args.str("dueAt").flatMap(normalizeDueAt)
         // A past day is refused BEFORE anything is created — an error means
         // nothing happened (rules §1), so the model asks for another day.
         if let date, let past = rejectPastDate(api, date) ?? rejectPastTime(api, date, startTime) {
@@ -624,7 +632,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         let t = TaskItem(id: newUUID(), name: nm, estimateMin: clampEstimateMin(args.int("estimateMin")), totalFocused: 0, done: false,
                          tags: args.strList("tags"), lifeArea: args.str("lifeArea"),
                          firstPhysicalAction: args.str("firstPhysicalAction"), later: args.bool("later") ?? false,
-                         createdAt: now(), updatedAt: now(), dueAt: args.str("dueAt"))
+                         createdAt: now(), updatedAt: now(), dueAt: dueAt)
         await api.upsertTask(t)
         scratch.newTasks[t.id] = t
         // date + startTime → on the calendar in the same call (registry). A
@@ -648,7 +656,8 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
     case "schedule_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
         guard let date = args.str("date") else { return "error: date required" }
-        let startTime = args.str("startTime")
+        if let bad = rejectBadStartTime(args.str("startTime")) { return bad + " Nothing was scheduled." }
+        let startTime = args.str("startTime").flatMap(normalizeClockTime)
         if let past = rejectPastDate(api, date) { return past }
         // No time given AND the task has never had one: don't guess — ask,
         // suggesting a slot (Ahmad, 2026-09-01: "when confused, prompt").
@@ -689,7 +698,8 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         if args.isNull("dueAt") {
             if t.dueAt != nil { upd.dueAt = nil; changed.append("deadline") }
         } else if let due = args.str("dueAt") {
-            let next: String? = due.lowercased() == "none" ? nil : due
+            if due.lowercased() != "none", let bad = rejectBadDueAt(due) { return bad + " Nothing was changed." }
+            let next: String? = due.lowercased() == "none" ? nil : normalizeDueAt(due)
             if next != t.dueAt { upd.dueAt = next; changed.append("deadline") }
         }
         if let later = args.bool("later"), later != (t.later ?? false) { upd.later = later; changed.append(later ? "parked in Later" : "back from Later") }
@@ -729,6 +739,11 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             return "error: unknown recurrence kind \"\(kind)\" — use daily, weekly, monthly, or none"
         }
         let until = args.str("until")
+        // Stored as given, then bounded by a string compare: "2026-09-31" or
+        // "next Friday" ended the series on the wrong day (audit 2026-09-22, C28).
+        if let until, !isCalendarDate(until) {
+            return "error: until must be a real YYYY-MM-DD date (got \"\(until)\") — nothing changed"
+        }
         let days = (args.intList("daysOfWeek") ?? []).filter { (0...6).contains($0) }
         // Weekly with no days used to save an EMPTY weekly series (never
         // materialised a single day) and report ok — refuse and ask instead.
@@ -843,14 +858,19 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         for (i, it) in items.enumerated() {
             guard let nm = it.str("name") else { notCreated.append("item \(i + 1) (no name)"); continue }
             if made.count >= cap { notCreated.append("\"\(nm)\" (over the \(cap) limit — call create_tasks again for the rest)"); continue }
+            // The same refusal create_task makes, per item (C28).
+            if let bad = rejectBadStartTime(it.str("startTime")) ?? rejectBadDueAt(it.str("dueAt")) {
+                notCreated.append("\"\(nm)\" (" + bad.replacingOccurrences(of: "error: ", with: "", options: .anchored) + ")")
+                continue
+            }
             let t = TaskItem(id: newUUID(), name: nm, estimateMin: clampEstimateMin(it.int("estimateMin")), totalFocused: 0, done: false,
                              tags: it.strList("tags"), lifeArea: it.str("lifeArea"),
                              firstPhysicalAction: it.str("firstPhysicalAction"), later: it.bool("later") ?? false,
-                             createdAt: now(), updatedAt: now(), dueAt: it.str("dueAt"))
+                             createdAt: now(), updatedAt: now(), dueAt: it.str("dueAt").flatMap(normalizeDueAt))
             await api.upsertTask(t)
             scratch.newTasks[t.id] = t
             let date = it.str("date")
-            let startTime = it.str("startTime")
+            let startTime = it.str("startTime").flatMap(normalizeClockTime)
             // Date + time → schedule. Date WITHOUT time → do NOT invent 09:00:
             // create it unscheduled and tell the model to ask ONE question.
             let past = date.flatMap { rejectPastDate(api, $0) ?? rejectPastTime(api, $0, startTime) }
@@ -973,7 +993,8 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         let shared = !(c.members ?? []).isEmpty || c.myRole == "editor" || c.myRole == "viewer"
         let wantLoop = args.str("mode") == "loop"
         let loop = wantLoop && shared
-        let dueAt = loop ? args.str("dueAt") : nil
+        if loop, let bad = rejectBadDueAt(args.str("dueAt")) { return bad + " Nothing was promoted." }
+        let dueAt = loop ? args.str("dueAt").flatMap(normalizeDueAt) : nil
         guard let taskId = api.promoteItemToTask(collectionId: c.id, itemId: item.id, loop: loop, dueAt: dueAt) else {
             return "error: couldn't promote \"\(item.body)\" — try again"
         }

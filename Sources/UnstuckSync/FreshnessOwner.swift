@@ -99,15 +99,23 @@ public actor FreshnessOwner {
         /// Re-read the account-wide preference rows (they are not in the local
         /// store, so the cursor pull can't carry them).
         public var refreshPreferences: @Sendable () async -> Void
+        /// Bring back any realtime channel that isn't live (a no-op for a
+        /// healthy set). `networkRegained` resets its back-off. The deafness
+        /// rules can't see a set that never subscribed — an offline launch —
+        /// so the network, foreground and floor triggers ask for this
+        /// directly (audit 2026-09-22, C30).
+        public var ensureRealtime: @Sendable (_ networkRegained: Bool) async -> Void
 
         public init(fullSync: @escaping @Sendable (String) async -> Void,
                     catchUp: @escaping @Sendable (String, Bool) async -> CatchUpPuller.Outcome,
                     rebuildSubscriptions: @escaping @Sendable () async -> Void = {},
-                    refreshPreferences: @escaping @Sendable () async -> Void = {}) {
+                    refreshPreferences: @escaping @Sendable () async -> Void = {},
+                    ensureRealtime: @escaping @Sendable (Bool) async -> Void = { _ in }) {
             self.fullSync = fullSync
             self.catchUp = catchUp
             self.rebuildSubscriptions = rebuildSubscriptions
             self.refreshPreferences = refreshPreferences
+            self.ensureRealtime = ensureRealtime
         }
     }
 
@@ -138,6 +146,9 @@ public actor FreshnessOwner {
     private var userId: String?
     private var visible = false
     private var hasHydratedThisSession = false
+    /// A discard asked for the full hydrate (C28): honoured by the next pull
+    /// even when a hydrate already running when it asked finishes first.
+    private var fullHydrateWanted = false
     private var subscribed = false
 
     private var running = false
@@ -164,6 +175,7 @@ public actor FreshnessOwner {
         guard uid != userId else { return }
         userId = uid
         hasHydratedThisSession = false
+        fullHydrateWanted = false
         subscribed = false
         pending = nil
         lastReconcileAt = nil
@@ -198,6 +210,15 @@ public actor FreshnessOwner {
 
     public func snapshot() -> FreshnessStats { stats }
 
+    /// The local store holds rows the server never took (changes the user
+    /// just discarded): the next pull is the full server-canonical hydrate —
+    /// the catch-up never re-reads a row this device already has (audit
+    /// 2026-09-22, C28).
+    public func requireFullHydrate() {
+        fullHydrateWanted = true
+        request(.manual, reconcile: true)
+    }
+
     // MARK: - reporting
 
     /// The single entry point. Everything else in the app calls THIS instead of
@@ -217,11 +238,15 @@ public actor FreshnessOwner {
             lastSilenceCheckAt = now()
             request(signal, reconcile: true)
 
-        case .socketConnected, .becameActive, .networkRegained, .tokenRefreshed,
-             .coldStart, .deafnessSuspected:
+        case .becameActive, .networkRegained:
+            ensureRealtime(networkRegained: signal == .networkRegained)
+            request(signal, reconcile: true)
+
+        case .socketConnected, .tokenRefreshed, .coldStart, .deafnessSuspected:
             request(signal, reconcile: true)
 
         case .floorTick:
+            ensureRealtime(networkRegained: false)
             checkForDeafness()
             request(signal, reconcile: false)
 
@@ -271,6 +296,13 @@ public actor FreshnessOwner {
         scheduleRebuild()
     }
 
+    /// Fire-and-forget: a rebuild must never hold up the pull.
+    private func ensureRealtime(networkRegained: Bool) {
+        guard userId != nil else { return }
+        let ensure = actions.ensureRealtime
+        Task { await ensure(networkRegained) }
+    }
+
     private func scheduleRebuild() {
         let t = now()
         if let last = lastRebuildAt, t.timeIntervalSince(last) < Self.rebuildCooldown { return }
@@ -313,9 +345,10 @@ public actor FreshnessOwner {
     private func perform(reason: FreshnessSignal, reconcile: Bool) async {
         guard let uid = userId else { return }
         stats.lastPullReason = reason.rawValue
-        if !hasHydratedThisSession {
+        if !hasHydratedThisSession || fullHydrateWanted {
             // First pull of the session, or the cursors are gone: the full
             // server-canonical hydrate is the fallback the catch-up needs.
+            fullHydrateWanted = false
             await actions.fullSync(uid)
             guard userId == uid else { return }
             hasHydratedThisSession = true

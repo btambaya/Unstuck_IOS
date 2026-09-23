@@ -44,3 +44,19 @@ func captureTagColor(_ tag: CaptureTag, _ theme: UTheme) -> Color {
     case .distraction: return theme.palette.coral
     }
 }
+
+/// Under a capture field once its text is past what a capture keeps
+/// (`captures.body` ≤ 4096 characters): the save keeps the start, and this says
+/// so before it happens rather than cutting the note silently (audit
+/// 2026-09-22, C28).
+struct CaptureLengthNote: View {
+    let text: String
+    @Environment(\.uTheme) private var theme
+
+    var body: some View {
+        if captureBodyWillBeClamped(text) {
+            Text("Only the first \(maxCaptureBodyLength.formatted()) characters will be saved.")
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+        }
+    }
+}

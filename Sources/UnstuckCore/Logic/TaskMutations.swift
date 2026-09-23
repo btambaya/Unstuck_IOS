@@ -149,3 +149,32 @@ public func clampEstimateMin(_ raw: Int?) -> Int { min(1440, max(1, raw ?? 25)) 
 /// length: recurrence minting, WriteThrough and the wire codec all use it
 /// (audit 2026-09-22, C4).
 public func clampDurationMin(_ raw: Int?, fallback: Int = 25) -> Int { min(1440, max(5, raw ?? fallback)) }
+
+/// `captures.body` is `check (length(body) between 1 and 4096)` (migration
+/// 002), and Postgres counts characters — Unicode scalars. A longer paste into
+/// the Focus capture sheet, the task editor or Siri was saved here, refused on
+/// every flush and quarantined: the note sat in this phone's Inbox and nowhere
+/// else (audit 2026-09-22, C28). The ONE rule for a capture's length:
+/// WriteThrough and the wire codec clamp with it, whole characters only.
+public let maxCaptureBodyLength = 4096
+
+public func clampCaptureBody(_ body: String) -> String {
+    guard body.unicodeScalars.count > maxCaptureBodyLength else { return body }
+    var out = ""
+    var scalars = 0
+    for ch in body {
+        let n = ch.unicodeScalars.count
+        if scalars + n > maxCaptureBodyLength { break }
+        out.append(ch)
+        scalars += n
+    }
+    return out
+}
+
+/// True when saving `body` — trimmed, as every capture path saves it — keeps
+/// only its first `maxCaptureBodyLength` characters. The capture sheets and
+/// Siri say so; the clamp alone cut a long paste silently (audit 2026-09-22,
+/// C28).
+public func captureBodyWillBeClamped(_ body: String) -> Bool {
+    body.trimmingCharacters(in: .whitespacesAndNewlines).unicodeScalars.count > maxCaptureBodyLength
+}

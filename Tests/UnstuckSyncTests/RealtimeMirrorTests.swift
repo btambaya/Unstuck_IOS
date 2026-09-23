@@ -5,6 +5,8 @@
 // GRDB store — no network/realtime channel needed.
 
 import XCTest
+import Auth
+import Supabase
 import UnstuckCore
 import UnstuckData
 @testable import UnstuckSync
@@ -115,4 +117,181 @@ final class RealtimeMirrorTests: XCTestCase {
         XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: 0), 500_000_000)
         XCTAssertEqual(RealtimeMirror.retryBackoffNs(attempt: -3), 500_000_000)
     }
+
+    // MARK: - self-heal (audit 2026-09-22, C30)
+
+    /// An OFFLINE launch: the socket never opened and every subscribe gave up.
+    /// Nothing in the SDK brings that back, so it must be rebuilt.
+    func testASetThatNeverSubscribedIsRebuilt() {
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .disconnected, channels: [.unsubscribed, .unsubscribed],
+                                                      droppedSinceJoin: false))
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .disconnected, channels: [], droppedSinceJoin: false))
+        // Someone else opened the socket, but our channels had already given up.
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: [.subscribed, .unsubscribed],
+                                                      droppedSinceJoin: false))
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: [], droppedSinceJoin: false))
+    }
+
+    /// A socket that dropped and came back: every channel still reads
+    /// `.subscribed` and the SDK's rejoin no-ops on it — dead until rebuilt.
+    func testASetThatSurvivedASocketDropIsRebuilt() {
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: [.subscribed, .subscribed],
+                                                      droppedSinceJoin: true))
+    }
+
+    func testAHealthyOrStillConnectingSetIsLeftAlone() {
+        XCTAssertFalse(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: [.subscribed, .subscribed],
+                                                       droppedSinceJoin: false))
+        // Subscribes still retrying on an open socket are not interfered with.
+        XCTAssertFalse(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: [.subscribed, .subscribing],
+                                                       droppedSinceJoin: false))
+        // A connect already in flight settles first; its `.connected` re-asks.
+        XCTAssertFalse(RealtimeHealPolicy.needsRebuild(socket: .connecting, channels: [.unsubscribed],
+                                                       droppedSinceJoin: true))
+    }
+
+    /// A channel whose subscribe is still running — a fresh one, or one in a
+    /// retry's back-off sleep — reads `.unsubscribed` without having given up.
+    /// Read as dead, a floor tick right after a rebuild restarted the set
+    /// (C30 re-review).
+    func testAChannelStillJoiningIsNotDead() {
+        let comingUp = [RealtimeHealPolicy.effectiveStatus(.unsubscribed, joining: true),
+                        RealtimeHealPolicy.effectiveStatus(.subscribed, joining: false)]
+        XCTAssertFalse(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: comingUp, droppedSinceJoin: false))
+        let gaveUp = [RealtimeHealPolicy.effectiveStatus(.unsubscribed, joining: false), .subscribed]
+        XCTAssertTrue(RealtimeHealPolicy.needsRebuild(socket: .connected, channels: gaveUp, droppedSinceJoin: false))
+        XCTAssertEqual(RealtimeHealPolicy.effectiveStatus(.subscribed, joining: true), .subscribed)
+    }
+
+    /// Only the whole set going live resets the back-off: one channel that
+    /// keeps failing beside ten live ones rebuilt all eleven on every floor
+    /// tick (C30 re-review).
+    func testOnlyAWhollyLiveSetResetsTheBackOff() {
+        XCTAssertTrue(RealtimeHealPolicy.isLive([.subscribed, .subscribed]))
+        XCTAssertFalse(RealtimeHealPolicy.isLive([.subscribed, .unsubscribed]))
+        XCTAssertFalse(RealtimeHealPolicy.isLive([.subscribed, .subscribing]))
+        XCTAssertFalse(RealtimeHealPolicy.isLive([]))
+    }
+
+    /// The socket stream replays its current status to each new listener, and
+    /// the mirror starts one after every rebuild. The replay is read against
+    /// how the set was joined, so `.connected` on a set joined open is nothing
+    /// — it used to read as a first connect and rebuild the set again.
+    func testTheReplayedSocketStatusIsNotAnEvent() {
+        var joinedOpen = SocketWatch(joinedOpen: true)
+        XCTAssertEqual(joinedOpen.see(.connected), .none, "the replay after a rebuild")
+        XCTAssertEqual(joinedOpen.see(.disconnected), .dropped)
+        XCTAssertEqual(joinedOpen.see(.connecting), .dropped)
+        XCTAssertEqual(joinedOpen.see(.connected), .reconnected)
+        XCTAssertEqual(joinedOpen.see(.connected), .none)
+
+        var builtOffline = SocketWatch(joinedOpen: false)
+        XCTAssertEqual(builtOffline.see(.disconnected), .none, "the replay")
+        XCTAssertEqual(builtOffline.see(.connecting), .none)
+        XCTAssertEqual(builtOffline.see(.connected), .firstConnected)
+        XCTAssertEqual(builtOffline.see(.disconnected), .dropped)
+        XCTAssertEqual(builtOffline.see(.connected), .reconnected)
+
+        // Opened between the rebuild and its listener: bring the set up.
+        var openedMeanwhile = SocketWatch(joinedOpen: false)
+        XCTAssertEqual(openedMeanwhile.see(.connected), .firstConnected)
+        // Dropped between the joins and the listener: the set is stale.
+        var droppedMeanwhile = SocketWatch(joinedOpen: true)
+        XCTAssertEqual(droppedMeanwhile.see(.disconnected), .dropped)
+    }
+
+    /// Rebuilds that don't bring the set live back off (5, 10, 20 … 300 s), so
+    /// a persistent failure can't churn joins; a live channel or the network
+    /// coming back resets that.
+    func testRebuildsBackOffUntilTheSetIsLive() {
+        XCTAssertEqual(RealtimeHealPolicy.backoff(afterFailures: 0), 0)
+        XCTAssertEqual(RealtimeHealPolicy.backoff(afterFailures: 1), 5)
+        XCTAssertEqual(RealtimeHealPolicy.backoff(afterFailures: 2), 10)
+        XCTAssertEqual(RealtimeHealPolicy.backoff(afterFailures: 3), 20)
+        XCTAssertEqual(RealtimeHealPolicy.backoff(afterFailures: 9), 300)
+        XCTAssertEqual(RealtimeHealPolicy.backoff(afterFailures: 500), 300)
+
+        let t0 = Date(timeIntervalSince1970: 1_000_000)
+        var policy = RealtimeHealPolicy()
+        XCTAssertTrue(policy.mayHeal(now: t0))
+        policy.recordHeal(now: t0)
+        XCTAssertFalse(policy.mayHeal(now: t0.addingTimeInterval(4)))
+        XCTAssertTrue(policy.mayHeal(now: t0.addingTimeInterval(5)))
+        policy.recordHeal(now: t0.addingTimeInterval(5))
+        XCTAssertFalse(policy.mayHeal(now: t0.addingTimeInterval(14)), "the second failure waits 10 s")
+        XCTAssertTrue(policy.mayHeal(now: t0.addingTimeInterval(15)))
+
+        policy.resetBackoff()   // the network came back
+        XCTAssertFalse(policy.mayHeal(now: t0.addingTimeInterval(9)), "the minimum spacing still holds")
+        XCTAssertTrue(policy.mayHeal(now: t0.addingTimeInterval(10)))
+        policy.recordHeal(now: t0.addingTimeInterval(10))
+        policy.recordLive()
+        XCTAssertEqual(policy.failedHeals, 0)
+        XCTAssertTrue(policy.mayHeal(now: t0.addingTimeInterval(15)))
+    }
+
+    /// The real mirror against a server that can't be reached — an offline
+    /// launch. It used to give up and never try again; `ensureLive` (asked on
+    /// network back / foreground / the floor tick) rebuilds it, backs off, and
+    /// never registers a channel while the socket is down.
+    func testEnsureLiveRebuildsAMirrorThatLaunchedOffline() async throws {
+        let client = SupabaseClient(
+            supabaseURL: URL(string: "http://127.0.0.1:9")!, supabaseKey: "anon",
+            options: .init(auth: .init(storage: MemoryAuthStorage(), autoRefreshToken: false)))
+        let mirror = RealtimeMirror(client: client, db: db)
+        await mirror.subscribeAll(userId: "u1")
+        XCTAssertNotEqual(client.realtimeV2.status, .connected, "the premise: the socket could not open")
+        XCTAssertTrue(client.realtimeV2.channels.isEmpty, "no socket, no joins racing to open one")
+        var failedHeals = await mirror.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 0)
+
+        await mirror.ensureLive()
+        failedHeals = await mirror.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 1, "a set that never subscribed is rebuilt")
+
+        await mirror.ensureLive()
+        failedHeals = await mirror.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 1, "and the next try waits for the back-off")
+
+        await mirror.unsubscribeAll()
+        await mirror.ensureLive(networkRegained: true)
+        failedHeals = await mirror.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 1, "signed out: nothing is rebuilt")
+        XCTAssertTrue(client.realtimeV2.channels.isEmpty)
+    }
+
+    /// The sharing signal channel: a first subscribe that failed used to just
+    /// return, and nothing ever subscribed it again.
+    func testEnsureLiveRebuildsACollabChannelThatLaunchedOffline() async throws {
+        let client = SupabaseClient(
+            supabaseURL: URL(string: "http://127.0.0.1:9")!, supabaseKey: "anon",
+            options: .init(auth: .init(storage: MemoryAuthStorage(), autoRefreshToken: false)))
+        let collab = CollabRealtime(client: client)
+        await collab.start(userId: "u1")
+        XCTAssertLessThanOrEqual(client.realtimeV2.channels.count, 1)
+
+        await collab.ensureLive()
+        var failedHeals = await collab.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 1, "a channel that never subscribed is rebuilt")
+        XCTAssertLessThanOrEqual(client.realtimeV2.channels.count, 1, "never a second channel for the topic")
+
+        await collab.ensureLive()
+        failedHeals = await collab.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 1, "and the next try waits for the back-off")
+
+        await collab.stop()
+        await collab.ensureLive(networkRegained: true)
+        failedHeals = await collab.healPolicyForTesting.failedHeals
+        XCTAssertEqual(failedHeals, 0, "stopped: nothing is rebuilt")
+        XCTAssertTrue(client.realtimeV2.channels.isEmpty)
+    }
+}
+
+/// Session storage that lives and dies with the test — NOT the keychain.
+private final class MemoryAuthStorage: AuthLocalStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    func store(key: String, value: Data) throws { lock.withLock { values[key] = value } }
+    func retrieve(key: String) throws -> Data? { lock.withLock { values[key] } }
+    func remove(key: String) throws { _ = lock.withLock { values.removeValue(forKey: key) } }
 }

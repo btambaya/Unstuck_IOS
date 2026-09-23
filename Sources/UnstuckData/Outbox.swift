@@ -20,6 +20,11 @@
 //    quarantined: kept in the outbox (so hydrate keeps the local row and a
 //    future build can retry it), skipped by every drain. It is never
 //    silently deleted — that was the old poison-pill data-loss path.
+//    Nothing ever reset `attempts` and nothing showed the quarantine, so a
+//    refused change lived on this phone only, for good, without a word. Now
+//    each new build releases it once (`releaseQuarantine`), and the app shows
+//    what is stuck with Retry (`retryQuarantined`) and Discard (`discardStuck`)
+//    (audit 2026-09-22, C28).
 
 import Foundation
 import GRDB
@@ -299,6 +304,79 @@ public struct OutboxStore: Sendable {
             try OutboxOp.filter(Column("attempts") >= Self.quarantineCap).fetchCount($0)
         }
     }
+
+    /// Every op that can't reach the server as things stand: the quarantined
+    /// ones, and every op held back behind one through `dependsOn` (a block
+    /// waiting on its refused task, a capture on its session), transitively —
+    /// the flusher holds a dependent while its parent row has ANY pending op
+    /// (audit 2026-09-22, C28).
+    public func stuck() throws -> [OutboxOp] {
+        try db.writer.read { try Self.stuck(in: $0) }
+    }
+
+    static func stuck(in db: Database) throws -> [OutboxOp] {
+        let all = try pending(in: db)
+        var stuckRows = Set(all.filter(\.isQuarantined).map(\.rowId))
+        guard !stuckRows.isEmpty else { return [] }
+        var grew = true
+        while grew {
+            grew = false
+            for op in all where !stuckRows.contains(op.rowId) {
+                if let dep = op.dependsOn, stuckRows.contains(dep) {
+                    stuckRows.insert(op.rowId)
+                    grew = true
+                }
+            }
+        }
+        return all.filter { $0.isQuarantined || ($0.dependsOn.map(stuckRows.contains) ?? false) }
+    }
+
+    /// A new build: every quarantined op (queued, or parked for a signed-out
+    /// user) gets its rejections back, so a build whose payloads the server
+    /// now accepts actually sends them. Returns how many were released.
+    @discardableResult
+    public func releaseQuarantine() throws -> Int {
+        try db.writer.write { db in
+            try db.execute(sql: "UPDATE outbox SET attempts = 0 WHERE attempts >= ?", arguments: [Self.quarantineCap])
+            var n = db.changesCount
+            try db.execute(sql: "UPDATE parked_outbox SET attempts = 0 WHERE attempts >= ?", arguments: [Self.quarantineCap])
+            n += db.changesCount
+            return n
+        }
+    }
+
+    /// The user's Retry: one more attempt for each quarantined op — a refusal
+    /// quarantines it again at once, so the app can say so right away rather
+    /// than after five more drains. Returns how many.
+    @discardableResult
+    public func retryQuarantined() throws -> Int {
+        try db.writer.write { db in
+            try db.execute(sql: "UPDATE outbox SET attempts = ? WHERE attempts >= ?",
+                           arguments: [Self.quarantineCap - 1, Self.quarantineCap])
+            return db.changesCount
+        }
+    }
+
+    /// The user's Discard: drop every stuck op AND the local rows they carry,
+    /// in one transaction. Kept, a row with no op would sit here as if saved;
+    /// dropped, the next full hydrate brings back the server's copy where it
+    /// has one. Returns how many ops were dropped.
+    @discardableResult
+    public func discardStuck() throws -> Int {
+        try db.writer.write { db in
+            let ops = try Self.stuck(in: db)
+            for op in ops {
+                if let seq = op.opSeq { _ = try OutboxOp.deleteOne(db, key: seq) }
+                guard op.kind != .delete, Self.discardableTables.contains(op.tableName) else { continue }
+                try db.execute(sql: "DELETE FROM \(op.tableName) WHERE id = ?", arguments: [op.rowId])
+            }
+            return ops.count
+        }
+    }
+
+    /// Local tables whose rows ride outbox ops (the names are the server's).
+    static let discardableTables: Set<String> = ["tasks", "cal_blocks", "sessions", "captures", "reason_logs",
+                                                 "collections", "tags", "life_areas", "profile_facts"]
 
     // MARK: - parking (sign-out while edits are still queued)
 

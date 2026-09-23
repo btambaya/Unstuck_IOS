@@ -176,6 +176,7 @@ public func rejectPastDate(today: String, date: String, weekdayNames: [String] =
     if ISO_DATE_RE.firstMatch(in: date, range: range) == nil {
         return "error: date must be YYYY-MM-DD (got \"\(date)\")"
     }
+    if !isCalendarDate(date) { return impossibleDateError(date) }
     if date >= today { return nil }
     let dow = LocalDate.dayOfWeek(date)
     let todayDow = LocalDate.dayOfWeek(today)
@@ -184,6 +185,67 @@ public func rejectPastDate(today: String, date: String, weekdayNames: [String] =
     let next = LocalDate.addDays(today, ahead)
     let name = weekdayNames[dow]
     return "error: \(date) is in the PAST (today is \(today)). If the user meant the coming \(name), use \(next) — see context.upcoming. Never schedule into the past."
+}
+
+/// A 'YYYY-MM-DD' that names a real day. "2026-09-31" or "2027-02-29" pass
+/// the pattern, `LocalDate.parse` quietly rolls them into the next month, and
+/// the server's `date` columns refuse them — the write was quarantined on
+/// this phone while the tool said "ok" (audit 2026-09-22, C28).
+public func isCalendarDate(_ s: String) -> Bool {
+    let range = NSRange(s.startIndex..<s.endIndex, in: s)
+    guard ISO_DATE_RE.firstMatch(in: s, range: range) != nil else { return false }
+    return LocalDate.format(LocalDate.parse(s)) == s
+}
+
+private func impossibleDateError(_ date: String) -> String {
+    let parts = date.split(separator: "-").compactMap { Int($0) }
+    if parts.count == 3, (1...12).contains(parts[1]) {
+        let days = Time.daysInMonth(Time.civil(parts[0], parts[1], 1))
+        return "error: \(date) is not a real date — \(date.prefix(7)) has \(days) days. Use a day that exists."
+    }
+    return "error: \(date) is not a real date. Use a day that exists."
+}
+
+/// The model's `startTime` as the zero-padded 24-hour 'HH:MM' the server's
+/// `cal_blocks_start_time_format` CHECK accepts ("9:00" → "09:00"); nil for
+/// anything else ("7:30pm", "0930"). A '9:00' block was refused and
+/// quarantined, and sorted after '10:00' here (date + time string order)
+/// (audit 2026-09-22, C28).
+public func normalizeClockTime(_ raw: String) -> String? {
+    let parts = raw.trimmingCharacters(in: .whitespaces).split(separator: ":", omittingEmptySubsequences: false)
+    guard parts.count == 2, (1...2).contains(parts[0].count), parts[1].count == 2,
+          parts.allSatisfy({ $0.unicodeScalars.allSatisfy { ("0"..."9").contains($0) } }),
+          let h = Int(parts[0]), let m = Int(parts[1]), (0...23).contains(h), (0...59).contains(m) else { return nil }
+    return "\(hmPad2(h)):\(hmPad2(m))"
+}
+
+/// The refusal for a `startTime` that isn't a clock time; nil when absent or fine.
+public func rejectBadStartTime(_ raw: String?) -> String? {
+    guard let raw, normalizeClockTime(raw) == nil else { return nil }
+    return "error: startTime must be 24-hour HH:MM (got \"\(raw)\")."
+}
+
+/// The model's `dueAt` as an ISO-8601 instant `tasks.due_at` (timestamptz)
+/// takes. An instant with its zone travels as sent; a zone-less stamp is read
+/// as LOCAL time (Postgres would read it as UTC, and the deadline moved by the
+/// user's offset after the echo) and a bare date as local midnight (how this
+/// phone already reads one), both written as a UTC instant. nil for anything
+/// else ("Friday 5pm", "2026-09-31T10:00"), which the whole row's upsert
+/// failed on — the task was quarantined while the tool said "created" (audit
+/// 2026-09-22, C28).
+public func normalizeDueAt(_ raw: String) -> String? {
+    let s = raw.trimmingCharacters(in: .whitespaces)
+    guard s.count >= 10, isCalendarDate(String(s.prefix(10))), let d = LocalTime.parseTimestamp(s) else { return nil }
+    if Time.parseMillis(s) != nil { return s }   // zoned: already an instant
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f.string(from: d)
+}
+
+/// The refusal for a `dueAt` that isn't a date / time; nil when absent or fine.
+public func rejectBadDueAt(_ raw: String?) -> String? {
+    guard let raw, normalizeDueAt(raw) == nil else { return nil }
+    return "error: dueAt must be an ISO-8601 date-time like 2026-09-25T17:00 (got \"\(raw)\")."
 }
 
 // MARK: - Context dates

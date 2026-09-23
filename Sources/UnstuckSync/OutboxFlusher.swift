@@ -26,6 +26,7 @@
 
 import Foundation
 import Supabase
+import UnstuckCore
 import UnstuckData
 
 public actor OutboxFlusher {
@@ -56,6 +57,10 @@ public actor OutboxFlusher {
     public typealias InsertResolvedHook = @Sendable (InsertResolution) -> Void
     private var onInsertResolved: InsertResolvedHook?
 
+    /// Every drain has ended (whatever it did): the app re-reads what is
+    /// stuck, so a refusal shows the moment it happens (audit 2026-09-22, C28).
+    private var onDrained: (@Sendable () -> Void)?
+
     /// Rule G's gate. The flusher brackets every insert-family send with
     /// `begin` / `resolve`, so a Google push can never slip between the op
     /// leaving the outbox and its outcome being known.
@@ -75,6 +80,14 @@ public actor OutboxFlusher {
     public func setOnInsertResolved(_ hook: InsertResolvedHook?) {
         onInsertResolved = hook
     }
+
+    public func setOnDrained(_ hook: (@Sendable () -> Void)?) {
+        onDrained = hook
+    }
+
+    /// Tables with `unique (user_id, name)` whose refused insert has a server
+    /// twin to adopt (see the drain's 23505 branch).
+    static let nameTwinTables: Set<String> = ["tags", "life_areas"]
 
     /// The FK-parent table a child table's `dependsOn` rowId lives in:
     /// cal_block → tasks, capture → sessions. Other tables have no FK parent.
@@ -111,6 +124,7 @@ public actor OutboxFlusher {
     }
 
     private func drainLoop(userId: String, currentUserId: @Sendable () -> String?) async {
+        defer { onDrained?() }
         while true {
             // A cancelled drain (sign-out's 5s timeout, BG-task stop) is normal
             // control flow, not a failure — abort without counting anything.
@@ -202,6 +216,27 @@ public actor OutboxFlusher {
                         try? box.markDone(seq)
                         progressed = true
                         onRPCRejected?(op.tableName, op.rowId, fn, error)
+                    case .rejected where op.kind == .upsert && Self.nameTwinTables.contains(op.tableName)
+                                         && (error as? PostgrestError)?.code == "23505":
+                        // unique(user_id, name): the server already has a tag /
+                        // area by this name — seeded at sign-up (seed_life_areas)
+                        // while onboarding seeded its own from a store the
+                        // hydrate hadn't reached yet, or made on another device.
+                        // A retry can only fail again, and quarantined, both
+                        // copies showed here for good. Adopt the server's: drop
+                        // the op and this phone's twin; the hydrate / the
+                        // catch-up's sweep bring the server row (audit
+                        // 2026-09-22, C28). Tasks key areas and tags by NAME, so
+                        // nothing points at the twin's id.
+                        print("[outbox] \(rowKey) duplicates a server row by name, adopting the server's")
+                        try? box.markDone(seq)
+                        progressed = true
+                        blockedRows.insert(rowKey)
+                        if op.tableName == "tags" {
+                            try? db.deleteById(TagRow.self, id: op.rowId)
+                        } else {
+                            try? db.deleteById(LifeArea.self, id: op.rowId)
+                        }
                     case .rejected:
                         // The server understood and refused these exact bytes.
                         // Count it (persisted); at the cap the op is quarantined:
