@@ -77,12 +77,23 @@ public func materializeOccurrences(
 /// The diff needed to align a task's existing cal_blocks with
 /// `recurrence`: keep past occurrences, delete mismatched future ones,
 /// add missing ones. `todayIso` is injected so the boundary is testable.
+///
+/// The three lists are DISJOINT by id (rule B, deterministic-occurrence-ids.md
+/// §3b), so callers may write them in any order:
+///  • `toUpsert` — NEW occurrences, each with its deterministic id: MINTS,
+///    written insert-if-absent (`insert_or_retime`);
+///  • `toRetime` — existing rows rewritten in place: an occurrence whose
+///    deterministic id the plan would otherwise delete and mint again (a time
+///    change). A plain upsert; the row keeps its Google mapping;
+///  • `toDelete` — ids to delete.
 public struct RegenPlan: Equatable, Sendable {
     public var toUpsert: [CalBlock]
     public var toDelete: [String]   // cal_block ids
-    public init(toUpsert: [CalBlock], toDelete: [String]) {
+    public var toRetime: [CalBlock]
+    public init(toUpsert: [CalBlock], toDelete: [String], toRetime: [CalBlock] = []) {
         self.toUpsert = toUpsert
         self.toDelete = toDelete
+        self.toRetime = toRetime
     }
 }
 
@@ -107,6 +118,21 @@ public func recurrenceAnchor(taskId: String, blocks: [CalBlock], todayIso: Strin
     return mine.max(by: { ($0.date + $0.startTime) < ($1.date + $1.startTime) })
 }
 
+/// `keepIds` are rows the edit must keep where they are (`RecurrenceStart.keepId`):
+/// they are never deleted and never rewritten, and they count as HELD, so the
+/// day whose id they carry is not minted again. They go INTO the plan, not
+/// around it: a caller filtering `toDelete` afterwards could not stop rule B
+/// from moving a kept row (deterministic-occurrence-ids.md §3b).
+///
+/// Deterministic ids (audit 2026-09-22 C21, stage 2) add two rules:
+///  • rule A — a desired occurrence whose id a KEPT row already holds (moved,
+///    done, skipped, kept, history) is not minted: the day's occurrence lives
+///    on elsewhere, and a mint would twin it;
+///  • rule B — a desired occurrence whose id is a row in the delete set (a
+///    time change: the 07:00 row is deleted and the 09:00 one minted with the
+///    SAME id) becomes that row rewritten in place (`toRetime`). Emitted as
+///    delete + mint, iOS's own callers cancelled the mint with the delete and
+///    the day was lost.
 public func regenerateForTask(
     task: TaskItem,
     recurrence: Recurrence?,
@@ -114,14 +140,15 @@ public func regenerateForTask(
     todayIso: String,
     startTime: String,
     startDate: Date,
-    horizonDays: Int = RECURRENCE_HORIZON_DAYS
+    horizonDays: Int = RECURRENCE_HORIZON_DAYS,
+    keepIds: Set<String> = []
 ) -> RegenPlan {
     let existing = existingBlocks.filter { $0.taskId == task.id && isTaskBlock($0) }
     let futureExisting = existing.filter { $0.date > todayIso }
 
     guard let recurrence else {
         // Clearing recurrence — delete every future occurrence, keep history.
-        return RegenPlan(toUpsert: [], toDelete: futureExisting.map(\.id))
+        return RegenPlan(toUpsert: [], toDelete: futureExisting.map(\.id).filter { !keepIds.contains($0) })
     }
 
     let desired = materializeOccurrences(recurrence, startDate: startDate, startTime: startTime, horizonDays: horizonDays)
@@ -133,21 +160,47 @@ public func regenerateForTask(
     for b in futureExisting where !desiredKeys.contains("\(b.date)|\(b.startTime)") {
         toDelete.append(b.id)
     }
+    // A kept row is HELD: never deleted, never rewritten.
+    var deleteSet = Set(toDelete).subtracting(keepIds)
+    let existingById = Dictionary(existing.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
 
     var toUpsert: [CalBlock] = []
+    var toRetime: [CalBlock] = []
     for o in desired where !existingFutureKeys.contains("\(o.date)|\(o.startTime)") {
-        toUpsert.append(occurrenceBlock(task, o))
+        let id = occurrenceId(taskId: task.id, date: o.date)
+        if deleteSet.contains(id), let row = existingById[id] {
+            // Rule B: the same id deleted + minted → rewrite it in place, from
+            // the EXISTING row (it keeps its Google mapping). The net effect of
+            // the old delete + fresh mint: the new date/time, open again.
+            deleteSet.remove(id)
+            var next = row
+            next.date = o.date
+            next.startTime = o.startTime
+            next.taskName = task.name
+            next.durationMinutes = clampDurationMin(task.estimateMin)
+            next.done = false
+            next.skipped = false
+            next.completedAt = nil
+            toRetime.append(next)
+        } else if existingById[id] != nil {
+            continue   // rule A: held by a kept row (moved, done, skipped, kept, history)
+        } else {
+            toUpsert.append(occurrenceBlock(task, o))
+        }
     }
 
-    return RegenPlan(toUpsert: toUpsert, toDelete: toDelete)
+    return RegenPlan(toUpsert: toUpsert, toDelete: toDelete.filter { deleteSet.contains($0) }, toRetime: toRetime)
 }
 
 /// A new occurrence block for `task` — the one place a series mints a block.
+/// Its id is the DETERMINISTIC `occurrenceId(task, date)` (audit 2026-09-22,
+/// C21, "same id for same day"): two devices minting the same day land on
+/// one row instead of twins. Written insert-if-absent, never over a row.
 /// The server's CHECK is `duration_minutes between 5 and 1440`, so a 2-minute
 /// task would mint occurrences it refuses on flush — the rows then live on
 /// that one phone for ever (audit 2026-09-21).
 private func occurrenceBlock(_ task: TaskItem, _ o: MaterializedOccurrence) -> CalBlock {
-    CalBlock(id: newUUID(), taskId: task.id, taskName: task.name,
+    CalBlock(id: occurrenceId(taskId: task.id, date: o.date), taskId: task.id, taskName: task.name,
              startTime: o.startTime, durationMinutes: clampDurationMin(task.estimateMin),
              date: o.date, kind: .task)
 }
@@ -313,6 +366,10 @@ public func recurrenceEditStart(taskId: String, recurrence: Recurrence?, blocks:
 ///   frontier dragged a few days earlier, or a re-plan's next one. Minting it
 ///   gave that month (or week) a second occurrence and a second reminder.
 /// - Today is never minted, matching regenerateForTask.
+/// - A date whose deterministic occurrence id one of the task's blocks already
+///   holds (any date, any state, past the horizon too) is never minted (rule
+///   A, stage 2): that occurrence was moved further than `occurrenceReach`,
+///   and it lives on there.
 public func recurrenceTopUp(task: TaskItem, existingBlocks: [CalBlock], todayIso: String, seriesTime: String? = nil,
                             horizonDays: Int = RECURRENCE_HORIZON_DAYS) -> [CalBlock] {
     guard let recurrence = task.recurrence else { return [] }
@@ -331,6 +388,7 @@ public func recurrenceTopUp(task: TaskItem, existingBlocks: [CalBlock], todayIso
         start = monthlyStart(day: series.day, onOrBefore: frontier)
     }
     let reach = occurrenceReach(recurrence)
+    let held = Set(mine.map(\.id))
     return materializeOccurrences(recurrence, startDate: LocalDate.parse(start), startTime: time,
                                   horizonDays: LocalDate.daysUntil(start, lastIso) + 1)
         .filter { $0.date > floor }
@@ -338,6 +396,7 @@ public func recurrenceTopUp(task: TaskItem, existingBlocks: [CalBlock], todayIso
             let (lo, hi) = (LocalDate.addDays(o.date, -reach), LocalDate.addDays(o.date, reach))
             return !mine.contains { $0.date >= lo && $0.date <= hi }
         }
+        .filter { !held.contains(occurrenceId(taskId: task.id, date: $0.date)) }
         .map { occurrenceBlock(task, $0) }
 }
 
@@ -366,16 +425,84 @@ public enum ChosenDateAction: Equatable, Sendable {
 /// deletes the block), a skipped one is retimed and un-skipped, and a done
 /// one still covers the day so no second open copy appears. Retiming rather
 /// than minting keeps one block per task per day.
+///
+/// Rule B′ (stage 2): a row the plan rewrites (`toRetime`) is treated exactly
+/// like one it deletes — it is moving to its own date, so it can't be the
+/// chosen day's occurrence (counted, the day the user picked could end up
+/// empty, or the row got two writes). A planned block covers the day only by
+/// its NEW date.
 public func recurrenceChosenDateAction(existing: [CalBlock], plan: RegenPlan, iso: String, startTime: String) -> ChosenDateAction {
-    if plan.toUpsert.contains(where: { $0.date == iso }) { return .covered }
-    let deleting = Set(plan.toDelete)
-    let onDay = existing.filter { $0.date == iso && isTaskBlock($0) && !deleting.contains($0.id) }
+    if (plan.toUpsert + plan.toRetime).contains(where: { $0.date == iso }) { return .covered }
+    let moving = Set(plan.toDelete).union(plan.toRetime.map(\.id))
+    let onDay = existing.filter { $0.date == iso && isTaskBlock($0) && !moving.contains($0.id) }
     let live = onDay.filter { !$0.done && !$0.skipped }
     if live.contains(where: { $0.startTime == startTime }) { return .covered }
     if let open = live.min(by: { $0.startTime < $1.startTime }) { return .retime(open) }
     if onDay.contains(where: { $0.done }) { return .covered }
     if let skipped = onDay.first(where: { $0.skipped }) { return .retime(skipped) }
     return .mint
+}
+
+/// The chosen day's write (`recurrenceChosenDateWrite`).
+public enum ChosenDateWrite: Equatable, Sendable {
+    /// The day already has its occurrence.
+    case none
+    /// A plain upsert: a retime, an in-place rewrite of the day's own row, or
+    /// a random-id block.
+    case upsert(CalBlock)
+    /// A deterministic mint: written insert-if-absent (`insert_or_retime`).
+    case insert(CalBlock)
+}
+
+/// §3b′ of deterministic-occurrence-ids.md: what guaranteeing the chosen day
+/// writes, computed AFTER regenerate and applied before any of the plan's
+/// writes are dispatched (Schedule on a series, "Start repeating", the create
+/// sheet, and — with an empty plan — a series' first placement). Returns the
+/// plan (possibly minus one delete) and the write; the plan's three lists and
+/// the write are disjoint by id.
+///  • `.covered` → `.none`; `.retime(b)` → `b` at `startTime`, un-skipped.
+///  • `.mint`, with `id = occurrenceId(task, iso)`:
+///    1. `id` is in `plan.toDelete` → that row is taken OUT of the delete and
+///       rewritten in place onto the day (from the existing row, so its Google
+///       mapping survives — a fresh block would null it);
+///    2. a block with `id` survives elsewhere (moved, done early, kept) → a
+///       block with a RANDOM id: the user asked for this day explicitly, and
+///       the surviving row is never taken over;
+///    3. otherwise → the deterministic mint.
+public func recurrenceChosenDateWrite(task: TaskItem, existing: [CalBlock], plan: RegenPlan,
+                                      iso: String, startTime: String) -> (RegenPlan, ChosenDateWrite) {
+    var plan = plan
+    switch recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: startTime) {
+    case .covered:
+        return (plan, .none)
+    case .retime(let b):
+        var moved = b
+        moved.startTime = startTime
+        moved.skipped = false
+        return (plan, .upsert(moved))
+    case .mint:
+        let id = occurrenceId(taskId: task.id, date: iso)
+        let mine = existing.filter { $0.taskId == task.id && isTaskBlock($0) }
+        let duration = clampDurationMin(task.estimateMin)
+        if let i = plan.toDelete.firstIndex(of: id), let row = mine.first(where: { $0.id == id }) {
+            plan.toDelete.remove(at: i)
+            var next = row
+            next.date = iso
+            next.startTime = startTime
+            next.taskName = task.name
+            next.durationMinutes = duration
+            next.done = false
+            next.skipped = false
+            next.completedAt = nil
+            return (plan, .upsert(next))
+        }
+        if mine.contains(where: { $0.id == id }) {
+            return (plan, .upsert(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: startTime,
+                                           durationMinutes: duration, date: iso, kind: .task)))
+        }
+        return (plan, .insert(CalBlock(id: id, taskId: task.id, taskName: task.name, startTime: startTime,
+                                       durationMinutes: duration, date: iso, kind: .task)))
+    }
 }
 
 /// Does the create sheet need a time before it may add this task? `date` is

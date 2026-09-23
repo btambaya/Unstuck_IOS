@@ -1900,8 +1900,11 @@ final class AppModel {
     }
 
     /// `saveBlock`, returning once the local row is committed; the Google
-    /// mirror runs behind it exactly as before.
-    func saveBlockAwaiting(_ block: CalBlock) async {
+    /// mirror runs behind it exactly as before. `unpark: false` skips the
+    /// un-park for a caller that has just saved the task itself (a series
+    /// edit): the un-park reads the task row, which may not carry that save
+    /// yet, and writes it back whole.
+    func saveBlockAwaiting(_ block: CalBlock, unpark: Bool = true) async {
         guard let write else { return }
         // Scheduling ends "Later" parking. Done HERE — the one choke point
         // every scheduling path funnels through (the Schedule sheet, a
@@ -1912,7 +1915,7 @@ final class AppModel {
         // (Only the block's OWN task is read — a whole-table fetch here would
         // run once per block in a bulk calendar turn.)
         let nowISO = Self.isoNow()
-        if let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
+        if unpark, let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
            let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
             try? await write.upsertTask(unparked, nowISO: nowISO)
         }
@@ -1929,10 +1932,10 @@ final class AppModel {
     /// locally (the day's occurrence lives on, moved or finished): nothing
     /// was written.
     @discardableResult
-    func saveBlockInserting(_ block: CalBlock, retimeIfTaken: Bool) async -> Bool {
+    func saveBlockInserting(_ block: CalBlock, retimeIfTaken: Bool, unpark: Bool = true) async -> Bool {
         guard let write else { return false }
         let nowISO = Self.isoNow()
-        if let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
+        if unpark, let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
            let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
             try? await write.upsertTask(unparked, nowISO: nowISO)
         }
@@ -2070,21 +2073,36 @@ final class AppModel {
                                         blocks: existingBlocks, todayIso: today)
         if task.recurrence != nil && start == nil { return false }
         saveTask(task)
-        guard let write = coordinator?.write else { return true }
+        guard coordinator?.write != nil else { return true }
         // Without a start we are clearing the repeat, where regenerateForTask
-        // ignores the time and date (it only deletes the future).
-        var plan = regenerateForTask(
+        // ignores the time and date (it only deletes the future). This month's
+        // moved occurrence (see RecurrenceStart) goes INTO the plan as kept, so
+        // it is neither deleted nor rewritten, and its day is not re-minted.
+        let plan = regenerateForTask(
             task: task, recurrence: task.recurrence, existingBlocks: existingBlocks,
             todayIso: today, startTime: start?.startTime ?? "09:00",
             startDate: start.map { LocalDate.parse($0.date) } ?? Date(),
-            horizonDays: start?.horizonDays ?? RECURRENCE_HORIZON_DAYS)
-        plan.toDelete.removeAll { $0 == start?.keepId }   // this month's moved occurrence (see RecurrenceStart)
-        let now = Self.isoNow()
-        Task {
-            for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }
-            for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
-        }
+            horizonDays: start?.horizonDays ?? RECURRENCE_HORIZON_DAYS,
+            keepIds: Set([start?.keepId].compactMap { $0 }))
+        Task { await self.applyRegenPlan(plan, unpark: false) }
         return true
+    }
+
+    /// Write a regenerate plan (stage 2, deterministic-occurrence-ids.md). The
+    /// lists are disjoint by id, so the order is free:
+    ///  • `toRetime` — rows rewritten in place: a plain save, which moves the
+    ///    row's Google event with it;
+    ///  • `toUpsert` — new occurrences: MINTS, insert-if-absent with rule H
+    ///    (the user asked for them), mirrored to Google once the server
+    ///    confirms each insert (rule G; owner decision 2026-09-23: every minted
+    ///    occurrence is mirrored, as on web and Android);
+    ///  • `toDelete` — deleted with their Google event, if they were pushed.
+    /// `unpark: false` — no Later un-park per block (see saveBlockAwaiting):
+    /// the plan's blocks never un-parked before stage 2 either.
+    func applyRegenPlan(_ plan: RegenPlan, unpark: Bool) async {
+        for b in plan.toRetime { await saveBlockAwaiting(b, unpark: unpark) }
+        for b in plan.toUpsert { await saveBlockInserting(b, retimeIfTaken: true, unpark: unpark) }
+        for id in plan.toDelete { await unscheduleAwaiting(id) }
     }
 
     /// Extend every repeating task's occurrences back out to the horizon.
@@ -2293,30 +2311,25 @@ final class AppModel {
             let today = Clock.todayISO()
             let parts = iso.split(separator: "-").compactMap { Int($0) }
             let startDate = parts.count == 3 ? Time.civil(parts[0], parts[1], parts[2]) : Date()
-            let plan = regenerateForTask(task: task, recurrence: recurrence, existingBlocks: existing,
-                                         todayIso: today, startTime: startTime, startDate: startDate)
-            Task {
-                for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
-                for b in plan.toUpsert { try? await write.upsertCalBlock(b, nowISO: now) }
-            }
+            let regen = regenerateForTask(task: task, recurrence: recurrence, existingBlocks: existing,
+                                          todayIso: today, startTime: startTime, startDate: startDate)
             // Guarantee the chosen slot is materialized (the horizon regen skips
-            // today / off-pattern picks), computed POST-plan by the pure helper:
-            // an open occurrence at another time (today's — regenerate never
-            // touches it) is moved, a skipped one is moved and un-skipped, and a
-            // done one leaves the day alone (audit 2026-09-22, C7).
-            switch recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: startTime) {
-            case .covered:
-                break
-            case .retime(let b):
-                var moved = b
-                moved.startTime = startTime
-                moved.skipped = false
-                saveBlock(moved)   // keeps its own length; PATCHes its Google event when pushed
-            case .mint:
-                // Clamped to the server's 5…1440 (audit 2026-09-22, C4) — also
-                // enforced in WriteThrough; here so the Google mirror matches.
-                saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: startTime,
-                                   durationMinutes: clampDurationMin(task.estimateMin), date: iso, kind: .task))
+            // today / off-pattern picks), computed POST-plan and BEFORE any write
+            // is dispatched (§3b′): an open occurrence at another time (today's —
+            // regenerate never touches it) is moved, a skipped one is moved and
+            // un-skipped, a done one leaves the day alone (audit 2026-09-22, C7);
+            // an empty day gets its deterministic occurrence, or — when that id
+            // lives on elsewhere — a block of its own. The plan and the write
+            // are disjoint, so one Task writes them all.
+            let (plan, chosen) = recurrenceChosenDateWrite(task: task, existing: existing, plan: regen,
+                                                           iso: iso, startTime: startTime)
+            Task {
+                await self.applyRegenPlan(plan, unpark: false)
+                switch chosen {
+                case .none: break
+                case .upsert(let b): await self.saveBlockAwaiting(b)   // PATCHes its Google event when pushed
+                case .insert(let b): await self.saveBlockInserting(b, retimeIfTaken: true)
+                }
             }
             // Compared with the series' next occurrence: a template's earliest
             // block is weeks-old history, so every re-schedule — even a no-op —

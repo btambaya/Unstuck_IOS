@@ -438,6 +438,24 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
                 let fresh = api.getTasks().first { $0.id == task.id } ?? task
                 await api.upsertTask(bumpMoveCount(fresh, nowISO: AppModel.isoNow()))
             }
+        } else if task.recurrence != nil {
+            // A series' first placement (nothing live to move): the chosen
+            // day's write with an empty plan (§3b′, stage 2) — the day's
+            // deterministic occurrence, minted insert-if-absent with rule H, or
+            // a block of its own when that id lives on elsewhere.
+            let (_, write) = recurrenceChosenDateWrite(task: task, existing: blocks.filter { $0.taskId == task.id },
+                                                       plan: RegenPlan(toUpsert: [], toDelete: []),
+                                                       iso: date, startTime: time)
+            switch write {
+            case .insert(let b):
+                _ = await api.insertBlockIfAbsent(b, retimeIfTaken: true)
+                scratch.placedBlocks[task.id] = b.id
+            case .upsert(let b):
+                await api.upsertBlock(b)
+                scratch.placedBlocks[task.id] = b.id
+            case .none:
+                break
+            }
         } else {
             // Clamped to the server's 5…1440 (audit 2026-09-22, C4) — also
             // enforced in WriteThrough; here so the mirror and receipts match.
@@ -451,10 +469,11 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
         // Extend only the TAIL, shared with the launch top-up (audit
         // 2026-09-22, C1): filling every open date from the moved date at the
         // moved time brought back occurrences the user had deleted and
-        // stretched the series at a one-off time. Read after the move.
+        // stretched the series at a one-off time. Read after the move. These
+        // are maintenance mints: insert-if-absent WITHOUT rule H's retime.
         for b in recurrenceTopUp(task: task, existingBlocks: api.getBlocks(), todayIso: today,
                                  seriesTime: placesSeries ? time : nil) {
-            await api.upsertBlock(b)
+            _ = await api.insertBlockIfAbsent(b, retimeIfTaken: false)
         }
     }
     return time
@@ -730,11 +749,14 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         let start = placed.map { RecurrenceStart(date: $0.date, startTime: $0.startTime, horizonDays: RECURRENCE_HORIZON_DAYS) }
             ?? recurrenceEditStart(taskId: t.id, recurrence: rec, blocks: blocks, todayIso: today)
         if let start {
-            var plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: today,
+            // This month's moved occurrence (see RecurrenceStart) goes INTO the
+            // plan as kept. The lists are disjoint (stage 2): rewrites are plain
+            // saves, new occurrences are mints (insert-if-absent + rule H).
+            let plan = regenerateForTask(task: t, recurrence: rec, existingBlocks: blocks, todayIso: today,
                                          startTime: start.startTime, startDate: LocalDate.parse(start.date),
-                                         horizonDays: start.horizonDays)
-            plan.toDelete.removeAll { $0 == start.keepId }   // this month's moved occurrence (see RecurrenceStart)
-            for b in plan.toUpsert { await api.upsertBlock(b) }
+                                         horizonDays: start.horizonDays, keepIds: Set([start.keepId].compactMap { $0 }))
+            for b in plan.toRetime { await api.upsertBlock(b) }
+            for b in plan.toUpsert { _ = await api.insertBlockIfAbsent(b, retimeIfTaken: true) }
             for id in plan.toDelete { await api.deleteBlock(id) }
         }
         // A done task made to repeat keeps the day it was done ticked, and the
