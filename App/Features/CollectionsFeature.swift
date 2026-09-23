@@ -5,8 +5,9 @@
 //    cards (rounded color chip + SHARED badge + item count + first 2 items).
 //  • Detail: colored chip + inline-rename title + archive/delete/share (owner)
 //    or Leave (member), "shared with N" line, recolor swatches, Pinned/All item
-//    rows (checkbox + body + ellipsis reveal: pin / move-to-task / remove +
-//    accountability chips), add-item pill, move-to-task chooser + by-time picker.
+//    rows (tap = strike out, swipe left = Delete, swipe right = Pin / Move to
+//    task, hold = edit; + accountability chips), add-item pill, move-to-task
+//    chooser + by-time picker.
 //  • Sharing: the ONE ShareScreen (ShareScreen.swift) — from the detail's
 //    Share button and the card's "Share…" context menu (owner only).
 // Reads via Repository<ItemCollection>; writes route through AppModel
@@ -636,8 +637,9 @@ struct CollectionDetailView: View {
     private func itemRow(_ col: ItemCollection, _ item: CollectionItem, canEdit: Bool) -> some View {
         CollItemRow(
             col: col, item: item, readOnly: !canEdit,
+            // One row open at a time: opening a swipe closes any other.
             revealed: revealedId == item.id,
-            onReveal: { revealedId = revealedId == item.id ? nil : item.id },
+            onReveal: { open in revealedId = open ? item.id : (revealedId == item.id ? nil : revealedId) },
             onMoveToTask: { startPromote(col, item) })
             // Key the row to item identity: pinning moves an item between the
             // Pinned/All sections, and without a stable id an in-progress edit's
@@ -675,13 +677,29 @@ private struct CollItemRow: View {
     let col: ItemCollection
     let item: CollectionItem
     let readOnly: Bool
+    /// This row is the open one (its swipe actions showing).
     let revealed: Bool
-    let onReveal: () -> Void
+    /// Open (true) or close (false) this row's swipe actions.
+    let onReveal: (Bool) -> Void
     let onMoveToTask: () -> Void
 
     @State private var editing = false
     @State private var draft = ""
     @SwiftUI.FocusState private var editFocused: Bool
+    /// Horizontal offset of the card: > 0 shows the leading actions (Pin, Move
+    /// to task), < 0 the trailing one (Delete).
+    @State private var offset: CGFloat = 0
+    /// Offset when the current drag began (a drag can start from an open row).
+    @State private var dragStart: CGFloat? = nil
+
+    /// Ahmad, 2026-09-23: the row did too many things at once (tap = edit, an
+    /// ellipsis that slid out three icons, hold = the same icons). Now each
+    /// gesture does one thing: TAP strikes it out, SWIPE LEFT offers Delete,
+    /// SWIPE RIGHT offers Pin and Move to task, HOLD edits the text.
+    private static let actionWidth: CGFloat = 74
+    private var canMove: Bool { !(item.promoted == true) || item.promotedDone == true }
+    private var leadingWidth: CGFloat { Self.actionWidth * (canMove ? 2 : 1) }
+    private var trailingWidth: CGFloat { Self.actionWidth }
 
     /// Commit the inline body edit. Blank draft → cancel (revert), never wipe
     /// the item body silently.
@@ -691,20 +709,134 @@ private struct CollItemRow: View {
         editing = false; editFocused = false
     }
 
+    private func close() {
+        withAnimation(.spring(response: 0.28, dampingFraction: 0.9)) { offset = 0 }
+        if revealed { onReveal(false) }
+    }
+
+    private func toggleDone() {
+        guard !readOnly else { return }
+        if offset != 0 { close(); return }
+        model.toggleCollectionItemDone(col, itemId: item.id)
+    }
+
+    private func startEdit() {
+        guard !readOnly else { return }
+        close()
+        draft = item.body; editing = true; editFocused = true
+    }
+
     var body: some View {
+        ZStack {
+            if !readOnly && offset != 0 { actions }
+            card
+                .offset(x: offset)
+                .simultaneousGesture(readOnly || editing ? nil : swipe)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.vertical, 3)
+        // Another row opened (or a promote started): slide this one shut.
+        .onChange(of: revealed) { _, open in
+            if !open && offset != 0 { withAnimation(.spring(response: 0.28, dampingFraction: 0.9)) { offset = 0 } }
+        }
+        // Swipes are not reachable with VoiceOver — every action is here too.
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint(readOnly ? "" : "Double-tap to strike it out. Swipe up or down for more actions.")
+        .accessibilityAction { toggleDone() }
+        .accessibilityActions {
+            if !readOnly {
+                Button(item.pinned == true ? "Unpin" : "Pin") { model.toggleCollectionItemPin(col, itemId: item.id) }
+                if canMove { Button("Move to task") { onMoveToTask() } }
+                Button("Edit") { startEdit() }
+                Button("Delete") { model.removeCollectionItem(col, itemId: item.id) }
+            }
+        }
+    }
+
+    // MARK: swipe
+
+    private var swipe: some Gesture {
+        DragGesture(minimumDistance: 14, coordinateSpace: .local)
+            .onChanged { v in
+                // Horizontal only: a vertical drag belongs to the ScrollView.
+                guard abs(v.translation.width) > abs(v.translation.height) * 1.2 else { return }
+                if dragStart == nil { dragStart = offset }
+                let raw = (dragStart ?? 0) + v.translation.width
+                // Rubber-band past each side's actions.
+                if raw > leadingWidth { offset = leadingWidth + (raw - leadingWidth) * 0.25 }
+                else if raw < -trailingWidth { offset = -trailingWidth + (raw + trailingWidth) * 0.25 }
+                else { offset = raw }
+            }
+            .onEnded { v in
+                guard dragStart != nil else { return }
+                dragStart = nil
+                let target: CGFloat
+                if offset > leadingWidth * 0.45 || (v.predictedEndTranslation.width > 160 && offset > 0) { target = leadingWidth }
+                else if offset < -trailingWidth * 0.45 || (v.predictedEndTranslation.width < -160 && offset < 0) { target = -trailingWidth }
+                else { target = 0 }
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.9)) { offset = target }
+                if target != 0 {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    onReveal(true)
+                } else if revealed { onReveal(false) }
+            }
+    }
+
+    /// The actions under the card: Pin + Move to task on the left (swipe
+    /// right), Delete on the right (swipe left). Neutral ink for the two
+    /// quiet ones; the system's destructive red only for Delete.
+    private var actions: some View {
+        HStack(spacing: 0) {
+            if offset > 0 {
+                actionButton(item.pinned == true ? "Unpin" : "Pin",
+                             icon: item.pinned == true ? "pin.slash" : "pin",
+                             tint: theme.palette.ink2) {
+                    model.toggleCollectionItemPin(col, itemId: item.id); close()
+                }
+                if canMove {
+                    actionButton("To task", icon: "arrow.up.forward.app", tint: theme.palette.ink) {
+                        close(); onMoveToTask()
+                    }
+                }
+                Spacer(minLength: 0)
+            } else {
+                Spacer(minLength: 0)
+                actionButton("Delete", icon: "trash", tint: theme.palette.red) {
+                    close(); model.removeCollectionItem(col, itemId: item.id)
+                }
+            }
+        }
+    }
+
+    private func actionButton(_ title: String, icon: String, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                Image(systemName: icon).font(.system(size: 16, weight: .semibold))
+                Text(title).font(UFont.sans(11, .semibold))
+            }
+            .foregroundStyle(theme.palette.bg)
+            .frame(width: Self.actionWidth)
+            .frame(maxHeight: .infinity)
+            .background(tint)
+        }.buttonStyle(.plain)
+        .accessibilityHidden(true)   // the row's accessibilityActions carry these
+    }
+
+    // MARK: card
+
+    private var card: some View {
         let done = item.done == true
         let promoted = item.promoted == true
         let struck = done || promoted        // promoted items read as "handled / in flight"
 
-        HStack(spacing: 10) {
-            // Done checkbox (always visible).
-            Button { if !readOnly { model.toggleCollectionItemDone(col, itemId: item.id) } } label: {
-                ZStack {
-                    Circle().fill(done ? theme.palette.coral : theme.palette.surface).frame(width: 18, height: 18)
-                        .overlay(Circle().stroke(theme.palette.line2, lineWidth: done ? 0 : 1.5))
-                    if done { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.white) }
-                }
-            }.buttonStyle(.plain).disabled(readOnly)
+        return HStack(spacing: 10) {
+            // Done checkbox (always visible) — the same toggle as tapping the row.
+            ZStack {
+                Circle().fill(done ? theme.palette.coral : theme.palette.surface).frame(width: 18, height: 18)
+                    .overlay(Circle().stroke(theme.palette.line2, lineWidth: done ? 0 : 1.5))
+                if done { Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.white) }
+            }
 
             VStack(alignment: .leading, spacing: 2) {
                 if editing && !readOnly {
@@ -729,49 +861,21 @@ private struct CollItemRow: View {
                         .strikethrough(struck)
                         .foregroundStyle(struck ? theme.palette.ink3 : theme.palette.ink)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                        .onTapGesture { if !readOnly { if revealed { onReveal() } else { draft = item.body; editing = true; editFocused = true } } }
-                        // Hold to reveal the action bar (Android onLongClick = onReveal) —
-                        // an extra trigger alongside the trailing ellipsis below.
-                        .onLongPressGesture { if !readOnly { onReveal() } }
                 }
                 if promoted, let label = promotedLabel() {
                     Text(label).font(UFont.sans(11, .medium)).foregroundStyle(promotedColor())
                         .padding(.top, 2)
                 }
             }
-
-            if !readOnly && !revealed {
-                Button { onReveal() } label: {
-                    Image(systemName: "ellipsis").font(.system(size: 15)).foregroundStyle(theme.palette.ink4)
-                }.buttonStyle(.plain)
-            }
-
-            // Action bar — hidden by default, revealed on tap of the ellipsis.
-            if !readOnly && revealed {
-                HStack(spacing: 8) {
-                    Button { model.toggleCollectionItemPin(col, itemId: item.id) } label: {
-                        Image(systemName: "pin\(item.pinned == true ? ".fill" : "")")
-                            .font(.system(size: 19))
-                            .foregroundStyle(item.pinned == true ? theme.palette.coral : theme.palette.ink4)
-                    }.buttonStyle(.plain)
-                    // Hide Move-to-task while a promotion is in flight (avoids a duplicate task).
-                    if !(item.promoted == true) || item.promotedDone == true {
-                        Button { onMoveToTask() } label: {
-                            Image(systemName: "arrow.up.forward.app").font(.system(size: 19)).foregroundStyle(theme.palette.ink4)
-                        }.buttonStyle(.plain)
-                    }
-                    Button { model.removeCollectionItem(col, itemId: item.id) } label: {
-                        Image(systemName: "xmark").font(.system(size: 19)).foregroundStyle(theme.palette.ink4)
-                    }.buttonStyle(.plain)
-                }
-            }
         }
         .padding(.horizontal, 12).padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.palette.surface)
         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line))
-        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onTapGesture { if !editing { toggleDone() } }
+        .onLongPressGesture(minimumDuration: 0.45) { if !editing { startEdit() } }
     }
 
     private func promotedLabel() -> String? {
