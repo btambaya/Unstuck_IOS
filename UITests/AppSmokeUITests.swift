@@ -100,7 +100,10 @@ final class AppSmokeUITests: XCTestCase {
         expect(groceries, "the Collections tab did not switch (no seeded list)")
         snap("06-collections")
         groceries.tap(); usleep(800_000)
-        expect(app.staticTexts["Milk"].firstMatch, "the collection detail did not open")
+        // An item row is ONE combined button since build 84 (tap strikes it
+        // out, swipes/hold do the rest), so "Milk" is a Button's label now —
+        // there is no separate StaticText to find.
+        expect(app.buttons["Milk"].firstMatch, "the collection detail did not open")
         snap("07-collection-detail")
     }
 

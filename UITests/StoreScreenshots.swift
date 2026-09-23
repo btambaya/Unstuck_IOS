@@ -121,7 +121,8 @@ final class StoreScreenshots: XCTestCase {
         let groceries = app.staticTexts["Groceries"].firstMatch
         expect(groceries, "the seeded 'Groceries' list is missing")
         groceries.tap(); usleep(900_000)
-        expect(app.staticTexts["Milk"].firstMatch, "the collection detail did not open")
+        // An item row is ONE combined button since build 84 — "Milk" is its label.
+        expect(app.buttons["Milk"].firstMatch, "the collection detail did not open")
         // The detail auto-focuses its add-item field on open (rapid entry), so
         // the software keyboard covers the lower half of the screen. Open the
         // title's inline rename and submit it unchanged: that path clears the
