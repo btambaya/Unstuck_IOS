@@ -161,7 +161,8 @@ public actor SyncCoordinator {
         self.mirrorGate = mirrorGate
         self.realtime = realtime
         self.catchUpPuller = catchUpPuller
-        self.collab = CollabRealtime(client: provider.client)
+        let collab = CollabRealtime(client: provider.client)
+        self.collab = collab
         self.db = db
         let prefsHook = self.preferencesHook
         // Every executor the owner drives is a sub-component built above, so
@@ -182,7 +183,11 @@ public actor SyncCoordinator {
                 return await catchUpPuller.catchUp(userId: uid, reconcileDeletions: reconcile)
             },
             rebuildSubscriptions: { await realtime.rebuildSubscriptionsNow() },
-            refreshPreferences: { await prefsHook.call() }))
+            refreshPreferences: { await prefsHook.call() },
+            ensureRealtime: { networkRegained in
+                await realtime.ensureLive(networkRegained: networkRegained)
+                await collab.ensureLive(networkRegained: networkRegained)
+            }))
     }
 
     /// The app's "re-read the account-wide preference rows" hook. Called by the

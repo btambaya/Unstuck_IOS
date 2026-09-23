@@ -690,6 +690,35 @@ final class CatchUpConvergenceTests: XCTestCase {
         XCTAssertEqual(try db.fetchById(ProfileFact.self, id: "f1")?.active, false)
     }
 
+    /// A realtime set that never subscribed (an offline launch) is invisible
+    /// to both deafness rules, which need `subscribed`. The network coming
+    /// back, the app coming forward and the floor tick ask for live channels
+    /// directly; the other triggers don't (audit 2026-09-22, C30).
+    func testNetworkForegroundAndFloorTicksAskForLiveChannels() async throws {
+        let asks = Asks()
+        let owner = FreshnessOwner(actions: FreshnessOwner.Actions(
+            fullSync: { _ in },
+            catchUp: { _, _ in CatchUpPuller.Outcome() },
+            ensureRealtime: { networkRegained in await asks.add(networkRegained) }))
+        await owner.report(.networkRegained)          // signed out: nothing
+        await owner.setUser(uid)
+        await owner.markHydrated()
+        for signal: FreshnessSignal in [.socketConnected, .channelsSubscribed, .tokenRefreshed, .coldStart,
+                                        .manual, .realtimeEvent, .networkRegained, .becameActive, .floorTick] {
+            await owner.report(signal)
+            await owner.awaitIdle()
+        }
+        for _ in 0..<200 where await asks.values.count < 3 { try await Task.sleep(nanoseconds: 5_000_000) }
+        let values = await asks.values
+        XCTAssertEqual(values.sorted { !$0 && $1 }, [false, false, true],
+                       "one ask each for network back (resetting the back-off), foreground and the floor tick")
+    }
+
+    actor Asks {
+        private(set) var values: [Bool] = []
+        func add(_ v: Bool) { values.append(v) }
+    }
+
     func testGapTriggersRefreshAccountPreferences() async throws {
         let prefs = Counter()
         let owner = FreshnessOwner(actions: FreshnessOwner.Actions(

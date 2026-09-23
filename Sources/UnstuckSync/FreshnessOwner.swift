@@ -99,15 +99,23 @@ public actor FreshnessOwner {
         /// Re-read the account-wide preference rows (they are not in the local
         /// store, so the cursor pull can't carry them).
         public var refreshPreferences: @Sendable () async -> Void
+        /// Bring back any realtime channel that isn't live (a no-op for a
+        /// healthy set). `networkRegained` resets its back-off. The deafness
+        /// rules can't see a set that never subscribed — an offline launch —
+        /// so the network, foreground and floor triggers ask for this
+        /// directly (audit 2026-09-22, C30).
+        public var ensureRealtime: @Sendable (_ networkRegained: Bool) async -> Void
 
         public init(fullSync: @escaping @Sendable (String) async -> Void,
                     catchUp: @escaping @Sendable (String, Bool) async -> CatchUpPuller.Outcome,
                     rebuildSubscriptions: @escaping @Sendable () async -> Void = {},
-                    refreshPreferences: @escaping @Sendable () async -> Void = {}) {
+                    refreshPreferences: @escaping @Sendable () async -> Void = {},
+                    ensureRealtime: @escaping @Sendable (Bool) async -> Void = { _ in }) {
             self.fullSync = fullSync
             self.catchUp = catchUp
             self.rebuildSubscriptions = rebuildSubscriptions
             self.refreshPreferences = refreshPreferences
+            self.ensureRealtime = ensureRealtime
         }
     }
 
@@ -217,11 +225,15 @@ public actor FreshnessOwner {
             lastSilenceCheckAt = now()
             request(signal, reconcile: true)
 
-        case .socketConnected, .becameActive, .networkRegained, .tokenRefreshed,
-             .coldStart, .deafnessSuspected:
+        case .becameActive, .networkRegained:
+            ensureRealtime(networkRegained: signal == .networkRegained)
+            request(signal, reconcile: true)
+
+        case .socketConnected, .tokenRefreshed, .coldStart, .deafnessSuspected:
             request(signal, reconcile: true)
 
         case .floorTick:
+            ensureRealtime(networkRegained: false)
             checkForDeafness()
             request(signal, reconcile: false)
 
@@ -269,6 +281,13 @@ public actor FreshnessOwner {
         stats.missedEventRebuilds += 1
         print("[freshness] catch-up applied \(outcome.rowsApplied) row(s) realtime never delivered — channel is deaf, rebuilding")
         scheduleRebuild()
+    }
+
+    /// Fire-and-forget: a rebuild must never hold up the pull.
+    private func ensureRealtime(networkRegained: Bool) {
+        guard userId != nil else { return }
+        let ensure = actions.ensureRealtime
+        Task { await ensure(networkRegained) }
     }
 
     private func scheduleRebuild() {
