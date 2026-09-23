@@ -672,6 +672,52 @@ final class OutboxFlusherTests: XCTestCase {
         XCTAssertEqual(recorder.of(b.id)?.outcome, .inserted)
         XCTAssertEqual(recorder.of(b.id)?.mirrorWanted, true)
     }
+
+    /// A confirmed push that finds its row missing (its own delete's realtime
+    /// echo landed after the re-mint) waits for the row instead of dropping
+    /// the mirror: released once by the realtime INSERT (`rowLanded`) or a
+    /// pull (`sweepLandedRows`), whichever brings it back first.
+    func testAConfirmedPushWaitsForItsRowToComeBack() throws {
+        let gate = flusher.mirrorGate
+        let landed = LandedRecorder()
+        gate.setOnAwaitedRowLanded { landed.add($0) }
+        let viaEcho = mintBlock("2026-09-24"), viaPull = mintBlock("2026-09-25"), there = mintBlock("2026-09-26")
+
+        XCTAssertFalse(gate.awaitRow(rowId: viaEcho.id), "no row yet: the push waits")
+        gate.rowLanded(rowId: mintBlock("2026-09-30").id)   // someone else's row: nothing
+        XCTAssertEqual(landed.ids, [])
+        try db.save(viaEcho)                                 // the INSERT echo
+        gate.rowLanded(rowId: viaEcho.id)
+        gate.rowLanded(rowId: viaEcho.id)
+        XCTAssertEqual(landed.ids, [viaEcho.id], "released once")
+
+        XCTAssertFalse(gate.awaitRow(rowId: viaPull.id))
+        gate.sweepLandedRows()
+        XCTAssertEqual(landed.ids, [viaEcho.id], "still missing: still waiting")
+        XCTAssertTrue(gate.isAwaitingRow(rowId: viaPull.id))
+        try db.save(viaPull)                                 // the next pull brings it
+        gate.sweepLandedRows()
+        XCTAssertEqual(landed.ids, [viaEcho.id, viaPull.id])
+        XCTAssertFalse(gate.isAwaitingRow(rowId: viaPull.id))
+
+        try db.save(there)                                   // back before the push asked
+        XCTAssertTrue(gate.awaitRow(rowId: there.id), "back already: push now")
+        XCTAssertFalse(gate.isAwaitingRow(rowId: there.id))
+
+        // A delete of the row ends the wait.
+        XCTAssertFalse(gate.awaitRow(rowId: mintBlock("2026-09-27").id))
+        gate.forget(rowId: mintBlock("2026-09-27").id)
+        try db.save(mintBlock("2026-09-27"))
+        gate.rowLanded(rowId: mintBlock("2026-09-27").id)
+        XCTAssertEqual(landed.ids, [viaEcho.id, viaPull.id])
+    }
+}
+
+private final class LandedRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String] = []
+    func add(_ id: String) { lock.withLock { stored.append(id) } }
+    var ids: [String] { lock.withLock { stored } }
 }
 
 private final class ResultBox: @unchecked Sendable {

@@ -141,9 +141,13 @@ public actor SyncCoordinator {
         self.assistant = AssistantClient(provider.client)
         self.calls = CallsClient(provider.client)
         self.callsMirror = CallRequestsMirror(db)
-        let hydrator = Hydrator(gateway: gateway, db: db)
-        let flusher = OutboxFlusher(gateway: gateway, db: db)
-        let realtime = RealtimeMirror(client: provider.client, db: db)
+        // Rule G's gate (stage 2) is shared: the flusher brackets every insert
+        // with it, and the realtime mirror and the cal_blocks pull release a
+        // confirmed push that is waiting for its row.
+        let mirrorGate = InsertMirrorGate(db: db)
+        let hydrator = Hydrator(gateway: gateway, db: db, mirrorGate: mirrorGate)
+        let flusher = OutboxFlusher(gateway: gateway, db: db, mirrorGate: mirrorGate)
+        let realtime = RealtimeMirror(client: provider.client, db: db, mirrorGate: mirrorGate)
         let catchUpPuller = CatchUpPuller(gateway: gateway, db: db,
                                           fullFallback: { table in
                                               await hydrator.hydrateFullReplaceTable(table)
@@ -154,7 +158,7 @@ public actor SyncCoordinator {
                                           })
         self.hydrator = hydrator
         self.flusher = flusher
-        self.mirrorGate = flusher.mirrorGate
+        self.mirrorGate = mirrorGate
         self.realtime = realtime
         self.catchUpPuller = catchUpPuller
         self.collab = CollabRealtime(client: provider.client)

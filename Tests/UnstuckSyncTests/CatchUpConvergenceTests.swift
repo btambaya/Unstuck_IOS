@@ -819,4 +819,24 @@ final class TwinOccurrenceTests: XCTestCase {
                        "a time-zone change")
         XCTAssertEqual(gate.verdict(pull: first, userId: "u2", today: today, timeZone: "Europe/London"), .run, "another account")
     }
+
+    /// The day / time-zone observers pull first (§3c): the top-up runs only if
+    /// THAT pull moved the stamp. A failed observer pull must not be stood in
+    /// for by an earlier floor pull, however new that one is.
+    func testTopUpGateAfterTheObserversOwnPullNeedsThatPullToSucceed() {
+        var gate = RecurrenceTopUpGate()
+        let yesterday = CalBlocksPull(seq: 3, at: Date(), rowCount: 120)
+        gate.recordRun(pull: yesterday, userId: "u1", today: day(-1), timeZone: "Europe/London")
+        let floorPull = CalBlocksPull(seq: 40, at: Date(), rowCount: 120)   // 23:59, before the day changed
+        XCTAssertEqual(gate.verdict(pull: floorPull, userId: "u1", today: today, timeZone: "Europe/London", pulledAfter: 40),
+                       .pullNotAdvanced, "the observer's own pull failed: the stamp did not move")
+        XCTAssertEqual(gate.verdict(pull: floorPull, userId: "u1", today: today, timeZone: "Europe/London"), .run,
+                       "the hydrate hook (no pull of its own) judges only against the last run")
+        let observerPull = CalBlocksPull(seq: 41, at: Date(), rowCount: 120)
+        XCTAssertEqual(gate.verdict(pull: observerPull, userId: "u1", today: today, timeZone: "Europe/London", pulledAfter: 40),
+                       .run)
+        XCTAssertEqual(gate.verdict(pull: CalBlocksPull(seq: 1, at: Date(), rowCount: 5), userId: "u9", today: today,
+                                    timeZone: "Europe/London", pulledAfter: 0), .run, "the first read of a session")
+        XCTAssertEqual(gate.verdict(pull: nil, userId: "u9", today: today, timeZone: "Europe/London", pulledAfter: 0), .noPull)
+    }
 }

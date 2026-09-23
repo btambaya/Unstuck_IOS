@@ -58,7 +58,7 @@ final class AppModelAssistantState: AssistantAppState {
     /// The mint path: the same un-park as `upsertBlock`, insert-if-absent, and
     /// the Google push deferred until the server confirms the insert (rule G).
     func insertBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool) async -> Bool {
-        await model.saveBlockInserting(b, retimeIfTaken: retimeIfTaken)
+        await model.saveBlockInserting(b, retimeIfTaken: retimeIfTaken).landed
     }
     /// `unschedule` reconciles Google for a pushed task block, then deletes.
     func deleteBlock(_ id: String) async { await model.unscheduleAwaiting(id) }

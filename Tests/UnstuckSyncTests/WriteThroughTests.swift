@@ -195,7 +195,7 @@ final class WriteThroughTests: XCTestCase {
         moved.done = true
         try db.save(moved)
         let wrote = try await write.insertCalBlockIfAbsent(mint("2026-09-24", "09:00"), retimeIfTaken: true, nowISO: now)
-        XCTAssertFalse(wrote)
+        XCTAssertEqual(wrote, .held)
         XCTAssertEqual(try box.count(), 0, "no op for a skipped mint")
         let row = try XCTUnwrap(db.fetchById(CalBlock.self, id: moved.id))
         XCTAssertEqual(row.date, "2026-09-26", "the moved occurrence is never pulled back")
@@ -209,9 +209,9 @@ final class WriteThroughTests: XCTestCase {
         var short = mint("2026-09-24")
         short.durationMinutes = 2
         let r1 = try await write.insertCalBlockIfAbsent(short, retimeIfTaken: false, nowISO: now)
-        XCTAssertTrue(r1)
+        XCTAssertEqual(r1, .inserted)
         let r2 = try await write.insertCalBlockIfAbsent(mint("2026-09-25"), retimeIfTaken: true, nowISO: now)
-        XCTAssertTrue(r2)
+        XCTAssertEqual(r2, .inserted)
         let ops = try box.pending()
         XCTAssertEqual(ops.map(\.kind), [.insert, .insertOrRetime])
         XCTAssertEqual(ops.map(\.kind.rawValue), ["insert", "insert_or_retime"], "the stored text every platform shares")
@@ -220,13 +220,13 @@ final class WriteThroughTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(ops[0].payload).contains("\"duration_minutes\":5"))
         // A second mint of the same day (a back-to-back top-up) queues nothing.
         let r3 = try await write.insertCalBlockIfAbsent(mint("2026-09-24"), retimeIfTaken: false, nowISO: now)
-        XCTAssertFalse(r3)
+        XCTAssertEqual(r3, .held)
         XCTAssertEqual(try box.count(), 2)
         // A Google g_ row is never enqueued, insert or not.
         let g = CalBlock(id: "g_evt", taskId: nil, taskName: "Meeting", startTime: "10:00", durationMinutes: 60,
                          date: "2026-09-24", kind: .external)
         let r4 = try await write.insertCalBlockIfAbsent(g, retimeIfTaken: false, nowISO: now)
-        XCTAssertTrue(r4)
+        XCTAssertEqual(r4, .inserted)
         XCTAssertEqual(try box.count(), 2)
     }
 
@@ -246,7 +246,7 @@ final class WriteThroughTests: XCTestCase {
         try db.save(b)
         try await write.deleteCalBlock(id: b.id, nowISO: now)
         let reMinted = try await write.insertCalBlockIfAbsent(b, retimeIfTaken: true, nowISO: now)
-        XCTAssertTrue(reMinted, "the deleted row is gone locally, so the re-mint writes")
+        XCTAssertEqual(reMinted, .inserted, "the deleted row is gone locally, so the re-mint writes")
         let ops = try box.pending()
         XCTAssertEqual(ops.map(\.kind), [.delete, .insertOrRetime])
         XCTAssertEqual(Set(ops.map(\.rowId)), [b.id])
@@ -262,5 +262,106 @@ final class WriteThroughTests: XCTestCase {
         for _ in 0..<OutboxStore.quarantineCap { try box.bumpAttempts(seq) }
         try await write.upsertCalBlock(b, nowISO: now)
         XCTAssertEqual(try box.pending().map(\.kind), [.upsert])
+    }
+
+    // MARK: - stage 2 review: rule H locally, the Google mapping, the stamp
+
+    /// A USER mint whose id is already that day's OPEN occurrence (a top-up
+    /// minted it after the caller read the store) retimes it — start and
+    /// length only — and queues insert_or_retime, so the server applies the
+    /// same conditional retime. Skipping it dropped the user's time everywhere.
+    func testUserMintRetimesTheDaysOpenOccurrenceLocally() async throws {
+        var topUp = mint("2026-09-24")   // 07:00, queued by a top-up
+        topUp.externalEventId = "evt-1"
+        topUp.externalConnectionId = "4c1f7a2e-9b3d-4e5f-8a6b-7c8d9e0f1a2b"
+        try await write.insertCalBlockIfAbsent(topUp, retimeIfTaken: false, nowISO: now)
+        var asked = mint("2026-09-24", "09:00")
+        asked.durationMinutes = 45
+        let outcome = try await write.insertCalBlockIfAbsent(asked, retimeIfTaken: true, nowISO: now)
+        XCTAssertEqual(outcome, .retimed)
+        let row = try XCTUnwrap(db.fetchById(CalBlock.self, id: asked.id))
+        XCTAssertEqual(row.startTime, "09:00")
+        XCTAssertEqual(row.durationMinutes, 45)
+        XCTAssertEqual(row.externalEventId, "evt-1", "only the start and the length move")
+        let ops = try box.pending()
+        XCTAssertEqual(ops.map(\.kind), [.insert, .insertOrRetime], "the top-up's insert first, then the user's rule H")
+        XCTAssertTrue(try XCTUnwrap(ops[1].payload).contains("\"start_time\":\"09:00\""))
+        XCTAssertEqual(ops[1].dependsOn, seriesId)
+
+        // Asked again at the same time: nothing to write.
+        let again = try await write.insertCalBlockIfAbsent(asked, retimeIfTaken: true, nowISO: now)
+        XCTAssertEqual(again, .alreadyThere)
+        XCTAssertEqual(try box.count(), 2)
+    }
+
+    /// Rule H never reaches a moved, done or skipped occurrence, and a
+    /// maintenance mint (a top-up) never moves any row.
+    func testLocalRuleHOnlyMovesTheDaysOpenOccurrence() async throws {
+        try db.save(mint("2026-09-24"))
+        let topUp = try await write.insertCalBlockIfAbsent(mint("2026-09-24", "09:00"), retimeIfTaken: false, nowISO: now)
+        XCTAssertEqual(topUp, .held, "a top-up never moves a row")
+        var skipped = mint("2026-09-25")
+        skipped.skipped = true
+        try db.save(skipped)
+        let onSkipped = try await write.insertCalBlockIfAbsent(mint("2026-09-25", "09:00"), retimeIfTaken: true, nowISO: now)
+        XCTAssertEqual(onSkipped, .held)
+        XCTAssertEqual(try box.count(), 0)
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: mint("2026-09-24").id)?.startTime, "07:00")
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: skipped.id)?.startTime, "07:00")
+    }
+
+    /// Every save carries the row's CURRENT Google mapping: a rewrite built
+    /// from a copy read before the stamp landed must not null the event id
+    /// (the push that followed INSERTed a second event).
+    func testASaveKeepsTheMappingStampedAfterItsCopyWasRead() async throws {
+        let snapshot = mint("2026-09-24")   // read before the Google push stamped it
+        try db.save(snapshot)
+        try await write.stampCalBlockMapping(id: snapshot.id, eventId: "evt-1",
+                                             connectionId: "4c1f7a2e-9b3d-4e5f-8a6b-7c8d9e0f1a2b", nowISO: now)
+        var rewrite = snapshot
+        rewrite.startTime = "08:00"
+        try await write.upsertCalBlock(rewrite, nowISO: now)
+        let row = try XCTUnwrap(db.fetchById(CalBlock.self, id: snapshot.id))
+        XCTAssertEqual(row.startTime, "08:00")
+        XCTAssertEqual(row.externalEventId, "evt-1")
+        XCTAssertEqual(row.externalConnectionId, "4c1f7a2e-9b3d-4e5f-8a6b-7c8d9e0f1a2b")
+        let last = try XCTUnwrap(box.pending().last?.payload)
+        XCTAssertTrue(last.contains("\"external_event_id\":\"evt-1\""), "the server keeps it too")
+        // A brand-new row keeps what it was given.
+        var fresh = mint("2026-09-26")
+        fresh.externalEventId = "evt-9"
+        try await write.upsertCalBlock(fresh, nowISO: now)
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId, "evt-9")
+    }
+
+    /// The stamp writes the two mapping columns onto the row as it is NOW, and
+    /// refuses a row that is gone or has an unresolved insert (rule G).
+    func testTheStampWritesOnlyTheMappingOntoTheCurrentRow() async throws {
+        var edited = mint("2026-09-24")
+        edited.startTime = "10:30"   // an edit made during the Google call
+        try db.save(edited)
+        let conn = "4c1f7a2e-9b3d-4e5f-8a6b-7c8d9e0f1a2b"
+        let stamped = try await write.stampCalBlockMapping(id: edited.id, eventId: "evt-1", connectionId: conn, nowISO: now)
+        XCTAssertEqual(stamped, .stamped)
+        let row = try XCTUnwrap(db.fetchById(CalBlock.self, id: edited.id))
+        XCTAssertEqual(row.startTime, "10:30", "the edit survives")
+        XCTAssertEqual(row.externalEventId, "evt-1")
+        XCTAssertEqual(try box.pending().map(\.kind), [.upsert])
+        let same = try await write.stampCalBlockMapping(id: edited.id, eventId: "evt-1", connectionId: conn, nowISO: now)
+        XCTAssertEqual(same, .unchanged)
+        let gone = try await write.stampCalBlockMapping(id: mint("2026-09-30").id, eventId: "evt-2", connectionId: conn, nowISO: now)
+        XCTAssertEqual(gone, .gone)
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: mint("2026-09-30").id), "a stamp never resurrects a row")
+
+        // Deleted and minted again during the call: the new row's insert is unresolved.
+        let reMint = mint("2026-09-25")
+        try db.save(reMint)
+        try await write.deleteCalBlock(id: reMint.id, nowISO: now)
+        try await write.insertCalBlockIfAbsent(reMint, retimeIfTaken: true, nowISO: now)
+        let ops = try box.count()
+        let blocked = try await write.stampCalBlockMapping(id: reMint.id, eventId: "evt-3", connectionId: conn, nowISO: now)
+        XCTAssertEqual(blocked, .insertUnresolved)
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: reMint.id)?.externalEventId)
+        XCTAssertEqual(try box.count(), ops, "nothing queued behind the insert")
     }
 }

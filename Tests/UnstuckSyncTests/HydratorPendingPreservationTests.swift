@@ -455,6 +455,27 @@ final class HydratorPendingPreservationTests: XCTestCase {
     }
     private func blockPayload(_ b: CalBlock) throws -> String? { String(data: try json(CalBlockRow(b)), encoding: .utf8) }
 
+    /// A confirmed mint's Google push that was waiting for its row (the
+    /// realtime DELETE echo of its earlier incarnation removed it) is released
+    /// by the next successful cal_blocks pull that brings the row back — and
+    /// not by a pull that failed.
+    func testASuccessfulCalBlocksPullReleasesAConfirmedPushWaitingForItsRow() async throws {
+        let reMinted = occurrence("2026-09-24")
+        let gate = InsertMirrorGate(db: db)
+        let landed = HydrateLandedRecorder()
+        gate.setOnAwaitedRowLanded { landed.add($0) }
+        XCTAssertFalse(gate.awaitRow(rowId: reMinted.id))
+        let gateway = SwitchableBlocksGateway()
+        await gateway.set([try json(CalBlockRow(reMinted))], failing: true)
+        let hydrator = Hydrator(gateway: gateway, db: db, mirrorGate: gate)
+        _ = await hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertEqual(landed.ids, [], "a failed read releases nothing")
+        await gateway.set([try json(CalBlockRow(reMinted))], failing: false)
+        _ = await hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertEqual(landed.ids, [reMinted.id])
+        XCTAssertFalse(gate.isAwaitingRow(rowId: reMinted.id))
+    }
+
     /// A mint the server hasn't seen yet survives the server-canonical replace,
     /// exactly like a pending upsert — and so does a RE-mint whose delete is
     /// queued ahead of it while the server still has the old row.
@@ -525,4 +546,11 @@ final class HydratorPendingPreservationTests: XCTestCase {
         let reset = await hydrator.calBlocksPull()
         XCTAssertNil(reset)
     }
+}
+
+private final class HydrateLandedRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String] = []
+    func add(_ id: String) { lock.withLock { stored.append(id) } }
+    var ids: [String] { lock.withLock { stored } }
 }

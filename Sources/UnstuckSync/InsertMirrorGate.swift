@@ -21,6 +21,14 @@
 // a push request can never slip through the gap between the two. "Wanted" is
 // in memory only: an app restart loses it, and the block then gets its event
 // on its next edit (the spec's accepted residual).
+//
+// A confirmed push can find its row MISSING: the realtime DELETE echo of this
+// device's own delete of the row's earlier incarnation ("Never" then "Daily",
+// hazard d) is applied unconditionally and can land after the re-mint, just
+// before the INSERT echo brings the row back. The push then waits for the row
+// (`awaitRow`): the realtime INSERT/UPDATE (`rowLanded`) or the next
+// successful cal_blocks pull (`sweepLandedRows`) releases it through
+// `onAwaitedRowLanded`, so the owner's "every minted day is mirrored" holds.
 
 import Foundation
 import GRDB
@@ -35,6 +43,9 @@ public final class InsertMirrorGate: @unchecked Sendable {
     private var inFlight: Set<String> = []
     /// Rows whose Google push was deferred until their insert resolves.
     private var wanted: Set<String> = []
+    /// Confirmed mints whose push found no local row (see the header).
+    private var awaitingRow: Set<String> = []
+    private var awaitedRowLanded: (@Sendable (String) -> Void)?
 
     public init(db: AppDatabase, table: String = "cal_blocks") {
         self.db = db
@@ -93,12 +104,64 @@ public final class InsertMirrorGate: @unchecked Sendable {
     /// The row was deleted (its queued insert cancelled with it): nothing is
     /// left to mirror.
     public func forget(rowId: String) {
-        lock.withLock { _ = wanted.remove(rowId) }
+        lock.withLock {
+            wanted.remove(rowId)
+            awaitingRow.remove(rowId)
+        }
+    }
+
+    /// Where a push that waited for its row goes once the row is back.
+    public func setOnAwaitedRowLanded(_ hook: (@Sendable (String) -> Void)?) {
+        lock.withLock { awaitedRowLanded = hook }
+    }
+
+    /// A CONFIRMED insert's push found no local row. True = the row is back
+    /// already (push now); false = the push waits for `rowLanded` or
+    /// `sweepLandedRows`. Marked before the store is read, so a row that lands
+    /// between the caller's read and this call is never missed.
+    public func awaitRow(rowId: String) -> Bool {
+        lock.withLock {
+            awaitingRow.insert(rowId)
+            guard rowExistsLocked(rowId) else { return false }
+            awaitingRow.remove(rowId)
+            return true
+        }
+    }
+
+    /// A cal_blocks row was just written from the server (a realtime INSERT or
+    /// UPDATE). Written BEFORE this is called, so with `awaitRow`'s
+    /// mark-then-read either side sees the other.
+    public func rowLanded(rowId: String) {
+        let hook: (@Sendable (String) -> Void)? = lock.withLock {
+            awaitingRow.remove(rowId) != nil ? awaitedRowLanded : nil
+        }
+        hook?(rowId)
+    }
+
+    /// A cal_blocks pull succeeded: release every awaited row it brought back.
+    public func sweepLandedRows() {
+        let (landed, hook): ([String], (@Sendable (String) -> Void)?) = lock.withLock {
+            guard !awaitingRow.isEmpty else { return ([], nil) }
+            let back = awaitingRow.filter { rowExistsLocked($0) }
+            awaitingRow.subtract(back)
+            return (Array(back), awaitedRowLanded)
+        }
+        guard let hook else { return }
+        for id in landed { hook(id) }
+    }
+
+    /// Test seam: is a confirmed push waiting for this row to come back?
+    public func isAwaitingRow(rowId: String) -> Bool {
+        lock.withLock { awaitingRow.contains(rowId) }
     }
 
     /// Test seam: is a mirror waiting on this row's insert?
     public func isMirrorWanted(rowId: String) -> Bool {
         lock.withLock { wanted.contains(rowId) }
+    }
+
+    private func rowExistsLocked(_ rowId: String) -> Bool {
+        ((try? db.writer.read { try CalBlock.fetchOne($0, key: rowId) }) ?? nil) != nil
     }
 
     private func unresolvedLocked(_ rowId: String) -> Bool {

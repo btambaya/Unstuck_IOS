@@ -71,9 +71,11 @@ protocol AssistantAppState: AnyObject {
     func upsertBlock(_ b: CalBlock) async
     /// A repeating task's occurrence MINTED with its deterministic id (stage
     /// 2): insert-if-absent, committed before returning like `upsertBlock`.
-    /// `retimeIfTaken` = the user asked for this day (rule H). False = a row
-    /// with that id already exists (the day's occurrence lives on): nothing
-    /// was written.
+    /// `retimeIfTaken` = the user asked for this day (rule H): an id already on
+    /// that day's OPEN occurrence moves it to `b`'s time. True = the day now
+    /// has that occurrence at `b`'s time (inserted, retimed, or already
+    /// there). False = the id lives on as a row that is not that day's open
+    /// occurrence (moved, done or skipped): nothing was written.
     func insertBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool) async -> Bool
     func deleteBlock(_ id: String) async
     // ── lists ──
@@ -443,17 +445,32 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
             // day's write with an empty plan (§3b′, stage 2) — the day's
             // deterministic occurrence, minted insert-if-absent with rule H, or
             // a block of its own when that id lives on elsewhere.
-            let (_, write) = recurrenceChosenDateWrite(task: task, existing: blocks.filter { $0.taskId == task.id },
-                                                       plan: RegenPlan(toUpsert: [], toDelete: []),
-                                                       iso: date, startTime: time)
-            switch write {
-            case .insert(let b):
-                _ = await api.insertBlockIfAbsent(b, retimeIfTaken: true)
-                scratch.placedBlocks[task.id] = b.id
-            case .upsert(let b):
-                await api.upsertBlock(b)
-                scratch.placedBlocks[task.id] = b.id
-            case .none:
+            // `placed` reports only what landed: a mint whose id was taken
+            // after `blocks` was read (a top-up, another device) is decided
+            // again from the store as it is now — once (stage 2 review).
+            var seen = blocks
+            for attempt in 0..<2 {
+                let (_, write) = recurrenceChosenDateWrite(task: task, existing: seen.filter { $0.taskId == task.id },
+                                                           plan: RegenPlan(toUpsert: [], toDelete: []),
+                                                           iso: date, startTime: time)
+                switch write {
+                case .insert(let b):
+                    if await api.insertBlockIfAbsent(b, retimeIfTaken: true) {
+                        scratch.placedBlocks[task.id] = b.id
+                    } else if attempt == 0 {
+                        seen = api.getBlocks()
+                        continue
+                    }
+                case .upsert(let b):
+                    await api.upsertBlock(b)
+                    scratch.placedBlocks[task.id] = b.id
+                case .none:
+                    // Covered after all: a done occurrence places nothing (as
+                    // the `.covered` branch above); a live one at the time is it.
+                    guard let open = seen.first(where: { $0.taskId == task.id && isTaskBlock($0) && $0.date == date
+                                                         && !$0.done && !$0.skipped }) else { return nil }
+                    scratch.placedBlocks[task.id] = open.id
+                }
                 break
             }
         } else {

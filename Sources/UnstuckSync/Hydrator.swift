@@ -17,11 +17,15 @@ public actor Hydrator {
     private let db: AppDatabase
     private let box: OutboxStore
     private let decoder = JSONDecoder()
+    /// Rule G's gate (stage 2): a successful cal_blocks read releases any
+    /// confirmed mint whose Google push was waiting for its row to come back.
+    private let mirrorGate: InsertMirrorGate?
 
-    public init(gateway: any SyncReadGatewayProtocol, db: AppDatabase) {
+    public init(gateway: any SyncReadGatewayProtocol, db: AppDatabase, mirrorGate: InsertMirrorGate? = nil) {
         self.gateway = gateway
         self.db = db
         self.box = OutboxStore(db)
+        self.mirrorGate = mirrorGate
     }
 
     /// Reconcile queued `tasks` upsert ops with the server BEFORE the flush.
@@ -630,6 +634,7 @@ public actor Hydrator {
             }
             calBlocksPullSeq += 1
             lastCalBlocksPull = CalBlocksPull(seq: calBlocksPullSeq, at: Date(), rowCount: raw.count)
+            mirrorGate?.sweepLandedRows()
             return true
         } catch {
             print("[hydrate] cal_blocks failed, leaving local intact: \(error)")
