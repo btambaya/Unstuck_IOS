@@ -393,4 +393,13 @@ final class GoogleConnectDisclosureTests: XCTestCase {
         XCTAssertEqual(GoogleConnectCopy.title(reconnect: false), "Connect Google Calendar?")
         XCTAssertEqual(GoogleConnectCopy.title(reconnect: true), "Reconnect Google Calendar?")
     }
+
+    /// The disconnect has removed the connection and is finishing its pull:
+    /// the pill that is back says so, never "Connecting…" (audit 2026-09-22,
+    /// C26).
+    func testTheConnectPillNeverSaysConnectingDuringADisconnect() {
+        XCTAssertEqual(GoogleConnectCopy.connectPill(busy: true, disconnecting: true), "Disconnecting…")
+        XCTAssertEqual(GoogleConnectCopy.connectPill(busy: true, disconnecting: false), "Connecting…")
+        XCTAssertEqual(GoogleConnectCopy.connectPill(busy: false, disconnecting: false), "＋ Connect Google Calendar")
+    }
 }

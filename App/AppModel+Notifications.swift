@@ -441,7 +441,11 @@ extension AppModel {
         let newTime = slot?.startTime ?? Self.plusHour(block.startTime)
         block.date = slot?.date ?? today
         block.startTime = newTime
-        try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
+        // Through the block save, so a pushed block's Google event moves with
+        // it (a bare upsert left it at the old time; audit 2026-09-22, C24).
+        // No un-park here: the move-count bump below writes the task row it
+        // read before this save.
+        await saveBlockAwaiting(block, unpark: false)
         if let task {
             try? await write.upsertTask(bumpMoveCount(task, nowISO: Self.isoNow()), nowISO: Self.isoNow())
         }

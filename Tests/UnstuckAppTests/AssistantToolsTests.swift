@@ -3542,3 +3542,547 @@ final class SignOutPrivacyTests: XCTestCase {
         XCTAssertEqual(model.quarantinedSyncCount, 1)
     }
 }
+
+// MARK: - the Google write-back over the PRODUCTION seam (audit 2026-09-22, C24 / C26)
+
+/// calendar-sync as the app's Google write-back sees it: every call is
+/// recorded ("<verb> <calendar> <id>"), and it fails on demand.
+private final class FakeGoogleCalls: GoogleEventCalls, @unchecked Sendable {
+    struct Offline: Error {}
+    private let lock = NSLock()
+    private var log: [String] = []
+    private var down = false
+    private var gone = false
+    private var disconnectDown = false
+    private var deletesDown = false
+    private var insertHook: (@Sendable () async -> Void)?
+    private var minted = 0
+    private var made: Set<String> = []
+    private var asked: [String?] = []
+    private var loseAnswers = false
+    var calls: [String] { lock.withLock { log } }
+    /// The id each INSERT that reached Google asked for.
+    var askedIds: [String?] { lock.withLock { asked } }
+    /// Every event an INSERT made in Google.
+    var events: Set<String> { lock.withLock { made } }
+    /// An INSERT makes its event, but its answer never arrives (a timeout,
+    /// a kill mid-flight).
+    var loseInsertAnswers: Bool {
+        get { lock.withLock { loseAnswers } }
+        set { lock.withLock { loseAnswers = newValue } }
+    }
+    var offline: Bool {
+        get { lock.withLock { down } }
+        set { lock.withLock { down = newValue } }
+    }
+    /// A PATCH of an event no INSERT here made answers `event_gone` (the
+    /// event is not on that calendar).
+    var patchGone: Bool {
+        get { lock.withLock { gone } }
+        set { lock.withLock { gone = newValue } }
+    }
+    var disconnectFails: Bool {
+        get { lock.withLock { disconnectDown } }
+        set { lock.withLock { disconnectDown = newValue } }
+    }
+    var deletesFail: Bool {
+        get { lock.withLock { deletesDown } }
+        set { lock.withLock { deletesDown = newValue } }
+    }
+    /// Runs while an INSERT is in flight (before it answers).
+    var duringInsert: (@Sendable () async -> Void)? {
+        get { lock.withLock { insertHook } }
+        set { lock.withLock { insertHook = newValue } }
+    }
+    private func record(_ call: String) throws {
+        try lock.withLock {
+            log.append(call)
+            if down { throw Offline() }
+        }
+    }
+    func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String,
+                     eventId: String?) async throws -> String {
+        try record("insert \(calendarId) \(summary)")
+        await duringInsert?()
+        return try lock.withLock {
+            asked.append(eventId)
+            // An id Google already has is the server's 409, answered with
+            // that id: no second event.
+            let id = eventId ?? { minted += 1; return "evt\(minted)" }()
+            made.insert(id)
+            if loseAnswers { throw Offline() }
+            return id
+        }
+    }
+    func patchEvent(eventId: String, connectionId: String, calendarId: String, summary: String?, start: String?, end: String?) async throws {
+        try record("patch \(calendarId) \(eventId)")
+        if patchGone, !events.contains(eventId) { throw CalendarSyncError.eventGone }
+    }
+    func deleteEvent(eventId: String, connectionId: String, calendarId: String) async throws {
+        try record("delete \(calendarId) \(eventId)")
+        if deletesFail { throw Offline() }
+    }
+    func disconnect(connectionId: String) async throws {
+        try record("disconnect \(connectionId)")
+        if disconnectFails { throw Offline() }
+    }
+}
+
+/// The real AppModel over a live GRDB store (the UI-test boot) with a fake
+/// calendar-sync behind the Google worker.
+@MainActor
+final class GoogleWriteBackAppTests: XCTestCase {
+    private let taskId = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+    private let seriesId = "7c0e4a52-3b1d-4f6e-9a8b-2d4c6e8f0a1b"
+    private let email = "maya@example.com"
+
+    /// Predictable INSERT ids ("evt1", "evt2", …) in place of random ones.
+    private final class EventIds: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func next() -> String { lock.withLock { n += 1; return "evt\(n)" } }
+    }
+
+    private func liveModel(_ google: FakeGoogleCalls, selected: [String] = ["primary"]) throws -> (AppModel, AppDatabase) {
+        AssistantModel.scrubPersisted()
+        let model = AppModel()
+        model.startUITestMode()
+        model.googleCallsOverride = google
+        let ids = EventIds()
+        model.uiTestGoogleBacklog = GoogleWriteBacklog(defaults: nil, currentUser: { "ui-test" }, newEventId: { ids.next() })
+        let db = try XCTUnwrap(model.db)
+        try db.save(CalendarConnection(id: "conn1", provider: .google, accountEmail: email, displayName: email,
+                                       selectedCalendarIds: selected, colorSlot: 0, connectedAt: PAST_CREATED))
+        return (model, db)
+    }
+
+    private func block(_ id: String = newUUID(), task: String? = nil, date: String = LocalDate.addDays(Clock.todayISO(), 1),
+                       event: String? = nil, name: String = "Dentist") -> CalBlock {
+        CalBlock(id: id, taskId: task ?? taskId, taskName: name, startTime: "10:00", durationMinutes: 30, date: date,
+                 externalEventId: event, externalConnectionId: event == nil ? nil : "conn1", kind: .task)
+    }
+
+    /// Fire-and-forget UI paths: wait until the worker has done `done`.
+    private func settle(_ model: AppModel, until done: @MainActor () -> Bool) async throws {
+        for _ in 0..<200 where !done() {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            await model.awaitGoogleMirrors()
+        }
+        await model.awaitGoogleMirrors()
+    }
+
+    /// Deleting a task from its editor deletes its pushed blocks' Google
+    /// events (the server cascade only removed the rows, and the orphans came
+    /// back from the pull as read-only meetings) — tasks-ui#8 / calendar#4.
+    func testDeletingATaskDeletesItsPushedEventsInGoogle() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        try db.save(TaskItem(id: taskId, name: "Dentist", estimateMin: 30, createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        let pushed = block(event: "evtA")
+        let unpushed = block(date: LocalDate.addDays(Clock.todayISO(), 2))
+        try db.save(pushed)
+        try db.save(unpushed)
+
+        let ok = await model.deleteTaskAwaiting(taskId)
+        await model.awaitGoogleMirrors()
+        XCTAssertTrue(ok)
+        XCTAssertEqual(google.calls, ["delete primary evtA"])
+        XCTAssertTrue(try db.blocks(forTask: taskId).isEmpty, "the blocks go with it on this phone too")
+        XCTAssertEqual(model.googleBacklog?.deletes(), [], "confirmed, so nothing is left to retry")
+    }
+
+    /// Switching a series to "Never" deletes the future occurrences WITH their
+    /// Google events (stage 2's plan deletes run through unscheduleAwaiting) —
+    /// gap-3#6, already fixed by build 85; pinned here.
+    func testSwitchingASeriesToNeverDeletesTheFutureOccurrencesEvents() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let series = TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                              createdAt: PAST_CREATED, updatedAt: PAST_CREATED)
+        try db.save(series)
+        let d1 = LocalDate.addDays(Clock.todayISO(), 1), d2 = LocalDate.addDays(Clock.todayISO(), 2)
+        let o1 = block(occurrenceId(taskId: seriesId, date: d1), task: seriesId, date: d1, event: "evt1", name: "Gym")
+        let o2 = block(occurrenceId(taskId: seriesId, date: d2), task: seriesId, date: d2, event: "evt2", name: "Gym")
+        try db.save(o1)
+        try db.save(o2)
+        var never = series
+        never.recurrence = nil
+        // saveTaskWithRecurrence's plan (it needs a coordinator to write it).
+        let plan = regenerateForTask(task: never, recurrence: nil, existingBlocks: [o1, o2], todayIso: Clock.todayISO(),
+                                     startTime: "07:00", startDate: Date(), horizonDays: RECURRENCE_HORIZON_DAYS, keepIds: [])
+        XCTAssertEqual(Set(plan.toDelete), [o1.id, o2.id])
+        await model.applyRegenPlan(plan, unpark: false)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["delete primary evt1", "delete primary evt2"])
+    }
+
+    /// "Skip this day" removes that day's Google event and never INSERTs one
+    /// for a skipped day; un-skipping puts a fresh event back — gap-3#6.
+    func testSkippingAnOccurrenceRemovesItsEventAndNeverInsertsOne() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        try db.save(TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                             createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        let d1 = LocalDate.addDays(Clock.todayISO(), 1), d2 = LocalDate.addDays(Clock.todayISO(), 2)
+        let pushed = block(occurrenceId(taskId: seriesId, date: d1), task: seriesId, date: d1, event: "evtS", name: "Gym")
+        let never = block(occurrenceId(taskId: seriesId, date: d2), task: seriesId, date: d2, name: "Gym")
+        try db.save(pushed)
+        try db.save(never)
+
+        model.skipOccurrence(pushed.id)
+        try await settle(model) { !google.calls.isEmpty }
+        XCTAssertEqual(google.calls, ["delete primary evtS"])
+        let skipped = try XCTUnwrap(try db.fetchById(CalBlock.self, id: pushed.id))
+        XCTAssertTrue(skipped.skipped)
+        XCTAssertNil(skipped.externalEventId, "the row no longer points at the deleted event")
+
+        model.skipOccurrence(never.id)
+        try await settle(model) { (try? db.fetchById(CalBlock.self, id: never.id))??.skipped == true }
+        XCTAssertEqual(google.calls, ["delete primary evtS"], "nothing is inserted for a skipped day")
+
+        model.setOccurrenceDone(skipped, done: false)
+        try await settle(model) { google.calls.count >= 2 }
+        XCTAssertEqual(google.calls.last, "insert primary Gym")
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: pushed.id)?.externalEventId, "evt1")
+    }
+
+    /// A Google delete that fails (offline) is kept: the pull treats its
+    /// event as ours meanwhile, and the next sync sends it — lens-silent#9 (b).
+    func testAFailedGoogleDeleteIsRetriedAndItsEventIsNeverImported() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let pushed = block(event: "evtB")
+        try db.save(pushed)
+        google.offline = true
+        await model.deleteBlockAwaiting(pushed)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["delete primary evtB"])
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertEqual(backlog.pendingDeleteEventIds(), ["evtB"])
+        let echo = ExternalEvent(id: "evtB", connectionId: "conn1", calendarId: "primary", summary: "Dentist",
+                                 start: "2026-10-01T10:00:00.000Z", end: "2026-10-01T10:30:00.000Z")
+        let plan = reconcileCalendarPull(events: [echo], localBlocks: try db.fetchAllCalBlocks(),
+                                         fromYmd: "2026-09-01", toYmd: "2026-12-31",
+                                         unconfirmedEventIds: backlog.unconfirmedEventIds())
+        XCTAssertTrue(plan.toUpsert.isEmpty, "never back as a meeting while the delete is pending")
+
+        google.offline = false
+        model.retryGoogleBacklog()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["delete primary evtB", "delete primary evtB"])
+        XCTAssertTrue(backlog.deletes().isEmpty)
+    }
+
+    /// A push that fails (scheduling offline) goes out after the next sync
+    /// instead of waiting for the block's next edit — lens-silent#9 (c).
+    func testAPushThatFailedOfflineGoesOutAfterTheNextSync() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.offline = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertEqual(backlog.pushes(), [fresh.id])
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId)
+
+        google.offline = false
+        model.retryGoogleBacklog()
+        await model.awaitGoogleMirrors()
+        // The retry asks for the first attempt's id (Google may have made
+        // it) and then sets that event's time.
+        XCTAssertEqual(google.calls, ["insert primary Dentist", "insert primary Dentist", "patch primary evt1"])
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId, "evt1")
+        XCTAssertTrue(backlog.pushes().isEmpty)
+        XCTAssertTrue(backlog.inserts().isEmpty)
+    }
+
+    /// The push's stamp lands after the caller read the block (drag, then
+    /// Delete from a menu opened before the INSERT returned): the event the
+    /// row really carried is deleted — calendar#5.
+    func testADeleteRightAfterTheStampDeletesTheStampedEvent() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let callersCopy = block()
+        try db.save(callersCopy)
+        let write = try XCTUnwrap(model.write)
+        try await write.stampCalBlockMapping(id: callersCopy.id, eventId: "evtX", connectionId: "conn1",
+                                             nowISO: AppModel.isoNow())
+        await model.deleteBlockAwaiting(callersCopy)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["delete primary evtX"])
+    }
+
+    /// The pull imported our brand-new event while its INSERT was in flight:
+    /// the stamp drops that echo at once instead of on the next pull.
+    func testAStampedInsertDropsItsOwnGoogleEcho() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        try db.save(CalBlock(id: "g_evt1", taskId: nil, taskName: "Dentist", startTime: "10:00", durationMinutes: 30,
+                             date: fresh.date, externalEventId: "evt1", externalConnectionId: "conn1", kind: .external))
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId, "evt1")
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: "g_evt1"))
+    }
+
+    /// The row was deleted while its INSERT ran, and deleting the new event
+    /// failed: it is kept in the backlog (so the pull never imports it and
+    /// the next sync deletes it), never left in Google owned by nothing.
+    func testANewEventNoRowWillCarryIsKeptUntilItsDeleteGoesThrough() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.duringInsert = { try? db.deleteById(CalBlock.self, id: fresh.id) }
+        google.deletesFail = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["insert primary Dentist", "delete primary evt1"])
+        XCTAssertEqual(model.googleBacklog?.pendingDeleteEventIds(), ["evt1"])
+
+        google.deletesFail = false
+        model.retryGoogleBacklog()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls.last, "delete primary evt1")
+        XCTAssertEqual(model.googleBacklog?.pendingDeleteEventIds(), [])
+    }
+
+    /// A web-era event lives on the connection's first selected calendar:
+    /// moved from iOS it is removed there before the re-insert on primary,
+    /// and a delete from iOS removes it there too — calendar#17 (web W13).
+    func testAWebEraEventOnTheOldCalendarIsMovedNotDuplicated() async throws {
+        let google = FakeGoogleCalls()
+        let work = "team@group.calendar.google.com"
+        let (model, db) = try liveModel(google, selected: [work, email])
+        let webEra = block(event: "evtW")
+        try db.save(webEra)
+        google.patchGone = true
+        var moved = webEra
+        moved.startTime = "15:00"
+        await model.saveBlockAwaiting(moved)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["patch primary evtW", "delete \(work) evtW", "insert primary Dentist"])
+
+        let stamped = try XCTUnwrap(try db.fetchById(CalBlock.self, id: webEra.id))
+        await model.deleteBlockAwaiting(stamped)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls.suffix(2), ["delete primary evt1", "delete \(work) evt1"])
+
+        func conn(_ selected: [String]) -> CalendarConnection {
+            CalendarConnection(id: "c", provider: .google, accountEmail: "Maya@Example.com", displayName: "",
+                               selectedCalendarIds: selected, colorSlot: 0, connectedAt: PAST_CREATED)
+        }
+        XCTAssertNil(AppModel.legacyPushCalendarId(conn(["primary", work])))
+        XCTAssertNil(AppModel.legacyPushCalendarId(conn(["maya@example.com", work])), "the primary calendar by its email")
+        XCTAssertNil(AppModel.legacyPushCalendarId(conn([])))
+        XCTAssertEqual(AppModel.legacyPushCalendarId(conn([work, "primary"])), work)
+    }
+
+    /// The notification's one-tap Reschedule moves the block's Google event
+    /// with it — gap-3#6 (a bare upsert left the event at the old time).
+    func testTheNotificationRescheduleMovesTheGoogleEvent() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        try db.save(TaskItem(id: taskId, name: "Dentist", estimateMin: 30, createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        let pushed = block(date: Clock.todayISO(), event: "evtR")
+        try db.save(pushed)
+        await model.rescheduleToNextSlot(blockId: pushed.id, taskId: taskId, taskName: "Dentist")
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["patch primary evtR"])
+    }
+
+    /// Disconnect purges nothing until the server has revoked access: a
+    /// failed revoke keeps the connection and its meetings and says so — C26.
+    func testDisconnectKeepsTheConnectionUntilTheServerConfirms() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let meeting = CalBlock(id: "g_m1", taskId: nil, taskName: "Standup", startTime: "09:00", durationMinutes: 15,
+                               date: Clock.todayISO(), externalEventId: "m1", externalConnectionId: "conn1", kind: .external)
+        try db.save(meeting)
+
+        google.disconnectFails = true
+        let failed = await model.disconnectCalendar()
+        XCTAssertFalse(failed)
+        XCTAssertNotNil(try db.fetchById(CalendarConnection.self, id: "conn1"), "the bar keeps saying Synced")
+        XCTAssertNotNil(try db.fetchById(CalBlock.self, id: meeting.id))
+
+        google.disconnectFails = false
+        let done = await model.disconnectCalendar()
+        XCTAssertTrue(done)
+        XCTAssertNil(try db.fetchById(CalendarConnection.self, id: "conn1"))
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: meeting.id))
+        XCTAssertEqual(google.calls, ["disconnect conn1", "disconnect conn1"])
+    }
+
+    // MARK: pushes outlive a kill (second pass)
+
+    /// A series edit's PATCHes still queued when iOS ends the suspended app
+    /// go out after the relaunch's sync: they are in the backlog from the
+    /// moment they are queued, not only once one fails (audit 2026-09-22,
+    /// C24).
+    func testQueuedPushesOutliveAKill() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let a = block(event: "evtA")
+        let b = block(date: LocalDate.addDays(Clock.todayISO(), 2), event: "evtB")
+        try db.save(a)
+        try db.save(b)
+        model.googleCallsPaused = true
+        var movedA = a
+        movedA.startTime = "15:00"
+        var movedB = b
+        movedB.startTime = "16:00"
+        await model.saveBlockAwaiting(movedA)
+        await model.saveBlockAwaiting(movedB)
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertEqual(backlog.pushes(), [a.id, b.id], "kept from the moment they are queued")
+        XCTAssertTrue(google.calls.isEmpty)
+
+        // Relaunched: the queue is gone, the store and the backlog are not.
+        let (relaunched, store) = try liveModel(google)
+        relaunched.uiTestGoogleBacklog = backlog
+        try store.save(try XCTUnwrap(try db.fetchById(CalBlock.self, id: a.id)))
+        try store.save(try XCTUnwrap(try db.fetchById(CalBlock.self, id: b.id)))
+        relaunched.retryGoogleBacklog()
+        await relaunched.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["patch primary evtA", "patch primary evtB"])
+        XCTAssertTrue(backlog.pushes().isEmpty)
+    }
+
+    /// A confirmed mint's push that waits for its row (its own delete's echo
+    /// landed after the re-mint) stays in the backlog while it waits: killed
+    /// meanwhile, the relaunch pushes it once the row is back (C24).
+    func testAConfirmedPushWaitingForItsRowOutlivesAKill() async throws {
+        let google = FakeGoogleCalls()
+        let (model, _) = try liveModel(google)
+        let minted = block()
+        model.handleInsertResolved(InsertResolution(table: "cal_blocks", rowId: minted.id, outcome: .inserted,
+                                                    serverRow: nil, mirrorWanted: true))
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(model.mirrorGate?.isAwaitingRow(rowId: minted.id), true)
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertEqual(backlog.pushes(), [minted.id], "kept while it waits for its row")
+
+        let (relaunched, store) = try liveModel(google)
+        relaunched.uiTestGoogleBacklog = backlog
+        try store.save(minted)   // the relaunch's pull brought it back
+        relaunched.retryGoogleBacklog()
+        await relaunched.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["insert primary Dentist"])
+        XCTAssertEqual(try store.fetchById(CalBlock.self, id: minted.id)?.externalEventId, "evt1")
+        XCTAssertTrue(backlog.pushes().isEmpty)
+    }
+
+    // MARK: an INSERT whose answer was lost (second pass, calendar#5)
+
+    /// Google made the event but the answer never arrived: the event is
+    /// ours meanwhile (never imported as a meeting), and the retry asks for
+    /// the same id, so Google ends up with ONE event, on the row.
+    func testAnInsertWhoseAnswerWasLostIsNotMadeTwice() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.loseInsertAnswers = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId)
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertEqual(backlog.unconfirmedEventIds(), ["evt1"])
+        let echo = ExternalEvent(id: "evt1", connectionId: "conn1", calendarId: "primary", summary: "Dentist",
+                                 start: "2026-10-01T10:00:00.000Z", end: "2026-10-01T10:30:00.000Z")
+        let plan = reconcileCalendarPull(events: [echo], localBlocks: try db.fetchAllCalBlocks(),
+                                         fromYmd: "2026-09-01", toYmd: "2026-12-31",
+                                         unconfirmedEventIds: backlog.unconfirmedEventIds())
+        XCTAssertTrue(plan.toUpsert.isEmpty, "never a meeting while its INSERT is unanswered")
+
+        google.loseInsertAnswers = false
+        model.retryGoogleBacklog()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.askedIds, ["evt1", "evt1"], "the retry asks for the same id")
+        XCTAssertEqual(google.events, ["evt1"], "one event in Google")
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId, "evt1")
+        XCTAssertEqual(google.calls.last, "patch primary evt1", "the event gets the retry's time")
+        XCTAssertTrue(backlog.inserts().isEmpty)
+        XCTAssertTrue(backlog.pushes().isEmpty)
+    }
+
+    /// Deleted before a lost INSERT was retried: the event Google may hold is
+    /// deleted, and scheduling the same occurrence again (stage 2's same id)
+    /// never asks for that deleted event's id.
+    func testDeletingABlockWhoseInsertWasLostDeletesItsEvent() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.loseInsertAnswers = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        google.loseInsertAnswers = false
+        await model.deleteBlockAwaiting(try XCTUnwrap(try db.fetchById(CalBlock.self, id: fresh.id)))
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["insert primary Dentist", "delete primary evt1"])
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertTrue(backlog.unconfirmedEventIds().isEmpty)
+
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.askedIds.last, "evt2", "a fresh id, never the deleted event's")
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId, "evt2")
+    }
+
+    /// "Skip this day" after a lost INSERT deletes the event Google may hold:
+    /// a skipped day has none (gap-3#6).
+    func testSkippingADayWhoseInsertWasLostDeletesItsEvent() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.loseInsertAnswers = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        google.loseInsertAnswers = false
+        var skipped = try XCTUnwrap(try db.fetchById(CalBlock.self, id: fresh.id))
+        skipped.skipped = true
+        await model.saveBlockAwaiting(skipped)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["insert primary Dentist", "delete primary evt1"])
+        XCTAssertTrue(try XCTUnwrap(model.googleBacklog).unconfirmedEventIds().isEmpty)
+    }
+
+    /// The row of a lost INSERT was deleted elsewhere (another device, the
+    /// web): the next sync deletes the event Google may hold.
+    func testALostInsertWhoseRowIsGoneIsDeletedAfterTheNextSync() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.loseInsertAnswers = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        google.loseInsertAnswers = false
+        try db.deleteById(CalBlock.self, id: fresh.id)
+        model.retryGoogleBacklog()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["insert primary Dentist", "delete primary evt1"])
+        let backlog = try XCTUnwrap(model.googleBacklog)
+        XCTAssertTrue(backlog.unconfirmedEventIds().isEmpty)
+        XCTAssertTrue(backlog.pushes().isEmpty)
+    }
+
+    /// A sync that lands while a re-INSERT (after `event_gone`) is in flight
+    /// leaves it alone: the row still carries the stale id, and taking that
+    /// for "mapped elsewhere" deleted the event the INSERT was making.
+    func testTheRetryLeavesTheInsertInFlightAlone() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let stale = block(event: "evtOld")
+        try db.save(stale)
+        google.patchGone = true
+        google.duringInsert = { await MainActor.run { model.retryGoogleBacklog() } }
+        var moved = stale
+        moved.startTime = "15:00"
+        await model.saveBlockAwaiting(moved)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["patch primary evtOld", "insert primary Dentist"])
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: stale.id)?.externalEventId, "evt1")
+        XCTAssertTrue(try XCTUnwrap(model.googleBacklog).unconfirmedEventIds().isEmpty)
+    }
+}

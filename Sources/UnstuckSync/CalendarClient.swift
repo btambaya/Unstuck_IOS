@@ -145,6 +145,13 @@ public struct CalendarClient: Sendable {
             status == 401 || reason == "invalid_grant" || reason == "needs_reauth" || reason == "unauthorized"
         }
         public var rateLimited: Bool { status == 429 }
+        /// Google no longer lets the account read that ONE calendar (404 /
+        /// 410: unshared, deleted) — its events are gone, not unknown. Never
+        /// a whole-connection failure (calendarId "*").
+        public var calendarGone: Bool {
+            guard let cid = calendarId, !cid.isEmpty, cid != "*" else { return false }
+            return status == 404 || status == 410
+        }
     }
 
     /// The reconciled shape of one `/events` pull.
@@ -217,12 +224,17 @@ public struct CalendarClient: Sendable {
     }
 
     public struct InsertResponse: Decodable, Sendable { public let id: String }
-    public func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String) async throws -> String {
-        struct Body: Encodable { let connectionId, calendarId, summary, start, end: String }
+    /// `eventId` (base32hex) asks Google for that id: the server answers
+    /// Google's duplicate-id 409 with it, so a retry of an INSERT whose answer
+    /// was lost finds the first attempt's event instead of making a second.
+    /// nil = Google mints one.
+    public func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String,
+                            eventId: String? = nil) async throws -> String {
+        struct Body: Encodable { let connectionId, calendarId, summary, start, end: String; let eventId: String? }
         do {
             let r: InsertResponse = try await client.functions.invoke(
                 "calendar-sync/events",
-                options: FunctionInvokeOptions(method: .post, body: Body(connectionId: connectionId, calendarId: calendarId, summary: summary, start: start, end: end)))
+                options: FunctionInvokeOptions(method: .post, body: Body(connectionId: connectionId, calendarId: calendarId, summary: summary, start: start, end: end, eventId: eventId)))
             return r.id
         } catch {
             throw Self.classify(error) ?? error
@@ -277,6 +289,19 @@ public struct CalendarClient: Sendable {
         return nil
     }
 }
+
+/// The calendar-sync calls the app's Google write-back and disconnect make —
+/// `CalendarClient` in production; a test double drives those paths without
+/// a server (audit 2026-09-22, C24 / C26).
+public protocol GoogleEventCalls: Sendable {
+    func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String,
+                     eventId: String?) async throws -> String
+    func patchEvent(eventId: String, connectionId: String, calendarId: String, summary: String?, start: String?, end: String?) async throws
+    func deleteEvent(eventId: String, connectionId: String, calendarId: String) async throws
+    func disconnect(connectionId: String) async throws
+}
+
+extension CalendarClient: GoogleEventCalls {}
 
 /// Sync-relevant calendar-sync failures (see `CalendarClient.classify`).
 public enum CalendarSyncError: Error, Equatable, Sendable {

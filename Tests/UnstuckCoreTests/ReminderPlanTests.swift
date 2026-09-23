@@ -160,6 +160,19 @@ final class PlanRemindersTests: XCTestCase {
         XCTAssertEqual(plans[0].taskId, "")
     }
 
+    /// A conference split across days (audit 2026-09-22, C25): its first
+    /// day rings "Coming up"; the later days' 00:00 blocks ring nothing.
+    func testALaterDayOfASplitGoogleEventArmsNoLead() {
+        let first = CalBlock(id: "g_conf", taskId: nil, taskName: "Conference", startTime: "09:00",
+                             durationMinutes: 900, date: "2026-05-21", externalEventId: "conf", kind: .external)
+        let next = CalBlock(id: "g_conf_2026-05-22", taskId: nil, taskName: "Conference", startTime: "00:00",
+                            durationMinutes: 1440, date: "2026-05-22", externalEventId: "conf", kind: .external)
+        let plans = planReminders(blocks: [first, next], tasks: [], level: .coach, globalLeadMin: 10, now: now)
+        XCTAssertEqual(keys(plans), ["lead:g_conf"])
+        XCTAssertFalse(isExternalContinuation(first))
+        XCTAssertTrue(isExternalContinuation(next))
+    }
+
     func testPlaceholderBlocksAreSkipped() {
         let b = mkBlock(id: "b1", taskId: "placeholder", date: "2026-05-21", kind: .placeholder)
         let plans = planReminders(blocks: [b], tasks: [], level: .coach, globalLeadMin: 10, now: now)
