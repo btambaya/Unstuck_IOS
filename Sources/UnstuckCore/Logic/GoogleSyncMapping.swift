@@ -98,7 +98,8 @@ public func externalEventBlocks(_ ev: ExternalEvent, fromYmd: String? = nil, toY
 }
 
 /// One reconciled Google pull: the external blocks to upsert plus the
-/// stale in-window external block ids to drop. Pure — the Edge-Function
+/// external block ids to drop (stale in-window ones, and imports nothing
+/// reconciles any more — see reconcileCalendarPull). Pure — the Edge-Function
 /// pull and the local reads/writes happen in SyncCoordinator.pullCalendar.
 public struct CalendarPullPlan: Equatable, Sendable {
     public var toUpsert: [CalBlock]

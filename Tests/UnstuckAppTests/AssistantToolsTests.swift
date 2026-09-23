@@ -3229,6 +3229,8 @@ private final class FakeGoogleCalls: GoogleEventCalls, @unchecked Sendable {
     private var down = false
     private var gone = false
     private var disconnectDown = false
+    private var deletesDown = false
+    private var insertHook: (@Sendable () -> Void)?
     private var minted = 0
     var calls: [String] { lock.withLock { log } }
     var offline: Bool {
@@ -3244,6 +3246,15 @@ private final class FakeGoogleCalls: GoogleEventCalls, @unchecked Sendable {
         get { lock.withLock { disconnectDown } }
         set { lock.withLock { disconnectDown = newValue } }
     }
+    var deletesFail: Bool {
+        get { lock.withLock { deletesDown } }
+        set { lock.withLock { deletesDown = newValue } }
+    }
+    /// Runs while an INSERT is in flight (before it answers).
+    var duringInsert: (@Sendable () -> Void)? {
+        get { lock.withLock { insertHook } }
+        set { lock.withLock { insertHook = newValue } }
+    }
     private func record(_ call: String) throws {
         try lock.withLock {
             log.append(call)
@@ -3252,6 +3263,7 @@ private final class FakeGoogleCalls: GoogleEventCalls, @unchecked Sendable {
     }
     func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String) async throws -> String {
         try record("insert \(calendarId) \(summary)")
+        duringInsert?()
         return lock.withLock { minted += 1; return "evt\(minted)" }
     }
     func patchEvent(eventId: String, connectionId: String, calendarId: String, summary: String?, start: String?, end: String?) async throws {
@@ -3260,6 +3272,7 @@ private final class FakeGoogleCalls: GoogleEventCalls, @unchecked Sendable {
     }
     func deleteEvent(eventId: String, connectionId: String, calendarId: String) async throws {
         try record("delete \(calendarId) \(eventId)")
+        if deletesFail { throw Offline() }
     }
     func disconnect(connectionId: String) async throws {
         try record("disconnect \(connectionId)")
@@ -3452,6 +3465,27 @@ final class GoogleWriteBackAppTests: XCTestCase {
         await model.awaitGoogleMirrors()
         XCTAssertEqual(try db.fetchById(CalBlock.self, id: fresh.id)?.externalEventId, "evt1")
         XCTAssertNil(try db.fetchById(CalBlock.self, id: "g_evt1"))
+    }
+
+    /// The row was deleted while its INSERT ran, and deleting the new event
+    /// failed: it is kept in the backlog (so the pull never imports it and
+    /// the next sync deletes it), never left in Google owned by nothing.
+    func testANewEventNoRowWillCarryIsKeptUntilItsDeleteGoesThrough() async throws {
+        let google = FakeGoogleCalls()
+        let (model, db) = try liveModel(google)
+        let fresh = block()
+        google.duringInsert = { try? db.deleteById(CalBlock.self, id: fresh.id) }
+        google.deletesFail = true
+        await model.saveBlockAwaiting(fresh)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls, ["insert primary Dentist", "delete primary evt1"])
+        XCTAssertEqual(model.googleBacklog?.pendingDeleteEventIds(), ["evt1"])
+
+        google.deletesFail = false
+        model.retryGoogleBacklog()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(google.calls.last, "delete primary evt1")
+        XCTAssertEqual(model.googleBacklog?.pendingDeleteEventIds(), [])
     }
 
     /// A web-era event lives on the connection's first selected calendar:

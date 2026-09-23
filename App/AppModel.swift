@@ -2558,15 +2558,27 @@ final class AppModel {
         case .gone:
             // Deleted while the event was being created: don't resurrect the
             // row with a stamp, drop the new event.
-            try? await calendar.deleteEvent(eventId: newId, connectionId: conn.id, calendarId: calId)
+            await dropNewEvent(newId, of: block, conn: conn, calls: calendar)
         case .insertUnresolved:
             // Deleted and minted again (or retimed by a user's mint) during
             // the call: this event belongs to no confirmed row. Drop it; the
             // insert's outcome mirrors the row once confirmed (rule G).
-            try? await calendar.deleteEvent(eventId: newId, connectionId: conn.id, calendarId: calId)
+            await dropNewEvent(newId, of: block, conn: conn, calls: calendar)
             _ = mirrorGate?.requestMirror(rowId: block.id)
         }
         return true
+    }
+
+    /// An event this push just created that no row will carry: delete it,
+    /// and keep it in the backlog if that fails — nothing else knows it is
+    /// ours (audit 2026-09-22, C24).
+    private func dropNewEvent(_ eventId: String, of block: CalBlock, conn: CalendarConnection,
+                              calls: GoogleEventCalls) async {
+        do {
+            try await calls.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: "primary")
+        } catch {
+            googleBacklog?.recordDelete(PendingGoogleDelete(blockId: block.id, eventId: eventId, connectionId: conn.id))
+        }
     }
 
     /// Delete a block locally + on Google (if it was pushed). External g_
