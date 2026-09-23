@@ -43,6 +43,28 @@ phases land. Newest status at the top.
 
 
 
+## Where things stand (2026-09-23, night) — build 87: daily voice minutes
+
+- **Ahmad's decision** (DECISIONS.md "Voice minutes"): ONE allowance for Talk AND assistant calls, 10 min per user per LOCAL day
+  (notification_preferences.timezone); the team (Ahmad's and Zubair's accounts + the App Review demo) gets 60. Out of minutes →
+  a call does not ring and a quiet "Call skipped" bell card is written; one spoken warning at a minute left.
+- **Where it is enforced:** the voice-proxy Worker (unstuck `workers/voice-proxy`) + migration 077 (`voice_usage` ledger,
+  `voice_allowances`, RPCs `voice_seconds_remaining` / `record_voice_seconds`, `dispatch_calls` skip). The Worker sends
+  `{"type":"unstuck.voice_budget","remaining_ms":…,"warn":…}` frames, charges every two minutes and at close, and hangs up 1008
+  when the minutes run out; a connect with none left is refused (Android gets the 429 it already maps).
+- **iOS client:** VoiceModeScreen shows "N min left today" (counted down between the proxy's figures); BargeIn/VoiceRealtimeClient
+  speak the one warning without breaking turn-taking; the daily-limit close ends a call normally and reads as the minutes even
+  with no close code; NotificationCenterScreen shows the skipped-call card.
+- **Tests:** 1270 package tests green; app unit tests green (bar the known CrashBreadcrumbs order flake). A FULL run including
+  UITests showed 4 UI-test failures in screens b87 does not touch (collections detail open, calendar Next day, share People card) —
+  the ship loop had only been running `-only-testing:UnstuckAppTests`; triage on branch fix/ui-tests.
+- **Also live tonight (backend):** migration 078 — push tokens carry the auth session (`device_tokens.session_id`); every sender
+  reads `live_device_tokens`, so a remote sign-out / password change stops pushes and calls to that phone. Clients can no longer
+  INSERT/UPDATE device_tokens directly (registration goes through `register-push-token`; the client DELETE on sign-out still works).
+- **Device checks for Ahmad:** Talk shows the minutes line; the spoken warning at 1 min; a 0-minute account is refused in plain
+  words; a scheduled call with no minutes left doesn't ring and leaves the bell card; sign out everywhere on web → a test call
+  must not ring on the phone.
+
 ## Where things stand (2026-09-23, evening) — build 86: the beta build (audit P2 batches 1–5 + Gregorian dates)
 
 Ahmad: "work on 1 to 5, then I will do all that's required to start beta testing by end of day". Six groups, each implemented → adversarially reviewed → fixed up (results: audit/prelaunch-2026-09-22/p2-batch-results.json; evidence: p2-batch-input.json). Merge conflicts were resolved by hand:
