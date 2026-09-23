@@ -30,20 +30,57 @@ final class PushRegistrar {
         set { UserDefaults.standard.set(newValue, forKey: accountSignedInKey) }
     }
 
-    /// A registerForRemoteNotifications() is outstanding (its token arrives
-    /// via didReceive) — so the launch path and a sign-in don't both ask.
-    private var apnsRequested = false
+    /// When the outstanding registerForRemoteNotifications() was made (its
+    /// token arrives via didReceive) — so the launch path and a sign-in don't
+    /// both ask.
+    private(set) var apnsRequestedAt: Date?
+
+    /// How long an unanswered request holds off the next one. A re-register
+    /// right after sign-out's unregister (sign-out → sign-in in one process)
+    /// is not verified to always call back, and a request that never answered
+    /// used to block every later one until a relaunch — the next account got
+    /// no alert pushes (audit 2026-09-22, C36).
+    nonisolated static let apnsRequestLapse: TimeInterval = 30
+
+    /// Pure: whether `requestAPNsToken` asks now.
+    nonisolated static func shouldRequestAPNs(accountSignedIn: Bool?, requestedAt: Date?, now: Date) -> Bool {
+        guard accountSignedIn != false else { return false }
+        guard let requestedAt else { return true }
+        return now.timeIntervalSince(requestedAt) >= apnsRequestLapse
+    }
 
     /// Ask APNs for the alert-push token, if notifications are allowed and
     /// this device isn't signed out. A signed-out launch skips it (see
-    /// `accountSignedIn`), so the next sign-in asks here.
+    /// `accountSignedIn`), so the next sign-in asks here; a signed-in
+    /// foreground with no token yet asks again (AppModel.syncNow).
     func requestAPNsToken() {
-        guard Self.accountSignedIn != false, !apnsRequested else { return }
-        apnsRequested = true
+        let now = Date()
+        guard Self.shouldRequestAPNs(accountSignedIn: Self.accountSignedIn, requestedAt: apnsRequestedAt, now: now)
+        else { return }
+        apnsRequestedAt = now
         Task { @MainActor in
             let status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
-            guard [.authorized, .provisional, .ephemeral].contains(status) else { apnsRequested = false; return }
+            guard [.authorized, .provisional, .ephemeral].contains(status) else { apnsRequestedAt = nil; return }
             UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    /// AppModel.start, once the stored session has been read: record whether
+    /// an account is signed in here. An install from before the flag that
+    /// launches signed out records false AND drops both registrations then
+    /// and there: the launch path had already asked for both (the flag was
+    /// unset), and a token that came back before this point was kept — so the
+    /// old account's briefs and share pushes kept reaching a phone signed out
+    /// on build 85 or earlier (audit 2026-09-22, C36). Only while protected
+    /// data is available: before the first unlock after a reboot the session
+    /// (and this flag) read as absent even on a signed-in phone.
+    func recordLaunch(sessionFound: Bool, protectedDataAvailable: Bool) {
+        if sessionFound {
+            Self.accountSignedIn = true
+        } else if Self.accountSignedIn == nil, protectedDataAvailable {
+            Self.accountSignedIn = false
+            unregisterFromAPNs()
+            VoipPushRegistry.shared.unregisterBestEffort()
         }
     }
 
@@ -53,13 +90,13 @@ final class PushRegistrar {
     /// pushes kept arriving. Unregistered, the phone drops them and APNs
     /// answers 410, which the senders prune on (audit 2026-09-22, C36).
     func unregisterFromAPNs() {
-        apnsRequested = false
+        apnsRequestedAt = nil
         apnsTokenHex = nil
         UIApplication.shared.unregisterForRemoteNotifications()
     }
 
     func didFailToRegister() {
-        apnsRequested = false
+        apnsRequestedAt = nil
     }
     /// The PushKit VoIP token (C1 "Unstuck calls you"), hex. Persisted by
     /// VoipPushRegistry; surfaces here so Settings can show "this iPhone can
@@ -69,7 +106,7 @@ final class PushRegistrar {
     var onVoipToken: ((String) -> Void)?
 
     func didReceive(_ tokenHex: String) {
-        apnsRequested = false
+        apnsRequestedAt = nil
         // A registration that was in flight when the account signed out: undo
         // it rather than keep (or upload) a token nobody is signed in for.
         guard Self.accountSignedIn != false else {

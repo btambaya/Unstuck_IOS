@@ -1301,17 +1301,77 @@ final class AppCallEnvironmentAnchorTests: XCTestCase {
 final class SignedOutCallTests: XCTestCase {
     private var savedFlag: Bool?
     private var savedToken: String?
+    private var savedApnsToken: String?
+    private var savedOnToken: ((String) -> Void)?
 
     override func setUp() async throws {
         try await super.setUp()
         savedFlag = PushRegistrar.accountSignedIn
         savedToken = VoipPushRegistry.storedToken
+        savedApnsToken = PushRegistrar.shared.apnsTokenHex
+        savedOnToken = PushRegistrar.shared.onToken
+        PushRegistrar.shared.onToken = nil   // no registerPush from the tokens fed below
     }
 
     override func tearDown() async throws {
+        if let savedApnsToken {
+            PushRegistrar.accountSignedIn = true
+            PushRegistrar.shared.didReceive(savedApnsToken)
+        }
+        PushRegistrar.shared.onToken = savedOnToken
         PushRegistrar.accountSignedIn = savedFlag
         UserDefaults.standard.set(savedToken, forKey: VoipPushRegistry.tokenKey)
         try await super.tearDown()
+    }
+
+    /// A phone signed out on build 85 or earlier: its first launch of this
+    /// build found the flag unset, so the launch path asked for BOTH
+    /// registrations, and a token that came back before start() recorded
+    /// "signed out" was kept — nothing ever unregistered it.
+    func testALegacySignedOutLaunchDropsTheRegistrationsItAlreadyMade() {
+        let push = PushRegistrar.shared
+        PushRegistrar.accountSignedIn = nil
+        UserDefaults.standard.set("a1b2c3", forKey: VoipPushRegistry.tokenKey)
+        push.didReceive("feedface")   // the launch path's APNs token lands first
+        XCTAssertEqual(push.apnsTokenHex, "feedface")
+
+        push.recordLaunch(sessionFound: false, protectedDataAvailable: true)
+
+        XCTAssertEqual(PushRegistrar.accountSignedIn, false)
+        XCTAssertNil(push.apnsTokenHex, "the APNs registration is dropped")
+        XCTAssertNil(VoipPushRegistry.storedToken, "and the VoIP one")
+    }
+
+    func testALaunchRecordsOnlyWhatItCouldReallyRead() {
+        let push = PushRegistrar.shared
+        PushRegistrar.accountSignedIn = nil
+        UserDefaults.standard.set("a1b2c3", forKey: VoipPushRegistry.tokenKey)
+        // Before the first unlock after a reboot the session only LOOKS absent.
+        push.recordLaunch(sessionFound: false, protectedDataAvailable: false)
+        XCTAssertNil(PushRegistrar.accountSignedIn)
+        XCTAssertEqual(VoipPushRegistry.storedToken, "a1b2c3", "nothing dropped")
+
+        push.recordLaunch(sessionFound: true, protectedDataAvailable: true)
+        XCTAssertEqual(PushRegistrar.accountSignedIn, true)
+        // A recorded flag is left to the scrub / the next sign-in.
+        push.recordLaunch(sessionFound: false, protectedDataAvailable: true)
+        XCTAssertEqual(PushRegistrar.accountSignedIn, true)
+        XCTAssertEqual(VoipPushRegistry.storedToken, "a1b2c3")
+    }
+
+    /// One APNs request at a time — but one that never answered no longer
+    /// blocks every later one for the rest of the process.
+    func testAnUnansweredAPNsRequestLapses() {
+        let t0 = Date()
+        XCTAssertTrue(PushRegistrar.shouldRequestAPNs(accountSignedIn: true, requestedAt: nil, now: t0))
+        XCTAssertFalse(PushRegistrar.shouldRequestAPNs(accountSignedIn: true, requestedAt: t0,
+                                                       now: t0.addingTimeInterval(5)))
+        XCTAssertTrue(PushRegistrar.shouldRequestAPNs(accountSignedIn: true, requestedAt: t0,
+                                                      now: t0.addingTimeInterval(PushRegistrar.apnsRequestLapse)))
+        XCTAssertTrue(PushRegistrar.shouldRequestAPNs(accountSignedIn: nil, requestedAt: nil, now: t0),
+                      "an install from before the flag")
+        XCTAssertFalse(PushRegistrar.shouldRequestAPNs(accountSignedIn: false, requestedAt: nil, now: t0),
+                       "never while signed out")
     }
 
     func testKilledStateSignedInIsTheAccountFlagNotALeftoverToken() {

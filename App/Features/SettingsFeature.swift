@@ -609,7 +609,8 @@ private struct AccountSettingsView: View {
                               destructive: true, locked: model.tourRunning) {
                     // Edits still queued: say where they go before they're
                     // parked (audit 2026-09-22, C36).
-                    signOutWarning = AppModel.unsyncedSignOutWarning(pending: model.pendingSyncCount)
+                    signOutWarning = AppModel.unsyncedSignOutWarning(pending: model.pendingSyncCount,
+                                                                     quarantined: model.quarantinedSyncCount)
                     if signOutWarning == nil { model.signOut(); dismiss() }
                 }
             }

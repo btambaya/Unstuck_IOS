@@ -3340,4 +3340,59 @@ final class SignOutPrivacyTests: XCTestCase {
         await model.handlePushAction(.open(deepLink: "unstuck://task/t-proposal"))
         XCTAssertTrue(model.router.hasActivePresentation)
     }
+
+    /// Today's own widget writer. Today stays mounted through the Sign-out
+    /// button's drain (and for a render after a reactive sign-out) while the
+    /// store still holds A's rows: a change to them then wrote A's next task
+    /// back onto the home / lock widget after the scrub had emptied it.
+    func testTodaysWidgetWriterStopsOnceSignedOut() async throws {
+        let group = try XCTUnwrap(UserDefaults(suiteName: AppGroup.id))
+        group.removeObject(forKey: "startNextSnapshot")
+        let repo = try XCTUnwrap(model.taskRepo)
+        let today = TodayModel(repo)
+        let obs = Task { await today.observe() }
+        defer { obs.cancel() }
+        func settle(_ done: () -> Bool) async throws {
+            var tries = 0
+            while !done() && tries < 60 { try await Task.sleep(nanoseconds: 50_000_000); tries += 1 }
+        }
+        try await settle { group.object(forKey: "startNextSnapshot") != nil }
+        XCTAssertNotNil(group.object(forKey: "startNextSnapshot"), "signed in: Today writes the widget")
+
+        signOut()
+        XCTAssertNil(group.object(forKey: "startNextSnapshot"), "the scrub cleared it")
+        // A's rows change before the sync engine wipes the store (a realtime
+        // edit, the drain): one more open task, so the widget content differs.
+        try repo.upsert(TaskItem(id: "a-late", name: "A's late task", estimateMin: 10,
+                                 createdAt: "2026-09-22T09:00:00.000Z", updatedAt: "2026-09-22T09:00:00.000Z"))
+        try await settle { today.all.contains { $0.id == "a-late" } }
+        XCTAssertTrue(today.all.contains { $0.id == "a-late" }, "the emission reached Today")
+        XCTAssertNil(group.object(forKey: "startNextSnapshot"), "and wrote nothing for the widget")
+    }
+
+    /// Signed in with no APNs token (a sign-in's re-register after the
+    /// sign-out's unregister that never answered): the next foreground asks
+    /// again instead of leaving the account without alert pushes.
+    func testASignedInForegroundWithNoTokenAsksForOneAgain() {
+        let push = PushRegistrar.shared
+        push.unregisterFromAPNs()   // no token, nothing outstanding
+        model.syncNow()
+        XCTAssertNotNil(push.apnsRequestedAt, "asked on the foreground")
+
+        push.unregisterFromAPNs()
+        model.signedIn = false
+        model.syncNow()
+        XCTAssertNil(push.apnsRequestedAt, "never while signed out")
+    }
+
+    /// The Sign out row's split: the ops the server refused are counted
+    /// apart from the ones still waiting to be sent.
+    func testQuarantinedChangesAreCountedApart() throws {
+        let outbox = OutboxStore(try XCTUnwrap(model.db))
+        let now = "2026-09-22T09:00:00.000Z"
+        try outbox.enqueue(table: "tasks", rowId: "t-waiting", kind: .upsert, payload: "{}", nowISO: now)
+        let refused = try outbox.enqueue(table: "tasks", rowId: "t-refused", kind: .upsert, payload: "{}", nowISO: now)
+        for _ in 0..<OutboxStore.quarantineCap { try outbox.bumpAttempts(try XCTUnwrap(refused.opSeq)) }
+        XCTAssertEqual(model.quarantinedSyncCount, 1)
+    }
 }

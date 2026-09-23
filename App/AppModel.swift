@@ -971,10 +971,11 @@ final class AppModel {
         coordinator = coord
         signedIn = coord.auth.currentUserId != nil
         // The persisted account flag follows the session found at launch. An
-        // install from before the flag records "signed out" here too, so its
-        // next launch stops re-registering for the previous account's pushes
-        // (PushRegistrar.accountSignedIn; audit 2026-09-22, C36).
-        if signedIn || PushRegistrar.accountSignedIn == nil { PushRegistrar.accountSignedIn = signedIn }
+        // install from before the flag records "signed out" here too and drops
+        // the push registrations this launch already made for the previous
+        // account (PushRegistrar.recordLaunch; audit 2026-09-22, C36).
+        PushRegistrar.shared.recordLaunch(sessionFound: signedIn,
+                                          protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable)
         // Seed the cached identity once at cold launch (one keychain read here,
         // off the render/snapshot path). Thereafter it's refreshed from the
         // authStateChanges session — see cachedUserName's note.
@@ -1175,6 +1176,11 @@ final class AppModel {
         // status read must not impose unflagged offline state by rev
         // authority). Belt-and-braces beside the channel's socket monitor.
         if isPartnerCoFocusCandidate(cachedLiveSession) { liveCoFocus?.reexchange() }
+        // Signed in with no APNs token yet: ask again. The re-register a
+        // sign-in makes after the sign-out's unregister may never answer, and
+        // the account then got no alert pushes until a relaunch (audit
+        // 2026-09-22, C36). No-op while a recent request is still out.
+        if signedIn, PushRegistrar.shared.apnsTokenHex == nil { PushRegistrar.shared.requestAPNsToken() }
         guard let coord = coordinator else { return }
         Task { await coord.syncNow() }
     }
@@ -1579,14 +1585,30 @@ final class AppModel {
     /// here" (they're parked, not lost).
     var pendingSyncCount: Int { coordinator?.pendingOutboxCount() ?? 0 }
 
+    /// The part of `pendingSyncCount` the server refused `quarantineCap`
+    /// times: skipped by every drain, and parked / restored with their
+    /// attempts, so no sign-in ever syncs them.
+    var quarantinedSyncCount: Int { db.flatMap { try? OutboxStore($0).quarantinedCount() } ?? 0 }
+
     /// What the Sign out row says before signing out with `pending` edits
     /// still queued (offline / a slow link) — nil when nothing is waiting.
     /// The row used to sign out at once: the bounded drain parked the rest on
-    /// this iPhone with no word (audit 2026-09-22, C36).
-    static func unsyncedSignOutWarning(pending: Int) -> String? {
-        guard pending > 0 else { return nil }
-        let changes = pending == 1 ? "1 change hasn’t" : "\(pending) changes haven’t"
-        return "\(changes) reached the server yet. If you sign out now, they wait on this iPhone and sync the next time you sign in here — until then they won’t show up anywhere else."
+    /// this iPhone with no word (audit 2026-09-22, C36). `quarantined` (part
+    /// of `pending`) is told apart: promising those "sync the next time you
+    /// sign in" was false, on every sign-out.
+    static func unsyncedSignOutWarning(pending: Int, quarantined: Int = 0) -> String? {
+        let stuck = min(max(quarantined, 0), max(pending, 0))
+        let queued = max(pending, 0) - stuck
+        var lines: [String] = []
+        if queued > 0 {
+            let changes = queued == 1 ? "1 change hasn’t" : "\(queued) changes haven’t"
+            lines.append("\(changes) reached the server yet. If you sign out now, any that still can’t be sent wait on this iPhone and sync the next time you sign in here — until then they won’t show up anywhere else.")
+        }
+        if stuck > 0 {
+            let changes = stuck == 1 ? "1 change the server couldn’t accept stays" : "\(stuck) changes the server couldn’t accept stay"
+            lines.append("\(changes) on this iPhone only — signing in again won’t sync \(stuck == 1 ? "it" : "them").")
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n\n")
     }
 
     func signOut() {
