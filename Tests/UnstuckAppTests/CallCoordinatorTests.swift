@@ -13,6 +13,7 @@
 //   nobody signed in → dropped silently,
 //   the outcome reporter persists, flushes in order and retries.
 
+import PushKit
 import XCTest
 import UnstuckCore
 import UnstuckData
@@ -1285,5 +1286,69 @@ final class AppCallEnvironmentAnchorTests: XCTestCase {
 
     func testACallWithNoTaskAnchorHasNothingToCheck() {
         XCTAssertTrue(env.anchorIsLive(taskId: nil, blockId: nil))
+    }
+}
+
+// MARK: - a signed-out phone never rings for the previous account (audit 2026-09-22, C36)
+//
+// Before AppModel attaches (a killed-state VoIP launch) "signed in" was "a VoIP
+// token is stored" — and every signed-out launch re-registered PushKit and
+// stored one again, so the previous account's calls rang. The persisted
+// account flag the sign-out scrub writes is the answer now, and a signed-out
+// launch doesn't register at all.
+
+@MainActor
+final class SignedOutCallTests: XCTestCase {
+    private var savedFlag: Bool?
+    private var savedToken: String?
+
+    override func setUp() async throws {
+        try await super.setUp()
+        savedFlag = PushRegistrar.accountSignedIn
+        savedToken = VoipPushRegistry.storedToken
+    }
+
+    override func tearDown() async throws {
+        PushRegistrar.accountSignedIn = savedFlag
+        UserDefaults.standard.set(savedToken, forKey: VoipPushRegistry.tokenKey)
+        try await super.tearDown()
+    }
+
+    func testKilledStateSignedInIsTheAccountFlagNotALeftoverToken() {
+        UserDefaults.standard.set("a1b2c3", forKey: VoipPushRegistry.tokenKey)
+        let env = AppCallEnvironment(model: nil)
+        PushRegistrar.accountSignedIn = false
+        XCTAssertFalse(env.isSignedIn, "signed out here, whatever token PushKit handed back")
+        PushRegistrar.accountSignedIn = true
+        XCTAssertTrue(env.isSignedIn)
+        // An install from before the flag keeps the old proxy.
+        PushRegistrar.accountSignedIn = nil
+        XCTAssertTrue(env.isSignedIn)
+        UserDefaults.standard.removeObject(forKey: VoipPushRegistry.tokenKey)
+        XCTAssertFalse(env.isSignedIn)
+    }
+
+    func testASignedOutLaunchDoesNotRegisterForVoip() {
+        XCTAssertEqual(VoipPushRegistry.launchPushTypes(accountSignedIn: false), [])
+        XCTAssertEqual(VoipPushRegistry.launchPushTypes(accountSignedIn: true), [.voIP])
+        XCTAssertEqual(VoipPushRegistry.launchPushTypes(accountSignedIn: nil), [.voIP])
+    }
+
+    /// The push that still arrives is REPORTED (Apple's rule) and ended at
+    /// once — no ring, no outcome, none of the old account's notes.
+    func testAKilledStatePushAfterSignOutIsReportedThenEndedSilently() {
+        UserDefaults.standard.set("a1b2c3", forKey: VoipPushRegistry.tokenKey)
+        PushRegistrar.accountSignedIn = false
+        let provider = FakeCallProvider(), notifier = FakeNotifier(), reporter = FakeReporter()
+        let sut = CallCoordinator(provider: provider, controller: FakeCallController(),
+                                  environment: AppCallEnvironment(model: nil), launcher: FakeLauncher(),
+                                  notifier: notifier, reporter: reporter, clock: FakeClock())
+        sut.reportIncoming(IncomingCallPayload(callId: CallCoordinatorTests.callId, label: "A's call",
+                                               notes: ["A's private note"]))
+        XCTAssertEqual(provider.incoming.count, 1, "reported to CallKit")
+        XCTAssertEqual(provider.ended.map(\.reason), [.failed])
+        XCTAssertNil(sut.active)
+        XCTAssertTrue(reporter.reports.isEmpty)
+        XCTAssertTrue(notifier.posted.isEmpty)
     }
 }

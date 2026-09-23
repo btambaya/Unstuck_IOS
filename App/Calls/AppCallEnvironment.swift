@@ -16,10 +16,10 @@ import UserNotifications
 /// attached (a killed-state VoIP launch) it falls back to the only signals
 /// that exist without the store: the focus Live Activity for "mid-focus",
 /// "anchor is live" for the stale rule (ring rather than silently drop), the
-/// UserDefaults-backed call hours, and — for "signed in" — whether this
-/// device still holds a VoIP registration (sign-out wipes it via
-/// VoipPushRegistry.unregisterBestEffort, so a queued call that lands after
-/// a sign-out is dropped instead of ringing with the old account's notes).
+/// UserDefaults-backed call hours, and — for "signed in" — the persisted
+/// account flag the sign-out scrub clears (PushRegistrar.accountSignedIn), so
+/// a queued call that lands after a sign-out is dropped instead of ringing
+/// with the old account's notes.
 /// That proxy is only good enough for the VoIP path: `isSessionKnown` tells
 /// the coordinator when it is the real session, so the alert-tap fallback
 /// (which runs exactly when there is NO VoIP token) waits for AppModel
@@ -32,7 +32,11 @@ final class AppCallEnvironment: CallEnvironment {
 
     var isSignedIn: Bool {
         if let m = model { return m.signedIn }
-        return VoipPushRegistry.storedToken != nil
+        // The persisted account flag. The token alone came back on the next
+        // signed-out launch, so the previous account's calls rang again (audit
+        // 2026-09-22, C36); it stays the answer only on an install from
+        // before the flag.
+        return PushRegistrar.accountSignedIn ?? (VoipPushRegistry.storedToken != nil)
     }
 
     var isSessionKnown: Bool { model != nil }

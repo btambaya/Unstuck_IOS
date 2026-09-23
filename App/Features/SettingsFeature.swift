@@ -565,6 +565,7 @@ private struct AccountSettingsView: View {
     @State private var showFeedback = false
     @State private var message: String?
     @State private var messageIsError = false
+    @State private var signOutWarning: String?
 
     var body: some View {
         SettingsScaffold(eyebrow: "Settings · Account", title: "Your account.") {
@@ -606,7 +607,10 @@ private struct AccountSettingsView: View {
                 CardDivider()
                 SettingTapRow(label: "Sign out", value: "End this session",
                               destructive: true, locked: model.tourRunning) {
-                    model.signOut(); dismiss()
+                    // Edits still queued: say where they go before they're
+                    // parked (audit 2026-09-22, C36).
+                    signOutWarning = AppModel.unsyncedSignOutWarning(pending: model.pendingSyncCount)
+                    if signOutWarning == nil { model.signOut(); dismiss() }
                 }
             }
             if let message {
@@ -618,6 +622,13 @@ private struct AccountSettingsView: View {
         }
         .sheet(item: $exportURL) { url in
             ActivityView(items: [url]) { AppModel.removeExportFile(url) }
+        }
+        .alert("Sign out with changes unsynced?",
+               isPresented: Binding(get: { signOutWarning != nil }, set: { if !$0 { signOutWarning = nil } })) {
+            Button("Sign out", role: .destructive) { model.signOut(); dismiss() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(signOutWarning ?? "")
         }
         .sheet(isPresented: $showFeedback) { FeedbackSheet() }
         .sheet(isPresented: $showName) {

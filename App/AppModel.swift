@@ -891,6 +891,7 @@ final class AppModel {
         startCaptureArchiveObservation(database)
         configured = true
         signedIn = true
+        PushRegistrar.accountSignedIn = true
         profileFactsHydrated = true   // nothing to pull — the seed IS the memory
         onboarded = true
         onboardingResolved = true
@@ -969,6 +970,11 @@ final class AppModel {
         let coord = SyncCoordinator(provider: provider, db: database)
         coordinator = coord
         signedIn = coord.auth.currentUserId != nil
+        // The persisted account flag follows the session found at launch. An
+        // install from before the flag records "signed out" here too, so its
+        // next launch stops re-registering for the previous account's pushes
+        // (PushRegistrar.accountSignedIn; audit 2026-09-22, C36).
+        if signedIn || PushRegistrar.accountSignedIn == nil { PushRegistrar.accountSignedIn = signedIn }
         // Seed the cached identity once at cold launch (one keychain read here,
         // off the render/snapshot path). Thereafter it's refreshed from the
         // authStateChanges session — see cachedUserName's note.
@@ -1049,7 +1055,14 @@ final class AppModel {
 
         // Register the APNs token (now or when it arrives).
         PushRegistrar.shared.onToken = { [weak self] hex in self?.registerPush(hex) }
-        if let existing = PushRegistrar.shared.apnsTokenHex { registerPush(existing) }
+        if let existing = PushRegistrar.shared.apnsTokenHex {
+            registerPush(existing)
+        } else if signedIn {
+            // A launch that began with the flag saying "signed out" skipped
+            // the request (a sign-out killed before it finished). No-op when
+            // the launch path already asked.
+            PushRegistrar.shared.requestAPNsToken()
+        }
         // "Unstuck calls you" (C1): bind the CallKit coordinator to the live store + calls client.
         CallCoordinator.shared.attach(model: self, client: coord.calls)
         installCallVoiceLauncher()
@@ -1202,7 +1215,12 @@ final class AppModel {
     /// Recompute + write the Start-Next widget snapshot from the local
     /// store, then poke WidgetKit (used by the BG refresh task).
     func refreshWidgetSnapshot() {
-        guard let repo = taskRepo else { return }
+        // Never while signed out: the scrub empties the App Group, but the
+        // sync engine wipes the store only later (after realtime teardown), so
+        // a `.background` or BG-refresh pass in between wrote the signed-out
+        // account's next task, counts and Siri task list back for the widget
+        // and Siri (audit 2026-09-22, C35).
+        guard signedIn, let repo = taskRepo else { return }
         let tasks = (try? repo.all()) ?? []
         let blocks = (try? db?.fetchAllCalBlocks()) ?? []
         let collections = (try? db?.fetchAllCollections()) ?? []
@@ -1253,7 +1271,10 @@ final class AppModel {
     }
 
     func registerPush(_ tokenHex: String) {
-        guard let coord = coordinator else { return }
+        // Not once the sign-out scrub has run (the flag goes false before the
+        // JWT does): a token arriving during the sign-out's drain recreated the
+        // device row the unregister was about to delete (audit 2026-09-22, C36).
+        guard signedIn, PushRegistrar.accountSignedIn != false, let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
         Task { try? await coord.push.register(deviceId: deviceId, apnsToken: tokenHex) }
     }
@@ -1307,6 +1328,9 @@ final class AppModel {
                     if self.signedIn && isSignOut { self.scrubDeviceLocalUserContent() }
                     let becameAuthed = isAuthed && !self.signedIn
                     self.signedIn = isAuthed
+                    // Only on the transition: a token refresh during the
+                    // Sign-out button's drain must not undo the scrub's false.
+                    if becameAuthed { PushRegistrar.accountSignedIn = true }
                     // Refresh cached identity from the session in hand (no
                     // keychain read). Sign-out passes nil → clears it.
                     self.cachedUserName = AuthService.displayName(from: session)
@@ -1332,6 +1356,10 @@ final class AppModel {
                     // must recreate it for the NEW user.
                     if isAuthed, let hex = PushRegistrar.shared.apnsTokenHex {
                         self.registerPush(hex)
+                    } else if becameAuthed {
+                        // The sign-out dropped this device's APNs registration
+                        // too (C36): ask again; the token lands in registerPush.
+                        PushRegistrar.shared.requestAPNsToken()
                     }
                     // Usage-analytics sign-in ping (not on recovery — that's a
                     // re-auth, not a real login). Throttled to once / 12h / user.
@@ -1551,6 +1579,16 @@ final class AppModel {
     /// here" (they're parked, not lost).
     var pendingSyncCount: Int { coordinator?.pendingOutboxCount() ?? 0 }
 
+    /// What the Sign out row says before signing out with `pending` edits
+    /// still queued (offline / a slow link) — nil when nothing is waiting.
+    /// The row used to sign out at once: the bounded drain parked the rest on
+    /// this iPhone with no word (audit 2026-09-22, C36).
+    static func unsyncedSignOutWarning(pending: Int) -> String? {
+        guard pending > 0 else { return nil }
+        let changes = pending == 1 ? "1 change hasn’t" : "\(pending) changes haven’t"
+        return "\(changes) reached the server yet. If you sign out now, they wait on this iPhone and sync the next time you sign in here — until then they won’t show up anywhere else."
+    }
+
     func signOut() {
         guard let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
@@ -1619,11 +1657,23 @@ final class AppModel {
         _tour?.teardownForSignOut()
         _tour = nil
         TourStore.clear()
-        // What the bottom-bar + is aimed at: the Collections surface described
-        // A's shelf. The tab setter retracts it on every tab change, but a
-        // sign-out tears the whole scaffold down without one.
-        router.clearCollectionsSurface()
-        NotificationLog.shared.clear()
+        // Everything the router holds described A's session: the Collections
+        // surface the bottom-bar + is aimed at (the tab setter retracts it on
+        // every tab change, but a sign-out tears the whole scaffold down
+        // without one), and every sheet / cover / parked deep link — the
+        // router outlives the scaffold, so they came back at the next sign-in
+        // (audit 2026-09-22, C35).
+        router.resetForSignOut()
+        // Today's "Just now" card (shown for 6 h) named A's task.
+        lastRecap = nil
+        // Shared-with-me titles, outgoing badges and shared calendar blocks
+        // were A's; the next account's Today rendered them until its first
+        // refresh returned. Dropped rather than emptied, so a refresh of A's
+        // still in flight lands in the discarded model (audit 2026-09-22, C35).
+        _shareState?.onChange = nil
+        _shareState?.stop()
+        _shareState = nil
+        NotificationLog.shared.clear()   // the tray too (NotificationLog.clear)
         NotificationPrefs.clearUserContent()   // per-task overrides + the cached level / lead
         PausedCheckinBudget.disarm()           // no budget settlement — the JWT is going away
         // The Inbox archive cache — from the store side (the outbox / archive
@@ -1669,6 +1719,12 @@ final class AppModel {
         // never routes through signOutAndUnregister, so drop the VoIP token +
         // any call in progress best-effort here too — else the previous
         // account's calls could still ring this device.
+        // The server row outlives an offline or reactive sign-out, so this
+        // device drops BOTH registrations and remembers it is signed out:
+        // nothing re-registers, shows, logs or rings until a sign-in (audit
+        // 2026-09-22, C36; PushRegistrar.accountSignedIn).
+        PushRegistrar.accountSignedIn = false
+        PushRegistrar.shared.unregisterFromAPNs()
         VoipPushRegistry.shared.unregisterBestEffort()
         // Gateway state is per-user too: ritual prefs + dismissed moments
         // (PAPrefsStore.scrub() under the hood, then the in-memory reset) and

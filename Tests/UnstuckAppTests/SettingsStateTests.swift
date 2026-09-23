@@ -126,3 +126,19 @@ final class SettingsStateTests: XCTestCase {
         XCTAssertEqual(d.object(forKey: "unstuck.focusSoftExit") as? Bool, false)
     }
 }
+
+// MARK: - Sign out with edits still queued (audit 2026-09-22, C36)
+
+@MainActor
+final class SignOutWarningTests: XCTestCase {
+    /// The Sign out row signs out at once only when nothing is waiting;
+    /// otherwise it first says where the queued edits go.
+    func testTheSignOutRowWarnsOnlyWhenEditsAreStillQueued() throws {
+        XCTAssertNil(AppModel.unsyncedSignOutWarning(pending: 0))
+        let one = try XCTUnwrap(AppModel.unsyncedSignOutWarning(pending: 1))
+        XCTAssertTrue(one.hasPrefix("1 change hasn’t reached the server yet."), one)
+        let three = try XCTUnwrap(AppModel.unsyncedSignOutWarning(pending: 3))
+        XCTAssertTrue(three.hasPrefix("3 changes haven’t reached the server yet."), three)
+        XCTAssertTrue(three.contains("sync the next time you sign in here"), three)
+    }
+}

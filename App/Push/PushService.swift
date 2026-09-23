@@ -13,6 +13,54 @@ final class PushRegistrar {
     private(set) var apnsTokenHex: String?
     /// Set by AppModel once the coordinator exists; called when a token arrives.
     var onToken: ((String) -> Void)?
+
+    nonisolated static let accountSignedInKey = "unstuck.push.accountSignedIn"
+
+    /// Whether an account is signed in on this device, persisted: the launch
+    /// path (before AppModel.start) and a killed-state VoIP push have no
+    /// session to ask. true = signed in; false = signed out here (the sign-out
+    /// scrub wrote it); nil = never recorded (an install from before this
+    /// flag) — callers keep their old behaviour then. A signed-out device
+    /// neither registers for pushes nor shows or logs one: the server's row
+    /// for the previous account survives an offline or reactive sign-out, so
+    /// its briefs, share pushes and calls kept reaching the phone (audit
+    /// 2026-09-22, C36).
+    nonisolated static var accountSignedIn: Bool? {
+        get { UserDefaults.standard.object(forKey: accountSignedInKey) as? Bool }
+        set { UserDefaults.standard.set(newValue, forKey: accountSignedInKey) }
+    }
+
+    /// A registerForRemoteNotifications() is outstanding (its token arrives
+    /// via didReceive) — so the launch path and a sign-in don't both ask.
+    private var apnsRequested = false
+
+    /// Ask APNs for the alert-push token, if notifications are allowed and
+    /// this device isn't signed out. A signed-out launch skips it (see
+    /// `accountSignedIn`), so the next sign-in asks here.
+    func requestAPNsToken() {
+        guard Self.accountSignedIn != false, !apnsRequested else { return }
+        apnsRequested = true
+        Task { @MainActor in
+            let status = await UNUserNotificationCenter.current().notificationSettings().authorizationStatus
+            guard [.authorized, .provisional, .ephemeral].contains(status) else { apnsRequested = false; return }
+            UIApplication.shared.registerForRemoteNotifications()
+        }
+    }
+
+    /// Sign-out: stop this device receiving the account's alert pushes. The
+    /// server row is deleted only by an online button sign-out; after an
+    /// offline or reactive one the old account's morning briefs and share
+    /// pushes kept arriving. Unregistered, the phone drops them and APNs
+    /// answers 410, which the senders prune on (audit 2026-09-22, C36).
+    func unregisterFromAPNs() {
+        apnsRequested = false
+        apnsTokenHex = nil
+        UIApplication.shared.unregisterForRemoteNotifications()
+    }
+
+    func didFailToRegister() {
+        apnsRequested = false
+    }
     /// The PushKit VoIP token (C1 "Unstuck calls you"), hex. Persisted by
     /// VoipPushRegistry; surfaces here so Settings can show "this iPhone can
     /// take calls" and so a refresh re-registers BOTH tokens.
@@ -21,6 +69,13 @@ final class PushRegistrar {
     var onVoipToken: ((String) -> Void)?
 
     func didReceive(_ tokenHex: String) {
+        apnsRequested = false
+        // A registration that was in flight when the account signed out: undo
+        // it rather than keep (or upload) a token nobody is signed in for.
+        guard Self.accountSignedIn != false else {
+            UIApplication.shared.unregisterForRemoteNotifications()
+            return
+        }
         apnsTokenHex = tokenHex
         onToken?(tokenHex)
     }
@@ -58,7 +113,9 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         Task { @MainActor in
             let granted = (try? await UNUserNotificationCenter.current()
                 .requestAuthorization(options: [.alert, .sound, .badge])) ?? false
-            if granted { UIApplication.shared.registerForRemoteNotifications() }
+            // Not while signed out (PushRegistrar.accountSignedIn): this used
+            // to re-register the token the sign-out had dropped.
+            if granted { PushRegistrar.shared.requestAPNsToken() }
         }
         return true
     }
@@ -72,6 +129,7 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
     func application(_ application: UIApplication,
                      didFailToRegisterForRemoteNotificationsWithError error: Error) {
         print("[push] APNs registration failed: \(error.localizedDescription)")
+        Task { @MainActor in PushRegistrar.shared.didFailToRegister() }
     }
 
     // Show recap/check-in banners while the app is foregrounded, and append
@@ -100,8 +158,10 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         let posted = PostedNotification(notification)
         let done = CompletionBox(call: completionHandler)
         Task { @MainActor in
-            NotificationLog.shared.add(posted)
-            done.call([.banner, .sound])
+            NotificationLog.shared.add(posted)   // a no-op while signed out
+            // Signed out, a push that still reaches the phone belongs to the
+            // account that left: never put it on screen (audit 2026-09-22, C36).
+            done.call(PushRegistrar.accountSignedIn == false ? [] : [.banner, .sound])
         }
     }
 
