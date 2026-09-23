@@ -164,6 +164,98 @@ final class FocusReentryTests: XCTestCase {
     }
 }
 
+/// A repeating task's focus starts from ITS day, never the series' lifetime
+/// total (web/Android audit 2026-09-23, W10/A13). Every occurrence session
+/// accrues onto the TEMPLATE's totalFocused, so from day 2 that number is
+/// the whole series' history: seeded into the ring, day 4 of a 25-min habit
+/// opened at 75:00 — overrun from the first second, the over-time prompt and
+/// the spoken coach firing at once. Both the Focus screen (FocusModel) and
+/// the assistant's start_focus (startFocusJoinOrMint) seeded it.
+@MainActor
+final class RepeatingFocusPriorTests: XCTestCase {
+    private let stamp = "2026-09-01T08:00:00.000Z"
+    private var today: String { Clock.todayISO() }
+
+    /// Day 4 of a daily 25-min habit focused 25 min on each of 3 days.
+    private func series(id: String = "w10-tpl") -> TaskItem {
+        TaskItem(id: id, name: "Stretch", estimateMin: 25, totalFocused: 4_500,
+                 recurrence: .daily(until: nil), createdAt: stamp, updatedAt: stamp)
+    }
+    private func day(of tpl: TaskItem) -> CalBlock {
+        CalBlock(id: "\(tpl.id)-td", taskId: tpl.id, taskName: tpl.name, startTime: "09:00",
+                 durationMinutes: 25, date: today, kind: .task)
+    }
+
+    private func assertStartsAtZero(_ live: LiveSession, file: StaticString = #filePath, line: UInt = #line) {
+        let now = live.sessionStart ?? 0
+        XCTAssertEqual(live.priorAccumulatedSec ?? 0, 0, "no prior from the series' lifetime", file: file, line: line)
+        XCTAssertEqual(FocusTimer.displayedElapsedSec(live, now: now), 0, file: file, line: line)
+        XCTAssertEqual(FocusTimer.deriveState(live, now: now, overrunGraceSec: 1), .running,
+                       "not over time at the first second", file: file, line: line)
+    }
+
+    /// The Focus screen on a day's row (the projected occurrence — it carries
+    /// the template's totalFocused, which the old call site seeded).
+    func testTheFocusScreenOnARepeatingTasksDayStartsAtZero() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        let tpl = series()
+        let block = day(of: tpl)
+        let row = try XCTUnwrap(projectOccurrences([tpl], [block], fromISO: today).first)
+        let fm = FocusModel(task: row, store: store, occurrence: (tpl.id, tpl.name, block.id))
+        XCTAssertEqual(fm.live.taskId, tpl.id, "the session still runs on the template")
+        XCTAssertEqual(fm.live.occurrenceBlockId, block.id)
+        assertStartsAtZero(fm.live)
+    }
+
+    /// A series with no open day (a reminder's Start before today's block
+    /// synced) reaches Focus as the template itself.
+    func testTheFocusScreenOnASeriesWithNoOpenDayStartsAtZero() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        let fm = FocusModel(task: series(), store: store)
+        assertStartsAtZero(fm.live)
+    }
+
+    /// "End for now", then back: a one-off task's total IS its progress.
+    func testAPlainTaskStillContinuesFromItsFocusedTotal() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        let plain = TaskItem(id: "w10-plain", name: "Write report", estimateMin: 50, totalFocused: 600,
+                             createdAt: stamp, updatedAt: stamp)
+        XCTAssertEqual(FocusModel(task: plain, store: store).live.priorAccumulatedSec, 600)
+    }
+
+    /// The assistant's start_focus on a series names the template + today's
+    /// block; on a series with no open day, the template alone.
+    func testTheAssistantsStartFocusOnARepeatingTaskStartsAtZero() async throws {
+        let model = AppModel()
+        model.startUITestMode()
+        let db = try XCTUnwrap(model.db)
+        let store = try XCTUnwrap(model.liveStore)
+        let tpl = series()
+        let block = day(of: tpl)
+        try db.save(tpl)
+        try db.save(block)
+
+        await model.startFocusJoinOrMint(taskId: tpl.id, estimateMin: 25, occurrenceBlockId: block.id)
+        let live = try XCTUnwrap(store.get())
+        XCTAssertEqual(live.taskId, tpl.id)
+        XCTAssertEqual(live.occurrenceBlockId, block.id)
+        assertStartsAtZero(live)
+
+        try store.set(nil)
+        let bare = series(id: "w10-bare")
+        try db.save(bare)
+        await model.startFocusJoinOrMint(taskId: bare.id, estimateMin: 25, occurrenceBlockId: nil)
+        assertStartsAtZero(try XCTUnwrap(store.get()))
+
+        try store.set(nil)
+        let plain = TaskItem(id: "w10-plain2", name: "Write report", estimateMin: 50, totalFocused: 600,
+                             createdAt: stamp, updatedAt: stamp)
+        try db.save(plain)
+        await model.startFocusJoinOrMint(taskId: plain.id, estimateMin: nil, occurrenceBlockId: nil)
+        XCTAssertEqual(try store.get()?.priorAccumulatedSec, 600, "a plain task keeps its own total")
+    }
+}
+
 final class SharedFocusLedgerParkingTests: XCTestCase {
     private var defaults: UserDefaults!
     private var suite: String!

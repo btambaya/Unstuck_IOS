@@ -41,13 +41,13 @@ final class FocusModel {
 
     init(task: TaskItem, store: LiveSessionStore?,
          defaultTreatment: FocusTreatment = .ambient,
-         occurrence: (templateId: String, templateName: String, blockId: String, priorFocused: Int)? = nil,
+         occurrence: (templateId: String, templateName: String, blockId: String)? = nil,
          sharedLevel: ShareLevel? = nil,
          adopt: SharedSessionState? = nil,
          partnerShared: Bool = false) {
         self.task = task
         self.store = store
-        self.occurrence = occurrence.map { ($0.templateId, $0.templateName, $0.blockId) }
+        self.occurrence = occurrence
         self.sharedLevel = sharedLevel
         let existing: LiveSession? = (try? store?.get()) ?? nil
         // The live session is keyed to the TEMPLATE when focusing an occurrence
@@ -55,10 +55,8 @@ final class FocusModel {
         // finish marks just this day. Display still uses the occurrence's name/
         // estimate (which it inherits from the template).
         let focusId = occurrence?.templateId ?? task.id
-        // ONE clock (one true shared session): a partner-shared session —
-        // minted OR adopted — displays the SESSION clock only (no prior task
-        // accumulation), so every device's ring shows the same number.
-        let prior = partnerShared ? 0 : (occurrence?.priorFocused ?? task.totalFocused)
+        let prior = Self.seededPriorSec(task: task, isOccurrence: occurrence != nil,
+                                        partnerShared: partnerShared)
         var session: LiveSession
         let localRev = max(existing?.sharedSessionRev ?? 0, existing?.lastAppliedRev ?? 0)
         if let adopt, existing?.id != adopt.sessionId || localRev < adopt.rev {
@@ -84,10 +82,11 @@ final class FocusModel {
             session = existing
         } else {
             // MINT: a fresh session (nothing live, or another task) —
-            // priorAccumulatedSec seeds the displayed timer so reopening after
-            // "Just finish" continues from the accumulated total, not 0 (Android
-            // parity). Another occurrence of the SAME template also lands here
-            // (reopensExistingSession keys on the occurrence block id): there
+            // priorAccumulatedSec seeds the displayed timer so reopening a plain
+            // task after "Just finish" continues from the accumulated total, not
+            // 0 (Android parity; never a series' lifetime total — see
+            // seededPriorSec). Another occurrence of the SAME template also
+            // lands here (reopensExistingSession keys on the occurrence block id): there
             // FocusTimer.start's same-task branch continues the live session —
             // resumed if paused — RE-POINTED at today's occurrence, so "Mark
             // complete" ticks today's block rather than the day it was minted on.
@@ -115,6 +114,24 @@ final class FocusModel {
         if live.paused {
             LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? Self.now(), paused: true, estimateMin: live.sessionEstimateMin)
         }
+    }
+
+    /// The prior focus a freshly minted session's clock starts from.
+    /// - A plain task: its own totalFocused IS its progress, so reopening
+    ///   after "End for now" continues from it rather than 0 (Android parity).
+    /// - A repeating task — a day's occurrence, or the series template itself
+    ///   (no open day to attach, e.g. a reminder's Start before today's block
+    ///   synced): 0. The template's totalFocused, which every occurrence
+    ///   session accrues onto, is the series' LIFETIME focus, not this day's —
+    ///   seeded, day 4 of a 25-min habit opened at 75:00, over its estimate
+    ///   from the first second, with the over-time prompt and the spoken coach
+    ///   firing at once (web/Android audit 2026-09-23, W10/A13).
+    /// - A partner-shared session (minted OR adopted): 0 — ONE clock (one true
+    ///   shared session), so every device's ring shows the same number.
+    /// Shared by the Focus screen and the assistant's start_focus.
+    nonisolated static func seededPriorSec(task: TaskItem?, isOccurrence: Bool, partnerShared: Bool) -> Int {
+        guard let task, !partnerShared, !isOccurrence, task.recurrence == nil else { return 0 }
+        return task.totalFocused
     }
 
     /// True when `existing` is the LIVE session for this very focus target
@@ -298,7 +315,7 @@ struct FocusView: View {
                 if let adopted { model.finalizeDisplacedForAdoption(adopted, taskId: focusId) }
                 let newFM = FocusModel(task: task, store: model.liveStore,
                                 defaultTreatment: model.settings.defaultTreatment,
-                                occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id, $0.template.totalFocused) },
+                                occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id) },
                                 sharedLevel: shared?.level,
                                 adopt: adopted,
                                 partnerShared: partnerShared)

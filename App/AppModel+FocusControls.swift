@@ -167,9 +167,15 @@ extension AppModel {
             session = FocusTimer.adopt(existing ?? .empty, taskId: taskId, state: adopted,
                                        priorAccumulatedSec: 0, now: now, occurrenceBlockId: occurrenceBlockId)
         } else {
+            // `task` is the series TEMPLATE for an occurrence (or a series
+            // with no open day): its totalFocused is the series' lifetime
+            // focus, never this sitting's — seeded, the ring opened over its
+            // estimate (web/Android audit 2026-09-23, W10/A13).
+            let prior = FocusModel.seededPriorSec(task: task, isOccurrence: occurrenceBlockId != nil,
+                                                  partnerShared: partnerShared)
             session = FocusTimer.start(existing ?? .empty, taskId: taskId,
                                        estimateMin: estimateMin ?? task?.estimateMin,
-                                       priorAccumulatedSec: partnerShared ? 0 : task?.totalFocused,
+                                       priorAccumulatedSec: prior,
                                        now: now, occurrenceBlockId: occurrenceBlockId)
         }
         let isFresh = existing?.sessionStart == nil || existing?.taskId != taskId
