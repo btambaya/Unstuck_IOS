@@ -82,6 +82,16 @@ private actor FakeServer: SyncReadGatewayProtocol {
         }
         return Array(ids.prefix(limit))
     }
+
+    func fetchIdStampPage(table: String, stampColumn: String?, afterId: String?, limit: Int) async throws -> [IdStamp] {
+        try await fetchIdPage(table: table, afterId: afterId, limit: limit).map { id in
+            IdStamp(id: id, stamp: stampColumn.flatMap { col in rows[table]?[id].flatMap { CatchUpPuller.stringField(col, in: $0) } })
+        }
+    }
+
+    func fetchRowsByIds(table: String, ids: [String]) async throws -> [Data] {
+        ids.compactMap { rows[table]?[$0] }
+    }
 }
 
 final class CatchUpConvergenceTests: XCTestCase {
@@ -562,6 +572,122 @@ final class CatchUpConvergenceTests: XCTestCase {
                       !CatchUpPuller.hasPendingDelete(table: "cal_blocks", rowId: minted.id, db: db))
         let stamp = await hydrator.calBlocksPull()
         XCTAssertEqual(stamp?.rowCount, 1, "the catch-up's full replace stamps the top-up gate too")
+    }
+
+    // MARK: - rows stamped by their writer's clock (audit 2026-09-22, C29)
+    //
+    // A task / call_request INSERT keeps the `updated_at` its writer sent (the
+    // touch trigger is BEFORE UPDATE only) and profile_facts has no trigger at
+    // all, so these rows can land BEHIND a cursor that already moved on.
+
+    /// A task created offline on another device at 09:00 and flushed at 09:40
+    /// is an INSERT that keeps its 09:00 stamp. This phone's cursor is already
+    /// at 09:20, so `>= cursor` never returns it: the sweep must.
+    func testATaskFlushedLateBehindTheCursorArrivesByTheSweep() async throws {
+        let seen = task("t1", "Seen", updatedAt: "2026-09-12T09:20:00.000Z")
+        try db.save(seen)
+        await server.put("tasks", try serverRow(seen))
+        let puller = makePuller()
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)   // cursor → 09:20
+        await server.put("tasks", try serverRow(task("t2", "Made offline elsewhere", updatedAt: "2026-09-12T09:00:00.000Z")))
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+        XCTAssertNil(try db.fetchById(TaskItem.self, id: "t2"), "the premise: the cursor alone can't see it")
+
+        let outcome = await puller.catchUp(userId: uid, reconcileDeletions: true)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t2")?.name, "Made offline elsewhere")
+        XCTAssertEqual(outcome.rowsRepaired, 1)
+        XCTAssertEqual(outcome.appliedStampsMs, [], "a row the sweep took is not deafness evidence")
+    }
+
+    /// A device whose clock runs fast drags the cursor past real server edits:
+    /// the web's edit to another task, stamped by the server between the two,
+    /// sits behind the cursor. The sweep sees the server's newer stamp.
+    func testAFastClockCannotHideAServerEditBehindTheCursor() async throws {
+        let a = task("a", "Web v1", updatedAt: "2026-09-12T09:00:00.000Z")
+        try db.save(a)
+        await server.put("tasks", try serverRow(a))
+        let puller = makePuller()
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+        await server.put("tasks", try serverRow(task("fast", "From a fast clock", updatedAt: "2026-09-12T09:15:00.000Z")))
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)   // cursor → 09:15
+        await server.put("tasks", try serverRow(task("a", "Web v2", updatedAt: "2026-09-12T09:07:00.000Z")))
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "a")?.name, "Web v1", "the premise")
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: true)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "a")?.name, "Web v2")
+    }
+
+    /// The sweep never takes a row this device has a queued write for, and
+    /// never overwrites a local copy that is NEWER than the server's.
+    func testTheSweepLeavesPendingAndNewerLocalRowsAlone() async throws {
+        let mine = task("t1", "My newer copy", updatedAt: "2026-09-12T09:30:00.000Z")
+        try db.save(mine)
+        await server.put("tasks", try serverRow(task("t1", "Older server copy", updatedAt: "2026-09-12T09:00:00.000Z")))
+        let pending = task("t2", "Queued rename", updatedAt: "2026-09-12T09:05:00.000Z")
+        try db.save(pending)
+        await server.put("tasks", try serverRow(task("t2", "Server t2", updatedAt: "2026-09-12T09:10:00.000Z")))
+        _ = try OutboxStore(db).enqueue(table: "tasks", rowId: "t2", kind: .upsert,
+                                        payload: String(data: try JSONEncoder().encode(TaskRow(pending)), encoding: .utf8),
+                                        nowISO: "2026-09-12T09:05:00.000Z", baseUpdatedAt: "2026-09-12T09:00:00.000Z")
+        // Push the cursor past both so only the sweep could touch them.
+        let later = task("t9", "Later", updatedAt: "2026-09-12T10:00:00.000Z")
+        try db.save(later)
+        await server.put("tasks", try serverRow(later))
+        let puller = makePuller()
+        try SyncCursorStore(db).advance(userId: uid, table: "tasks", to: "2026-09-12T10:00:00.000Z")
+
+        let outcome = await puller.catchUp(userId: uid, reconcileDeletions: true)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.name, "My newer copy")
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t2")?.name, "Queued rename")
+        XCTAssertEqual(outcome.rowsRepaired, 0)
+    }
+
+    /// A session finished OFFLINE at 09:00 and flushed at 09:40: its
+    /// `completed_at` is 09:00 but the server stamps `updated_at` 09:40
+    /// (migration 064). The cursor follows the server stamp, so a plain tick —
+    /// no sweep — brings it in.
+    func testASessionFinishedOfflineIsPulledByItsServerStamp() async throws {
+        func sessionRow(_ id: String, completedAt: String, updatedAt: String) throws -> Data {
+            let s = Session(id: id, taskName: "Deep work", actualSec: 1500, completedAt: completedAt)
+            var obj = try XCTUnwrap(JSONSerialization.jsonObject(with: JSONEncoder().encode(SessionRow(s))) as? [String: Any])
+            obj["updated_at"] = updatedAt
+            return try JSONSerialization.data(withJSONObject: obj)
+        }
+        await server.put("sessions", try sessionRow("s1", completedAt: "2026-09-12T09:20:00.000Z",
+                                                    updatedAt: "2026-09-12T09:20:01.000Z"))
+        let puller = makePuller()
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+        await server.put("sessions", try sessionRow("s2", completedAt: "2026-09-12T09:00:00.000Z",
+                                                    updatedAt: "2026-09-12T09:40:00.000Z"))
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+
+        XCTAssertNotNil(try db.fetchById(Session.self, id: "s2"), "an offline-logged session must reach this device")
+        XCTAssertEqual(try SyncCursorStore(db).cursor(userId: uid, table: "sessions.updated_at"),
+                       "2026-09-12T09:40:00.000Z", "the mark is kept under the new column's own key")
+    }
+
+    /// profile_facts carries only its writer's clock: a "forget" made offline
+    /// elsewhere reaches the server stamped before this device's cursor. The
+    /// sweep takes the tombstone (its stamp is newer than the local copy's).
+    func testAFactForgottenOfflineElsewhereIsTakenByTheSweep() async throws {
+        func fact(_ id: String, active: Bool, updatedAt: String) -> ProfileFact {
+            ProfileFact(id: id, category: .person, fact: "Sister is Amina", source: .chat, active: active,
+                        createdAt: "2026-09-12T07:00:00.000Z", updatedAt: updatedAt)
+        }
+        let local = fact("f1", active: true, updatedAt: "2026-09-12T08:00:00.000Z")
+        try db.save(local)
+        await server.put("profile_facts", try JSONEncoder().encode(ProfileFactRow(local)))
+        await server.put("profile_facts", try JSONEncoder().encode(ProfileFactRow(fact("f2", active: true, updatedAt: "2026-09-12T09:20:00.000Z"))))
+        let puller = makePuller()
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)   // cursor → 09:20
+        await server.put("profile_facts", try JSONEncoder().encode(ProfileFactRow(fact("f1", active: false, updatedAt: "2026-09-12T09:00:00.000Z"))))
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: true)
+
+        XCTAssertEqual(try db.fetchById(ProfileFact.self, id: "f1")?.active, false)
     }
 
     func testGapTriggersRefreshAccountPreferences() async throws {

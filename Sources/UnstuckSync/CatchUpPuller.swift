@@ -24,6 +24,17 @@
 //     the server for ids only (paged, `select=id`) and drops local rows the
 //     server no longer has — never one with a pending local write.
 //
+// The cursor columns are not all SERVER stamps: a task / call_request INSERT
+// keeps the `updated_at` its writer sent (the touch trigger is BEFORE UPDATE
+// only) and profile_facts has no trigger at all. So a row created offline on
+// another device and flushed later lands BEHIND this device's cursor, and a
+// fast clock drags the cursor past real server edits. The same sweep therefore
+// also takes what the server has that this device lacks, or — where both sides
+// keep the cursor column as the row stamp — holds an older stamp of (audit
+// 2026-09-22, C29; Android CatchUp.repairUnseen parity). sessions and
+// reason_logs page by migration 064's server-stamped `updated_at`, not by the
+// event times their writers set.
+//
 // Two tables have no monotonic column on the server at all (`cal_blocks` has no
 // timestamp; `captures.archived_at` moves without `created_at` moving), so they
 // fall back to the existing full server-canonical replace inside the catch-up.
@@ -32,6 +43,7 @@
 // follow-up that would make them delta-capable too.
 
 import Foundation
+import GRDB
 import UnstuckCore
 import UnstuckData
 
@@ -64,8 +76,12 @@ public actor CatchUpPuller {
         /// change — so this is what tells the catch-up to re-read membership
         /// (audit 2026-09-22, C8). The inclusive boundary re-read never sets it.
         public var collectionsChanged = false
+        /// Rows the sweep took because the cursor could not see them (missing
+        /// here, or older here than on the server — audit 2026-09-22, C29).
+        /// Not deafness evidence: their stamps are their writers' clocks.
+        public var rowsRepaired = 0
 
-        public var changed: Bool { rowsApplied > 0 || idsDropped > 0 }
+        public var changed: Bool { rowsApplied > 0 || idsDropped > 0 || rowsRepaired > 0 }
         public init() {}
     }
 
@@ -81,6 +97,16 @@ public actor CatchUpPuller {
         let delete: @Sendable (String, AppDatabase) -> Void
         /// Hard deletes are possible (false for tombstoned tables).
         let reconcileDeletes: Bool
+        /// Where the cursor is stored. A table whose cursor column changed
+        /// gets a new key, so a mark measured on the old column is never read
+        /// as one on the new (audit 2026-09-22, C29).
+        var cursorKey: String? = nil
+        /// `SELECT id, <stamp>` over the local table when the local row keeps
+        /// `column` as its stamp — only then can the sweep tell that this
+        /// device holds an older copy than the server (audit 2026-09-22, C29).
+        var localStampSQL: String? = nil
+
+        var cursorName: String { cursorKey ?? name }
     }
 
     public enum ApplyVerdict: Sendable, Equatable {
@@ -104,6 +130,10 @@ public actor CatchUpPuller {
 
     static let pageSize = 500
     static let idPageSize = 1000
+    /// The sweep's by-id reads: ids per request, and rows per sweep (the rest
+    /// wait for the next one).
+    static let repairChunk = 50
+    static let maxRepairRows = 1000
 
     public init(gateway: any SyncReadGatewayProtocol, db: AppDatabase,
                 fullFallback: @escaping @Sendable (String) async -> Bool,
@@ -143,15 +173,26 @@ public actor CatchUpPuller {
         }
         if reconcileDeletions {
             outcome.reconciled = true
-            for table in Self.deltaTables where table.reconcileDeletes {
-                await reconcile(table, userId: userId, into: &outcome)
+            var tookLists = false
+            for table in Self.deltaTables {
+                let took = await reconcile(table, userId: userId, into: &outcome)
+                if table.name == "collections", took > 0 { tookLists = true }
+            }
+            // A list the sweep took has no membership yet (the server row
+            // carries none): re-read it, as the pull does.
+            if tookLists {
+                outcome.collectionsChanged = true
+                await refreshCollections(userId, true)
+            }
+            if outcome.rowsRepaired > 0 {
+                print("[catchup] took \(outcome.rowsRepaired) row(s) the cursor could not see")
             }
         }
         return outcome
     }
 
     private func pull(_ table: DeltaTable, userId: String, into outcome: inout Outcome) async {
-        let startCursor = (try? cursors.cursor(userId: userId, table: table.name)) ?? nil
+        let startCursor = (try? cursors.cursor(userId: userId, table: table.cursorName)) ?? nil
         // No cursor = this device has never completed a pull for the table, so
         // the pull below is a full one and its rows prove nothing about the
         // health of the realtime channel.
@@ -230,36 +271,102 @@ public actor CatchUpPuller {
             after = lastStamp
         }
         if let highWater, highWater != startCursor {
-            try? cursors.advance(userId: userId, table: table.name, to: highWater)
+            try? cursors.advance(userId: userId, table: table.cursorName, to: highWater)
         }
     }
 
-    /// Drop local rows the server no longer has. Never touches a row with a
-    /// pending local write (it may be a create the server hasn't seen yet).
-    private func reconcile(_ table: DeltaTable, userId: String, into outcome: inout Outcome) async {
+    /// Drop local rows the server no longer has, then take what the cursor
+    /// could not see (`repair`). Never touches a row with a pending local
+    /// write (it may be a create the server hasn't seen yet).
+    /// Returns how many rows the repair took.
+    @discardableResult
+    private func reconcile(_ table: DeltaTable, userId: String, into outcome: inout Outcome) async -> Int {
         var serverIds = Set<String>()
+        var serverStamps: [String: String] = [:]
         var afterId: String?
         var pages = 0
+        var complete = false
+        let stampColumn = table.localStampSQL == nil ? nil : table.column
         while pages < 40 {
             pages += 1
-            let page: [String]
+            let page: [IdStamp]
             do {
-                page = try await gateway.fetchIdPage(table: table.name, afterId: afterId, limit: Self.idPageSize)
+                page = try await gateway.fetchIdStampPage(table: table.name, stampColumn: stampColumn,
+                                                          afterId: afterId, limit: Self.idPageSize)
             } catch {
                 print("[catchup] \(table.name) id reconcile failed, keeping local rows: \(error)")
-                return   // an incomplete id set must NEVER drive deletions
+                return 0   // an incomplete id set must NEVER drive deletions
             }
-            serverIds.formUnion(page)
-            if page.count < Self.idPageSize { break }
-            afterId = page.last
+            for row in page {
+                serverIds.insert(row.id)
+                if let stamp = row.stamp { serverStamps[row.id] = stamp }
+            }
+            if page.count < Self.idPageSize { complete = true; break }
+            afterId = page.last?.id
         }
         let localIds = (try? db.localIds(table: table.name)) ?? []
-        guard !localIds.isEmpty else { return }
         let pending = pendingRowIds(table: table.name)
-        for id in localIds where !serverIds.contains(id) && !pending.contains(id) {
-            table.delete(id, db)
-            outcome.idsDropped += 1
+        if table.reconcileDeletes, complete {
+            for id in localIds where !serverIds.contains(id) && !pending.contains(id) {
+                table.delete(id, db)
+                outcome.idsDropped += 1
+            }
         }
+        return await repair(table, serverIds: serverIds, serverStamps: serverStamps, localIds: localIds,
+                            pending: pending, into: &outcome)
+    }
+
+    /// Take the rows the cursor could not see (audit 2026-09-22, C29): ones
+    /// the server has and this device doesn't, and — where the local row keeps
+    /// the cursor column as its stamp — ones the server holds a strictly newer
+    /// stamp of. Each goes through the table's own apply, with the pull's
+    /// guards: a row with a queued local write or delete is left alone.
+    private func repair(_ table: DeltaTable, serverIds: Set<String>, serverStamps: [String: String],
+                        localIds: Set<String>, pending: Set<String>, into outcome: inout Outcome) async -> Int {
+        let localStamps = table.localStampSQL.map { sql in
+            (try? db.writer.read { conn -> [String: String] in
+                var out: [String: String] = [:]
+                for row in try Row.fetchAll(conn, sql: sql) {
+                    if let id: String = row[0], let stamp: String = row[1] { out[id] = stamp }
+                }
+                return out
+            }) ?? [:]
+        } ?? [:]
+        let pendingDeletes = Set(((try? box.pending()) ?? [])
+            .filter { $0.tableName == table.name && $0.kind == .delete }
+            .map(\.rowId))
+        var want: [String] = []
+        for id in serverIds where !pending.contains(id) && !pendingDeletes.contains(id) {
+            if localIds.contains(id) {
+                guard let serverMs = serverStamps[id].flatMap(Time.parseMillis),
+                      let localMs = localStamps[id].flatMap(Time.parseMillis),
+                      serverMs > localMs else { continue }
+            }
+            want.append(id)
+        }
+        guard !want.isEmpty else { return 0 }
+        want.sort()
+        var took = 0
+        var start = 0
+        let capped = min(want.count, Self.maxRepairRows)
+        while start < capped {
+            let chunk = Array(want[start..<min(start + Self.repairChunk, capped)])
+            start += Self.repairChunk
+            let rows: [Data]
+            do {
+                rows = try await gateway.fetchRowsByIds(table: table.name, ids: chunk)
+            } catch {
+                print("[catchup] \(table.name) sweep read failed, retried next sweep: \(error)")
+                return took
+            }
+            for raw in rows {
+                guard let id = Self.stringField("id", in: raw),
+                      !Self.hasPendingDelete(table: table.name, rowId: id, db: db) else { continue }
+                if table.apply(raw, db) == .applied { took += 1 }
+            }
+        }
+        outcome.rowsRepaired += took
+        return took
     }
 
     // MARK: - guards
@@ -295,8 +402,11 @@ public actor CatchUpPuller {
     // MARK: - the table registry
 
     /// The tables a cursor pull covers, with the column each one's cursor
-    /// tracks. `sessions` / `reason_logs` are append-only ledgers whose natural
-    /// timestamp is their monotonic column; the rest carry `updated_at`.
+    /// tracks. Every one pages by `updated_at`: `sessions` / `reason_logs`
+    /// used their event times (`completed_at` / `at`), which the WRITER sets —
+    /// a session finished offline at 09:00 and flushed at 09:40 sat behind a
+    /// 09:20 cursor for good. Migration 064 gave both a server-stamped
+    /// `updated_at` their rows never send (audit 2026-09-22, C29).
     static let deltaTables: [DeltaTable] = [
         DeltaTable(name: "tasks", column: "updated_at",
                    apply: { raw, db in
@@ -309,9 +419,10 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(TaskItem.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   localStampSQL: "SELECT id, updatedAt FROM tasks"),
 
-        DeltaTable(name: "sessions", column: "completed_at",
+        DeltaTable(name: "sessions", column: "updated_at",
                    apply: { raw, db in
                        guard let row = try? JSONDecoder().decode(SessionRow.self, from: raw) else { return .failed }
                        guard !CatchUpPuller.hasPendingWrite(table: "sessions", rowId: row.id, db: db) else {
@@ -321,9 +432,10 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(Session.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   cursorKey: "sessions.updated_at"),
 
-        DeltaTable(name: "reason_logs", column: "at",
+        DeltaTable(name: "reason_logs", column: "updated_at",
                    apply: { raw, db in
                        guard let row = try? JSONDecoder().decode(ReasonLogRow.self, from: raw) else { return .failed }
                        guard !CatchUpPuller.hasPendingWrite(table: "reason_logs", rowId: row.id, db: db) else {
@@ -333,7 +445,8 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(ReasonLog.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   cursorKey: "reason_logs.updated_at"),
 
         DeltaTable(name: "collections", column: "updated_at",
                    apply: { raw, db in
@@ -381,7 +494,8 @@ public actor CatchUpPuller {
                    reconcileDeletes: true),
 
         // profile_facts are soft-deleted (`active=false` tombstones) so a
-        // missing id never means "deleted" — no reconcile pass.
+        // missing id never means "deleted" — the sweep never drops one, but it
+        // does take a fact (or a "forget" tombstone) the cursor missed.
         DeltaTable(name: "profile_facts", column: "updated_at",
                    apply: { raw, db in
                        guard let row = try? JSONDecoder().decode(ProfileFactRow.self, from: raw) else { return .failed }
@@ -393,7 +507,8 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { _, _ in },
-                   reconcileDeletes: false),
+                   reconcileDeletes: false,
+                   localStampSQL: "SELECT id, updatedAt FROM profile_facts"),
 
         // call_requests: direct writes only (no outbox op to guard), a touch
         // trigger on `updated_at` (migration 051) so every status change the
@@ -411,7 +526,8 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(CallRequest.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   localStampSQL: "SELECT id, updated_at FROM call_requests"),
     ]
 
     /// Table names the cursor pull covers (diagnostics + tests).
