@@ -125,6 +125,9 @@ public func planReminders(
         let isExternal = isExternalBlock(b)
         let isTask = isTaskBlock(b)
         if !isTask && !isExternal { continue }
+        // Day 2+ of a Google event that crosses midnight starts at 00:00 only
+        // on the grid (audit 2026-09-22, C25): nothing starts then.
+        if isExternal && isExternalContinuation(b) { continue }
         guard let startMs = blockStartMillis(b) else { continue }
         let taskId = b.taskId ?? ""
         if isTask, tasks.first(where: { $0.id == taskId })?.done == true { continue }

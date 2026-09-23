@@ -97,6 +97,14 @@ public func externalEventBlocks(_ ev: ExternalEvent, fromYmd: String? = nil, toY
     return out
 }
 
+/// A later day of a Google event split across midnight (`g_<id>_<ymd>`,
+/// externalEventBlocks): the event did not START then, so it rings no
+/// "Coming up" reminder at 23:50 the night before.
+public func isExternalContinuation(_ b: CalBlock) -> Bool {
+    guard isExternalBlock(b), b.id.hasPrefix("g_"), let ev = b.externalEventId, !ev.isEmpty else { return false }
+    return b.id != "g_\(ev)"
+}
+
 /// One reconciled Google pull: the external blocks to upsert plus the
 /// external block ids to drop (stale in-window ones, and imports nothing
 /// reconciles any more — see reconcileCalendarPull). Pure — the Edge-Function
