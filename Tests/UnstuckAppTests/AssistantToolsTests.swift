@@ -293,7 +293,9 @@ final class FakeAssistantState: AssistantAppState {
         await commit()
         guard let cur = live, cur.sessionStart != nil else { return nil }
         focusCalls.append("finish:\(markDone)")
-        let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        // Capped at the estimate + grace like the real one (C43).
+        let raw = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        let elapsed = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: cur.sessionEstimateMin)
         let t = tasks.first { $0.id == cur.taskId }
         sessions.append(Session(id: cur.id ?? nid("s"), taskId: cur.taskId, taskName: t?.name ?? "Focus session",
                                 estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: "2026-09-02T09:00:00.000Z"))
@@ -303,7 +305,8 @@ final class FakeAssistantState: AssistantAppState {
             if markDone && tasks[i].recurrence == nil { tasks[i].done = true; markedDone = true }
         }
         live = nil
-        return FocusFinishOutcome(taskId: cur.taskId, taskName: t?.name ?? "Focus session", elapsedSec: elapsed, markedDone: markedDone)
+        return FocusFinishOutcome(taskId: cur.taskId, taskName: t?.name ?? "Focus session", elapsedSec: elapsed, markedDone: markedDone,
+                                  ranSec: raw > elapsed ? raw : nil)
     }
     func cancelFocus() { focusCalls.append("cancel"); live = nil }
     func setTaskReminder(taskId: String, minutes: Int?) -> Bool {
@@ -1534,6 +1537,17 @@ final class AssistantToolsTests: XCTestCase {
         await eq("add_capture", #"{"tag":"idea"}"#, "error: body required")
     }
 
+    /// A session on a task shared WITH the user writes no own Session row, so
+    /// a capture tied to it waited in the outbox for one for ever (audit
+    /// 2026-09-22, C44).
+    func testAddCaptureDuringASessionSharedWithTheUserTiesItToNoSession() async {
+        var shared = liveSession("owners-task")
+        shared.sharedFocusLevel = .partner
+        api.live = shared
+        await prefix("add_capture", #"{"body":"Ask Sam about X"}"#, "ok: captured")
+        XCTAssertNil(api.captures.last?.sessionId)
+    }
+
     func testGetCapturesListsOpenNewestFirstExcludingArchived() async {
         api.tasks = [task("a", "Alpha")]
         api.captures = [capture("c1", "Oldest", at: "2026-09-01T08:00:00.000Z"), capture("c2", "Archived", at: "2026-09-01T09:00:00.000Z"),
@@ -2034,6 +2048,21 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertFalse(api.tasks[1].done)
         api.live = liveSession("a")
         await eq("finish_focus", "{}", "ok: finished the session on \"Alpha\" — 5m logged, task still open")
+    }
+
+    /// A session left running overnight is logged at its estimate + grace —
+    /// and the result SAYS it was capped, never a silent clamp (rules §1;
+    /// audit 2026-09-22, C43).
+    func testFinishFocusSaysWhenItCappedASessionLeftRunning() async {
+        api.tasks = [task("a", "Alpha")]
+        var forgotten = liveSession("a")
+        forgotten.sessionStart = Date().timeIntervalSince1970 * 1000 - 16 * 3_600_000
+        api.live = forgotten
+        let r = await run("finish_focus", "{}")
+        XCTAssertEqual(r, "ok: finished the session on \"Alpha\" — 55m logged (capped at its estimate + 30 min — the timer ran 16h), task still open")
+        XCTAssertEqual(api.sessions.last?.actualSec, 55 * 60)
+        let receipt = assistantReceipt(name: "finish_focus", args: ToolArgs(), result: r, tasks: api.tasks, facts: [])
+        XCTAssertEqual(receipt?.label, "Finished “Alpha” · 55m logged (capped at its estimate + 30 min — the timer ran 16h), task still open")
     }
 
     func testStartFocusReportsAJoinOrMintThatDidNotLand() async {

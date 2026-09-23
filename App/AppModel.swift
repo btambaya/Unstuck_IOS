@@ -228,6 +228,10 @@ final class AppModel {
     /// its FocusModel from the store (remote pause/resume/extend) or leaves
     /// (remote end).
     var sharedSessionRemoteTick = 0
+    /// The same, for a LOCAL control made off the Focus screen (shade Resume,
+    /// Today's card, the assistant) — `noteLiveSessionChangedOffScreen`
+    /// (audit 2026-09-22, C37).
+    var liveSessionOffScreenTick = 0
     /// Calm attribution line for the focus screen ("Ann paused" / "Ann
     /// resumed") — never a modal. Sticky for a remote pause; transient (a few
     /// seconds) for resume/extend. Cleared on any local control.
@@ -1149,6 +1153,9 @@ final class AppModel {
         // kill/crash: rebind to a still-live session, else end the ghost timer.
         refreshLiveSession()
         reapStaleLiveActivities()
+        // Captures an earlier build left waiting on a session that never wrote
+        // its row are sent without it (audit 2026-09-22, C44).
+        releaseStrandedCaptures()
         // Retry shared-focus accruals that couldn't reach the server before a
         // kill (the offline-finish pending ledger — idempotent per sessionId),
         // after un-parking any this user parked at an offline sign-out.

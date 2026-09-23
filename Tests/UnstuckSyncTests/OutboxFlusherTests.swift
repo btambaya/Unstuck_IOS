@@ -290,6 +290,22 @@ final class OutboxFlusherTests: XCTestCase {
         XCTAssertEqual(upserts.map(\.id), ["c1"])
     }
 
+    /// A session that ended without its row (audit 2026-09-22, C44): once its
+    /// captures are detached they flush instead of waiting for ever.
+    func testADetachedCaptureFlushesWithoutTheSessionThatNeverCame() async throws {
+        let write = WriteThrough(db: db)
+        let sid = UUID().uuidString.lowercased()
+        try await write.upsertCapture(Capture(id: "c1", sessionId: sid, tag: .idea, body: "x", at: now), nowISO: now)
+        await flusher.flush(userId: "u1")
+        var upserts = await gateway.upserts
+        XCTAssertTrue(upserts.isEmpty, "held for the session's row")
+        try await write.detachCapturesFromSession(sid, nowISO: now)
+        await flusher.flush(userId: "u1")
+        upserts = await gateway.upserts
+        XCTAssertEqual(upserts.map(\.id), ["c1"])
+        XCTAssertEqual(try box.count(), 0)
+    }
+
     func testOtherRowsStillFlushWhenOneRowFails() async throws {
         _ = try box.enqueue(table: "tasks", rowId: "t1", kind: .upsert,
                             payload: try taskPayload(id: "t1"), nowISO: now)

@@ -1430,7 +1430,7 @@ final class ShadeActionBackgroundTimeTests: XCTestCase {
         let log = Log()
         hub.bootApp = { log.boots += 1 }
         let posting = Task { @MainActor in
-            await hub.post(.endSession)
+            await hub.post(.endSession(sessionId: nil))
             log.done = true
         }
         for _ in 0..<20 { await Task.yield() }
@@ -1482,7 +1482,7 @@ final class ShadeActionBackgroundTimeTests: XCTestCase {
         hub.backgroundTime = bg.make()
         hub.bootApp = {}
         hub.deadline = 0.05
-        await hub.post(.snoozeCheckin(taskName: "Deep work"))
+        await hub.post(.snoozeCheckin(taskName: "Deep work", sessionId: nil))
         XCTAssertEqual(bg.begun, 1)
         XCTAssertEqual(bg.released, 1)
         let log = Log()

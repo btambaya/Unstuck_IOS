@@ -297,6 +297,88 @@ public actor WriteThrough {
         onEnqueue?()
     }
 
+    /// A focus session ended WITHOUT a Session row — cancelled or discarded,
+    /// one whose task was deleted meanwhile, a session on a task shared with
+    /// me (audit 2026-09-22, C44). The captures taken during it wait
+    /// (`dependsOn`) for a sessions row that will never exist here, so they
+    /// never left the phone. Each still-queued one is re-saved with
+    /// `session_id` null, replacing its held op, in one transaction. A task
+    /// gone meanwhile (`unlinkingTaskId`) comes off them too: captures.task_id
+    /// references tasks(id), and the dead id would be refused on every flush.
+    /// Returns how many were released.
+    @discardableResult
+    public func detachCapturesFromSession(_ sessionId: String, unlinkingTaskId deadTaskId: String? = nil,
+                                          nowISO: String) throws -> Int {
+        let released = try db.transaction { conn -> Int in
+            let held = try OutboxStore.pending(in: conn)
+                .filter { $0.tableName == "captures" && $0.kind == .upsert && $0.dependsOn == sessionId }
+            return try requeueCaptures(held.map(\.rowId), in: conn, nowISO: nowISO) { c in
+                guard c.sessionId == sessionId else { return nil }
+                var freed = c
+                freed.sessionId = nil
+                if let deadTaskId, freed.taskId == deadTaskId { freed.taskId = nil }
+                return freed
+            }
+        }
+        if released > 0 { onEnqueue?() }
+        return released
+    }
+
+    /// Captures an EARLIER run left held behind a session that will never get
+    /// its row (audit 2026-09-22, C44 — up to build 85 every shared-with-me
+    /// session, cancel_focus and a displaced session of a deleted task did
+    /// this): released as `detachCapturesFromSession` does. A session still
+    /// counts as coming while its row is stored or queued here, or it is
+    /// `liveSessionId`. Only ops queued before `queuedBefore` are touched, so a
+    /// session ending right now — its row write still in flight — is never
+    /// taken for one that never will be; a capture un-parked at sign-in has
+    /// no row stored here and is left alone.
+    @discardableResult
+    public func releaseCapturesOfEndedSessions(liveSessionId: String?, queuedBefore: String,
+                                               nowISO: String) throws -> Int {
+        guard let cutoff = Time.parseMillis(queuedBefore) else { return 0 }
+        let released = try db.transaction { conn -> Int in
+            let pending = try OutboxStore.pending(in: conn)
+            let held = pending.filter { op in
+                op.tableName == "captures" && op.kind == .upsert && op.dependsOn != nil
+                    && (Time.parseMillis(op.createdAt).map { $0 < cutoff } ?? false)
+            }
+            guard !held.isEmpty else { return 0 }
+            var coming = Set(try String.fetchAll(conn, sql: "SELECT id FROM sessions"))
+            coming.formUnion(pending.filter { $0.tableName == "sessions" }.map(\.rowId))
+            if let liveSessionId { coming.insert(liveSessionId) }
+            let stranded = held.filter { !coming.contains($0.dependsOn ?? "") }
+            return try requeueCaptures(stranded.map(\.rowId), in: conn, nowISO: nowISO) { c in
+                guard let sid = c.sessionId, !coming.contains(sid) else { return nil }
+                var freed = c
+                freed.sessionId = nil
+                return freed
+            }
+        }
+        if released > 0 { onEnqueue?() }
+        return released
+    }
+
+    /// Re-save each stored capture `change` rewrites (nil = leave it), its
+    /// queued upserts replaced by one of the new row with no `dependsOn` —
+    /// the archive state travels as `upsertCapture` sends it.
+    private func requeueCaptures(_ ids: [String], in conn: Database, nowISO: String,
+                                 _ change: (Capture) -> Capture?) throws -> Int {
+        var released = 0
+        var seen: Set<String> = []
+        for id in ids where seen.insert(id).inserted {
+            guard let c = try Capture.fetchOne(conn, key: id), let freed = change(c) else { continue }
+            let archivedAt = try String.fetchOne(conn, sql: "SELECT archivedAt FROM capture_archive WHERE captureId = ?", arguments: [id])
+            try OutboxStore.cancelPendingUpserts(in: conn, table: "captures", rowId: id)
+            try freed.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: "captures", rowId: id, kind: .upsert,
+                                    payload: try jsonString(CaptureRow(freed, archivedAt: archivedAt)),
+                                    dependsOn: freed.sessionId.flatMap { isUUID($0) ? $0 : nil }, nowISO: nowISO)
+            released += 1
+        }
+        return released
+    }
+
     /// Archive / restore a capture (Inbox "Done" / "Restore"): the local
     /// archive table + a captures upsert carrying `archived_at` (server truth,
     /// migration 053). Returns false — with NO op enqueued — when the capture

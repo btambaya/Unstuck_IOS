@@ -405,16 +405,19 @@ extension AppModel {
             // slot, and an after-block call rang about a block the user had
             // moved (audit 2026-09-22, C31; Android: the drain inside goAsync).
             await flushHoldingBackgroundTime(limit: Self.shadeActionFlushLimit)
-        case .resumeSession:
-            resumeLiveSessionFromNotification()
-        case .snoozeCheckin(let taskName):
+        case .resumeSession(let sessionId):
+            resumeLiveSessionFromNotification(sessionId: sessionId)
+        case .snoozeCheckin(let taskName, let sessionId):
             // Snooze == re-arm the same ~14-min check (spec 10 §1.6). The nag
             // that was snoozed HAS fired — settle its budget slot first, then
-            // arm (and peek the cap for) the next one.
+            // arm (and peek the cap for) the next one. Only while the session
+            // it was about is still paused (audit 2026-09-22, C38).
+            guard let cur = (try? liveStore?.get()) ?? nil,
+                  Self.pausedCheckinActsOn(cur, sessionId: sessionId) else { return }
             cancelPausedCheckin()
-            armPausedCheckin(taskName: taskName)
-        case .endSession:
-            await endLiveSessionFromNotification()
+            armPausedCheckin(taskName: taskName, sessionId: cur.id)
+        case .endSession(let sessionId):
+            await endLiveSessionFromNotification(sessionId: sessionId)
             // The Session row and the focus minutes, likewise (C31). Writes
             // finishFocus queues a moment later ride the post-write flush,
             // which holds its own background time.
@@ -475,18 +478,29 @@ extension AppModel {
 
     // MARK: paused check-in actions (Resume / End, app possibly backgrounded)
 
-    /// Resume the persisted live session from the notification shade. The
-    /// Focus screen (if later reopened) re-reads the store, so the session
-    /// keeps counting true focus time.
-    private func resumeLiveSessionFromNotification() {
+    /// May a paused check-in's action touch `cur`? Only the session the nag
+    /// was armed for (`sessionId`; nil = a nag from a build before this
+    /// check), and only while it is still paused — a nag that outlived its
+    /// session (displaced, or re-pointed to another day and resumed) must not
+    /// end or resume a RUNNING one (audit 2026-09-22, C38).
+    nonisolated static func pausedCheckinActsOn(_ cur: LiveSession?, sessionId: String?) -> Bool {
+        guard let cur, cur.sessionStart != nil, cur.paused else { return false }
+        return sessionId == nil || cur.id == sessionId
+    }
+
+    /// Resume the persisted live session from the notification shade, and
+    /// have an open Focus screen follow it (C37).
+    private func resumeLiveSessionFromNotification(sessionId: String?) {
+        guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
+              Self.pausedCheckinActsOn(cur, sessionId: sessionId) else { return }
         cancelPausedCheckin()   // the nag fired (that's what was tapped) → claims its slot
-        guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.paused else { return }
         let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
         try? liveStore.set(resumed)
         refreshLiveSession()
         LiveActivityController.shared.update(
             sessionStartMs: resumed.sessionStart ?? 0, paused: false,
             estimateMin: resumed.sessionEstimateMin)
+        noteLiveSessionChangedOffScreen()
     }
 
     /// End the persisted live session from the shade: write the Session,
@@ -495,13 +509,22 @@ extension AppModel {
     /// `ended: true` on the shared channel BEFORE teardown — best-effort: the
     /// channel may be down while backgrounded, in which case the partner
     /// converges via the ledger + stale-reap.
-    private func endLiveSessionFromNotification() async {
+    private func endLiveSessionFromNotification(sessionId: String?) async {
+        guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
+              Self.pausedCheckinActsOn(cur, sessionId: sessionId) else { return }
         cancelPausedCheckin()
-        guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.sessionStart != nil else { return }
         let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        // Ended off the Focus screen — a session left running then paused can
+        // measure a whole night: capped at the estimate + grace like the
+        // shared paths (audit 2026-09-22, C43).
+        let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
         try? liveStore.set(nil)
         refreshLiveSession()
         LiveActivityController.shared.end()
+        // A Focus screen still up would keep this clock and log it again on
+        // Done (audit 2026-09-22, C37) — as the assistant's finish does.
+        if router.focusTask != nil { router.focusTask = nil; router.sharedFocus = nil }
+        noteLiveSessionChangedOffScreen()
         // A SHARED session (a recipient's focus on someone else's task) has no
         // local row — taskRepo.fetch(cur.taskId) misses, so the own-Session
         // fallback below would mint a phantom "Focus session" row polluting the
@@ -511,27 +534,23 @@ extension AppModel {
         // session resurrected across a background/kill (wall-clock elapsed);
         // idempotent per session id (migration 046).
         if let level = cur.sharedFocusLevel, levelCanComplete(level) {
-            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
             await logSharedFocusDurable(taskId: cur.taskId, actualSec: capped,
                                         estimateMin: cur.sessionEstimateMin,
                                         sessionId: cur.id ?? newUUID())
+            releaseCaptures(ofSession: cur.id)   // no own Session row (C44)
             return
         }
         if let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil {
             let session = Session(id: cur.id ?? newUUID(), taskId: task.id, taskName: task.name,
-                                  estimateMin: task.estimateMin, actualSec: elapsed, completedAt: Self.isoNow())
+                                  estimateMin: task.estimateMin, actualSec: capped, completedAt: Self.isoNow())
             // One true shared session: an OWNER session on a partner-shared task
             // accrues via the ledger only (same session id as the partner's
-            // finalize — exactly once). This path can resurrect a session across
-            // a background/kill, so the ledger amount is CAPPED like the shared
-            // paths (estimate + grace); the Session row keeps the raw elapsed,
-            // as today.
+            // finalize — exactly once), with the same capped amount.
             let sharedLedger = accruesViaSharedLedger(cur, taskId: task.id)
-            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
-            finishFocus(task: task, session: session, elapsedSec: elapsed, markDone: false,
-                        sharedLedger: sharedLedger, ledgerSec: sharedLedger ? capped : nil)
+            finishFocus(task: task, session: session, elapsedSec: capped, markDone: false,
+                        sharedLedger: sharedLedger)
         } else {
-            saveSession(Self.goneTaskSession(cur, elapsedSec: elapsed))
+            saveSession(Self.goneTaskSession(cur, elapsedSec: capped))
         }
     }
 

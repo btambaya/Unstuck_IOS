@@ -83,9 +83,12 @@ enum PushAction: Sendable {
     case open(deepLink: String)
     case startFocus(taskId: String)
     case reschedule(taskId: String, blockId: String, taskName: String, drifted: Bool)
-    case resumeSession
-    case snoozeCheckin(taskName: String)
-    case endSession
+    /// The paused check-in's actions carry the id of the session the nag was
+    /// armed for (nil: a nag scheduled by a build before audit 2026-09-22,
+    /// C38) — they act on that session only.
+    case resumeSession(sessionId: String?)
+    case snoozeCheckin(taskName: String, sessionId: String?)
+    case endSession(sessionId: String?)
 
     /// Registered without `.foreground` (NotificationCategories.registerAll):
     /// iOS runs it with the app in the background, launching it with no

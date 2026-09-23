@@ -35,7 +35,40 @@ extension AppModel {
             sessionStartMs: paused.sessionStart ?? 0, paused: true,
             estimateMin: paused.sessionEstimateMin)
         let taskName = ((try? taskRepo?.fetch(id: paused.taskId)) ?? nil)?.name ?? "your task"
-        armPausedCheckin(taskName: taskName)
+        armPausedCheckin(taskName: taskName, sessionId: paused.id)
+        noteLiveSessionChangedOffScreen()
+    }
+
+    /// The live session was changed OFF the Focus screen (the paused check-in's
+    /// Resume, Today's Pause / Resume, the assistant's pause / resume /
+    /// extend): an open FocusView re-reads the store instead of acting on —
+    /// and re-saving — its own stale copy (audit 2026-09-22, C37).
+    func noteLiveSessionChangedOffScreen() {
+        liveSessionOffScreenTick &+= 1
+    }
+
+    // MARK: - captures of a session that writes no Session row
+
+    /// A live session ended WITHOUT its Session row (cancelled / discarded, a
+    /// task shared with me, its task deleted meanwhile): the captures queued
+    /// behind it go up without the session — and without `deadTaskId`, when
+    /// the task is gone — instead of waiting for a row that never comes
+    /// (audit 2026-09-22, C44; WriteThrough.detachCapturesFromSession).
+    func releaseCaptures(ofSession sessionId: String?, unlinkingTaskId deadTaskId: String? = nil) {
+        guard let sessionId, let write else { return }
+        let now = Self.isoNow()
+        Task { _ = try? await write.detachCapturesFromSession(sessionId, unlinkingTaskId: deadTaskId, nowISO: now) }
+    }
+
+    /// Launch: captures an earlier run (up to build 85) left held behind a
+    /// session that never wrote its row are released (audit 2026-09-22, C44;
+    /// WriteThrough.releaseCapturesOfEndedSessions). Ops queued from now on
+    /// are left to the paths above.
+    func releaseStrandedCaptures() {
+        guard let write else { return }
+        let liveId = cachedLiveSession?.id
+        let now = Self.isoNow()
+        Task { _ = try? await write.releaseCapturesOfEndedSessions(liveSessionId: liveId, queuedBefore: now, nowISO: now) }
     }
 
     // MARK: - sign-out finalize (Android parity)
@@ -63,9 +96,18 @@ extension AppModel {
         PausedCheckinBudget.disarm()
         defer { LiveActivityController.shared.end() }
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.sessionStart != nil else { return nil }
-        guard cur.sharedFocusLevel == nil else { return nil }   // a recipient's session — not ours
+        guard cur.sharedFocusLevel == nil else {
+            // A recipient's session — not ours to finalize, and no Session row
+            // comes from this phone: its captures go up without one before the
+            // outbox is parked (audit 2026-09-22, C44).
+            releaseCaptures(ofSession: cur.id)
+            return nil
+        }
         let nowMs = Date().timeIntervalSince1970 * 1000
-        let elapsed = FocusTimer.elapsedSec(cur, now: nowMs)
+        // Finalized off the Focus screen: a forgotten running session is capped
+        // at its estimate + grace like the shared paths (audit 2026-09-22, C43).
+        let elapsed = Self.cappedSharedElapsedSec(rawSec: FocusTimer.elapsedSec(cur, now: nowMs),
+                                                  estimateMin: cur.sessionEstimateMin)
         try? liveStore.set(nil)
         refreshLiveSession()
         let sessionId = cur.id ?? newUUID()
@@ -80,10 +122,9 @@ extension AppModel {
         if accruesViaSharedLedger(cur, taskId: task.id) {
             // Partner-shared own task: the exactly-once ledger (same session id
             // as the partner's finalize) — capped like every resurrected path.
-            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
-            guard capped > 0 else { return nil }
+            guard elapsed > 0 else { return nil }
             return PendingSharedFocusLog(sessionId: sessionId, taskId: task.id,
-                                         sec: capped, estimateMin: cur.sessionEstimateMin)
+                                         sec: elapsed, estimateMin: cur.sessionEstimateMin)
         }
         var bumped = task
         bumped.totalFocused += elapsed
@@ -101,8 +142,8 @@ extension AppModel {
     /// when web and Android claim it: a quick pause/resume used to burn one of
     /// the 3 daily slots per pause, silently suppressing the afternoon recap
     /// and later genuine check-ins on EVERY device.
-    func armPausedCheckin(taskName: String) {
-        PausedCheckinBudget.arm(taskName: taskName)
+    func armPausedCheckin(taskName: String, sessionId: String?) {
+        PausedCheckinBudget.arm(taskName: taskName, sessionId: sessionId)
         peekPausedCheckinAllowed { allowed in
             if !allowed { PausedCheckinBudget.disarm() }
         }
@@ -180,8 +221,20 @@ extension AppModel {
         }
         let isFresh = existing?.sessionStart == nil || existing?.taskId != taskId
         if isFresh { session = FocusTimer.setTreatment(session, settings.defaultTreatment) }
+        // A paused session this start did not keep paused as-is — resumed
+        // (same task, or the series re-pointed to another day), or adopted
+        // over — takes its "Did you step away?" nag with it, as on the Focus
+        // screen: finalizeDisplacedFocus skips the same task, so the nag fired
+        // during the running session (audit 2026-09-22, C38).
+        if let existing, existing.paused, !(session.id == existing.id && session.paused) {
+            cancelPausedCheckin()
+        }
         try? store.set(session)
         refreshLiveSession()
+        // The same session continued (resumed / re-pointed): an open Focus
+        // screen follows it instead of showing PAUSED (C37). A different one
+        // is opened by the caller's navigation.
+        if existing?.sessionStart != nil, existing?.id == session.id { noteLiveSessionChangedOffScreen() }
     }
 
     /// Reap focus Live Activities left dangling by a kill/crash mid-session.
@@ -212,6 +265,7 @@ extension AppModel {
                 refreshLiveSession()
                 Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
                                                         estimateMin: estimate, sessionId: sessionId) }
+                releaseCaptures(ofSession: cur.id)   // no own Session row (C44)
                 LiveActivityController.shared.reapOrphans(hasActiveSession: false)
                 return
             }
@@ -232,6 +286,7 @@ extension AppModel {
             sessionStartMs: resumed.sessionStart ?? 0, paused: false,
             estimateMin: resumed.sessionEstimateMin)
         cancelPausedCheckin()
+        noteLiveSessionChangedOffScreen()
     }
 }
 
@@ -249,9 +304,9 @@ enum PausedCheckinBudget {
 
     /// Schedule the local nag and remember when it fires. Nothing is armed on
     /// the Calm level (the scheduler posts nothing there, so nothing can fire).
-    static func arm(taskName: String, now: Date = Date(), defaults: UserDefaults = .standard) {
+    static func arm(taskName: String, sessionId: String?, now: Date = Date(), defaults: UserDefaults = .standard) {
         guard NotificationPrefs.level.pausedCheckin else { return }
-        PausedCheckinScheduler.schedule(taskName: taskName)
+        PausedCheckinScheduler.schedule(taskName: taskName, sessionId: sessionId)
         defaults.set(now.timeIntervalSince1970 + delay, forKey: fireAtKey)
     }
 

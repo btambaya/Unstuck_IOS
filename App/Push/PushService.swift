@@ -223,6 +223,7 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         let taskName = (info["taskName"] as? String)
             ?? (content.body.isEmpty ? "your task" : content.body)
         let drifted = info["drifted"] as? Bool ?? false
+        let sessionId = info["sessionId"] as? String
 
         // Fallback B for "Unstuck calls you": a time-sensitive alert push with
         // kind='call' (no VoIP token registered). A tap on it — or its
@@ -249,11 +250,11 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
         case NotificationCategories.actionReschedule:
             action = .reschedule(taskId: taskId, blockId: blockId, taskName: taskName, drifted: drifted)
         case NotificationCategories.actionResume:
-            action = .resumeSession
+            action = .resumeSession(sessionId: sessionId)
         case NotificationCategories.actionSnooze:
-            action = .snoozeCheckin(taskName: taskName)
+            action = .snoozeCheckin(taskName: taskName, sessionId: sessionId)
         case NotificationCategories.actionEnd:
-            action = .endSession
+            action = .endSession(sessionId: sessionId)
         case UNNotificationDefaultActionIdentifier:
             action = .open(deepLink: deepLink ?? "unstuck://today")
         default:

@@ -443,7 +443,16 @@ extension AppModel {
     func finalizeDisplacedFocus(forNewTaskId newTaskId: String) {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
               cur.sessionStart != nil, cur.taskId != newTaskId else { return }
+        // The displaced session's "Did you step away?" nag goes with it: left
+        // armed it fired during the NEW session, naming the old task, and its
+        // End ended the new one (audit 2026-09-22, C38).
+        cancelPausedCheckin()
         let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        // Nobody is watching this clock: "← Out" keeps a session running, and a
+        // forgotten one measures wall-clock time — a whole night logged as one
+        // session. Capped at the estimate + grace like the shared paths below
+        // (audit 2026-09-22, C43).
+        let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
         // A displaced SHARED focus (partner/assign) belongs to someone else — its
         // time accrues onto the OWNER's task via log_shared_focus, never an own
         // Session/totalFocused (there is no local row for it, so the old
@@ -456,14 +465,20 @@ extension AppModel {
             let taskId = cur.taskId
             let sessionId = cur.id ?? newUUID()
             let estimate = cur.sessionEstimateMin
-            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
             Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
                                                     estimateMin: estimate, sessionId: sessionId) }
+            releaseCaptures(ofSession: cur.id)   // no own Session row (C44)
             return
         }
-        guard let prev = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else { return }
+        guard let prev = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil else {
+            // The task was deleted meanwhile: no Session row is written, so the
+            // captures taken during it go up without one — and without the
+            // dead task (audit 2026-09-22, C44).
+            releaseCaptures(ofSession: cur.id, unlinkingTaskId: cur.taskId)
+            return
+        }
         saveSession(Session(id: cur.id ?? newUUID(), taskId: prev.id, taskName: prev.name,
-                            estimateMin: prev.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+                            estimateMin: prev.estimateMin, actualSec: capped, completedAt: Self.isoNow()))
         // One true shared session: an OWNER session on a partner-shared task
         // accrues via the exactly-once ledger with the SHARED session id — the
         // direct bump would double-count against the partner's finalize of the
@@ -473,13 +488,12 @@ extension AppModel {
             let taskId = prev.id
             let sessionId = cur.id ?? newUUID()
             let estimate = cur.sessionEstimateMin
-            let capped = Self.cappedSharedElapsedSec(rawSec: elapsed, estimateMin: cur.sessionEstimateMin)
             Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
                                                     estimateMin: estimate, sessionId: sessionId) }
             return
         }
         var bumped = prev
-        bumped.totalFocused += elapsed
+        bumped.totalFocused += capped
         bumped.updatedAt = Self.isoNow()
         saveTask(bumped)
     }
@@ -611,6 +625,9 @@ extension AppModel {
     /// the session estimate + a grace window so a stale orphan measuring
     /// wall-clock time can never over-credit the owner (T2). In-app finishes (a
     /// live foreground timer) are already bounded and pass their real elapsed.
+    /// The same cap bounds an OWN session finalized off the Focus screen, and
+    /// is what the Focus screen offers to log for an over-long one (audit
+    /// 2026-09-22, C43).
     static func cappedSharedElapsedSec(rawSec: Int, estimateMin: Int) -> Int {
         let cap = max(1, estimateMin) * 60 + sharedFocusCapGraceSec
         return min(max(0, rawSec), cap)
@@ -657,6 +674,10 @@ extension AppModel {
                              elapsedSec: Int, estimateMin: Int, markDone: Bool, showRecap: Bool) {
         Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: elapsedSec,
                                                 estimateMin: estimateMin, sessionId: sessionId) }
+        // No own Session row, so no capture may wait for one (audit 2026-09-22,
+        // C44) — the Focus screen no longer ties them to a shared session, but
+        // ones an earlier build queued are still held.
+        releaseCaptures(ofSession: sessionId)
         if markDone && sharedTaskAllowsTick(taskId) {
             Task { try? await shareState.completeSharedTask(taskId: taskId, done: true) }
         }
