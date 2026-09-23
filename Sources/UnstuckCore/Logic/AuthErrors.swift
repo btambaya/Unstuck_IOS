@@ -65,9 +65,17 @@ public func nextSafePath(_ raw: String?, fallback: String = "/dashboard") -> Str
     return decoded
 }
 
+/// The sign-up screen's line when `detectSignupAlreadyExists` says the email
+/// is already registered (Supabase sent no email — "check your email" would be
+/// a dead end). The screen puts "Sign in instead" + "Forgot password?" under it.
+public let signupAlreadyExistsMessage = "An account with this email already exists. Sign in instead."
+
 /// Supabase's sign-up anti-enumeration response is "successful" even for
 /// an already-registered email; these are the tells (any one ⇒ exists).
 /// Pure so UnstuckSync can feed it the decoded signup response fields.
+/// For a confirmed address GoTrue's obfuscated user has identities == [] and
+/// no dates, so the empty identities are the tell that matters; nil (the key
+/// absent) is unknown and never counts.
 public func detectSignupAlreadyExists(
     identitiesCount: Int?,
     emailConfirmedAt: String?,

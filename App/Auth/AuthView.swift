@@ -8,6 +8,7 @@ import SwiftUI
 import AuthenticationServices
 import CryptoKit
 import UIKit
+import UnstuckCore
 import UnstuckDesign
 import UnstuckSync
 
@@ -62,6 +63,9 @@ struct AuthView: View {
                 .padding(.top, 22)
 
                 if let status { banner(status) }
+                // Sign-up with an already-registered email: Supabase sent no
+                // email, so offer the two ways on right here.
+                if showAccountExistsActions { accountExistsActions }
 
                 UButton(busy ? "…" : (signUp ? "Create account" : "Sign in"), kind: .dark) {
                     Task { await submit() }
@@ -106,6 +110,17 @@ struct AuthView: View {
         .scrollDismissesKeyboard(.interactively)
         .background(theme.palette.bg.ignoresSafeArea())
         .disabled(busy)
+        // An app-confirm email link's progress / failure ("Checking your
+        // link…", "already used — sign in") lands in this screen's banner.
+        .onAppear { takeLinkStatus() }
+        .onChange(of: model.authLinkStatus) { _, _ in takeLinkStatus() }
+    }
+
+    private func takeLinkStatus() {
+        guard let linkStatus = model.authLinkStatus else { return }
+        model.authLinkStatus = nil
+        statusIsError = linkStatus.isError
+        status = linkStatus.message
     }
 
     // MARK: field (Material-style outlined, matches Android MdField)
@@ -147,6 +162,24 @@ struct AuthView: View {
         .background(statusIsError ? theme.palette.coralSoft : theme.palette.greenSoft,
                     in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .padding(.top, 16)
+    }
+
+    // MARK: already registered (sign-up with an email that has an account)
+
+    private var showAccountExistsActions: Bool { signUp && status == signupAlreadyExistsMessage }
+
+    private var accountExistsActions: some View {
+        HStack(spacing: 22) {
+            Button("Sign in instead") {
+                // Keep the email + password they typed: often it IS their password.
+                mode = .signIn; status = nil; focus = .password
+            }
+            .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+            Button("Forgot password?") { Task { await forgotPassword() } }
+                .font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
+        }
+        .buttonStyle(.plain)
+        .padding(.top, 12)
     }
 
     // MARK: outlined social button (pill, matches Android Google button)
@@ -229,7 +262,7 @@ struct AuthView: View {
         switch outcome {
         case .ok: status = nil
         case .needsConfirmation: statusIsError = false; status = "Check your email to confirm your account, then sign in."
-        case .alreadyExists: statusIsError = true; status = "That account already exists — try signing in."
+        case .alreadyExists: statusIsError = true; status = signupAlreadyExistsMessage
         case .error(let message): statusIsError = true; status = message
         }
     }

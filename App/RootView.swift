@@ -26,6 +26,19 @@ struct RootView: View {
             }
         }
         .background(theme.palette.bg.ignoresSafeArea())
+        // An app-confirm email link tapped while an account is signed in here:
+        // the link isn't used (no silent account swap) — say why.
+        .alert("Already signed in", isPresented: signedInLinkNoticeShown, presenting: model.signedInLinkNotice) { _ in
+            Button("OK") { model.signedInLinkNotice = nil }
+        } message: { msg in
+            Text(msg)
+        }
+    }
+
+    private var signedInLinkNoticeShown: Binding<Bool> {
+        Binding(
+            get: { model.signedInLinkNotice != nil },
+            set: { shown in if !shown { model.signedInLinkNotice = nil } })
     }
 }
 

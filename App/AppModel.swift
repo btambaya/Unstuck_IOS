@@ -69,10 +69,19 @@ final class AppModel {
     /// the set-new-password screen never appeared.
     private var pendingRecoveryProbe = false
     @ObservationIgnored private var recoveryProbeArmedToken: String?
-    /// An `auth-callback` URL that arrived BEFORE `start()` built the
-    /// coordinator (a cold launch off the reset / magic link): stashed here and
-    /// replayed at the end of `start()` instead of being dropped.
+    /// An `auth-callback` or app-confirm URL that arrived BEFORE `start()`
+    /// built the coordinator (a cold launch off the reset / sign-up / magic
+    /// link): stashed here and replayed at the end of `start()` instead of
+    /// being dropped.
     @ObservationIgnored private var pendingAuthCallbackURL: URL?
+    /// A line for the sign-in screen from an app-confirm email link
+    /// ("Checking your link…", "already used — sign in", …). AuthView takes it
+    /// into its own banner and clears it.
+    var authLinkStatus: AuthLinkStatus?
+    /// Set when an app-confirm email link lands while an account is already
+    /// signed in here — RootView shows it as an alert. The link is NOT used, so
+    /// it never swaps accounts silently and still works after a sign-out.
+    var signedInLinkNotice: String?
     /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
     var uiTestWrite: WriteThrough?
     /// Rule G's gate for the XCUITest / unit-test boot (no coordinator, so no
@@ -1175,8 +1184,9 @@ final class AppModel {
         // budget slot now; today's first foreground feeds wake calibration.
         settlePausedCheckinBudgetIfFired()
         recordWakeWindowIfNeeded()
-        // An auth-callback link that landed before the coordinator existed
-        // (cold launch off a reset / magic link) is exchanged now.
+        // An auth-callback / app-confirm link that landed before the
+        // coordinator existed (cold launch off a reset / sign-up / magic link)
+        // is exchanged or verified now.
         if let url = pendingAuthCallbackURL {
             pendingAuthCallbackURL = nil
             handleDeepLink(url)
@@ -1469,6 +1479,8 @@ final class AppModel {
                     // an existing account on a fresh install isn't shown the
                     // 5 steps while the server is still being asked.
                     if becameAuthed {
+                        // A pending sign-in-screen line from an email link is moot now.
+                        self.authLinkStatus = nil
                         self.reconcileAccountOnboardingIfNeeded()
                         // The zone the SERVER schedules this account in — pushed
                         // at sign-in (not only after a hydrate) so a phone-only
@@ -1613,6 +1625,13 @@ final class AppModel {
     }
 
     func handleDeepLink(_ url: URL) {
+        // An app-confirm email link (https://unstucknow.io/auth/app-confirm/?
+        // token_hash=…, or unstuck://auth-confirm?…) → verify it in-app and land
+        // signed in, like a successful auth-callback exchange.
+        if let link = AppConfirmLink.parse(url) {
+            handleAppConfirmLink(link, url: url)
+            return
+        }
         // A tapped invite LINK (https universal link) → ask Accept / Not now in
         // the app (was opening the website; then auto-redeeming with no visible
         // feedback). Signed out → stash and ask right after sign-in.
@@ -1647,6 +1666,96 @@ final class AppModel {
             return
         }
         routeDeepLink(url.absoluteString)
+    }
+
+    // MARK: app-confirm email links (owner decision 2026-09-23)
+    //
+    // Sign-up and magic-link emails asked for with redirect
+    // `unstuck://auth-confirm` link to https://unstucknow.io/auth/app-confirm/
+    // ?token_hash=…&type=…: a Universal Link on a phone with the app, a web
+    // page on a computer. The app trades the hash for a session with
+    // verifyOTP(tokenHash:type:); the SDK then emits `.signedIn` and
+    // observeAuth + the sync coordinator land it exactly like an auth-callback
+    // exchange (hydrate, onboarding gate, push registration).
+
+    /// A line for AuthView's banner. `id` makes the same text twice a change.
+    struct AuthLinkStatus: Equatable {
+        let message: String
+        let isError: Bool
+        let id = UUID()
+    }
+
+    /// What to do with a parsed app-confirm link.
+    enum AppConfirmAction: Equatable {
+        /// The coordinator isn't built yet (cold launch) — stash, replay in start().
+        case stash
+        /// An account is signed in here. The link is not used: verifying it
+        /// would replace the session with whichever account it belongs to.
+        case alreadySignedIn
+        case showFailure(EmailLinkFailure)
+        case verify(tokenHash: String, kind: EmailLinkKind)
+        /// `unstuck://auth-confirm?code=…` — Supabase's own PKCE redirect.
+        case exchange
+    }
+
+    /// How long the sign-in screen waits on a verify before saying "tap it
+    /// again" (the request keeps going; a late success still signs in).
+    static let emailLinkDeadline: TimeInterval = 20
+
+    /// Pure routing for an app-confirm link (unit-tested).
+    nonisolated static func appConfirmAction(_ link: AppConfirmLink, coordinatorReady: Bool,
+                                             signedInUserId: String?) -> AppConfirmAction {
+        guard coordinatorReady else { return .stash }
+        if let uid = signedInUserId, !uid.isEmpty { return .alreadySignedIn }
+        switch link {
+        case .verify(let hash, let kind): return .verify(tokenHash: hash, kind: kind)
+        case .exchangeCode: return .exchange
+        case .unusable(let failure): return .showFailure(failure)
+        }
+    }
+
+    private func handleAppConfirmLink(_ link: AppConfirmLink, url: URL) {
+        let auth = coordinator?.auth
+        switch Self.appConfirmAction(link, coordinatorReady: auth != nil, signedInUserId: auth?.currentUserId) {
+        case .stash:
+            pendingAuthCallbackURL = url
+        case .alreadySignedIn:
+            signedInLinkNotice = emailLinkAlreadySignedInMessage(email: auth?.currentEmail ?? cachedEmail)
+        case .showFailure(let failure):
+            authLinkStatus = AuthLinkStatus(message: failure.message, isError: true)
+        case .verify(let hash, let kind):
+            guard let auth else { return }
+            runEmailLink { await auth.verifyEmailLink(tokenHash: hash, kind: kind) }
+        case .exchange:
+            guard let auth else { return }
+            runEmailLink { await auth.exchangeEmailLinkCode(url: url) }
+        }
+    }
+
+    /// Show "Checking your link…", run the verify within `emailLinkDeadline`,
+    /// then report — never a hang or a blank screen.
+    private func runEmailLink(_ op: @escaping @Sendable () async -> EmailLinkOutcome) {
+        authLinkStatus = AuthLinkStatus(message: "Checking your link…", isError: false)
+        Task { [weak self] in
+            let outcome = await AuthService.firstWithin(Self.emailLinkDeadline) { await op() } ?? .failed(.retry)
+            await MainActor.run { self?.applyEmailLinkOutcome(outcome) }
+        }
+    }
+
+    func applyEmailLinkOutcome(_ outcome: EmailLinkOutcome) {
+        // Signed in by now (a second tap of the same link lost the race to the
+        // first): there's no sign-in screen to tell, and a stale "already used"
+        // must not greet the next sign-out.
+        guard !signedIn else { authLinkStatus = nil; return }
+        switch outcome {
+        case .signedIn:
+            // The SDK's `.signedIn` swaps AuthView for the app via observeAuth.
+            authLinkStatus = nil
+        case .confirmedNoSession:
+            authLinkStatus = AuthLinkStatus(message: emailLinkConfirmedSignInMessage, isError: false)
+        case .failed(let failure):
+            authLinkStatus = AuthLinkStatus(message: failure.message, isError: true)
+        }
     }
 
     /// The task id of the active live focus session (nil when idle). Today uses
