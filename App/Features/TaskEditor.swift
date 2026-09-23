@@ -91,8 +91,18 @@ struct TaskEditor: View {
         return "Unscheduled"
     }
     private var statusText: String {
-        if isDone { return "Completed" }
-        if editTarget.totalFocused > 0 { return "In progress" }
+        Self.statusLabel(done: isDone, isOccurrence: isOcc, focusedSec: editTarget.totalFocused)
+    }
+    /// The Status cell. For a day of a repeating task `editTarget` is the
+    /// series TEMPLATE, whose totalFocused is the series' LIFETIME focus (every
+    /// occurrence session accrues onto it), so reading it showed an untouched
+    /// day as "In progress". A day is "Completed" or "Not started" — web and
+    /// Android project occurrence rows with totalFocused 0 for the same reason
+    /// (web/Android audit 2026-09-23, W10/A13). A plain task, or the series
+    /// itself, keeps reading its own total.
+    nonisolated static func statusLabel(done: Bool, isOccurrence: Bool, focusedSec: Int) -> String {
+        if done { return "Completed" }
+        if !isOccurrence && focusedSec > 0 { return "In progress" }
         return "Not started"
     }
     /// The task is handed to someone else (an outgoing 'assign' share): the

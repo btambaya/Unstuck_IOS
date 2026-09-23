@@ -254,6 +254,20 @@ final class RepeatingFocusPriorTests: XCTestCase {
         await model.startFocusJoinOrMint(taskId: plain.id, estimateMin: nil, occurrenceBlockId: nil)
         XCTAssertEqual(try store.get()?.priorAccumulatedSec, 600, "a plain task keeps its own total")
     }
+
+    /// The task sheet's Status on a day of a repeating task: the editor reads
+    /// the TEMPLATE, whose total is the series' lifetime focus, so an untouched
+    /// day read "In progress".
+    func testTheTaskSheetShowsAnUntouchedDayOfARepeatingTaskAsNotStarted() {
+        let tpl = series()
+        XCTAssertEqual(TaskEditor.statusLabel(done: false, isOccurrence: true, focusedSec: tpl.totalFocused),
+                       "Not started", "the series' lifetime focus is not this day's")
+        XCTAssertEqual(TaskEditor.statusLabel(done: true, isOccurrence: true, focusedSec: tpl.totalFocused), "Completed")
+        // A plain task, or the series itself, still reads its own total.
+        XCTAssertEqual(TaskEditor.statusLabel(done: false, isOccurrence: false, focusedSec: 600), "In progress")
+        XCTAssertEqual(TaskEditor.statusLabel(done: false, isOccurrence: false, focusedSec: 0), "Not started")
+        XCTAssertEqual(TaskEditor.statusLabel(done: true, isOccurrence: false, focusedSec: 600), "Completed")
+    }
 }
 
 final class SharedFocusLedgerParkingTests: XCTestCase {
