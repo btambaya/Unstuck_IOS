@@ -56,11 +56,16 @@
 //      so once, in its own voice (Ahmad 2026-09-23). It is a reply like any
 //      other, so it waits its turn: nothing on air or being created (ours,
 //      or the client's own opening / corrective / tool continuation), no
-//      tool running, no turn of theirs waiting, the user not speaking, and a
-//      moment of quiet after the last sound — never over the user.
+//      tool running, no turn of theirs waiting or still being transcribed,
+//      the user not speaking (nor the mic's gate just opened, nor Interrupt
+//      just pressed), and a moment of quiet after the last sound — never
+//      over the user. The held echo deletes go before it, as before any ask.
 //
 // Hold-to-talk (turn_detection null) is unchanged: the client commits and
-// creates on release. Inputs are events + a monotonic clock (seconds);
+// creates on release. Two guards since 2026-09-23 (review): a reply created
+// while the button is held is cut as it arrives, and a release create that
+// such a reply refused is asked again once it is done. Inputs are events +
+// a monotonic clock (seconds);
 // outputs are commands the transport/audio layers execute
 // (VoiceRealtimeClient / VoiceAudioEngine).
 
@@ -403,6 +408,10 @@ struct BargeInController: Sendable {
         /// talking before the turn was asked for), from `displacedTurn`.
         var movedTurn = false
         var displacedTurn: TimeInterval?
+        /// Its completed transcript (or the transcription's failure) has
+        /// come: what it was — a turn, echo, a cough — is decided. The
+        /// minutes notice waits for it (header §6).
+        var settled = false
     }
     private var segments: [Segment] = []
     static let segmentHistory = 8
@@ -450,6 +459,23 @@ struct BargeInController: Sendable {
     /// long, at the first moment nothing is on air or owed: a minute's
     /// warning that comes after the minute is no warning.
     static let noticeMaxWaitSec: TimeInterval = 20
+    /// The local gate opens ~200–300 ms before the server VAD's
+    /// speech_started on the energy routes (CallKit, earphones): an open gate
+    /// holds the notice this long, time for a voice to be confirmed. A gate
+    /// open longer with the VAD silent is the room, not the user — never a
+    /// reason to hold it for ever (review 2026-09-23).
+    static let noticeGateMs = 1000
+    /// The Interrupt button: they asked for silence. The notice waits this
+    /// long after it — past the max wait too, which is for a conversation
+    /// with no pause, not for one they just stopped (review 2026-09-23).
+    private var lastInterruptAt: TimeInterval?
+    static let noticeAfterInterruptMs = 3000
+    /// Hold-to-talk: the release's own `response.create`, until a
+    /// response.created answers it. Refused ("already has an active
+    /// response" — a reply that was already on its way when they pressed),
+    /// it becomes a pending turn, asked for once that reply is done; before,
+    /// nothing asked again and their words went unanswered (review 2026-09-23).
+    private var releaseCreateAt: TimeInterval?
 
     init(profile: BargeInProfile, holdToTalk: Bool = false) {
         self.profile = profile
@@ -514,12 +540,23 @@ struct BargeInController: Sendable {
             if let since = pendingTurnSince, let sent = createSentAt, since > sent { answeredTurnsThrough = sent } else { pendingTurnSince = nil }
             createSentAt = nil
             clientCreateSentAt = nil
+            releaseCreateAt = nil
             // A new reply: the one before it is now the "previous" reference.
             spokenPrevious = spokenCurrent
             spokenCurrent = []
             spokenSet = Set(spokenPrevious.map(Self.stem))
             out.append(.uiState(.thinking))
             if state == .idle { state = .speaking }
+            if state == .hold {
+                // The button is held: a reply whose create was already on its
+                // way when they pressed (the opening, a tool continuation, the
+                // minutes notice) would play over them, and refuse the
+                // release's own create. The press means "stop and listen" —
+                // `.pttDown` cancels a reply already busy; this one is cut as
+                // it arrives, and the hold stays (review 2026-09-23).
+                out += cancel(now: now, hard: true)
+                state = .hold
+            }
 
         case .audioDelta(let id):
             guard shouldEnqueueAudio(id: id) else { break }
@@ -589,6 +626,7 @@ struct BargeInController: Sendable {
         case .gateClose:
             gateOpen = false
             gateOpenSince = nil
+            lastSoundAt = now   // a sound at the mic just ended (the notice's quiet)
             if case .ducked(_, let trigger) = state, trigger == .gate {
                 // Below threshold before confirm and the server never agreed:
                 // nothing was committed server-side, just restore.
@@ -669,6 +707,7 @@ struct BargeInController: Sendable {
                 break
             }
             if index.map({ segments[$0].responded }) == true { break }   // a completed transcript re-sent
+            if let index { segments[index].settled = true }
             let id = (index.map { segments[$0].itemId } ?? nil) ?? itemId
             guard let index else {
                 guard !tokens.isEmpty else {
@@ -758,6 +797,7 @@ struct BargeInController: Sendable {
             // from the echo, and that reply was never cut for it.
             guard !holdToTalk else { break }   // the release already committed + asked
             let index = segmentIndex(for: itemId)
+            if let index { segments[index].settled = true }   // no words are coming
             if let index, segments[index].responded { break }
             let alreadyCancelled = activeResponseId != nil && activeResponseId == cancelledResponseId
             if modelBusy && !alreadyCancelled { break }
@@ -800,6 +840,7 @@ struct BargeInController: Sendable {
         case .interruptPressed:
             if state == .hold { break }
             pendingTurnSince = nil   // the user wants silence, not the next reply
+            lastInterruptAt = now    // …nor the minutes notice straight after (header §6)
             if modelBusy {
                 out += cancel(now: now, hard: true)
             } else {
@@ -845,6 +886,13 @@ struct BargeInController: Sendable {
             // grace timer's.
             responseActive = true
             if state == .idle { state = .speaking }
+            if holdToTalk, releaseCreateAt != nil {
+                // The refused create is the release's (nothing answered it
+                // yet): their committed words are a pending turn, its hold
+                // already over — asked for when this reply's done comes.
+                releaseCreateAt = nil
+                pendingTurnSince = now - Double(Self.turnHoldMs) / 1000
+            }
             if pendingCreate { out.append(.startConfirmTimer(ms: Int(Self.createGraceSec * 1000))) }
             out.append(.uiState(uiStateNow))
 
@@ -858,6 +906,10 @@ struct BargeInController: Sendable {
         case .pttDown:
             guard holdToTalk, state != .hold else { break }
             if modelBusy { out += cancel(now: now, hard: true) }
+            // Whatever was still owed rides on this release's create, which
+            // answers everything committed so far.
+            pendingTurnSince = nil
+            releaseCreateAt = nil
             state = .hold
             out.append(.uiState(.listening))
 
@@ -869,6 +921,7 @@ struct BargeInController: Sendable {
             // That create is the release's own, not a pending turn's: the
             // minutes notice must not be created into it.
             clientCreateSentAt = now
+            releaseCreateAt = now
             lastSoundAt = now
             out.append(.commitAndRespond)
             out.append(.uiState(.thinking))
@@ -894,7 +947,7 @@ struct BargeInController: Sendable {
         if noticeOwedSince != nil {
             switch event {
             case .minutesWarning, .tick, .playbackDrained, .responseDone, .speechStopped, .toolFinished,
-                 .benignActiveResponseError, .transcription(_, _, true):
+                 .benignActiveResponseError, .transcription(_, _, true), .transcriptionFailed, .gateClose:
                 out += tryNotice(now: now)
             default:
                 break
@@ -1223,10 +1276,11 @@ struct BargeInController: Sendable {
     /// The notice, if now is its moment (header §6): nothing on air or
     /// generating, no turn of theirs waiting or being asked, no create of the
     /// client's own in flight, no tool running, the user not speaking or
-    /// holding the button, and `noticeQuietMs` since the last sound — unless
-    /// it has waited `noticeMaxWaitSec` already. A wait with an end arms the
-    /// tick that re-checks; one with none (a reply playing, a tool running)
-    /// is re-checked by the event that ends it.
+    /// holding the button, not just interrupted, the mic's gate not just
+    /// opened, the last segment's words in, and `noticeQuietMs` since the
+    /// last sound — unless it has waited `noticeMaxWaitSec` already. A wait
+    /// with an end arms the tick that re-checks; one with none (a reply
+    /// playing, a tool running) is re-checked by the event that ends it.
     private mutating func tryNotice(now: TimeInterval) -> [BargeInCommand] {
         guard let owed = noticeOwedSince else { return [] }
         guard !modelBusy, !pendingCreate, !serverSpeaking, state != .hold, toolsRunning == 0 else { return [] }
@@ -1236,6 +1290,21 @@ struct BargeInController: Sendable {
         let graceMs = Int(Self.createGraceSec * 1000)
         if let sent = [createSentAt, clientCreateSentAt].compactMap({ $0 }).max(), ms(since: sent) < graceMs {
             return [.startConfirmTimer(ms: graceMs - ms(since: sent) + 1)]
+        }
+        if let pressed = lastInterruptAt, ms(since: pressed) < Self.noticeAfterInterruptMs {
+            return [.startConfirmTimer(ms: Self.noticeAfterInterruptMs - ms(since: pressed) + 1)]
+        }
+        // The gate hears a voice before the server VAD does (review
+        // 2026-09-23): a notice created in that gap starts over them.
+        if gateOpen, let opened = gateOpenSince, ms(since: opened) < Self.noticeGateMs {
+            return [.startConfirmTimer(ms: Self.noticeGateMs - ms(since: opened) + 1)]
+        }
+        // The last segment's words are still being transcribed: it may be a
+        // turn of theirs (asked for first), or echo / no words whose delete
+        // must go before the note (below). Not for ever — a transcript that
+        // never comes is the grace's, as for an ask.
+        if let last = segments.last, !last.settled, let stopped = last.stoppedAt, ms(since: stopped) < graceMs {
+            return [.startConfirmTimer(ms: graceMs - ms(since: stopped) + 1)]
         }
         let quietNeededMs = ms(since: owed) >= Int(Self.noticeMaxWaitSec * 1000) ? 0 : Self.noticeQuietMs
         if let last = lastSoundAt, ms(since: last) < quietNeededMs {
@@ -1247,7 +1316,11 @@ struct BargeInController: Sendable {
         // stays pending (responseCreated: `since > sent`) and is asked once
         // the notice's reply is done — never dropped as "answered".
         createSentAt = now
-        return [.speakMinutesNotice]
+        // The held echo / no-words deletes go first, as before any ask: the
+        // model must not hear a noise or its own words back as the user
+        // speaking and answer that ("Sorry, I didn't catch that — …") in
+        // the notice (voice-echo-verdict; review 2026-09-23).
+        return flushPendingDeletes(except: nil) + [.speakMinutesNotice]
     }
 }
 

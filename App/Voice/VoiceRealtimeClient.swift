@@ -238,9 +238,10 @@ struct VoiceMinutes: Equatable, Sendable {
     /// The hidden note that has the ASSISTANT say the warning in its own
     /// voice (BargeIn header §6). A user-role item, as the proxy relays only
     /// user messages and tool outputs; worded as the app's, not the user's,
-    /// like the integrity corrective. One line, no question, no tool — and
-    /// once: the note stays in the conversation, and the primer taught us a
-    /// standing instruction is re-run after a barge-in (2026-08-30).
+    /// like the integrity corrective. One line, no question, no tool (and
+    /// its create carries tool_choice "none") — and once: the primer taught
+    /// us a standing instruction is re-run after a barge-in (2026-08-30), so
+    /// the note is also deleted when its reply is done.
     static let noticeText = "(note from the app, not the user: about one minute of today's voice time is left. Say so now, once, in one short natural line in your own words — like \"We've got about a minute left today.\" — then stop and listen. No question, no tool, and never say it again.)"
 }
 
@@ -281,6 +282,16 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     static let primerDeleteEvent = "evt_primer_delete_0001"
     /// Client event ids on truncates, so their rejections are recognised.
     static let truncateEventPrefix = "evt_truncate_"
+    /// The minutes notice's hidden note (VoiceMinutes.noticeText), by a known
+    /// id so it is deleted once its reply is done — like the primer, a note
+    /// left in the conversation is a standing instruction the model re-runs
+    /// after a barge-in (2026-08-30; review 2026-09-23). Same 32-hex shape.
+    static let minutesNoticeItemId = "b1e2f3d4c5b6a7988970615243342516"
+    static let minutesNoticeDeleteEvent = "evt_minutes_notice_delete_0001"
+    /// The notice's create: no tool in a line about the time left — the
+    /// note's "no tool" is only a request, and the integrity guard never
+    /// scores this reply (it is exempt), so it is enforced here.
+    static let minutesNoticeResponse: [String: String] = ["tool_choice": "none"]
 
     private let proxyURL: String          // wss://…workers.dev (token added as a header)
     private let token: String             // Supabase access token (the Worker validates it); the fallback when `freshToken` is set
@@ -360,6 +371,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     static let dailyLimitMessage = "You've used today's voice time — try again tomorrow."
     /// The proxy's 15-minute cap (close 1000 "session time limit").
     static let sessionTimeLimitMessage = "Voice sessions last up to 15 minutes."
+    /// The same close well short of 15 minutes: the proxy's fallback cap on a
+    /// session whose voice minutes it could not read — a new one is fine.
+    static let sessionEndedMessage = "This voice session reached its time limit — start a new one to keep going."
+    /// A session that ran at least this long was ended by the 15-minute cap:
+    /// the proxy's clock starts before the socket opens here, so a minute of
+    /// slack. The fallback cap ends one at 10.
+    static let fullSessionSec: TimeInterval = 14 * 60
     /// Any other close the server started — its relayed reason is never shown.
     static let serverClosedMessage = "The voice server closed the session."
     /// A handshake 429: the proxy answers the concurrent-session cap AND the
@@ -443,9 +461,17 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private var _minutes: VoiceMinutes?
     private var _minutesAt: TimeInterval = 0
     private var _largestMinutesMs = 0
-    /// Set when today's minutes ended the session: the plain line, read by
-    /// the call launcher to end the call normally (`minutesUsedNote`).
-    private var _minutesUsedNote: String?
+    /// Set when a daily limit ended the session: the plain line, read by the
+    /// call launcher to end the call normally (`dailyLimitNote`).
+    private var _dailyLimitNote: String?
+    /// The minutes notice's note is in the conversation, and the response
+    /// that answers it — nil until the next response.created, then its id
+    /// ("" for an id-less backend) — whose done deletes the note.
+    private var _noticeNoteLive = false
+    private var _noticeResponseId: String?
+    /// When the socket opened (`now()`): how long the session ran when the
+    /// proxy ends it on time.
+    private var _openedAt: TimeInterval = 0
 
     /// How long to wait before re-asking a rate-limited reply: the bucket's
     /// own reset when known, else the server's "try again in 6.9s", else 5 s;
@@ -645,15 +671,21 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case Self.dailyLimitMessage?:
             // Today's voice minutes, when their figure has run out — named
             // with the account's allowance (Ahmad 2026-09-23); else the
-            // proxy's reply budget, which closes the same way.
-            if let note = minutesUsedMessage() {
-                withLock { _minutesUsedNote = note }
-                transportEnded(error: note, retryable: false)
-            } else {
-                transportEnded(error: Self.dailyLimitMessage, retryable: false)
-            }
+            // proxy's reply budget, which closes the same way — or the
+            // minutes after all, when a charge found another device had
+            // spent them and the proxy closed without a fresh figure. Either
+            // way a daily limit: a call ends normally on it, never "Couldn't
+            // start the call" after a real conversation (review 2026-09-23).
+            let note = minutesUsedMessage() ?? Self.dailyLimitMessage
+            withLock { _dailyLimitNote = note }
+            transportEnded(error: note, retryable: false)
         case Self.sessionTimeLimitMessage?:
-            transportEnded(error: nil, note: Self.sessionTimeLimitMessage)
+            // The 15-minute cap — or, well before it, the proxy's fallback
+            // cap for a session whose minutes it could not read (10 minutes,
+            // closed the same way): that one must not claim 15 (review
+            // 2026-09-23).
+            let ran = now() - withLock { _openedAt }
+            transportEnded(error: nil, note: ran < Self.fullSessionSec ? Self.sessionEndedMessage : Self.sessionTimeLimitMessage)
         case let message?:
             transportEnded(error: message)
         case nil:
@@ -661,17 +693,21 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         }
     }
 
-    /// The out-of-minutes line when the session ended because today's voice
-    /// minutes ran out (read before it is reported), else nil. The call
-    /// launcher ends a call that ends this way normally, with this line in
-    /// the post-call notice, instead of "Couldn't start the call".
-    var minutesUsedNote: String? { withLock { _minutesUsedNote } }
+    /// The plain line when a daily limit ended the session — today's voice
+    /// minutes ("You've used today's 10 voice minutes…"), or the proxy's
+    /// reply budget (`dailyLimitMessage`) — set before it is reported, else
+    /// nil. The call launcher ends a call that ends this way normally, with
+    /// this line in the post-call notice, instead of "Couldn't start the call".
+    var dailyLimitNote: String? { withLock { _dailyLimitNote } }
 
     /// `VoiceMinutes.usedMessage` for the account's allowance when the last
     /// figure has run out by now, else nil (see `endedByMinutes`).
-    private func minutesUsedMessage() -> String? {
+    /// `figureOnly`: only on a figure that says so — never the no-figure
+    /// reading of a 1008 before any reply, which a transport failure is not.
+    private func minutesUsedMessage(figureOnly: Bool = false) -> String? {
         let t = now()
         let (last, at, largest, anyReply) = withLock { (_minutes, _minutesAt, _largestMinutesMs, _anyResponse) }
+        if figureOnly, last == nil { return nil }
         guard VoiceMinutes.endedByMinutes(last: last, elapsed: t - at, anyReply: anyReply) else { return nil }
         // The account's other sessions today count too — also when this one
         // was refused before its figure was read.
@@ -928,14 +964,20 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 onCaption("user", text, true)
             case .speakMinutesNotice:
                 // The warning in the assistant's own voice (Ahmad
-                // 2026-09-23): the app's note, then the reply to it. A plain
-                // create — per-response instructions are stripped by the proxy.
+                // 2026-09-23): the app's note, then the reply to it — per-
+                // response instructions are stripped by the proxy, its
+                // tool_choice is not. The note is deleted once that reply is
+                // done (`minutesNoticeItemId`).
                 voiceLog.notice("voice minutes: asking for the one-minute notice")
-                withLock { _guard.nextResponseExempt = true }
+                withLock {
+                    _guard.nextResponseExempt = true
+                    _noticeNoteLive = true
+                    _noticeResponseId = nil
+                }
                 send(["type": "conversation.item.create",
-                      "item": ["type": "message", "role": "user",
+                      "item": ["id": Self.minutesNoticeItemId, "type": "message", "role": "user",
                                "content": [["type": "input_text", "text": VoiceMinutes.noticeText]]]])
-                send(["type": "response.create"])
+                send(["type": "response.create", "response": Self.minutesNoticeResponse])
             case .uiState(let s): onState(s)
             }
         }
@@ -991,9 +1033,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         // Profile for the route we're actually on BEFORE the first
         // session.update (a CallKit call on the receiver → low-echo).
         let route = initialRoute ?? routeProvider()
+        let t0 = now()
         let gateCtx: GateContext = withLock {
             _open = true
             _openedOnce = true
+            _openedAt = t0
             _ = _bargeIn.handle(.routeChanged(route), now: now())
             return _bargeIn.initialGateContext()
         }
@@ -1064,9 +1108,23 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// `note` — a clean end the user is told about (`onServerEnded`).
     private func transportEnded(error: String?, retryable: Bool = true, note: String? = nil) {
         voiceLog.notice("voice transport ended (\(error ?? "clean close", privacy: .public))")
+        // A socket that fails once today's minutes are gone is the minutes,
+        // whatever the transport says: the refusal's `remaining_ms: 0` read,
+        // then a reset or a close with no code (closeCode still .invalid)
+        // was taken for dead on arrival — two "Connecting…" redials into the
+        // same refusal, then "The voice server dropped the session twice"
+        // (review 2026-09-23). Only on a figure that says so.
+        var error = error, retryable = retryable
+        var minutesLine: String?
+        if error != nil, retryable, let line = minutesUsedMessage(figureOnly: true) {
+            error = line
+            retryable = false
+            minutesLine = line
+        }
         let first: Bool = withLock {
             if _stopped || _reportedError { return false }   // our own invalidate / already reported
             _open = false; _reportedError = true
+            if let minutesLine { _dailyLimitNote = minutesLine }   // a call ends normally on it
             return true
         }
         guard first else { return }
@@ -1113,7 +1171,12 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case "input_audio_buffer.speech_stopped":
             dispatch(.speechStopped)
         case "response.created":
-            withLock { _guard.responseCreated(); _anyResponse = true }
+            withLock {
+                _guard.responseCreated(); _anyResponse = true
+                // The reply that answers the minutes notice's note (header
+                // §6 in BargeIn) — its done deletes the note.
+                if _noticeNoteLive, _noticeResponseId == nil { _noticeResponseId = responseId ?? "" }
+            }
             // The model heard the user and is reasoning — "Thinking" until the
             // first audio delta (or an immediate cancel if this reply is the
             // one the server made from a false-start blip).
@@ -1194,6 +1257,22 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             if deletePrimer {
                 send(["type": "conversation.item.delete", "item_id": Self.primerItemId, "event_id": Self.primerDeleteEvent])
             }
+            // The minutes notice's reply is over (said, or cut by the user):
+            // its note goes, so it can never be re-run as a standing
+            // instruction (review 2026-09-23). Before the done reaches the
+            // controller, which may ask for a turn of theirs in the same breath.
+            let deleteNotice: Bool = withLock {
+                guard type == "response.done", _noticeNoteLive, let answering = _noticeResponseId,
+                      answering.isEmpty || responseId == nil || responseId == answering else { return false }
+                // A reply the server could not produce said nothing: the note
+                // stays for the one that does (a rate-limited one is re-asked).
+                if (response?["status"] as? String) == "failed" { _noticeResponseId = nil; return false }
+                _noticeNoteLive = false
+                return true
+            }
+            if deleteNotice {
+                send(["type": "conversation.item.delete", "item_id": Self.minutesNoticeItemId, "event_id": Self.minutesNoticeDeleteEvent])
+            }
             if type == "response.done" {
                 // A cancelled/incomplete response (barge-in) is not a claim:
                 // never score it, and never inject a corrective mid-utterance.
@@ -1270,6 +1349,9 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // swallow also hid rejected tool outputs.
             let evId = (ev["event_id"] as? String) ?? (errObj?["event_id"] as? String)
             if evId == Self.primerDeleteEvent || (m?.contains(Self.primerItemId) ?? false) { return }
+            // The same for the minutes notice's note (its create may never
+            // have landed): best effort, never a broken session.
+            if evId == Self.minutesNoticeDeleteEvent || (m?.contains(Self.minutesNoticeItemId) ?? false) { return }
             // A truncate the server refused (the item already gone, a backend
             // without the event) is best effort, not a broken session: the
             // reply was cut on the phone either way. OpenAI puts OUR event id

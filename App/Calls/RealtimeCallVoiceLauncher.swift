@@ -54,9 +54,10 @@ protocol CallRealtimeSession: AnyObject, Sendable {
     func start()
     func stop()
     func setMicMuted(_ muted: Bool)
-    /// Set when today's voice minutes ended the session — the plain line
-    /// for the post-call notice (VoiceRealtimeClient.minutesUsedNote).
-    var minutesUsedNote: String? { get }
+    /// Set when a daily limit ended the session (today's voice minutes, or
+    /// the proxy's reply budget) — the plain line for the post-call notice
+    /// (VoiceRealtimeClient.dailyLimitNote).
+    var dailyLimitNote: String? { get }
 }
 
 extension VoiceRealtimeClient: CallRealtimeSession {}
@@ -327,10 +328,11 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
     }
 
     private func transportEnded(_ error: String?, generation gen: Int) {
-        // Today's voice minutes ran out (Ahmad 2026-09-23): the call did not
-        // fail — it ends normally, and the notice after it says why in plain
-        // words instead of "Couldn't start the call".
-        if error != nil, let a = active, a.generation == gen, let note = a.realtime.minutesUsedNote {
+        // Today's voice minutes ran out (Ahmad 2026-09-23) — or another daily
+        // limit closed it the same way: the call did not fail — it ends
+        // normally, and the notice after it says why in plain words instead
+        // of "Couldn't start the call".
+        if error != nil, let a = active, a.generation == gen, let note = a.realtime.dailyLimitNote {
             finish(.outOfMinutes(note), generation: gen)
             return
         }

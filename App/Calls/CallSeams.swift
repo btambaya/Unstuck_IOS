@@ -26,8 +26,9 @@ enum CallEndReason: Equatable, Sendable {
     /// gets the notes as a notification.
     case failed(String)
     /// Today's voice minutes ran out (the proxy's 1008 "daily voice limit
-    /// reached", Ahmad 2026-09-23) — a normal end, not a failure; the
-    /// post-call notice carries this plain line.
+    /// reached", Ahmad 2026-09-23 — also its daily reply budget, which closes
+    /// the same way) — a normal end, not a failure; the post-call notice
+    /// carries this plain line.
     case outOfMinutes(String)
 }
 

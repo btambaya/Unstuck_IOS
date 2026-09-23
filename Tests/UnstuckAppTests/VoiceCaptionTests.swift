@@ -819,9 +819,16 @@ final class VoiceLimitTests: XCTestCase {
         var notes: [String] { lock.withLock { _notes } }
     }
 
+    /// A monotonic clock the test moves (the session's length).
+    private final class Clock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _t: TimeInterval = 0
+        var t: TimeInterval { get { lock.withLock { _t } } set { lock.withLock { _t = newValue } } }
+    }
+
     /// A client whose socket has OPENED (the delegate's didOpen), with an
     /// owner hooked for dead-on-arrival reconnects, as Talk and calls have.
-    private func openClient(_ rec: Rec) -> VoiceRealtimeClient {
+    private func openClient(_ rec: Rec, clock: Clock = Clock()) -> VoiceRealtimeClient {
         let c = VoiceRealtimeClient(
             proxyURL: "wss://example.invalid/v", token: "t", model: "m",
             instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
@@ -831,7 +838,7 @@ final class VoiceLimitTests: XCTestCase {
             onError: { rec.error($0) },
             initialRoute: .speaker,
             routeProvider: { .speaker },
-            now: { 0 })
+            now: { clock.t })
         c.sendOverride = { _ in }
         c.onTransportEnded = { rec.end($0) }
         c.onServerEnded = { rec.note($0) }
@@ -902,14 +909,32 @@ final class VoiceLimitTests: XCTestCase {
     /// hangs up as a normal end (the launcher maps nil to .hungUp), not
     /// "Couldn't start the call — here's what it was about".
     func testTheSessionTimeLimitIsACleanEndWithANote() {
-        let rec = Rec()
-        let c = openClient(rec)
+        let rec = Rec(), clock = Clock()
+        let c = openClient(rec, clock: clock)
         c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        clock.t = 15 * 60 - 1   // the proxy's clock started before the socket opened here
         c.serverClosed(code: 1000, reason: "session time limit")
         XCTAssertEqual(rec.errors, [], "not an error")
         XCTAssertEqual(rec.ended, [nil], "a clean end for the call")
         XCTAssertEqual(rec.notes, [VoiceRealtimeClient.sessionTimeLimitMessage])
         XCTAssertEqual(rec.states.last, .closed)
+        c.stop()
+    }
+
+    /// The same close at 10 minutes is the proxy's fallback cap on a session
+    /// whose voice minutes it couldn't read (077): still a clean end, but it
+    /// never claims "up to 15 minutes" (review 2026-09-23).
+    func testTheFallbackCapAtTenMinutesDoesNotClaimFifteen() {
+        let rec = Rec(), clock = Clock()
+        clock.t = 100
+        let c = openClient(rec, clock: clock)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        clock.t = 100 + 600
+        c.serverClosed(code: 1000, reason: "session time limit")
+        XCTAssertEqual(rec.errors, [])
+        XCTAssertEqual(rec.ended, [nil])
+        XCTAssertEqual(rec.notes, ["This voice session reached its time limit — start a new one to keep going."])
+        XCTAssertFalse(rec.notes[0].contains("15"))
         c.stop()
     }
 
@@ -1118,9 +1143,12 @@ final class VoiceMinutesTests: XCTestCase {
         let item = wire.frames[0]["item"] as? [String: Any]
         XCTAssertEqual(item?["type"] as? String, "message")
         XCTAssertEqual(item?["role"] as? String, "user", "the proxy relays user messages only")
+        XCTAssertEqual(item?["id"] as? String, VoiceRealtimeClient.minutesNoticeItemId, "a known id, to delete it by")
         let content = (item?["content"] as? [[String: Any]])?.first
         XCTAssertEqual(content?["text"] as? String, VoiceMinutes.noticeText)
-        XCTAssertNil(wire.frames[1]["response"], "a plain create: the proxy strips per-response instructions")
+        // No per-response instructions (the proxy strips them) — only the
+        // tool_choice it lets through: no tool in a line about the time.
+        XCTAssertEqual(wire.frames[1]["response"] as? [String: String], ["tool_choice": "none"])
         clock.t = 20
         c.handle(budget(50_000, warn: true))
         XCTAssertEqual(wire.types.count, 2, "once per session")
@@ -1157,6 +1185,61 @@ final class VoiceMinutesTests: XCTestCase {
         c.stop()
     }
 
+    /// The note is a standing instruction while it stays (the primer, re-run
+    /// after every barge-in — 2026-08-30): it goes when its reply is done,
+    /// said or cut; a reply the server couldn't produce leaves it for the
+    /// next (review 2026-09-23).
+    func testTheNoticesNoteIsDeletedOnceItsReplyIsDone() {
+        func noteDeletes(_ w: Wire) -> [[String: Any]] {
+            w.frames.filter { $0["type"] as? String == "conversation.item.delete"
+                && $0["item_id"] as? String == VoiceRealtimeClient.minutesNoticeItemId }
+        }
+        func done(_ c: VoiceRealtimeClient, _ id: String, _ status: String) {
+            c.handle(json(["type": "response.done", "response": ["id": id, "status": status]]))
+        }
+        let rec = Rec(), wire = Wire(), clock = Clock()
+        let c = client(rec, wire, clock)
+        c.handle(json(["type": "response.created", "response": ["id": "r0"]]))
+        done(c, "r0", "completed")   // a reply before the notice: nothing to delete
+        clock.t = 5
+        c.handle(budget(60_000, warn: true))
+        XCTAssertEqual(noteDeletes(wire).count, 0, "asked for, not yet said")
+        c.handle(json(["type": "response.created", "response": ["id": "n1"]]))
+        XCTAssertEqual(noteDeletes(wire).count, 0)
+        done(c, "n1", "completed")
+        XCTAssertEqual(noteDeletes(wire).count, 1)
+        XCTAssertEqual(noteDeletes(wire).first?["event_id"] as? String, VoiceRealtimeClient.minutesNoticeDeleteEvent)
+        c.handle(json(["type": "response.created", "response": ["id": "r2"]]))
+        done(c, "r2", "completed")
+        XCTAssertEqual(noteDeletes(wire).count, 1, "once")
+        // Its rejection (the note never landed) is no broken session.
+        c.handle(json(["type": "error", "event_id": "srv_1",
+                       "error": ["type": "invalid_request_error", "code": "item_not_found",
+                                 "message": "Item with item_id not found: \(VoiceRealtimeClient.minutesNoticeItemId)",
+                                 "event_id": VoiceRealtimeClient.minutesNoticeDeleteEvent]]))
+        XCTAssertEqual(rec.errors, [])
+        c.stop()
+
+        // Cut by the user: gone too. Failed: kept for the reply that is made.
+        let wire2 = Wire(), clock2 = Clock()
+        let cut = client(Rec(), wire2, clock2)
+        cut.handle(budget(50_000, warn: true))
+        cut.handle(json(["type": "response.created", "response": ["id": "n1"]]))
+        done(cut, "n1", "cancelled")
+        XCTAssertEqual(noteDeletes(wire2).count, 1)
+        cut.stop()
+        let wire3 = Wire(), clock3 = Clock()
+        let failed = client(Rec(), wire3, clock3)
+        failed.handle(budget(50_000, warn: true))
+        failed.handle(json(["type": "response.created", "response": ["id": "n1"]]))
+        done(failed, "n1", "failed")
+        XCTAssertEqual(noteDeletes(wire3).count, 0, "nothing was said")
+        failed.handle(json(["type": "response.created", "response": ["id": "n2"]]))
+        done(failed, "n2", "completed")
+        XCTAssertEqual(noteDeletes(wire3).count, 1)
+        failed.stop()
+    }
+
     func testTheWarningWaitsForTheOpeningsReply() {
         let rec = Rec(), wire = Wire(), clock = Clock()
         let c = client(rec, wire, clock)
@@ -1180,9 +1263,58 @@ final class VoiceMinutesTests: XCTestCase {
         let line = "You've used today's 10 voice minutes. They reset at midnight."
         XCTAssertEqual(rec.errors, [line])
         XCTAssertEqual(rec.ended, [line])
-        XCTAssertEqual(c.minutesUsedNote, line, "a call ends normally on it")
+        XCTAssertEqual(c.dailyLimitNote, line, "a call ends normally on it")
         XCTAssertFalse(c.failedBeforeAnyReply, "no quiet reconnect into the same refusal")
         c.stop()
+    }
+
+    /// The refusal's `remaining_ms: 0` is read, then the socket dies with no
+    /// close code (a reset; closeCode still .invalid): still the minutes —
+    /// not dead on arrival, which redialled twice into the same refusal and
+    /// then said "The voice server dropped the session twice" (review
+    /// 2026-09-23). A failure with minutes left, or with no figure, is still
+    /// the quiet reconnect it always was.
+    func testARefusalWhoseCloseCarriesNoCodeIsStillTheMinutes() {
+        let reset = URLError(.networkConnectionLost)
+        let rec = Rec(), clock = Clock()
+        let c = client(rec, Wire(), clock)
+        open(c)
+        c.handle(budget(0))
+        c.handshakeEnded(status: -1, error: reset)   // didCompleteWithError, no close frame
+        let line = "You've used today's 10 voice minutes. They reset at midnight."
+        XCTAssertEqual(rec.errors, [line])
+        XCTAssertEqual(rec.ended, [line])
+        XCTAssertFalse(c.failedBeforeAnyReply, "never redialled")
+        XCTAssertEqual(c.dailyLimitNote, line, "a call ends normally on it")
+        c.stop()
+        // Minutes left: a drop is a drop.
+        let rec2 = Rec()
+        let left = client(rec2, Wire(), Clock())
+        open(left)
+        left.handle(budget(300_000))
+        left.handshakeEnded(status: -1, error: reset)
+        XCTAssertTrue(left.failedBeforeAnyReply, "dead on arrival: reconnected quietly")
+        XCTAssertEqual(rec2.errors, [])
+        XCTAssertNil(left.dailyLimitNote)
+        left.stop()
+        // No figure at all: nothing says the minutes are gone.
+        let rec3 = Rec()
+        let none = client(rec3, Wire(), Clock())
+        open(none)
+        none.handshakeEnded(status: -1, error: reset)
+        XCTAssertTrue(none.failedBeforeAnyReply)
+        XCTAssertNil(none.dailyLimitNote)
+        none.stop()
+        // Mid-session, the figure run down to nothing by the time it drops.
+        let rec4 = Rec(), clock4 = Clock()
+        let late = client(rec4, Wire(), clock4)
+        open(late)
+        late.handle(budget(90_000))
+        late.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        clock4.t = 88
+        late.handshakeEnded(status: -1, error: reset)
+        XCTAssertEqual(rec4.errors, [line])
+        late.stop()
     }
 
     func testMinutesThatRunOutMidSessionNameTheTeamsAllowance() {
@@ -1234,7 +1366,10 @@ final class VoiceMinutesTests: XCTestCase {
         clock.t = 10
         c.serverClosed(code: 1008, reason: "daily voice limit reached")
         XCTAssertEqual(rec.errors, [VoiceRealtimeClient.dailyLimitMessage])
-        XCTAssertNil(c.minutesUsedNote, "a call that ends so is not the minutes")
+        // Still a daily limit: a call ends normally on it — this close is
+        // also the minutes when a charge found another device had spent them
+        // and the proxy closed without a fresh figure (review 2026-09-23).
+        XCTAssertEqual(c.dailyLimitNote, VoiceRealtimeClient.dailyLimitMessage)
         c.stop()
         let rec2 = Rec()
         let c2 = client(rec2, Wire(), Clock())
@@ -1242,7 +1377,7 @@ final class VoiceMinutesTests: XCTestCase {
         c2.handle(json(["type": "response.created", "response": ["id": "r1"]]))
         c2.serverClosed(code: 1008, reason: "daily voice limit reached")
         XCTAssertEqual(rec2.errors, [VoiceRealtimeClient.dailyLimitMessage])
-        XCTAssertNil(c2.minutesUsedNote)
+        XCTAssertEqual(c2.dailyLimitNote, VoiceRealtimeClient.dailyLimitMessage)
         c2.stop()
     }
 
@@ -1258,7 +1393,7 @@ final class VoiceMinutesTests: XCTestCase {
         open(c)
         c.serverClosed(code: 1008, reason: "daily voice limit reached")
         XCTAssertEqual(rec.errors, ["You've used today's 60 voice minutes. They reset at midnight."])
-        XCTAssertNotNil(c.minutesUsedNote)
+        XCTAssertNotNil(c.dailyLimitNote)
         XCTAssertFalse(c.failedBeforeAnyReply)
         c.stop()
         XCTAssertFalse(VoiceMinutes.endedByMinutes(last: nil, elapsed: 0, anyReply: true))
