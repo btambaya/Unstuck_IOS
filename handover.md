@@ -23,6 +23,7 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (80) uploaded to TestFlight — the token diet: voice tool schemas compacted (~36 % off the block, no tool or value removed) and a route change no longer re-uploads the whole session. 2026-09-22.
 
+- Ship: 1.1.1 (81) uploaded to TestFlight (delivery d3874e6a) — the 20 P0/P1 fixes from the pre-launch audit (C1–C20, see the entry below); backend migration 075 + seven edge functions + the voice-proxy Worker deployed first. 2026-09-23.
 
 
 
@@ -30,6 +31,90 @@ phases land. Newest status at the top.
 
 
 
+
+
+## Where things stand (2026-09-23) — build 81: the 20 pre-launch fixes
+
+A read-only audit of every section (audit/prelaunch-2026-09-22/REPORT.md, 112
+issues: 1 P0, 19 P1, 74 P2, 18 P3) → a design + an independent critique per
+P0/P1 (fix-design/designs.json; Ahmad's calls in fix-design/DECISIONS.md) →
+10 file-grouped branches, each implemented, adversarially reviewed and fixed
+up (fix-impl/results.json has every summary, deviation and residual) → merged
+on integrate/b81 (only rec × done conflicted: setRecurrence and
+set_task_recurrence, resolved by hand) → main.
+
+What changed, by area (the audit ids are in the code comments):
+- Recurrence (C1 P0, C7, C4). topUpRecurrenceHorizon is TAIL-ONLY now
+  (recurrenceTopUp): it only extends past the series' last block, at the
+  series' own time (a 56-day vote, not the next open block's) and, for
+  monthly, its own day; it never re-adds a deleted, moved or unscheduled
+  occurrence and never deletes. Recurrence edits start from
+  recurrenceEditStart, so an edit can't rebuild a series at a one-off moved
+  time. schedule_task moves the occurrence on the TARGET date; a placement
+  onto an empty future sets the series time. unschedule_task on a repeating
+  task REFUSES and tells the model to ask: stop the series
+  (set_task_recurrence none) or skip one day (Ahmad). Turning a repeat on
+  with no timed block refuses and the editor opens "Start repeating" (a
+  Schedule sheet) instead of inventing 09:00. One clamp (5–1440 min) at the
+  write-through boundary + occurrenceBlock.
+- Completion (C3, C5, C6). A template is never ticked: Mark done / the
+  assistant's complete_task tick TODAY's occurrence; a repeat turned on
+  reopens a done template; "Never" carries a ticked today onto the task.
+  toggleDone flips the STORED row, not the caller's copy; the assistant reads
+  the store, not stale scratch copies. Server: shared_task_set_done refuses
+  a partner/assignee tick on a repeating series ('recurring_series'); iOS
+  hides that tick.
+- Sync (C8, C9). The catch-up pull re-reads collection memberships (a list
+  shared while backgrounded is picked up); quarantined outbox ops no longer
+  get overwritten by a hydrate; sign-out drains with a bound.
+- Calendar + reminders (C18, C2). Google sync surfaces its failures; the
+  connections mirror is ordered with connect/disconnect; reminders skip done
+  and skipped occurrences.
+- Tags/areas (C19). Rename/delete carries every task (and the Today/Tasks
+  area filters) along; a taken name is refused.
+- Calls (C12, C13, C16). Default call hours 06:00–23:00 (Android + server;
+  end minute excluded — refusals name 22:59). request_call / update_call /
+  the Call-me editor refuse a time this phone would decline and the model
+  ASKS for another. Mic permission is requested even after onboarding on
+  another device. A killed-app VoIP launch boots AppModel (bootApp →
+  startWithoutScene) and the outcome reporter holds background time.
+- Voice token (C14 + iOS half of C15). Talk start, reconnect and the call
+  launcher force a refresh when the JWT has < 16 min left
+  (voiceTokenMinValidity, tied to the proxy's MAX_SESSION_MS = 15 min); a
+  401 dial gets one redial (5 s grace, ≤ 20 s dead air).
+- Sharing (C10, C11). Server-backed Block / Unblock / Remove-from-my-list /
+  Report (the old device-local People block list is dropped); 'not_in_circle'
+  maps to "not connected yet". Removing a person also ends list sharing BOTH
+  ways (migration 075 §5, one helper shared with the block sever).
+- Backend (unstuck repo dbec3fd + f1b0c8d, all deployed 2026-09-23): 075
+  applied (verified: 9 fns, user_blocks, 3 guards, the C3 refusal); edge
+  fns share-task, circle-invite, share-collection, share-notify,
+  report-notify, support, beta-signup; voice-proxy counts a reply at the
+  upstream response.created (C17) and treats an expired token mid-session as
+  'error' not 'capped' (C15), with a per-session ceiling and the new
+  SUPABASE_SERVICE_ROLE_KEY Worker secret. Zubair's two series the old bug
+  ended ("Arabic Class", "Project Check-in") were reopened on prod (Ahmad's OK).
+- C20: team alerts go to TEAM_INBOX (default support@unstucknow.io) —
+  still bouncing until Ahmad creates that mailbox in M365.
+
+Tests: 875 app tests (only the known CrashBreadcrumbs order flake; passes
+alone), `swift test` 1158 green, backend vitest 2820 green, functions
+typecheck ok, 075 PGlite harness all checks (incl. the everyday invite link).
+
+Needs a DEVICE (not provable from the CLI): C16 — swipe the app away, lock,
+ring a test call, answer AND decline, watch syslog; C13 — fresh install on an
+account with a web-booked call gets the mic prompt; C14 — answer a call after
+> 1 h suspended, no 401; a Talk session > 15 min.
+
+Residuals kept on purpose (in fix-impl/results.json): deleting the LAST
+occurrence inside the 56-day window comes back at the next top-up (needs a
+removal record); two devices can still mint the same tail date (C21 —
+deterministic occurrence ids, decide before Android/web get a top-up); the
+1000-row cal_blocks hydrate cap is a latent precondition of the tail rule;
+consent-first sharing by email (071 §5d-f) waits for all platforms.
+
+Parity: Ahmad lifted the iOS-only rule (2026-09-23). Gap reports:
+audit/parity-2026-09-23/android-gap.md and web-gap.md.
 
 ## Where things stand (2026-09-22, afternoon) — build 80: the token diet
 
