@@ -2959,6 +2959,40 @@ final class StoredRowWriteTests: XCTestCase {
         XCTAssertTrue(ops.allSatisfy { $0.kind == .delete })
     }
 
+    /// "Turn that capture into a task", then Undo on the receipt: the task
+    /// goes and the thought stays, unlinked and back in the inbox. The Undo
+    /// is a task delete, the delete now takes the task's captures (C23), and
+    /// promote_capture had linked this one to the new task, so the Undo
+    /// deleted the user's capture here and on the server (C23 review).
+    func testUndoingAPromotedCaptureKeepsTheCapture() async throws {
+        let state = AppModelAssistantState(model: model, assistant: model.assistant)
+        let cap = Capture(id: "c23-undo", taskId: nil, sessionId: nil, tag: .idea, body: "call mum about Sunday", at: PAST_CREATED)
+        try db.save(cap)
+        let result = await runAssistantTool(name: "promote_capture", args: ToolArgs(json: #"{"captureId":"c23-undo"}"#),
+                                            api: state, scratch: TurnScratch())
+        let receipt = try XCTUnwrap(deriveReceipt(name: "promote_capture", args: ReceiptArgs(), result: result,
+                                                  tasks: state.getTasks()), result)
+        guard case .deleteTask(let taskId)? = receipt.undo else { return XCTFail("no task undo: \(result)") }
+        XCTAssertEqual(try db.fetchById(Capture.self, id: cap.id)?.taskId, taskId, "the promote linked it")
+        try await settle { try self.db.captureArchivedAt(id: cap.id) != nil }
+        XCTAssertNotNil(try db.captureArchivedAt(id: cap.id), "the promote took it out of the inbox")
+
+        let action = try XCTUnwrap(planReceiptUndo(.deleteTask(id: taskId), tasks: state.getTasks(), nowISO: AppModel.isoNow()))
+        let undone = await AssistantModel.applyLocalUndo(action, api: state)
+
+        XCTAssertTrue(undone)
+        XCTAssertNil(try stored(taskId), "the task the promote made is gone")
+        let kept = try XCTUnwrap(db.fetchById(Capture.self, id: cap.id), "the user's thought survives the Undo")
+        XCTAssertNil(kept.taskId, "unlinked from the removed task")
+        XCTAssertEqual(kept.body, cap.body)
+        try await settle { try self.db.captureArchivedAt(id: cap.id) == nil && !self.model.archivedCaptureIds.contains(cap.id) }
+        XCTAssertNil(try db.captureArchivedAt(id: cap.id), "back in the inbox, where the promote took it from")
+        XCTAssertFalse(model.archivedCaptureIds.contains(cap.id))
+        let ops = try OutboxStore(db).pending().filter { $0.rowId == cap.id }
+        XCTAssertFalse(ops.isEmpty)
+        XCTAssertTrue(ops.allSatisfy { $0.kind == .upsert }, "no captures delete reaches the server")
+    }
+
     /// The immediate cancel covers every reminder a block can be armed under
     /// (the scheduler's own identifier scheme).
     func testReminderIdentifiersForABlockCoverEveryKind() {

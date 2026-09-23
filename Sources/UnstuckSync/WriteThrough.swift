@@ -154,7 +154,8 @@ public actor WriteThrough {
         case alreadyThere
         /// Rule A: the id lives on as a row that is NOT that day's open
         /// occurrence (moved, done or skipped), or any row holds it and this is
-        /// a maintenance mint (a top-up never moves a row). Nothing written.
+        /// a maintenance mint (a top-up never moves a row). Also a maintenance
+        /// mint whose task is no longer in this store (deleted). Nothing written.
         case held
 
         /// The day now has the asked occurrence (whatever was written).
@@ -194,6 +195,20 @@ public actor WriteThrough {
         let dependsOn = b.taskId.flatMap { isUUID($0) ? $0 : nil }
         let row = b
         let outcome = try db.transaction { conn -> MintOutcome in
+            // A maintenance mint extends a series this store holds, so a task
+            // that is gone was deleted while the run was in flight. The top-up
+            // reads its templates once and then mints a day at a time: a
+            // Delete landing between two mints (or another device's, by
+            // realtime) left the task's remaining days minted after the
+            // cascade, each insert waiting forever on a parent that will never
+            // be here again and kept by every hydrate: a ghost block, and an
+            // outbox that never drains (audit 2026-09-22, C23). A user's mint
+            // is not refused: a new repeating task's own save can still be on
+            // its way (NewTaskSheet queues both), and the flusher holds the
+            // insert until the task lands.
+            if !retimeIfTaken, let parent = dependsOn, try TaskItem.fetchOne(conn, key: parent) == nil {
+                return .held
+            }
             if var held = try CalBlock.fetchOne(conn, key: row.id) {
                 guard retimeIfTaken, held.date == row.date, !held.done, !held.skipped else { return .held }
                 if held.startTime == row.startTime && held.durationMinutes == row.durationMinutes { return .alreadyThere }

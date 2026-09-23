@@ -563,9 +563,24 @@ public actor SyncCoordinator {
     /// are actually queued, so it's free in the common empty-outbox case.
     public func flushNow() async {
         guard let uid = auth.currentUserId else { return }
-        let auth = self.auth
-        await hydrator.pruneStaleTaskOps()
-        await flusher.flush(userId: uid, currentUserId: { auth.currentUserId })
+        let auth = self.auth, hydrator = self.hydrator, flusher = self.flusher
+        await Self.pruneThenFlush(prune: { await hydrator.pruneStaleTaskOps() },
+                                  flush: { await flusher.flush(userId: uid, currentUserId: { auth.currentUserId }) })
+    }
+
+    /// Prune, then flush — unless the flush was cancelled on the way. The
+    /// post-write flush is cancelled by the next write (`scheduleDebouncedFlush`)
+    /// even once it has started: the cancel reached the prune's tasks GET, the
+    /// prune gave up, and the drain, an unstructured task the cancel never
+    /// reaches, then sent the UNPRUNED task edits over a newer change from the
+    /// web — two edits a second or two apart on a slow link, the first after
+    /// a spell offline, were enough. The flush that replaced it prunes and
+    /// sends them instead (audit 2026-09-22, C31 review; the sign-out drain's
+    /// C9 hazard, where this rule came from).
+    static func pruneThenFlush(prune: @Sendable () async -> Void, flush: @Sendable () async -> Void) async {
+        await prune()
+        guard !Task.isCancelled else { return }
+        await flush()
     }
 
     /// Schedule the debounced post-write flush from OUTSIDE the WriteThrough
@@ -637,11 +652,7 @@ public actor SyncCoordinator {
                                    prune: @escaping @Sendable () async -> Void,
                                    flush: @escaping @Sendable () async -> Void) async {
         await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await prune()
-                guard !Task.isCancelled else { return }
-                await flush()
-            }
+            group.addTask { await Self.pruneThenFlush(prune: prune, flush: flush) }
             group.addTask { try? await Task.sleep(nanoseconds: timeoutNs) }
             _ = await group.next()   // whichever finishes first: drain or timeout
             group.cancelAll()

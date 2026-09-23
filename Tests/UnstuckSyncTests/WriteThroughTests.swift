@@ -229,6 +229,12 @@ final class WriteThroughTests: XCTestCase {
         CalBlock(id: occurrenceId(taskId: seriesId, date: date), taskId: seriesId, taskName: "Gym",
                  startTime: time, durationMinutes: 30, date: date, kind: .task)
     }
+    /// The series' template, where a top-up reads it: a maintenance mint
+    /// needs its task in the store (C23).
+    private func saveSeries() throws {
+        try db.save(TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                             createdAt: now, updatedAt: now))
+    }
 
     /// A row with the id already exists locally (moved, done, kept — any
     /// state): the mint is skipped. No row write, no op.
@@ -249,6 +255,7 @@ final class WriteThroughTests: XCTestCase {
     /// A fresh mint writes the row (clamped) and queues the requested kind,
     /// waiting on the parent task like every block op.
     func testInsertIfAbsentEnqueuesTheRequestedKind() async throws {
+        try saveSeries()
         var short = mint("2026-09-24")
         short.durationMinutes = 2
         let r1 = try await write.insertCalBlockIfAbsent(short, retimeIfTaken: false, nowISO: now)
@@ -282,6 +289,32 @@ final class WriteThroughTests: XCTestCase {
         XCTAssertNil(try db.fetchById(CalBlock.self, id: b.id))
     }
 
+    /// The launch top-up mints a day at a time, and the user deletes the
+    /// series between two mints. The days still to come are refused: minted
+    /// after the cascade, each waited forever on the deleted task and stayed
+    /// on the phone as a ghost block (audit 2026-09-22, C23). A user's mint
+    /// for a task whose own save hasn't landed yet still writes — the
+    /// flusher holds it until the task does.
+    func testATopUpMintForADeletedTaskWritesNothing() async throws {
+        try await write.upsertTask(TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                                            createdAt: now, updatedAt: now), nowISO: now)
+        let first = try await write.insertCalBlockIfAbsent(mint("2026-09-24"), retimeIfTaken: false, nowISO: now)
+        XCTAssertEqual(first, .inserted)
+        try await write.deleteTask(id: seriesId, nowISO: now)
+
+        let late = try await write.insertCalBlockIfAbsent(mint("2026-09-25"), retimeIfTaken: false, nowISO: now)
+
+        XCTAssertEqual(late, .held)
+        XCTAssertTrue(try db.fetchAllCalBlocks().isEmpty, "no ghost block for the deleted task")
+        XCTAssertTrue(try box.pending().allSatisfy { $0.kind == .delete }, "nothing left waiting on the deleted task")
+
+        let fresh = "5b2d7c1e-8f3a-4d6b-9c0e-1a2b3c4d5e6f"
+        let userMint = CalBlock(id: occurrenceId(taskId: fresh, date: "2026-09-24"), taskId: fresh, taskName: "Swim",
+                                startTime: "08:00", durationMinutes: 30, date: "2026-09-24", kind: .task)
+        let asked = try await write.insertCalBlockIfAbsent(userMint, retimeIfTaken: true, nowISO: now)
+        XCTAssertEqual(asked, .inserted, "the user's own mint never waits on the task's save")
+    }
+
     /// "Never" then "Daily": the day's id is deleted, then minted again. The
     /// outbox keeps both, delete first (hazard d).
     func testDeleteThenReMintKeepsOrder() async throws {
@@ -299,6 +332,7 @@ final class WriteThroughTests: XCTestCase {
     /// A fresh whole-row save supersedes a quarantined insert of the row, as
     /// it does a quarantined upsert (C4).
     func testAFreshSaveDropsAQuarantinedInsert() async throws {
+        try saveSeries()
         let b = mint("2026-09-24")
         try await write.insertCalBlockIfAbsent(b, retimeIfTaken: false, nowISO: now)
         let seq = try XCTUnwrap(box.pending().first?.opSeq)
@@ -314,6 +348,7 @@ final class WriteThroughTests: XCTestCase {
     /// length only — and queues insert_or_retime, so the server applies the
     /// same conditional retime. Skipping it dropped the user's time everywhere.
     func testUserMintRetimesTheDaysOpenOccurrenceLocally() async throws {
+        try saveSeries()
         var topUp = mint("2026-09-24")   // 07:00, queued by a top-up
         topUp.externalEventId = "evt-1"
         topUp.externalConnectionId = "4c1f7a2e-9b3d-4e5f-8a6b-7c8d9e0f1a2b"

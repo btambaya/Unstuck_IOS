@@ -506,9 +506,20 @@ final class AssistantModel {
     /// Returns false when nothing could be undone (the fact is already gone).
     static func applyLocalUndo(_ action: ReceiptUndoAction, api: AssistantAppState) async -> Bool {
         // Undoing a "Created" mirrors the executor's delete_task: the task AND
-        // its calendar blocks — ghost blocks were a confirmed flow bug.
+        // its calendar blocks — ghost blocks were a confirmed flow bug. Not its
+        // captures: the task's delete takes them too now (the editor's Delete,
+        // audit 2026-09-22 C23), and promote_capture links the capture it
+        // promoted to the task this Undo removes, so undoing "Task from
+        // capture" deleted the user's thought on every device. Each capture on
+        // the task is unlinked and put back in the inbox first, where the
+        // promote took it from; the web's undo never removes one either.
         func removeTaskAndBlocks(_ id: String) async {
             for b in api.getBlocks() where b.taskId == id { await api.deleteBlock(b.id) }
+            for var c in api.getCaptures() where c.taskId == id {
+                c.taskId = nil
+                await api.upsertCapture(c)
+                api.archiveCapture(c.id, archived: false)
+            }
             await api.removeTask(id)
         }
         // Undoing a "Completed" reopens the task — for a loop-promoted shared
