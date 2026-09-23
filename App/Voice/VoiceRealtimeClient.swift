@@ -16,6 +16,8 @@
 //          → response.audio_transcript.delta {delta}          (captions)
 //          → input_audio_buffer.speech_started/stopped        (→ barge-in)
 //   client → response.cancel                                 (confirmed barge-in)
+//          → conversation.item.truncate {item_id, content_index:0,
+//            audio_end_ms}          (a reply cut on air: only what was HEARD)
 //          → response.function_call_arguments.done {name, call_id, arguments}
 //          → response.output_item.done {item: function_call}  (same, other shape)
 //   client → conversation.item.create {function_call_output, call_id, output}
@@ -62,8 +64,12 @@ protocol VoiceAudioIO: AnyObject {
     func startPlayback()
     /// Begin mic capture; `onFrame` is called with each ~100ms PCM16/16k frame.
     func startCapture(_ onFrame: @escaping @Sendable (Data) -> Void)
-    /// Queue a PCM16/24k chunk for playback.
-    func enqueue(_ pcm: Data)
+    /// Queue a PCM16/24k chunk for playback. `itemId` = the conversation item
+    /// it belongs to (the delta's `item_id`), so a cut reply can be truncated.
+    func enqueue(_ pcm: Data, itemId: String?)
+    /// What the user has heard of the item being played — read BEFORE
+    /// `flushPlayback()`, which resets it. nil when nothing has played.
+    func playbackPosition() -> PlaybackPosition?
     /// Barge-in: drop queued audio + cut current playback immediately.
     func flushPlayback()
     /// Playback gain, linear (0.25 = −12 dB duck, 1 = unity), short ramp.
@@ -143,6 +149,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     static let primerItemId = "a0e1f2d3c4b5a6978869504132231405"
     /// Client event id on the primer delete, so ONLY its rejection is swallowed.
     static let primerDeleteEvent = "evt_primer_delete_0001"
+    /// Client event ids on truncates, so their rejections are recognised.
+    static let truncateEventPrefix = "evt_truncate_"
 
     private let proxyURL: String          // wss://…workers.dev (token added as a header)
     private let token: String             // Supabase access token (the Worker validates it); the fallback when `freshToken` is set
@@ -182,6 +190,9 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// Test seam: when set (before `start()`), a dial hands its request here
     /// instead of opening a socket. Never set in the app.
     var dialOverride: (@Sendable (URLRequest) -> Void)?
+    /// Test seam: when set, every outgoing frame is handed here instead of the
+    /// socket (what a barge-in actually sends). Never set in the app.
+    var sendOverride: (@Sendable (String) -> Void)?
     /// How long a dial may go unopened (token wait included) before start()'s
     /// watchdog gives up, and how much longer the one redial after a 401 gets.
     /// Settable (before `start()`) only so tests don't wait 15 s.
@@ -256,6 +267,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private var _earlyFailure = false
     var failedBeforeAnyReply: Bool { withLock { _earlyFailure } }
     private var _openingCreates = 0
+    /// Truncates sent this session (their event ids).
+    private var _truncates = 0
     private var _guard = VoiceIntegrityGuard()
     /// Both event shapes can carry the same call — dispatch once.
     private var _handledCalls = Set<String>()
@@ -533,6 +546,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .duck: return "duck"
             case .restore: return "restore"
             case .sendCancel: return "cancel"
+            case .truncatePlayback: return "truncate"
             case .deleteItem: return "delete-echo"
             case .createResponse: return "respond"
             case .userTurn: return "turn"
@@ -594,6 +608,18 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .restore: audio.setPlaybackGain(1)
             case .flushPlayback: audio.flushPlayback()
             case .sendCancel: send(["type": "response.cancel"])
+            case .truncatePlayback:
+                // Read the playhead NOW — the .flushPlayback after this resets
+                // it. Which item and how much of it: the engine's; whether to
+                // send and the ms: AudioTruncation (Ahmad 2026-09-23).
+                let heard = audio.playbackPosition()
+                guard let cut = AudioTruncation.plan(heard) else {
+                    voiceLog.notice("voice truncate skipped (heard \(heard?.playedFrames ?? -1, privacy: .public) of \(heard?.receivedFrames ?? -1, privacy: .public) frames)")
+                    break
+                }
+                let n: Int = withLock { _truncates += 1; return _truncates }
+                voiceLog.notice("voice truncate at \(cut.audioEndMs, privacy: .public) ms of \((heard?.receivedFrames ?? 0) * 1000 / AudioTruncation.sampleRate, privacy: .public) ms")
+                send(cut.event(id: Self.truncateEventPrefix + String(n)))
             case .deleteItem(let id): send(["type": "conversation.item.delete", "item_id": id])
             case .createResponse: send(["type": "response.create"])
             case .commitAndRespond:
@@ -796,7 +822,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // next response starts.
             guard withLock({ _bargeIn.shouldEnqueueAudio(id: responseId) }) else { return }
             if let b64 = ev["delta"] as? String, let pcm = Data(base64Encoded: b64) {
-                audio.enqueue(pcm)
+                // The item id travels with the audio: a cut reply is truncated
+                // by the item the user was HEARING (the proxy keeps GA's
+                // item_id when it renames response.output_audio.delta).
+                audio.enqueue(pcm, itemId: ev["item_id"] as? String)
                 dispatch(.audioDelta(id: responseId))
             }
         case "response.audio_transcript.delta":
@@ -915,6 +944,15 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // swallow also hid rejected tool outputs.
             let evId = (ev["event_id"] as? String) ?? (errObj?["event_id"] as? String)
             if evId == Self.primerDeleteEvent || (m?.contains(Self.primerItemId) ?? false) { return }
+            // A truncate the server refused (the item already gone, a backend
+            // without the event) is best effort, not a broken session: the
+            // reply was cut on the phone either way. OpenAI puts OUR event id
+            // under error.event_id and its own at the top level — check both.
+            let truncateRefused = [ev["event_id"], errObj?["event_id"]].contains { ($0 as? String)?.hasPrefix(Self.truncateEventPrefix) == true }
+            if truncateRefused || (m?.contains("item.truncate") ?? false) {
+                voiceLog.notice("voice truncate refused: \(String((m ?? "-").prefix(200)), privacy: .public)")
+                return
+            }
             // A server error before ANY reply started: the session is dead on
             // arrival (the socket closes right after). Not surfaced — the
             // screen reconnects once or twice; only if that fails does the
@@ -1024,6 +1062,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private func send(_ obj: [String: Any]) {
         guard let data = try? JSONSerialization.data(withJSONObject: obj),
               let str = String(data: data, encoding: .utf8) else { return }
+        if let hook = sendOverride { hook(str); return }
         task?.send(.string(str)) { [weak self] err in
             guard let self, let err else { return }
             // A send failure means the socket is gone — but the mic keeps encoding

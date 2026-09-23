@@ -44,6 +44,13 @@
 //      300 ms pre-roll, DIGITAL SILENCE while closed (the server's
 //      silence_duration_ms timer must observe silence to end a turn), and no
 //      floor adaptation while the model is playing (residual echo).
+//   5. TRUNCATE: a reply cut while its audio was on air is truncated
+//      server-side to what the user actually HEARD
+//      (`conversation.item.truncate`, `AudioTruncation`). Without it the
+//      server keeps the whole reply and the model believes it said all of it:
+//      Zubair talked over "I can nudge you in a couple of ways…", said "Carry
+//      on", and got a new topic (assistant_turns, 2026-09-23 05:06; Ahmad
+//      2026-09-23).
 //
 // Hold-to-talk (turn_detection null) is unchanged: the client commits and
 // creates on release. Inputs are events + a monotonic clock (seconds);
@@ -191,6 +198,14 @@ enum BargeInCommand: Equatable, Sendable {
     case flushPlayback
     /// `response.cancel` — only ever emitted while a response is active.
     case sendCancel
+    /// `conversation.item.truncate` for the assistant audio item the user was
+    /// hearing when they cut it off — emitted by a real interruption (their
+    /// words, their voice confirmed, the Interrupt button, a PTT press) while
+    /// the reply's audio was on air, never by an echo discard. Always BEFORE
+    /// `.flushPlayback`: which item, and how much of it was heard, is read
+    /// from the audio engine's playhead at execution, and the flush resets it
+    /// (`AudioTruncation.plan` decides the ms, or skips). Ahmad 2026-09-23.
+    case truncatePlayback
     /// Hold-to-talk release: `input_audio_buffer.commit` + `response.create`.
     case commitAndRespond
     /// Arm a timer: deliver `.tick` after this many ms (the energy confirm,
@@ -943,6 +958,14 @@ struct BargeInController: Sendable {
             // (if any) stay dropped.
             cancelledResponseId = active
         }
+        // Audio on air: the user heard only part of it, and the server's copy
+        // of the reply must end where they stopped hearing it — or the model
+        // carries on as if it had said all of it (Zubair's "Carry on",
+        // 2026-09-23: the reply had finished GENERATING, so the cancel found
+        // nothing, and the unheard half stayed in the conversation). Nothing
+        // on air (a reply still thinking, or one that drained) → nothing to
+        // truncate.
+        if playbackQueued { out.append(.truncatePlayback) }
         out.append(.flushPlayback)
         if playbackQueued {
             // The last of the flushed audio is already in the room and comes
@@ -958,6 +981,57 @@ struct BargeInController: Sendable {
         out.append(.uiState(.listening))
         state = .idle
         return out
+    }
+}
+
+// MARK: - Truncating an interrupted reply
+
+/// What the user has HEARD of the model audio item at the playhead — the
+/// audio engine's answer (`PlaybackLedger`), read before a flush resets it.
+/// Frames at the playback rate (24 kHz).
+struct PlaybackPosition: Equatable, Sendable {
+    /// The conversation item the audio belongs to (the audio deltas'
+    /// `item_id`); nil when the server sent none.
+    var itemId: String?
+    /// Frames of this item actually played out.
+    var playedFrames: Int
+    /// Frames of this item received and scheduled.
+    var receivedFrames: Int
+}
+
+/// `conversation.item.truncate` for a reply cut while on air (Ahmad
+/// 2026-09-23): the server's copy of the reply ends where the user stopped
+/// hearing it. OpenAI removes the unheard audio AND the item's transcript, so
+/// the model no longer believes it said the rest. Same event and fields on
+/// OpenAI's GA realtime API as in the beta shape; the voice proxy allowlists
+/// it and relays it unchanged (openai-adapter.ts reshapes only session.update,
+/// audio appends and response.create).
+struct AudioTruncation: Equatable, Sendable {
+    let itemId: String
+    let audioEndMs: Int
+
+    /// The model's audio rate (PCM16 24 kHz; VoiceAudioEngine.outRate).
+    static let sampleRate = 24_000
+
+    /// nil = send nothing: no item id to name; nothing of it heard yet (cut
+    /// in its first millisecond); or it was heard to the end of what arrived
+    /// (the cut fell in audio queued behind it — a later reply's). The ms are
+    /// rounded DOWN and never pass what was received: the server refuses an
+    /// `audio_end_ms` beyond the item's audio.
+    static func plan(_ position: PlaybackPosition?) -> AudioTruncation? {
+        guard let p = position, let itemId = p.itemId, !itemId.isEmpty else { return nil }
+        let heard = min(max(0, p.playedFrames), p.receivedFrames)
+        guard heard < p.receivedFrames else { return nil }
+        let ms = heard * 1000 / sampleRate
+        guard ms > 0 else { return nil }
+        return AudioTruncation(itemId: itemId, audioEndMs: ms)
+    }
+
+    /// The client event. `content_index` 0 is the audio part of an assistant
+    /// message (OpenAI: "Set this to 0").
+    func event(id: String) -> [String: Any] {
+        ["type": "conversation.item.truncate", "event_id": id,
+         "item_id": itemId, "content_index": 0, "audio_end_ms": audioEndMs]
     }
 }
 

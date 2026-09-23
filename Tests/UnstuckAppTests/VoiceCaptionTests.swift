@@ -23,7 +23,8 @@ private final class SilentAudioIO: VoiceAudioIO, @unchecked Sendable {
     var onPlaybackDrained: (@Sendable () -> Void)?
     func startPlayback() {}
     func startCapture(_ onFrame: @escaping @Sendable (Data) -> Void) {}
-    func enqueue(_ pcm: Data) {}
+    func enqueue(_ pcm: Data, itemId: String?) {}
+    func playbackPosition() -> PlaybackPosition? { nil }
     func flushPlayback() {}
     func setPlaybackGain(_ gain: Float) {}
     func setGateContext(_ ctx: GateContext) {}
@@ -598,5 +599,164 @@ final class VoiceDialTokenTests: XCTestCase {
         XCTAssertGreaterThan(minValidity, 15 * 60)
         XCTAssertLessThan(topUp, deadline)
         XCTAssertLessThan(deadline, 15, "inside the client's dial watchdog")
+    }
+}
+
+// MARK: - Truncating a reply cut on air (Ahmad 2026-09-23)
+//
+// Zubair's voice session 2026-09-23 05:05:56–05:06:17 (assistant_turns): he
+// talked over "Ah, good question. I can nudge you in a couple of ways…" after
+// it had finished generating, said "Carry on", and got a new topic — the
+// server still held the WHOLE reply. Driven through the real client, the
+// real PlaybackLedger and the real frames it sends.
+
+/// A VoiceAudioIO whose playhead the test moves: buffers go through the REAL
+/// PlaybackLedger, so a barge-in's truncate is computed as on the phone.
+private final class ScriptedPlayheadAudioIO: VoiceAudioIO, @unchecked Sendable {
+    private let lock = NSLock()
+    private var ledger = PlaybackLedger()
+    private var _playhead = 0
+    var onGateChange: (@Sendable (_ open: Bool) -> Void)?
+    var onPlaybackDrained: (@Sendable () -> Void)?
+    /// The player's timeline (frames at 24 kHz), as heard.
+    var playhead: Int {
+        get { lock.withLock { _playhead } }
+        set { lock.withLock { _playhead = newValue } }
+    }
+    func startPlayback() {}
+    func startCapture(_ onFrame: @escaping @Sendable (Data) -> Void) {}
+    func enqueue(_ pcm: Data, itemId: String?) {
+        lock.withLock { ledger.scheduled(itemId: itemId, frames: pcm.count / 2, playhead: _playhead) }
+    }
+    func playbackPosition() -> PlaybackPosition? { lock.withLock { ledger.position(at: _playhead) } }
+    /// stop() + play(): a new timeline, as in VoiceAudioEngine.
+    func flushPlayback() { lock.withLock { ledger.reset(); _playhead = 0 } }
+    func setPlaybackGain(_ gain: Float) {}
+    func setGateContext(_ ctx: GateContext) {}
+    func recalibrateGate() {}
+    func shutdown() {}
+}
+
+/// Every frame the client sends, and every error / state it reports.
+private final class Wire: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _frames: [[String: Any]] = []
+    private var _errors: [String] = []
+    private var _states: [VoiceState] = []
+    func sent(_ text: String) {
+        guard let obj = (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] else { return }
+        lock.withLock { _frames.append(obj) }
+    }
+    func error(_ m: String) { lock.withLock { _errors.append(m) } }
+    func state(_ s: VoiceState) { lock.withLock { _states.append(s) } }
+    var types: [String] { lock.withLock { _frames.compactMap { $0["type"] as? String } } }
+    var truncates: [[String: Any]] { lock.withLock { _frames.filter { $0["type"] as? String == "conversation.item.truncate" } } }
+    var errors: [String] { lock.withLock { _errors } }
+    var states: [VoiceState] { lock.withLock { _states } }
+}
+
+final class VoiceTruncateTests: XCTestCase {
+
+    private func client(_ audio: VoiceAudioIO, _ wire: Wire) -> VoiceRealtimeClient {
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: audio,
+            runTool: { _, _ in "ok" },
+            onState: { wire.state($0) },
+            onCaption: { _, _, _ in },
+            onError: { wire.error($0) },
+            initialRoute: .speaker,
+            routeProvider: { .speaker },
+            now: { 0 })
+        c.sendOverride = { wire.sent($0) }
+        return c
+    }
+
+    private func json(_ obj: [String: Any]) -> String {
+        String(data: try! JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+    }
+    /// `frames` of 24 kHz PCM16 for `item` — the GA response.output_audio.delta
+    /// as the proxy relays it (renamed, item_id kept).
+    private func audio(_ response: String, _ item: String, frames: Int) -> String {
+        json(["type": "response.audio.delta", "response_id": response, "item_id": item,
+              "output_index": 0, "content_index": 0, "delta": Data(count: frames * 2).base64EncodedString()])
+    }
+    private func words(_ response: String, _ text: String) -> String {
+        json(["type": "response.audio_transcript.delta", "response_id": response, "delta": text])
+    }
+    private func speechStarted(_ item: String) -> String { json(["type": "input_audio_buffer.speech_started", "item_id": item]) }
+    /// OpenAI's live transcription delta shape.
+    private func hearing(_ item: String, _ text: String) -> String {
+        json(["type": "conversation.item.input_audio_transcription.delta", "item_id": item, "delta": text])
+    }
+
+    func testZubairsTalkOverTruncatesTheItemHeHeardAtWhereHeStopped_thenTheNextRepliesItem() {
+        let io = ScriptedPlayheadAudioIO(), wire = Wire()
+        let c = client(io, wire)
+        // Reply 1 arrives whole (2 s of audio) and finishes generating.
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(audio("r1", "item_A", frames: 24_000))
+        c.handle(audio("r1", "item_A", frames: 24_000))
+        c.handle(words("r1", "Ah, good question. I can nudge you in a couple of ways."))
+        c.handle(json(["type": "response.done", "response": ["id": "r1", "status": "completed"]]))
+        // 1.5 s of it heard, then he talks over it.
+        io.playhead = 36_000
+        c.handle(speechStarted("item_u"))
+        c.handle(hearing("item_u", "Wait, so how does"))
+        XCTAssertFalse(wire.types.contains("response.cancel"), "nothing was generating — only playback was cut")
+        XCTAssertEqual(wire.truncates.count, 1)
+        let first = wire.truncates[0]
+        XCTAssertEqual(first["item_id"] as? String, "item_A")
+        XCTAssertEqual(first["content_index"] as? Int, 0)
+        XCTAssertEqual(first["audio_end_ms"] as? Int, 1500, "what he HEARD, not the 2000 ms received")
+        XCTAssertEqual((first["event_id"] as? String)?.hasPrefix(VoiceRealtimeClient.truncateEventPrefix), true)
+
+        // Reply 2 — a new item on a new timeline — is cut 250 ms in while
+        // still generating: cancelled, then truncated by ITS item.
+        c.handle(json(["type": "response.created", "response": ["id": "r2"]]))
+        c.handle(audio("r2", "item_B", frames: 24_000))
+        io.playhead = 6_000
+        c.handle(speechStarted("item_v"))
+        c.handle(hearing("item_v", "Actually tell me tomorrow instead"))
+        XCTAssertEqual(wire.truncates.count, 2)
+        XCTAssertEqual(wire.truncates[1]["item_id"] as? String, "item_B")
+        XCTAssertEqual(wire.truncates[1]["audio_end_ms"] as? Int, 250)
+        let types = wire.types
+        let cancel = types.lastIndex(of: "response.cancel"), truncate = types.lastIndex(of: "conversation.item.truncate")
+        XCTAssertNotNil(cancel)
+        XCTAssertLessThan(cancel!, truncate!, "cancel, then truncate (the reference client's order)")
+        XCTAssertNotEqual(wire.truncates[0]["event_id"] as? String, wire.truncates[1]["event_id"] as? String)
+    }
+
+    func testAReplyNotYetHeardIsCancelledButNotTruncated() {
+        let io = ScriptedPlayheadAudioIO(), wire = Wire()
+        let c = client(io, wire)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(words("r1", "Here is the plan for today."))
+        c.handle(audio("r1", "item_A", frames: 24_000))
+        io.playhead = 0   // on air, but not a frame of it heard yet
+        c.handle(speechStarted("item_u"))
+        c.handle(hearing("item_u", "Wait, what about Friday"))
+        XCTAssertTrue(wire.types.contains("response.cancel"))
+        XCTAssertEqual(wire.truncates.count, 0, "nothing of it was heard")
+    }
+
+    func testARefusedTruncateIsNotASessionError() {
+        let wire = Wire()
+        let c = client(ScriptedPlayheadAudioIO(), wire)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        // OpenAI: our event id under error.event_id, its own at the top.
+        c.handle(json(["type": "error", "event_id": "event_srv_1",
+                       "error": ["type": "invalid_request_error", "code": "invalid_value",
+                                 "message": "Audio content of 262ms is already shorter than 1500ms",
+                                 "event_id": VoiceRealtimeClient.truncateEventPrefix + "1"]]))
+        // A backend without the event names it.
+        c.handle(json(["type": "error", "error": ["message": "Unsupported event type: conversation.item.truncate"]]))
+        XCTAssertEqual(wire.errors, [])
+        XCTAssertFalse(wire.states.contains(.error))
+        // Any other error still surfaces.
+        c.handle(json(["type": "error", "error": ["message": "Something else broke"]]))
+        XCTAssertEqual(wire.errors.count, 1)
+        XCTAssertTrue(wire.states.contains(.error))
     }
 }

@@ -164,6 +164,10 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
     /// itself have gaps?" (`voice playback queued gapMs=…` / `drained`).
     private var lastDrainedAt: TimeInterval?
     private var playedSinceQueued = 0
+    /// Which item each scheduled buffer belongs to and where it sits on the
+    /// player's timeline — how much of a cut reply was HEARD (the truncate,
+    /// Ahmad 2026-09-23). Under `lock`; reset whenever the player is stopped.
+    private var ledger = PlaybackLedger()
 
     /// `.app` (default) keeps Talk mode's behaviour; `.callKit` for a
     /// CallKit-managed call (see the file header).
@@ -293,6 +297,7 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         playGeneration += 1
         let dropped = outstanding
         outstanding = 0
+        ledger.reset()                 // player.stop() below restarts its timeline
         recalibratePending = true      // the route, and its noise floor, may have changed
         if allowed { configurationRestarts += 1 }
         lock.unlock()
@@ -410,14 +415,17 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         return Array(UnsafeBufferPointer(start: ch[0], count: Int(outBuf.frameLength)))
     }
 
-    func enqueue(_ pcm: Data) {
+    func enqueue(_ pcm: Data, itemId: String?) {
         guard !pcm.isEmpty, let buffer = Self.pcm16ToBuffer(pcm, format: playFormat) else { return }
         // Check `started` AND schedule under the same lock shutdown() holds, so a
         // concurrent teardown can't stop/detach the player between the guard and
         // the scheduleBuffer (the prior TOCTOU could schedule onto a dead engine).
         lock.lock(); defer { lock.unlock() }
         guard started else { return }
-        if !player.isPlaying { player.play() }
+        if !player.isPlaying { player.play(); ledger.reset() }   // a new timeline
+        // Where this buffer lands on the timeline: after the one before it, or
+        // at the playhead on an empty queue.
+        ledger.scheduled(itemId: itemId, frames: Int(buffer.frameLength), playhead: renderedFrames())
         outstanding += 1
         if outstanding == 1 {
             let now = ProcessInfo.processInfo.systemUptime
@@ -502,9 +510,33 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         lock.lock()
         playGeneration += 1
         outstanding = 0
+        // stop() restarts the player's timeline. A buffer scheduled between
+        // here and stop() leaves a stale span; the ledger drops it when it
+        // sees the playhead go backwards.
+        ledger.reset()
         lock.unlock()
         player.stop()                 // drops scheduled buffers
         player.play()                 // ready for the next response
+    }
+
+    /// What the user has heard of the item at the playhead. `.dataPlayedBack`
+    /// completions only count WHOLE buffers; the player's own timeline counts
+    /// frames. Rendered is not yet heard: the output hardware plays it
+    /// `outputLatency` later (Bluetooth: ~0.2 s), so that is taken off.
+    func playbackPosition() -> PlaybackPosition? {
+        lock.lock(); defer { lock.unlock() }
+        guard started, let rendered = renderedFrames() else { return nil }
+        let latency = Int(AVAudioSession.sharedInstance().outputLatency * Self.outRate)
+        return ledger.position(at: max(0, rendered - latency))
+    }
+
+    /// The player's timeline in frames at 24 kHz: counted from its last
+    /// `play()` — through silence too, so an empty queue keeps it moving —
+    /// and restarted by every `stop()`. nil until it has rendered.
+    private func renderedFrames() -> Int? {
+        guard let node = player.lastRenderTime, node.isSampleTimeValid,
+              let t = player.playerTime(forNodeTime: node), t.isSampleTimeValid, t.sampleRate > 0 else { return nil }
+        return Int((Double(t.sampleTime) * Self.outRate / t.sampleRate).rounded(.down))
     }
 
     func shutdown() {
@@ -519,6 +551,7 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         started = false
         playGeneration += 1
         outstanding = 0
+        ledger.reset()
         gainRamp += 1
         lock.unlock()
         guard wasStarted else { return }
@@ -561,5 +594,80 @@ struct EngineRestartPolicy: Sendable {
         guard stamps.count < maxRestarts else { return false }
         stamps.append(now)
         return true
+    }
+}
+
+/// Which model audio item the user is hearing, and how much of it — what a
+/// reply cut on air is truncated to (Ahmad 2026-09-23). Pure, unit-tested:
+/// the engine hands it the player's timeline (frames at 24 kHz since the
+/// last `play()`, restarted by every `stop()`) at each schedule and asks it
+/// at the playhead.
+struct PlaybackLedger: Sendable {
+    private struct Span: Sendable {
+        let itemId: String
+        let start: Int
+        let frames: Int
+    }
+    private var spans: [Span] = []
+    /// Where the last scheduled buffer ends: the next one plays right after
+    /// it, or at the playhead when the queue has run dry.
+    private(set) var end = 0
+    private var lastPlayhead = 0
+    /// Spans are kept for the last few items only (the one being heard is
+    /// always among them), and never more than `maxSpans` — a reply is
+    /// bounded, a session is not.
+    static let itemHistory = 3
+    static let maxSpans = 4096
+
+    /// A buffer of `frames` for `itemId` was scheduled with the player's
+    /// timeline at `playhead` (nil: it has not rendered since its `play()`).
+    mutating func scheduled(itemId: String?, frames: Int, playhead: Int?) {
+        guard frames > 0 else { return }
+        // The timeline only runs backwards when the player was stopped and
+        // restarted without this ledger being reset first (a buffer that
+        // raced a flush): the old spans mean nothing on the new timeline.
+        if let playhead, playhead < lastPlayhead { reset() }
+        if let playhead { lastPlayhead = playhead }
+        // (Were the timeline to stand still while the queue is dry, the
+        // playhead would never pass `end` and this still holds.)
+        let start = max(end, playhead ?? end)
+        end = start + frames
+        // No item id, nothing a truncate could name: the timeline moves on,
+        // nothing is recorded.
+        guard let itemId else { return }
+        if spans.last?.itemId != itemId { forgetOldItems() }
+        spans.append(Span(itemId: itemId, start: start, frames: frames))
+        if spans.count > Self.maxSpans { spans.removeFirst(spans.count - Self.maxSpans) }
+    }
+
+    /// The player was stopped: its timeline starts again at 0.
+    mutating func reset() {
+        spans.removeAll()
+        end = 0
+        lastPlayhead = 0
+    }
+
+    /// At `playhead`: the item of the last span that had started by then
+    /// (the one on air, or in a gap between bursts the one heard last), with
+    /// the frames of it played out so far and received in all. nil when
+    /// nothing had started.
+    func position(at playhead: Int) -> PlaybackPosition? {
+        guard let current = spans.last(where: { $0.start <= playhead }) else { return nil }
+        var played = 0, received = 0
+        for s in spans where s.itemId == current.itemId {
+            received += s.frames
+            played += min(s.frames, max(0, playhead - s.start))
+        }
+        return PlaybackPosition(itemId: current.itemId, playedFrames: played, receivedFrames: received)
+    }
+
+    /// A new item starts: keep the spans of the last `itemHistory - 1` items.
+    private mutating func forgetOldItems() {
+        var recent: [String] = []
+        for s in spans.reversed() where !recent.contains(s.itemId) {
+            recent.append(s.itemId)
+            if recent.count >= Self.itemHistory - 1 { break }
+        }
+        spans.removeAll { !recent.contains($0.itemId) }
     }
 }

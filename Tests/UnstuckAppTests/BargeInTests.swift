@@ -55,7 +55,7 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(core(c.handle(.tick, now: 1.2)), [], "before confirmMs nothing happens")
         let out = core(c.handle(.tick, now: 1.3))
         XCTAssertEqual(count(out, .sendCancel), 1)
-        XCTAssertEqual(out, [.sendCancel, .flushPlayback, .restore, .clearCaption, .uiState(.listening)])
+        XCTAssertEqual(out, [.sendCancel, .truncatePlayback, .flushPlayback, .restore, .clearCaption, .uiState(.listening)])
         XCTAssertTrue(c.muted)
         XCTAssertFalse(c.playbackQueued)
         XCTAssertEqual(c.cancelledResponseId, "r1")
@@ -642,7 +642,7 @@ final class BargeInTests: XCTestCase {
         said(&c, "Taxi's at quarter to eight, after the gym.")
         _ = c.handle(.speechStarted(itemId: "item-1"), now: 1.0)
         let out = core(c.handle(.transcription(text: "actually make it before the gym", itemId: "item-1", final: false), now: 1.4))
-        XCTAssertEqual(out, [.sendCancel, .flushPlayback, .restore, .clearCaption, .uiState(.listening)])
+        XCTAssertEqual(out, [.sendCancel, .truncatePlayback, .flushPlayback, .restore, .clearCaption, .uiState(.listening)])
         XCTAssertTrue(c.muted)
         XCTAssertFalse(c.playbackQueued)
         XCTAssertEqual(c.state, .idle)
@@ -919,7 +919,7 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.speechStarted(itemId: "u"), now: 1.0)
         _ = c.handle(.speechStopped, now: 1.6)
         let out = core(c.handle(.transcription(text: "no, book the dentist instead", itemId: "u", final: true), now: 1.9))
-        XCTAssertEqual(out, [.userTurn("no, book the dentist instead"), .sendCancel, .flushPlayback, .restore, .clearCaption, .uiState(.listening),
+        XCTAssertEqual(out, [.userTurn("no, book the dentist instead"), .sendCancel, .truncatePlayback, .flushPlayback, .restore, .clearCaption, .uiState(.listening),
                              .startConfirmTimer(ms: 500), .startConfirmTimer(ms: 2500), .uiState(.thinking)])
         XCTAssertTrue(c.pendingCreate)
         XCTAssertFalse(c.shouldEnqueueAudio(id: "r1"), "audio still in flight for the cancelled reply is dropped")
@@ -1594,6 +1594,161 @@ final class BargeInTests: XCTestCase {
         XCTAssertEqual(core(c.handle(.transcription(text: "Have to go", itemId: "h", final: false), now: 1.4)), [], "\"go\" alone proves nothing")
         XCTAssertEqual(core(c.handle(.transcription(text: "Have to go through", itemId: "h", final: false), now: 1.6)), [], "\"through\" the model said")
         XCTAssertEqual(count(core(c.handle(.transcription(text: "Have to go through Friday", itemId: "h", final: false), now: 1.9)), .sendCancel), 1, "\"friday\" it never said")
+    }
+
+    // MARK: 28 — a reply cut on air is TRUNCATED to what was heard (Zubair's
+    // voice session, 2026-09-23 05:05:56–05:06:17, assistant_turns): he talked
+    // over "Ah, good question. I can nudge you in a couple of ways…", the
+    // cancel found no active response (the reply had finished GENERATING —
+    // only its playback was cut), he said "Carry on", and the assistant opened
+    // a new topic: the server still held the whole reply, so the model
+    // believed it had said all of it. Ahmad 2026-09-23.
+
+    private func index(_ cmds: [BargeInCommand], _ c: BargeInCommand) -> Int? { cmds.firstIndex(of: c) }
+
+    func test28a_aConfirmedTalkOverTruncates_afterTheCancel_beforeTheFlush() {
+        // Energy confirm (low-echo routes, calls): server VAD + mic for confirmMs.
+        var e = speaking()
+        _ = e.handle(.speechStarted(itemId: "u"), now: 1.0)
+        _ = e.handle(.gateOpen, now: 1.05)
+        let confirmed = core(e.handle(.tick, now: 1.3))
+        XCTAssertEqual(count(confirmed, .truncatePlayback), 1)
+        XCTAssertLessThan(index(confirmed, .sendCancel)!, index(confirmed, .truncatePlayback)!, "cancel first (the reference client's order)")
+        XCTAssertLessThan(index(confirmed, .truncatePlayback)!, index(confirmed, .flushPlayback)!, "the playhead is read before the flush resets it")
+        // Words (the loudspeaker): the live guess is clearly theirs.
+        var w = speaking(.speaker)
+        said(&w, "Ah, good question. I can nudge you in a couple of ways.")
+        _ = w.handle(.speechStarted(itemId: "v"), now: 1.0)
+        let words = core(w.handle(.transcription(text: "wait so how does", itemId: "v", final: false), now: 1.4))
+        XCTAssertEqual(count(words, .truncatePlayback), 1)
+        XCTAssertLessThan(index(words, .truncatePlayback)!, index(words, .flushPlayback)!)
+        // The Interrupt button and a hold-to-talk press cut what was on air too.
+        var b = speaking(.speaker)
+        XCTAssertEqual(count(b.handle(.interruptPressed, now: 1), .truncatePlayback), 1)
+        var h = speaking(holdToTalk: true)
+        XCTAssertEqual(count(h.handle(.pttDown, now: 1), .truncatePlayback), 1)
+    }
+
+    func test28b_zubairsCase_aReplyThatFinishedGeneratingIsTruncatedWithNoCancel() {
+        var c = speaking(.speaker)
+        said(&c, "Ah, good question. I can nudge you in a couple of ways.")
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 0.8)   // generated; still playing
+        _ = c.handle(.speechStarted(itemId: "u"), now: 1.0)
+        let out = core(c.handle(.transcription(text: "wait so how does", itemId: "u", final: false), now: 1.4))
+        XCTAssertEqual(count(out, .sendCancel), 0, "nothing is generating — a cancel finds nothing")
+        XCTAssertEqual(Array(out.prefix(2)), [.truncatePlayback, .flushPlayback], "but what he did not hear leaves the conversation")
+    }
+
+    func test28c_echoIsNeverTruncated_theReplyPlaysOn() {
+        var c = speaking(.speaker)
+        said(&c, "Taxi's at quarter to eight, after the gym.")
+        _ = c.handle(.speechStarted(itemId: "echo"), now: 1.0)
+        XCTAssertEqual(core(c.handle(.transcription(text: "taxi's at quarter", itemId: "echo", final: false), now: 1.2)), [], "an echo's live guess cuts nothing")
+        _ = c.handle(.speechStopped, now: 1.3)
+        let out = core(c.handle(.transcription(text: "taxi's at quarter to eight after the gym", itemId: "echo", final: true), now: 1.4))
+        XCTAssertEqual(count(out, .truncatePlayback), 0)
+        XCTAssertEqual(out, [], "discarded: its item deleted later, nothing truncated")
+        XCTAssertTrue(c.playbackQueued, "the reply is still on air, whole")
+        // A blip on an energy route restores — nothing truncated either.
+        var e = speaking()
+        _ = e.handle(.speechStarted(itemId: "blip"), now: 1.0)
+        XCTAssertEqual(count(e.handle(.speechStopped, now: 1.1), .truncatePlayback), 0)
+        XCTAssertEqual(count(e.handle(.tick, now: 1.3), .truncatePlayback), 0)
+    }
+
+    func test28d_nothingOnAir_nothingTruncated() {
+        // A reply that never played: still thinking when they speak.
+        var t = BargeInController(profile: .speaker)
+        _ = t.handle(.responseCreated(id: "r1"), now: 0)
+        let thinking = core(t.handle(.transcription(text: "actually never mind", itemId: nil, final: true), now: 0.5))
+        XCTAssertEqual(count(thinking, .truncatePlayback), 0)
+        XCTAssertEqual(count(t.handle(.interruptPressed, now: 0.6), .truncatePlayback), 0)
+        // A reply played to the end (drained), the next one only thinking:
+        // cutting that one truncates nothing — the last was heard whole.
+        var d = speaking(.speaker)
+        _ = d.handle(.responseDone(id: "r1", status: "completed"), now: 1)
+        _ = d.handle(.playbackDrained, now: 2)
+        _ = d.handle(.responseCreated(id: "r2"), now: 2.5)
+        let out = d.handle(.interruptPressed, now: 3)
+        XCTAssertEqual(count(out, .sendCancel), 1)
+        XCTAssertEqual(count(out, .truncatePlayback), 0)
+        // …and once a reply was cut, its late tail audio is not on air again.
+        var x = speaking(.speaker)
+        XCTAssertEqual(count(x.handle(.interruptPressed, now: 1), .truncatePlayback), 1)
+        _ = x.handle(.audioDelta(id: "r1"), now: 1.1)   // dropped (cancelled id)
+        XCTAssertEqual(count(x.handle(.interruptPressed, now: 1.2), .truncatePlayback), 0)
+    }
+
+    // The item and the ms come from the audio engine's ledger (frames at
+    // 24 kHz on the player's timeline) and AudioTruncation — both pure.
+
+    func test28e_msAccounting_heardNotReceived_roundedDown_neverPastTheItem() {
+        func plan(_ played: Int, of received: Int, _ id: String? = "item_A") -> AudioTruncation? {
+            AudioTruncation.plan(PlaybackPosition(itemId: id, playedFrames: played, receivedFrames: received))
+        }
+        XCTAssertEqual(plan(36_000, of: 48_000), AudioTruncation(itemId: "item_A", audioEndMs: 1500))
+        XCTAssertEqual(plan(36_023, of: 48_000)?.audioEndMs, 1500, "rounded down — never a ms they did not hear")
+        XCTAssertEqual(plan(47_999, of: 48_000)?.audioEndMs, 1999, "below what arrived (2000 ms)")
+        XCTAssertNil(plan(48_000, of: 48_000), "heard to the end — nothing to take back")
+        XCTAssertNil(plan(60_000, of: 48_000), "a playhead past what arrived is clamped to it: heard whole")
+        XCTAssertNil(plan(0, of: 48_000), "nothing of it heard")
+        XCTAssertNil(plan(23, of: 48_000), "under a millisecond is nothing")
+        XCTAssertNil(plan(12_000, of: 48_000, nil), "no item id, nothing to name")
+        XCTAssertNil(plan(12_000, of: 48_000, ""))
+        XCTAssertNil(AudioTruncation.plan(nil))
+        let ev = AudioTruncation(itemId: "item_A", audioEndMs: 1500).event(id: "evt_truncate_1")
+        XCTAssertEqual(ev["type"] as? String, "conversation.item.truncate")
+        XCTAssertEqual(ev["item_id"] as? String, "item_A")
+        XCTAssertEqual(ev["content_index"] as? Int, 0)
+        XCTAssertEqual(ev["audio_end_ms"] as? Int, 1500)
+        XCTAssertEqual(ev["event_id"] as? String, "evt_truncate_1")
+    }
+
+    func test28f_ledger_theItemAtThePlayheadAndWhatOfItWasHeard() {
+        var l = PlaybackLedger()
+        // The player has been playing silence for 2 s when the greeting lands.
+        l.scheduled(itemId: "A", frames: 24_000, playhead: 48_000)
+        l.scheduled(itemId: "A", frames: 24_000, playhead: 48_100)   // queued behind
+        XCTAssertNil(l.position(at: 47_000), "nothing had started")
+        XCTAssertEqual(l.position(at: 60_000), PlaybackPosition(itemId: "A", playedFrames: 12_000, receivedFrames: 48_000))
+        XCTAssertEqual(l.position(at: 84_000), PlaybackPosition(itemId: "A", playedFrames: 36_000, receivedFrames: 48_000))
+        // The queue ran dry at 96 000; the next burst lands at 100 000.
+        l.scheduled(itemId: "A", frames: 12_000, playhead: 100_000)
+        XCTAssertEqual(l.position(at: 98_000), PlaybackPosition(itemId: "A", playedFrames: 48_000, receivedFrames: 60_000), "the gap is silence, not the reply")
+        XCTAssertEqual(l.position(at: 106_000), PlaybackPosition(itemId: "A", playedFrames: 54_000, receivedFrames: 60_000))
+    }
+
+    func test28g_ledger_theRightItemWhenANewReplyIsQueuedBehindTheLast() {
+        var l = PlaybackLedger()
+        l.scheduled(itemId: "A", frames: 24_000, playhead: 0)
+        l.scheduled(itemId: "B", frames: 24_000, playhead: 1_000)   // the next reply, behind A's tail
+        XCTAssertEqual(l.position(at: 12_000), PlaybackPosition(itemId: "A", playedFrames: 12_000, receivedFrames: 24_000), "A's tail is on air: A is cut")
+        XCTAssertNil(AudioTruncation.plan(l.position(at: 24_000)), "at the seam: A heard whole, B not yet begun")
+        XCTAssertEqual(l.position(at: 30_000), PlaybackPosition(itemId: "B", playedFrames: 6_000, receivedFrames: 24_000))
+        XCTAssertEqual(AudioTruncation.plan(l.position(at: 30_000)), AudioTruncation(itemId: "B", audioEndMs: 250))
+    }
+
+    func test28h_ledger_resetsWithThePlayersTimeline_andStaysBounded() {
+        var l = PlaybackLedger()
+        l.scheduled(itemId: "A", frames: 24_000, playhead: 500_000)
+        // Stopped and restarted (a flush it was not told about): the playhead
+        // runs backwards, and A's span means nothing on the new timeline.
+        l.scheduled(itemId: "B", frames: 24_000, playhead: 1_000)
+        XCTAssertEqual(l.end, 25_000)
+        XCTAssertEqual(l.position(at: 13_000), PlaybackPosition(itemId: "B", playedFrames: 12_000, receivedFrames: 24_000))
+        l.reset()
+        XCTAssertNil(l.position(at: 13_000))
+        XCTAssertEqual(l.end, 0)
+        // No item id: the timeline moves on, nothing is named.
+        l.scheduled(itemId: nil, frames: 24_000, playhead: 0)
+        XCTAssertEqual(l.end, 24_000)
+        XCTAssertNil(l.position(at: 12_000))
+        // Only the last few items are kept.
+        var m = PlaybackLedger()
+        for (i, id) in ["A", "B", "C", "D"].enumerated() { m.scheduled(itemId: id, frames: 1_000, playhead: i * 1_000) }
+        XCTAssertNil(m.position(at: 500), "A is forgotten")
+        XCTAssertEqual(m.position(at: 3_500)?.itemId, "D")
+        XCTAssertEqual(m.position(at: 1_500)?.itemId, "B")
     }
 
 }
