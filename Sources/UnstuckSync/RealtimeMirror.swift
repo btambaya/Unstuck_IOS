@@ -70,9 +70,14 @@ public actor RealtimeMirror {
     /// user_preferences — both in the publication since migration 063).
     private var onPreferencesChanged: (@Sendable () -> Void)?
 
-    public init(client: SupabaseClient, db: AppDatabase) {
+    /// Rule G's gate (stage 2): a cal_blocks row arriving from the server
+    /// releases a confirmed mint's Google push that was waiting for it.
+    private let mirrorGate: InsertMirrorGate?
+
+    public init(client: SupabaseClient, db: AppDatabase, mirrorGate: InsertMirrorGate? = nil) {
         self.client = client
         self.db = db
+        self.mirrorGate = mirrorGate
     }
 
     /// Wire the mirror's reports into the freshness owner. Set once, before
@@ -142,7 +147,10 @@ public actor RealtimeMirror {
                         onUpsert: { [db] in try? db.save($0.model()) },
                         onDelete: { [db] in try? db.deleteById(Session.self, id: $0) })
         await subscribe("cal_blocks", CalBlockRow.self, userId: userId,
-                        onUpsert: { [db] in try? db.save($0.model()) },
+                        onUpsert: { [db, mirrorGate] row in
+                            try? db.save(row.model())
+                            mirrorGate?.rowLanded(rowId: row.id)
+                        },
                         onDelete: { [db] in try? db.deleteById(CalBlock.self, id: $0) })
         // captures carry their Inbox archive state (`archived_at`, migration
         // 053) — an archive made on the web must move the row out of this

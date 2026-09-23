@@ -117,7 +117,32 @@ final class FakeAssistantState: AssistantAppState {
         await commit()
         if let i = blocks.firstIndex(where: { $0.id == b.id }) { blocks[i] = b } else { blocks.append(b) }
     }
-    func deleteBlock(_ id: String) async { await commit(); blocks.removeAll { $0.id == id } }
+    /// Every mint the executor asked for: "<id>|<retime or insert>" (stage 2).
+    var insertedBlocks: [String] = []
+    /// Every block the executor deleted, in order.
+    var deletedBlockIds: [String] = []
+    /// Runs as an insert is applied, before its check — lands a row the
+    /// executor never read (a top-up or another device, mid-turn).
+    var beforeInsert: ((CalBlock) -> Void)?
+    /// Insert-if-absent like the real seam (WriteThrough): a row with the id
+    /// already present is left alone and reported false (rule A) — unless it
+    /// is that day's OPEN occurrence and the user asked for the day, which is
+    /// retimed in place (rule H, applied locally) and reported true.
+    func insertBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool) async -> Bool {
+        await commit()
+        beforeInsert?(b)
+        insertedBlocks.append("\(b.id)|\(retimeIfTaken ? "insert_or_retime" : "insert")")
+        if let i = blocks.firstIndex(where: { $0.id == b.id }) {
+            let held = blocks[i]
+            guard retimeIfTaken, held.date == b.date, !held.done, !held.skipped else { return false }
+            blocks[i].startTime = b.startTime
+            blocks[i].durationMinutes = b.durationMinutes
+            return true
+        }
+        blocks.append(b)
+        return true
+    }
+    func deleteBlock(_ id: String) async { await commit(); deletedBlockIds.append(id); blocks.removeAll { $0.id == id } }
 
     private func patch(_ id: String, _ fn: (inout ItemCollection) -> Void) {
         guard let i = collections.firstIndex(where: { $0.id == id }) else { return }
@@ -964,6 +989,89 @@ final class AssistantToolsTests: XCTestCase {
         scratch = TurnScratch()
         api.blocks[api.blocks.firstIndex { $0.date == next }!].startTime = "18:00"
         await eq("set_task_recurrence", #"{"taskId":"o","kind":"weekly","daysOfWeek":[1]}"#, "ok: \"Office\" now repeats weekly on Mon at 11:00")
+    }
+
+    /// Stage 2 (C21): a series with deterministic occurrence ids re-timed from
+    /// 07:00 to 19:00 (schedule_task, then set_task_recurrence in the same
+    /// turn) REWRITES each day's row in place. Emitted as delete + mint of the
+    /// same id, the delete cancelled the mint and every day was lost.
+    func testSetTaskRecurrenceTimeChangeDeletesNoRetimedId() async {
+        let rid = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+        api.tasks = [task(rid, "Gym", recurrence: .daily(until: nil))]
+        api.blocks = (1...55).map { o -> CalBlock in
+            let d = LocalDate.addDays(TODAY, o)
+            return block(occurrenceId(taskId: rid, date: d), rid, d, "07:00")
+        }
+        let seriesIds = Set(api.blocks.map(\.id))
+        await eq("schedule_task", #"{"taskId":"\#(rid)","date":"\#(TOMORROW)","startTime":"19:00"}"#,
+                 "ok: scheduled \"Gym\" \(TOMORROW) 19:00")
+        await eq("set_task_recurrence", #"{"taskId":"\#(rid)","kind":"daily"}"#, "ok: \"Gym\" now repeats daily at 19:00")
+        XCTAssertTrue(api.deletedBlockIds.filter { seriesIds.contains($0) }.isEmpty, "no retimed id is deleted")
+        let upcoming = api.blocks.filter { $0.date > TODAY }
+        XCTAssertTrue(seriesIds.allSatisfy { id in upcoming.contains { $0.id == id && $0.startTime == "19:00" } },
+                      "every day kept its row, now at 19:00")
+        XCTAssertEqual(Set(upcoming.map(\.date)).count, upcoming.count, "one occurrence per day")
+        // The only new day is minted with its deterministic id, as a user mint.
+        let last = LocalDate.addDays(TODAY, 56)
+        XCTAssertEqual(api.insertedBlocks.filter { $0.hasPrefix(occurrenceId(taskId: rid, date: last)) },
+                       ["\(occurrenceId(taskId: rid, date: last))|insert_or_retime"])
+    }
+
+    /// A series' first placement whose day id is taken between the tool's read
+    /// and its write (the launch top-up, another device): the reply and
+    /// `placedBlocks` report what actually landed (stage 2 review).
+    /// • the id is that day's OPEN occurrence at the series time → it is
+    ///   retimed to the asked time (rule H, locally);
+    /// • the id lives on ELSEWHERE (moved) → the day gets a block of its own;
+    /// • the day's occurrence is DONE → nothing is placed, and the reply says so.
+    func testSeriesFirstPlacementReportsWhatLandedWhenTheDaysIdIsTakenMidTurn() async {
+        let rid = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+        let dayId = occurrenceId(taskId: rid, date: TOMORROW)
+        let day = TOMORROW
+        api.tasks = [task(rid, "Gym", recurrence: .daily(until: nil))]
+
+        // Open, same day, 07:00 — minted by the top-up mid-turn.
+        api.beforeInsert = { [unowned api = self.api] b in
+            if b.id == dayId, !api.blocks.contains(where: { $0.id == dayId }) {
+                api.blocks.append(block(dayId, rid, day, "07:00"))
+            }
+        }
+        await eq("schedule_task", #"{"taskId":"\#(rid)","date":"\#(TOMORROW)","startTime":"18:00"}"#,
+                 "ok: scheduled \"Gym\" \(TOMORROW) 18:00")
+        XCTAssertEqual(scratch.placedBlocks[rid], dayId)
+        XCTAssertEqual(api.blocks.filter { $0.date == TOMORROW }.map(\.startTime), ["18:00"], "the day moved to 18:00, once")
+
+        // Moved elsewhere mid-turn: the day still gets a block, at 18:00.
+        api.blocks = []
+        api.insertedBlocks = []
+        scratch = TurnScratch()
+        let moved = LocalDate.addDays(TOMORROW, 2)
+        api.beforeInsert = { [unowned api = self.api] b in
+            if b.id == dayId, !api.blocks.contains(where: { $0.id == dayId }) {
+                api.blocks.append(block(dayId, rid, moved, "07:00"))
+            }
+        }
+        await eq("schedule_task", #"{"taskId":"\#(rid)","date":"\#(TOMORROW)","startTime":"18:00"}"#,
+                 "ok: scheduled \"Gym\" \(TOMORROW) 18:00")
+        let onDay = api.blocks.filter { $0.date == TOMORROW }
+        XCTAssertEqual(onDay.map(\.startTime), ["18:00"])
+        XCTAssertNotEqual(onDay.first?.id, dayId, "the moved occurrence keeps its id and its day")
+        XCTAssertEqual(scratch.placedBlocks[rid], onDay.first?.id, "placed = the block that is really on the day")
+        XCTAssertEqual(api.blocks.first { $0.id == dayId }?.date, moved)
+
+        // Done on the day mid-turn: nothing placed, and the reply says why.
+        api.blocks = []
+        api.insertedBlocks = []
+        scratch = TurnScratch()
+        api.beforeInsert = { [unowned api = self.api] b in
+            if b.id == dayId, !api.blocks.contains(where: { $0.id == dayId }) {
+                api.blocks.append(block(dayId, rid, day, "07:00", done: true))
+            }
+        }
+        await eq("schedule_task", #"{"taskId":"\#(rid)","date":"\#(TOMORROW)","startTime":"18:00"}"#,
+                 "error: \"Gym\" is already done on \(TOMORROW) — nothing changed")
+        XCTAssertNil(scratch.placedBlocks[rid])
+        XCTAssertEqual(api.blocks.filter { $0.date == TOMORROW }.map(\.startTime), ["07:00"])
     }
 
     /// October's rent pushed from the 15th to the 20th, then only the end date
@@ -2817,5 +2925,294 @@ final class StoredRowWriteTests: XCTestCase {
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertNil(try stored("c5-gone"))
         XCTAssertEqual(try taskOps("c5-gone").count, 0)
+    }
+}
+
+
+// MARK: - stage 2 over the PRODUCTION seam (deterministic occurrence ids)
+
+/// A server for the rule-G test: ON CONFLICT (id) DO NOTHING by id.
+private actor OccurrenceServer: SyncGatewayProtocol {
+    private var ids: Set<String>
+    init(existing: Set<String>) { ids = existing }
+    func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {}
+    func delete(table: String, id: String) async throws { ids.remove(id) }
+    func insertIfAbsent<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws -> Bool {
+        let obj = (try? JSONSerialization.jsonObject(with: JSONEncoder().encode(row))) as? [String: Any]
+        guard let id = obj?["id"] as? String else { return false }
+        return ids.insert(id).inserted
+    }
+    func retimeIfOpen(table: String, id: String, date: String, startTime: String, durationMinutes: Int) async throws -> Data? { nil }
+}
+
+/// The real AppModel + AppModelAssistantState over a live GRDB store (the
+/// UI-test boot: in-memory database, real WriteThrough + outbox).
+@MainActor
+final class DeterministicOccurrenceAppTests: XCTestCase {
+    private let seriesId = "7c0e4a52-3b1d-4f6e-9a8b-2d4c6e8f0a1b"
+    private let oneOffId = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"
+
+    private func liveModel() throws -> (AppModel, AppModelAssistantState, AppDatabase) {
+        AssistantModel.scrubPersisted()
+        let model = AppModel()
+        model.startUITestMode()
+        let db = try XCTUnwrap(model.db)
+        return (model, AppModelAssistantState(model: model, assistant: model.assistant), db)
+    }
+
+    /// A series' first placement mints the day's DETERMINISTIC occurrence as a
+    /// user mint (insert_or_retime), the tail as maintenance mints (insert) —
+    /// and the mint path keeps saveBlockAwaiting's Later un-park.
+    func testScheduleTaskFirstPlacementMintsTheOccurrenceIdAndKeepsTheUnpark() async throws {
+        let (model, api, db) = try liveModel()
+        let today = Clock.todayISO()
+        let tomorrow = LocalDate.addDays(today, 1)
+        try db.save(TaskItem(id: seriesId, name: "Stretch", estimateMin: 20, recurrence: .daily(until: nil),
+                             createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        let scratch = TurnScratch()
+        let r = await runAssistantTool(name: "schedule_task", args: ToolArgs(json: #"{"taskId":"\#(seriesId)","date":"\#(tomorrow)","startTime":"07:00"}"#),
+                                       api: api, scratch: scratch)
+        XCTAssertEqual(r, "ok: scheduled \"Stretch\" \(tomorrow) 07:00")
+        let placedId = occurrenceId(taskId: seriesId, date: tomorrow)
+        XCTAssertEqual(scratch.placedBlocks[seriesId], placedId)
+        let blocks = try db.fetchAllCalBlocks().filter { $0.taskId == seriesId }
+        XCTAssertEqual(blocks.first { $0.date == tomorrow }?.id, placedId)
+        XCTAssertTrue(blocks.allSatisfy { $0.id == occurrenceId(taskId: seriesId, date: $0.date) }, "every occurrence is deterministic")
+        let ops = try OutboxStore(db).pending().filter { $0.tableName == "cal_blocks" }
+        XCTAssertEqual(ops.first { $0.rowId == placedId }?.kind, .insertOrRetime, "the user's own day: rule H")
+        XCTAssertTrue(ops.filter { $0.rowId != placedId }.allSatisfy { $0.kind == .insert }, "the tail fill never retimes")
+        XCTAssertEqual(ops.count, blocks.count)
+
+        // The mint path un-parks exactly like saveBlockAwaiting (TaskMutations'
+        // rule: a parked one-off is un-parked; a series template never is).
+        try db.save(TaskItem(id: oneOffId, name: "Dentist", estimateMin: 30, later: true,
+                             createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        let wrote = await model.saveBlockInserting(CalBlock(id: newUUID(), taskId: oneOffId, taskName: "Dentist", startTime: "10:00",
+                                                            durationMinutes: 30, date: tomorrow, kind: .task), retimeIfTaken: true)
+        XCTAssertEqual(wrote, .inserted)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: oneOffId)?.later, false)
+    }
+
+    /// Rule G: a minted block's Google push waits for its insert — also a push
+    /// asked for by an edit made meanwhile — goes out ONCE when the server
+    /// confirms, and never when the server ignored the insert. A block with no
+    /// insert pushes at once, as before.
+    func testRuleGMirrorsAMintOnlyAfterTheServerConfirmsIt() async throws {
+        let (model, _, db) = try liveModel()
+        let gate = try XCTUnwrap(model.mirrorGate)
+        var pushed: [CalBlock] = []
+        model.onGoogleMirrorDispatched = { pushed.append($0) }
+        var dispatched: [String] { pushed.map(\.id) }
+        try db.save(TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                             createdAt: PAST_CREATED, updatedAt: PAST_CREATED))
+        let d1 = LocalDate.addDays(Clock.todayISO(), 1), d2 = LocalDate.addDays(Clock.todayISO(), 2)
+        let ours = CalBlock(id: occurrenceId(taskId: seriesId, date: d1), taskId: seriesId, taskName: "Gym",
+                            startTime: "07:00", durationMinutes: 30, date: d1, kind: .task)
+        let theirs = CalBlock(id: occurrenceId(taskId: seriesId, date: d2), taskId: seriesId, taskName: "Gym",
+                              startTime: "07:00", durationMinutes: 30, date: d2, kind: .task)
+        let minted1 = await model.saveBlockInserting(ours, retimeIfTaken: true)
+        let minted2 = await model.saveBlockInserting(theirs, retimeIfTaken: false)
+        XCTAssertEqual([minted1, minted2], [.inserted, .inserted])
+        var edited = ours
+        edited.startTime = "08:00"
+        await model.saveBlockAwaiting(edited)   // an edit before the flush
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(dispatched, [], "nothing is pushed while the inserts are unresolved")
+        XCTAssertTrue(gate.isMirrorWanted(rowId: ours.id))
+
+        let plain = CalBlock(id: newUUID(), taskId: seriesId, taskName: "Gym", startTime: "12:00",
+                             durationMinutes: 30, date: d1, kind: .task)
+        await model.saveBlockAwaiting(plain)
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(dispatched, [plain.id], "a block with no insert pushes at once")
+
+        // The server: another device already minted d2.
+        let flusher = OutboxFlusher(gateway: OccurrenceServer(existing: [theirs.id]), db: db, mirrorGate: gate)
+        await flusher.setOnInsertResolved { r in Task { @MainActor in model.handleInsertResolved(r) } }
+        await flusher.flush(userId: "u1")
+        for _ in 0..<100 where !dispatched.contains(ours.id) {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            await model.awaitGoogleMirrors()
+        }
+        await model.awaitGoogleMirrors()
+
+        XCTAssertEqual(dispatched.filter { $0 == ours.id }.count, 1, "the confirmed mint is mirrored once")
+        XCTAssertEqual(pushed.first { $0.id == ours.id }?.startTime, "08:00", "pushed as it is now, the edit included")
+        XCTAssertFalse(dispatched.contains(theirs.id), "the ignored insert is never mirrored")
+        XCTAssertFalse(gate.isMirrorWanted(rowId: theirs.id))
+        XCTAssertEqual(try OutboxStore(db).count(), 0)
+    }
+
+    // MARK: stage 2 review — the Google worker, rule G at dispatch, a missing row
+
+    private func occurrence(_ date: String, _ time: String = "07:00") -> CalBlock {
+        CalBlock(id: occurrenceId(taskId: seriesId, date: date), taskId: seriesId, taskName: "Gym",
+                 startTime: time, durationMinutes: 30, date: date, kind: .task)
+    }
+    private func saveSeries(_ db: AppDatabase) throws -> TaskItem {
+        let t = TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                         createdAt: PAST_CREATED, updatedAt: PAST_CREATED)
+        try db.save(t)
+        return t
+    }
+    private func until(_ done: @MainActor () -> Bool, _ model: AppModel) async throws {
+        for _ in 0..<200 where !done() {
+            try await Task.sleep(nanoseconds: 10_000_000)
+            await model.awaitGoogleMirrors()
+        }
+        await model.awaitGoogleMirrors()
+    }
+
+    /// A Google delete never waits behind queued pushes (the row is gone, so a
+    /// delete lost to a kill is never retried), and a row queued twice is
+    /// pushed once — as it is when its turn comes.
+    func testGoogleDeletesRunBeforeQueuedPushesAndARowQueuedTwicePushesOnce() async throws {
+        let (model, _, db) = try liveModel()
+        var calls: [String] = []
+        model.onGoogleMirrorDispatched = { calls.append("push:\($0.id)") }
+        model.onGoogleDeleteDispatched = { calls.append("delete:\($0.id)") }
+        let day = LocalDate.addDays(Clock.todayISO(), 1)
+        let a = CalBlock(id: newUUID(), taskId: oneOffId, taskName: "A", startTime: "09:00", durationMinutes: 30, date: day, kind: .task)
+        let b = CalBlock(id: newUUID(), taskId: oneOffId, taskName: "B", startTime: "10:00", durationMinutes: 30, date: day, kind: .task)
+        try db.save(a)
+        try db.save(b)
+        model.googleCallsPaused = true   // a burst of pushes waiting their turn
+        model.queueGooglePush(a.id)
+        model.queueGooglePush(b.id)
+        model.queueGooglePush(a.id)
+        await model.deleteBlockAwaiting(b)
+        model.resumeGoogleCalls()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(calls, ["delete:\(b.id)", "push:\(a.id)"], "the delete first; b's queued push went with its row")
+    }
+
+    /// Rule G is checked again when a queued push's TURN comes: the row may
+    /// have been deleted and minted again meanwhile, and a push then — or its
+    /// whole-row stamp — would go out for an insert the server may ignore.
+    /// And a push queued for a row that a mint then takes over is dropped, so
+    /// it can't go out after that insert resolves as IGNORED. Nothing goes out
+    /// while a row's insert is unresolved; each confirmed insert is mirrored
+    /// once; the ignored one never.
+    func testAPushQueuedBeforeTheRowIsMintedAgainWaitsForTheInsertsOutcome() async throws {
+        let (model, _, db) = try liveModel()
+        let gate = try XCTUnwrap(model.mirrorGate)
+        let write = try XCTUnwrap(model.write)
+        var pushed: [String] = []
+        model.onGoogleMirrorDispatched = { pushed.append($0.id) }
+        _ = try saveSeries(db)
+        let today = Clock.todayISO()
+        let x = occurrence(LocalDate.addDays(today, 1)), y = occurrence(LocalDate.addDays(today, 2))
+        let z = occurrence(LocalDate.addDays(today, 3))
+        for b in [x, y, z] { try db.save(b) }   // synced rows, no op
+        model.googleCallsPaused = true
+        model.queueGooglePush(x.id)
+        model.queueGooglePush(z.id)
+
+        // x: "Never" then "Daily" while its push waits.
+        await model.deleteBlockAwaiting(x)
+        let reMinted = await model.saveBlockInserting(x, retimeIfTaken: true)
+        XCTAssertEqual(reMinted, .inserted)
+        // z: deleted and minted again by a path that never touches the queue.
+        try await write.deleteCalBlock(id: z.id, nowISO: AppModel.isoNow())
+        try await write.insertCalBlockIfAbsent(z, retimeIfTaken: false, nowISO: AppModel.isoNow())
+
+        model.resumeGoogleCalls()
+        await model.awaitGoogleMirrors()
+        XCTAssertEqual(pushed, [], "no push goes out while its row's insert is unresolved")
+        XCTAssertTrue(gate.isMirrorWanted(rowId: z.id), "z's push, deferred at its turn, waits for the outcome")
+
+        // y: its push is queued, then a user's mint lands on that day's open
+        // occurrence (rule H, locally), and the insert resolves while the push
+        // still waits.
+        model.googleCallsPaused = true
+        model.queueGooglePush(y.id)
+        var y9 = y
+        y9.startTime = "09:00"
+        let retimed = await model.saveBlockInserting(y9, retimeIfTaken: true)
+        XCTAssertEqual(retimed, .retimed)
+
+        // The server already holds y (another device's copy): its insert is
+        // ignored and its retime finds nothing open to move, so y is never
+        // mirrored — not even by the push queued before the mint.
+        let flusher = OutboxFlusher(gateway: OccurrenceServer(existing: [y.id, z.id]), db: db, mirrorGate: gate)
+        await flusher.setOnInsertResolved { r in Task { @MainActor in model.handleInsertResolved(r) } }
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try OutboxStore(db).count(), 0)
+        try await Task.sleep(nanoseconds: 50_000_000)   // the resolutions reach the model
+        model.resumeGoogleCalls()
+        try await until({ pushed.contains(x.id) && pushed.contains(z.id) }, model)
+        XCTAssertEqual(pushed.filter { $0 == x.id }.count, 1)
+        XCTAssertEqual(pushed.filter { $0 == z.id }.count, 1)
+        XCTAssertFalse(pushed.contains(y.id), "an ignored insert is never mirrored")
+    }
+
+    /// Hazard d + rule G: a confirmed mint whose row is missing for a moment
+    /// (the realtime DELETE echo of its earlier incarnation landed after the
+    /// re-mint) is mirrored when the row lands, not silently dropped.
+    func testAConfirmedMintWhoseRowIsBrieflyMissingIsMirroredWhenItLands() async throws {
+        let (model, _, db) = try liveModel()
+        let gate = try XCTUnwrap(model.mirrorGate)
+        var pushed: [String] = []
+        model.onGoogleMirrorDispatched = { pushed.append($0.id) }
+        _ = try saveSeries(db)
+        let x = occurrence(LocalDate.addDays(Clock.todayISO(), 1))
+        let minted = await model.saveBlockInserting(x, retimeIfTaken: true)
+        XCTAssertEqual(minted, .inserted)
+        try db.deleteById(CalBlock.self, id: x.id)   // the DELETE echo
+
+        let flusher = OutboxFlusher(gateway: OccurrenceServer(existing: []), db: db, mirrorGate: gate)
+        await flusher.setOnInsertResolved { r in Task { @MainActor in model.handleInsertResolved(r) } }
+        await flusher.flush(userId: "u1")
+        try await until({ gate.isAwaitingRow(rowId: x.id) }, model)
+        XCTAssertTrue(gate.isAwaitingRow(rowId: x.id))
+        XCTAssertEqual(pushed, [], "no row to push yet")
+
+        try db.save(x)                        // the INSERT echo
+        gate.rowLanded(rowId: x.id)
+        try await until({ !pushed.isEmpty }, model)
+        XCTAssertEqual(pushed, [x.id])
+    }
+
+    /// The chosen day's mint whose id was taken after Schedule read the store:
+    /// the day still gets its block. Held ELSEWHERE (a moved occurrence) → a
+    /// block of its own; held by that day's OPEN occurrence → retimed in place.
+    func testTheChosenDayStillGetsItsBlockWhenItsIdIsTakenAfterTheRead() async throws {
+        let (model, _, db) = try liveModel()
+        let series = try saveSeries(db)
+        let today = Clock.todayISO()
+        let d1 = LocalDate.addDays(today, 1), movedTo = LocalDate.addDays(today, 3)
+        var moved = occurrence(d1)
+        moved.date = movedTo                  // another device moved it
+        try db.save(moved)
+        await model.writeChosenDay(.insert(occurrence(d1, "18:00")), task: series, iso: d1, startTime: "18:00")
+        let onDay = try db.fetchAllCalBlocks().filter { $0.taskId == seriesId && $0.date == d1 }
+        XCTAssertEqual(onDay.map(\.startTime), ["18:00"])
+        XCTAssertNotEqual(onDay.first?.id, moved.id, "never takes over the surviving row")
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: moved.id)?.date, movedTo)
+
+        let d5 = LocalDate.addDays(today, 5)
+        try db.save(occurrence(d5))           // a top-up minted it at 07:00
+        await model.writeChosenDay(.insert(occurrence(d5, "18:00")), task: series, iso: d5, startTime: "18:00")
+        let day5 = try db.fetchAllCalBlocks().filter { $0.taskId == seriesId && $0.date == d5 }
+        XCTAssertEqual(day5.map { "\($0.id)|\($0.startTime)" }, ["\(occurrence(d5).id)|18:00"])
+        XCTAssertEqual(try OutboxStore(db).pending().last { $0.rowId == occurrence(d5).id }?.kind, .insertOrRetime)
+    }
+
+    /// `unscheduleAwaiting` reads the ONE row (a series edit sends ~55 ids
+    /// through it): present → deleted with its Google half; absent → a plain delete.
+    func testUnscheduleDeletesByIdWhetherOrNotTheRowIsHere() async throws {
+        let (model, _, db) = try liveModel()
+        var googleDeletes: [String] = []
+        model.onGoogleDeleteDispatched = { googleDeletes.append($0.id) }
+        _ = try saveSeries(db)
+        let here = occurrence(LocalDate.addDays(Clock.todayISO(), 1))
+        let gone = occurrence(LocalDate.addDays(Clock.todayISO(), 2))
+        try db.save(here)
+        await model.unscheduleAwaiting(here.id)
+        await model.unscheduleAwaiting(gone.id)
+        await model.awaitGoogleMirrors()
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: here.id))
+        XCTAssertEqual(try OutboxStore(db).pending().filter { $0.kind == .delete }.map(\.rowId), [here.id, gone.id])
+        XCTAssertEqual(googleDeletes, [here.id])
     }
 }

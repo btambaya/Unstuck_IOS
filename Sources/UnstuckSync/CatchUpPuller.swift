@@ -264,11 +264,11 @@ public actor CatchUpPuller {
 
     // MARK: - guards
 
-    /// Row ids with an un-acked local write (upsert or RPC) for `table` —
-    /// the same set the hydrate preserves.
+    /// Row ids with an un-acked local write (upsert, RPC or an insert-family
+    /// mint) for `table` — the same set the hydrate preserves.
     private func pendingRowIds(table: String) -> Set<String> {
         Set(((try? box.pending()) ?? [])
-            .filter { $0.tableName == table && ($0.kind == .upsert || $0.kind == .rpc) }
+            .filter { $0.tableName == table && $0.kind.isPendingWrite }
             .map(\.rowId))
     }
 
@@ -280,9 +280,10 @@ public actor CatchUpPuller {
             .contains { $0.tableName == table && $0.kind == .delete && $0.rowId == rowId }
     }
 
+    /// An un-acked local write (upsert, RPC, or an insert-family mint) for that row.
     static func hasPendingWrite(table: String, rowId: String, db: AppDatabase) -> Bool {
         ((try? OutboxStore(db).pending()) ?? [])
-            .contains { $0.tableName == table && ($0.kind == .upsert || $0.kind == .rpc) && $0.rowId == rowId }
+            .contains { $0.tableName == table && $0.kind.isPendingWrite && $0.rowId == rowId }
     }
 
     /// Read one string field out of a raw server row without decoding it.

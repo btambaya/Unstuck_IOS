@@ -102,6 +102,10 @@ public actor SyncCoordinator {
     /// app lifecycle, the network monitor and the floor interval all report
     /// into it; nothing else schedules its own refresh.
     public nonisolated let freshness: FreshnessOwner
+    /// Rule G (stage 2): the app asks it before every Google push of a
+    /// cal_block, and a push for a row whose insert is still unresolved waits
+    /// for `setOnInsertResolved`. The flusher owns and brackets it.
+    public nonisolated let mirrorGate: InsertMirrorGate
     private let hydrator: Hydrator
     private let catchUpPuller: CatchUpPuller
     private let realtime: RealtimeMirror
@@ -137,9 +141,13 @@ public actor SyncCoordinator {
         self.assistant = AssistantClient(provider.client)
         self.calls = CallsClient(provider.client)
         self.callsMirror = CallRequestsMirror(db)
-        let hydrator = Hydrator(gateway: gateway, db: db)
-        let flusher = OutboxFlusher(gateway: gateway, db: db)
-        let realtime = RealtimeMirror(client: provider.client, db: db)
+        // Rule G's gate (stage 2) is shared: the flusher brackets every insert
+        // with it, and the realtime mirror and the cal_blocks pull release a
+        // confirmed push that is waiting for its row.
+        let mirrorGate = InsertMirrorGate(db: db)
+        let hydrator = Hydrator(gateway: gateway, db: db, mirrorGate: mirrorGate)
+        let flusher = OutboxFlusher(gateway: gateway, db: db, mirrorGate: mirrorGate)
+        let realtime = RealtimeMirror(client: provider.client, db: db, mirrorGate: mirrorGate)
         let catchUpPuller = CatchUpPuller(gateway: gateway, db: db,
                                           fullFallback: { table in
                                               await hydrator.hydrateFullReplaceTable(table)
@@ -150,6 +158,7 @@ public actor SyncCoordinator {
                                           })
         self.hydrator = hydrator
         self.flusher = flusher
+        self.mirrorGate = mirrorGate
         self.realtime = realtime
         self.catchUpPuller = catchUpPuller
         self.collab = CollabRealtime(client: provider.client)
@@ -255,6 +264,36 @@ public actor SyncCoordinator {
             guard table == "collections" else { return }
             hook(rowId, fn, error)
         }
+    }
+
+    // MARK: - deterministic occurrence mints (stage 2)
+
+    /// An insert-family op resolved (deterministic-occurrence-ids.md §3c). The
+    /// flusher has already markDone'd it and, for `retimed`, written the
+    /// server's row into the local store (the realtime apply path) before the
+    /// hook fires, so the app mirrors from a row that carries the server's
+    /// Google mapping. `mirrorWanted` = a push was deferred for it (rule G).
+    /// Fired on the flusher's executor: hop to the app's actor for real work.
+    public func setOnInsertResolved(_ hook: @escaping @Sendable (InsertResolution) -> Void) async {
+        await flusher.setOnInsertResolved(hook)
+    }
+
+    /// The last `cal_blocks` read that succeeded this session (nil = none yet).
+    public func lastCalBlocksPull() async -> CalBlocksPull? {
+        await hydrator.calBlocksPull()
+    }
+
+    /// The recurrence top-up's pull (§3c "topUpAfterCatchUp"): run one freshness
+    /// pull now, exactly as `syncNow` does, and return the `cal_blocks` stamp
+    /// afterwards. The top-up only runs when that stamp advanced. nil when
+    /// signed out or when no `cal_blocks` read has succeeded yet.
+    public func pullForRecurrenceTopUp() async -> CalBlocksPull? {
+        guard let uid = auth.currentUserId else { return nil }
+        await freshness.setUser(uid)
+        await freshness.report(.manual)
+        await freshness.awaitIdle()
+        guard auth.currentUserId == uid else { return nil }
+        return await hydrator.calBlocksPull()
     }
 
     /// Re-pull collections + membership from the server (RLS-scoped) — after
@@ -606,6 +645,7 @@ public actor SyncCoordinator {
                 // them, never wiped and never replayed under the new user.
                 if let prev, prev != uid { _ = try? OutboxStore(db).park(userId: prev) }
                 try? db.clearAll()
+                await hydrator.resetCalBlocksPull()
             }
             UserDefaults.standard.set(uid, forKey: prevUserKey)
             // Ops parked at THIS user's last sign-out (offline sign-out) rejoin
@@ -667,6 +707,7 @@ public actor SyncCoordinator {
                 if parked > 0 { print("[sync] parked \(parked) un-pushed op(s) for \(owner)") }
             }
             try? db.clearAll()
+            await hydrator.resetCalBlocksPull()
             UserDefaults.standard.removeObject(forKey: prevUserKey)
 
         case .tokenRefreshed:

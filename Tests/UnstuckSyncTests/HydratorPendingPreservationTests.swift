@@ -39,6 +39,20 @@ private actor FakeRawGateway: SyncReadGatewayProtocol {
     }
 }
 
+/// A read gateway whose cal_blocks read can be switched between failing and
+/// answering (the catch-up's full replace failing after a good hydrate).
+private actor SwitchableBlocksGateway: SyncReadGatewayProtocol {
+    var blocks: [Data] = []
+    var failBlocks = false
+    func set(_ rows: [Data], failing: Bool) { blocks = rows; failBlocks = failing }
+    func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] { [] }
+    func fetchAllRaw(table: String) async throws -> [Data] {
+        guard table == "cal_blocks" else { return [] }
+        if failBlocks { throw URLError(.timedOut) }
+        return blocks
+    }
+}
+
 /// Holds the FIRST collections read open until released, so a test can pile
 /// more hydrateCollections calls up behind it.
 private actor GatedCollectionsGateway: SyncReadGatewayProtocol {
@@ -431,4 +445,112 @@ final class HydratorPendingPreservationTests: XCTestCase {
         let reads = await gateway.collectionsReads
         XCTAssertEqual(reads, 2, "the events that landed mid-run share ONE trailing run")
     }
+
+    // MARK: - stage 2: insert-family ops + the cal_blocks pull signal
+
+    private let seriesId = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+    private func occurrence(_ date: String, _ time: String = "07:00") -> CalBlock {
+        CalBlock(id: occurrenceId(taskId: seriesId, date: date), taskId: seriesId, taskName: "Gym",
+                 startTime: time, durationMinutes: 30, date: date, kind: .task)
+    }
+    private func blockPayload(_ b: CalBlock) throws -> String? { String(data: try json(CalBlockRow(b)), encoding: .utf8) }
+
+    /// A confirmed mint's Google push that was waiting for its row (the
+    /// realtime DELETE echo of its earlier incarnation removed it) is released
+    /// by the next successful cal_blocks pull that brings the row back — and
+    /// not by a pull that failed.
+    func testASuccessfulCalBlocksPullReleasesAConfirmedPushWaitingForItsRow() async throws {
+        let reMinted = occurrence("2026-09-24")
+        let gate = InsertMirrorGate(db: db)
+        let landed = HydrateLandedRecorder()
+        gate.setOnAwaitedRowLanded { landed.add($0) }
+        XCTAssertFalse(gate.awaitRow(rowId: reMinted.id))
+        let gateway = SwitchableBlocksGateway()
+        await gateway.set([try json(CalBlockRow(reMinted))], failing: true)
+        let hydrator = Hydrator(gateway: gateway, db: db, mirrorGate: gate)
+        _ = await hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertEqual(landed.ids, [], "a failed read releases nothing")
+        await gateway.set([try json(CalBlockRow(reMinted))], failing: false)
+        _ = await hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertEqual(landed.ids, [reMinted.id])
+        XCTAssertFalse(gate.isAwaitingRow(rowId: reMinted.id))
+    }
+
+    /// A mint the server hasn't seen yet survives the server-canonical replace,
+    /// exactly like a pending upsert — and so does a RE-mint whose delete is
+    /// queued ahead of it while the server still has the old row.
+    func testPendingInsertSurvivesHydrate() async throws {
+        let minted = occurrence("2026-09-24")
+        try db.save(minted)
+        _ = try box.enqueue(table: "cal_blocks", rowId: minted.id, kind: .insert, payload: try blockPayload(minted),
+                            nowISO: "2026-09-23T10:00:00.000Z")
+        let reMinted = occurrence("2026-09-25", "09:15")
+        try db.save(reMinted)
+        _ = try box.enqueue(table: "cal_blocks", rowId: reMinted.id, kind: .delete, nowISO: "2026-09-23T10:00:00.000Z")
+        _ = try box.enqueue(table: "cal_blocks", rowId: reMinted.id, kind: .insertOrRetime, payload: try blockPayload(reMinted),
+                            nowISO: "2026-09-23T10:00:01.000Z")
+        let stale = occurrence("2026-09-26")
+        try db.save(stale)   // no op: the server's word wins, and it doesn't have it
+        let serverOld = occurrence("2026-09-25", "07:00")
+        let hydrator = Hydrator(gateway: FakeRawGateway(rowsByTable: ["cal_blocks": [try json(CalBlockRow(serverOld))]]), db: db)
+
+        await hydrator.hydrate(userId: "u1")
+
+        XCTAssertNotNil(try db.fetchById(CalBlock.self, id: minted.id), "the pending mint stays on the UI")
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: reMinted.id)?.startTime, "09:15",
+                       "the re-mint's local intent wins over the not-yet-deleted server row")
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: stale.id))
+    }
+
+    /// The top-up's gate: only a SUCCESSFUL cal_blocks read stamps it. The
+    /// session's first pull (fullSync) with cal_blocks failing still reads as
+    /// "success" to the freshness owner — the top-up must not believe that.
+    func testFailedCalBlocksPullDoesNotAdvanceTheTopUpStamp() async throws {
+        let gateway = SwitchableBlocksGateway()
+        await gateway.set([], failing: true)
+        let hydrator = Hydrator(gateway: gateway, db: db)
+        let owner = FreshnessOwner(actions: FreshnessOwner.Actions(
+            fullSync: { uid in await hydrator.hydrate(userId: uid) },
+            catchUp: { _, _ in CatchUpPuller.Outcome() }))
+        await owner.setUser("u1")
+        await owner.report(.coldStart)
+        await owner.awaitIdle()
+        let generic = await owner.snapshot().lastSuccessfulPullAt
+        XCTAssertNotNil(generic, "the generic signal claims success")
+        var stamp = await hydrator.calBlocksPull()
+        XCTAssertNil(stamp, "but cal_blocks was never read")
+
+        // A good read stamps it, with the raw row count.
+        await gateway.set([try json(CalBlockRow(occurrence("2026-09-24"))), try json(CalBlockRow(occurrence("2026-09-25")))],
+                          failing: false)
+        let okFull = await hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertTrue(okFull)
+        stamp = await hydrator.calBlocksPull()
+        XCTAssertEqual(stamp?.seq, 1)
+        XCTAssertEqual(stamp?.rowCount, 2)
+        XCTAssertEqual(stamp?.mayBeTruncated, false)
+
+        // The catch-up's full replace failing later leaves it where it was.
+        await gateway.set([], failing: true)
+        let failedFull = await hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertFalse(failedFull)
+        let after = await hydrator.calBlocksPull()
+        XCTAssertEqual(after, stamp, "a failed read never advances the stamp")
+
+        // A read at PostgREST's row cap may be truncated: the top-up must skip.
+        XCTAssertTrue(CalBlocksPull(seq: 9, at: Date(), rowCount: 1000).mayBeTruncated)
+        XCTAssertFalse(CalBlocksPull(seq: 9, at: Date(), rowCount: 999).mayBeTruncated)
+
+        // A sign-out forgets it: the next account waits for its own read.
+        await hydrator.resetCalBlocksPull()
+        let reset = await hydrator.calBlocksPull()
+        XCTAssertNil(reset)
+    }
+}
+
+private final class HydrateLandedRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String] = []
+    func add(_ id: String) { lock.withLock { stored.append(id) } }
+    var ids: [String] { lock.withLock { stored } }
 }

@@ -110,9 +110,141 @@ public actor WriteThrough {
         b.durationMinutes = clampDurationMin(b.durationMinutes)
         let dependsOn = b.taskId.flatMap { isUUID($0) ? $0 : nil }   // wait for the parent task op
         let id = b.id
-        try saveAndEnqueue(b, table: "cal_blocks", rowId: id, payload: try jsonString(CalBlockRow(b)),
-                           dependsOn: dependsOn, nowISO: nowISO,
-                           extra: { try OutboxStore.dropQuarantinedUpserts(in: $0, table: "cal_blocks", rowId: id) })
+        try db.transaction { conn in
+            // The Google mapping belongs to the stamp (`stampCalBlockMapping`):
+            // every other save carries the row's CURRENT mapping. A save built
+            // from a copy read before a stamp landed — a series edit's
+            // rewrites, a Schedule, an assistant move, all computed from a
+            // snapshot while the Google chain stamps minted days — nulled the
+            // event id, and the push that followed INSERTed a second event
+            // (stage 2 review). Read inside the write, so no stamp slips
+            // between the read and the save.
+            if let current = try CalBlock.fetchOne(conn, key: id) {
+                b.externalEventId = current.externalEventId
+                b.externalConnectionId = current.externalConnectionId
+            }
+            try b.upsert(conn)
+            try OutboxStore.dropQuarantinedUpserts(in: conn, table: "cal_blocks", rowId: id)
+            try OutboxStore.enqueue(in: conn, table: "cal_blocks", rowId: id, kind: .upsert,
+                                    payload: try jsonString(CalBlockRow(b)), dependsOn: dependsOn, nowISO: nowISO)
+        }
+        onEnqueue?()
+    }
+
+    /// What a MINT did (`insertCalBlockIfAbsent`).
+    public enum MintOutcome: Sendable, Equatable {
+        /// The row was written and its insert queued.
+        case inserted
+        /// Rule H, applied locally (`retimeIfTaken` only): the id was already
+        /// that day's OPEN occurrence at another time — typically minted by a
+        /// top-up after the caller read the store. It now has the asked start
+        /// and length (those two columns only), queued as `insert_or_retime`
+        /// so the server makes the same conditional retime.
+        case retimed
+        /// That day's open occurrence already has the asked start and length:
+        /// nothing to write.
+        case alreadyThere
+        /// Rule A: the id lives on as a row that is NOT that day's open
+        /// occurrence (moved, done or skipped), or any row holds it and this is
+        /// a maintenance mint (a top-up never moves a row). Nothing written.
+        case held
+
+        /// The day now has the asked occurrence (whatever was written).
+        public var landed: Bool { self != .held }
+        /// An insert-family op was queued for the row.
+        public var queued: Bool { self == .inserted || self == .retimed }
+    }
+
+    /// A MINT: a repeating task's occurrence created with its deterministic id
+    /// (`occurrenceId`, audit 2026-09-22 C21, stage 2). Insert-if-absent end to
+    /// end — rule A of deterministic-occurrence-ids.md:
+    ///  • locally it never overwrites a row with that id: a moved, done, skipped
+    ///    or kept occurrence lives on (`.held`). The check, the row save and the
+    ///    op commit in ONE transaction, so two back-to-back top-ups that read
+    ///    the store before either wrote can't both enqueue it;
+    ///  • on the server the op is `INSERT … ON CONFLICT (id) DO NOTHING`
+    ///    (`insert`), plus rule H's conditional retime when the USER asked for
+    ///    this day (`retimeIfTaken` → `insert_or_retime`).
+    /// A user's mint (`retimeIfTaken`) whose id is already that day's OPEN
+    /// occurrence gets rule H here too (`.retimed`): the planner would have
+    /// retimed that row had it seen it, and skipping silently dropped the
+    /// user's time on every device, since no op reached the server to apply
+    /// rule H (stage 2 review).
+    /// Otherwise exactly `upsertCalBlock`: the duration clamp, `dependsOn` the
+    /// parent task, and a g_ / external row is never enqueued.
+    @discardableResult
+    public func insertCalBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool, nowISO: String) throws -> MintOutcome {
+        if b.kind == .external || b.id.hasPrefix("g_") {
+            return try db.transaction { conn -> MintOutcome in
+                guard try CalBlock.fetchOne(conn, key: b.id) == nil else { return .held }
+                try b.upsert(conn)
+                return .inserted
+            }
+        }
+        var b = b
+        b.durationMinutes = clampDurationMin(b.durationMinutes)
+        let dependsOn = b.taskId.flatMap { isUUID($0) ? $0 : nil }
+        let row = b
+        let outcome = try db.transaction { conn -> MintOutcome in
+            if var held = try CalBlock.fetchOne(conn, key: row.id) {
+                guard retimeIfTaken, held.date == row.date, !held.done, !held.skipped else { return .held }
+                if held.startTime == row.startTime && held.durationMinutes == row.durationMinutes { return .alreadyThere }
+                held.startTime = row.startTime
+                held.durationMinutes = row.durationMinutes
+                try held.upsert(conn)
+                try OutboxStore.dropQuarantinedUpserts(in: conn, table: "cal_blocks", rowId: held.id)
+                try OutboxStore.enqueue(in: conn, table: "cal_blocks", rowId: held.id, kind: .insertOrRetime,
+                                        payload: try jsonString(CalBlockRow(held)), dependsOn: dependsOn, nowISO: nowISO)
+                return .retimed
+            }
+            try row.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: "cal_blocks", rowId: row.id,
+                                    kind: retimeIfTaken ? .insertOrRetime : .insert,
+                                    payload: try jsonString(CalBlockRow(row)), dependsOn: dependsOn, nowISO: nowISO)
+            return .inserted
+        }
+        if outcome.queued { onEnqueue?() }
+        return outcome
+    }
+
+    /// What `stampCalBlockMapping` did.
+    public enum MappingStamp: Sendable, Equatable {
+        case stamped
+        /// The row already carries that mapping.
+        case unchanged
+        /// The row is gone (deleted while the Google call ran).
+        case gone
+        /// The row has an unresolved insert-family op — it was deleted and
+        /// minted again, or a user mint retimed it, during the Google call.
+        /// Rule G: nothing is written; the event belongs to the insert's
+        /// outcome, which mirrors the row itself once confirmed.
+        case insertUnresolved
+    }
+
+    /// The Google push's write-back: the new event id and connection go onto
+    /// the row as it is NOW, in one transaction — the two mapping columns
+    /// only, never the pushed copy (an edit made during the Google call
+    /// survives). Queued as a plain upsert of that current row.
+    @discardableResult
+    public func stampCalBlockMapping(id: String, eventId: String, connectionId: String,
+                                     nowISO: String) throws -> MappingStamp {
+        let result = try db.transaction { conn -> MappingStamp in
+            guard var row = try CalBlock.fetchOne(conn, key: id) else { return .gone }
+            guard row.kind != .external, !id.hasPrefix("g_") else { return .unchanged }
+            if try OutboxStore.hasInsertFamilyOp(in: conn, table: "cal_blocks", rowId: id) { return .insertUnresolved }
+            guard row.externalEventId != eventId || row.externalConnectionId != connectionId else { return .unchanged }
+            row.externalEventId = eventId
+            row.externalConnectionId = connectionId
+            row.durationMinutes = clampDurationMin(row.durationMinutes)
+            try row.upsert(conn)
+            try OutboxStore.dropQuarantinedUpserts(in: conn, table: "cal_blocks", rowId: id)
+            try OutboxStore.enqueue(in: conn, table: "cal_blocks", rowId: id, kind: .upsert,
+                                    payload: try jsonString(CalBlockRow(row)),
+                                    dependsOn: row.taskId.flatMap { isUUID($0) ? $0 : nil }, nowISO: nowISO)
+            return .stamped
+        }
+        if result == .stamped { onEnqueue?() }
+        return result
     }
 
     public func upsertSession(_ s: Session, nowISO: String) throws {

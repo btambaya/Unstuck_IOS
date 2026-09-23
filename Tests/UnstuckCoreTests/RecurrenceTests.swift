@@ -879,3 +879,232 @@ final class TaskAfterSettingRecurrenceTests: XCTestCase {
                                                   todayIso: today, nowISO: now).isEmpty)
     }
 }
+
+// Stage 2 — "same id for same day" (audit 2026-09-22 C21; the rules are in
+// audit/parity-2026-09-23/deterministic-occurrence-ids.md §3). Every occurrence
+// a series mints carries occurrenceId(task, date), so the pure plans must never
+// mint an id a kept row holds (rule A), never delete and mint the same id
+// (rule B), never count a row the plan moves as the chosen day's (rule B′), and
+// the chosen day's own write follows §3b′.
+final class DeterministicOccurrenceTests: XCTestCase {
+    private let taskId = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+    private let today = "2026-09-23"
+
+    private func series(_ recurrence: Recurrence, estimateMin: Int = 30) -> TaskItem {
+        var t = mkTask(id: taskId, name: "Gym", estimateMin: estimateMin)
+        t.recurrence = recurrence
+        return t
+    }
+    private func day(_ offset: Int) -> String { LocalDate.addDays(today, offset) }
+    /// The occurrence minted FOR `date`, sitting on `on` (moved when they differ).
+    private func occ(_ date: String, on: String? = nil, _ time: String = "07:00", done: Bool = false,
+                     event: String? = nil) -> CalBlock {
+        var b = mkBlock(id: occurrenceId(taskId: taskId, date: date), taskId: taskId, taskName: "Gym",
+                        startTime: time, durationMinutes: 30, date: on ?? date, kind: .task)
+        b.done = done
+        b.completedAt = done ? "2026-09-23T08:00:00.000Z" : nil
+        b.externalEventId = event
+        return b
+    }
+    private func ids(_ p: RegenPlan) -> [String] { p.toUpsert.map(\.id) + p.toRetime.map(\.id) + p.toDelete }
+
+    func testRegenerateMintsDeterministicIds() {
+        let t = series(.weekly(daysOfWeek: [1, 3], until: nil))
+        let plan = regenerateForTask(task: t, recurrence: t.recurrence, existingBlocks: [], todayIso: today,
+                                     startTime: "07:00", startDate: LocalDate.parse(today))
+        XCTAssertFalse(plan.toUpsert.isEmpty)
+        for b in plan.toUpsert {
+            XCTAssertEqual(b.id, occurrenceId(taskId: t.id, date: b.date))
+        }
+        XCTAssertTrue(plan.toRetime.isEmpty)
+        XCTAssertTrue(plan.toDelete.isEmpty)
+    }
+
+    /// Rule B: 07:00 → 09:00. Each future day's row is rewritten IN PLACE —
+    /// never deleted and minted again with the same id (iOS's own callers
+    /// cancelled that mint with the delete, and the day was lost).
+    func testRegenerateTimeChangeRewritesInPlace() {
+        let t = series(.daily(until: nil))
+        var blocks = (1...55).map { occ(day($0), event: $0 % 2 == 0 ? "evt\($0)" : nil) }
+        blocks[4].done = true   // a future day ticked early comes back open, as delete + mint did
+        blocks.append(occ(day(-1), done: true))   // history is never touched
+        let plan = regenerateForTask(task: t, recurrence: t.recurrence, existingBlocks: blocks, todayIso: today,
+                                     startTime: "09:00", startDate: LocalDate.parse(day(1)))
+        let retimed = Dictionary(uniqueKeysWithValues: plan.toRetime.map { ($0.id, $0) })
+        for o in 1...55 {
+            let id = occurrenceId(taskId: t.id, date: day(o))
+            XCTAssertEqual(retimed[id]?.date, day(o))
+            XCTAssertEqual(retimed[id]?.startTime, "09:00")
+            XCTAssertEqual(retimed[id]?.done, false)
+            XCTAssertNil(retimed[id]?.completedAt)
+            XCTAssertEqual(retimed[id]?.externalEventId, o % 2 == 0 ? "evt\(o)" : nil, "the Google mapping is kept")
+            XCTAssertFalse(plan.toDelete.contains(id), "day \(o) is not deleted")
+            XCTAssertFalse(plan.toUpsert.contains { $0.id == id }, "day \(o) is not minted again")
+        }
+        XCTAssertEqual(plan.toUpsert.map(\.date), [day(56)], "only the day nobody had is minted")
+        XCTAssertTrue(plan.toDelete.isEmpty)
+        XCTAssertEqual(Set(ids(plan)).count, ids(plan).count, "the three lists are disjoint")
+    }
+
+    /// Rule A: id(D) sits on E (still desired there, same time). D is not
+    /// minted — the day's occurrence lives on, moved.
+    func testRegenerateSkipsIdHeldByMovedOccurrence() {
+        let t = series(.daily(until: nil))
+        var blocks = (1...10).filter { $0 != 3 && $0 != 5 }.map { occ(day($0)) }
+        blocks.append(occ(day(3), on: day(5)))   // D = +3 moved to E = +5 (E's own was deleted)
+        let plan = regenerateForTask(task: t, recurrence: t.recurrence, existingBlocks: blocks, todayIso: today,
+                                     startTime: "07:00", startDate: LocalDate.parse(day(1)), horizonDays: 10)
+        XCTAssertEqual(plan, RegenPlan(toUpsert: [], toDelete: []), "no block is minted for D, nothing moves")
+    }
+
+    /// Rule A in the top-up: id(D) was moved before the frontier, outside
+    /// occurrenceReach (daily: 0 days). The tail mint for D is dropped.
+    func testTopUpSkipsIdHeldByMovedOccurrence() {
+        let t = series(.daily(until: nil))
+        var blocks = (1...52).map { occ(day($0)) }
+        blocks.append(occ(day(54), on: day(10), "18:00"))
+        let tail = recurrenceTopUp(task: t, existingBlocks: blocks, todayIso: today)
+        XCTAssertEqual(tail.map(\.date), [day(53), day(55)], "+54's occurrence lives on at +10")
+        XCTAssertEqual(tail.map(\.id), [occurrenceId(taskId: t.id, date: day(53)), occurrenceId(taskId: t.id, date: day(55))])
+    }
+
+    func testTopUpIdsAreDeterministic() {
+        let t = series(.weekly(daysOfWeek: [1, 3, 5], until: nil))
+        let blocks = (1...20).map { day($0) }.filter { [1, 3, 5].contains(LocalDate.dayOfWeek($0)) }.map { occ($0) }
+        let a = recurrenceTopUp(task: t, existingBlocks: blocks, todayIso: today)
+        let b = recurrenceTopUp(task: t, existingBlocks: blocks, todayIso: today)
+        XCTAssertFalse(a.isEmpty)
+        XCTAssertEqual(a.map(\.id), b.map(\.id), "two devices topping up the same store mint the same ids")
+        XCTAssertTrue(a.allSatisfy { $0.id == occurrenceId(taskId: t.id, date: $0.date) })
+    }
+
+    /// The kept row (`RecurrenceStart.keepId`) goes INTO the plan: it is in
+    /// none of the three lists, and the day whose id it carries is not minted.
+    func testKeepIdNeverCollidesWithAMint() throws {
+        // (a) The C1 fixture: Oct 15's rent pushed to Oct 20 18:00; on Oct 16
+        // only the end date changes.
+        let rent = series(.monthly(until: "2027-06-30"))
+        let a = [occ("2026-08-15", done: true), occ("2026-09-15", done: true),
+                 occ("2026-10-15", on: "2026-10-20", "18:00"), occ("2026-11-15")]
+        let startA = try XCTUnwrap(recurrenceEditStart(taskId: taskId, recurrence: rent.recurrence, blocks: a, todayIso: "2026-10-16"))
+        let keptA = try XCTUnwrap(startA.keepId)
+        XCTAssertEqual(keptA, occurrenceId(taskId: taskId, date: "2026-10-15"))
+        let planA = regenerateForTask(task: rent, recurrence: rent.recurrence, existingBlocks: a, todayIso: "2026-10-16",
+                                      startTime: startA.startTime, startDate: LocalDate.parse(startA.date),
+                                      horizonDays: startA.horizonDays, keepIds: [keptA])
+        XCTAssertFalse(ids(planA).contains(keptA))
+        XCTAssertEqual(planA, RegenPlan(toUpsert: [], toDelete: []))
+
+        // (b) The monthly series on the 15th, today Sep 20: NEXT month's
+        // occurrence id(Oct 15) dragged earlier to Sep 25 is within 14 days of
+        // the passed Sep 15, so keepId == id(Oct 15). Without keepIds in the
+        // plan, rule B would move the kept block back to Oct 15.
+        let monthly = series(.monthly(until: nil))
+        let b = [occ("2026-07-15", done: true), occ("2026-08-15", done: true), occ("2026-09-15", done: true),
+                 occ("2026-10-15", on: "2026-09-25"), occ("2026-11-15")]
+        let startB = try XCTUnwrap(recurrenceEditStart(taskId: taskId, recurrence: monthly.recurrence, blocks: b, todayIso: "2026-09-20"))
+        let keptB = try XCTUnwrap(startB.keepId)
+        XCTAssertEqual(keptB, occurrenceId(taskId: taskId, date: "2026-10-15"))
+        let planB = regenerateForTask(task: monthly, recurrence: monthly.recurrence, existingBlocks: b, todayIso: "2026-09-20",
+                                      startTime: startB.startTime, startDate: LocalDate.parse(startB.date),
+                                      horizonDays: startB.horizonDays, keepIds: [keptB])
+        XCTAssertFalse(ids(planB).contains(keptB), "the kept row is in none of the lists")
+        XCTAssertFalse(planB.toUpsert.contains { $0.date == "2026-10-15" }, "Oct 15 is not minted: its occurrence lives on")
+        XCTAssertFalse(planB.toRetime.contains { $0.id == keptB }, "the Sep 25 block stays where the user put it")
+        // Filtering afterwards (the old callers) cannot undo the rewrite.
+        let unkept = regenerateForTask(task: monthly, recurrence: monthly.recurrence, existingBlocks: b, todayIso: "2026-09-20",
+                                       startTime: startB.startTime, startDate: LocalDate.parse(startB.date),
+                                       horizonDays: startB.horizonDays)
+        XCTAssertTrue(unkept.toRetime.contains { $0.id == keptB && $0.date == "2026-10-15" },
+                      "the trap keepIds closes")
+    }
+
+    /// Rule B′, the exact example: weekly Mon/Wed at 07:00, today Tue Sep 29;
+    /// Wed Oct 7's occurrence was moved to Fri Oct 2, then the series is
+    /// scheduled on Fri Oct 2 at 09:00. The plan moves id(Oct 7) home; Oct 2
+    /// gets its own mint; no id is written twice.
+    func testChosenDateIgnoresRowTheRetimeMovesAway() {
+        let t = series(.weekly(daysOfWeek: [1, 3], until: nil))
+        let today = "2026-09-29"
+        let dates = (1...56).map { LocalDate.addDays(today, $0) }.filter { [1, 3].contains(LocalDate.dayOfWeek($0)) }
+        let existing = dates.map { $0 == "2026-10-07" ? occ($0, on: "2026-10-02") : occ($0) }
+        let plan0 = regenerateForTask(task: t, recurrence: t.recurrence, existingBlocks: existing, todayIso: today,
+                                      startTime: "09:00", startDate: LocalDate.parse("2026-10-02"))
+        let oct7 = occurrenceId(taskId: taskId, date: "2026-10-07")
+        XCTAssertEqual(plan0.toRetime.first { $0.id == oct7 }?.date, "2026-10-07", "moved home, at the new time")
+        XCTAssertEqual(recurrenceChosenDateAction(existing: existing, plan: plan0, iso: "2026-10-02", startTime: "09:00"), .mint,
+                       "the row the plan moves away is not Oct 2's occurrence")
+        let (plan, write) = recurrenceChosenDateWrite(task: t, existing: existing, plan: plan0, iso: "2026-10-02", startTime: "09:00")
+        guard case .insert(let minted) = write else { return XCTFail("expected a mint, got \(write)") }
+        XCTAssertEqual(minted.id, occurrenceId(taskId: taskId, date: "2026-10-02"))
+        XCTAssertEqual(minted.date, "2026-10-02")
+        XCTAssertEqual(minted.startTime, "09:00")
+        let written = ids(plan) + [minted.id]
+        XCTAssertEqual(Set(written).count, written.count, "no id is written twice")
+    }
+
+    /// §3b′ case by case.
+    func testChosenDateWrite() {
+        let t = series(.weekly(daysOfWeek: [1, 3], until: nil), estimateMin: 2)
+        let d = "2026-10-02"
+        let idD = occurrenceId(taskId: taskId, date: d)
+        let none = RegenPlan(toUpsert: [], toDelete: [])
+
+        // .covered → nothing.
+        let covering = occ(d, "09:00")
+        XCTAssertEqual(recurrenceChosenDateWrite(task: t, existing: [covering], plan: none, iso: d, startTime: "09:00").1, .none)
+
+        // .retime → the day's row at the time, un-skipped.
+        var skipped = occ(d, "07:00")
+        skipped.skipped = true
+        var expected = skipped
+        expected.startTime = "09:00"
+        expected.skipped = false
+        XCTAssertEqual(recurrenceChosenDateWrite(task: t, existing: [skipped], plan: none, iso: d, startTime: "09:00").1,
+                       .upsert(expected))
+
+        // .mint with the day's id in toDelete → that row, taken out of the
+        // delete and rewritten in place: it keeps its Google mapping.
+        let doomed = occ(d, "07:00", done: true, event: "evt-d")
+        let (planA, writeA) = recurrenceChosenDateWrite(task: t, existing: [doomed], plan: RegenPlan(toUpsert: [], toDelete: [idD]),
+                                                        iso: d, startTime: "09:00")
+        XCTAssertEqual(planA.toDelete, [], "no longer deleted")
+        guard case .upsert(let rewritten) = writeA else { return XCTFail("expected an upsert, got \(writeA)") }
+        XCTAssertEqual(rewritten.id, idD)
+        XCTAssertEqual(rewritten.externalEventId, "evt-d", "built from the existing row, never a fresh one")
+        XCTAssertEqual(rewritten.startTime, "09:00")
+        XCTAssertEqual(rewritten.durationMinutes, 5, "clamped to the server's 5…1440")
+        XCTAssertFalse(rewritten.done)
+        XCTAssertNil(rewritten.completedAt)
+
+        // .mint with the id held elsewhere (moved) → a RANDOM-id block; the
+        // surviving row is never taken over.
+        let moved = occ(d, on: "2026-10-05")
+        let (planB, writeB) = recurrenceChosenDateWrite(task: t, existing: [moved], plan: none, iso: d, startTime: "09:00")
+        XCTAssertEqual(planB, none)
+        guard case .upsert(let extra) = writeB else { return XCTFail("expected an upsert, got \(writeB)") }
+        XCTAssertNotEqual(extra.id, idD)
+        XCTAssertTrue(isUUID(extra.id))
+        XCTAssertEqual(extra.date, d)
+        XCTAssertEqual(extra.startTime, "09:00")
+
+        // .mint with nothing held → the deterministic insert.
+        let (planC, writeC) = recurrenceChosenDateWrite(task: t, existing: [], plan: none, iso: d, startTime: "09:00")
+        XCTAssertEqual(planC, none)
+        XCTAssertEqual(writeC, .insert(CalBlock(id: idD, taskId: taskId, taskName: "Gym", startTime: "09:00",
+                                                durationMinutes: 5, date: d, kind: .task)))
+    }
+
+    /// A rewritten row covers the chosen day by its NEW date.
+    func testChosenDateActionCountsRetimeAsCoverage() {
+        let d = "2026-10-07"
+        let moved = occ(d, on: "2026-10-02")
+        var home = moved
+        home.date = d
+        home.startTime = "09:00"
+        let plan = RegenPlan(toUpsert: [], toDelete: [], toRetime: [home])
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [moved], plan: plan, iso: d, startTime: "09:00"), .covered)
+        XCTAssertEqual(recurrenceChosenDateAction(existing: [moved], plan: plan, iso: "2026-10-02", startTime: "09:00"), .mint,
+                       "and never covers the day it is leaving")
+    }
+}

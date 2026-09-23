@@ -75,6 +75,29 @@ final class AppModel {
     @ObservationIgnored private var pendingAuthCallbackURL: URL?
     /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
     var uiTestWrite: WriteThrough?
+    /// Rule G's gate for the XCUITest / unit-test boot (no coordinator, so no
+    /// flusher owns one). Production reads the flusher's via the coordinator.
+    var uiTestMirrorGate: InsertMirrorGate?
+    /// Every Google call for a cal_block (push or delete) runs on ONE serial
+    /// worker. Since stage 2 every minted occurrence is mirrored, so a series
+    /// edit, a Schedule or a top-up pushes dozens of rows at once; fired as
+    /// concurrent calendar-sync calls they would trip Google's rate limit.
+    /// Serial also means a push reads the row after the previous one stamped
+    /// it, instead of two quick saves both INSERTing an event. DELETES go
+    /// first: a delete never waits behind a burst of pushes (the row is
+    /// already gone, so a delete lost to a kill is never retried).
+    @ObservationIgnored private var googleDeletes: [CalBlock] = []
+    /// Queued pushes, one per row (a push reads the row when its turn comes,
+    /// so a second request for a queued row adds nothing).
+    @ObservationIgnored private var googlePushes: [GooglePush] = []
+    @ObservationIgnored private var googleWorker: Task<Void, Never>?
+    /// Test seam: every Google push of a cal_block that actually goes out.
+    @ObservationIgnored var onGoogleMirrorDispatched: ((CalBlock) -> Void)?
+    /// Test seam: every Google delete as its turn comes.
+    @ObservationIgnored var onGoogleDeleteDispatched: ((CalBlock) -> Void)?
+    /// Test seam: hold the Google worker (calls queue up, none runs) until
+    /// `resumeGoogleCalls()`.
+    @ObservationIgnored var googleCallsPaused = false
     // Per-collection serial RPC queue. The optimistic local write happens
     // synchronously on the main actor; the server RPC dispatch is chained so two
     // rapid edits to the same shared collection can't reach the server out of
@@ -113,6 +136,13 @@ final class AppModel {
     @ObservationIgnored private var timezonePushedFor: String?
     /// Live as long as the model; the app has one AppModel for its lifetime.
     @ObservationIgnored private var timezoneObserver: NSObjectProtocol?
+    /// The recurrence top-up's gate + serialisation (stage 2, C21): one run in
+    /// flight, one trailing re-run, and callers that arrived meanwhile resume
+    /// once it is done.
+    @ObservationIgnored private var topUpGate = RecurrenceTopUpGate()
+    @ObservationIgnored private var topUpRunning = false
+    @ObservationIgnored private var topUpTrailing: Bool?
+    @ObservationIgnored private var topUpWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var dayChangeObserver: NSObjectProtocol?
     /// Generation counters so a push that succeeds can only clear the
     /// pending-push flag its own change set.
@@ -846,6 +876,10 @@ final class AppModel {
         liveStore = LiveSessionStore(database)
         refreshLiveSession()
         uiTestWrite = WriteThrough(db: database)
+        uiTestMirrorGate = InsertMirrorGate(db: database)
+        uiTestMirrorGate?.setOnAwaitedRowLanded { [weak self] id in
+            Task { @MainActor in self?.queueGooglePush(id) }
+        }
         if heavy { HeavyDemoSeed.seedIfNeeded(database) } else { DemoSeed.seed(database) }
         // The demo persona has a NAME. Without one the greeting falls back to
         // "Good evening Unstuck." — correct behaviour, but it reads as a bug in
@@ -958,8 +992,9 @@ final class AppModel {
                 self.pushTimezoneIfNeeded()
                 // Repeating tasks whose 8-week horizon has run out since the
                 // last edit (topUpRecurrenceHorizon). After the hydrate, so it
-                // sees the account's real blocks rather than an empty store.
-                self.topUpRecurrenceHorizon()
+                // sees the account's real blocks rather than an empty store —
+                // and only if that hydrate's cal_blocks read succeeded.
+                Task { await self.topUpRecurrenceHorizon(pullFirst: false) }
                 // Hands-free ops whose target wasn't in the local store before
                 // this hydrate (a widget "Done" on a task pulled just now) are
                 // retried the moment the store is faithful, then flushed.
@@ -978,6 +1013,16 @@ final class AppModel {
         // the optimistic row back to the server's copy + say so once.
         await coord.setOnCollectionRPCRejected { [weak self] collectionId, fn, error in
             Task { @MainActor in self?.handleCollectionRPCRejected(collectionId: collectionId, fn: fn, error: error) }
+        }
+        // A minted occurrence's insert resolved (stage 2): a Google push that
+        // waited for it goes out now — once, and never for an ignored insert.
+        await coord.setOnInsertResolved { [weak self] resolution in
+            Task { @MainActor in self?.handleInsertResolved(resolution) }
+        }
+        // ...and a confirmed push that found its row missing (its own delete's
+        // realtime echo landed after the re-mint) goes out when the row is back.
+        coord.mirrorGate.setOnAwaitedRowLanded { [weak self] id in
+            Task { @MainActor in self?.queueGooglePush(id) }
         }
         // Ritual toggles are account-wide (migration 053) — push every change.
         paPrefs.onRitualsChanged = { [weak self] rituals in self?.pushRituals(rituals) }
@@ -1021,14 +1066,17 @@ final class AppModel {
                     guard let self else { return }
                     self.timezonePushedFor = nil   // force the push: the zone changed
                     self.pushTimezoneIfNeeded()
-                    self.topUpRecurrenceHorizon()
+                    // A catch-up first, then the top-up (stage 2, C21): never
+                    // against a store that may be a minute stale.
+                    await self.topUpRecurrenceHorizon(pullFirst: true)
                 }
             }
         // A new day: repeating tasks get their horizon extended (see
-        // topUpRecurrenceHorizon) for an app that stays open for weeks.
+        // topUpRecurrenceHorizon) for an app that stays open for weeks —
+        // after a catch-up, like the time-zone change.
         dayChangeObserver = NotificationCenter.default.addObserver(
             forName: .NSCalendarDayChanged, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.topUpRecurrenceHorizon() }
+                Task { @MainActor in await self?.topUpRecurrenceHorizon(pullFirst: true) }
             }
 
         // Register Live Activity per-update push tokens as they're issued.
@@ -1486,6 +1534,8 @@ final class AppModel {
     /// Drives the UI instantly via each repository's ValueObservation. Falls
     /// back to the local-only writer in the XCUITest demo boot.
     var write: WriteThrough? { coordinator?.write ?? uiTestWrite }
+    /// Rule G's gate (see InsertMirrorGate).
+    var mirrorGate: InsertMirrorGate? { coordinator?.mirrorGate ?? uiTestMirrorGate }
 
     /// Sign out via the coordinator's spec'd path: drain the outbox
     /// (bounded; whatever can't be pushed — offline — is parked under this
@@ -1883,8 +1933,11 @@ final class AppModel {
     }
 
     /// `saveBlock`, returning once the local row is committed; the Google
-    /// mirror runs behind it exactly as before.
-    func saveBlockAwaiting(_ block: CalBlock) async {
+    /// mirror runs behind it exactly as before. `unpark: false` skips the
+    /// un-park for a caller that has just saved the task itself (a series
+    /// edit): the un-park reads the task row, which may not carry that save
+    /// yet, and writes it back whole.
+    func saveBlockAwaiting(_ block: CalBlock, unpark: Bool = true) async {
         guard let write else { return }
         // Scheduling ends "Later" parking. Done HERE — the one choke point
         // every scheduling path funnels through (the Schedule sheet, a
@@ -1895,31 +1948,169 @@ final class AppModel {
         // (Only the block's OWN task is read — a whole-table fetch here would
         // run once per block in a bulk calendar turn.)
         let nowISO = Self.isoNow()
-        if let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
+        if unpark, let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
            let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
             try? await write.upsertTask(unparked, nowISO: nowISO)
         }
         try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
-        // Only TASK blocks mirror to Google (spec §1.6): external g_ blocks are
-        // read-only mirrors of the remote calendar and must never be
-        // (re-)pushed; placeholders have nothing to push.
+        requestGoogleMirror(block)
+    }
+
+    /// A MINT (stage 2, deterministic-occurrence-ids.md): `saveBlockAwaiting`
+    /// for a repeating task's occurrence created with its deterministic id —
+    /// the same un-park, but written insert-if-absent (`retimeIfTaken`: the
+    /// user asked for this day, so an id already on that day's open
+    /// occurrence retimes it, locally and on the server — rule H). Its Google
+    /// push waits until the server confirms the insert (rule G). `.held` = the
+    /// id lives on as a row that is not that day's open occurrence (moved or
+    /// finished): nothing was written.
+    @discardableResult
+    func saveBlockInserting(_ block: CalBlock, retimeIfTaken: Bool, unpark: Bool = true) async -> WriteThrough.MintOutcome {
+        guard let write else { return .held }
+        let nowISO = Self.isoNow()
+        if unpark, let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
+           let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
+            try? await write.upsertTask(unparked, nowISO: nowISO)
+        }
+        // "Mirror wanted" goes on BEFORE the op is queued: a flush that
+        // resolved the insert before this await returned would otherwise let
+        // a later push through for an insert the server ignored (rule G).
+        let gate = isTaskBlock(block) ? mirrorGate : nil
+        let expected = gate?.expectMirror(rowId: block.id) ?? false
+        let outcome = (try? await write.insertCalBlockIfAbsent(block, retimeIfTaken: retimeIfTaken, nowISO: Self.isoNow())) ?? .held
+        if !outcome.queued, expected { gate?.forget(rowId: block.id) }
+        // A push already queued for this id belonged to the row before this
+        // insert (an earlier incarnation, or the row this mint just retimed):
+        // pushing it after an IGNORED outcome would stamp this device's copy
+        // over another device's row. The insert's outcome pushes it instead.
+        if outcome.queued { googlePushes.removeAll { $0.blockId == block.id } }
+        return outcome
+    }
+
+    /// Rule G (deterministic-occurrence-ids.md §3 c-bis): push a task block to
+    /// Google, unless its insert is still unresolved — then the push only
+    /// records "mirror wanted" and `handleInsertResolved` runs it once the
+    /// server confirms (never when the server ignored it). Checked here AND
+    /// again when the push's turn comes (`runGooglePush`). Only TASK blocks
+    /// mirror (spec §1.6): external g_ blocks are read-only mirrors of the
+    /// remote calendar; placeholders have nothing to push.
+    private func requestGoogleMirror(_ block: CalBlock) {
         guard isTaskBlock(block) else { return }
-        Task { await self.mirrorBlockToGoogle(block) }
+        if let gate = mirrorGate, !gate.requestMirror(rowId: block.id) { return }
+        queueGooglePush(block.id)
+    }
+
+    /// An insert-family op resolved. A push that waited on it goes out once,
+    /// from the row as it is NOW (a `retimed` row already carries the other
+    /// device's Google mapping, so this PATCHes that event). A row that is
+    /// missing right now is waited for (see InsertMirrorGate.awaitRow).
+    func handleInsertResolved(_ resolution: InsertResolution) {
+        guard resolution.table == "cal_blocks", resolution.mirrorWanted, resolution.outcome.isConfirmed else { return }
+        queueGooglePush(resolution.rowId, awaitRowIfMissing: true)
+    }
+
+    private struct GooglePush {
+        let blockId: String
+        /// A confirmed insert's push: a missing row is waited for, not dropped.
+        var awaitRowIfMissing: Bool
+    }
+
+    /// Queue a Google push of `blockId`; it pushes the row as it is when its
+    /// turn comes (gone = nothing to push).
+    func queueGooglePush(_ blockId: String, awaitRowIfMissing: Bool = false) {
+        if let i = googlePushes.firstIndex(where: { $0.blockId == blockId }) {
+            googlePushes[i].awaitRowIfMissing = googlePushes[i].awaitRowIfMissing || awaitRowIfMissing
+        } else {
+            googlePushes.append(GooglePush(blockId: blockId, awaitRowIfMissing: awaitRowIfMissing))
+        }
+        runGoogleWorker()
+    }
+
+    func queueGoogleDelete(_ block: CalBlock) {
+        googleDeletes.append(block)
+        runGoogleWorker()
+    }
+
+    private enum GoogleCall {
+        case delete(CalBlock)
+        case push(GooglePush)
+    }
+
+    /// The next Google call: every queued delete before any push. Clears the
+    /// worker when both queues are empty (on the main actor, so a call queued
+    /// right after starts a fresh worker).
+    private func takeGoogleCall() -> GoogleCall? {
+        if !googleDeletes.isEmpty { return .delete(googleDeletes.removeFirst()) }
+        if !googlePushes.isEmpty { return .push(googlePushes.removeFirst()) }
+        googleWorker = nil
+        return nil
+    }
+
+    private func runGoogleWorker() {
+        guard googleWorker == nil, !googleCallsPaused else { return }
+        googleWorker = Task { @MainActor [weak self] in
+            while let call = self?.takeGoogleCall() {
+                switch call {
+                case .delete(let block):
+                    self?.onGoogleDeleteDispatched?(block)
+                    await self?.deleteGoogleEvent(for: block)
+                case .push(let push):
+                    await self?.runGooglePush(push)
+                }
+            }
+        }
+    }
+
+    /// One push, when its turn comes.
+    private func runGooglePush(_ push: GooglePush) async {
+        // Rule G again at DISPATCH, not only when the push was asked for: the
+        // row may have been deleted and minted again while this push waited,
+        // and the new incarnation's insert is unresolved. Deferred, the push
+        // becomes "mirror wanted" and the insert's outcome decides.
+        if let gate = mirrorGate, !gate.requestMirror(rowId: push.blockId) { return }
+        guard let fresh = (try? db?.fetchById(CalBlock.self, id: push.blockId)) ?? nil else {
+            // A confirmed mint whose row is missing for a moment: its own
+            // delete's realtime echo landed after the re-mint (hazard d). Wait
+            // for the INSERT echo / the next pull instead of dropping the push.
+            if push.awaitRowIfMissing, let gate = mirrorGate, gate.awaitRow(rowId: push.blockId) {
+                queueGooglePush(push.blockId)   // back already
+            }
+            return
+        }
+        guard isTaskBlock(fresh) else { return }
+        onGoogleMirrorDispatched?(fresh)
+        await mirrorBlockToGoogle(fresh)
+    }
+
+    /// Test seam: the queued Google calls have all run.
+    func awaitGoogleMirrors() async {
+        while let worker = googleWorker { await worker.value }
+    }
+
+    /// Test seam: release a paused Google worker.
+    func resumeGoogleCalls() {
+        googleCallsPaused = false
+        runGoogleWorker()
     }
 
     /// `deleteBlock`, returning once the local row is committed. The Google
-    /// event delete (if it was pushed) follows behind — order doesn't matter
-    /// to either side, and the executor must not wait on the network.
+    /// event delete (if it was pushed) follows on the Google worker, ahead of
+    /// any queued push; the executor must not wait on the network.
     func deleteBlockAwaiting(_ block: CalBlock) async {
         guard let write else { return }
         try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
-        Task { await self.deleteGoogleEvent(for: block) }
+        mirrorGate?.forget(rowId: block.id)   // its cancelled insert will never resolve
+        googlePushes.removeAll { $0.blockId == block.id }   // nothing left to push
+        queueGoogleDelete(block)
     }
 
     /// `unschedule` (AppModel+CalendarControls), awaited: reconcile Google for a
-    /// pushed task block, plain delete when the block isn't in the store.
+    /// pushed task block, plain delete when the block isn't in the store. The
+    /// ONE row is read by id: a series edit deletes up to ~55 occurrences
+    /// through here, and a whole-table read per id decoded the table ~55 times
+    /// on the main actor (stage 2 review).
     func unscheduleAwaiting(_ blockId: String) async {
-        if let block = (try? db?.fetchAllCalBlocks())?.first(where: { $0.id == blockId }) {
+        if let block = (try? db?.fetchById(CalBlock.self, id: blockId)) ?? nil {
             await deleteBlockAwaiting(block)
         } else if let write {
             try? await write.deleteCalBlock(id: blockId, nowISO: Self.isoNow())
@@ -2002,21 +2193,61 @@ final class AppModel {
                                         blocks: existingBlocks, todayIso: today)
         if task.recurrence != nil && start == nil { return false }
         saveTask(task)
-        guard let write = coordinator?.write else { return true }
+        guard coordinator?.write != nil else { return true }
         // Without a start we are clearing the repeat, where regenerateForTask
-        // ignores the time and date (it only deletes the future).
-        var plan = regenerateForTask(
+        // ignores the time and date (it only deletes the future). This month's
+        // moved occurrence (see RecurrenceStart) goes INTO the plan as kept, so
+        // it is neither deleted nor rewritten, and its day is not re-minted.
+        let plan = regenerateForTask(
             task: task, recurrence: task.recurrence, existingBlocks: existingBlocks,
             todayIso: today, startTime: start?.startTime ?? "09:00",
             startDate: start.map { LocalDate.parse($0.date) } ?? Date(),
-            horizonDays: start?.horizonDays ?? RECURRENCE_HORIZON_DAYS)
-        plan.toDelete.removeAll { $0 == start?.keepId }   // this month's moved occurrence (see RecurrenceStart)
-        let now = Self.isoNow()
-        Task {
-            for block in plan.toUpsert { try? await write.upsertCalBlock(block, nowISO: now) }
-            for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
-        }
+            horizonDays: start?.horizonDays ?? RECURRENCE_HORIZON_DAYS,
+            keepIds: Set([start?.keepId].compactMap { $0 }))
+        Task { await self.applyRegenPlan(plan, unpark: false) }
         return true
+    }
+
+    /// Write a regenerate plan (stage 2, deterministic-occurrence-ids.md). The
+    /// lists are disjoint by id, so the order is free:
+    ///  • `toRetime` — rows rewritten in place: a plain save, which moves the
+    ///    row's Google event with it;
+    ///  • `toUpsert` — new occurrences: MINTS, insert-if-absent with rule H
+    ///    (the user asked for them), mirrored to Google once the server
+    ///    confirms each insert (rule G; owner decision 2026-09-23: every minted
+    ///    occurrence is mirrored, as on web and Android);
+    ///  • `toDelete` — deleted with their Google event, if they were pushed.
+    /// `unpark: false` — no Later un-park per block (see saveBlockAwaiting):
+    /// the plan's blocks never un-parked before stage 2 either.
+    func applyRegenPlan(_ plan: RegenPlan, unpark: Bool) async {
+        for b in plan.toRetime { await saveBlockAwaiting(b, unpark: unpark) }
+        for b in plan.toUpsert { await saveBlockInserting(b, retimeIfTaken: true, unpark: unpark) }
+        for id in plan.toDelete { await unscheduleAwaiting(id) }
+    }
+
+    /// The chosen day's write (§3b′), after the plan's. `.upsert` PATCHes its
+    /// Google event when pushed. A mint whose id turned out to be taken by the
+    /// time it was written — the row appeared after `existing` was read (a
+    /// top-up, another device's occurrence), and it is not that day's open
+    /// occurrence (a local rule-H retime covers that one) — is decided again
+    /// from the store as it is now: the user asked for THIS day, so it still
+    /// gets its block (stage 2 review).
+    func writeChosenDay(_ chosen: ChosenDateWrite, task: TaskItem, iso: String, startTime: String) async {
+        switch chosen {
+        case .none:
+            return
+        case .upsert(let b):
+            await saveBlockAwaiting(b)
+        case .insert(let b):
+            guard await saveBlockInserting(b, retimeIfTaken: true) == .held else { return }
+            let now = ((try? db?.blocks(forTask: task.id)) ?? []).filter { isTaskBlock($0) }
+            switch recurrenceChosenDateWrite(task: task, existing: now, plan: RegenPlan(toUpsert: [], toDelete: []),
+                                             iso: iso, startTime: startTime).1 {
+            case .none: break
+            case .upsert(let again): await saveBlockAwaiting(again)
+            case .insert(let again): await saveBlockInserting(again, retimeIfTaken: true)
+            }
+        }
     }
 
     /// Extend every repeating task's occurrences back out to the horizon.
@@ -2036,20 +2267,67 @@ final class AppModel {
     /// deleted or unscheduled occurrences on every launch and at midnight. It
     /// now only extends past the series' last occurrence, at the series'
     /// usual time (recurrenceTopUp), and never deletes.
-    func topUpRecurrenceHorizon() {
-        guard let write = coordinator?.write, let repo = taskRepo else { return }
-        let tasks = (try? repo.all()) ?? []
-        let templates = tasks.filter { $0.recurrence != nil && !$0.done }
+    ///
+    /// STAGE 2 (audit 2026-09-22 C21, "same id for same day"): every tail day
+    /// is minted with its deterministic id, insert-if-absent WITHOUT rule H's
+    /// retime (a stale top-up must never move a row another device's user
+    /// retimed), so two devices extending the same tail land on one row. The
+    /// run is serialised (one in flight, one trailing), its writes are awaited
+    /// inside it, and it only runs after a SUCCESSFUL cal_blocks read with
+    /// fewer rows than the cap, once per local day per user (and again on a
+    /// time-zone change) — RecurrenceTopUpGate. `pullFirst` runs a freshness
+    /// pull before judging (the day / time-zone observers); the hydrate hook
+    /// has just pulled. Each minted day is mirrored to Google once its insert
+    /// is confirmed (rule G; owner decision "every day, everywhere").
+    func topUpRecurrenceHorizon(pullFirst: Bool) async {
+        if topUpRunning {
+            topUpTrailing = (topUpTrailing ?? false) || pullFirst
+            await withCheckedContinuation { topUpWaiters.append($0) }
+            return
+        }
+        topUpRunning = true
+        var next: Bool? = pullFirst
+        while let pull = next {
+            topUpTrailing = nil
+            await performRecurrenceTopUp(pullFirst: pull)
+            next = topUpTrailing
+        }
+        topUpRunning = false
+        let waiters = topUpWaiters
+        topUpWaiters.removeAll()
+        for w in waiters { w.resume() }
+    }
+
+    private func performRecurrenceTopUp(pullFirst: Bool) async {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId, let repo = taskRepo else { return }
+        let log = Logger(subsystem: "io.unstucknow.app", category: "recurrence")
+        // A caller that pulls first needs ITS pull to have succeeded: the stamp
+        // it read before pulling must have moved (§3c). Else an earlier floor
+        // pull stood in for an observer pull that failed.
+        let pulledAfter: Int? = pullFirst ? ((await coord.lastCalBlocksPull())?.seq ?? 0) : nil
+        let pull = pullFirst ? await coord.pullForRecurrenceTopUp() : await coord.lastCalBlocksPull()
+        guard coord.auth.currentUserId == uid else { return }
+        let today = Clock.todayISO()
+        let zone = TimeZone.current.identifier
+        let verdict = topUpGate.verdict(pull: pull, userId: uid, today: today, timeZone: zone, pulledAfter: pulledAfter)
+        guard verdict == .run, let pull else {
+            if verdict == .truncated {
+                log.notice("horizon top-up skipped: the cal_blocks read hit the row cap")
+            }
+            return
+        }
+        topUpGate.recordRun(pull: pull, userId: uid, today: today, timeZone: zone)
+        let templates = ((try? repo.all()) ?? []).filter { $0.recurrence != nil && !$0.done }
         guard !templates.isEmpty else { return }
         // Grouped once: a per-template filter over every block was O(n·m).
         let byTask = Dictionary(grouping: (try? db?.fetchAllCalBlocks()) ?? []) { $0.taskId ?? "" }
-        let today = Clock.todayISO()
         let toAdd = templates.flatMap { recurrenceTopUp(task: $0, existingBlocks: byTask[$0.id] ?? [], todayIso: today) }
         guard !toAdd.isEmpty else { return }
-        let now = Self.isoNow()
-        Logger(subsystem: "io.unstucknow.app", category: "recurrence")
-            .notice("horizon top-up: \(toAdd.count, privacy: .public) occurrence(s) across \(templates.count, privacy: .public) task(s)")
-        Task { for b in toAdd { try? await write.upsertCalBlock(b, nowISO: now) } }
+        log.notice("horizon top-up: \(toAdd.count, privacy: .public) occurrence(s) across \(templates.count, privacy: .public) task(s)")
+        for b in toAdd {
+            guard coord.auth.currentUserId == uid else { return }
+            await saveBlockInserting(b, retimeIfTaken: false, unpark: false)
+        }
     }
 
     func deleteTask(_ id: String) {
@@ -2119,19 +2397,18 @@ final class AppModel {
         // (which 403 on insert). "primary" is Google's alias for the
         // main, always-writable calendar (Android pushBlockUpsert).
         let calId = "primary"
-        var next = block
         if let eventId = block.externalEventId {
             do {
                 try await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
                                               summary: block.taskName, start: range.start, end: range.end)
                 // A legacy row pushed before stamping: record the connection now.
                 if block.externalConnectionId == nil {
-                    next.externalConnectionId = conn.id
-                    try? await write.upsertCalBlock(next, nowISO: Self.isoNow())
+                    _ = try? await write.stampCalBlockMapping(id: block.id, eventId: eventId, connectionId: conn.id,
+                                                              nowISO: Self.isoNow())
                 }
                 return
             } catch CalendarSyncError.eventGone {
-                next.externalEventId = nil   // gone in Google → re-create below
+                // gone in Google → re-create below (the stamp replaces the stale id)
             } catch {
                 return   // offline / transient: the next save retries the PATCH
             }
@@ -2139,9 +2416,23 @@ final class AppModel {
         guard let newId = try? await calendar.insertEvent(
             connectionId: conn.id, calendarId: calId,
             summary: block.taskName, start: range.start, end: range.end) else { return }
-        next.externalEventId = newId
-        next.externalConnectionId = conn.id
-        try? await write.upsertCalBlock(next, nowISO: Self.isoNow())
+        // The new mapping goes onto the row as it is NOW, never onto the copy
+        // that was pushed (rule G; an edit made during the call survives).
+        switch (try? await write.stampCalBlockMapping(id: block.id, eventId: newId, connectionId: conn.id,
+                                                       nowISO: Self.isoNow())) ?? .gone {
+        case .stamped, .unchanged:
+            break
+        case .gone:
+            // Deleted while the event was being created: don't resurrect the
+            // row with a stamp, drop the new event.
+            try? await calendar.deleteEvent(eventId: newId, connectionId: conn.id, calendarId: calId)
+        case .insertUnresolved:
+            // Deleted and minted again (or retimed by a user's mint) during
+            // the call: this event belongs to no confirmed row. Drop it; the
+            // insert's outcome mirrors the row once confirmed (rule G).
+            try? await calendar.deleteEvent(eventId: newId, connectionId: conn.id, calendarId: calId)
+            _ = mirrorGate?.requestMirror(rowId: block.id)
+        }
     }
 
     /// Delete a block locally + on Google (if it was pushed). External g_
@@ -2209,30 +2500,21 @@ final class AppModel {
             let today = Clock.todayISO()
             let parts = iso.split(separator: "-").compactMap { Int($0) }
             let startDate = parts.count == 3 ? Time.civil(parts[0], parts[1], parts[2]) : Date()
-            let plan = regenerateForTask(task: task, recurrence: recurrence, existingBlocks: existing,
-                                         todayIso: today, startTime: startTime, startDate: startDate)
-            Task {
-                for id in plan.toDelete { try? await write.deleteCalBlock(id: id, nowISO: now) }
-                for b in plan.toUpsert { try? await write.upsertCalBlock(b, nowISO: now) }
-            }
+            let regen = regenerateForTask(task: task, recurrence: recurrence, existingBlocks: existing,
+                                          todayIso: today, startTime: startTime, startDate: startDate)
             // Guarantee the chosen slot is materialized (the horizon regen skips
-            // today / off-pattern picks), computed POST-plan by the pure helper:
-            // an open occurrence at another time (today's — regenerate never
-            // touches it) is moved, a skipped one is moved and un-skipped, and a
-            // done one leaves the day alone (audit 2026-09-22, C7).
-            switch recurrenceChosenDateAction(existing: existing, plan: plan, iso: iso, startTime: startTime) {
-            case .covered:
-                break
-            case .retime(let b):
-                var moved = b
-                moved.startTime = startTime
-                moved.skipped = false
-                saveBlock(moved)   // keeps its own length; PATCHes its Google event when pushed
-            case .mint:
-                // Clamped to the server's 5…1440 (audit 2026-09-22, C4) — also
-                // enforced in WriteThrough; here so the Google mirror matches.
-                saveBlock(CalBlock(id: newUUID(), taskId: task.id, taskName: task.name, startTime: startTime,
-                                   durationMinutes: clampDurationMin(task.estimateMin), date: iso, kind: .task))
+            // today / off-pattern picks), computed POST-plan and BEFORE any write
+            // is dispatched (§3b′): an open occurrence at another time (today's —
+            // regenerate never touches it) is moved, a skipped one is moved and
+            // un-skipped, a done one leaves the day alone (audit 2026-09-22, C7);
+            // an empty day gets its deterministic occurrence, or — when that id
+            // lives on elsewhere — a block of its own. The plan and the write
+            // are disjoint, so one Task writes them all.
+            let (plan, chosen) = recurrenceChosenDateWrite(task: task, existing: existing, plan: regen,
+                                                           iso: iso, startTime: startTime)
+            Task {
+                await self.applyRegenPlan(plan, unpark: false)
+                await self.writeChosenDay(chosen, task: task, iso: iso, startTime: startTime)
             }
             // Compared with the series' next occurrence: a template's earliest
             // block is weeks-old history, so every re-schedule — even a no-op —

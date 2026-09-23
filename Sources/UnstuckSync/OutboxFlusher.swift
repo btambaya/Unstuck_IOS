@@ -17,6 +17,12 @@
 //    stay held back behind it. Offline / timeout / 5xx / auth-refresh
 //    failures are TRANSIENT: they never count — the old cap counted plain
 //    airplane-mode failures and silently dropped valid writes after five.
+//  • the insert family (stage 2, deterministic occurrence ids): `insert` /
+//    `insert_or_retime` go out as INSERT … ON CONFLICT (id) DO NOTHING, an
+//    ignored `insert_or_retime` falls back to rule H's conditional retime,
+//    and every resolution is reported after markDone (`InsertResolution`),
+//    bracketed by rule G's `InsertMirrorGate`. Never coalesced, never sent
+//    as a plain upsert.
 
 import Foundation
 import Supabase
@@ -44,14 +50,30 @@ public actor OutboxFlusher {
     public typealias RPCRejectedHook = @Sendable (_ table: String, _ rowId: String, _ fn: String, _ error: Error) -> Void
     private var onRPCRejected: RPCRejectedHook?
 
-    public init(gateway: any SyncGatewayProtocol, db: AppDatabase) {
+    /// An insert-family op resolved (stage 2, deterministic-occurrence-ids.md
+    /// §3c): fired after `markDone`, once per op, on the flusher's executor —
+    /// keep it cheap and hop elsewhere for real work.
+    public typealias InsertResolvedHook = @Sendable (InsertResolution) -> Void
+    private var onInsertResolved: InsertResolvedHook?
+
+    /// Rule G's gate. The flusher brackets every insert-family send with
+    /// `begin` / `resolve`, so a Google push can never slip between the op
+    /// leaving the outbox and its outcome being known.
+    public nonisolated let mirrorGate: InsertMirrorGate
+
+    public init(gateway: any SyncGatewayProtocol, db: AppDatabase, mirrorGate: InsertMirrorGate? = nil) {
         self.gateway = gateway
         self.box = OutboxStore(db)
         self.db = db
+        self.mirrorGate = mirrorGate ?? InsertMirrorGate(db: db)
     }
 
     public func setOnRPCRejected(_ hook: RPCRejectedHook?) {
         onRPCRejected = hook
+    }
+
+    public func setOnInsertResolved(_ hook: InsertResolvedHook?) {
+        onInsertResolved = hook
     }
 
     /// The FK-parent table a child table's `dependsOn` rowId lives in:
@@ -134,11 +156,15 @@ public actor OutboxFlusher {
                 guard let seq = op.opSeq else { continue }
                 let rowKey = "\(op.tableName):\(op.rowId)"
                 if blockedRows.contains(rowKey) { continue }
+                let inserting = op.kind.isInsertFamily
+                if inserting { mirrorGate.begin(rowId: op.rowId) }
                 do {
-                    try await apply(op, userId: userId)
+                    let resolved = try await apply(op, userId: userId)
                     try box.markDone(seq)
                     progressed = true
+                    if inserting { finishInsert(op, outcome: resolved?.outcome ?? .ignored, serverRow: resolved?.serverRow) }
                 } catch let bad as MalformedOpError {
+                    if inserting { mirrorGate.abandon(rowId: op.rowId) }
                     // Structurally-invalid op (nil payload / unknown table): it
                     // can never become a request, so dead-letter it — keep the
                     // outbox row (the user's local row is untouched and stays on
@@ -149,6 +175,7 @@ public actor OutboxFlusher {
                     malformed.insert(seq)
                     blockedRows.insert(rowKey)
                 } catch {
+                    if inserting { mirrorGate.abandon(rowId: op.rowId) }
                     switch SyncDecision.classifyFlushFailure(error) {
                     case .cancelled:
                         // Sign-out timeout / BG-task stop / URLSession cancelled —
@@ -202,17 +229,35 @@ public actor OutboxFlusher {
         let reason: Reason
     }
 
-    private func apply(_ op: OutboxOp, userId: String) async throws {
+    /// After an insert-family op is markDone'd: a `retimed` row is written
+    /// into the local store the way a realtime echo would be (so the copy
+    /// carries the server's Google mapping before anything mirrors it), THEN
+    /// rule G's gate resolves, THEN the app hears about it. The local write
+    /// comes before the gate opens so a push can never read the pre-retime row.
+    private func finishInsert(_ op: OutboxOp, outcome: InsertOutcome, serverRow: Data?) {
+        if outcome == .retimed, op.tableName == "cal_blocks", let serverRow {
+            RealtimeMirror.applyResolvedCalBlock(serverRow, db: db)
+        }
+        let mirror = mirrorGate.resolve(rowId: op.rowId, outcome: outcome)
+        onInsertResolved?(InsertResolution(table: op.tableName, rowId: op.rowId, outcome: outcome,
+                                           serverRow: serverRow, mirrorWanted: mirror))
+    }
+
+    /// Sends one op. Returns the outcome for an insert-family op, nil otherwise.
+    private func apply(_ op: OutboxOp, userId: String) async throws -> (outcome: InsertOutcome, serverRow: Data?)? {
         if op.kind == .delete {
             try await gateway.delete(table: op.tableName, id: op.rowId)
-            return
+            return nil
         }
         if op.kind == .rpc {
             guard let rpc = OutboxRPCPayload.decode(op.payload) else {
                 throw MalformedOpError(reason: .missingPayload)
             }
             try await gateway.rpc(fn: rpc.fn, paramsJSON: rpc.paramsJSON)
-            return
+            return nil
+        }
+        if op.kind.isInsertFamily {
+            return try await applyInsert(op, userId: userId)
         }
         // A nil/empty upsert payload can never be sent. Surface it so the drain
         // quarantines the op instead of silently markDone'ing (= dropping the
@@ -237,6 +282,49 @@ public actor OutboxFlusher {
         // `default: break` (which fell through to markDone, dropping the row).
         default: throw MalformedOpError(reason: .unknownTable(op.tableName))
         }
+        return nil
+    }
+
+    /// An insert-family op (stage 2): insert-if-absent, and for
+    /// `insert_or_retime` whose insert the server ignored, rule H's
+    /// conditional retime with the op's own date, start and duration. A
+    /// top-up's plain `insert` never retimes: a stale top-up must not move a
+    /// row another device's user retimed. Only occurrences mint, so only
+    /// `cal_blocks` routes; anything else is malformed (never a plain upsert).
+    private func applyInsert(_ op: OutboxOp, userId: String) async throws -> (outcome: InsertOutcome, serverRow: Data?) {
+        guard op.tableName == "cal_blocks" else { throw MalformedOpError(reason: .unknownTable(op.tableName)) }
+        guard let data = op.payload?.data(using: .utf8) else { throw MalformedOpError(reason: .missingPayload) }
+        let row = try decoder.decode(CalBlockRow.self, from: data)
+        if try await gateway.insertIfAbsent(row, table: op.tableName, userId: userId) {
+            return (.inserted, nil)
+        }
+        guard op.kind == .insertOrRetime else { return (.ignored, nil) }
+        if let server = try await gateway.retimeIfOpen(table: op.tableName, id: row.id, date: row.date,
+                                                       startTime: row.startTime, durationMinutes: row.durationMinutes) {
+            return (.retimed, server)
+        }
+        return (.ignored, nil)
+    }
+}
+
+/// One insert-family op's resolution, as the flusher reports it after
+/// `markDone` (deterministic-occurrence-ids.md §3c `onInsertResolved`).
+public struct InsertResolution: Sendable, Equatable {
+    public let table: String
+    public let rowId: String
+    public let outcome: InsertOutcome
+    /// The server row a `retimed` outcome changed (already written locally).
+    public let serverRow: Data?
+    /// Rule G: a Google push was deferred while this insert was unresolved and
+    /// the outcome confirms it — mirror the row once now, from the fresh local row.
+    public let mirrorWanted: Bool
+
+    public init(table: String, rowId: String, outcome: InsertOutcome, serverRow: Data?, mirrorWanted: Bool) {
+        self.table = table
+        self.rowId = rowId
+        self.outcome = outcome
+        self.serverRow = serverRow
+        self.mirrorWanted = mirrorWanted
     }
 }
 

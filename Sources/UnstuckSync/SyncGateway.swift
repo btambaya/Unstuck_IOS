@@ -18,6 +18,32 @@ public protocol SyncGatewayProtocol: Sendable {
     /// Call a Postgres function with a JSON-object parameter string (an
     /// `OutboxKind.rpc` op — a shared collection's atomic item mutation).
     func rpc(fn: String, paramsJSON: String) async throws
+    /// Insert-if-absent (an `OutboxKind.insert` / `.insertOrRetime` op):
+    /// `INSERT … ON CONFLICT (id) DO NOTHING`. True = the server inserted the
+    /// row; false = it already had that id and left it untouched (another
+    /// device minted the same day, or a retry after a lost ack).
+    func insertIfAbsent<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws -> Bool
+    /// Rule H's conditional retime: move ONLY an open occurrence on `date` to
+    /// `startTime` / `durationMinutes`, nothing else. The server row (JSON) it
+    /// changed, or nil when no row matched (moved, done, skipped or gone).
+    func retimeIfOpen(table: String, id: String, date: String, startTime: String, durationMinutes: Int) async throws -> Data?
+}
+
+/// What an insert-family op did on the server (deterministic-occurrence-ids.md
+/// §3). `inserted` and `retimed` are CONFIRMED: only those may be mirrored to
+/// Google (rule G).
+public enum InsertOutcome: String, Sendable, Equatable {
+    case inserted, retimed, ignored
+    public var isConfirmed: Bool { self != .ignored }
+}
+
+/// A gateway that doesn't do insert-if-absent (test fakes that predate stage
+/// 2). A definite rejection, never a retry loop — and never a fallback to a
+/// plain upsert: that would overwrite another device's row (hazard c).
+public struct InsertUnsupportedError: Error, ServerRejectionClassifiable, Sendable {
+    public let table: String
+    public var isServerRejection: Bool { true }
+    public init(table: String) { self.table = table }
 }
 
 /// A gateway that doesn't do RPCs (test fakes that predate them): the op is a
@@ -30,6 +56,15 @@ public struct RPCUnsupportedError: Error, ServerRejectionClassifiable, Sendable 
 
 public extension SyncGatewayProtocol {
     func rpc(fn: String, paramsJSON: String) async throws { throw RPCUnsupportedError(fn: fn) }
+    /// THROWS — a protocol extension cannot reach a client, and a default that
+    /// upserted instead would reopen hazard c for any gateway that forgot to
+    /// override it.
+    func insertIfAbsent<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws -> Bool {
+        throw InsertUnsupportedError(table: table)
+    }
+    func retimeIfOpen(table: String, id: String, date: String, startTime: String, durationMinutes: Int) async throws -> Data? {
+        throw InsertUnsupportedError(table: table)
+    }
 }
 
 /// The server answered HTTP 200 with the JSON literal `false`: the shared-list
@@ -153,6 +188,39 @@ public struct SyncGateway: Sendable, SyncGatewayProtocol, SyncReadGatewayProtoco
 
     public func delete(table: String, id: String) async throws {
         _ = try await client.from(table).delete().eq("id", value: id).execute()
+    }
+
+    /// `POST /<table>?on_conflict=id&select=id` with
+    /// `Prefer: resolution=ignore-duplicates,return=representation` — i.e.
+    /// `INSERT … ON CONFLICT (id) DO NOTHING RETURNING id`, which returns only
+    /// the rows it inserted: one row = inserted, `[]` = the id was taken.
+    /// Shapes verified live on 2026-09-23 (audit/parity-2026-09-23,
+    /// stage2-check.mjs); the request itself is pinned by
+    /// `testGatewayInsertIfAbsentRequestShape`.
+    public func insertIfAbsent<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws -> Bool {
+        let rows: [AnyJSON] = try await client.from(table)
+            .upsert(Self.withUserId(row, userId: userId), onConflict: "id", returning: .representation, ignoreDuplicates: true)
+            .select("id")
+            .execute().value
+        return !rows.isEmpty
+    }
+
+    /// `PATCH /<table>?id=eq.X&date=eq.D&done=is.false&skipped=is.false` with
+    /// `Prefer: return=representation` and a body of ONLY `start_time` +
+    /// `duration_minutes`: it never touches the Google mapping, the name, the
+    /// done state or the date (rule H).
+    public func retimeIfOpen(table: String, id: String, date: String, startTime: String,
+                             durationMinutes: Int) async throws -> Data? {
+        let body: [String: AnyJSON] = ["start_time": .string(startTime), "duration_minutes": .integer(durationMinutes)]
+        let rows: [AnyJSON] = try await client.from(table)
+            .update(body, returning: .representation)
+            .eq("id", value: id)
+            .eq("date", value: date)
+            .is("done", value: false)
+            .is("skipped", value: false)
+            .execute().value
+        guard let first = rows.first else { return nil }
+        return try JSONEncoder().encode(first)
     }
 
     /// Throws `RPCRefusedError` when the function returned `false` (see the
