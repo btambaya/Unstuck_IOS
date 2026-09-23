@@ -205,7 +205,12 @@ enum BargeInCommand: Equatable, Sendable {
     /// `.flushPlayback`: which item, and how much of it was heard, is read
     /// from the audio engine's playhead at execution, and the flush resets it
     /// (`AudioTruncation.plan` decides the ms, or skips). Ahmad 2026-09-23.
-    case truncatePlayback
+    /// `generating`: the cut reply is still generating and its audio was on
+    /// air — queued, or drained for a moment between bursts. The server's
+    /// copy then runs past what reached the phone (audio in flight, the
+    /// transcript ahead of it), so it is truncated even when everything that
+    /// arrived was heard.
+    case truncatePlayback(generating: Bool)
     /// Hold-to-talk release: `input_audio_buffer.commit` + `response.create`.
     case commitAndRespond
     /// Arm a timer: deliver `.tick` after this many ms (the energy confirm,
@@ -950,6 +955,14 @@ struct BargeInController: Sendable {
     /// keeps the NEXT reply at unity.
     private mutating func cancel(now: TimeInterval, hard: Bool = false) -> [BargeInCommand] {
         var out: [BargeInCommand] = []
+        // The reply being cut is still generating and its audio was on air:
+        // queued now, or drained a moment ago between bursts (the queue runs
+        // dry mid-reply — device log 2026-09-17, 14:21:09). Not one already
+        // cut (its truncate went out then), and never a reply that is only
+        // thinking — that one never played.
+        let lastOnAir = playbackQueued ? playingResponseId : lastDrained?.id
+        let generating = responseActive && activeResponseId != nil
+            && activeResponseId != cancelledResponseId && lastOnAir == activeResponseId
         if responseActive {
             cancelledResponseId = activeResponseId
             out.append(.sendCancel)
@@ -962,10 +975,12 @@ struct BargeInController: Sendable {
         // of the reply must end where they stopped hearing it — or the model
         // carries on as if it had said all of it (Zubair's "Carry on",
         // 2026-09-23: the reply had finished GENERATING, so the cancel found
-        // nothing, and the unheard half stayed in the conversation). Nothing
-        // on air (a reply still thinking, or one that drained) → nothing to
-        // truncate.
-        if playbackQueued { out.append(.truncatePlayback) }
+        // nothing, and the unheard half stayed in the conversation). A reply
+        // still generating that drained between bursts was heard to the end
+        // of what ARRIVED, but the server's copy runs on past it — truncated
+        // too. Nothing on air (a reply still thinking, or a finished one that
+        // drained) → nothing to truncate.
+        if playbackQueued || generating { out.append(.truncatePlayback(generating: generating)) }
         out.append(.flushPlayback)
         if playbackQueued {
             // The last of the flushed audio is already in the room and comes
@@ -997,6 +1012,9 @@ struct PlaybackPosition: Equatable, Sendable {
     var playedFrames: Int
     /// Frames of this item received and scheduled.
     var receivedFrames: Int
+    /// Audio of a LATER item is already queued behind this one: this item
+    /// is not the one still generating.
+    var laterItemQueued = false
 }
 
 /// `conversation.item.truncate` for a reply cut while on air (Ahmad
@@ -1015,13 +1033,18 @@ struct AudioTruncation: Equatable, Sendable {
 
     /// nil = send nothing: no item id to name; nothing of it heard yet (cut
     /// in its first millisecond); or it was heard to the end of what arrived
-    /// (the cut fell in audio queued behind it — a later reply's). The ms are
-    /// rounded DOWN and never pass what was received: the server refuses an
-    /// `audio_end_ms` beyond the item's audio.
-    static func plan(_ position: PlaybackPosition?) -> AudioTruncation? {
+    /// (the cut fell in audio queued behind it — a later reply's) and the
+    /// reply is not still generating. Still `generating` and nothing of a
+    /// later item behind it, the server's copy runs past what arrived (audio
+    /// in flight, the transcript ahead of it): heard to the end of what
+    /// arrived is truncated there — as OpenAI's own realtime client does
+    /// while a response is ongoing. The ms are rounded DOWN and never pass
+    /// what was received: the server refuses an `audio_end_ms` beyond the
+    /// item's audio.
+    static func plan(_ position: PlaybackPosition?, generating: Bool = false) -> AudioTruncation? {
         guard let p = position, let itemId = p.itemId, !itemId.isEmpty else { return nil }
         let heard = min(max(0, p.playedFrames), p.receivedFrames)
-        guard heard < p.receivedFrames else { return nil }
+        guard heard < p.receivedFrames || (generating && !p.laterItemQueued) else { return nil }
         let ms = heard * 1000 / sampleRate
         guard ms > 0 else { return nil }
         return AudioTruncation(itemId: itemId, audioEndMs: ms)

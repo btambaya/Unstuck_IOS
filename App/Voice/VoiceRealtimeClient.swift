@@ -608,13 +608,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .restore: audio.setPlaybackGain(1)
             case .flushPlayback: audio.flushPlayback()
             case .sendCancel: send(["type": "response.cancel"])
-            case .truncatePlayback:
+            case .truncatePlayback(let generating):
                 // Read the playhead NOW — the .flushPlayback after this resets
                 // it. Which item and how much of it: the engine's; whether to
                 // send and the ms: AudioTruncation (Ahmad 2026-09-23).
                 let heard = audio.playbackPosition()
-                guard let cut = AudioTruncation.plan(heard) else {
-                    voiceLog.notice("voice truncate skipped (heard \(heard?.playedFrames ?? -1, privacy: .public) of \(heard?.receivedFrames ?? -1, privacy: .public) frames)")
+                guard let cut = AudioTruncation.plan(heard, generating: generating) else {
+                    voiceLog.notice("voice truncate skipped (heard \(heard?.playedFrames ?? -1, privacy: .public) of \(heard?.receivedFrames ?? -1, privacy: .public) frames, generating=\(generating, privacy: .public))")
                     break
                 }
                 let n: Int = withLock { _truncates += 1; return _truncates }

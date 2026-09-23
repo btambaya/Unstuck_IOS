@@ -741,6 +741,37 @@ final class VoiceTruncateTests: XCTestCase {
         XCTAssertEqual(wire.truncates.count, 0, "nothing of it was heard")
     }
 
+    func testAReplyStillGeneratingIsTruncatedAtWhatArrived_evenWhenAllOfThatWasHeard() {
+        // Review, 2026-09-23: the server's copy of a reply still generating
+        // runs past what reached the phone. Heard to the end of what arrived
+        // is not heard to its end.
+        let io = ScriptedPlayheadAudioIO(), wire = Wire()
+        let c = client(io, wire)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(words("r1", "Here's your week. Monday you have the dentist, then"))
+        c.handle(audio("r1", "item_A", frames: 24_000))
+        io.playhead = 30_000   // the 1 s that arrived was heard; the rest is on its way
+        c.handle(speechStarted("item_u"))
+        c.handle(hearing("item_u", "Wait, what about Friday"))
+        XCTAssertTrue(wire.types.contains("response.cancel"))
+        XCTAssertEqual(wire.truncates.count, 1)
+        XCTAssertEqual(wire.truncates.first?["item_id"] as? String, "item_A")
+        XCTAssertEqual(wire.truncates.first?["audio_end_ms"] as? Int, 1000, "what arrived and was heard — never past it")
+    }
+
+    func testAFinishedReplyHeardToItsEndIsNotTruncated() {
+        let io = ScriptedPlayheadAudioIO(), wire = Wire()
+        let c = client(io, wire)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(words("r1", "Here is the plan for today."))
+        c.handle(audio("r1", "item_A", frames: 24_000))
+        c.handle(json(["type": "response.done", "response": ["id": "r1", "status": "completed"]]))
+        io.playhead = 30_000   // heard whole; its drain not reported yet
+        c.handle(speechStarted("item_u"))
+        c.handle(hearing("item_u", "Wait, what about Friday"))
+        XCTAssertEqual(wire.truncates.count, 0, "nothing of it was unheard")
+    }
+
     func testARefusedTruncateIsNotASessionError() {
         let wire = Wire()
         let c = client(ScriptedPlayheadAudioIO(), wire)

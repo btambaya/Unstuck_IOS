@@ -297,7 +297,9 @@ final class VoiceAudioEngine: VoiceAudioIO, @unchecked Sendable {
         playGeneration += 1
         let dropped = outstanding
         outstanding = 0
-        ledger.reset()                 // player.stop() below restarts its timeline
+        // player.stop() below restarts its timeline. A reply still streaming
+        // plays on afterwards; the ledger keeps where its item had got to.
+        ledger.reset()
         recalibratePending = true      // the route, and its noise floor, may have changed
         if allowed { configurationRestarts += 1 }
         lock.unlock()
@@ -605,17 +607,30 @@ struct EngineRestartPolicy: Sendable {
 struct PlaybackLedger: Sendable {
     private struct Span: Sendable {
         let itemId: String
+        /// Where it starts on the player's timeline.
         let start: Int
-        let frames: Int
+        var frames: Int
+        /// Frames of the item received before this span: where the span sits
+        /// in the ITEM's audio, which is what `audio_end_ms` counts. Carried
+        /// per span, so forgetting an older span, or a timeline restart
+        /// mid-reply, never shifts it.
+        let offset: Int
     }
     private var spans: [Span] = []
+    /// Frames received per item, oldest first, the last `itemHistory` items.
+    /// Kept across a timeline restart: a reply still streaming after a route
+    /// change restarted the engine (its queued audio dropped) goes on from
+    /// where its audio had got to, not from 0.
+    private var received: [(itemId: String, frames: Int)] = []
     /// Where the last scheduled buffer ends: the next one plays right after
     /// it, or at the playhead when the queue has run dry.
     private(set) var end = 0
     private var lastPlayhead = 0
     /// Spans are kept for the last few items only (the one being heard is
     /// always among them), and never more than `maxSpans` — a reply is
-    /// bounded, a session is not.
+    /// bounded, a session is not. Back-to-back buffers of one item share a
+    /// span, so a reply is a span per burst (the queue running dry), not one
+    /// per delta: the cap is a memory bound that a reply never reaches.
     static let itemHistory = 3
     static let maxSpans = 4096
 
@@ -635,12 +650,30 @@ struct PlaybackLedger: Sendable {
         // No item id, nothing a truncate could name: the timeline moves on,
         // nothing is recorded.
         guard let itemId else { return }
-        if spans.last?.itemId != itemId { forgetOldItems() }
-        spans.append(Span(itemId: itemId, start: start, frames: frames))
+        let before: Int
+        if let i = received.lastIndex(where: { $0.itemId == itemId }) {
+            before = received[i].frames
+            received[i].frames += frames
+        } else {
+            before = 0
+            received.append((itemId, frames))
+            if received.count > Self.itemHistory {
+                received.removeFirst(received.count - Self.itemHistory)
+                let kept = Set(received.map(\.itemId))
+                spans.removeAll { !kept.contains($0.itemId) }
+            }
+        }
+        if let last = spans.last, last.itemId == itemId,
+           last.start + last.frames == start, last.offset + last.frames == before {
+            spans[spans.count - 1].frames += frames
+            return
+        }
+        spans.append(Span(itemId: itemId, start: start, frames: frames, offset: before))
         if spans.count > Self.maxSpans { spans.removeFirst(spans.count - Self.maxSpans) }
     }
 
-    /// The player was stopped: its timeline starts again at 0.
+    /// The player was stopped: its timeline starts again at 0. What each
+    /// item has received so far is kept (see `received`).
     mutating func reset() {
         spans.removeAll()
         end = 0
@@ -649,25 +682,15 @@ struct PlaybackLedger: Sendable {
 
     /// At `playhead`: the item of the last span that had started by then
     /// (the one on air, or in a gap between bursts the one heard last), with
-    /// the frames of it played out so far and received in all. nil when
-    /// nothing had started.
+    /// the frames of it played out so far and received in all, and whether a
+    /// later item's audio is queued behind it. nil when nothing had started.
     func position(at playhead: Int) -> PlaybackPosition? {
-        guard let current = spans.last(where: { $0.start <= playhead }) else { return nil }
-        var played = 0, received = 0
-        for s in spans where s.itemId == current.itemId {
-            received += s.frames
-            played += min(s.frames, max(0, playhead - s.start))
-        }
-        return PlaybackPosition(itemId: current.itemId, playedFrames: played, receivedFrames: received)
-    }
-
-    /// A new item starts: keep the spans of the last `itemHistory - 1` items.
-    private mutating func forgetOldItems() {
-        var recent: [String] = []
-        for s in spans.reversed() where !recent.contains(s.itemId) {
-            recent.append(s.itemId)
-            if recent.count >= Self.itemHistory - 1 { break }
-        }
-        spans.removeAll { !recent.contains($0.itemId) }
+        guard let i = spans.lastIndex(where: { $0.start <= playhead }) else { return nil }
+        let s = spans[i]
+        // The item's earlier spans all ended before this one began: played.
+        let played = s.offset + min(s.frames, max(0, playhead - s.start))
+        let total = received.last(where: { $0.itemId == s.itemId })?.frames ?? (s.offset + s.frames)
+        let later = spans[(i + 1)...].contains { $0.itemId != s.itemId }
+        return PlaybackPosition(itemId: s.itemId, playedFrames: played, receivedFrames: total, laterItemQueued: later)
     }
 }
