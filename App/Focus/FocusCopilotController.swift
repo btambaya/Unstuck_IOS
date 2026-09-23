@@ -47,8 +47,16 @@ import UnstuckCore
 protocol CopilotSpeaker: AnyObject {
     /// True if speaking is possible right now (a voice exists / not muted).
     var canSpeak: Bool { get }
-    func speak(_ text: String) throws
+    /// `onFinish` fires once, on the main actor, when the line has been
+    /// spoken or was cut short (`stop()`, a newer line). A throw means it
+    /// never will.
+    func speak(_ text: String, onFinish: @escaping @MainActor () -> Void) throws
     func stop()
+}
+
+extension CopilotSpeaker {
+    /// Speak with nothing waiting on the end of the line.
+    func speak(_ text: String) throws { try speak(text, onFinish: {}) }
 }
 
 /// A short on-device speech-to-text window. `start` opens the mic, streams a
@@ -118,6 +126,9 @@ final class FocusCopilotController {
     /// Guards re-entrancy: while a prompt's speak+listen cycle is in flight we
     /// don't fire another milestone (so a burst of ticks can't stack prompts).
     @ObservationIgnored private var busy = false
+    /// Bumped by every prompt and every halt: a line that finishes speaking
+    /// after a pause / end, or after a newer prompt, opens no mic.
+    @ObservationIgnored private var promptSeq = 0
 
     init(
         speaker: CopilotSpeaker,
@@ -176,6 +187,7 @@ final class FocusCopilotController {
     /// the timer.
     private func haltSpeechAndMic() {
         busy = false
+        promptSeq += 1
         if listening { listening = false }
         if capturing { capturing = false }
         safe { speaker.stop() }
@@ -276,13 +288,27 @@ final class FocusCopilotController {
     private func deliver(_ milestone: FocusMilestone, line: String) {
         busy = true
         lastSpokenLine = line
+        promptSeq += 1
+        let prompt = promptSeq
 
-        // Speak (fail-safe). If TTS is unavailable, we still proceed to the
+        // Speak (fail-safe), and go on once the line has been HEARD. Opening
+        // the mic straight after queueing it switched the session to
+        // record-only a few ms in: the question was cut off or never heard,
+        // and the listen window opened for a question nobody heard (audit
+        // 2026-09-22, C41). If TTS is unavailable, we still proceed to the
         // listening window for question milestones (the user may have read the
         // visual overrun buttons); a fully-silent path just ends cleanly.
         duck()
-        let spoke = safe { try speaker.speak(line) } != nil ? true : false
-        _ = spoke   // (kept for clarity; speaking is best-effort)
+        let spoke = safe {
+            try speaker.speak(line) { [weak self] in self?.promptSpoken(milestone, prompt: prompt) }
+        } != nil
+        if !spoke { promptSpoken(milestone, prompt: prompt) }
+    }
+
+    /// The prompt's line has been spoken (or couldn't be): listen for the
+    /// answer, or finish. Not if the session was paused / ended meanwhile.
+    private func promptSpoken(_ milestone: FocusMilestone, prompt: Int) {
+        guard prompt == promptSeq, busy else { return }
 
         // Speak-only milestone, or Voice replies off, or recognizer unavailable
         // → no mic. Restore audio and finish.

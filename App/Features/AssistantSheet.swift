@@ -126,6 +126,12 @@ struct AssistantSheet: View {
         .onChange(of: assistant.lastReplyTick) { _, _ in
             if speakReplies, let r = assistant.lastReply { voice.speak(r) }
         }
+        // Talk opens over this sheet: a reply still being read aloud would
+        // talk over the realtime voice (VoiceController itself stays silent
+        // once Talk holds the audio — audit 2026-09-22, C41).
+        .onChange(of: showVoice) { _, talking in
+            if talking { voice.stopSpeaking() }
+        }
         // On-device dictation streams into the input field via the model bridge.
         .onChange(of: assistant.voiceDraft) { _, v in if assistant.dictating || !v.isEmpty { input = v } }
         .onDisappear {
