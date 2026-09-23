@@ -6,7 +6,8 @@
 // the destructive disconnect (which purges the connection row + its external
 // blocks locally so the bar flips back to "Connect" immediately — the Android
 // SyncCoordinator.disconnectCalendar behavior, replicated here since the iOS
-// coordinator exposes no equivalent and this extension may only add methods).
+// coordinator exposes no equivalent and this extension may only add methods;
+// unlike Android, only once the server has confirmed the revoke — C26).
 
 import Foundation
 import UnstuckCore

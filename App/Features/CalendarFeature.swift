@@ -304,7 +304,7 @@ private struct CalendarSyncBar: View {
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 14) {
                 Button { reconnecting = true; showDisclosure = true } label: {
-                    Text(busy ? "Connecting…" : "Reconnect")
+                    Text(busy && !disconnecting ? "Connecting…" : "Reconnect")
                         .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 14).padding(.vertical, 7)
                         .background(theme.palette.ink, in: Capsule())
