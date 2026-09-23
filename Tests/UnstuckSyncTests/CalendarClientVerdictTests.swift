@@ -259,6 +259,51 @@ final class CalendarClientVerdictTests: XCTestCase {
         XCTAssertEqual(items.first { $0.name == "to" }?.value, "2026-10-23T00:00:00Z")
     }
 
+    // MARK: - the INSERT's asked-for id
+
+    /// The id the app keeps for an INSERT reaches the server as `eventId`
+    /// (index.ts passes it to Google and answers the duplicate-id 409 with
+    /// it); none is sent when there is none (audit 2026-09-22, C24).
+    func testAnInsertSendsTheIdItAsksFor() async throws {
+        CalendarStubProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [CalendarStubProtocol.self]
+        let client = SupabaseClient(
+            supabaseURL: URL(string: "https://stub.invalid")!, supabaseKey: "anon",
+            options: .init(auth: .init(storage: StubAuthStorage(), autoRefreshToken: false),
+                           global: .init(session: URLSession(configuration: config))))
+        let calendar = CalendarClient(client)
+
+        let id = try await calendar.insertEvent(connectionId: "c1", calendarId: "primary", summary: "Dentist",
+                                                start: "2026-09-24T10:00:00Z", end: "2026-09-24T10:30:00Z",
+                                                eventId: "0a1b2c3d4e5f")
+        XCTAssertEqual(id, "evt-server")
+        _ = try await calendar.insertEvent(connectionId: "c1", calendarId: "primary", summary: "Dentist",
+                                           start: "2026-09-24T10:00:00Z", end: "2026-09-24T10:30:00Z")
+        let bodies = try CalendarStubProtocol.recorded().map { r -> [String: Any] in
+            XCTAssertEqual(r.httpMethod, "POST")
+            let data = try XCTUnwrap(r.httpBody ?? r.httpBodyStream.map(Self.drain))
+            return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+        XCTAssertEqual(bodies.count, 2)
+        XCTAssertEqual(bodies[0]["eventId"] as? String, "0a1b2c3d4e5f")
+        XCTAssertEqual(bodies[0]["summary"] as? String, "Dentist")
+        XCTAssertNil(bodies[1]["eventId"], "no id asked for: Google mints one")
+    }
+
+    private static func drain(_ stream: InputStream) -> Data {
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable {
+            let n = stream.read(&buffer, maxLength: buffer.count)
+            guard n > 0 else { break }
+            data.append(buffer, count: n)
+        }
+        return data
+    }
+
     // MARK: - wake-window sample
 
     func testWakeWindowSampleUsesTheLocalDayAndServerWeekdayConvention() {
@@ -279,7 +324,8 @@ final class CalendarClientVerdictTests: XCTestCase {
     }
 }
 
-/// Answers the calendar-sync GETs from fixtures and records every request.
+/// Answers the calendar-sync GETs (and an INSERT) from fixtures and records
+/// every request.
 private final class CalendarStubProtocol: URLProtocol, @unchecked Sendable {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var requests: [URLRequest] = []
@@ -295,7 +341,7 @@ private final class CalendarStubProtocol: URLProtocol, @unchecked Sendable {
         let path = request.url?.path ?? ""
         let body = path.hasSuffix("/calendar-sync/connections")
             ? CalendarClientVerdictTests.serverConnectionsJSON
-            : #"{"events":[],"failures":[]}"#
+            : request.httpMethod == "POST" ? #"{"id":"evt-server"}"# : #"{"events":[],"failures":[]}"#
         let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1",
                                        headerFields: ["Content-Type": "application/json"])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)

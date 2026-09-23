@@ -326,7 +326,7 @@ private struct CalendarSyncBar: View {
         HStack(spacing: 8) {
             if vm.connections.isEmpty {
                 Button { reconnecting = false; showDisclosure = true } label: {
-                    Text(busy ? "Connecting…" : "＋ Connect Google Calendar")
+                    Text(GoogleConnectCopy.connectPill(busy: busy, disconnecting: disconnecting))
                         .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
                         .padding(.horizontal, 12).padding(.vertical, 8)
                         .background(theme.palette.bg2, in: Capsule())

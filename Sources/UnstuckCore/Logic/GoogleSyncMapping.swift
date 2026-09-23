@@ -124,8 +124,9 @@ public struct CalendarPullPlan: Equatable, Sendable {
 /// - skip events the app itself pushed (a task block's externalEventId) —
 ///   the originating task block already represents them, otherwise a
 ///   duplicate g_ block sits next to it (and double-counts in findFreeSlots).
-///   `pendingDeleteEventIds` are ours too: events whose block is gone but
-///   whose Google delete has not gone through yet (GoogleWriteBacklog) —
+///   `unconfirmedEventIds` are ours too (GoogleWriteBacklog): events whose
+///   block is gone but whose Google delete has not gone through yet, and
+///   events an INSERT may have created whose answer never came back —
 ///   imported, they came back as undeletable "meetings" (audit 2026-09-22,
 ///   C24);
 /// - skip all-day events — the server flags them `allDay: true`
@@ -152,13 +153,13 @@ public struct CalendarPullPlan: Equatable, Sendable {
 public func reconcileCalendarPull(
     events: [ExternalEvent], localBlocks: [CalBlock], fromYmd: String, toYmd: String,
     allDayEventIds: Set<String> = [], failedConnectionIds: Set<String> = [],
-    pendingDeleteEventIds: Set<String> = [], liveConnectionIds: Set<String>? = nil
+    unconfirmedEventIds: Set<String> = [], liveConnectionIds: Set<String>? = nil
 ) -> CalendarPullPlan {
     let ownEventIds = Set(localBlocks
         .filter { blockKind($0) == .task }
         .compactMap { $0.externalEventId }
         .filter { !$0.isEmpty })
-        .union(pendingDeleteEventIds)
+        .union(unconfirmedEventIds)
     var seen = Set<String>()
     let toUpsert = events
         .filter { !ownEventIds.contains($0.id) }

@@ -224,12 +224,17 @@ public struct CalendarClient: Sendable {
     }
 
     public struct InsertResponse: Decodable, Sendable { public let id: String }
-    public func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String) async throws -> String {
-        struct Body: Encodable { let connectionId, calendarId, summary, start, end: String }
+    /// `eventId` (base32hex) asks Google for that id: the server answers
+    /// Google's duplicate-id 409 with it, so a retry of an INSERT whose answer
+    /// was lost finds the first attempt's event instead of making a second.
+    /// nil = Google mints one.
+    public func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String,
+                            eventId: String? = nil) async throws -> String {
+        struct Body: Encodable { let connectionId, calendarId, summary, start, end: String; let eventId: String? }
         do {
             let r: InsertResponse = try await client.functions.invoke(
                 "calendar-sync/events",
-                options: FunctionInvokeOptions(method: .post, body: Body(connectionId: connectionId, calendarId: calendarId, summary: summary, start: start, end: end)))
+                options: FunctionInvokeOptions(method: .post, body: Body(connectionId: connectionId, calendarId: calendarId, summary: summary, start: start, end: end, eventId: eventId)))
             return r.id
         } catch {
             throw Self.classify(error) ?? error
@@ -289,7 +294,8 @@ public struct CalendarClient: Sendable {
 /// `CalendarClient` in production; a test double drives those paths without
 /// a server (audit 2026-09-22, C24 / C26).
 public protocol GoogleEventCalls: Sendable {
-    func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String) async throws -> String
+    func insertEvent(connectionId: String, calendarId: String, summary: String, start: String, end: String,
+                     eventId: String?) async throws -> String
     func patchEvent(eventId: String, connectionId: String, calendarId: String, summary: String?, start: String?, end: String?) async throws
     func deleteEvent(eventId: String, connectionId: String, calendarId: String) async throws
     func disconnect(connectionId: String) async throws

@@ -91,6 +91,8 @@ final class AppModel {
     /// Queued pushes, one per row (a push reads the row when its turn comes,
     /// so a second request for a queued row adds nothing).
     @ObservationIgnored private var googlePushes: [GooglePush] = []
+    /// The block whose push the worker is sending right now.
+    @ObservationIgnored private var googlePushRunning: String?
     @ObservationIgnored private var googleWorker: Task<Void, Never>?
     /// Test seam: every Google push of a cal_block that actually goes out.
     @ObservationIgnored var onGoogleMirrorDispatched: ((CalBlock) -> Void)?
@@ -2039,8 +2041,12 @@ final class AppModel {
     }
 
     /// Queue a Google push of `blockId`; it pushes the row as it is when its
-    /// turn comes (gone = nothing to push).
+    /// turn comes (gone = nothing to push). In the backlog from now, not only
+    /// once it fails: the queue is memory, and a series edit's ~30 PATCHes
+    /// still waiting when iOS ended the suspended app were lost — those
+    /// events stayed at the old times (audit 2026-09-22, C24).
     func queueGooglePush(_ blockId: String, awaitRowIfMissing: Bool = false) {
+        googleBacklog?.recordPush(blockId: blockId)
         if let i = googlePushes.firstIndex(where: { $0.blockId == blockId }) {
             googlePushes[i].awaitRowIfMissing = googlePushes[i].awaitRowIfMissing || awaitRowIfMissing
         } else {
@@ -2063,12 +2069,25 @@ final class AppModel {
     /// meanwhile (audit 2026-09-22, C24).
     func queueGoogleDelete(_ block: CalBlock) {
         let eventId = isExternalBlock(block) ? nil : block.externalEventId.flatMap { $0.isEmpty ? nil : $0 }
-        if let eventId {
-            googleBacklog?.recordDelete(PendingGoogleDelete(blockId: block.id, eventId: eventId,
-                                                            connectionId: block.externalConnectionId))
+        queueGoogleDelete(GoogleDelete(id: block.id, eventId: eventId, connectionId: block.externalConnectionId))
+    }
+
+    private func queueGoogleDelete(_ delete: GoogleDelete) {
+        if let eventId = delete.eventId {
+            googleBacklog?.recordDelete(PendingGoogleDelete(blockId: delete.id, eventId: eventId,
+                                                            connectionId: delete.connectionId))
         }
-        googleDeletes.append(GoogleDelete(id: block.id, eventId: eventId, connectionId: block.externalConnectionId))
+        googleDeletes.append(delete)
         runGoogleWorker()
+    }
+
+    /// The block wants no event any more (deleted, skipped, or mapped to
+    /// another event since) while an INSERT for it never answered: Google may
+    /// hold that event, so it is deleted like a pushed one (audit 2026-09-22,
+    /// C24 / calendar#5).
+    private func abandonPendingInsert(_ blockId: String) {
+        guard let pending = googleBacklog?.takeInsert(blockId: blockId) else { return }
+        queueGoogleDelete(GoogleDelete(id: blockId, eventId: pending.eventId, connectionId: pending.connectionId))
     }
 
     private enum GoogleCall {
@@ -2101,11 +2120,11 @@ final class AppModel {
         }
     }
 
-    /// One push, when its turn comes. A push that fails (offline, a 5xx) is
-    /// recorded in the backlog and goes out again after the next sync; one
-    /// that went through, or has nothing left to push, is cleared (audit
-    /// 2026-09-22, C24 — scheduling offline used to leave the block without
-    /// its event until its next edit).
+    /// One push, when its turn comes. It has been in the backlog since it was
+    /// queued: one that fails (offline, a 5xx) stays there and goes out again
+    /// after the next sync; one that went through, or has nothing left to
+    /// push, is cleared (audit 2026-09-22, C24 — scheduling offline used to
+    /// leave the block without its event until its next edit).
     private func runGooglePush(_ push: GooglePush) async {
         // Rule G again at DISPATCH, not only when the push was asked for: the
         // row may have been deleted and minted again while this push waited,
@@ -2116,18 +2135,24 @@ final class AppModel {
             return
         }
         guard let fresh = (try? db?.fetchById(CalBlock.self, id: push.blockId)) ?? nil else {
-            googleBacklog?.clearPush(blockId: push.blockId)
             // A confirmed mint whose row is missing for a moment: its own
             // delete's realtime echo landed after the re-mint (hazard d). Wait
-            // for the INSERT echo / the next pull instead of dropping the push.
-            if push.awaitRowIfMissing, let gate = mirrorGate, gate.awaitRow(rowId: push.blockId) {
-                queueGooglePush(push.blockId)   // back already
+            // for the INSERT echo / the next pull instead of dropping the push
+            // — still in the backlog, so a kill meanwhile leaves it to the
+            // retry (C24).
+            if push.awaitRowIfMissing, let gate = mirrorGate {
+                if gate.awaitRow(rowId: push.blockId) { queueGooglePush(push.blockId) }   // back already
+                return
             }
+            googleBacklog?.clearPush(blockId: push.blockId)
             return
         }
         guard isTaskBlock(fresh) else { googleBacklog?.clearPush(blockId: push.blockId); return }
         onGoogleMirrorDispatched?(fresh)
-        if await mirrorBlockToGoogle(fresh) {
+        googlePushRunning = push.blockId
+        let pushed = await mirrorBlockToGoogle(fresh)
+        googlePushRunning = nil
+        if pushed {
             googleBacklog?.clearPush(blockId: push.blockId)
         } else {
             googleBacklog?.recordPush(blockId: push.blockId)
@@ -2144,14 +2169,34 @@ final class AppModel {
               (calendarSyncStatus?.backoffUntil ?? .distantPast) <= Date() else { return }
         let deletes = backlog.deletes()
         let pushes = backlog.pushes()
-        guard !deletes.isEmpty || !pushes.isEmpty else { return }
-        let inUse = Set(((try? db?.fetchAllCalBlocks()) ?? []).filter { isTaskBlock($0) }.compactMap(\.externalEventId))
+        let inserts = backlog.inserts()
+        guard !deletes.isEmpty || !pushes.isEmpty || !inserts.isEmpty else { return }
+        let blocks = try? db?.fetchAllCalBlocks()
+        let inUse = Set((blocks ?? []).filter { isTaskBlock($0) }.compactMap(\.externalEventId))
         for d in deletes {
             if inUse.contains(d.eventId) { backlog.clearDelete(eventId: d.eventId); continue }
             guard !googleDeletes.contains(where: { $0.eventId == d.eventId }) else { continue }
             googleDeletes.append(GoogleDelete(id: d.blockId, eventId: d.eventId, connectionId: d.connectionId))
         }
-        for id in pushes { queueGooglePush(id) }
+        // An INSERT that never answered, whose row has since gone or been
+        // mapped to another event (a pull brought another device's): the
+        // event it may have made is deleted. Its row carrying it = it landed.
+        // Not the one in flight: a re-INSERT after `event_gone` still carries
+        // the stale id until its answer is stamped.
+        if let blocks {
+            let rows = Dictionary(blocks.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            for pending in inserts where pending.blockId != googlePushRunning {
+                let carried = rows[pending.blockId]?.externalEventId ?? ""
+                if carried == pending.eventId {
+                    backlog.clearInsert(blockId: pending.blockId)
+                } else if rows[pending.blockId] == nil || !carried.isEmpty {
+                    abandonPendingInsert(pending.blockId)
+                }
+            }
+        }
+        // The push in flight reports its own outcome (an edit made meanwhile
+        // queued a push of its own).
+        for id in pushes where id != googlePushRunning { queueGooglePush(id) }
         runGoogleWorker()
     }
 
@@ -2188,6 +2233,7 @@ final class AppModel {
         googlePushes.removeAll { $0.blockId == block.id }   // nothing left to push
         googleBacklog?.clearPush(blockId: block.id)
         queueGoogleDelete(deleted ?? block)
+        abandonPendingInsert(block.id)
     }
 
     /// `unschedule` (AppModel+CalendarControls), awaited: reconcile Google for a
@@ -2512,6 +2558,7 @@ final class AppModel {
         // main, always-writable calendar (Android pushBlockUpsert).
         let calId = "primary"
         if block.skipped {
+            abandonPendingInsert(block.id)
             guard let eventId = block.externalEventId, !eventId.isEmpty else { return true }
             do {
                 try await calendar.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: calId)
@@ -2541,29 +2588,48 @@ final class AppModel {
                 return false   // offline / transient: retried after the next sync
             }
         }
+        // The id asked for is kept until the answer is on the row: a retry
+        // after a lost answer (a timeout, a kill mid-flight) asks for the same
+        // one and gets the event the first attempt made, where it used to
+        // make a second and the pull imported the first as a meeting (audit
+        // 2026-09-22, C24 / calendar#5).
+        let asked = googleBacklog?.insertEventId(blockId: block.id, connectionId: conn.id)
         guard let newId = try? await calendar.insertEvent(
             connectionId: conn.id, calendarId: calId,
-            summary: block.taskName, start: range.start, end: range.end) else { return false }
+            summary: block.taskName, start: range.start, end: range.end, eventId: asked?.eventId) else { return false }
         // The new mapping goes onto the row as it is NOW, never onto the copy
         // that was pushed (rule G; an edit made during the call survives).
         switch (try? await write.stampCalBlockMapping(id: block.id, eventId: newId, connectionId: conn.id,
                                                        nowISO: Self.isoNow())) ?? .gone {
         case .stamped, .unchanged:
+            googleBacklog?.clearInsert(blockId: block.id)
             // A pull that ran while the INSERT was in flight saw the new event
             // on no task block and imported it as a meeting: drop that echo
             // now rather than on the next pull (audit 2026-09-22, C24).
             for echo in ((try? db?.fetchExternalCalBlocks()) ?? []) where echo.externalEventId == newId {
                 _ = try? await write.deleteCalBlock(id: echo.id, nowISO: Self.isoNow())
             }
+            // A kept id can be answered with the event an earlier attempt
+            // made, which still has that attempt's time: set this one's.
+            if asked?.reused == true {
+                do {
+                    try await calendar.patchEvent(eventId: newId, connectionId: conn.id, calendarId: calId,
+                                                  summary: block.taskName, start: range.start, end: range.end)
+                } catch {
+                    return false
+                }
+            }
         case .gone:
             // Deleted while the event was being created: don't resurrect the
             // row with a stamp, drop the new event.
             await dropNewEvent(newId, of: block, conn: conn, calls: calendar)
+            googleBacklog?.clearInsert(blockId: block.id)
         case .insertUnresolved:
             // Deleted and minted again (or retimed by a user's mint) during
             // the call: this event belongs to no confirmed row. Drop it; the
             // insert's outcome mirrors the row once confirmed (rule G).
             await dropNewEvent(newId, of: block, conn: conn, calls: calendar)
+            googleBacklog?.clearInsert(blockId: block.id)
             _ = mirrorGate?.requestMirror(rowId: block.id)
         }
         return true

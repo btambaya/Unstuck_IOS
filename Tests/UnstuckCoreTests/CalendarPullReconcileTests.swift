@@ -82,7 +82,7 @@ final class CalendarPullReconcileTests: XCTestCase {
     /// (offline, a kill): the event is ours, never a meeting.
     func testAnEventWhoseGoogleDeleteIsPendingIsNeverImported() {
         let plan = reconcileCalendarPull(events: [ev("mine"), ev("theirs")], localBlocks: [],
-                                         fromYmd: fromYmd, toYmd: toYmd, pendingDeleteEventIds: ["mine"])
+                                         fromYmd: fromYmd, toYmd: toYmd, unconfirmedEventIds: ["mine"])
         XCTAssertEqual(plan.toUpsert.map(\.id), ["g_theirs"])
     }
 

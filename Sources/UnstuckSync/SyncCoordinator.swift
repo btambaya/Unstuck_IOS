@@ -108,7 +108,8 @@ public actor SyncCoordinator {
     public nonisolated let mirrorGate: InsertMirrorGate
     /// The Google write-backs that have not reached Google yet (audit
     /// 2026-09-22, C24): the app records and retries them, the pull never
-    /// imports a pending delete's event as a meeting.
+    /// imports an event of ours whose delete or INSERT is unconfirmed as a
+    /// meeting.
     public nonisolated let googleBacklog: GoogleWriteBacklog
     private let hydrator: Hydrator
     private let catchUpPuller: CatchUpPuller
@@ -519,7 +520,7 @@ public actor SyncCoordinator {
         let plan = reconcileCalendarPull(events: pull.events, localBlocks: local,
                                          fromYmd: Clock.dateISO(fromDate), toYmd: Clock.dateISO(toDate),
                                          allDayEventIds: pull.allDayEventIds, failedConnectionIds: failed,
-                                         pendingDeleteEventIds: googleBacklog.pendingDeleteEventIds(),
+                                         unconfirmedEventIds: googleBacklog.unconfirmedEventIds(),
                                          liveConnectionIds: Set(statuses.map(\.connection.id)))
         let now = Self.isoNow()
         // reconcileCalendarPull returns every in-window event whether or not it

@@ -57,6 +57,51 @@ final class GoogleWriteBacklogTests: XCTestCase {
         XCTAssertEqual(relaunched.pushes(), ["b2"])
     }
 
+    /// An INSERT's id is kept until its answer lands: a retry asks for the
+    /// same one (Google may have made it), the next INSERT after it landed
+    /// asks for a fresh one, and until then the pull counts it as ours
+    /// (audit 2026-09-22, C24 / calendar#5).
+    func testAnInsertKeepsItsIdUntilItsAnswerLands() {
+        let b = GoogleWriteBacklog(defaults: nil, currentUser: { "u1" })
+        let first = b.insertEventId(blockId: "b1", connectionId: "c1")
+        XCTAssertFalse(first.reused)
+        XCTAssertTrue(first.eventId.range(of: "^[a-v0-9]{5,1024}$", options: .regularExpression) != nil,
+                      "an id Google accepts: \(first.eventId)")
+        let retry = b.insertEventId(blockId: "b1", connectionId: "c1")
+        XCTAssertEqual(retry.eventId, first.eventId)
+        XCTAssertTrue(retry.reused)
+        XCTAssertEqual(b.unconfirmedEventIds(), [first.eventId])
+        b.clearInsert(blockId: "b1")
+        let next = b.insertEventId(blockId: "b1", connectionId: "c1")
+        XCTAssertNotEqual(next.eventId, first.eventId)
+        XCTAssertFalse(next.reused)
+        XCTAssertEqual(b.takeInsert(blockId: "b1"), PendingGoogleInsert(blockId: "b1", eventId: next.eventId, connectionId: "c1"))
+        XCTAssertNil(b.takeInsert(blockId: "b1"))
+        XCTAssertTrue(b.unconfirmedEventIds().isEmpty)
+    }
+
+    /// Asked of another account (disconnected and connected again), the
+    /// earlier attempt's event becomes a delete on the account it was sent to.
+    func testAnInsertOnAnotherConnectionDeletesTheEarlierAttempt() {
+        let b = GoogleWriteBacklog(defaults: nil, currentUser: { "u1" })
+        let first = b.insertEventId(blockId: "b1", connectionId: "c1")
+        let other = b.insertEventId(blockId: "b1", connectionId: "c2")
+        XCTAssertFalse(other.reused)
+        XCTAssertNotEqual(other.eventId, first.eventId)
+        XCTAssertEqual(b.deletes(), [PendingGoogleDelete(blockId: "b1", eventId: first.eventId, connectionId: "c1")])
+        XCTAssertEqual(b.inserts(), [PendingGoogleInsert(blockId: "b1", eventId: other.eventId, connectionId: "c2")])
+    }
+
+    func testAnUnansweredInsertSurvivesARelaunch() {
+        let defaults = suite()
+        let first = GoogleWriteBacklog(defaults: defaults, currentUser: { "u1" })
+        let asked = first.insertEventId(blockId: "b1", connectionId: "c1")
+        let relaunched = GoogleWriteBacklog(defaults: defaults, currentUser: { "u1" })
+        let retry = relaunched.insertEventId(blockId: "b1", connectionId: "c1")
+        XCTAssertEqual(retry.eventId, asked.eventId)
+        XCTAssertTrue(retry.reused)
+    }
+
     func testTheOldestEntriesGoPastTheCap() {
         let b = GoogleWriteBacklog(defaults: nil, currentUser: { "u1" })
         for i in 0...GoogleWriteBacklog.cap {

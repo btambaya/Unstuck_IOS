@@ -31,6 +31,15 @@ enum GoogleConnectCopy {
         reconnect ? "Reconnect Google Calendar?" : "Connect Google Calendar?"
     }
 
+    /// The "Connect" pill. A disconnect removes the connection as soon as
+    /// the server confirms, then waits for its clean-up pull: the pill is
+    /// back while `busy` still holds, and it read "Connecting…" though
+    /// nobody asked to connect (audit 2026-09-22, C26).
+    static func connectPill(busy: Bool, disconnecting: Bool) -> String {
+        guard busy else { return "＋ Connect Google Calendar" }
+        return disconnecting ? "Disconnecting…" : "Connecting…"
+    }
+
     /// The sync bar once Google has stopped accepting Unstuck's access (a 401,
     /// `invalid_grant`, or the server's needs_reauth flag). Plain words only:
     /// the bar used to print the provider's raw error under the row —
