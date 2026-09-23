@@ -20,6 +20,13 @@
     <!-- Also covers PushKit VoIP pushes (APNs topic io.unstucknow.app.voip):
          VoIP needs no extra entitlement beyond aps-environment, only the
          `voip` UIBackgroundMode in Info.plist. -->
+    <!-- Time-Sensitive notifications: calls and due reminders may break through a
+         Focus mode (the app sets .timeSensitive only there; quiet notices stay
+         .passive). Portal capability USERNOTIFICATIONS_TIMESENSITIVE enabled and
+         the App Store profile regenerated 2026-09-23 — the key must never be
+         added before the portal has it, or the archive fails to sign. -->
+    <key>com.apple.developer.usernotifications.time-sensitive</key>
+    <true/>
     <key>aps-environment</key>
     <string>$(APS_ENVIRONMENT)</string>
 </dict>
