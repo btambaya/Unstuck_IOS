@@ -189,6 +189,9 @@ final class VoiceSessionModel {
             onError: { [weak self] msg in voiceLog.error("voice error \(msg, privacy: .public)"); Task { @MainActor in self?.note = msg } },
             holdToTalk: holdToTalk)
         client = rc
+        // The proxy's 15-minute cap ends the session cleanly ("Ended"): say
+        // why, instead of a bare "Ended" (audit 2026-09-22, C47).
+        rc.onServerEnded = { [weak self] note in Task { @MainActor in self?.note = note } }
         // Dead on arrival (the server failed before any reply): reconnect,
         // twice at most, before telling the user anything.
         rc.onTransportEnded = { [weak self, weak rc] error in

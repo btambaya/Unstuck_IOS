@@ -260,6 +260,10 @@ enum BargeInEvent: Equatable, Sendable {
     /// the user's input. Deltas can stop a reply early; only the completed
     /// transcript decides what is answered.
     case transcription(text: String, itemId: String?, final: Bool)
+    /// `conversation.item.input_audio_transcription.failed`: the server
+    /// committed the segment but could not write it down (OpenAI: the
+    /// transcription model's rate limit, an upstream error).
+    case transcriptionFailed(itemId: String?)
     /// response.audio_transcript.delta — the model's own words, the echo
     /// reference.
     case assistantTranscript(delta: String)
@@ -270,8 +274,12 @@ enum BargeInEvent: Equatable, Sendable {
     case routeChanged(VoiceRoute)
     case pttDown
     case pttUp
-    /// An `error` whose message contains "active response" (either form).
+    /// An `error` saying there is NO active response ("no active response" —
+    /// a cancel that found nothing).
     case benignActiveResponseError
+    /// An `error` saying a response IS active ("already has an active
+    /// response") — a create that collided with one still generating.
+    case responseAlreadyActive
 }
 
 /// Pure barge-in state machine (spec §2). Value type: the client mutates it
@@ -364,9 +372,19 @@ struct BargeInController: Sendable {
         /// in pieces ("Coming up on." then "Day.", device log 2026-09-20
         /// 00:04:43): a short later piece is more of the same echo, not a turn.
         var echoJudged = false
+        /// When it began.
+        var startedAt: TimeInterval = 0
+        /// It moved a pending turn's hold to its own start (they went on
+        /// talking before the turn was asked for), from `displacedTurn`.
+        var movedTurn = false
+        var displacedTurn: TimeInterval?
     }
     private var segments: [Segment] = []
     static let segmentHistory = 8
+    /// The create time of the last reply that answered a turn while a later
+    /// sound kept it pending (`responseCreated`): a turn from before it has
+    /// been answered.
+    private var answeredTurnsThrough: TimeInterval?
     /// Items judged echo / no words, whose `conversation.item.delete` is HELD
     /// until the next segment starts or a reply is asked for: the user often
     /// starts talking inside the same VAD segment as the reply's echo tail,
@@ -447,7 +465,7 @@ struct BargeInController: Sendable {
             // The turn this create was for is being answered. A turn taken
             // AFTER the create went out (they spoke again while it was in
             // flight) stays pending and is asked once this reply is done.
-            if let since = pendingTurnSince, let sent = createSentAt, since > sent { /* keep it */ } else { pendingTurnSince = nil }
+            if let since = pendingTurnSince, let sent = createSentAt, since > sent { answeredTurnsThrough = sent } else { pendingTurnSince = nil }
             createSentAt = nil
             // A new reply: the one before it is now the "previous" reference.
             spokenPrevious = spokenCurrent
@@ -537,9 +555,14 @@ struct BargeInController: Sendable {
             let onAir = playbackQueued
             let inGrace = !onAir && lastDrained.map { now - $0.at <= Self.drainEchoGraceSec } == true
             out += flushPendingDeletes(except: itemId)
-            segments.append(Segment(itemId: itemId, echoPossible: onAir || inGrace, onAir: onAir))
+            var segment = Segment(itemId: itemId, echoPossible: onAir || inGrace, onAir: onAir, startedAt: now)
             // They go on talking before their turn was asked for: hold from here.
-            if pendingCreate, !(onAir || inGrace) { pendingTurnSince = now }
+            if pendingCreate, !(onAir || inGrace) {
+                segment.movedTurn = true
+                segment.displacedTurn = pendingTurnSince
+                pendingTurnSince = now
+            }
+            segments.append(segment)
             if segments.count > Self.segmentHistory { segments.removeFirst(segments.count - Self.segmentHistory) }
             switch state {
             case .speaking where modelBusy && profile.confirm == .transcript:
@@ -624,7 +647,7 @@ struct BargeInController: Sendable {
                 // nowhere until "Hello?". With echo cancellation on, a
                 // one-word echo that reaches the transcriber is rarer than a
                 // one-word answer that shares the reply's word.
-            } else if !notATurn, segment.onAir || segment.echoJudged {
+            } else if !notATurn, profile.confirm == .transcript, segment.onAir || segment.echoJudged {
                 // Judged by its words only when it began while the reply's
                 // audio was ON AIR. After the drain the words are the user's:
                 // with echo cancellation on (build 69) no tail echo has
@@ -632,12 +655,19 @@ struct BargeInController: Sendable {
                 // they answer — "Have you set up the call?", "What is
                 // today?" were deleted as echo of the question they answered
                 // (assistant_turns, 2026-09-20 15:21 / 15:36).
+                // And only on the loudspeaker. Earphones, the receiver and a
+                // CallKit call (`.energy`) barely hear the reply, and their
+                // barge-in is confirmed by the voice itself: "Tuesday works"
+                // over "…move it to Tuesday?" cut the reply, then scored 1 of
+                // 2 against it and was deleted — the assistant stopped
+                // mid-word and said nothing (audit 2026-09-22, C46).
                 lastEchoScore = score(tokens)
                 notATurn = isEcho(tokens, onAir: true)          // the model's own words, back through the mic
             }
             if notATurn {
                 if !tokens.isEmpty { segments[index].echoJudged = true }
                 if let id, !pendingDeletes.contains(id) { pendingDeletes.append(id) }
+                if segments[index].movedTurn { restoreDisplacedTurn(from: index) }
                 break
             }
             // The user's turn — possibly riding on the echo's tail inside the
@@ -652,6 +682,27 @@ struct BargeInController: Sendable {
             if modelBusy && !alreadyCancelled { out += cancel(now: now) }
             // Not asked for yet: the hold first (they may be mid-sentence),
             // and, if a cancel is in flight, its done — or the fallback.
+            pendingTurnSince = now
+            out.append(.startConfirmTimer(ms: Self.turnHoldMs))
+            if responseActive { out.append(.startConfirmTimer(ms: Self.pendingCreateFallbackMs)) }
+            out.append(.uiState(.thinking))
+
+        case .transcriptionFailed(let itemId):
+            // Nothing else would ever ask for a reply to this segment (the
+            // client owns turn-taking): a failed transcription was dead air
+            // after a spoken request — on a call, silence (audit 2026-09-22,
+            // C46). The model hears the audio item itself, so the turn is
+            // asked for as if its words had come. Not under a reply still on
+            // air and uncut, though: without words the user can't be told
+            // from the echo, and that reply was never cut for it.
+            guard !holdToTalk else { break }   // the release already committed + asked
+            let index = segmentIndex(for: itemId)
+            if let index, segments[index].responded { break }
+            let alreadyCancelled = activeResponseId != nil && activeResponseId == cancelledResponseId
+            if modelBusy && !alreadyCancelled { break }
+            if let index { segments[index].responded = true }
+            rateLimitRetries = 0
+            out += flushPendingDeletes(except: nil)
             pendingTurnSince = now
             out.append(.startConfirmTimer(ms: Self.turnHoldMs))
             if responseActive { out.append(.startConfirmTimer(ms: Self.pendingCreateFallbackMs)) }
@@ -690,6 +741,12 @@ struct BargeInController: Sendable {
             pendingTurnSince = nil   // the user wants silence, not the next reply
             if modelBusy {
                 out += cancel(now: now, hard: true)
+            } else {
+                // Nothing generating — "Thinking…" was the hold, a create in
+                // flight or a rate-limit wait, and no reply is coming now. The
+                // label stayed on "Thinking…" until they spoke again (audit
+                // 2026-09-22, C46).
+                out.append(.uiState(uiStateNow))
             }
 
         case .benignActiveResponseError:
@@ -715,6 +772,20 @@ struct BargeInController: Sendable {
             } else {
                 out.append(.uiState(uiStateNow))
             }
+
+        case .responseAlreadyActive:
+            // Our create collided with a reply the server is still generating
+            // (the tool continuation, the corrective and the opening create
+            // outside the controller). Something IS generating: clearing
+            // responseActive here showed "Listening…" over it, left a barge-in
+            // with no response.cancel to send, and re-created at network speed
+            // into the same refusal until it ended (audit 2026-09-22, C46).
+            // Its done re-asks a pending turn; a done that never comes is the
+            // grace timer's.
+            responseActive = true
+            if state == .idle { state = .speaking }
+            if pendingCreate { out.append(.startConfirmTimer(ms: Int(Self.createGraceSec * 1000))) }
+            out.append(.uiState(uiStateNow))
 
         case .routeChanged(let route):
             let next = BargeInProfile.forRoute(route)
@@ -766,6 +837,30 @@ struct BargeInController: Sendable {
         return (itemId == nil || segments[last].itemId == nil) ? last : nil
     }
 
+    /// A segment that moved the pending turn's hold turned out to be no turn
+    /// (a cough, a door, no words): the hold goes back to where it was — or,
+    /// if the reply that answered the turn was created meanwhile, the turn is
+    /// done. Left pending, the finished reply's done asked for it again and
+    /// the assistant answered the same question twice (audit 2026-09-22,
+    /// C46). A later segment that moved it again keeps the hold; this one's
+    /// start then stands for nothing, so that segment inherits what it
+    /// displaced.
+    private mutating func restoreDisplacedTurn(from index: Int) {
+        let s = segments[index]
+        segments[index].movedTurn = false
+        guard pendingTurnSince == s.startedAt else {
+            for i in segments.indices where segments[i].movedTurn && segments[i].displacedTurn == s.startedAt {
+                segments[i].displacedTurn = s.displacedTurn
+            }
+            return
+        }
+        if let d = s.displacedTurn, answeredTurnsThrough.map({ d > $0 }) ?? true {
+            pendingTurnSince = d
+        } else {
+            pendingTurnSince = nil
+        }
+    }
+
     /// The held turn, asked for when it is ready: the hold has elapsed since
     /// the user was last heard, the server VAD is silent, and no reply is
     /// generating — or the cancelled reply's done never came (the fallback).
@@ -774,6 +869,12 @@ struct BargeInController: Sendable {
         let elapsed = Int(((now - since) * 1000).rounded())
         if responseActive {
             guard elapsed >= Self.pendingCreateFallbackMs else { return [] }
+            // Our create was just refused by a reply still generating
+            // (`.responseAlreadyActive`): that reply isn't presumed lost
+            // until the grace is out.
+            if let sent = createSentAt, now - sent < Self.createGraceSec {
+                return [.startConfirmTimer(ms: Int(((Self.createGraceSec - (now - sent)) * 1000).rounded()) + 1)]
+            }
             responseActive = false
         } else {
             guard elapsed >= Self.turnHoldMs, !serverSpeaking else { return [] }
