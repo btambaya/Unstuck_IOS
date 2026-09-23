@@ -631,9 +631,8 @@ private struct AccountSettingsView: View {
             Button("Sign out", role: .destructive) { model.signOut(); dismiss() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(model.stuckChanges > 0
-                 ? "They stay on this phone and sync when you sign in here again. \(model.stuckChanges) couldn't be saved — Today shows them."
-                 : "They stay on this phone and sync when you sign in here again.")
+            Text("Unstuck sends what it can first; the rest stays on this phone and syncs when you sign in here again."
+                 + (model.stuckChanges > 0 ? " \(model.stuckChanges) couldn't be saved — Today shows them." : ""))
         }
         .sheet(isPresented: $showName) {
             DisplayNameSheet(initial: model.currentUserName ?? "") { name in

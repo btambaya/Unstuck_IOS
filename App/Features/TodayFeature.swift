@@ -765,7 +765,6 @@ struct TodayView: View {
         }
         .padding(14).frame(maxWidth: .infinity, alignment: .leading)
         .background(theme.palette.amberSoft, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .accessibilityIdentifier("today-stuck-changes")
         .alert("Discard \(n == 1 ? "this change" : "these changes")?", isPresented: $confirmDiscardStuck) {
             Button("Discard", role: .destructive) { model.discardStuckChanges() }
             Button("Cancel", role: .cancel) {}

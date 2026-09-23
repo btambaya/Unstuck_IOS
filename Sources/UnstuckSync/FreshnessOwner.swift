@@ -146,6 +146,9 @@ public actor FreshnessOwner {
     private var userId: String?
     private var visible = false
     private var hasHydratedThisSession = false
+    /// A discard asked for the full hydrate (C28): honoured by the next pull
+    /// even when a hydrate already running when it asked finishes first.
+    private var fullHydrateWanted = false
     private var subscribed = false
 
     private var running = false
@@ -172,6 +175,7 @@ public actor FreshnessOwner {
         guard uid != userId else { return }
         userId = uid
         hasHydratedThisSession = false
+        fullHydrateWanted = false
         subscribed = false
         pending = nil
         lastReconcileAt = nil
@@ -211,7 +215,7 @@ public actor FreshnessOwner {
     /// the catch-up never re-reads a row this device already has (audit
     /// 2026-09-22, C28).
     public func requireFullHydrate() {
-        hasHydratedThisSession = false
+        fullHydrateWanted = true
         request(.manual, reconcile: true)
     }
 
@@ -341,9 +345,10 @@ public actor FreshnessOwner {
     private func perform(reason: FreshnessSignal, reconcile: Bool) async {
         guard let uid = userId else { return }
         stats.lastPullReason = reason.rawValue
-        if !hasHydratedThisSession {
+        if !hasHydratedThisSession || fullHydrateWanted {
             // First pull of the session, or the cursors are gone: the full
             // server-canonical hydrate is the fallback the catch-up needs.
+            fullHydrateWanted = false
             await actions.fullSync(uid)
             guard userId == uid else { return }
             hasHydratedThisSession = true

@@ -784,6 +784,9 @@ public actor SyncCoordinator {
             try? db.clearAll()
             await hydrator.resetCalBlocksPull()
             UserDefaults.standard.removeObject(forKey: prevUserKey)
+            // The outbox is empty now (parked for the owner): nothing is stuck
+            // for whoever signs in next (C28).
+            stuckHook.call(0)
 
         case .tokenRefreshed:
             // The window around a refresh is exactly where a channel re-joins
