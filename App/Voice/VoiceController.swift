@@ -35,6 +35,9 @@ final class VoiceController: NSObject, AVSpeechSynthesizerDelegate, @unchecked S
     /// Speech + mic permission, `true` when both are granted. A seam so a
     /// stop during the permission prompts is testable without the OS prompts.
     private let authorize: @Sendable (_ granted: @escaping @Sendable (Bool) -> Void) -> Void
+    /// Hands the shared session back. A seam so a release that lands after
+    /// the owner has let go of this controller is observable in tests.
+    private let deactivate: @Sendable () -> Void
 
     /// Bumped by every start and stop: a dictation whose permission callbacks
     /// come back after a stop — or after a newer start — is stale and must
@@ -62,10 +65,18 @@ final class VoiceController: NSObject, AVSpeechSynthesizerDelegate, @unchecked S
     /// How long the session stays ours after the last use.
     static let releaseGraceSec: Double = 0.4
 
-    init(authorize: @escaping @Sendable (_ granted: @escaping @Sendable (Bool) -> Void) -> Void = VoiceController.systemAuthorize) {
+    init(authorize: @escaping @Sendable (_ granted: @escaping @Sendable (Bool) -> Void) -> Void = VoiceController.systemAuthorize,
+         deactivate: @escaping @Sendable () -> Void = VoiceController.systemDeactivate) {
         self.authorize = authorize
+        self.deactivate = deactivate
         super.init()
         synth.delegate = self
+    }
+
+    /// `.notifyOthersOnDeactivation`, so music that dictation paused or
+    /// speech ducked comes back.
+    @Sendable static func systemDeactivate() {
+        try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
     }
 
     /// The OS prompts: speech recognition, then the microphone.
@@ -252,7 +263,14 @@ final class VoiceController: NSObject, AVSpeechSynthesizerDelegate, @unchecked S
     func stopSpeaking() {
         // Also a line queued a moment ago that isn't "speaking" yet: it would
         // play out after the stop, and its end is what hands the session back.
+        let current: AVSpeechUtterance? = lock.withLock { utterance }
         synth.stopSpeaking(at: .immediate)
+        // Ended here, not by the synthesizer's didCancel: its delegate is weak,
+        // and the owners stop on the way out (the sheet swiped away, Focus
+        // closed) and free this controller at once — the callback never came
+        // and the session stayed ducked (audit 2026-09-22, C41). A late
+        // didCancel for it is a no-op.
+        if let current { spoken(current) }
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
@@ -285,16 +303,20 @@ final class VoiceController: NSObject, AVSpeechSynthesizerDelegate, @unchecked S
     /// dictation paused or speech ducked comes back. Not under a Talk session
     /// or call (checked atomically with a Talk start), nor while the Focus
     /// ambient bed plays in the same session — deactivating stops it.
+    ///
+    /// The grace holds this controller: its owners are views' `@State`, freed
+    /// the moment the sheet or Focus goes away — exactly when the last use
+    /// ends — and a weak capture dropped the release then (audit 2026-09-22,
+    /// C41). 0.4 s, and nothing here holds the closure: no cycle.
     private func releaseWhenIdle() {
         let use: Int = lock.withLock { sessionUse }
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.releaseGraceSec) { [weak self] in
-            guard let self else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.releaseGraceSec) { [self] in
             let bedPlaying = MainActor.assumeIsolated { AmbientAudio.shared.isRunning }
-            self.lock.withLock {
-                guard use == self.sessionUse, !self.listenWanted, self.utterance == nil, !bedPlaying else { return }
+            lock.withLock {
+                guard use == sessionUse, !listenWanted, utterance == nil, !bedPlaying else { return }
                 VoiceAudioOwnership.unlessHeld {
-                    try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
-                    self._sessionReleases += 1
+                    deactivate()
+                    _sessionReleases += 1
                 }
             }
         }

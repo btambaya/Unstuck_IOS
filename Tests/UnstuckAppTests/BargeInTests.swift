@@ -2040,4 +2040,84 @@ final class BargeInTests: XCTestCase {
         _ = w.handle(.transcription(text: "and tomorrow", itemId: "more", final: true), now: 2.9)
         XCTAssertTrue(w.pendingCreate)
     }
+
+    /// The same cough, but the short reply's done lands BEFORE the cough's
+    /// (empty) transcript: the done asked for the turn at once, and the empty
+    /// transcript that cleared it came after the create was out — answered
+    /// twice. Whether anything is owed waits for the cough's words.
+    func test29g_aReplyDoneBeforeTheNoisesTranscriptNeverAsksTheTurnAgain() {
+        var c = BargeInController(profile: .speaker)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = c.handle(.speechStopped, now: 1.0)
+        _ = c.handle(.transcription(text: "what's next today", itemId: "u", final: true), now: 1.2)
+        XCTAssertEqual(core(c.handle(.tick, now: 1.7)), [.createResponse, .uiState(.thinking)])
+        _ = c.handle(.speechStarted(itemId: "cough"), now: 1.8)
+        _ = c.handle(.responseCreated(id: "r1"), now: 2.0)
+        _ = c.handle(.speechStopped, now: 2.1)
+        _ = c.handle(.audioDelta(id: "r1"), now: 2.2)
+        XCTAssertEqual(count(core(c.handle(.responseDone(id: "r1", status: "completed"), now: 2.4)), .createResponse), 0,
+                       "the cough may be nothing: wait for its words")
+        XCTAssertEqual(count(core(c.handle(.tick, now: 2.9)), .createResponse), 0)
+        _ = c.handle(.transcription(text: "", itemId: "cough", final: true), now: 3.0)
+        XCTAssertFalse(c.pendingCreate, "no words: the question was the one answered")
+        XCTAssertEqual(count(core(c.handle(.tick, now: 5.5)), .createResponse), 0, "answered once")
+
+        // Its audio drained before its done: once the cough is heard as
+        // nothing, the screen says so instead of the reply's last state.
+        var drained = BargeInController(profile: .speaker)
+        _ = drained.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = drained.handle(.speechStopped, now: 1.0)
+        _ = drained.handle(.transcription(text: "what's next today", itemId: "u", final: true), now: 1.2)
+        _ = drained.handle(.tick, now: 1.7)
+        _ = drained.handle(.speechStarted(itemId: "cough"), now: 1.8)
+        _ = drained.handle(.responseCreated(id: "r1"), now: 2.0)
+        _ = drained.handle(.speechStopped, now: 2.1)
+        _ = drained.handle(.audioDelta(id: "r1"), now: 2.2)
+        _ = drained.handle(.playbackDrained, now: 2.3)
+        XCTAssertEqual(count(core(drained.handle(.responseDone(id: "r1", status: "completed"), now: 2.4)), .createResponse), 0)
+        XCTAssertEqual(core(drained.handle(.transcription(text: "", itemId: "cough", final: true), now: 3.0)), [.uiState(.listening)])
+        XCTAssertEqual(drained.state, .idle)
+
+        // A long reply: the fallback tick (2.5 s after the cough began, the
+        // reply still generating) doesn't presume it lost and ask either.
+        var f = BargeInController(profile: .speaker)
+        _ = f.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = f.handle(.speechStopped, now: 1.0)
+        _ = f.handle(.transcription(text: "what's next today", itemId: "u", final: true), now: 1.2)
+        _ = f.handle(.tick, now: 1.7)
+        _ = f.handle(.speechStarted(itemId: "cough"), now: 1.8)
+        _ = f.handle(.responseCreated(id: "r1"), now: 2.0)
+        _ = f.handle(.speechStopped, now: 2.1)
+        XCTAssertEqual(count(core(f.handle(.tick, now: 4.4)), .createResponse), 0)
+        XCTAssertTrue(f.responseActive, "r1 is still the live reply")
+        _ = f.handle(.transcription(text: "", itemId: "cough", final: true), now: 4.6)
+        XCTAssertFalse(f.pendingCreate)
+
+        // The sound had words after all: a turn of its own, asked for.
+        var w = BargeInController(profile: .speaker)
+        _ = w.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = w.handle(.speechStopped, now: 1.0)
+        _ = w.handle(.transcription(text: "what's next today", itemId: "u", final: true), now: 1.2)
+        _ = w.handle(.tick, now: 1.7)
+        _ = w.handle(.speechStarted(itemId: "more"), now: 1.8)
+        _ = w.handle(.responseCreated(id: "r1"), now: 2.0)
+        _ = w.handle(.speechStopped, now: 2.6)
+        _ = w.handle(.responseDone(id: "r1", status: "completed"), now: 2.7)
+        let heard = core(w.handle(.transcription(text: "and tomorrow", itemId: "more", final: true), now: 3.0))
+        XCTAssertTrue(heard.contains(.userTurn("and tomorrow")))
+        XCTAssertEqual(core(w.handle(.tick, now: 3.5)), [.createResponse, .uiState(.thinking)])
+
+        // Its words never come (no completed, no failed): asked for as a turn
+        // once the wait from the sound's end is out — never stuck.
+        var lost = BargeInController(profile: .speaker)
+        _ = lost.handle(.speechStarted(itemId: "u"), now: 0)
+        _ = lost.handle(.speechStopped, now: 1.0)
+        _ = lost.handle(.transcription(text: "what's next today", itemId: "u", final: true), now: 1.2)
+        _ = lost.handle(.tick, now: 1.7)
+        _ = lost.handle(.speechStarted(itemId: "x"), now: 1.8)
+        _ = lost.handle(.responseCreated(id: "r1"), now: 2.0)
+        _ = lost.handle(.speechStopped, now: 2.1)
+        XCTAssertEqual(core(lost.handle(.responseDone(id: "r1", status: "completed"), now: 2.4)), [.startConfirmTimer(ms: 2701)])
+        XCTAssertEqual(count(core(lost.handle(.tick, now: 5.2)), .createResponse), 1)
+    }
 }

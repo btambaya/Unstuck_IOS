@@ -30,9 +30,12 @@ final class FakeSpeaker: CopilotSpeaker {
         spoken.append(text)
         if holdLines { playing.append(onFinish) } else { onFinish() }
     }
+    /// Off, `stop()` cuts a held line without reporting its end — the
+    /// synthesizer an audio interruption cut off.
+    var stopEndsLines = true
     /// The held lines finish playing.
     func finishSpeaking() { let p = playing; playing = []; p.forEach { $0() } }
-    func stop() { stopCount += 1; finishSpeaking() }
+    func stop() { stopCount += 1; if stopEndsLines { finishSpeaking() } }
 }
 
 @MainActor
@@ -89,7 +92,8 @@ final class FocusCopilotControllerTests: XCTestCase {
     private func makeController(
         estimateMin: Int = 25,
         level: NotificationLevel = .coach,
-        voiceReplies: Bool = true
+        voiceReplies: Bool = true,
+        lineTimeoutSec: Double = 12
     ) -> FocusCopilotController {
         speaker = FakeSpeaker()
         listener = FakeListener()
@@ -100,7 +104,7 @@ final class FocusCopilotControllerTests: XCTestCase {
             estimateMin: { estimateMin }, level: { level },
             voiceRepliesEnabled: { voiceReplies },
             duck: { self.ducks += 1 }, restore: { self.restores += 1 },
-            listenWindowSec: 6
+            listenWindowSec: 6, lineTimeoutSec: lineTimeoutSec
         )
         c.startSession()
         return c
@@ -434,6 +438,44 @@ final class FocusCopilotControllerTests: XCTestCase {
         XCTAssertEqual(listener.startCount, 0)
     }
 
+    /// A phone call or an alarm cut the synthesizer off mid-line: no
+    /// didFinish, no didCancel. Nothing else closed the cycle — `busy` stayed
+    /// set, the bed ducked, and the coach said nothing for the rest of the
+    /// block (audit 2026-09-22, C41).
+    func testALineWhoseEndIsNeverReportedStillGoesOn() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true, lineTimeoutSec: 0.05)
+        speaker.holdLines = true
+        speaker.stopEndsLines = false
+        listener.autoResult = nil
+        tickThrough(c, to: 1500)
+        XCTAssertEqual(listener.startCount, 0)
+        settle(0.3)
+        XCTAssertEqual(speaker.stopCount, 1, "the stuck line is stopped")
+        XCTAssertEqual(listener.startCount, 1, "and the question gets its answer window")
+        XCTAssertTrue(c.listening)
+        speaker.finishSpeaking()    // its end, reported late after all
+        XCTAssertEqual(listener.startCount, 1, "the window opens once")
+        listener.deliver("")
+        XCTAssertEqual(restores, 1)
+
+        // A speak-only line: the bed comes back, and the next milestone fires.
+        let coach = makeController(estimateMin: 25, level: .coach, voiceReplies: true, lineTimeoutSec: 0.05)
+        speaker.holdLines = true
+        speaker.stopEndsLines = false
+        tickThrough(coach, to: 750)
+        XCTAssertEqual(restores, 0)
+        settle(0.3)
+        XCTAssertEqual(restores, 1, "the bed is restored")
+        tickThrough(coach, from: 751, to: 1200)
+        XCTAssertEqual(speaker.spoken.count, 2, "the coach goes on: \(speaker.spoken)")
+    }
+
+    private func settle(_ seconds: Double) {
+        let e = expectation(description: "settle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { e.fulfill() }
+        wait(for: [e], timeout: seconds + 5)
+    }
+
     // ── GUARDRAIL: zero LLM / network in the copilot path ────────────────
 
     func testNoNetworkOrAssistantSymbolsReachableFromCopilotPath() {
@@ -583,6 +625,32 @@ final class CopilotAudioSessionTests: XCTestCase {
         XCTAssertEqual(held.sessionReleases, 0, "never deactivated under a call")
     }
 
+    /// Swiping the sheet away (or closing Focus) mid-line or mid-dictation
+    /// stops it and frees the controller at once — it is the view's @State.
+    /// The release rode on a weak self, and a line's end on the
+    /// synthesizer's weak delegate: neither came, and the music stayed
+    /// ducked or paused for as long as the app ran.
+    func testTheSessionIsHandedBackAfterTheOwnerHasLetGoOfTheVoice() throws {
+        let releases = Flag()
+        var reading: VoiceController? = VoiceController(authorize: { $0(false) }, deactivate: { releases.hit() })
+        reading?.speak("Here is a reply long enough to still be playing when the sheet is swiped away.")
+        reading?.stopSpeaking()
+        reading = nil
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(releases.count, 1, "handed back although its owner has gone")
+
+        // Mid-dictation (still at the permission prompts: the dictation is
+        // wanted, the session is ours).
+        let prompts = Prompts()
+        var dictating: VoiceController? = VoiceController(authorize: { prompts.ask($0) }, deactivate: { releases.hit() })
+        guard dictating?.sttAvailable == true else { throw XCTSkip("no speech recognizer in this simulator") }
+        dictating?.startListening(onPartial: { _ in }, onFinal: { _ in }, onDone: {})
+        dictating?.stopListening()
+        dictating = nil
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(releases.count, 2)
+    }
+
     func testANewLineInsideTheGraceKeepsTheSession() {
         let voice = VoiceController(authorize: { $0(false) })
         let first = expectation(description: "first")
@@ -609,6 +677,22 @@ final class CopilotAudioSessionTests: XCTestCase {
         AmbientAudio.shared.start()
         XCTAssertFalse(AmbientAudio.shared.isRunning, "the bed waits for the call")
         XCTAssertEqual(s.category, .playAndRecord, "the call keeps its input")
+    }
+
+    /// The copilot ducked (paused) the bed, and a call was answered before
+    /// it restored it: the restore can't play into the call's session, and
+    /// left it paused but "running" — start() then refused it after the
+    /// call, and it stayed silent until Focus was left.
+    func testABedDuckedWhenACallTookTheSessionCanStartAgainAfterIt() throws {
+        AmbientAudio.shared.start()
+        guard AmbientAudio.shared.isRunning else { throw XCTSkip("no audio output route in this simulator") }
+        AmbientAudio.shared.duck()                      // a coach line
+        VoiceAudioOwnership.set(true, by: .callKit)     // a call answered meanwhile
+        AmbientAudio.shared.restore()
+        XCTAssertFalse(AmbientAudio.shared.isRunning, "stopped, not paused and counted as playing")
+        VoiceAudioOwnership.set(false, by: .callKit)    // the call has ended
+        AmbientAudio.shared.start()                     // the next updateAudio
+        XCTAssertTrue(AmbientAudio.shared.isRunning)
     }
 
     /// The copilot's listen window left the session record-only; the bed was

@@ -99,7 +99,12 @@ final class AmbientAudio {
         guard duckedForCopilot else { return }
         duckedForCopilot = false
         guard running else { return }
-        guard !VoiceAudioOwnership.isHeld else { return }
+        // A Talk session or call took the session while the bed was ducked:
+        // it can't play in theirs. Stopped, not left paused — a paused bed
+        // still counted as running, so start() refused it after the call and
+        // it stayed silent until Focus was left (audit 2026-09-22, C42). The
+        // next updateAudio starts it again.
+        guard !VoiceAudioOwnership.isHeld else { teardown(); return }
         // The copilot's listen window left the session record-only (and its
         // speech .spokenAudio with .duckOthers): an engine restarted into a
         // .record session renders nothing, so the bed stayed silent while

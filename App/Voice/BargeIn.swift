@@ -372,8 +372,9 @@ struct BargeInController: Sendable {
         /// in pieces ("Coming up on." then "Day.", device log 2026-09-20
         /// 00:04:43): a short later piece is more of the same echo, not a turn.
         var echoJudged = false
-        /// When it began.
+        /// When it began, and when the server VAD heard it end.
         var startedAt: TimeInterval = 0
+        var stoppedAt: TimeInterval?
         /// It moved a pending turn's hold to its own start (they went on
         /// talking before the turn was asked for), from `displacedTurn`.
         var movedTurn = false
@@ -580,6 +581,7 @@ struct BargeInController: Sendable {
 
         case .speechStopped:
             serverSpeaking = false
+            if let last = segments.indices.last, segments[last].stoppedAt == nil { segments[last].stoppedAt = now }
             // A held turn is asked for `turnHoldMs` after the user's last
             // sound, whether or not that segment produced a transcript.
             if pendingCreate { out.append(.startConfirmTimer(ms: Self.turnHoldMs)) }
@@ -667,7 +669,16 @@ struct BargeInController: Sendable {
             if notATurn {
                 if !tokens.isEmpty { segments[index].echoJudged = true }
                 if let id, !pendingDeletes.contains(id) { pendingDeletes.append(id) }
-                if segments[index].movedTurn { restoreDisplacedTurn(from: index) }
+                if segments[index].movedTurn {
+                    restoreDisplacedTurn(from: index)
+                    // Nothing owed, and the reply that answered it is over
+                    // (its done came while this was awaited): the screen
+                    // shows it, not the reply's last state.
+                    if !pendingCreate, !modelBusy, state == .speaking {
+                        state = .idle
+                        out.append(.uiState(.listening))
+                    }
+                }
                 break
             }
             // The user's turn — possibly riding on the echo's tail inside the
@@ -861,11 +872,37 @@ struct BargeInController: Sendable {
         }
     }
 
+    /// The pending turn stands only for a sound heard after the ask went out
+    /// (`movedTurn`), whose words haven't come yet, and the turn it displaced
+    /// has been answered: whether anything is owed depends on those words.
+    /// The reply's done — or the fallback tick — can land before a cough's
+    /// empty transcript, and asking then answered the same question twice
+    /// (audit 2026-09-22, C46). Seconds left to wait for them, counted from
+    /// the sound's end; past that it is asked for as a turn of its own.
+    private func waitForDisplacingWords(since: TimeInterval, now: TimeInterval) -> TimeInterval? {
+        guard let answered = answeredTurnsThrough,
+              let i = segments.lastIndex(where: { $0.movedTurn && $0.startedAt == since }) else { return nil }
+        // Back through a run of such sounds, none heard yet, to the turn
+        // before them.
+        var displaced = segments[i].displacedTurn
+        for _ in segments.indices {
+            guard let d = displaced,
+                  let j = segments.lastIndex(where: { $0.movedTurn && $0.startedAt == d }) else { break }
+            displaced = segments[j].displacedTurn
+        }
+        guard let d = displaced, d <= answered else { return nil }
+        let left = (segments[i].stoppedAt ?? now) + Self.createGraceSec - now
+        return left > 0 ? left : nil
+    }
+
     /// The held turn, asked for when it is ready: the hold has elapsed since
     /// the user was last heard, the server VAD is silent, and no reply is
     /// generating — or the cancelled reply's done never came (the fallback).
     private mutating func tryAsk(now: TimeInterval) -> [BargeInCommand] {
         guard let since = pendingTurnSince else { return [] }
+        if let wait = waitForDisplacingWords(since: since, now: now) {
+            return [.startConfirmTimer(ms: Int((wait * 1000).rounded()) + 1)]
+        }
         let elapsed = Int(((now - since) * 1000).rounded())
         if responseActive {
             guard elapsed >= Self.pendingCreateFallbackMs else { return [] }

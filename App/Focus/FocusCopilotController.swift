@@ -118,6 +118,9 @@ final class FocusCopilotController {
     @ObservationIgnored private let restore: () -> Void
     /// Seconds the STT window stays open after a question prompt.
     @ObservationIgnored private let listenWindowSec: Double
+    /// Seconds a prompt's line may take before it counts as over without its
+    /// end being reported. The longest line is ~4 s spoken.
+    @ObservationIgnored private let lineTimeoutSec: Double
 
     // State (caller-tracked cadence, mirrors the pure contract).
     @ObservationIgnored private var fired = Set<String>()
@@ -126,8 +129,9 @@ final class FocusCopilotController {
     /// Guards re-entrancy: while a prompt's speak+listen cycle is in flight we
     /// don't fire another milestone (so a burst of ticks can't stack prompts).
     @ObservationIgnored private var busy = false
-    /// Bumped by every prompt and every halt: a line that finishes speaking
-    /// after a pause / end, or after a newer prompt, opens no mic.
+    /// Bumped by every prompt, every halt and once a prompt's line is over: a
+    /// line that finishes speaking after a pause / end, or after a newer
+    /// prompt, opens no mic, and a line goes on to its answer only once.
     @ObservationIgnored private var promptSeq = 0
 
     init(
@@ -139,7 +143,8 @@ final class FocusCopilotController {
         voiceRepliesEnabled: @escaping () -> Bool,
         duck: @escaping () -> Void = { AmbientAudio.shared.duck() },
         restore: @escaping () -> Void = { AmbientAudio.shared.restore() },
-        listenWindowSec: Double = 6
+        listenWindowSec: Double = 6,
+        lineTimeoutSec: Double = 12
     ) {
         self.speaker = speaker
         self.listener = listener
@@ -150,6 +155,7 @@ final class FocusCopilotController {
         self.duck = duck
         self.restore = restore
         self.listenWindowSec = listenWindowSec
+        self.lineTimeoutSec = lineTimeoutSec
     }
 
     /// Begin a coach session (called on focus start when the feature is on).
@@ -302,13 +308,28 @@ final class FocusCopilotController {
         let spoke = safe {
             try speaker.speak(line) { [weak self] in self?.promptSpoken(milestone, prompt: prompt) }
         } != nil
-        if !spoke { promptSpoken(milestone, prompt: prompt) }
+        guard spoke else { promptSpoken(milestone, prompt: prompt); return }
+        // Nothing else closes the cycle now: a line whose end is never
+        // reported (the synthesizer cut off by an audio interruption — a
+        // phone call, an alarm) left `busy` set and the bed ducked for the
+        // rest of the block, and the coach said nothing more (audit
+        // 2026-09-22, C41). Past the timeout the line is over: stop it and
+        // go on.
+        let timeout = lineTimeoutSec
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            guard let self, prompt == self.promptSeq, self.busy else { return }
+            self.safe { self.speaker.stop() }
+            self.promptSpoken(milestone, prompt: prompt)
+        }
     }
 
     /// The prompt's line has been spoken (or couldn't be): listen for the
-    /// answer, or finish. Not if the session was paused / ended meanwhile.
+    /// answer, or finish. Not if the session was paused / ended meanwhile,
+    /// and once per prompt — the line's end and the timeout both land here.
     private func promptSpoken(_ milestone: FocusMilestone, prompt: Int) {
         guard prompt == promptSeq, busy else { return }
+        promptSeq += 1
 
         // Speak-only milestone, or Voice replies off, or recognizer unavailable
         // → no mic. Restore audio and finish.

@@ -122,9 +122,13 @@ struct AssistantSheet: View {
                 interview?.turnFinished()
             }
         }
-        // Read each new assistant reply aloud while the toggle is on.
+        // Read each new assistant reply aloud while the toggle is on — not
+        // while Talk is open over the sheet: a reply landing while it still
+        // connects got past VoiceController's check (Talk holds the audio
+        // only once its socket is open) and played over the realtime voice
+        // (audit 2026-09-22, C41).
         .onChange(of: assistant.lastReplyTick) { _, _ in
-            if speakReplies, let r = assistant.lastReply { voice.speak(r) }
+            if speakReplies, !showVoice, let r = assistant.lastReply { voice.speak(r) }
         }
         // Talk opens over this sheet: a reply still being read aloud would
         // talk over the realtime voice (VoiceController itself stays silent
