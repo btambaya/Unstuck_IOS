@@ -628,12 +628,19 @@ extension AppModel {
         // Owner (no shared marker + a local row): keep the displaced clock's
         // Session row — single writer, id = the displaced session id.
         if cur.sharedFocusLevel == nil, let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil {
-            saveSession(Session(id: oldId, taskId: task.id, taskName: task.name,
-                                estimateMin: task.estimateMin, actualSec: raw,
-                                completedAt: Self.isoNow()))
+            saveSession(Self.displacedClockSession(id: oldId, task: task, rawSec: raw, estimateMin: estimate))
         }
         Task { await self.logSharedFocusDurable(taskId: taskId, actualSec: capped,
                                                 estimateMin: estimate, sessionId: oldId) }
+    }
+
+    /// The owner's Session row for a clock displaced by an adoption, with the
+    /// CAPPED elapsed like its ledger write: a clock left running overnight
+    /// logged its whole night into Insights (audit 2026-09-22, C43).
+    static func displacedClockSession(id: String, task: TaskItem, rawSec: Int, estimateMin: Int) -> Session {
+        Session(id: id, taskId: task.id, taskName: task.name, estimateMin: task.estimateMin,
+                actualSec: cappedSharedElapsedSec(rawSec: rawSec, estimateMin: estimateMin),
+                completedAt: isoNow())
     }
 
     // MARK: - Today live-card resume (shared sessions have no local task row)

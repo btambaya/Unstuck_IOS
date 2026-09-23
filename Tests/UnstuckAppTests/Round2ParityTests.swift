@@ -462,6 +462,27 @@ final class FocusAccuracyTests: XCTestCase {
         XCTAssertEqual(try store.get(), live, "B keeps running, unlogged")
     }
 
+    /// "Start focus on X" to the assistant while X sits paused ("Save for
+    /// later") resumes the same session — its nag goes, and an open Focus
+    /// screen is told (the screen's own start already did both).
+    func testTheAssistantsStartOnAPausedSessionCancelsItsCheckin() async throws {
+        let (model, db, store) = try boot()
+        let x = task(newUUID())
+        try db.save(x)
+        let paused = FocusTimer.pause(running(x.id, sinceMin: 10), now: nowMs - 3 * 60_000)
+        try store.set(paused)
+        model.refreshLiveSession()
+        UserDefaults.standard.set(Date().timeIntervalSince1970 + 600, forKey: PausedCheckinBudget.fireAtKey)
+        let tick = model.liveSessionOffScreenTick
+        await model.startFocusJoinOrMint(taskId: x.id, estimateMin: nil, occurrenceBlockId: nil)
+        let live = try XCTUnwrap(store.get())
+        XCTAssertEqual(live.id, paused.id)
+        XCTAssertFalse(live.paused, "resumed")
+        XCTAssertNil(UserDefaults.standard.object(forKey: PausedCheckinBudget.fireAtKey),
+                     "left armed, 'Did you step away?' fired while it ran")
+        XCTAssertGreaterThan(model.liveSessionOffScreenTick, tick, "an open Focus screen stayed on PAUSED")
+    }
+
     func testDisplacingAPausedSessionCancelsItsCheckin() throws {
         let (model, db, store) = try boot()
         let a = task(newUUID())
@@ -517,12 +538,60 @@ final class FocusAccuracyTests: XCTestCase {
     func testTheFocusScreenAsksOnlyPastTheEstimatePlusGrace() {
         let now = nowMs
         let forgotten = running("c43", sinceMin: 16 * 60)
-        let over = FocusModel.overlongElapsedSec(forgotten, now: now)
+        let over = FocusModel.overlongElapsedSec(forgotten, now: now, sharedLedger: false)
         XCTAssertEqual(Double(over?.raw ?? 0), 16 * 3600, accuracy: 2)
         XCTAssertEqual(over?.capped, 25 * 60 + AppModel.sharedFocusCapGraceSec)
-        XCTAssertNil(FocusModel.overlongElapsedSec(running("c43", sinceMin: 40), now: now), "a long but real session logs as it is")
-        XCTAssertNil(FocusModel.overlongElapsedSec(running("c43", sinceMin: 16 * 60, estimate: 24 * 60), now: now),
+        XCTAssertEqual(over?.mayDiscard, true)
+        XCTAssertNil(FocusModel.overlongElapsedSec(running("c43", sinceMin: 40), now: now, sharedLedger: false),
+                     "a long but real session logs as it is")
+        XCTAssertNil(FocusModel.overlongElapsedSec(running("c43", sinceMin: 16 * 60, estimate: 24 * 60), now: now,
+                                                   sharedLedger: false),
                      "extended to fit")
+    }
+
+    /// On a partner-shared task, ending here broadcasts `ended` and the
+    /// partner's device logs the whole run under the same session id — so
+    /// the prompt never offers "Discard", which would log nothing only here.
+    func testTheFocusScreenOffersNoDiscardOnASessionSharedWithAPartner() throws {
+        let (model, _, _) = try boot()
+        var cofocus = running("c43-partner", sinceMin: 16 * 60)
+        cofocus.sharedSessionRev = 3   // broadcast on the co-focus channel
+        let ledger = model.accruesViaSharedLedger(cofocus, taskId: "c43-partner")
+        XCTAssertTrue(ledger)
+        let over = try XCTUnwrap(FocusModel.overlongElapsedSec(cofocus, now: nowMs, sharedLedger: ledger))
+        XCTAssertFalse(over.mayDiscard)
+        XCTAssertEqual(over.capped, 25 * 60 + AppModel.sharedFocusCapGraceSec, "logging it capped is still offered")
+    }
+
+    /// Adopting a partner's session over my own forgotten clock on the same
+    /// task keeps that clock's Session row — capped like its ledger write,
+    /// not the whole night (C43).
+    func testAdoptingOverAForgottenOwnClockCapsItsSessionRow() {
+        let t = task("c43-adopt")
+        let row = AppModel.displacedClockSession(id: "old", task: t, rawSec: 16 * 3600, estimateMin: 25)
+        XCTAssertEqual(row.id, "old")
+        XCTAssertEqual(row.taskId, t.id)
+        XCTAssertEqual(row.actualSec, 25 * 60 + AppModel.sharedFocusCapGraceSec, "not 16 hours into Insights")
+        XCTAssertEqual(AppModel.displacedClockSession(id: "old", task: t, rawSec: 20 * 60, estimateMin: 25).actualSec,
+                       20 * 60, "a real one logs as it is")
+    }
+
+    /// The assistant's finish_focus caps a session left running — and says
+    /// by how much, so the result line can (rules §1; C43).
+    func testTheAssistantsFinishReportsTheRunItCapped() async throws {
+        let (model, db, store) = try boot()
+        let t = task(newUUID())
+        try db.save(t)
+        try store.set(running(t.id, sinceMin: 16 * 60))
+        model.refreshLiveSession()
+        let state = AppModelAssistantState(model: model, assistant: model.assistant)
+        let finished = await state.finishFocus(markDone: false)
+        let out = try XCTUnwrap(finished)
+        XCTAssertEqual(out.elapsedSec, 25 * 60 + AppModel.sharedFocusCapGraceSec)
+        XCTAssertEqual(Double(try XCTUnwrap(out.ranSec)), 16 * 3600, accuracy: 5)
+        try store.set(running(t.id, sinceMin: 10))
+        let ordinary = await state.finishFocus(markDone: false)
+        XCTAssertNil(try XCTUnwrap(ordinary).ranSec, "logged in full — nothing to report")
     }
 
     // MARK: C44 — captures of a session with no Session row

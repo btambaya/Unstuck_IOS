@@ -196,10 +196,17 @@ final class FocusModel {
     /// running, and one left overnight reads as hours. The screen asks before
     /// logging it (log the capped time, all of it, or discard) instead of
     /// logging it all (audit 2026-09-22, C43). nil = an ordinary finish.
-    static func overlongElapsedSec(_ live: LiveSession, now: Double) -> (raw: Int, capped: Int)? {
+    ///
+    /// Discard is offered only when nothing else will log the session:
+    /// one that accrues via the shared ledger (`sharedLedger`, a partner-
+    /// shared task) broadcasts `ended` when it ends here, and a partner's
+    /// device still on it logs its whole wall-clock run onto this task under
+    /// the same session id — "discarding logs none of it" would be false.
+    static func overlongElapsedSec(_ live: LiveSession, now: Double,
+                                   sharedLedger: Bool) -> (raw: Int, capped: Int, mayDiscard: Bool)? {
         let raw = FocusTimer.elapsedSec(live, now: now)
         let capped = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: live.sessionEstimateMin)
-        return raw > capped ? (raw, capped) : nil
+        return raw > capped ? (raw, capped, !sharedLedger) : nil
     }
 
     /// Stop the session + return the Session row (reusing the live id so
@@ -297,7 +304,7 @@ struct FocusView: View {
     @State private var reflectSel: String?
     /// A finish past the estimate + grace waiting on "log or discard?" (C43).
     @State private var overlongFinish: OverlongFinish?
-    private struct OverlongFinish { let markDone: Bool; let rawSec: Int; let cappedSec: Int }
+    private struct OverlongFinish { let markDone: Bool; let rawSec: Int; let cappedSec: Int; let mayDiscard: Bool }
 
     // Hands-Free Focus Copilot (Phase 1). The VoiceController is the same
     // on-device $0 STT/TTS layer the assistant uses (no LLM/network here). The
@@ -426,10 +433,12 @@ struct FocusView: View {
                             titleVisibility: .visible, presenting: overlongFinish) { o in
             Button("Log \(fmtHrs(o.cappedSec / 60))") { finishSession(markDone: o.markDone, capAt: o.cappedSec) }
             Button("Log all \(fmtHrs(o.rawSec / 60))") { finishSession(markDone: o.markDone, capAt: .max) }
-            Button("Discard this session", role: .destructive) { discardSession() }
+            if o.mayDiscard {
+                Button("Discard this session", role: .destructive) { discardSession() }
+            }
             Button("Cancel", role: .cancel) {}
         } message: { o in
-            Text("That's well past its \(fmtHrs(fm?.live.sessionEstimateMin ?? task.estimateMin)) estimate — was the timer left running? Discarding logs none of it\(o.markDone ? " and leaves the task open" : "").")
+            Text(overlongMessage(o))
         }
         .sheet(isPresented: $showCapture) { captureSheet }
         .sheet(isPresented: $showReflect, onDismiss: { dismiss() }) { reflectSheet }
@@ -456,6 +465,12 @@ struct FocusView: View {
             if phase != .active { teardownCopilot(); AmbientAudio.shared.stop() }
             else if let fm { updateAudio(fm) }
         }
+    }
+
+    private func overlongMessage(_ o: OverlongFinish) -> String {
+        let asked = "That's well past its \(fmtHrs(fm?.live.sessionEstimateMin ?? task.estimateMin)) estimate — was the timer left running?"
+        guard o.mayDiscard else { return asked + " It's shared with a partner, so it can't be discarded." }
+        return asked + " Discarding logs none of it\(o.markDone ? " and leaves the task open" : "")."
     }
 
     /// Mirror the stored session into this screen's FocusModel, or leave when
@@ -895,9 +910,13 @@ struct FocusView: View {
         // second finish logged it twice with a second recap (C37).
         guard fm.syncFromStore() else { dismiss(); return }
         // A session on a task shared WITH me is capped by its own paths.
+        // `sharedLedger` is the check finishFocus's accrual uses below.
         if capAt == nil, fm.sharedLevel == nil,
-           let over = FocusModel.overlongElapsedSec(fm.live, now: FocusModel.now()) {
-            overlongFinish = OverlongFinish(markDone: markDone, rawSec: over.raw, cappedSec: over.capped)
+           let over = FocusModel.overlongElapsedSec(
+               fm.live, now: FocusModel.now(),
+               sharedLedger: model.accruesViaSharedLedger(fm.live, taskId: fm.occurrence?.templateId ?? task.id)) {
+            overlongFinish = OverlongFinish(markDone: markDone, rawSec: over.raw, cappedSec: over.capped,
+                                            mayDiscard: over.mayDiscard)
             return
         }
         teardownCopilot()

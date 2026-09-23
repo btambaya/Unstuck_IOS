@@ -221,8 +221,20 @@ extension AppModel {
         }
         let isFresh = existing?.sessionStart == nil || existing?.taskId != taskId
         if isFresh { session = FocusTimer.setTreatment(session, settings.defaultTreatment) }
+        // A paused session this start did not keep paused as-is — resumed
+        // (same task, or the series re-pointed to another day), or adopted
+        // over — takes its "Did you step away?" nag with it, as on the Focus
+        // screen: finalizeDisplacedFocus skips the same task, so the nag fired
+        // during the running session (audit 2026-09-22, C38).
+        if let existing, existing.paused, !(session.id == existing.id && session.paused) {
+            cancelPausedCheckin()
+        }
         try? store.set(session)
         refreshLiveSession()
+        // The same session continued (resumed / re-pointed): an open Focus
+        // screen follows it instead of showing PAUSED (C37). A different one
+        // is opened by the caller's navigation.
+        if existing?.sessionStart != nil, existing?.id == session.id { noteLiveSessionChangedOffScreen() }
     }
 
     /// Reap focus Live Activities left dangling by a kill/crash mid-session.

@@ -291,7 +291,10 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         }
         let mins = max(1, Int((Double(out.elapsedSec) / 60.0).rounded()))
         let state = out.markedDone ? "task marked done" : (markDone ? "task still open (a repeating task's series is never closed this way)" : "task still open")
-        return "ok: finished the session on \"\(out.taskName)\" — \(mins)m logged, \(state)"
+        // A session left running is logged capped — SAID, never a silent
+        // clamp (rules §1; audit 2026-09-22, C43).
+        let capped = out.ranSec.map { " (capped at its estimate + \(AppModel.sharedFocusCapGraceSec / 60) min — the timer ran \(fmtHrs($0 / 60)))" } ?? ""
+        return "ok: finished the session on \"\(out.taskName)\" — \(mins)m logged\(capped), \(state)"
 
     case "cancel_focus":
         guard let live = api.getLiveFocus(), live.sessionStart != nil else { return "error: no focus session is running" }

@@ -195,6 +195,11 @@ struct FocusFinishOutcome: Equatable, Sendable {
     let taskName: String
     let elapsedSec: Int
     let markedDone: Bool
+    /// What the timer measured when `elapsedSec` is that capped at the
+    /// estimate + grace (a session left running); nil = logged in full. The
+    /// result line says so — a clamped value is never silent (rules §1;
+    /// audit 2026-09-22, C43).
+    var ranSec: Int? = nil
 }
 
 /// The `get_settings` read (2026-09-20). Strings carry the registry's

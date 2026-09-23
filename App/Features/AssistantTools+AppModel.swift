@@ -300,10 +300,11 @@ final class AppModelAssistantState: AssistantAppState {
         guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return nil }
         let now = Date().timeIntervalSince1970 * 1000
         // Finished off the Focus screen: a session left running overnight is
-        // capped at its estimate + grace, not logged as hours (audit
+        // capped at its estimate + grace, not logged as hours — and the
+        // outcome carries the raw run so the result says so (audit
         // 2026-09-22, C43).
-        let elapsed = AppModel.cappedSharedElapsedSec(rawSec: FocusTimer.elapsedSec(cur, now: now),
-                                                      estimateMin: cur.sessionEstimateMin)
+        let raw = FocusTimer.elapsedSec(cur, now: now)
+        let elapsed = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: cur.sessionEstimateMin)
         let task = (try? model.taskRepo?.fetch(id: cur.taskId)) ?? nil
         let name = task?.name ?? "Focus session"
         let session = Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: name,
@@ -334,7 +335,8 @@ final class AppModelAssistantState: AssistantAppState {
         }
         // A presented Focus screen would keep showing a clock the store no longer has.
         if model.router.focusTask != nil { model.router.focusTask = nil; model.router.sharedFocus = nil }
-        return FocusFinishOutcome(taskId: cur.taskId, taskName: name, elapsedSec: elapsed, markedDone: markedDone)
+        return FocusFinishOutcome(taskId: cur.taskId, taskName: name, elapsedSec: elapsed, markedDone: markedDone,
+                                  ranSec: raw > elapsed ? raw : nil)
     }
     func cancelFocus() {
         guard let store = model.liveStore, let cur = (try? store.get()) ?? nil, cur.sessionStart != nil else { return }
