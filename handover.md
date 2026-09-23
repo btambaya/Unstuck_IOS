@@ -43,7 +43,7 @@ phases land. Newest status at the top.
 
 
 
-## App-confirm links (build 88) — branch feat/app-confirm-links, not shipped
+## App-confirm links (build 88) — shipped 2026-09-23
 
 **Why** (owner decision 2026-09-23, "Proper fix in the apps"): an app sign-up's email carried Supabase's own link, which ends
 at `unstuck://auth-callback?code=…`. A phone opens that; a COMPUTER can't — dead end. Shared contract with web + Android:
