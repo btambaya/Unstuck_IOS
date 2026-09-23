@@ -51,6 +51,24 @@ final class AssistantBulkUITests: XCTestCase {
         bubble.tap()
     }
 
+    /// Close the sheet the way a person does: drag it down BY ITS HEADER.
+    /// A swipe from the middle of the screen lands in the thread, which a live
+    /// turn pins to the bottom — it only scrolls the thread back up and the
+    /// sheet never moves. That is how this file used to "exit" nothing: the
+    /// Today tab bar still EXISTS behind a sheet, so the next check passed and
+    /// the walk then tapped through the sheet (the Calendar tab's spot is the
+    /// sheet's input bar).
+    private func exitSheet() {
+        let header = app.staticTexts["ASK UNSTUCK TO HANDLE IT"].firstMatch
+        XCTAssertTrue(header.waitForExistence(timeout: 5), "the assistant sheet's header is missing")
+        header.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 0.05,
+                   thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.95)),
+                   withVelocity: .fast, thenHoldForDuration: 0)
+        XCTAssertTrue(app.textFields["assistant-input"].waitForNonExistence(timeout: 5),
+                      "the assistant sheet did not close")
+    }
+
     private func send(_ text: String) {
         // By IDENTIFIER — Today's gateway composer is a TextField too and sits
         // behind this sheet, so `textFields.firstMatch` picks the wrong one.
@@ -86,9 +104,7 @@ final class AssistantBulkUITests: XCTestCase {
         // Exit immediately — the turn keeps running detached, writing 50 rows
         // into a store the Today/Calendar screens are observing.
         usleep(400_000)
-        app.swipeDown(velocity: .fast)
-        usleep(300_000)
-        app.swipeDown(velocity: .fast)
+        exitSheet()
         snap("10-exited-mid-turn")
 
         XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 15), "the app died on exiting the sheet")
@@ -123,8 +139,7 @@ final class AssistantBulkUITests: XCTestCase {
         openAssistant()
         send("put 50 things on tomorrow")
         usleep(6_000_000)
-        app.swipeDown(velocity: .fast); usleep(400_000)
-        app.swipeDown(velocity: .fast); usleep(600_000)
+        exitSheet(); usleep(600_000)
         openAssistant()
         usleep(800_000)
         snap("20-reopened")

@@ -13,6 +13,12 @@
 // (App/UITestSupport.swift), theme + accent are UserDefaults launch
 // arguments (`-unstuck.theme dark -unstuck.accent forest`) and the text size
 // is -UIPreferredContentSizeCategoryName.
+//
+// Since build 59 (2026-09-17) the card lists ONLY the people who already have
+// the item; everyone else sits behind one "Choose someone, N people" row that
+// opens a searchable picker ("Search people", rows "Share with <name>"). The
+// collapse / "Show N more" / inline Find field are gone, so the busy + search
+// configurations go through that picker.
 
 import XCTest
 
@@ -143,6 +149,16 @@ final class SharePeopleCardShots: XCTestCase {
         return true
     }
 
+    /// Open the "Choose someone" picker — the only way to the people who
+    /// don't have the item yet.
+    private func openPicker(_ app: XCUIApplication, _ c: Config) -> Bool {
+        let choose = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Choose someone'")).firstMatch
+        expect(choose, "[\(c.name)] no 'Choose someone' row on the People card")
+        guard choose.exists else { return false }
+        choose.tap(); usleep(800_000)
+        return true
+    }
+
     func testPeopleCardMatrix() throws {
         // SHARE_SHOTS_ONLY="07-seven,ax-07-2shared" (TEST_RUNNER_-prefixed for
         // xcodebuild) re-shoots a subset after a targeted fix.
@@ -157,15 +173,17 @@ final class SharePeopleCardShots: XCTestCase {
                 if more.exists { more.tap(); usleep(600_000) }
                 expect(app.buttons["Show fewer people"].firstMatch, "[\(c.name)] the disclosure did not flip to Show fewer")
             }
-            if let q = c.query {
-                let field = app.textFields["Find a person"].firstMatch
-                expect(field, "[\(c.name)] the Find field is missing when expanded at ≥10 people")
+            if let q = c.query, openPicker(app, c) {
+                let field = app.searchFields["Search people"].firstMatch
+                expect(field, "[\(c.name)] the picker's search field is missing")
                 if field.exists { field.tap(); usleep(300_000); field.typeText(q); usleep(600_000) }
             }
-            if c.slowTap {
+            if c.slowTap, openPicker(app, c) {
                 let first = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Share with '")).firstMatch
-                expect(first, "[\(c.name)] no unshared row to tap")
-                if first.exists { first.tap(); usleep(350_000) }
+                expect(first, "[\(c.name)] no unshared person in the picker to tap")
+                // The pick closes the picker; the write is held 1.5s
+                // (UITEST_SHARE_SLOW), so this still shoots it mid-write.
+                if first.exists { first.tap(); usleep(700_000) }
             }
             if c.openMenu {
                 let shared = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Change access'")).firstMatch
@@ -176,7 +194,9 @@ final class SharePeopleCardShots: XCTestCase {
             if c.ax {
                 // At accessibility sizes the header fills the first screen —
                 // bring the People eyebrow to the top so the rows are in frame.
-                let eyebrow = app.staticTexts[c.handOver ? "Hand over to, 7" : "People, 7"].firstMatch
+                // Its label counts who HAS the item ("People, 2"), not the roster.
+                let eyebrow = app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH %@",
+                                                                   c.handOver ? "Hand over to," : "People,")).firstMatch
                 for _ in 0..<5 where !(eyebrow.exists && eyebrow.frame.minY < 260) {
                     app.swipeUp(); usleep(500_000)
                 }
