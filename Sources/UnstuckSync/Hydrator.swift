@@ -218,9 +218,12 @@ public actor Hydrator {
     /// reverted to the server's older copy by a hydrate that runs while the op
     /// is still in the outbox. A flush normally precedes the hydrate, so this
     /// closes a narrow race rather than an everyday path.
+    /// An insert-family op (a deterministic occurrence mint, stage 2) counts
+    /// exactly like an upsert: a re-minted row must survive a pull that runs
+    /// between its queued delete and its insert.
     private static func pendingUpsertIds(in conn: Database, table: String) throws -> Set<String> {
         Set(try OutboxStore.pending(in: conn)
-            .filter { $0.tableName == table && ($0.kind == .upsert || $0.kind == .rpc) }
+            .filter { $0.tableName == table && $0.kind.isPendingWrite }
             .map(\.rowId))
     }
 
@@ -589,12 +592,31 @@ public actor Hydrator {
         }
     }
 
+    // MARK: - the cal_blocks pull signal (stage 2, deterministic-occurrence-ids.md §3c)
+
+    /// The last `cal_blocks` read that SUCCEEDED, stamped inside
+    /// `hydrateCalBlocks` — the full hydrate and the catch-up's full replace
+    /// both go through it. The recurrence top-up runs only after this advances
+    /// (and not when the read hit the row cap, §f). The generic "pull
+    /// succeeded" signals lie for this: the first pull of a session stamps
+    /// success unconditionally, and the hydrate ignores this table's result.
+    private var lastCalBlocksPull: CalBlocksPull?
+    private var calBlocksPullSeq = 0
+
+    public func calBlocksPull() -> CalBlocksPull? { lastCalBlocksPull }
+
+    /// A signed-out / switched user: the next account's top-up must wait for
+    /// ITS own successful read.
+    public func resetCalBlocksPull() { lastCalBlocksPull = nil }
+
     @discardableResult
     private func hydrateCalBlocks() async -> Bool {
         do {
             // Per-row tolerant decode (see replace()): a single bad cal_block row
-            // mustn't wipe the whole schedule.
-            let remote = try await gateway.fetchAllTolerant(CalBlockRow.self, table: "cal_blocks").map { $0.model() }
+            // mustn't wipe the whole schedule. The RAW count is what the row cap
+            // (PostgREST max_rows = 1000) is judged on.
+            let raw = try await gateway.fetchAllRaw(table: "cal_blocks")
+            let remote = raw.compactMap { try? decoder.decode(CalBlockRow.self, from: $0) }.map { $0.model() }
             try db.replaceAllAtomically(CalBlock.self) { conn, local in
                 let localExternal = local.filter { isExternalBlock($0) }
                 let merged = SyncDecision.mergeHydratedCalBlocks(remote: remote, localExternal: localExternal)
@@ -606,11 +628,33 @@ public actor Hydrator {
                 let ownLocal = local.filter { !isExternalBlock($0) }
                 return SyncDecision.mergeHydratedRows(remote: merged, local: ownLocal, pendingIds: pending) { l, _ in l }
             }
+            calBlocksPullSeq += 1
+            lastCalBlocksPull = CalBlocksPull(seq: calBlocksPullSeq, at: Date(), rowCount: raw.count)
             return true
         } catch {
             print("[hydrate] cal_blocks failed, leaving local intact: \(error)")
             return false
         }
+    }
+}
+
+/// One successful `cal_blocks` read (see `Hydrator.calBlocksPull`). `seq` only
+/// ever grows, so "has a new pull landed since?" never compares clocks.
+public struct CalBlocksPull: Sendable, Equatable {
+    public let seq: Int
+    public let at: Date
+    /// Rows the server returned. At PostgREST's cap the read is truncated.
+    public let rowCount: Int
+
+    /// PostgREST `max_rows`: a read that returned this many rows may be cut
+    /// short (ordered by nothing, so any rows can be missing).
+    public static let rowCap = 1000
+    public var mayBeTruncated: Bool { rowCount >= Self.rowCap }
+
+    public init(seq: Int, at: Date, rowCount: Int) {
+        self.seq = seq
+        self.at = at
+        self.rowCount = rowCount
     }
 }
 

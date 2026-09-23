@@ -55,6 +55,11 @@ final class AppModelAssistantState: AssistantAppState {
     /// The UI's completion hook (AppModel.toggleDone / finishFocus → `.done`), best-effort.
     func notifyTaskCompletedIfShared(_ t: TaskItem) { model.notifyTaskDoneIfShared(t) }
     func upsertBlock(_ b: CalBlock) async { await model.saveBlockAwaiting(b) }
+    /// The mint path: the same un-park as `upsertBlock`, insert-if-absent, and
+    /// the Google push deferred until the server confirms the insert (rule G).
+    func insertBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool) async -> Bool {
+        await model.saveBlockInserting(b, retimeIfTaken: retimeIfTaken)
+    }
     /// `unschedule` reconciles Google for a pushed task block, then deletes.
     func deleteBlock(_ id: String) async { await model.unscheduleAwaiting(id) }
 

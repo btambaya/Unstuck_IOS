@@ -75,6 +75,15 @@ final class AppModel {
     @ObservationIgnored private var pendingAuthCallbackURL: URL?
     /// Local-only WriteThrough used by the XCUITest demo boot (no coordinator).
     var uiTestWrite: WriteThrough?
+    /// Rule G's gate for the XCUITest / unit-test boot (no coordinator, so no
+    /// flusher owns one). Production reads the flusher's via the coordinator.
+    var uiTestMirrorGate: InsertMirrorGate?
+    /// The Google pushes that waited for their insert (rule G), run one at a
+    /// time so a top-up's worth of confirmations can't fire dozens of
+    /// concurrent calendar calls.
+    @ObservationIgnored private var googleMirrorTail: Task<Void, Never>?
+    /// Test seam: every Google push of a cal_block that actually goes out.
+    @ObservationIgnored var onGoogleMirrorDispatched: ((CalBlock) -> Void)?
     // Per-collection serial RPC queue. The optimistic local write happens
     // synchronously on the main actor; the server RPC dispatch is chained so two
     // rapid edits to the same shared collection can't reach the server out of
@@ -846,6 +855,7 @@ final class AppModel {
         liveStore = LiveSessionStore(database)
         refreshLiveSession()
         uiTestWrite = WriteThrough(db: database)
+        uiTestMirrorGate = InsertMirrorGate(db: database)
         if heavy { HeavyDemoSeed.seedIfNeeded(database) } else { DemoSeed.seed(database) }
         // The demo persona has a NAME. Without one the greeting falls back to
         // "Good evening Unstuck." — correct behaviour, but it reads as a bug in
@@ -978,6 +988,11 @@ final class AppModel {
         // the optimistic row back to the server's copy + say so once.
         await coord.setOnCollectionRPCRejected { [weak self] collectionId, fn, error in
             Task { @MainActor in self?.handleCollectionRPCRejected(collectionId: collectionId, fn: fn, error: error) }
+        }
+        // A minted occurrence's insert resolved (stage 2): a Google push that
+        // waited for it goes out now — once, and never for an ignored insert.
+        await coord.setOnInsertResolved { [weak self] resolution in
+            Task { @MainActor in self?.handleInsertResolved(resolution) }
         }
         // Ritual toggles are account-wide (migration 053) — push every change.
         paPrefs.onRitualsChanged = { [weak self] rituals in self?.pushRituals(rituals) }
@@ -1486,6 +1501,8 @@ final class AppModel {
     /// Drives the UI instantly via each repository's ValueObservation. Falls
     /// back to the local-only writer in the XCUITest demo boot.
     var write: WriteThrough? { coordinator?.write ?? uiTestWrite }
+    /// Rule G's gate (see InsertMirrorGate).
+    var mirrorGate: InsertMirrorGate? { coordinator?.mirrorGate ?? uiTestMirrorGate }
 
     /// Sign out via the coordinator's spec'd path: drain the outbox
     /// (bounded; whatever can't be pushed — offline — is parked under this
@@ -1900,11 +1917,61 @@ final class AppModel {
             try? await write.upsertTask(unparked, nowISO: nowISO)
         }
         try? await write.upsertCalBlock(block, nowISO: Self.isoNow())
-        // Only TASK blocks mirror to Google (spec §1.6): external g_ blocks are
-        // read-only mirrors of the remote calendar and must never be
-        // (re-)pushed; placeholders have nothing to push.
+        requestGoogleMirror(block)
+    }
+
+    /// A MINT (stage 2, deterministic-occurrence-ids.md): `saveBlockAwaiting`
+    /// for a repeating task's occurrence created with its deterministic id —
+    /// the same un-park, but written insert-if-absent (`retimeIfTaken`: the
+    /// user asked for this day, so an id the server already has retimes that
+    /// day's open occurrence, rule H). Its Google push waits until the server
+    /// confirms the insert (rule G). False = a row with that id already exists
+    /// locally (the day's occurrence lives on, moved or finished): nothing
+    /// was written.
+    @discardableResult
+    func saveBlockInserting(_ block: CalBlock, retimeIfTaken: Bool) async -> Bool {
+        guard let write else { return false }
+        let nowISO = Self.isoNow()
+        if let taskId = block.taskId, let owner = (try? taskRepo?.fetch(id: taskId)) ?? nil,
+           let unparked = unparkedTaskForBlock(block, tasks: [owner], nowISO: nowISO) {
+            try? await write.upsertTask(unparked, nowISO: nowISO)
+        }
+        let wrote = (try? await write.insertCalBlockIfAbsent(block, retimeIfTaken: retimeIfTaken, nowISO: Self.isoNow())) ?? false
+        if wrote { requestGoogleMirror(block) }
+        return wrote
+    }
+
+    /// Rule G (deterministic-occurrence-ids.md §3 c-bis): push a task block to
+    /// Google now, unless its insert is still unresolved — then the push only
+    /// records "mirror wanted" and `handleInsertResolved` runs it once the
+    /// server confirms (never when the server ignored it). Only TASK blocks
+    /// mirror (spec §1.6): external g_ blocks are read-only mirrors of the
+    /// remote calendar; placeholders have nothing to push.
+    private func requestGoogleMirror(_ block: CalBlock) {
         guard isTaskBlock(block) else { return }
+        if let gate = mirrorGate, !gate.requestMirror(rowId: block.id) { return }
+        onGoogleMirrorDispatched?(block)
         Task { await self.mirrorBlockToGoogle(block) }
+    }
+
+    /// An insert-family op resolved. A push that waited on it goes out once,
+    /// from the row as it is NOW (a `retimed` row already carries the other
+    /// device's Google mapping, so this PATCHes that event), one at a time.
+    func handleInsertResolved(_ resolution: InsertResolution) {
+        guard resolution.table == "cal_blocks", resolution.mirrorWanted, resolution.outcome.isConfirmed else { return }
+        let previous = googleMirrorTail
+        googleMirrorTail = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, let fresh = (try? self.db?.fetchById(CalBlock.self, id: resolution.rowId)) ?? nil,
+                  isTaskBlock(fresh) else { return }
+            self.onGoogleMirrorDispatched?(fresh)
+            await self.mirrorBlockToGoogle(fresh)
+        }
+    }
+
+    /// Test seam: the queued rule-G pushes have all run.
+    func awaitGoogleMirrors() async {
+        await googleMirrorTail?.value
     }
 
     /// `deleteBlock`, returning once the local row is committed. The Google
@@ -1913,6 +1980,7 @@ final class AppModel {
     func deleteBlockAwaiting(_ block: CalBlock) async {
         guard let write else { return }
         try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
+        mirrorGate?.forget(rowId: block.id)   // its cancelled insert will never resolve
         Task { await self.deleteGoogleEvent(for: block) }
     }
 
@@ -2119,19 +2187,17 @@ final class AppModel {
         // (which 403 on insert). "primary" is Google's alias for the
         // main, always-writable calendar (Android pushBlockUpsert).
         let calId = "primary"
-        var next = block
         if let eventId = block.externalEventId {
             do {
                 try await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
                                               summary: block.taskName, start: range.start, end: range.end)
                 // A legacy row pushed before stamping: record the connection now.
                 if block.externalConnectionId == nil {
-                    next.externalConnectionId = conn.id
-                    try? await write.upsertCalBlock(next, nowISO: Self.isoNow())
+                    _ = await stampGoogleMapping(blockId: block.id, eventId: eventId, connectionId: conn.id, write: write)
                 }
                 return
             } catch CalendarSyncError.eventGone {
-                next.externalEventId = nil   // gone in Google → re-create below
+                // gone in Google → re-create below (the stamp replaces the stale id)
             } catch {
                 return   // offline / transient: the next save retries the PATCH
             }
@@ -2139,9 +2205,27 @@ final class AppModel {
         guard let newId = try? await calendar.insertEvent(
             connectionId: conn.id, calendarId: calId,
             summary: block.taskName, start: range.start, end: range.end) else { return }
-        next.externalEventId = newId
-        next.externalConnectionId = conn.id
-        try? await write.upsertCalBlock(next, nowISO: Self.isoNow())
+        if !(await stampGoogleMapping(blockId: block.id, eventId: newId, connectionId: conn.id, write: write)) {
+            // The block was deleted while the event was being created: don't
+            // resurrect the row with a whole-row stamp, drop the new event.
+            try? await calendar.deleteEvent(eventId: newId, connectionId: conn.id, calendarId: calId)
+        }
+    }
+
+    /// Write a Google mapping onto the block as it is NOW, re-read after the
+    /// Google call — never onto the row that was pushed (deterministic-
+    /// occurrence-ids.md rule G). The stamp is a whole-row upsert: built from
+    /// the pushed copy it overwrote any edit made during the call (and, for a
+    /// deterministic occurrence, could write this device's copy over another
+    /// device's row). False when the row is gone.
+    private func stampGoogleMapping(blockId: String, eventId: String, connectionId: String,
+                                    write: WriteThrough) async -> Bool {
+        guard var fresh = (try? db?.fetchById(CalBlock.self, id: blockId)) ?? nil else { return false }
+        guard fresh.externalEventId != eventId || fresh.externalConnectionId != connectionId else { return true }
+        fresh.externalEventId = eventId
+        fresh.externalConnectionId = connectionId
+        try? await write.upsertCalBlock(fresh, nowISO: Self.isoNow())
+        return true
     }
 
     /// Delete a block locally + on Google (if it was pushed). External g_

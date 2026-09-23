@@ -34,6 +34,26 @@ public enum OutboxKind: String, Codable, Sendable {
     /// bytes can never succeed) — the flusher drops it and reports it so the
     /// optimistic local row is rolled back with a visible error.
     case rpc
+    /// Insert-if-absent: a repeating task's occurrence minted with its
+    /// deterministic id (`occurrenceId`, audit 2026-09-22 C21, stage 2). The
+    /// server runs `INSERT … ON CONFLICT (id) DO NOTHING`, so a mint never
+    /// overwrites a row another device already has (hazard c). The top-up's
+    /// maintenance mints use it.
+    case insert
+    /// Insert-if-absent for a mint the USER asked for (an edit, Schedule, a
+    /// placement): when the server already had the id, one conditional,
+    /// column-scoped retime of that day's OPEN occurrence follows (rule H).
+    case insertOrRetime = "insert_or_retime"
+
+    /// `insert` or `insertOrRetime`. Stored as text, so no migration; a build
+    /// before stage 2 cannot decode them (the accepted TestFlight-downgrade
+    /// residual, deterministic-occurrence-ids.md §e).
+    public var isInsertFamily: Bool { self == .insert || self == .insertOrRetime }
+
+    /// An un-acked local write that keeps its row alive locally: the hydrate,
+    /// the catch-up and the id reconcile all preserve a row with one. Every
+    /// kind but `delete` (an insert-family op counts exactly like an upsert).
+    public var isPendingWrite: Bool { self != .delete }
 }
 
 /// The payload of an `OutboxKind.rpc` op: the function name and its
@@ -188,7 +208,7 @@ public struct OutboxStore: Sendable {
         _ = try OutboxOp.deleteOne(db, key: opSeq)
     }
 
-    /// Drop any queued upsert (and rpc-mutation) ops for a row about to be
+    /// Drop any queued upsert (and rpc-mutation, and insert-family) ops for a row about to be
     /// deleted, so a held-back upsert (e.g. a cal_block waiting on its parent
     /// task via `dependsOn`) can't flush AFTER the delete and resurrect the
     /// row server-side (spec 02-sync-engine §1.6/§1.8), and a shared-list item
@@ -213,11 +233,15 @@ public struct OutboxStore: Sendable {
     /// its attempts). Kept, it pinned the row against every hydrate and
     /// catch-up and, for a task, held back all of its blocks via `dependsOn`
     /// (audit 2026-09-22, C4).
+    /// A quarantined insert-family op is dropped the same way (stage 2): the
+    /// fresh upsert carries the whole current row, which is what the insert
+    /// would have created.
     public static func dropQuarantinedUpserts(in db: Database, table: String, rowId: String) throws {
+        let kinds = [OutboxKind.upsert, .insert, .insertOrRetime].map(\.rawValue)
         _ = try OutboxOp
             .filter(Column("tableName") == table)
             .filter(Column("rowId") == rowId)
-            .filter(Column("kind") == OutboxKind.upsert.rawValue)
+            .filter(kinds.contains(Column("kind")))
             .filter(Column("attempts") >= quarantineCap)
             .deleteAll(db)
     }
@@ -251,6 +275,16 @@ public struct OutboxStore: Sendable {
         op.baseUpdatedAt = baseUpdatedAt
         op.basePayload = basePayload
         try op.update(db)
+    }
+
+    /// True while `rowId` has a queued insert-family op in `table` (rule G:
+    /// no Google push goes out for a row whose insert is unresolved).
+    public static func hasInsertFamilyOp(in db: Database, table: String, rowId: String) throws -> Bool {
+        try OutboxOp
+            .filter(Column("tableName") == table)
+            .filter(Column("rowId") == rowId)
+            .filter([OutboxKind.insert.rawValue, OutboxKind.insertOrRetime.rawValue].contains(Column("kind")))
+            .fetchCount(db) > 0
     }
 
     public func count() throws -> Int {

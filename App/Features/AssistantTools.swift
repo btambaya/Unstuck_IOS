@@ -69,6 +69,12 @@ protocol AssistantAppState: AnyObject {
     /// every member seeing the item open or overdue. No-op for any other task.
     func notifyTaskCompletedIfShared(_ t: TaskItem)
     func upsertBlock(_ b: CalBlock) async
+    /// A repeating task's occurrence MINTED with its deterministic id (stage
+    /// 2): insert-if-absent, committed before returning like `upsertBlock`.
+    /// `retimeIfTaken` = the user asked for this day (rule H). False = a row
+    /// with that id already exists (the day's occurrence lives on): nothing
+    /// was written.
+    func insertBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool) async -> Bool
     func deleteBlock(_ id: String) async
     // ── lists ──
     // Every list write returns the REAL outcome (2026-09-20 tooling rules §1):

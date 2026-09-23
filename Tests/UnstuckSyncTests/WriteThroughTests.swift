@@ -178,4 +178,89 @@ final class WriteThroughTests: XCTestCase {
         XCTAssertEqual(try db.fetchById(ItemCollection.self, id: "l1")?.name, "Fresh")
         XCTAssertEqual(try box.pending().map(\.rowId), ["l1"])
     }
+
+    // MARK: - insert-if-absent (stage 2, deterministic-occurrence-ids.md rule A)
+
+    private let seriesId = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+    private func mint(_ date: String, _ time: String = "07:00") -> CalBlock {
+        CalBlock(id: occurrenceId(taskId: seriesId, date: date), taskId: seriesId, taskName: "Gym",
+                 startTime: time, durationMinutes: 30, date: date, kind: .task)
+    }
+
+    /// A row with the id already exists locally (moved, done, kept — any
+    /// state): the mint is skipped. No row write, no op.
+    func testInsertIfAbsentSkipsAnExistingRow() async throws {
+        var moved = mint("2026-09-24")
+        moved.date = "2026-09-26"   // the day's occurrence, moved two days on
+        moved.done = true
+        try db.save(moved)
+        let wrote = try await write.insertCalBlockIfAbsent(mint("2026-09-24", "09:00"), retimeIfTaken: true, nowISO: now)
+        XCTAssertFalse(wrote)
+        XCTAssertEqual(try box.count(), 0, "no op for a skipped mint")
+        let row = try XCTUnwrap(db.fetchById(CalBlock.self, id: moved.id))
+        XCTAssertEqual(row.date, "2026-09-26", "the moved occurrence is never pulled back")
+        XCTAssertEqual(row.startTime, "07:00")
+        XCTAssertTrue(row.done)
+    }
+
+    /// A fresh mint writes the row (clamped) and queues the requested kind,
+    /// waiting on the parent task like every block op.
+    func testInsertIfAbsentEnqueuesTheRequestedKind() async throws {
+        var short = mint("2026-09-24")
+        short.durationMinutes = 2
+        let r1 = try await write.insertCalBlockIfAbsent(short, retimeIfTaken: false, nowISO: now)
+        XCTAssertTrue(r1)
+        let r2 = try await write.insertCalBlockIfAbsent(mint("2026-09-25"), retimeIfTaken: true, nowISO: now)
+        XCTAssertTrue(r2)
+        let ops = try box.pending()
+        XCTAssertEqual(ops.map(\.kind), [.insert, .insertOrRetime])
+        XCTAssertEqual(ops.map(\.kind.rawValue), ["insert", "insert_or_retime"], "the stored text every platform shares")
+        XCTAssertEqual(ops.map(\.dependsOn), [seriesId, seriesId])
+        XCTAssertEqual(try db.fetchById(CalBlock.self, id: short.id)?.durationMinutes, 5, "clamped like an upsert")
+        XCTAssertTrue(try XCTUnwrap(ops[0].payload).contains("\"duration_minutes\":5"))
+        // A second mint of the same day (a back-to-back top-up) queues nothing.
+        let r3 = try await write.insertCalBlockIfAbsent(mint("2026-09-24"), retimeIfTaken: false, nowISO: now)
+        XCTAssertFalse(r3)
+        XCTAssertEqual(try box.count(), 2)
+        // A Google g_ row is never enqueued, insert or not.
+        let g = CalBlock(id: "g_evt", taskId: nil, taskName: "Meeting", startTime: "10:00", durationMinutes: 60,
+                         date: "2026-09-24", kind: .external)
+        let r4 = try await write.insertCalBlockIfAbsent(g, retimeIfTaken: false, nowISO: now)
+        XCTAssertTrue(r4)
+        XCTAssertEqual(try box.count(), 2)
+    }
+
+    /// A delete cancels a still-queued mint (it would re-create the row).
+    func testDeleteCancelsAPendingInsert() async throws {
+        let b = mint("2026-09-24")
+        try await write.insertCalBlockIfAbsent(b, retimeIfTaken: true, nowISO: now)
+        try await write.deleteCalBlock(id: b.id, nowISO: now)
+        XCTAssertEqual(try box.pending().map(\.kind), [.delete])
+        XCTAssertNil(try db.fetchById(CalBlock.self, id: b.id))
+    }
+
+    /// "Never" then "Daily": the day's id is deleted, then minted again. The
+    /// outbox keeps both, delete first (hazard d).
+    func testDeleteThenReMintKeepsOrder() async throws {
+        let b = mint("2026-09-24")
+        try db.save(b)
+        try await write.deleteCalBlock(id: b.id, nowISO: now)
+        let reMinted = try await write.insertCalBlockIfAbsent(b, retimeIfTaken: true, nowISO: now)
+        XCTAssertTrue(reMinted, "the deleted row is gone locally, so the re-mint writes")
+        let ops = try box.pending()
+        XCTAssertEqual(ops.map(\.kind), [.delete, .insertOrRetime])
+        XCTAssertEqual(Set(ops.map(\.rowId)), [b.id])
+        XCTAssertLessThan(try XCTUnwrap(ops[0].opSeq), try XCTUnwrap(ops[1].opSeq))
+    }
+
+    /// A fresh whole-row save supersedes a quarantined insert of the row, as
+    /// it does a quarantined upsert (C4).
+    func testAFreshSaveDropsAQuarantinedInsert() async throws {
+        let b = mint("2026-09-24")
+        try await write.insertCalBlockIfAbsent(b, retimeIfTaken: false, nowISO: now)
+        let seq = try XCTUnwrap(box.pending().first?.opSeq)
+        for _ in 0..<OutboxStore.quarantineCap { try box.bumpAttempts(seq) }
+        try await write.upsertCalBlock(b, nowISO: now)
+        XCTAssertEqual(try box.pending().map(\.kind), [.upsert])
+    }
 }

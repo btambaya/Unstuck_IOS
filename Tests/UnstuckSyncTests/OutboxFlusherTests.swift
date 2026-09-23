@@ -6,6 +6,8 @@
 // drain loop runs against a real GRDB outbox without a network.
 
 import XCTest
+import Auth
+import Supabase
 import UnstuckCore
 import UnstuckData
 @testable import UnstuckSync
@@ -58,13 +60,77 @@ private actor FakeGateway: SyncGatewayProtocol {
         if shouldFail(fn) { throw errorFor[fn] ?? Failure() }
         rpcs.append((fn, paramsJSON))
     }
+
+    // MARK: the insert family (stage 2): a real ON CONFLICT (id) DO NOTHING
+    // store keyed by id, and the filtered, column-scoped retime.
+
+    struct ServerBlock: Sendable, Equatable {
+        var id: String
+        var taskId: String?
+        var taskName: String
+        var date: String
+        var startTime: String
+        var durationMinutes: Int
+        var done = false
+        var skipped = false
+        var externalEventId: String?
+    }
+    private(set) var blocks: [String: ServerBlock] = [:]
+    /// Every insert-if-absent sent (ids), and every conditional retime
+    /// ("id|date|start|duration").
+    private(set) var inserts: [String] = []
+    private(set) var retimes: [String] = []
+    private var onInsert: (@Sendable (String) -> Void)?
+
+    func seed(_ b: ServerBlock) { blocks[b.id] = b }
+    func setOnInsert(_ hook: @escaping @Sendable (String) -> Void) { onInsert = hook }
+
+    func insertIfAbsent<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws -> Bool {
+        let data = try JSONEncoder().encode(row)
+        let obj = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+        let id = obj["id"] as? String ?? ""
+        onInsert?(id)
+        if shouldFail(id) { throw errorFor[id] ?? Failure() }
+        inserts.append(id)
+        guard blocks[id] == nil else { return false }
+        blocks[id] = ServerBlock(id: id, taskId: obj["task_id"] as? String, taskName: obj["task_name"] as? String ?? "",
+                                 date: obj["date"] as? String ?? "", startTime: obj["start_time"] as? String ?? "",
+                                 durationMinutes: obj["duration_minutes"] as? Int ?? 0,
+                                 externalEventId: obj["external_event_id"] as? String)
+        return true
+    }
+
+    func retimeIfOpen(table: String, id: String, date: String, startTime: String, durationMinutes: Int) async throws -> Data? {
+        retimes.append("\(id)|\(date)|\(startTime)|\(durationMinutes)")
+        guard var b = blocks[id], b.date == date, !b.done, !b.skipped else { return nil }
+        b.startTime = startTime
+        b.durationMinutes = durationMinutes
+        blocks[id] = b
+        let row: [String: Any] = ["id": b.id, "task_id": b.taskId ?? NSNull(), "task_name": b.taskName,
+                                  "start_time": b.startTime, "duration_minutes": b.durationMinutes, "date": b.date,
+                                  "external_event_id": b.externalEventId ?? NSNull(), "external_connection_id": NSNull(),
+                                  "kind": "task", "done": b.done, "skipped": b.skipped, "completed_at": NSNull(),
+                                  "user_id": "u1"]
+        return try JSONSerialization.data(withJSONObject: row)
+    }
 }
 
 /// A gateway that predates RPC ops (protocol default): every rpc op is a
 /// definite rejection, never a retry loop.
 private actor LegacyGateway: SyncGatewayProtocol {
-    func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {}
+    private(set) var upsertCalls = 0
+    func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws { upsertCalls += 1 }
     func delete(table: String, id: String) async throws {}
+}
+
+/// Collects the flusher's insert resolutions (the hook fires synchronously on
+/// the flusher's executor).
+private final class ResolutionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [InsertResolution] = []
+    func add(_ r: InsertResolution) { lock.withLock { items.append(r) } }
+    var all: [InsertResolution] { lock.withLock { items } }
+    func of(_ id: String) -> InsertResolution? { all.first { $0.rowId == id } }
 }
 
 final class OutboxFlusherTests: XCTestCase {
@@ -217,7 +283,7 @@ final class OutboxFlusherTests: XCTestCase {
 
         // Once the session row lands locally (flushed or hydrated), the FK is
         // satisfied server-side, so the capture is now flushable.
-        try db.save(Session(id: "s1", taskName: "S", actualSec: 60, completedAt: now))
+        try db.save(UnstuckCore.Session(id: "s1", taskName: "S", actualSec: 60, completedAt: now))
         await flusher.flush(userId: "u1")
         XCTAssertEqual(try box.count(), 0)
         upserts = await gateway.upserts
@@ -392,4 +458,342 @@ final class OutboxFlusherTests: XCTestCase {
         await flusher.flush(userId: "u1")
         XCTAssertEqual(try box.count(), 0)
     }
+
+    // MARK: - the insert family (stage 2, deterministic-occurrence-ids.md §3c)
+
+    private let seriesId = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+    private func mintBlock(_ date: String, _ time: String = "07:00", duration: Int = 30) -> CalBlock {
+        CalBlock(id: occurrenceId(taskId: seriesId, date: date), taskId: seriesId, taskName: "Gym",
+                 startTime: time, durationMinutes: duration, date: date, kind: .task)
+    }
+    /// The op WriteThrough.insertCalBlockIfAbsent queues (no dependsOn: the
+    /// parent task isn't in this store).
+    private func enqueueMint(_ b: CalBlock, _ kind: OutboxKind) throws {
+        _ = try box.enqueue(table: "cal_blocks", rowId: b.id, kind: kind,
+                            payload: String(data: try JSONEncoder().encode(CalBlockRow(b)), encoding: .utf8), nowISO: now)
+    }
+    private func serverBlock(_ b: CalBlock, done: Bool = false, eventId: String? = nil) -> FakeGateway.ServerBlock {
+        FakeGateway.ServerBlock(id: b.id, taskId: b.taskId, taskName: b.taskName, date: b.date, startTime: b.startTime,
+                                durationMinutes: b.durationMinutes, done: done, externalEventId: eventId)
+    }
+
+    func testInsertRoutesToInsertIfAbsent() async throws {
+        let b = mintBlock("2026-09-24")
+        try enqueueMint(b, .insert)
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0)
+        let inserts = await gateway.inserts
+        let upserts = await gateway.upserts
+        let server = await gateway.blocks[b.id]
+        XCTAssertEqual(inserts, [b.id])
+        XCTAssertTrue(upserts.isEmpty, "a mint is never a plain upsert")
+        XCTAssertEqual(server?.startTime, "07:00")
+    }
+
+    /// Rule H: the user's mint of a day another device already has retimes
+    /// that day's OPEN occurrence — only its start and duration.
+    func testIgnoredInsertOrRetimeSendsTheConditionalRetime() async throws {
+        let theirs = mintBlock("2026-09-24", "07:00")
+        await gateway.seed(serverBlock(theirs, eventId: "evt-A"))
+        try enqueueMint(mintBlock("2026-09-24", "16:00", duration: 45), .insertOrRetime)
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0)
+        let retimes = await gateway.retimes
+        XCTAssertEqual(retimes, ["\(theirs.id)|2026-09-24|16:00|45"], "the op's own date, start and duration")
+        let server = await gateway.blocks[theirs.id]
+        XCTAssertEqual(server?.startTime, "16:00")
+        XCTAssertEqual(server?.durationMinutes, 45)
+        XCTAssertEqual(server?.externalEventId, "evt-A", "column-scoped: the other device's Google mapping stays")
+        let upserts = await gateway.upserts
+        XCTAssertTrue(upserts.isEmpty)
+    }
+
+    /// A top-up's plain insert never moves a row another device has.
+    func testIgnoredPlainInsertDoesNot() async throws {
+        let theirs = mintBlock("2026-09-24", "07:00")
+        await gateway.seed(serverBlock(theirs))
+        try enqueueMint(mintBlock("2026-09-24", "16:00"), .insert)
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(try box.count(), 0, "an ignored insert acks — nothing left pending")
+        let retimes = await gateway.retimes
+        let server = await gateway.blocks[theirs.id]
+        XCTAssertTrue(retimes.isEmpty)
+        XCTAssertEqual(server?.startTime, "07:00")
+    }
+
+    /// `[delete X, insert X]`: a failed delete holds the re-mint back for the
+    /// whole pass, so the insert can never land first (and be ignored by the
+    /// row it was meant to replace).
+    func testDeleteFlushesBeforeReMint() async throws {
+        let old = mintBlock("2026-09-24", "07:00")
+        await gateway.seed(serverBlock(old))
+        _ = try box.enqueue(table: "cal_blocks", rowId: old.id, kind: .delete, nowISO: now)
+        try enqueueMint(mintBlock("2026-09-24", "09:15"), .insertOrRetime)
+        await gateway.fail(old.id, times: 1, with: URLError(.notConnectedToInternet))
+        await flusher.flush(userId: "u1")
+        var inserts = await gateway.inserts
+        XCTAssertTrue(inserts.isEmpty, "the insert must not go out in the pass its delete failed")
+        XCTAssertEqual(try box.pending().map(\.kind), [.delete, .insertOrRetime])
+        await flusher.flush(userId: "u1")
+        inserts = await gateway.inserts
+        let deletes = await gateway.deletes
+        let server = await gateway.blocks[old.id]
+        XCTAssertEqual(deletes, [old.id])
+        XCTAssertEqual(inserts, [old.id])
+        XCTAssertEqual(server?.startTime, "09:15", "the delete landed first, so the re-mint INSERTED")
+        XCTAssertEqual(try box.count(), 0)
+    }
+
+    func testInsertResolvedHookReportsOutcome() async throws {
+        let fresh = mintBlock("2026-09-24")
+        let open = mintBlock("2026-09-25", "07:00")
+        let done = mintBlock("2026-09-26", "07:00")
+        let taken = mintBlock("2026-09-27", "07:00")
+        await gateway.seed(serverBlock(open, eventId: "evt-open"))
+        await gateway.seed(serverBlock(done, done: true))
+        await gateway.seed(serverBlock(taken))
+        // This device's own copy of the retimed day: its time, no mapping.
+        let mine = mintBlock("2026-09-25", "16:00")
+        try db.save(mine)
+        try enqueueMint(fresh, .insert)
+        try enqueueMint(mine, .insertOrRetime)
+        try enqueueMint(mintBlock("2026-09-26", "16:00"), .insertOrRetime)
+        try enqueueMint(mintBlock("2026-09-27", "16:00"), .insert)
+        let recorder = ResolutionRecorder()
+        await flusher.setOnInsertResolved { recorder.add($0) }
+        await flusher.flush(userId: "u1")
+
+        XCTAssertEqual(recorder.all.count, 4, "one report per op")
+        XCTAssertEqual(recorder.of(fresh.id)?.outcome, .inserted)
+        XCTAssertNil(recorder.of(fresh.id)?.serverRow)
+        XCTAssertEqual(recorder.of(done.id)?.outcome, .ignored, "a done day keeps its occurrence")
+        XCTAssertEqual(recorder.of(taken.id)?.outcome, .ignored)
+        let retimed = try XCTUnwrap(recorder.of(open.id))
+        XCTAssertEqual(retimed.outcome, .retimed)
+        XCTAssertEqual(retimed.table, "cal_blocks")
+        let row = try JSONDecoder().decode(CalBlockRow.self, from: XCTUnwrap(retimed.serverRow))
+        XCTAssertEqual(row.startTime, "16:00")
+        XCTAssertEqual(row.externalEventId, "evt-open")
+        // The server row replaced the local copy BEFORE anyone heard: it now
+        // carries the other device's Google mapping.
+        let local = try XCTUnwrap(db.fetchById(CalBlock.self, id: open.id))
+        XCTAssertEqual(local.externalEventId, "evt-open")
+        XCTAssertEqual(local.startTime, "16:00")
+    }
+
+    /// The protocol default THROWS — it never falls back to an upsert, which
+    /// would overwrite another device's row (hazard c).
+    func testDefaultGatewayInsertThrows() async throws {
+        let gw = LegacyGateway()
+        let row = CalBlockRow(mintBlock("2026-09-24"))
+        do {
+            _ = try await gw.insertIfAbsent(row, table: "cal_blocks", userId: "u1")
+            XCTFail("the default must throw")
+        } catch let e as InsertUnsupportedError {
+            XCTAssertTrue(e.isServerRejection)
+        }
+        do {
+            _ = try await gw.retimeIfOpen(table: "cal_blocks", id: row.id, date: row.date, startTime: "09:00", durationMinutes: 30)
+            XCTFail("the default must throw")
+        } catch is InsertUnsupportedError {}
+        // Through the flusher: a rejection (counted, kept), never an upsert.
+        let legacy = OutboxFlusher(gateway: gw, db: db)
+        try enqueueMint(mintBlock("2026-09-24"), .insert)
+        await legacy.flush(userId: "u1")
+        let upserts = await gw.upsertCalls
+        XCTAssertEqual(upserts, 0)
+        XCTAssertEqual(try box.pending().first?.attempts, 1)
+    }
+
+    /// Rule G: a push for a row whose insert is unresolved (queued, or being
+    /// sent) is deferred; the confirmed outcome carries it, an ignored one
+    /// drops it; a row with no insert pushes at once.
+    func testRuleGDefersAPushUntilTheInsertResolvesAndDropsItWhenIgnored() async throws {
+        let gate = flusher.mirrorGate
+        let ours = mintBlock("2026-09-24")
+        let theirs = mintBlock("2026-09-25")
+        let late = mintBlock("2026-09-26")
+        await gateway.seed(serverBlock(theirs))
+        try enqueueMint(ours, .insert)
+        try enqueueMint(theirs, .insert)
+        try enqueueMint(late, .insert)
+        XCTAssertFalse(gate.requestMirror(rowId: ours.id), "queued: deferred")
+        XCTAssertFalse(gate.requestMirror(rowId: theirs.id))
+        XCTAssertTrue(gate.requestMirror(rowId: "no-insert-here"), "an ordinary block pushes at once")
+        // A push asked for WHILE the insert is being sent is deferred too.
+        let probe = ResultBox()
+        await gateway.setOnInsert { id in if id == late.id { probe.set(gate.requestMirror(rowId: id)) } }
+        let recorder = ResolutionRecorder()
+        await flusher.setOnInsertResolved { recorder.add($0) }
+        await flusher.flush(userId: "u1")
+
+        XCTAssertEqual(probe.value, false, "in flight: still unresolved")
+        XCTAssertEqual(recorder.of(ours.id)?.mirrorWanted, true, "confirmed: mirror once")
+        XCTAssertEqual(recorder.of(late.id)?.mirrorWanted, true)
+        XCTAssertEqual(recorder.of(theirs.id)?.outcome, .ignored)
+        XCTAssertEqual(recorder.of(theirs.id)?.mirrorWanted, false, "an ignored insert is never mirrored")
+        XCTAssertFalse(gate.isMirrorWanted(rowId: theirs.id), "and nothing lingers")
+        XCTAssertTrue(gate.requestMirror(rowId: ours.id), "resolved: later edits push normally")
+    }
+
+    /// A push the flusher could not deliver (offline) stays deferred: the op is
+    /// still queued, so the row is still unresolved.
+    func testRuleGKeepsATransientlyFailedInsertUnresolved() async throws {
+        let b = mintBlock("2026-09-24")
+        try enqueueMint(b, .insert)
+        await gateway.fail(b.id, times: 1, with: URLError(.notConnectedToInternet))
+        await flusher.flush(userId: "u1")
+        XCTAssertTrue(flusher.mirrorGate.isUnresolved(rowId: b.id))
+        XCTAssertFalse(flusher.mirrorGate.requestMirror(rowId: b.id))
+        let recorder = ResolutionRecorder()
+        await flusher.setOnInsertResolved { recorder.add($0) }
+        await flusher.flush(userId: "u1")
+        XCTAssertEqual(recorder.of(b.id)?.outcome, .inserted)
+        XCTAssertEqual(recorder.of(b.id)?.mirrorWanted, true)
+    }
+}
+
+private final class ResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Bool?
+    func set(_ v: Bool) { lock.withLock { stored = v } }
+    var value: Bool? { lock.withLock { stored } }
+}
+
+// MARK: - the requests supabase-swift 2.46 actually sends (stage 2)
+//
+// Step 0 verified the SERVER's answers to these exact requests live
+// (audit/parity-2026-09-23/stage2-check.mjs). These pin that the SDK sends
+// them: `Prefer: resolution=ignore-duplicates,return=representation` with
+// `on_conflict=id` for the insert (a `.select()` after `upsert` must not drop
+// the resolution), and a filtered PATCH with `return=representation`.
+
+final class SyncGatewayInsertRequestTests: XCTestCase {
+    private let uid = "11111111-1111-4111-8111-111111111111"
+    private let block = CalBlock(id: occurrenceId(taskId: "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60", date: "2026-09-24"),
+                                 taskId: "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60", taskName: "Gym",
+                                 startTime: "07:00", durationMinutes: 30, date: "2026-09-24", kind: .task)
+
+    private func gateway() -> SyncGateway {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [PostgrestStubProtocol.self]
+        let client = SupabaseClient(
+            supabaseURL: URL(string: "https://stub.invalid")!, supabaseKey: "anon",
+            options: .init(auth: .init(storage: MemoryAuthStorage(), autoRefreshToken: false),
+                           global: .init(session: URLSession(configuration: config))))
+        return SyncGateway(client)
+    }
+
+    private func query(_ r: URLRequest) -> [String: String] {
+        let items = URLComponents(url: r.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        return Dictionary(items.map { ($0.name, $0.value ?? "") }, uniquingKeysWith: { a, _ in a })
+    }
+    private func preferParts(_ r: URLRequest) -> Set<String> {
+        Set((r.value(forHTTPHeaderField: "Prefer") ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+    }
+
+    func testGatewayInsertIfAbsentRequestShape() async throws {
+        PostgrestStubProtocol.reset(bodies: [#"[{"id":"\#(block.id)"}]"#, "[]"], status: 201)
+        let gw = gateway()
+        let inserted = try await gw.insertIfAbsent(CalBlockRow(block), table: "cal_blocks", userId: uid)
+        let ignored = try await gw.insertIfAbsent(CalBlockRow(block), table: "cal_blocks", userId: uid)
+        XCTAssertTrue(inserted, "one row back = inserted")
+        XCTAssertFalse(ignored, "[] = the server already had the id")
+
+        let requests = PostgrestStubProtocol.recorded()
+        XCTAssertEqual(requests.count, 2)
+        let r = try XCTUnwrap(requests.first)
+        XCTAssertEqual(r.request.httpMethod, "POST")
+        XCTAssertEqual(r.request.url?.path, "/rest/v1/cal_blocks")
+        let q = query(r.request)
+        XCTAssertEqual(q["on_conflict"], "id")
+        XCTAssertEqual(q["select"], "id")
+        XCTAssertEqual(preferParts(r.request), ["resolution=ignore-duplicates", "return=representation"],
+                       "ignore-duplicates must survive the .select()")
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: r.body) as? [String: Any])
+        XCTAssertEqual(body["id"] as? String, block.id)
+        XCTAssertEqual(body["user_id"] as? String, uid)
+        XCTAssertEqual(body["start_time"] as? String, "07:00")
+    }
+
+    func testGatewayRetimeIfOpenRequestShape() async throws {
+        let row = #"[{"id":"\#(block.id)","task_id":null,"task_name":"Gym","start_time":"16:00","duration_minutes":45,"date":"2026-09-24","external_event_id":"evt","external_connection_id":null,"kind":"task","done":false,"skipped":false,"completed_at":null}]"#
+        PostgrestStubProtocol.reset(bodies: [row, "[]"], status: 200)
+        let gw = gateway()
+        let hit = try await gw.retimeIfOpen(table: "cal_blocks", id: block.id, date: "2026-09-24",
+                                            startTime: "16:00", durationMinutes: 45)
+        let miss = try await gw.retimeIfOpen(table: "cal_blocks", id: block.id, date: "2026-09-24",
+                                             startTime: "16:00", durationMinutes: 45)
+        let server = try JSONDecoder().decode(CalBlockRow.self, from: XCTUnwrap(hit))
+        XCTAssertEqual(server.startTime, "16:00")
+        XCTAssertEqual(server.externalEventId, "evt")
+        XCTAssertNil(miss, "[] = moved, done, skipped or gone")
+
+        let r = try XCTUnwrap(PostgrestStubProtocol.recorded().first)
+        XCTAssertEqual(r.request.httpMethod, "PATCH")
+        XCTAssertEqual(r.request.url?.path, "/rest/v1/cal_blocks")
+        let q = query(r.request)
+        XCTAssertEqual(q["id"], "eq.\(block.id)")
+        XCTAssertEqual(q["date"], "eq.2026-09-24")
+        XCTAssertEqual(q["done"], "is.false")
+        XCTAssertEqual(q["skipped"], "is.false")
+        XCTAssertNil(q["on_conflict"])
+        XCTAssertEqual(preferParts(r.request), ["return=representation"])
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: r.body) as? [String: Any])
+        XCTAssertEqual(Set(body.keys), ["start_time", "duration_minutes"], "column-scoped: nothing else is written")
+        XCTAssertEqual(body["start_time"] as? String, "16:00")
+        XCTAssertEqual(body["duration_minutes"] as? Int, 45)
+    }
+}
+
+/// Answers PostgREST requests from a queue of bodies and records each request
+/// with its body (inside a URLProtocol the body arrives as a stream).
+private final class PostgrestStubProtocol: URLProtocol, @unchecked Sendable {
+    struct Recorded { let request: URLRequest; let body: Data }
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var requests: [Recorded] = []
+    nonisolated(unsafe) private static var bodies: [String] = []
+    nonisolated(unsafe) private static var status = 200
+
+    static func reset(bodies: [String], status: Int) {
+        lock.withLock { requests = []; Self.bodies = bodies; Self.status = status }
+    }
+    static func recorded() -> [Recorded] { lock.withLock { requests } }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        var body = request.httpBody ?? Data()
+        if body.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let n = stream.read(&buf, maxLength: buf.count)
+                if n <= 0 { break }
+                body.append(buf, count: n)
+            }
+            stream.close()
+        }
+        let (answer, code): (String, Int) = Self.lock.withLock {
+            Self.requests.append(Recorded(request: request, body: body))
+            return (Self.bodies.isEmpty ? "[]" : Self.bodies.removeFirst(), Self.status)
+        }
+        let response = HTTPURLResponse(url: request.url!, statusCode: code, httpVersion: "HTTP/1.1",
+                                       headerFields: ["Content-Type": "application/json"])!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(answer.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+/// Session storage that lives and dies with the test — NOT the keychain.
+private final class MemoryAuthStorage: AuthLocalStorage, @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [String: Data] = [:]
+    func store(key: String, value: Data) throws { lock.withLock { values[key] = value } }
+    func retrieve(key: String) throws -> Data? { lock.withLock { values[key] } }
+    func remove(key: String) throws { _ = lock.withLock { values.removeValue(forKey: key) } }
 }

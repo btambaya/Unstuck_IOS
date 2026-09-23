@@ -117,7 +117,20 @@ final class FakeAssistantState: AssistantAppState {
         await commit()
         if let i = blocks.firstIndex(where: { $0.id == b.id }) { blocks[i] = b } else { blocks.append(b) }
     }
-    func deleteBlock(_ id: String) async { await commit(); blocks.removeAll { $0.id == id } }
+    /// Every mint the executor asked for: "<id>|<retime or insert>" (stage 2).
+    var insertedBlocks: [String] = []
+    /// Every block the executor deleted, in order.
+    var deletedBlockIds: [String] = []
+    /// Insert-if-absent like the real seam (WriteThrough rule A): a row with
+    /// the id already present is left alone and reported false.
+    func insertBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool) async -> Bool {
+        await commit()
+        insertedBlocks.append("\(b.id)|\(retimeIfTaken ? "insert_or_retime" : "insert")")
+        guard !blocks.contains(where: { $0.id == b.id }) else { return false }
+        blocks.append(b)
+        return true
+    }
+    func deleteBlock(_ id: String) async { await commit(); deletedBlockIds.append(id); blocks.removeAll { $0.id == id } }
 
     private func patch(_ id: String, _ fn: (inout ItemCollection) -> Void) {
         guard let i = collections.firstIndex(where: { $0.id == id }) else { return }

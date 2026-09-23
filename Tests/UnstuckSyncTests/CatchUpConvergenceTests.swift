@@ -535,6 +535,35 @@ final class CatchUpConvergenceTests: XCTestCase {
     /// Every gap trigger must also re-read the account-wide preference rows —
     /// they live outside the local store, so no cursor pull carries them, and
     /// before this they were read ONCE per process launch.
+    /// A mint queued as an insert-family op counts as a pending local write in
+    /// the catch-up: cal_blocks' full replace keeps the row, and the generic
+    /// pending guard (every delta table's skip rule) sees it (stage 2).
+    func testCatchUpSkipsRowWithPendingInsert() async throws {
+        let seriesId = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+        let minted = CalBlock(id: occurrenceId(taskId: seriesId, date: "2026-09-24"), taskId: seriesId, taskName: "Gym",
+                              startTime: "07:00", durationMinutes: 30, date: "2026-09-24", kind: .task)
+        try db.save(minted)
+        _ = try OutboxStore(db).enqueue(table: "cal_blocks", rowId: minted.id, kind: .insert,
+                                        payload: String(data: try JSONEncoder().encode(CalBlockRow(minted)), encoding: .utf8),
+                                        nowISO: "2026-09-23T10:00:00.000Z")
+        let other = CalBlock(id: "b-server", taskId: seriesId, taskName: "Gym", startTime: "07:00", durationMinutes: 30,
+                             date: "2026-09-25", kind: .task)
+        await server.put("cal_blocks", try JSONEncoder().encode(CalBlockRow(other)))
+        let hydrator = Hydrator(gateway: server, db: db)
+        let puller = CatchUpPuller(gateway: server, db: db, fullFallback: { await hydrator.hydrateFullReplaceTable($0) })
+
+        let outcome = await puller.catchUp(userId: uid, reconcileDeletions: true)
+
+        XCTAssertTrue(outcome.fullFallbackTables.contains("cal_blocks"))
+        XCTAssertNotNil(try db.fetchById(CalBlock.self, id: minted.id), "the pending mint survives the pull")
+        XCTAssertNotNil(try db.fetchById(CalBlock.self, id: "b-server"))
+        XCTAssertTrue(CatchUpPuller.hasPendingWrite(table: "cal_blocks", rowId: minted.id, db: db))
+        XCTAssertTrue(CatchUpPuller.hasPendingWrite(table: "cal_blocks", rowId: minted.id, db: db) &&
+                      !CatchUpPuller.hasPendingDelete(table: "cal_blocks", rowId: minted.id, db: db))
+        let stamp = await hydrator.calBlocksPull()
+        XCTAssertEqual(stamp?.rowCount, 1, "the catch-up's full replace stamps the top-up gate too")
+    }
+
     func testGapTriggersRefreshAccountPreferences() async throws {
         let prefs = Counter()
         let owner = FreshnessOwner(actions: FreshnessOwner.Actions(

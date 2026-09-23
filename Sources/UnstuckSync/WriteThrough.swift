@@ -115,6 +115,46 @@ public actor WriteThrough {
                            extra: { try OutboxStore.dropQuarantinedUpserts(in: $0, table: "cal_blocks", rowId: id) })
     }
 
+    /// A MINT: a repeating task's occurrence created with its deterministic id
+    /// (`occurrenceId`, audit 2026-09-22 C21, stage 2). Insert-if-absent end to
+    /// end — rule A of deterministic-occurrence-ids.md:
+    ///  • locally it is skipped when ANY row with that id exists (a moved,
+    ///    done, skipped or kept occurrence: the day's occurrence lives on), and
+    ///    the check, the row save and the op commit in ONE transaction, so two
+    ///    back-to-back top-ups that read the store before either wrote can't
+    ///    both enqueue it;
+    ///  • on the server the op is `INSERT … ON CONFLICT (id) DO NOTHING`
+    ///    (`insert`), plus rule H's conditional retime when the USER asked for
+    ///    this day (`retimeIfTaken` → `insert_or_retime`).
+    /// Otherwise exactly `upsertCalBlock`: the duration clamp, `dependsOn` the
+    /// parent task, and a g_ / external row is never enqueued. Returns true
+    /// when the row was written (and the op queued).
+    @discardableResult
+    public func insertCalBlockIfAbsent(_ b: CalBlock, retimeIfTaken: Bool, nowISO: String) throws -> Bool {
+        if b.kind == .external || b.id.hasPrefix("g_") {
+            return try db.transaction { conn -> Bool in
+                guard try CalBlock.fetchOne(conn, key: b.id) == nil else { return false }
+                try b.upsert(conn)
+                return true
+            }
+        }
+        var b = b
+        b.durationMinutes = clampDurationMin(b.durationMinutes)
+        let dependsOn = b.taskId.flatMap { isUUID($0) ? $0 : nil }
+        let payload = try jsonString(CalBlockRow(b))
+        let row = b
+        let wrote = try db.transaction { conn -> Bool in
+            guard try CalBlock.fetchOne(conn, key: row.id) == nil else { return false }
+            try row.upsert(conn)
+            try OutboxStore.enqueue(in: conn, table: "cal_blocks", rowId: row.id,
+                                    kind: retimeIfTaken ? .insertOrRetime : .insert, payload: payload,
+                                    dependsOn: dependsOn, nowISO: nowISO)
+            return true
+        }
+        if wrote { onEnqueue?() }
+        return wrote
+    }
+
     public func upsertSession(_ s: Session, nowISO: String) throws {
         try saveAndEnqueue(s, table: "sessions", rowId: s.id, payload: try jsonString(SessionRow(s)), nowISO: nowISO)
     }
