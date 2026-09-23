@@ -29,6 +29,9 @@ phases land. Newest status at the top.
 
 - Ship: 1.1.1 (83) uploaded to TestFlight (delivery 06ef3e9c) — a reply cut on air is truncated to what the user heard (conversation.item.truncate), so 'carry on' resumes the same point. Server: missed calls re-ring every 5 min, 4 rings (migration 076). 2026-09-23.
 
+- Ship: 1.1.1 (84) uploaded (delivery d6602f1b) — list items: tap strikes out, swipe left Delete, swipe right Pin/To task, hold edits; Google reconnect is a plain card (never 'invalid_grant (400)'). 2026-09-23.
+
+- Ship: 1.1.1 (85) uploaded (delivery f1ff0fe0) — STAGE 2, same id for same day (C21): deterministic occurrence ids, insert-if-absent, rules A/B/G/H, serialised top-up after a good pull; every minted occurrence mirrored to Google after a confirmed insert (Ahmad: 'every day, everywhere'). 2026-09-23.
 
 
 
@@ -36,6 +39,22 @@ phases land. Newest status at the top.
 
 
 
+
+
+## Where things stand (2026-09-23, afternoon) — builds 84 + 85: list-item gestures, the reconnect card, stage 2
+
+- **Build 84** (Ahmad's screenshots). Collection items now use one gesture per job, replacing the "…" icon bar: TAP strikes the item out, SWIPE LEFT shows Delete, SWIPE RIGHT shows Pin/Unpin and "To task", HOLD edits. All four are also exposed as VoiceOver actions. The Google reconnect state is a plain card ("Google Calendar stopped syncing"; copy in GoogleConnectCopy.reauthTitle/reauthBody) and never shows the raw lastError. Android vc102 carries the same two changes.
+- **Build 85: stage 2, "same id for same day" (C21).** Spec: `audit/parity-2026-09-23/deterministic-occurrence-ids.md`. Ahmad's four answers are in DECISIONS.md. Step 0 was verified on prod with temporary users (stage2-check.mjs, 15/15).
+  - `occurrenceId` is UUIDv5(task|date), with the shared §1.5 vectors.
+  - New outbox kinds `insert` / `insert_or_retime`. `WriteThrough.insertCalBlockIfAbsent` does the local check, the save and the enqueue in one transaction. The gateway gained `insertIfAbsent` (POST on_conflict=id, ignore-duplicates, return=representation) and `retimeIfOpen` (PATCH filtered on id/date/done=false/skipped=false). Request shapes are pinned by a URLProtocol stub.
+  - Rules A/B/B′ are in regenerateForTask (keepIds, toRetime), recurrenceTopUp and recurrenceChosenDateAction/Write.
+  - Rule G (`InsertMirrorGate`): Google gets a row only after a confirmed insert, checked again at dispatch time. All Google calls run on one serial chain, deletes first.
+  - Rule H: a user's mint that the server ignored becomes a conditional retime.
+  - The top-up is serialised and gated by `RecurrenceTopUpGate`: it runs only after a successful cal_blocks read of under 1000 rows, once per local day per user, and again on a time-zone change. The time-zone and day observers pull first.
+  - Owner call "every day, everywhere": every minted occurrence is mirrored to Google. Plan deletes go through unscheduleAwaiting, so they also remove the Google event. Its whole-table read was removed (the reviewer's O(n·m) finding).
+  - Tests: 915 app tests (plus the known CrashBreadcrumbs order flake) and 1199 package tests green.
+  - DEVICE CHECKS (Google path never run on a device): a new daily series with Google connected gets exactly one event per day, appearing gradually; "Never" deletes the future events; two devices produce one row per tail day; a midnight or time-zone change runs the top-up after the pull.
+- **Build tooling:** SwiftPM and xcodebuild picked up /usr/local/bin/git (x86_64, dead without Rosetta). Put /usr/bin first in PATH for swift test / xcodebuild.
 
 ## Where things stand (2026-09-23, late morning) — build 83: the interrupted reply is truncated; missed calls ring back
 
