@@ -277,7 +277,9 @@ struct CaptureRow: Codable, Sendable {
         try c.encode(taskId, forKey: .taskId)
         try c.encode(sessionId, forKey: .sessionId)
         try c.encode(tag, forKey: .tag)
-        try c.encode(body, forKey: .body)
+        // Clamped on the wire too, so an op queued by an earlier build sends
+        // what the server accepts when it is retried (audit 2026-09-22, C28).
+        try c.encode(clampCaptureBody(body), forKey: .body)
         try c.encode(at, forKey: .at)
         try c.encode(archivedAt, forKey: .archivedAt)
     }

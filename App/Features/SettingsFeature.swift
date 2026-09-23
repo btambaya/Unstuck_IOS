@@ -563,6 +563,8 @@ private struct AccountSettingsView: View {
     @State private var showPassword = false
     @State private var showDelete = false
     @State private var showFeedback = false
+    @State private var confirmSignOut = false
+    @State private var unsyncedAtSignOut = 0
     @State private var message: String?
     @State private var messageIsError = false
 
@@ -606,7 +608,11 @@ private struct AccountSettingsView: View {
                 CardDivider()
                 SettingTapRow(label: "Sign out", value: "End this session",
                               destructive: true, locked: model.tourRunning) {
-                    model.signOut(); dismiss()
+                    // Changes that haven't reached the server are parked for
+                    // this account's next sign-in here, never lost — but the
+                    // user should know before leaving (audit 2026-09-22, C28).
+                    unsyncedAtSignOut = model.pendingSyncCount
+                    if unsyncedAtSignOut > 0 { confirmSignOut = true } else { model.signOut(); dismiss() }
                 }
             }
             if let message {
@@ -620,6 +626,15 @@ private struct AccountSettingsView: View {
             ActivityView(items: [url]) { AppModel.removeExportFile(url) }
         }
         .sheet(isPresented: $showFeedback) { FeedbackSheet() }
+        .alert("\(unsyncedAtSignOut) change\(unsyncedAtSignOut == 1 ? " hasn't" : "s haven't") synced yet",
+               isPresented: $confirmSignOut) {
+            Button("Sign out", role: .destructive) { model.signOut(); dismiss() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(model.stuckChanges > 0
+                 ? "They stay on this phone and sync when you sign in here again. \(model.stuckChanges) couldn't be saved — Today shows them."
+                 : "They stay on this phone and sync when you sign in here again.")
+        }
         .sheet(isPresented: $showName) {
             DisplayNameSheet(initial: model.currentUserName ?? "") { name in
                 Task {

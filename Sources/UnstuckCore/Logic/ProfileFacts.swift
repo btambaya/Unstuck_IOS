@@ -94,9 +94,12 @@ public enum ProfileFactsLogic {
         return String(String.UnicodeScalarView(trimmed.unicodeScalars.prefix(maxFactLength)))
     }
 
-    /// `YYYY-MM-DD` or nothing (web `/^\d{4}-\d{2}-\d{2}$/`).
+    /// `YYYY-MM-DD` or nothing (web `/^\d{4}-\d{2}-\d{2}$/`) — and a day
+    /// that exists: `when_iso` is a Postgres `date`, so "2027-02-29" was
+    /// refused on every flush and the fact never left this phone (audit
+    /// 2026-09-22, C28).
     public static func validWhenIso(_ s: String?) -> String? {
-        guard let s, Patterns.whenIso.test(s) else { return nil }
+        guard let s, Patterns.whenIso.test(s), isCalendarDate(s) else { return nil }
         return s
     }
 

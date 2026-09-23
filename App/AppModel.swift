@@ -191,6 +191,12 @@ final class AppModel {
     /// UI's "Reconnect Google" gate.
     var calendarSyncStatus: SyncCoordinator.CalendarSyncStatus?
 
+    /// Changes the server refused five times (and the ones waiting behind
+    /// them): they exist on this phone only. Today says so, with Retry and
+    /// Discard — before, nothing read the quarantine and the user believed the
+    /// change was everywhere (audit 2026-09-22, C28).
+    var stuckChanges = 0
+
     /// A shared-list edit the server REFUSED (RLS / a revoked share / a bad
     /// RPC): the optimistic row was rolled back to the server's copy and this
     /// says so — the Lists surface shows it once, then clears it.
@@ -1040,6 +1046,16 @@ final class AppModel {
         await coord.setOnPreferencesStale { [weak self] in
             await MainActor.run { self?.refreshServerPreferences() }
         }
+        // A new build gets one more go at what an earlier one couldn't save,
+        // before the sign-in flush; then every drain reports what is still
+        // stuck (audit 2026-09-22, C28).
+        if let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String {
+            coord.releaseQuarantineIfNewBuild(build)
+        }
+        coord.setOnStuckChanges { [weak self] n in
+            Task { @MainActor in self?.stuckChanges = n }
+        }
+        stuckChanges = coord.stuckChangeCount()
         await coord.start()
         // Apply the visibility the scenePhase handler may already have
         // reported before the coordinator existed (the cold-launch race that
@@ -1550,6 +1566,18 @@ final class AppModel {
     /// say "N changes haven't synced yet; they'll sync when you next sign in
     /// here" (they're parked, not lost).
     var pendingSyncCount: Int { coordinator?.pendingOutboxCount() ?? 0 }
+
+    /// Today's "couldn't be saved" card: send the refused changes once more.
+    func retryStuckChanges() {
+        guard let coord = coordinator else { return }
+        Task { await coord.retryStuckChanges() }
+    }
+
+    /// …or drop them and show what the server has.
+    func discardStuckChanges() {
+        guard let coord = coordinator else { return }
+        Task { await coord.discardStuckChanges() }
+    }
 
     func signOut() {
         guard let coord = coordinator else { return }

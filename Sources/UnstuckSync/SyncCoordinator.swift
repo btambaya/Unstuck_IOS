@@ -31,6 +31,15 @@ final class HookBox: @unchecked Sendable {
     }
 }
 
+/// Where the stuck-change count goes (the app's banner). Settable from any
+/// isolation domain, like HookBox.
+final class CountHookBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var hook: (@Sendable (Int) -> Void)?
+    func set(_ h: (@Sendable (Int) -> Void)?) { lock.withLock { hook = h } }
+    func call(_ n: Int) { lock.withLock { hook }?(n) }
+}
+
 /// A lock-guarded Bool for the NWPathMonitor callback (which runs on its own
 /// queue, outside any actor).
 final class MutableFlag: @unchecked Sendable {
@@ -114,6 +123,8 @@ public actor SyncCoordinator {
     private nonisolated let preferencesHook = HookBox()
     /// Network-path watch → `.networkRegained`.
     private var pathMonitor: NWPathMonitor?
+    /// The app's "changes couldn't be saved" count (C28).
+    private nonisolated let stuckHook = CountHookBox()
     /// Live change-signal for sharing (posts NotificationCenter; the UI refetches
     /// the RPC-backed projections). Recipients can't mirror shared task rows (RLS).
     private let collab: CollabRealtime
@@ -206,6 +217,12 @@ public actor SyncCoordinator {
         await write.setOnEnqueue { [weak self] in
             Task { await self?.scheduleDebouncedFlush() }
         }
+        // After every drain, however it ended: what the server refused (and
+        // what waits behind it) is only on this phone — the app says so
+        // (audit 2026-09-22, C28).
+        let db = self.db
+        let stuckHook = self.stuckHook
+        await flusher.setOnDrained { stuckHook.call((try? OutboxStore(db).stuck().count) ?? 0) }
         // Realtime REPORTS; the freshness owner decides. A delivered row is
         // liveness evidence, a (re)subscribe is a gap, a preference-row change
         // is a stale-preferences signal.
@@ -573,6 +590,59 @@ public actor SyncCoordinator {
     /// yet" before the user leaves. Whatever can't drain is parked, never lost.
     public nonisolated func pendingOutboxCount() -> Int {
         (try? OutboxStore(db).count()) ?? 0
+    }
+
+    // MARK: - changes the server refused (audit 2026-09-22, C28)
+    //
+    // An op the server refuses five times is quarantined: kept, never re-sent,
+    // and — until now — never mentioned, so the change lived on this phone
+    // only while the user believed it was everywhere.
+
+    /// Changes that can't reach the server as things stand: the quarantined
+    /// ops and those held back behind them.
+    public nonisolated func stuckChangeCount() -> Int {
+        (try? OutboxStore(db).stuck().count) ?? 0
+    }
+
+    /// Hear the count after every drain, retry and discard.
+    public nonisolated func setOnStuckChanges(_ hook: @escaping @Sendable (Int) -> Void) {
+        stuckHook.set(hook)
+    }
+
+    /// Retry: one more send for each quarantined op, now. A refusal
+    /// quarantines it again at once, and the count says so.
+    public func retryStuckChanges() async {
+        _ = try? OutboxStore(db).retryQuarantined()
+        await flushNow()
+        stuckHook.call(stuckChangeCount())
+    }
+
+    /// Discard: drop the stuck ops and the local rows they carry, then pull
+    /// server-canonical (the full hydrate — the catch-up never re-reads a row
+    /// it already has), so the phone shows what the server has.
+    public func discardStuckChanges() async {
+        _ = try? OutboxStore(db).discardStuck()
+        stuckHook.call(stuckChangeCount())
+        await freshness.requireFullHydrate()
+    }
+
+    /// Once per build: quarantined ops get their rejections back, so a build
+    /// that fixed what the server refused actually sends them. Nothing reset
+    /// `attempts` before, so "a future build can retry it" never happened.
+    /// Returns how many were released.
+    @discardableResult
+    public nonisolated func releaseQuarantineIfNewBuild(_ build: String, defaults: UserDefaults = .standard) -> Int {
+        Self.releaseQuarantineIfNewBuild(build, box: OutboxStore(db), defaults: defaults)
+    }
+
+    static let quarantineReleaseBuildKey = "unstuck.outboxQuarantineReleasedBuild"
+
+    static func releaseQuarantineIfNewBuild(_ build: String, box: OutboxStore, defaults: UserDefaults) -> Int {
+        guard defaults.string(forKey: quarantineReleaseBuildKey) != build else { return 0 }
+        guard let released = try? box.releaseQuarantine() else { return 0 }
+        defaults.set(build, forKey: quarantineReleaseBuildKey)
+        if released > 0 { print("[outbox] build \(build): released \(released) quarantined op(s) for another try") }
+        return released
     }
 
     private func scheduleDebouncedFlush() {

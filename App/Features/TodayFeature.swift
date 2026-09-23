@@ -245,6 +245,7 @@ struct TodayView: View {
     /// The row whose "Share…" context action opened the Share screen.
     @State private var shareTarget: ShareTarget?
     @State private var notifsEnabled = true
+    @State private var confirmDiscardStuck = false
     @State private var backlogActive = false
     /// Realtime "Talk" mode from the assistant input pill's mic — the same
     /// VoiceModeScreen cover the Assistant sheet presents for its Talk button.
@@ -265,6 +266,7 @@ struct TodayView: View {
                 header
                 if let vm {
                     if !notifsEnabled { notificationsOffBanner.padding(.horizontal, 18).padding(.top, 8) }
+                    if model.stuckChanges > 0 { stuckChangesBanner.padding(.horizontal, 18).padding(.top, 8) }
                     // "Just now" session recap — shows for 6h after a finished
                     // focus session, between the header and the list
                     // (Android TodayScreen recap parity).
@@ -736,6 +738,40 @@ struct TodayView: View {
             .padding(14).frame(maxWidth: .infinity, alignment: .leading)
             .background(theme.palette.amberSoft, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         }.buttonStyle(.plain)
+    }
+
+    /// Changes the server refused are on this phone only (audit 2026-09-22,
+    /// C28): say so, and offer the two ways out.
+    private var stuckChangesBanner: some View {
+        let n = model.stuckChanges
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.icloud").font(.system(size: 16)).foregroundStyle(theme.palette.amberInk)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(n) change\(n == 1 ? "" : "s") couldn't be saved")
+                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.amberInk)
+                    Text("\(n == 1 ? "It's" : "They're") only on this phone. Try again, or discard to keep what your other devices have.")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.amberInk.opacity(0.85))
+                }
+            }
+            HStack(spacing: 16) {
+                Spacer()
+                Button("Discard") { confirmDiscardStuck = true }
+                    .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.amberInk.opacity(0.85))
+                Button("Try again") { model.retryStuckChanges() }
+                    .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.amberInk)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.amberSoft, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .accessibilityIdentifier("today-stuck-changes")
+        .alert("Discard \(n == 1 ? "this change" : "these changes")?", isPresented: $confirmDiscardStuck) {
+            Button("Discard", role: .destructive) { model.discardStuckChanges() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This phone goes back to what your account has on the server.")
+        }
     }
 
     private func refreshNotifStatus() async {

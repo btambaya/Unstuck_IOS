@@ -1157,6 +1157,50 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.tasks.count, 2)
     }
 
+    // MARK: inputs the server refuses (audit 2026-09-22, C28)
+    //
+    // Each was written here, refused on every flush and quarantined — on this
+    // phone only — while the tool said "ok".
+
+    /// `cal_blocks.start_time` must be zero-padded HH:MM: '9:00' is padded,
+    /// '7:30pm' is refused before anything is written.
+    func testStartTimesArePaddedOrRefusedBeforeAnythingIsWritten() async {
+        api.tasks = [task("a", "Alpha")]
+        let r = await run("schedule_task", #"{"taskId":"a","date":"\#(NEXT_WEEK)","startTime":"9:00"}"#)
+        XCTAssertTrue(r.hasPrefix("ok: scheduled \"Alpha\" \(NEXT_WEEK) 09:00"), r)
+        XCTAssertEqual(api.blocks.first?.startTime, "09:00")
+        let made = await run("create_task", #"{"name":"Gym","date":"\#(NEXT_WEEK)","startTime":"7:05"}"#)
+        XCTAssertTrue(made.contains("scheduled \(NEXT_WEEK) 07:05"), made)
+
+        let before = snapshot(api.tasks) + snapshot(api.blocks)
+        await eq("schedule_task", #"{"taskId":"a","date":"\#(NEXT_WEEK)","startTime":"7:30pm"}"#,
+                 "error: startTime must be 24-hour HH:MM (got \"7:30pm\"). Nothing was scheduled.")
+        await eq("create_task", #"{"name":"Swim","date":"\#(NEXT_WEEK)","startTime":"7:30pm"}"#,
+                 "error: startTime must be 24-hour HH:MM (got \"7:30pm\"). The task was NOT created.")
+        await eq("block_time", #"{"name":"Swim","date":"\#(NEXT_WEEK)","startTime":"7pm"}"#,
+                 "error: startTime must be 24-hour HH:MM (got \"7pm\"). Nothing was blocked.")
+        XCTAssertEqual(snapshot(api.tasks) + snapshot(api.blocks), before)
+    }
+
+    /// A date no calendar has, a free-text deadline, or an `until` that isn't
+    /// a date is refused — nothing is written.
+    func testImpossibleDatesAndFreeTextDeadlinesAreRefused() async {
+        api.tasks = [task("a", "Alpha")]
+        let moved = await run("schedule_task", #"{"taskId":"a","date":"2099-09-31","startTime":"09:00"}"#)
+        XCTAssertTrue(moved.hasPrefix("error: 2099-09-31 is not a real date — 2099-09 has 30 days."), moved)
+        XCTAssertTrue(api.blocks.isEmpty)
+        await eq("update_task", #"{"taskId":"a","dueAt":"Friday 5pm"}"#,
+                 "error: dueAt must be an ISO-8601 date-time like 2026-09-25T17:00 (got \"Friday 5pm\"). Nothing was changed.")
+        XCTAssertNil(api.tasks[0].dueAt)
+        await prefix("create_task", #"{"name":"Report","dueAt":"tomorrow"}"#, "error: dueAt must be an ISO-8601 date-time")
+        let bulk = await run("create_tasks", #"{"tasks":[{"name":"Fine"},{"name":"Bad","dueAt":"tomorrow 5pm"}]}"#)
+        XCTAssertTrue(bulk.contains("Not created: \"Bad\" (dueAt must be"), bulk)
+        await prefix("set_task_recurrence", #"{"taskId":"a","kind":"daily","until":"2099-02-30"}"#,
+                     "error: until must be a real YYYY-MM-DD date")
+        XCTAssertNil(api.tasks[0].recurrence)
+        XCTAssertEqual(api.tasks.map(\.name), ["Alpha", "Fine"])
+    }
+
     func testCarryToTomorrowMovesSkipsWhenTakenAndBumpsMoveCount() async {
         api.tasks = [task("a", "Alpha"), task("b", "Beta", moveCount: 1), task("c", "Gamma")]
         api.blocks = [block("a_td", "a", TODAY, "09:00"), block("b_td", "b", TODAY, "10:00"), block("b_tm", "b", TOMORROW, "10:00"), block("c_td", "c", TODAY, "11:00", done: true)]

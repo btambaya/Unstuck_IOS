@@ -206,6 +206,15 @@ public actor FreshnessOwner {
 
     public func snapshot() -> FreshnessStats { stats }
 
+    /// The local store holds rows the server never took (changes the user
+    /// just discarded): the next pull is the full server-canonical hydrate —
+    /// the catch-up never re-reads a row this device already has (audit
+    /// 2026-09-22, C28).
+    public func requireFullHydrate() {
+        hasHydratedThisSession = false
+        request(.manual, reconcile: true)
+    }
+
     // MARK: - reporting
 
     /// The single entry point. Everything else in the app calls THIS instead of
