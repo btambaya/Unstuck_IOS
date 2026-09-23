@@ -3333,3 +3333,183 @@ final class DeterministicOccurrenceAppTests: XCTestCase {
         XCTAssertEqual(googleDeletes, [here.id])
     }
 }
+
+// MARK: - nothing of the previous account survives sign-out (audit 2026-09-22, C35/C36)
+//
+// The scrub runs from the Sign-out button AND from every reactive sign-out,
+// and the next account on a shared phone must not see the previous one's
+// notifications, open sheets, recap, shares or widget snapshot. Signed out,
+// the device also stops showing, logging and acting on pushes. The XCUITest
+// demo boot is the seam; `signedIn = false` is what observeAuth sets right
+// after the scrub.
+
+@MainActor
+final class SignOutPrivacyTests: XCTestCase {
+    private var model: AppModel!
+    private var savedFlag: Bool?
+    private var savedTrayClear: (@MainActor () -> Void)!
+    private var trayClears = 0
+
+    override func setUp() async throws {
+        try await super.setUp()
+        savedFlag = PushRegistrar.accountSignedIn
+        savedTrayClear = NotificationLog.removeDeliveredNotifications
+        NotificationLog.removeDeliveredNotifications = { [weak self] in self?.trayClears += 1 }
+        model = AppModel()
+        model.startUITestMode()
+    }
+
+    override func tearDown() async throws {
+        NotificationLog.removeDeliveredNotifications = savedTrayClear
+        NotificationLog.shared.clear()
+        PushRegistrar.accountSignedIn = savedFlag
+        try await super.tearDown()
+    }
+
+    private func signOut() {
+        model.scrubDeviceLocalUserContent()
+        model.signedIn = false
+    }
+
+    /// The tray is emptied, and nothing the sweep / a delivery / a tap finds
+    /// afterwards is logged — clear() had just forgotten every dedupe key.
+    func testSignOutEmptiesTheTrayAndTheLogStaysShutUntilSignIn() {
+        let log = NotificationLog.shared
+        log.add(kind: "reminder", title: "Coming up: Therapy appointment", body: "in 10 minutes",
+                deepLink: "unstuck://task/a-task", dedupeKey: "unstuck.rem.lead:b1|1")
+        XCTAssertEqual(log.items.count, 1, "signed in: logged")
+
+        signOut()
+        XCTAssertEqual(trayClears, 1, "delivered notifications removed from Notification Center")
+        XCTAssertTrue(log.items.isEmpty)
+        XCTAssertEqual(PushRegistrar.accountSignedIn, false)
+
+        // The next foreground's sweep re-reads the same delivered notification.
+        log.add(kind: "reminder", title: "Coming up: Therapy appointment", body: "in 10 minutes",
+                deepLink: "unstuck://task/a-task", dedupeKey: "unstuck.rem.lead:b1|1")
+        XCTAssertTrue(log.items.isEmpty, "signed out: nothing re-imported")
+    }
+
+    func testSignOutClosesEverythingTheRouterHeldAndTheRecap() {
+        let task = TaskItem(id: "a-task", name: "A's private task", estimateMin: 25,
+                            createdAt: "2026-09-22T09:00:00.000Z", updatedAt: "2026-09-22T09:00:00.000Z")
+        let r = model.router
+        r.tab = .calendar
+        r.calendarMode = .week
+        r.activeSheet = .inbox
+        r.showAssistant = true
+        r.detailTask = task
+        r.focusTask = task
+        r.pendingDeepLink = "unstuck://task/a-task"
+        r.openCollectionId = "a-list"
+        model.lastRecap = AppModel.RecapState(taskName: "A's private task", focusedSec: 1500,
+                                              at: Date().timeIntervalSince1970 * 1000)
+
+        signOut()
+
+        XCTAssertFalse(r.hasActivePresentation)
+        XCTAssertNil(r.detailTask)
+        XCTAssertNil(r.focusTask)
+        XCTAssertNil(r.pendingDeepLink)
+        XCTAssertNil(r.openCollectionId)
+        XCTAssertEqual(r.tab, .today)
+        XCTAssertEqual(r.calendarMode, .day)
+        XCTAssertNil(model.lastRecap, "B's Today never shows A's 'Just now' card")
+    }
+
+    func testSignOutDropsTheSharedWithMeState() {
+        let before = model.shareState
+        before.sharedWithMe = [SharedWithMe(shareId: "s1", taskId: "t-a", ownerName: "Anna", level: .view,
+                                            title: "A's shared task", done: false)]
+
+        signOut()
+
+        XCTAssertFalse(model.shareState === before, "a fresh model for the next account")
+        XCTAssertTrue(model.shareState.sharedWithMe.isEmpty)
+    }
+
+    /// A `.background` / BG-refresh pass between the scrub and the sync
+    /// engine's store wipe used to write A's next task back for the widget.
+    func testTheWidgetSnapshotIsNotRewrittenOnceSignedOut() throws {
+        let group = try XCTUnwrap(UserDefaults(suiteName: AppGroup.id))
+        model.refreshWidgetSnapshot()
+        XCTAssertNotNil(group.object(forKey: "startNextSnapshot"), "signed in: written")
+
+        signOut()
+        XCTAssertNil(group.object(forKey: "startNextSnapshot"), "the scrub cleared it")
+        model.refreshWidgetSnapshot()   // the store still holds A's rows here
+        XCTAssertNil(group.object(forKey: "startNextSnapshot"))
+        XCTAssertNil(group.object(forKey: "unstuckSnapshot"))
+    }
+
+    /// A tap on one of A's notifications after the sign-out must not park a
+    /// route (or write a reschedule) that the next account's session runs.
+    func testANotificationTappedWhileSignedOutGoesNowhere() async {
+        signOut()
+        await model.handlePushAction(.open(deepLink: "unstuck://task/t-proposal"))
+        await model.handlePushAction(.startFocus(taskId: "t-proposal"))
+        let r = model.router
+        XCTAssertFalse(r.hasActivePresentation)
+        XCTAssertNil(r.pendingDeepLink)
+    }
+
+    func testATapWhileSignedInStillRoutes() async {
+        await model.handlePushAction(.open(deepLink: "unstuck://task/t-proposal"))
+        XCTAssertTrue(model.router.hasActivePresentation)
+    }
+
+    /// Today's own widget writer. Today stays mounted through the Sign-out
+    /// button's drain (and for a render after a reactive sign-out) while the
+    /// store still holds A's rows: a change to them then wrote A's next task
+    /// back onto the home / lock widget after the scrub had emptied it.
+    func testTodaysWidgetWriterStopsOnceSignedOut() async throws {
+        let group = try XCTUnwrap(UserDefaults(suiteName: AppGroup.id))
+        group.removeObject(forKey: "startNextSnapshot")
+        let repo = try XCTUnwrap(model.taskRepo)
+        let today = TodayModel(repo)
+        let obs = Task { await today.observe() }
+        defer { obs.cancel() }
+        func settle(_ done: () -> Bool) async throws {
+            var tries = 0
+            while !done() && tries < 60 { try await Task.sleep(nanoseconds: 50_000_000); tries += 1 }
+        }
+        try await settle { group.object(forKey: "startNextSnapshot") != nil }
+        XCTAssertNotNil(group.object(forKey: "startNextSnapshot"), "signed in: Today writes the widget")
+
+        signOut()
+        XCTAssertNil(group.object(forKey: "startNextSnapshot"), "the scrub cleared it")
+        // A's rows change before the sync engine wipes the store (a realtime
+        // edit, the drain): one more open task, so the widget content differs.
+        try repo.upsert(TaskItem(id: "a-late", name: "A's late task", estimateMin: 10,
+                                 createdAt: "2026-09-22T09:00:00.000Z", updatedAt: "2026-09-22T09:00:00.000Z"))
+        try await settle { today.all.contains { $0.id == "a-late" } }
+        XCTAssertTrue(today.all.contains { $0.id == "a-late" }, "the emission reached Today")
+        XCTAssertNil(group.object(forKey: "startNextSnapshot"), "and wrote nothing for the widget")
+    }
+
+    /// Signed in with no APNs token (a sign-in's re-register after the
+    /// sign-out's unregister that never answered): the next foreground asks
+    /// again instead of leaving the account without alert pushes.
+    func testASignedInForegroundWithNoTokenAsksForOneAgain() {
+        let push = PushRegistrar.shared
+        push.unregisterFromAPNs()   // no token, nothing outstanding
+        model.syncNow()
+        XCTAssertNotNil(push.apnsRequestedAt, "asked on the foreground")
+
+        push.unregisterFromAPNs()
+        model.signedIn = false
+        model.syncNow()
+        XCTAssertNil(push.apnsRequestedAt, "never while signed out")
+    }
+
+    /// The Sign out row's split: the ops the server refused are counted
+    /// apart from the ones still waiting to be sent.
+    func testQuarantinedChangesAreCountedApart() throws {
+        let outbox = OutboxStore(try XCTUnwrap(model.db))
+        let now = "2026-09-22T09:00:00.000Z"
+        try outbox.enqueue(table: "tasks", rowId: "t-waiting", kind: .upsert, payload: "{}", nowISO: now)
+        let refused = try outbox.enqueue(table: "tasks", rowId: "t-refused", kind: .upsert, payload: "{}", nowISO: now)
+        for _ in 0..<OutboxStore.quarantineCap { try outbox.bumpAttempts(try XCTUnwrap(refused.opSeq)) }
+        XCTAssertEqual(model.quarantinedSyncCount, 1)
+    }
+}

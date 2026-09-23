@@ -23,10 +23,16 @@
 // and tears down any call in progress silently — so a call the server had
 // already queued for the previous account can't ring this device, and even
 // if a push slips through before PushKit catches up, the coordinator sees
-// "no VoIP registration" ⇒ "nobody signed in" and drops it. The server-side
+// "nobody signed in", reports the call and ends it at once. The server-side
 // row is deleted by SyncCoordinator.signOutAndUnregister when the JWT is
 // still valid; this is the device half that works without one. `rearm()`
 // (CallCoordinator.attach(model:client:) once signed in) re-registers.
+// The drop has to OUTLIVE the launch: `start()` used to re-register on every
+// launch, the token came back, and the killed-state check read it as "signed
+// in" — so a signed-out phone rang for the previous account again. A
+// signed-out device (PushRegistrar.accountSignedIn == false) now stays
+// unregistered until a sign-in re-arms it, and the killed-state check reads
+// that flag, not the token (audit 2026-09-22, C36).
 
 import Foundation
 import PushKit
@@ -88,9 +94,17 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
         PushClient.voipTokenProvider = { VoipPushRegistry.storedToken }
         let r = PKPushRegistry(queue: .main)
         r.delegate = self
-        r.desiredPushTypes = [.voIP]
+        let types = Self.launchPushTypes(accountSignedIn: PushRegistrar.accountSignedIn)
+        r.desiredPushTypes = types
         registry = r
-        registrationStartedAt = Date()
+        registrationStartedAt = types.isEmpty ? nil : Date()
+    }
+
+    /// What `start()` registers for: nothing on a device that is signed out
+    /// (explicitly `[]`, which drops any registration left over), VoIP
+    /// otherwise — including an install that predates the flag (nil).
+    nonisolated static func launchPushTypes(accountSignedIn: Bool?) -> Set<PKPushType> {
+        accountSignedIn == false ? [] : [.voIP]
     }
 
     /// Sign-out (AppModel.scrubDeviceLocalUserContent): forget the token, stop
@@ -116,6 +130,10 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
 
     func pushRegistry(_ registry: PKPushRegistry, didUpdate pushCredentials: PKPushCredentials, for type: PKPushType) {
         guard type == .voIP else { return }
+        // A token for a registration sign-out already dropped (it was in
+        // flight) is not kept: stored, it would read as "signed in" and go up
+        // with the next register-push-token.
+        guard registry.desiredPushTypes?.contains(.voIP) == true else { return }
         let hex = pushCredentials.token.map { String(format: "%02x", $0) }.joined()
         UserDefaults.standard.set(hex, forKey: Self.tokenKey)
         PushRegistrar.shared.didReceiveVoip(hex)

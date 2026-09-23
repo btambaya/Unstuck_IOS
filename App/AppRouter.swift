@@ -182,6 +182,20 @@ final class AppRouter {
         collectionFabRequest = nil
     }
 
+    /// Sign-out: the router outlives the scaffold, so whatever the previous
+    /// account had open came back when the next sign-in remounted it — a task
+    /// editor holding a pre-sign-out snapshot (a save could overwrite newer
+    /// data), a Focus cover that minted a fresh session, a parked deep link or
+    /// collection (audit 2026-09-22, C35).
+    func resetForSignOut() {
+        dismissAllPresentations()
+        pendingDeepLink = nil
+        openCollectionId = nil
+        calendarMode = .day
+        tab = .today
+        clearCollectionsSurface()
+    }
+
     /// Start a normal own-task focus (clears any stale shared marker so this
     /// session never inherits a prior shared context).
     func beginFocus(_ task: TaskItem) { sharedFocus = nil; focusTask = task }

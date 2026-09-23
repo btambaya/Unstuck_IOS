@@ -388,6 +388,11 @@ extension AppModel {
     // MARK: notification gestures (PushAppDelegate → PushActionHub)
 
     func handlePushAction(_ action: PushAction) async {
+        // Signed out, a tapped notification belongs to the account that left:
+        // its route used to be parked in the router and opened in the NEXT
+        // account's session, and a Reschedule wrote through the writer that
+        // outlives the sign-out (audit 2026-09-22, C35).
+        guard signedIn else { return }
         switch action {
         case .open(let deepLink):
             routeDeepLink(deepLink)

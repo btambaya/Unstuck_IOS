@@ -82,6 +82,11 @@ final class NotificationLog {
     /// delivered-sweep paths from triple-logging one notification.
     func add(kind: String?, title: String, body: String, deepLink: String?,
              at: Double = Date().timeIntervalSince1970 * 1000, dedupeKey: String? = nil) {
+        // Nothing is logged while this device is signed out: the foreground
+        // sweep, a foreground delivery or a tap would otherwise re-import the
+        // previous account's notifications for whoever signs in next — clear()
+        // has just emptied the dedupe keys (audit 2026-09-22, C35).
+        guard PushRegistrar.accountSignedIn != false else { return }
         if let dedupeKey {
             guard !loggedKeys.contains(dedupeKey) else { return }
             loggedKeys = Array(([dedupeKey] + loggedKeys).prefix(Self.dedupeCap))
@@ -131,6 +136,18 @@ final class NotificationLog {
         d.removeObject(forKey: Self.logKey)
         d.removeObject(forKey: Self.seenKey)
         d.removeObject(forKey: Self.dedupeKey)
+        // ...and the system tray the log is swept from. Left there, the
+        // previous account's reminders, briefs and call notes stayed on the
+        // lock screen, a tap routed their task ids into the next session, and
+        // the next account's first sweep logged them all again (audit
+        // 2026-09-22, C35).
+        Self.removeDeliveredNotifications()
+    }
+
+    /// Empties Notification Center of this app's delivered notifications. A
+    /// seam: tests swap it (the test host has no notification permission).
+    static var removeDeliveredNotifications: @MainActor () -> Void = {
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
     }
 
     private func persist() {

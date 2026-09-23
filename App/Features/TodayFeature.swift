@@ -156,6 +156,13 @@ final class TodayModel {
     private var lastWidgetContent: StartNextSnapshot?
 
     private func writeWidgetSnapshot() {
+        // Never once the sign-out scrub has run (it clears this flag and the
+        // App Group together): the store still holds the signed-out account's
+        // rows until the sync engine wipes it, and Today stays mounted through
+        // the Sign-out button's drain — an emission then (the scrub's own
+        // focus finalize, a realtime edit) put that account's next task back
+        // on the home / lock widget (audit 2026-09-22, C35).
+        guard PushRegistrar.accountSignedIn != false else { return }
         // The widget's pick is today-scoped (next scheduled by time → else the
         // shortest unscheduled → else nothing) — the same rule the on-screen
         // hero used before it was removed; the home/lock "Start Next" tile

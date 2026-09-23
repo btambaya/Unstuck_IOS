@@ -126,3 +126,32 @@ final class SettingsStateTests: XCTestCase {
         XCTAssertEqual(d.object(forKey: "unstuck.focusSoftExit") as? Bool, false)
     }
 }
+
+// MARK: - Sign out with edits still queued (audit 2026-09-22, C36)
+
+@MainActor
+final class SignOutWarningTests: XCTestCase {
+    /// The Sign out row signs out at once only when nothing is waiting;
+    /// otherwise it first says where the queued edits go.
+    func testTheSignOutRowWarnsOnlyWhenEditsAreStillQueued() throws {
+        XCTAssertNil(AppModel.unsyncedSignOutWarning(pending: 0))
+        let one = try XCTUnwrap(AppModel.unsyncedSignOutWarning(pending: 1))
+        XCTAssertTrue(one.hasPrefix("1 change hasn’t reached the server yet."), one)
+        let three = try XCTUnwrap(AppModel.unsyncedSignOutWarning(pending: 3))
+        XCTAssertTrue(three.hasPrefix("3 changes haven’t reached the server yet."), three)
+        XCTAssertTrue(three.contains("sync the next time you sign in here"), three)
+    }
+
+    /// Quarantined ops are parked and restored with their attempts, so no
+    /// sign-in ever syncs them: the row must not promise it for those.
+    func testChangesTheServerRefusedAreNeverPromisedASync() throws {
+        let stuckOnly = try XCTUnwrap(AppModel.unsyncedSignOutWarning(pending: 1, quarantined: 1))
+        XCTAssertFalse(stuckOnly.contains("sync the next time you sign in"), stuckOnly)
+        XCTAssertTrue(stuckOnly.hasPrefix("1 change the server couldn’t accept stays on this iPhone only"), stuckOnly)
+
+        let mixed = try XCTUnwrap(AppModel.unsyncedSignOutWarning(pending: 4, quarantined: 2))
+        XCTAssertTrue(mixed.hasPrefix("2 changes haven’t reached the server yet."), mixed)
+        XCTAssertTrue(mixed.contains("sync the next time you sign in here"), mixed)
+        XCTAssertTrue(mixed.contains("2 changes the server couldn’t accept stay on this iPhone only"), mixed)
+    }
+}

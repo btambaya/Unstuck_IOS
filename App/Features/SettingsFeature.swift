@@ -563,10 +563,9 @@ private struct AccountSettingsView: View {
     @State private var showPassword = false
     @State private var showDelete = false
     @State private var showFeedback = false
-    @State private var confirmSignOut = false
-    @State private var unsyncedAtSignOut = 0
     @State private var message: String?
     @State private var messageIsError = false
+    @State private var signOutWarning: String?
 
     var body: some View {
         SettingsScaffold(eyebrow: "Settings · Account", title: "Your account.") {
@@ -608,11 +607,14 @@ private struct AccountSettingsView: View {
                 CardDivider()
                 SettingTapRow(label: "Sign out", value: "End this session",
                               destructive: true, locked: model.tourRunning) {
-                    // Changes that haven't reached the server are parked for
-                    // this account's next sign-in here, never lost — but the
-                    // user should know before leaving (audit 2026-09-22, C28).
-                    unsyncedAtSignOut = model.pendingSyncCount
-                    if unsyncedAtSignOut > 0 { confirmSignOut = true } else { model.signOut(); dismiss() }
+                    // Edits still queued: say where they go before they're
+                    // parked (audit 2026-09-22, C36). What the server refused
+                    // — and everything held behind it — never syncs from a
+                    // later sign-in, so it's told apart (C28's stuck count).
+                    signOutWarning = AppModel.unsyncedSignOutWarning(
+                        pending: model.pendingSyncCount,
+                        quarantined: max(model.quarantinedSyncCount, model.stuckChanges))
+                    if signOutWarning == nil { model.signOut(); dismiss() }
                 }
             }
             if let message {
@@ -625,15 +627,14 @@ private struct AccountSettingsView: View {
         .sheet(item: $exportURL) { url in
             ActivityView(items: [url]) { AppModel.removeExportFile(url) }
         }
-        .sheet(isPresented: $showFeedback) { FeedbackSheet() }
-        .alert("\(unsyncedAtSignOut) change\(unsyncedAtSignOut == 1 ? " hasn't" : "s haven't") synced yet",
-               isPresented: $confirmSignOut) {
+        .alert("Sign out with changes unsynced?",
+               isPresented: Binding(get: { signOutWarning != nil }, set: { if !$0 { signOutWarning = nil } })) {
             Button("Sign out", role: .destructive) { model.signOut(); dismiss() }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Unstuck sends what it can first; the rest stays on this phone and syncs when you sign in here again."
-                 + (model.stuckChanges > 0 ? " \(model.stuckChanges) couldn't be saved — Today shows them." : ""))
+            Text(signOutWarning ?? "")
         }
+        .sheet(isPresented: $showFeedback) { FeedbackSheet() }
         .sheet(isPresented: $showName) {
             DisplayNameSheet(initial: model.currentUserName ?? "") { name in
                 Task {
