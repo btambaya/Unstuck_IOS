@@ -90,6 +90,6 @@ public func composeBrief(tasks: [TaskItem], blocks: [CalBlock], todayIso: String
 public func probeQuestion(_ gap: Gap) -> String {
     let due = LocalDate.parse(gap.dueDate)
     let dueDow = Time.dayOfWeekJS(due)
-    let month = Calendar.current.component(.month, from: due) - 1
+    let month = Time.calendar.component(.month, from: due) - 1
     return "You usually do ‘\(gap.taskName)’ on \(DAY_NAMES_FULL[gap.dow])s — still on for \(DAY_NAMES_FULL[dueDow]) \(Time.dayOfMonth(due)) \(MONTH_SHORT_GB[month])?"
 }

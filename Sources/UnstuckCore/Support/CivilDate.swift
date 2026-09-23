@@ -15,35 +15,35 @@ public extension Time {
         c.year = year
         c.month = month
         c.day = day
-        return Calendar.current.date(from: c) ?? Date(timeIntervalSince1970: 0)
+        return Time.calendar.date(from: c) ?? Date(timeIntervalSince1970: 0)
     }
 
     /// `Date` advanced by `n` whole days, preserving wall-clock time
     /// (DST-safe), matching `new Date(y, m, d+n)`.
     static func addDays(_ d: Date, _ n: Int) -> Date {
-        Calendar.current.date(byAdding: .day, value: n, to: d) ?? d
+        Time.calendar.date(byAdding: .day, value: n, to: d) ?? d
     }
 
     /// Local start-of-day. Equivalent to flooring a JS Date to midnight.
     static func startOfDay(_ d: Date) -> Date {
-        Calendar.current.startOfDay(for: d)
+        Time.calendar.startOfDay(for: d)
     }
 
     /// Day-of-week in JS convention: 0=Sun … 6=Sat (Calendar gives 1…7).
     static func dayOfWeekJS(_ d: Date) -> Int {
-        Calendar.current.component(.weekday, from: d) - 1
+        Time.calendar.component(.weekday, from: d) - 1
     }
 
     /// Day-of-month (1…31), matching `Date.getDate()`.
     static func dayOfMonth(_ d: Date) -> Int {
-        Calendar.current.component(.day, from: d)
+        Time.calendar.component(.day, from: d)
     }
 
     /// Number of days in the month containing `d` (28–31). Mirrors Android
     /// `Time.daysInMonth` — used to clamp a day-31 monthly recurrence to each
     /// month's last day (so Feb/Apr/etc. still get an occurrence).
     static func daysInMonth(_ d: Date) -> Int {
-        Calendar.current.range(of: .day, in: .month, for: d)?.count ?? 30
+        Time.calendar.range(of: .day, in: .month, for: d)?.count ?? 30
     }
 
     /// Whole-day difference `floor(a) - floor(b)` rounded — matches the

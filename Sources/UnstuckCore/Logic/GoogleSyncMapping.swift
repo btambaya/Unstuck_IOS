@@ -23,7 +23,7 @@ public func isoToLocalHHMM(_ iso: String) -> String {
 }
 
 private func localHHMM(_ d: Date) -> String {
-    let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+    let c = Time.calendar.dateComponents([.hour, .minute], from: d)
     return String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
 }
 
@@ -72,7 +72,7 @@ public func externalEventBlocks(_ ev: ExternalEvent, fromYmd: String? = nil, toY
     guard let start = date(ev.start), let end = date(ev.end), end > start else {
         return inWindow(one.date) ? [one] : []
     }
-    let cal = Calendar.current
+    let cal = Time.calendar
     let startYmd = Clock.dateISO(start)
     // Days before the window are skipped by date, not walked one by one.
     var day = cal.startOfDay(for: start)
@@ -201,7 +201,7 @@ public func blockToIsoRange(_ b: CalBlock) -> (start: String, end: String) {
     c.year = y; c.month = m; c.day = d
     c.hour = tParts.count > 0 ? (tParts[0] ?? 0) : 0
     c.minute = tParts.count > 1 ? (tParts[1] ?? 0) : 0
-    let startDate = Calendar.current.date(from: c) ?? Date(timeIntervalSince1970: 0)
+    let startDate = Time.calendar.date(from: c) ?? Date(timeIntervalSince1970: 0)
     let endDate = startDate.addingTimeInterval(Double(b.durationMinutes) * 60)
 
     let f = ISO8601DateFormatter()

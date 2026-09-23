@@ -145,7 +145,7 @@ final class ReminderScheduler {
 
         for plan in plans {
             let fireDate = Date(timeIntervalSince1970: plan.fireAt / 1000)
-            let comps = Calendar.current.dateComponents(
+            let comps = Time.calendar.dateComponents(
                 [.year, .month, .day, .hour, .minute, .second], from: fireDate)
             let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
             let request = UNNotificationRequest(

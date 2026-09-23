@@ -115,6 +115,6 @@ public func pickTodayHero(
 /// (which are stored in the device's local timezone).
 private func currentLocalHHMM(_ now: EpochMillis) -> String {
     let date = Date(timeIntervalSince1970: now / 1000)
-    let c = Foundation.Calendar.current.dateComponents([.hour, .minute], from: date)
+    let c = Time.calendar.dateComponents([.hour, .minute], from: date)
     return String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0)
 }

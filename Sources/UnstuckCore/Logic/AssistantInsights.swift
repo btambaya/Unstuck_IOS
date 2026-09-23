@@ -103,7 +103,7 @@ public func goldenHours(_ sessions: [Session], now: Date) -> GoldenHours? {
         guard s.actualSec > 0 else { continue }
         guard let endMs = LocalTime.parseMillis(s.completedAt), endMs >= windowStart, endMs <= nowMs else { continue }
         let start = Date(timeIntervalSince1970: (endMs - Double(s.actualSec) * 1000) / 1000)
-        let startHour = Calendar.current.component(.hour, from: start)
+        let startHour = Time.calendar.component(.hour, from: start)
         bins[startHour] += s.actualSec
         total += s.actualSec
         count += 1
@@ -237,7 +237,7 @@ public func quietWinLine(taskName: String, moveCount: Int, tone: Tone) -> String
 /// full timestamps render via local getters.
 public func factCitation(fact: String, createdAt: String) -> String {
     guard let d = LocalTime.parseTimestamp(createdAt) else { return "“\(fact)”" }
-    let month = Calendar.current.component(.month, from: d) - 1
+    let month = Time.calendar.component(.month, from: d) - 1
     return "“\(fact)” (you told me \(Time.dayOfMonth(d)) \(MONTHS[month]))"
 }
 

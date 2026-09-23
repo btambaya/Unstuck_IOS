@@ -51,7 +51,7 @@ enum DemoSeed {
         // Scheduled blocks placed RELATIVE to the current hour — the calendar
         // day view auto-scrolls to NOW, so screenshots always show a populated
         // schedule regardless of when the tour runs. Clamped to the 6–21h grid.
-        let h = Calendar.current.component(.hour, from: Date())
+        let h = Time.calendar.component(.hour, from: Date())
         func hm(_ hour: Int) -> String { String(format: "%02d:00", min(max(hour, 6), 21)) }
         let blocks: [(id: String, taskId: String, name: String, start: String, mins: Int)] = [
             ("blk-sarah", "t-sarah", "Reply to Sarah", hm(h - 1), 15),

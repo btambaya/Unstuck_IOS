@@ -71,7 +71,7 @@ final class AnalyticsModel {
     /// Cutoff (epoch ms) for the window — Monday 00:00 (week), 1st 00:00 (month),
     /// 0 (all). Mirrors the Android calendar-anchored cutoff.
     private var cutoff: Double {
-        let cal = Calendar.current
+        let cal = Time.calendar
         switch window {
         case .all: return 0
         case .week:

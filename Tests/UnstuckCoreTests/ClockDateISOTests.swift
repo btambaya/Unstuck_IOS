@@ -58,4 +58,29 @@ final class ClockDateISOTests: XCTestCase {
         XCTAssertEqual(Clock.todayISO(), reference(c.year ?? 0, c.month ?? 0, c.day ?? 0))
         XCTAssertEqual(Clock.todayISO(), Clock.dateISO(now))
     }
+
+    // A phone set to the Buddhist calendar (Thailand's default) or the
+    // Japanese one must still store Gregorian dates — `Calendar.current`
+    // gave "2569-…" / "0008-…" (Ahmad 2026-09-23).
+    func testStoredDatesAreGregorianWhateverTheDeviceCalendar() {
+        let instant = Date(timeIntervalSince1970: 1_790_164_800)   // 2026-09-23 12:00 UTC
+        for id in [Calendar.Identifier.buddhist, .japanese, .persian, .islamicUmmAlQura] {
+            var device = Calendar(identifier: id)
+            device.timeZone = TimeZone(identifier: "Asia/Bangkok")!
+            device.locale = Locale(identifier: "th_TH")
+            device.firstWeekday = 2
+            let g = Time.gregorian(matching: device)
+            XCTAssertEqual(g.identifier, .gregorian, "\(id)")
+            XCTAssertEqual(g.component(.year, from: instant), 2026, "\(id)")
+            XCTAssertEqual(g.component(.month, from: instant), 9, "\(id)")
+            XCTAssertEqual(g.component(.day, from: instant), 23, "\(id)")
+            XCTAssertEqual(g.timeZone, device.timeZone, "keeps the device's zone")
+            XCTAssertEqual(g.firstWeekday, 2, "keeps the device's week start")
+        }
+        XCTAssertNotEqual(Calendar(identifier: .buddhist).component(.year, from: instant), 2026,
+                          "the bug this guards: the device calendar's own year")
+        let gregorianDevice = Calendar(identifier: .gregorian)
+        XCTAssertEqual(Time.gregorian(matching: gregorianDevice), gregorianDevice, "the common case is untouched")
+        XCTAssertEqual(Time.calendar.identifier, .gregorian)
+    }
 }

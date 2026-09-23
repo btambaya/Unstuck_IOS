@@ -107,14 +107,14 @@ enum CalWindow {
     /// Week view's range, so the two share cache windows.
     static func week(containing iso: String) -> SharedBlocksCache.Window {
         guard let d = date(iso) else { return .init(from: iso, to: iso) }
-        let weekdaySun1 = Calendar.current.component(.weekday, from: d)   // 1=Sun … 7=Sat
+        let weekdaySun1 = Time.calendar.component(.weekday, from: d)   // 1=Sun … 7=Sat
         let monday = Time.addDays(d, -((weekdaySun1 + 5) % 7))
         return .init(from: Clock.dateISO(monday), to: Clock.dateISO(Time.addDays(monday, 6)))
     }
 
     /// The Monday-anchored week starting `weekOffset` weeks from this week.
     static func week(offset weekOffset: Int, today: Date = Date()) -> SharedBlocksCache.Window {
-        let cal = Calendar.current
+        let cal = Time.calendar
         let weekdaySun1 = cal.component(.weekday, from: today)
         let thisMonday = Time.addDays(cal.startOfDay(for: today), -((weekdaySun1 + 5) % 7))
         let monday = Time.addDays(thisMonday, weekOffset * 7)
@@ -123,7 +123,7 @@ enum CalWindow {
 
     /// The calendar month containing `d` (1st … last day).
     static func month(containing d: Date) -> SharedBlocksCache.Window {
-        let cal = Calendar.current
+        let cal = Time.calendar
         let first = cal.date(from: cal.dateComponents([.year, .month], from: d)) ?? d
         let count = cal.range(of: .day, in: .month, for: first)?.count ?? 30
         return .init(from: Clock.dateISO(first), to: Clock.dateISO(Time.addDays(first, count - 1)))

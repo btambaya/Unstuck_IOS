@@ -83,7 +83,7 @@ public func findFreeSlots(
     // true → garbage zero/negative-length slots. A slot must span real time.
     // Mirrors the Android coerceAtLeast(1).
     let durationMin = max(1, durationMin)
-    let nowMin = Calendar.current.component(.hour, from: now) * 60 + Calendar.current.component(.minute, from: now)
+    let nowMin = Time.calendar.component(.hour, from: now) * 60 + Time.calendar.component(.minute, from: now)
 
     var d = 0
     while d < daysToScan && out.count < limit {

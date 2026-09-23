@@ -12,6 +12,7 @@
 
 import AVFoundation
 import SwiftUI
+import UnstuckCore
 import UnstuckDesign
 import UnstuckSync
 
@@ -409,9 +410,9 @@ struct CallSettingsView: View {
 
     private static func date(_ hhmm: String) -> Date {
         let m = CallSettings.minutesOfDay(hhmm) ?? 6 * 60
-        var c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        var c = Time.calendar.dateComponents([.year, .month, .day], from: Date())
         c.hour = m / 60; c.minute = m % 60
-        return Calendar.current.date(from: c) ?? Date()
+        return Time.calendar.date(from: c) ?? Date()
     }
 }
 

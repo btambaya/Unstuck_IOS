@@ -166,13 +166,13 @@ private let DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 /// "Sat 12 Sept" — how a PA says a near date out loud.
 private func fmtDate(_ isoDate: String) -> String {
     let d = LocalDate.parse(isoDate)
-    let month = Calendar.current.component(.month, from: d) - 1
+    let month = Time.calendar.component(.month, from: d) - 1
     return "\(DAY_SHORT[Time.dayOfWeekJS(d)]) \(Time.dayOfMonth(d)) \(MONTH_SHORT_GB[month])"
 }
 
-private func hourOf(_ now: Date) -> Int { Calendar.current.component(.hour, from: now) }
+private func hourOf(_ now: Date) -> Int { Time.calendar.component(.hour, from: now) }
 private func minutesOfDay(_ now: Date) -> Int {
-    let c = Calendar.current.dateComponents([.hour, .minute], from: now)
+    let c = Time.calendar.dateComponents([.hour, .minute], from: now)
     return (c.hour ?? 0) * 60 + (c.minute ?? 0)
 }
 

@@ -14,6 +14,29 @@ public typealias EpochMillis = Double
 public let DAY_MS: Double = 24 * 60 * 60 * 1000
 
 public enum Time {
+    /// THE calendar every civil date the app stores, syncs or compares is
+    /// computed in: Gregorian, in the device's time zone, locale and week
+    /// start. `Calendar.current` follows the device's calendar SETTING, so on
+    /// a phone set to the Buddhist calendar (Thailand's default) or the
+    /// Japanese one `dateISO` wrote "2569-09-23" / "0008-09-23" — dates the
+    /// server and the web and Android apps read as a different day, which
+    /// broke scheduling, recurrence and reminders for those users (audit
+    /// 2026-09-22, known deferred; Ahmad 2026-09-23). Display formatting is
+    /// untouched: a DateFormatter still shows the user's own calendar.
+    public static var calendar: Calendar { gregorian(matching: Calendar.current) }
+
+    /// `base` itself when it is already Gregorian (the common case, no cost),
+    /// else a Gregorian calendar carrying its time zone, locale and week rules.
+    public static func gregorian(matching base: Calendar) -> Calendar {
+        if base.identifier == .gregorian { return base }
+        var g = Calendar(identifier: .gregorian)
+        g.timeZone = base.timeZone
+        g.locale = base.locale
+        g.firstWeekday = base.firstWeekday
+        g.minimumDaysInFirstWeek = base.minimumDaysInFirstWeek
+        return g
+    }
+
     /// Shared ISO-8601 parsers, hoisted to `static let` so the hot path
     /// (realtime mirror / outbox prune / analytics / list rebuild) doesn't
     /// allocate two formatters on every `parseMillis` call. `ISO8601DateFormatter`
@@ -172,7 +195,7 @@ public enum Time {
     /// `now`. Equivalent to `new Date(now).setHours(0,0,0,0)`.
     public static func startOfDayMillis(_ now: EpochMillis) -> EpochMillis {
         let date = Date(timeIntervalSince1970: now / 1000)
-        let start = Calendar.current.startOfDay(for: date)
+        let start = Time.calendar.startOfDay(for: date)
         return start.timeIntervalSince1970 * 1000
     }
 }
@@ -199,7 +222,7 @@ public enum Clock {
     /// `Tests/UnstuckCoreTests/ClockDateISOTests.swift` compares the two over
     /// the full component range.
     public static func dateISO(_ date: Date) -> String {
-        let c = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        let c = Time.calendar.dateComponents([.year, .month, .day], from: date)
         let y = c.year ?? 0, m = c.month ?? 0, d = c.day ?? 0
         guard y >= 0, y <= 9999, m >= 0, m <= 99, d >= 0, d <= 99 else {
             return String(format: "%04d-%02d-%02d", y, m, d)

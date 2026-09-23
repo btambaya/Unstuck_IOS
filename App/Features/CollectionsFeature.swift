@@ -927,7 +927,7 @@ private struct ByTimePicker: View {
     }
 
     static func iso(from time: Date) -> String {
-        let cal = Calendar.current
+        let cal = Time.calendar
         let comps = cal.dateComponents([.hour, .minute], from: time)
         var target = cal.date(bySettingHour: comps.hour ?? 9, minute: comps.minute ?? 0, second: 0, of: Date()) ?? Date()
         if target < Date() { target = cal.date(byAdding: .day, value: 1, to: target) ?? target }

@@ -190,12 +190,12 @@ enum FactDate {
 
     static func label(for f: ProfileFact, now: Date = Date()) -> String {
         if let when = f.whenIso, let d = parseIsoDate(when) {
-            let sameYear = Calendar.current.component(.year, from: d) == Calendar.current.component(.year, from: now)
+            let sameYear = Time.calendar.component(.year, from: d) == Time.calendar.component(.year, from: now)
             return "for " + (sameYear ? short : withYear).string(from: d)
         }
         if let ms = Time.parseMillis(f.updatedAt) {
             let d = Date(timeIntervalSince1970: ms / 1000)
-            let sameYear = Calendar.current.component(.year, from: d) == Calendar.current.component(.year, from: now)
+            let sameYear = Time.calendar.component(.year, from: d) == Time.calendar.component(.year, from: now)
             return (sameYear ? short : withYear).string(from: d)
         }
         return ""
@@ -204,7 +204,7 @@ enum FactDate {
     private static func parseIsoDate(_ s: String) -> Date? {
         let p = s.prefix(10).split(separator: "-").compactMap { Int($0) }
         guard p.count == 3 else { return nil }
-        return Calendar.current.date(from: DateComponents(year: p[0], month: p[1], day: p[2]))
+        return Time.calendar.date(from: DateComponents(year: p[0], month: p[1], day: p[2]))
     }
 }
 

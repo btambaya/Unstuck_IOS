@@ -991,7 +991,7 @@ extension AppModel {
             let g = ISO8601DateFormatter(); g.formatOptions = [.withInternetDateTime]; return g.date(from: iso)
         }()
         guard let date else { return nil }
-        let cal = Calendar.current
+        let cal = Time.calendar
         let c = cal.dateComponents([.hour, .minute], from: date)
         return (Clock.dateISO(date), String(format: "%02d:%02d", c.hour ?? 0, c.minute ?? 0))
     }

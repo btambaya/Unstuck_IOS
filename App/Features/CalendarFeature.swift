@@ -421,7 +421,7 @@ private struct WeekView: View {
     private let dows = ["M", "T", "W", "T", "F", "S", "S"]
 
     var body: some View {
-        let cal = Calendar.current
+        let cal = Time.calendar
         let weekdaySun1 = cal.component(.weekday, from: Date())          // 1=Sun … 7=Sat
         let thisMonday = cal.date(byAdding: .day, value: -((weekdaySun1 + 5) % 7), to: cal.startOfDay(for: Date()))!
         let monday = cal.date(byAdding: .day, value: weekOffset * 7, to: thisMonday)!
@@ -627,7 +627,7 @@ private struct WeekView: View {
 
     private func weekRangeLabel(_ start: Date, _ end: Date) -> String {
         let df = CalFmt.monthDay
-        let cal = Calendar.current
+        let cal = Time.calendar
         if cal.component(.month, from: start) == cal.component(.month, from: end) {
             return "\(df.string(from: start))–\(cal.component(.day, from: end))"
         }
@@ -659,7 +659,7 @@ private struct MonthView: View {
     private let dows = ["M", "T", "W", "T", "F", "S", "S"]
 
     var body: some View {
-        let cal = Calendar.current
+        let cal = Time.calendar
         let comps = cal.dateComponents([.year, .month], from: ym)
         let firstOfMonth = cal.date(from: comps)!
         let monthName = monthLabel(firstOfMonth)
@@ -809,7 +809,7 @@ private struct MonthView: View {
         let v = byDay[iso] ?? 0
         let t = min(1, max(0, Double(v) / Double(maxV)))
         let isToday = iso == todayISO
-        let day = Calendar.current.component(.day, from: d)
+        let day = Time.calendar.component(.day, from: d)
         // Heat fill: today = coral, empty = bg2, else lerp bg2→primary.
         let fill: Color = isToday ? theme.palette.coral
             : (v == 0 ? theme.palette.bg2 : lerpColor(theme.palette.bg2, theme.palette.primary, 0.2 + 0.6 * t))
@@ -1066,7 +1066,7 @@ struct DayGridView: View {
             }
             // NOW line on today's grid.
             if iso == Clock.todayISO() {
-                let cal = Calendar.current
+                let cal = Time.calendar
                 let nm = cal.component(.hour, from: now) * 60 + cal.component(.minute, from: now) - firstHour * 60
                 if nm >= 0 && nm <= (lastHour - firstHour) * 60 {
                     let y = CGFloat(nm) / 60 * pxPerHour
@@ -1148,14 +1148,14 @@ struct DayGridView: View {
 
     private func scrollToNow(_ proxy: ScrollViewProxy) {
         guard iso == Clock.todayISO() else { return }
-        let h = max(firstHour, Calendar.current.component(.hour, from: Date()) - 1)
+        let h = max(firstHour, Time.calendar.component(.hour, from: Date()) - 1)
         DispatchQueue.main.async {
             withAnimation(.none) { proxy.scrollTo("hour-\(h)", anchor: .top) }
         }
     }
 
     private func shift(_ days: Int) {
-        date = Calendar.current.date(byAdding: .day, value: days, to: date) ?? date
+        date = Time.calendar.date(byAdding: .day, value: days, to: date) ?? date
     }
     private var dayLabel: String {
         CalFmt.weekdayMonthDay.string(from: date)

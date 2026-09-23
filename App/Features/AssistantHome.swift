@@ -61,7 +61,7 @@ func buildAssistantContext(_ model: AppModel, now: Date = Date()) -> AssistantCo
     let openTodayCount = blocks.filter { $0.date == todayIso && !$0.done && !$0.skipped }.count
 
     let tour = TourStore().load()
-    let hour = Foundation.Calendar.current.component(.hour, from: now)
+    let hour = Time.calendar.component(.hour, from: now)
 
     return AssistantContext(
         nextTask: next,
@@ -574,7 +574,7 @@ struct AssistantShareConfirmCard: View {
 /// `dayLabel`. nil for a legacy turn with no stamp (it renders without one).
 func assistantDayLabel(at: Double?, now: Date = Date()) -> String? {
     guard let at else { return nil }
-    let cal = Foundation.Calendar.current
+    let cal = Time.calendar
     let date = Date(timeIntervalSince1970: at / 1000)
     if cal.isDate(date, inSameDayAs: now) { return "Today" }
     if let yesterday = cal.date(byAdding: .day, value: -1, to: now),

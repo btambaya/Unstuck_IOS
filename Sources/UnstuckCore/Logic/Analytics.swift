@@ -15,7 +15,7 @@ private let HOUR: Double = 3600
 private func parseDate(_ iso: String) -> Date? {
     Time.parseMillis(iso).map { Date(timeIntervalSince1970: $0 / 1000) }
 }
-private func hourOf(_ d: Date) -> Int { Calendar.current.component(.hour, from: d) }
+private func hourOf(_ d: Date) -> Int { Time.calendar.component(.hour, from: d) }
 
 /// Monday-anchored weekday index: Mon=0 … Sun=6.
 public func dayOfWeekIdx(_ d: Date) -> Int {

@@ -108,7 +108,7 @@ func minToHM(_ n: Int) -> String { "\(hmPad2(n / 60)):\(hmPad2(n % 60))" }
 
 /// Local wall-clock "HH:MM" of a `Date` — the ONLY time the model should reason from.
 public func localNowHM(_ d: Date = Date()) -> String {
-    let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+    let c = Time.calendar.dateComponents([.hour, .minute], from: d)
     return "\(hmPad2(c.hour ?? 0)):\(hmPad2(c.minute ?? 0))"
 }
 

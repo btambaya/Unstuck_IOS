@@ -713,7 +713,7 @@ struct NewTaskSheet: View {
                     ToolbarItem(placement: .cancellationAction) { Button("Cancel") { showTimePicker = false } }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("OK") {
-                            let c = Calendar.current.dateComponents([.hour, .minute], from: timePick)
+                            let c = Time.calendar.dateComponents([.hour, .minute], from: timePick)
                             pickedTime = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
                             autoTime = false
                             showTimePicker = false
@@ -838,7 +838,7 @@ struct NewTaskSheet: View {
     // MARK: date helpers
 
     private static func ymd(_ date: Date) -> String {
-        let c = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        let c = Time.calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
     private static func parseIso(_ s: String) -> Date? {
@@ -850,8 +850,8 @@ struct NewTaskSheet: View {
         guard let s else { return nil }
         let parts = s.split(separator: ":").compactMap { Int($0) }
         guard parts.count == 2 else { return nil }
-        var c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        var c = Time.calendar.dateComponents([.year, .month, .day], from: Date())
         c.hour = parts[0]; c.minute = parts[1]
-        return Calendar.current.date(from: c)
+        return Time.calendar.date(from: c)
     }
 }

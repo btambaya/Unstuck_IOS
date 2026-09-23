@@ -497,7 +497,7 @@ public actor SyncCoordinator {
         var status = CalendarSyncStatus(
             needsReauthConnectionIds: Set(statuses.filter(\.needsReauth).map(\.connection.id)),
             lastError: statuses.compactMap(\.lastError).first)
-        let cal = Foundation.Calendar.current
+        let cal = Time.calendar
         let today = cal.startOfDay(for: Date())
         guard let fromDate = cal.date(byAdding: .day, value: -7, to: today),
               let toDate = cal.date(byAdding: .day, value: 30, to: today),

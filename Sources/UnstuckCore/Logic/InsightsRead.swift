@@ -44,7 +44,7 @@ private let TAG_ORDER: [CaptureTag] = [.followUp, .idea, .edit, .question, .dist
 
 /// Window start: Monday 00:00 local for 'week', the 1st for 'month', nil for 'all'.
 func insightsWindowStart(_ window: InsightsWindow, now: Date) -> Date? {
-    let cal = Calendar.current
+    let cal = Time.calendar
     let day = cal.startOfDay(for: now)
     switch window {
     case .all: return nil
@@ -74,7 +74,7 @@ private func fmtHM(_ sec: Int) -> String { "\(sec / 3600)h \((sec % 3600) / 60)m
 
 /// `Wed 2 Sep` — local getters only.
 private func fmtDay(_ d: Date) -> String {
-    let c = Calendar.current.dateComponents([.month, .day], from: d)
+    let c = Time.calendar.dateComponents([.month, .day], from: d)
     return "\(DAY_SHORT[Time.dayOfWeekJS(d)]) \(c.day ?? 0) \(MONTHS[(c.month ?? 1) - 1])"
 }
 

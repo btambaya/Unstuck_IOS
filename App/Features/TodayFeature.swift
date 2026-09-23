@@ -791,7 +791,7 @@ struct TodayView: View {
     }
 
     private var greeting: String {
-        let h = Calendar.current.component(.hour, from: Date())
+        let h = Time.calendar.component(.hour, from: Date())
         switch h {
         case 5..<12: return "Good morning"
         case 12..<17: return "Good afternoon"

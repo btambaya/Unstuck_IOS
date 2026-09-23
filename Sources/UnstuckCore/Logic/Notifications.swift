@@ -87,7 +87,7 @@ public func blockStartMillis(_ b: CalBlock) -> EpochMillis? {
     var c = DateComponents()
     c.year = d[0]; c.month = d[1]; c.day = d[2]
     c.hour = t[0]; c.minute = t[1]
-    guard let date = Calendar.current.date(from: c) else { return nil }
+    guard let date = Time.calendar.date(from: c) else { return nil }
     return date.timeIntervalSince1970 * 1000
 }
 

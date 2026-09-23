@@ -588,7 +588,7 @@ struct TaskEditor: View {
     private var scheduleSheet: some View {
         NavigationStack {
             Form {
-                DatePicker("Day", selection: $datePick, in: Calendar.current.startOfDay(for: Date())..., displayedComponents: .date)
+                DatePicker("Day", selection: $datePick, in: Time.calendar.startOfDay(for: Date())..., displayedComponents: .date)
                 DatePicker("Time", selection: $timePick, displayedComponents: .hourAndMinute)
             }
             .navigationTitle(pendingRecurrence == nil ? "Schedule" : "Start repeating").navigationBarTitleDisplayMode(.inline)
@@ -743,7 +743,7 @@ struct TaskEditor: View {
         // so seeding a past block's date would leave the bound value below the
         // range (the picker shows today but the stale past date persists until the
         // user scrolls). max(parsed, today) keeps the binding in range.
-        let today = Calendar.current.startOfDay(for: Date())
+        let today = Time.calendar.startOfDay(for: Date())
         // A series seeds from its NEXT occurrence at the series' own time, not
         // from myBlocks.first — the oldest block, history at a time the series
         // may have left long ago — so OK without changes never re-plans the
@@ -775,7 +775,7 @@ struct TaskEditor: View {
     /// a separate setLater would write the row back without the rule.
     private func startRepeating(_ recurrence: Recurrence) {
         let dateIso = Clock.dateISO(datePick)
-        let c = Calendar.current.dateComponents([.hour, .minute], from: timePick)
+        let c = Time.calendar.dateComponents([.hour, .minute], from: timePick)
         let timeIso = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
         pendingRecurrence = nil
         var next = editTarget
@@ -793,7 +793,7 @@ struct TaskEditor: View {
 
     private func commitSchedule() {
         let dateIso = Clock.dateISO(datePick)
-        let c = Calendar.current.dateComponents([.hour, .minute], from: timePick)
+        let c = Time.calendar.dateComponents([.hour, .minute], from: timePick)
         let timeIso = String(format: "%02d:%02d", c.hour ?? 9, c.minute ?? 0)
         // Schedule the LIVE row (audit 2026-09-22, C5): the open-time snapshot
         // routed on a stale recurrence (a Repeat set in this sheet took the
@@ -849,7 +849,7 @@ struct TaskEditor: View {
     }
 
     private static func ymd(_ date: Date) -> String {
-        let c = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        let c = Time.calendar.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
     private static func parseIso(_ s: String) -> Date? {
@@ -860,8 +860,8 @@ struct TaskEditor: View {
     private static func parseHHmm(_ s: String) -> Date? {
         let parts = s.split(separator: ":").compactMap { Int($0) }
         guard parts.count == 2 else { return nil }
-        var c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        var c = Time.calendar.dateComponents([.year, .month, .day], from: Date())
         c.hour = parts[0]; c.minute = parts[1]
-        return Calendar.current.date(from: c)
+        return Time.calendar.date(from: c)
     }
 }
