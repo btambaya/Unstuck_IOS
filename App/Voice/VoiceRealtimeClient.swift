@@ -187,6 +187,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// this; a protocol-level `error` event (which only flips the state to
     /// `.error`) does NOT end the transport. Optional, so Talk mode is unchanged.
     var onTransportEnded: (@Sendable (_ error: String?) -> Void)?
+    /// The server ended the session on purpose, cleanly, and the user should
+    /// read why — the proxy's 15-minute cap. Not an error: the state goes to
+    /// `.closed` and `onTransportEnded` gets nil, so a call hangs up as a
+    /// normal end. Talk shows it; a call has no screen for it.
+    var onServerEnded: (@Sendable (_ note: String) -> Void)?
     /// Test seam: when set (before `start()`), a dial hands its request here
     /// instead of opening a socket. Never set in the app.
     var dialOverride: (@Sendable (URLRequest) -> Void)?
@@ -202,6 +207,51 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     /// What a 401 from the proxy tells the user (the token was refused even
     /// after a forced refresh, or there is no provider to refresh it).
     static let sessionExpiredMessage = "Your session expired — sign in again to use voice."
+
+    // The proxy's limits in plain words (audit 2026-09-22, C47; Android's
+    // VoiceRealtimeClient.rejectionMessage / serverCloseMessage). They used
+    // to read "A voice session is already running" (every 429) or a raw
+    // socket error ("Socket is not connected") — or a quiet reconnect that
+    // spent more of the budget.
+    /// The daily budget is spent: the proxy closes 1008 "daily voice limit
+    /// reached" mid-session.
+    static let dailyLimitMessage = "You've used today's voice time — try again tomorrow."
+    /// The proxy's 15-minute cap (close 1000 "session time limit").
+    static let sessionTimeLimitMessage = "Voice sessions last up to 15 minutes."
+    /// Any other close the server started — its relayed reason is never shown.
+    static let serverClosedMessage = "The voice server closed the session."
+    /// A handshake 429: the proxy answers the concurrent-session cap AND the
+    /// daily session cap with it, and the body that tells them apart never
+    /// reaches a URLSessionWebSocketTask (measured: only the status and the
+    /// headers do) — so both are named. Never "already running" alone: a
+    /// heavy user at the daily cap kept retrying on that.
+    static let voiceLimitMessage = "Voice isn't available right now — another voice session may still be open, or you've used today's voice time."
+
+    /// What a close the SERVER started means: `nil` for a clean end with
+    /// nothing to say, else the words for it. The proxy sends 1008 "daily
+    /// voice limit reached" (its reply budget, and the per-session ceiling)
+    /// and 1000 "session time limit" (its 15-minute cap).
+    static func serverCloseMessage(code: Int, reason: String) -> String? {
+        let r = reason.lowercased()
+        if code == 1008, r.contains("daily voice limit") { return dailyLimitMessage }
+        if r.contains("session time limit") { return sessionTimeLimitMessage }
+        if code == 1000 || code == 1001 { return nil }
+        return serverClosedMessage
+    }
+
+    /// Which "active response" complaint an `error` is, or nil for neither
+    /// (audit 2026-09-22, C46): a create refused because a reply IS
+    /// generating ("Conversation already has an active response…") is not a
+    /// cancel that found nothing ("…no active response…") — treating both as
+    /// "nothing is generating" looped creates into the refusal.
+    static func activeResponseEvent(code: String, message: String) -> BargeInEvent? {
+        let m = message.lowercased()
+        if code == "conversation_already_has_active_response" || m.contains("already has an active response") {
+            return .responseAlreadyActive
+        }
+        if code == "response_cancel_not_active" || m.contains("active response") { return .benignActiveResponseError }
+        return nil
+    }
 
     // A per-session URLSession with `self` as the WebSocket delegate (so onOpen
     // fires only AFTER the handshake). It RETAINS the delegate until
@@ -413,7 +463,44 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         if let ns = error as NSError? {
             voiceLog.error("voice socket failed domain=\(ns.domain, privacy: .public) code=\(ns.code, privacy: .public) http=\(status, privacy: .public)")
         }
+        // An open socket the server closed completes with no error: its close
+        // frame says why (normally reported already by the failed receive).
+        if let socket = task as? URLSessionWebSocketTask, socket.closeCode != .invalid, withLock({ _openedOnce }) {
+            serverClosed(code: socket.closeCode.rawValue,
+                         reason: socket.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+            return
+        }
         handshakeEnded(status: status, error: error)
+    }
+
+    // URLSessionWebSocketDelegate: the server's close frame. Usually the
+    // pending receive has already reported it (with the same code); this
+    // covers a close with no receive outstanding. Reported once either way.
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        serverClosed(code: closeCode.rawValue, reason: reason.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+    }
+
+    /// The server closed the session with `code` / `reason`. Internal so tests
+    /// can drive a close without a socket. A limit is told in plain words and
+    /// is never "dead on arrival" (a quiet reconnect only spends more of the
+    /// budget and meets the same limit); the 15-minute cap is a clean end
+    /// (`onServerEnded`) — a call hangs up normally instead of reporting
+    /// "Couldn't start the call" after 15 minutes of conversation; a clean
+    /// close before any reply is a session that never happened (Android
+    /// parity: the screen reconnects quietly, a call ends as failed).
+    func serverClosed(code: Int, reason: String) {
+        voiceLog.notice("voice server closed the session code=\(code, privacy: .public) reason=\(String(reason.prefix(80)), privacy: .public)")
+        switch Self.serverCloseMessage(code: code, reason: reason) {
+        case Self.dailyLimitMessage?:
+            transportEnded(error: Self.dailyLimitMessage, retryable: false)
+        case Self.sessionTimeLimitMessage?:
+            transportEnded(error: nil, note: Self.sessionTimeLimitMessage)
+        case let message?:
+            transportEnded(error: message)
+        case nil:
+            transportEnded(error: withLock({ _anyResponse }) ? nil : Self.serverClosedMessage)
+        }
     }
 
     /// A 401 before the socket ever opened, not yet retried — the one case
@@ -459,7 +546,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         switch status {
         case 401: friendly = Self.sessionExpiredMessage
         case 403: friendly = "Voice isn't available on this build."
-        case 429: friendly = "A voice session is already running. Close it and try again in a moment."
+        case 429: friendly = Self.voiceLimitMessage
         case let s where s >= 500: friendly = "The voice server is unavailable right now (\(s))."
         default: friendly = error.map { String($0.localizedDescription.prefix(160)) }
         }
@@ -531,7 +618,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         // user's words, and a .public log line travels in any sysdiagnose a
         // tester sends us (audit 2026-09-21). Shape only.
         switch event {
-        case .speechStarted, .speechStopped, .transcription, .interruptPressed, .gateOpen, .gateClose:
+        case .speechStarted, .speechStopped, .transcription, .transcriptionFailed, .interruptPressed, .gateOpen, .gateClose:
             voiceLog.notice("voice barge-in \(Self.describe(event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]")
         default:
             if decisive { voiceLog.notice("voice barge-in \(Self.describe(event), privacy: .public) → \(Self.describe(cmds), privacy: .public) [\(stateAfter, privacy: .public)]") }
@@ -577,6 +664,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case .audioDelta: return "audioDelta"
         case .tick: return "tick"
         case .benignActiveResponseError: return "benignActiveResponseError"
+        case .responseAlreadyActive: return "responseAlreadyActive"
+        case .transcriptionFailed: return "transcriptionFailed"
         case .routeChanged(let r): return "routeChanged(\(r))"
         case .pttDown: return "pttDown"
         case .pttUp: return "pttUp"
@@ -745,11 +834,12 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     }
 
     private func receiveLoop() {
-        task?.receive { [weak self] result in
+        let socket = task
+        socket?.receive { [weak self] result in
             guard let self else { return }
             switch result {
             case .failure(let err):
-                self.transportEnded(error: String(err.localizedDescription.prefix(160)))
+                self.socketFailed(socket, err)
             case .success(let message):
                 if case let .string(text) = message { self.handle(text) }
                 // (binary frames aren't used by this protocol)
@@ -758,11 +848,27 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         }
     }
 
+    /// A receive or send on `socket` failed. A close the server started fails
+    /// them ("Socket is not connected") with the close frame's code and
+    /// reason already on the task — measured (URLSession, 2026-09-23): the
+    /// pending receive fails first, then didCloseWith. Read them, so the user
+    /// sees the limit and not the socket error (audit 2026-09-22, C47).
+    private func socketFailed(_ socket: URLSessionWebSocketTask?, _ err: any Error) {
+        if let socket, socket.closeCode != .invalid {
+            serverClosed(code: socket.closeCode.rawValue,
+                         reason: socket.closeReason.flatMap { String(data: $0, encoding: .utf8) } ?? "")
+        } else {
+            transportEnded(error: String(err.localizedDescription.prefix(160)))
+        }
+    }
+
     /// The transport is gone on its own (never via stop()). Reports ONCE:
     /// with an error → onError + `.error`; a clean close → `.closed`; then
     /// `onTransportEnded`. Every failure path (pre-handshake, receive, send,
     /// bad URL) funnels through here so nothing is reported twice.
-    private func transportEnded(error: String?) {
+    /// `retryable: false` — a limit: never "dead on arrival", reported as is.
+    /// `note` — a clean end the user is told about (`onServerEnded`).
+    private func transportEnded(error: String?, retryable: Bool = true, note: String? = nil) {
         voiceLog.notice("voice transport ended (\(error ?? "clean close", privacy: .public))")
         let first: Bool = withLock {
             if _stopped || _reportedError { return false }   // our own invalidate / already reported
@@ -776,6 +882,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         // before any reply): no error state — the screen reconnects, or
         // reports if it has already tried.
         let early: Bool = withLock {
+            if !retryable { _earlyFailure = false; return false }
             if _openedOnce, !_anyResponse, error != nil, onTransportEnded != nil { _earlyFailure = true }
             return _earlyFailure
         }
@@ -787,6 +894,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             onError(error)
             onState(.error)
         } else {
+            if let note { onServerEnded?(note) }
             onState(.closed)
         }
         onTransportEnded?(error)
@@ -866,6 +974,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // the reply's caption).
             let t = (ev["transcript"] as? String) ?? ""
             dispatch(.transcription(text: t, itemId: ev["item_id"] as? String, final: true))
+        case "conversation.item.input_audio_transcription.failed":
+            // No words will come for this segment, and without them nothing
+            // asked for a reply: the user got dead air (audit 2026-09-22,
+            // C46). The controller asks anyway — the model hears the audio.
+            let err = ev["error"] as? [String: Any]
+            voiceLog.notice("voice transcription failed code=\((err?["code"] as? String) ?? "-", privacy: .public)")
+            dispatch(.transcriptionFailed(itemId: ev["item_id"] as? String))
         case "response.audio.done", "response.done":
             // `response.done` is terminal for the WHOLE reply, so it closes the
             // caption segment too — a backend that never sends
@@ -969,8 +1084,8 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // Benign realtime-protocol hiccups — cancelling/creating a response
             // that is (or isn't) active ("no active response" / "already has an
             // active response") — are NON-fatal: resync and keep listening.
-            if let m, m.lowercased().contains("active response") {
-                dispatch(.benignActiveResponseError); return
+            if let m, let resync = Self.activeResponseEvent(code: (errObj?["code"] as? String) ?? "", message: m) {
+                dispatch(resync); return
             }
             // Hold-to-talk: a tap too short to capture anything makes the
             // commit fail ("buffer too small" / "buffer is empty"). Not an
@@ -1063,12 +1178,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         guard let data = try? JSONSerialization.data(withJSONObject: obj),
               let str = String(data: data, encoding: .utf8) else { return }
         if let hook = sendOverride { hook(str); return }
-        task?.send(.string(str)) { [weak self] err in
+        let socket = task
+        socket?.send(.string(str)) { [weak self] err in
             guard let self, let err else { return }
             // A send failure means the socket is gone — but the mic keeps encoding
             // and queuing appends, so without this the session would silently
             // wedge ("Listening…" with a dead socket). Tear down once.
-            self.transportEnded(error: String(err.localizedDescription.prefix(160)))
+            self.socketFailed(socket, err)
         }
     }
 

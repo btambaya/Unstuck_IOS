@@ -53,7 +53,8 @@ final class CallCoordinator {
                                            backgroundTime: CallsOutcomeReporter.systemBackgroundTime),
             clock: SystemCallClock(),
             rearmVoip: { VoipPushRegistry.shared.rearm() },
-            bootApp: { Task { await AppModel.shared.startWithoutScene() } })
+            bootApp: { Task { await AppModel.shared.startWithoutScene() } },
+            holdVoiceAudio: { VoiceAudioOwnership.set($0, by: .callKit) })
         provider.coordinator = c
         return c
     }()
@@ -111,6 +112,14 @@ final class CallCoordinator {
     /// Start AppModel when a push arrives before it attached —
     /// AppModel.startWithoutScene in production.
     private let bootApp: @MainActor () -> Void
+    /// Mark the shared audio session as the call's (VoiceAudioOwnership,
+    /// `.callKit`) from the answer until CallKit takes the audio back. Only
+    /// Talk's own activation used to set it, so during a call the ambient bed
+    /// switched the session to `.playback` (no input) or deactivated it — a
+    /// connected call with dead air (audit 2026-09-22, C42). Set at the answer,
+    /// not at didActivate: CallKit activates the session BEFORE it tells us,
+    /// and a release landing in between killed the call just the same.
+    private let holdVoiceAudio: @MainActor (Bool) -> Void
 
     private var ringTimer: CallTimer?
     private var graceTimer: CallTimer?
@@ -121,7 +130,8 @@ final class CallCoordinator {
          launcher: CallVoiceLauncher, launcherAttached: Bool = true,
          notifier: CallNotifier, reporter: CallOutcomeReporting, clock: CallClock,
          rearmVoip: @escaping @MainActor () -> Void = {},
-         bootApp: @escaping @MainActor () -> Void = {}) {
+         bootApp: @escaping @MainActor () -> Void = {},
+         holdVoiceAudio: @escaping @MainActor (Bool) -> Void = { _ in }) {
         self.provider = provider
         self.controller = controller
         self.environment = environment
@@ -132,6 +142,7 @@ final class CallCoordinator {
         self.clock = clock
         self.rearmVoip = rearmVoip
         self.bootApp = bootApp
+        self.holdVoiceAudio = holdVoiceAudio
     }
 
     // MARK: - attach (late binding from AppModel / the integrator)
@@ -306,6 +317,7 @@ final class CallCoordinator {
         active = nil
         audioActive = false
         awaitingLauncher = false
+        holdVoiceAudio(false)
     }
 
     /// CXProviderDelegate.providerDidBegin — configure (never activate) the
@@ -323,6 +335,7 @@ final class CallCoordinator {
         provider.configureAudioSession()
         cur.phase = .answering
         active = cur
+        holdVoiceAudio(true)
         report(cur.session, .answered)
         if audioActive { startVoice() }   // rare: audio already up (reset mid-call)
         return true
@@ -337,6 +350,8 @@ final class CallCoordinator {
         awaitingLauncher = false
         if cur.launcherRunning { launcher.stop() }
         active = nil
+        // The call is over; CallKit's didDeactivate follows (clears it too).
+        holdVoiceAudio(false)
         let session = cur.session
         switch cur.phase {
         case .ringing:
@@ -369,6 +384,7 @@ final class CallCoordinator {
     /// now may the voice engine touch audio.
     func audioSessionDidActivate() {
         audioActive = true
+        holdVoiceAudio(true)
         if active?.phase == .answering { startVoice() }
     }
 
@@ -377,6 +393,7 @@ final class CallCoordinator {
     /// CXEndCallAction (if any) settles the outcome.
     func audioSessionDidDeactivate() {
         audioActive = false
+        holdVoiceAudio(false)
         if var cur = active, cur.launcherRunning {
             launcher.stop()
             cur.launcherRunning = false
@@ -528,6 +545,7 @@ final class CallCoordinator {
             provider.reportEnded(uuid: cur.session.uuid, reason: .failed)
         }
         active = nil
+        holdVoiceAudio(false)
         pendingFallback = nil
         deferredFallbackTap = nil
         reporter.discardAll()

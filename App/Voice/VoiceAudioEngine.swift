@@ -48,7 +48,7 @@
 import AVFoundation
 
 /// Who activates / deactivates the shared AVAudioSession for a voice session.
-enum VoiceAudioSessionOwnership: Sendable {
+enum VoiceAudioSessionOwnership: Sendable, Hashable {
     /// Talk mode: the engine configures AND activates the session, and
     /// deactivates it on shutdown.
     case app
@@ -71,11 +71,39 @@ protocol VoiceAudioSessionControlling: AnyObject, Sendable {
 /// `setActive(false, .notifyOthersOnDeactivation)`, which would deactivate the
 /// session under a live conversation: the engine stays "running" with no audio
 /// in or out and no error anywhere. They consult this first. Audit, 2026-09-11.
+///
+/// Held per owner: Talk sets `.app` around its own activation, and a CallKit
+/// call — whose session CallKit activates, so Talk's path never ran — sets
+/// `.callKit` from the answer to the deactivation (CallCoordinator). Before,
+/// a call never held it, and the ambient bed switched a live call to
+/// `.playback` (no input) or deactivated it (audit 2026-09-22, C42).
 enum VoiceAudioOwnership {
     private static let lock = NSLock()
-    nonisolated(unsafe) private static var _held = false
-    static var isHeld: Bool { lock.lock(); defer { lock.unlock() }; return _held }
-    static func set(_ held: Bool) { lock.lock(); _held = held; lock.unlock() }
+    nonisolated(unsafe) private static var holders: Set<VoiceAudioSessionOwnership> = []
+    static var isHeld: Bool { lock.lock(); defer { lock.unlock() }; return !holders.isEmpty }
+    static func set(_ held: Bool, by owner: VoiceAudioSessionOwnership = .app) {
+        lock.lock()
+        if held { holders.insert(owner) } else { holders.remove(owner) }
+        lock.unlock()
+    }
+
+    /// Run `release` (a deactivation of the shared session) only while no
+    /// voice session holds it, atomically with `set(true)`: Talk marks itself
+    /// BEFORE it activates, so a release either lands before that activation
+    /// or sees it held — never a deactivation right after it.
+    static func unlessHeld(_ release: () -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        if holders.isEmpty { release() }
+    }
+
+    /// Hold for `owner` across `activate`, and let go again if it throws: a
+    /// Talk start whose activation failed (the mic busy) left the flag set
+    /// for the rest of the process, and nothing released the session after
+    /// that (audit 2026-09-22, C42).
+    static func holding(_ owner: VoiceAudioSessionOwnership, _ activate: () throws -> Void) rethrows {
+        set(true, by: owner)
+        do { try activate() } catch { set(false, by: owner); throw error }
+    }
 }
 
 /// The real shared AVAudioSession.
@@ -85,10 +113,10 @@ final class SystemVoiceAudioSession: VoiceAudioSessionControlling {
     }
     func setActive(_ active: Bool) throws {
         let s = AVAudioSession.sharedInstance()
-        VoiceAudioOwnership.set(active)
         if active {
-            try s.setActive(true, options: [])
+            try VoiceAudioOwnership.holding(.app) { try s.setActive(true, options: []) }
         } else {
+            VoiceAudioOwnership.set(false, by: .app)
             try s.setActive(false, options: [.notifyOthersOnDeactivation])
         }
     }

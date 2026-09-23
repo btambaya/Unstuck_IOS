@@ -474,7 +474,9 @@ final class VoiceDialTokenTests: XCTestCase {
         c.start()
         _ = await eventually { rec.dials.count == 1 }
         c.handshakeEnded(status: 429, error: nil)
-        XCTAssertEqual(rec.errors, ["A voice session is already running. Close it and try again in a moment."])
+        // Both of the proxy's 429s — its concurrent-session cap and its daily
+        // cap — in plain words, never "already running" alone (C47).
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.voiceLimitMessage])
         XCTAssertEqual(p.asks, [false], "no forced refresh for a busy proxy")
         XCTAssertEqual(rec.dials.count, 1)
         c.stop()
@@ -789,5 +791,183 @@ final class VoiceTruncateTests: XCTestCase {
         c.handle(json(["type": "error", "error": ["message": "Something else broke"]]))
         XCTAssertEqual(wire.errors.count, 1)
         XCTAssertTrue(wire.states.contains(.error))
+    }
+}
+
+// MARK: - the proxy's limits, in plain words (audit 2026-09-22, C47)
+
+/// The proxy refuses with 429 (its concurrent-session cap AND its daily cap)
+/// and ends a live session with 1008 "daily voice limit reached" or 1000
+/// "session time limit" (its 15-minute cap). Users read "A voice session is
+/// already running" or a raw "Socket is not connected"; a limit before the
+/// first reply was taken for a dead-on-arrival session and quietly redialled,
+/// spending more of the budget; and a call cut at 15 minutes reported
+/// "Couldn't start the call".
+final class VoiceLimitTests: XCTestCase {
+    private final class Rec: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _errors: [String] = [], _states: [VoiceState] = [], _ended: [String?] = [], _notes: [String] = []
+        func error(_ m: String) { lock.withLock { _errors.append(m) } }
+        func state(_ s: VoiceState) { lock.withLock { _states.append(s) } }
+        func end(_ e: String?) { lock.withLock { _ended.append(e) } }
+        func note(_ n: String) { lock.withLock { _notes.append(n) } }
+        var errors: [String] { lock.withLock { _errors } }
+        var states: [VoiceState] { lock.withLock { _states } }
+        var ended: [String?] { lock.withLock { _ended } }
+        var notes: [String] { lock.withLock { _notes } }
+    }
+
+    /// A client whose socket has OPENED (the delegate's didOpen), with an
+    /// owner hooked for dead-on-arrival reconnects, as Talk and calls have.
+    private func openClient(_ rec: Rec) -> VoiceRealtimeClient {
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
+            runTool: { _, _ in "ok" },
+            onState: { rec.state($0) },
+            onCaption: { _, _, _ in },
+            onError: { rec.error($0) },
+            initialRoute: .speaker,
+            routeProvider: { .speaker },
+            now: { 0 })
+        c.sendOverride = { _ in }
+        c.onTransportEnded = { rec.end($0) }
+        c.onServerEnded = { rec.note($0) }
+        let socket = URLSession.shared.webSocketTask(with: URL(string: "wss://example.invalid/v")!)
+        c.urlSession(URLSession.shared, webSocketTask: socket, didOpenWithProtocol: nil)
+        return c
+    }
+    private func json(_ obj: [String: Any]) -> String {
+        String(data: try! JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+    }
+
+    func testTheProxysClosesMapToPlainWords() {
+        XCTAssertEqual(VoiceRealtimeClient.serverCloseMessage(code: 1008, reason: "daily voice limit reached"), VoiceRealtimeClient.dailyLimitMessage)
+        XCTAssertEqual(VoiceRealtimeClient.serverCloseMessage(code: 1000, reason: "session time limit"), VoiceRealtimeClient.sessionTimeLimitMessage)
+        XCTAssertNil(VoiceRealtimeClient.serverCloseMessage(code: 1000, reason: "bye"), "a clean close")
+        XCTAssertNil(VoiceRealtimeClient.serverCloseMessage(code: 1001, reason: ""))
+        let other = VoiceRealtimeClient.serverCloseMessage(code: 1011, reason: "upstream: org-XYZ internal error")
+        XCTAssertEqual(other, VoiceRealtimeClient.serverClosedMessage)
+        XCTAssertFalse(other?.contains("org-XYZ") ?? true, "a relayed upstream reason is never shown")
+    }
+
+    func testAHandshake429NamesBothLimitsNeverJustAlreadyRunning() {
+        let rec = Rec()
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
+            runTool: { _, _ in "ok" }, onState: { rec.state($0) }, onCaption: { _, _, _ in },
+            onError: { rec.error($0) }, initialRoute: .speaker, routeProvider: { .speaker }, now: { 0 })
+        c.handshakeEnded(status: 429, error: nil)
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.voiceLimitMessage])
+        XCTAssertTrue(VoiceRealtimeClient.voiceLimitMessage.contains("today's voice time"))
+        XCTAssertTrue(VoiceRealtimeClient.voiceLimitMessage.contains("another voice session"))
+    }
+
+    /// The budget ran out on the first reply of a session: before, that looked
+    /// dead on arrival — swallowed, redialled twice (each dial a session unit),
+    /// then "The voice server dropped the session twice".
+    func testADailyLimitCloseIsToldAndNeverQuietlyRedialled() {
+        let rec = Rec()
+        let c = openClient(rec)
+        c.serverClosed(code: 1008, reason: "daily voice limit reached")
+        XCTAssertFalse(c.failedBeforeAnyReply, "a limit is not dead on arrival — redialling meets it again")
+        XCTAssertEqual(rec.errors, [VoiceRealtimeClient.dailyLimitMessage])
+        XCTAssertEqual(rec.ended, [VoiceRealtimeClient.dailyLimitMessage])
+        XCTAssertTrue(rec.states.contains(.error))
+        // An early server error swallowed for the reconnect doesn't hide it either.
+        let rec2 = Rec()
+        let c2 = openClient(rec2)
+        c2.handle(json(["type": "error", "error": ["message": "upstream busy"]]))
+        XCTAssertTrue(c2.failedBeforeAnyReply)
+        c2.serverClosed(code: 1008, reason: "daily voice limit reached")
+        XCTAssertFalse(c2.failedBeforeAnyReply)
+        XCTAssertEqual(rec2.errors, [VoiceRealtimeClient.dailyLimitMessage])
+        c.stop(); c2.stop()
+    }
+
+    /// The 15-minute cap is a clean end: Talk says why under "Ended"; a call
+    /// hangs up as a normal end (the launcher maps nil to .hungUp), not
+    /// "Couldn't start the call — here's what it was about".
+    func testTheSessionTimeLimitIsACleanEndWithANote() {
+        let rec = Rec()
+        let c = openClient(rec)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.serverClosed(code: 1000, reason: "session time limit")
+        XCTAssertEqual(rec.errors, [], "not an error")
+        XCTAssertEqual(rec.ended, [nil], "a clean end for the call")
+        XCTAssertEqual(rec.notes, [VoiceRealtimeClient.sessionTimeLimitMessage])
+        XCTAssertEqual(rec.states.last, .closed)
+        c.stop()
+    }
+
+    /// A close the server started with nothing said: after a reply it is a
+    /// clean end; before any, a session that never happened (dead on arrival,
+    /// Android parity) — never a call reported done.
+    func testACleanServerCloseBeforeAnyReplyIsDeadOnArrival() {
+        let rec = Rec()
+        let c = openClient(rec)
+        c.serverClosed(code: 1000, reason: "")
+        XCTAssertTrue(c.failedBeforeAnyReply)
+        XCTAssertEqual(rec.ended, [VoiceRealtimeClient.serverClosedMessage])
+        XCTAssertEqual(rec.errors, [], "not shown — the owner reconnects or reports")
+        let rec2 = Rec()
+        let c2 = openClient(rec2)
+        c2.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c2.serverClosed(code: 1000, reason: "")
+        XCTAssertEqual(rec2.ended, [nil])
+        XCTAssertEqual(rec2.states.last, .closed)
+        // Reported once, whichever of receive / didCloseWith / didComplete lands.
+        c2.serverClosed(code: 1000, reason: "")
+        XCTAssertEqual(rec2.ended.count, 1)
+        c.stop(); c2.stop()
+    }
+}
+
+// MARK: - turn-taking through the real client (audit 2026-09-22, C46)
+
+final class VoiceTurnEventTests: XCTestCase {
+    private func client(_ wire: Wire) -> VoiceRealtimeClient {
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
+            runTool: { _, _ in "ok" },
+            onState: { wire.state($0) },
+            onCaption: { _, _, _ in },
+            onError: { wire.error($0) },
+            initialRoute: .speaker,
+            routeProvider: { .speaker },
+            now: { 0 })
+        c.sendOverride = { wire.sent($0) }
+        return c
+    }
+    private func json(_ obj: [String: Any]) -> String {
+        String(data: try! JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+    }
+
+    /// OpenAI's transcription.failed was ignored: the turn was never asked
+    /// for. It now puts the turn in hand ("Thinking…"; the hold's tick asks).
+    func testAFailedTranscriptionPutsTheTurnInHand() {
+        let wire = Wire()
+        let c = client(wire)
+        c.handle(json(["type": "input_audio_buffer.speech_started", "item_id": "u"]))
+        c.handle(json(["type": "input_audio_buffer.speech_stopped", "item_id": "u"]))
+        XCTAssertFalse(wire.states.contains(.thinking))
+        c.handle(json(["type": "conversation.item.input_audio_transcription.failed", "item_id": "u", "content_index": 0,
+                       "error": ["type": "transcription_error", "code": "rate_limit_exceeded", "message": "Rate limit reached"]]))
+        XCTAssertEqual(wire.states.last, .thinking)
+        XCTAssertEqual(wire.errors, [], "nothing to tell the user — the reply is coming")
+    }
+
+    /// "Already has an active response" is a reply generating, not nothing.
+    func testACreateRefusedByALiveReplyKeepsTheScreenOnIt() {
+        let wire = Wire()
+        let c = client(wire)
+        c.handle(json(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(json(["type": "error", "error": ["type": "invalid_request_error", "code": "conversation_already_has_active_response",
+                                                  "message": "Conversation already has an active response in progress: resp_r1."]]))
+        XCTAssertEqual(wire.states.last, .thinking, "not Listening over a live reply")
+        XCTAssertFalse(wire.states.contains(.error))
+        XCTAssertFalse(wire.types.contains("response.create"), "and nothing re-created into the refusal")
     }
 }

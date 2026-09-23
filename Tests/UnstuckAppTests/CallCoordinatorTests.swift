@@ -738,6 +738,51 @@ final class CallCoordinatorTests: XCTestCase {
         XCTAssertEqual(reporter.outcomes, [.answered, .done])
     }
 
+    // MARK: - the call holds the shared audio session (audit 2026-09-22, C42)
+
+    /// The ambient bed and the tour release the shared session unless a voice
+    /// session holds it; a call never held it, so the bed could switch a live
+    /// call to .playback (no input) or deactivate it — dead air.
+    func testTheCallHoldsTheAudioSessionFromTheAnswerUntilCallKitTakesItBack() {
+        var held: [Bool] = []
+        let c = CallCoordinator(provider: provider, controller: controller, environment: env,
+                                launcher: launcher, launcherAttached: true,
+                                notifier: notifier, reporter: reporter, clock: clock,
+                                holdVoiceAudio: { held.append($0) })
+        controller.coordinator = c
+        c.reportIncoming(payload())
+        XCTAssertEqual(held, [], "ringing: not the call's audio yet")
+        XCTAssertTrue(c.performAnswer(uuid: uuid))
+        XCTAssertEqual(held, [true], "from the answer — CallKit activates the session before it tells us")
+        c.audioSessionDidActivate()
+        XCTAssertEqual(held.last, true)
+        c.audioSessionDidDeactivate()
+        XCTAssertEqual(held.last, false, "CallKit took the audio back")
+        c.audioSessionDidActivate()
+        XCTAssertEqual(held.last, true, "…and gave it back (a cellular call ended)")
+        XCTAssertTrue(c.performEnd(uuid: uuid))
+        XCTAssertEqual(held.last, false, "the call is over")
+    }
+
+    func testTheHoldIsLetGoOnAProviderResetOrASignOut() {
+        var held: [Bool] = []
+        let c = CallCoordinator(provider: provider, controller: controller, environment: env,
+                                launcher: launcher, launcherAttached: true,
+                                notifier: notifier, reporter: reporter, clock: clock,
+                                holdVoiceAudio: { held.append($0) })
+        controller.coordinator = c
+        c.reportIncoming(payload())
+        XCTAssertTrue(c.performAnswer(uuid: uuid))
+        c.audioSessionDidActivate()
+        c.providerDidReset()
+        XCTAssertEqual(held.last, false)
+        c.reportIncoming(payload())
+        XCTAssertTrue(c.performAnswer(uuid: uuid))
+        XCTAssertEqual(held.last, true)
+        c.signedOut()
+        XCTAssertEqual(held.last, false)
+    }
+
     func testProviderResetClearsEverything() {
         answerAndActivate()
         sut.providerDidReset()

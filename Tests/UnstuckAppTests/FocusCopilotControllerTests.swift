@@ -8,6 +8,7 @@
 //   • a THROWING speaker/listener never breaks the controller (fail-safe),
 //   • NO LLM/network is reachable from the copilot path.
 
+import AVFoundation
 import XCTest
 import UnstuckCore
 @testable import Unstuck
@@ -20,11 +21,21 @@ final class FakeSpeaker: CopilotSpeaker {
     var spoken: [String] = []
     var shouldThrow = false
     var stopCount = 0
-    func speak(_ text: String) throws {
+    /// Lines "still playing": their onFinish waits for `finishSpeaking()` /
+    /// `stop()`. Off, a line finishes as soon as it is spoken.
+    var holdLines = false
+    private var playing: [@MainActor () -> Void] = []
+    func speak(_ text: String, onFinish: @escaping @MainActor () -> Void) throws {
         if shouldThrow { throw NSError(domain: "test", code: 1) }
         spoken.append(text)
+        if holdLines { playing.append(onFinish) } else { onFinish() }
     }
-    func stop() { stopCount += 1 }
+    /// Off, `stop()` cuts a held line without reporting its end — the
+    /// synthesizer an audio interruption cut off.
+    var stopEndsLines = true
+    /// The held lines finish playing.
+    func finishSpeaking() { let p = playing; playing = []; p.forEach { $0() } }
+    func stop() { stopCount += 1; if stopEndsLines { finishSpeaking() } }
 }
 
 @MainActor
@@ -81,7 +92,8 @@ final class FocusCopilotControllerTests: XCTestCase {
     private func makeController(
         estimateMin: Int = 25,
         level: NotificationLevel = .coach,
-        voiceReplies: Bool = true
+        voiceReplies: Bool = true,
+        lineTimeoutSec: Double = 12
     ) -> FocusCopilotController {
         speaker = FakeSpeaker()
         listener = FakeListener()
@@ -92,7 +104,7 @@ final class FocusCopilotControllerTests: XCTestCase {
             estimateMin: { estimateMin }, level: { level },
             voiceRepliesEnabled: { voiceReplies },
             duck: { self.ducks += 1 }, restore: { self.restores += 1 },
-            listenWindowSec: 6
+            listenWindowSec: 6, lineTimeoutSec: lineTimeoutSec
         )
         c.startSession()
         return c
@@ -386,6 +398,84 @@ final class FocusCopilotControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(listener.stopCount, 1)
     }
 
+    // ── the question is heard before the mic opens (audit 2026-09-22, C41) ─
+
+    func testTheListenWindowOpensOnlyOnceTheQuestionHasBeenSpoken() {
+        // The mic opened a few ms after the question was queued; the session
+        // went record-only and cut the question off.
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        speaker.holdLines = true
+        listener.autoResult = nil
+        tickThrough(c, to: 1500)
+        XCTAssertTrue(speaker.spoken.contains("That's your block. Add five, stop, or keep going?"))
+        XCTAssertEqual(listener.startCount, 0, "the mic stays shut while the question is being spoken")
+        XCTAssertFalse(c.listening)
+        speaker.finishSpeaking()
+        XCTAssertEqual(listener.startCount, 1, "then it listens for the answer")
+        XCTAssertTrue(c.listening)
+    }
+
+    func testASpeakOnlyLineRestoresTheBedOnceItHasBeenSpoken() {
+        let c = makeController(estimateMin: 25, level: .coach, voiceReplies: true)
+        speaker.holdLines = true
+        tickThrough(c, to: 750)
+        XCTAssertEqual(speaker.spoken, ["Halfway there — about 12 minutes left."])
+        XCTAssertEqual(ducks, 1)
+        XCTAssertEqual(restores, 0, "the bed stays ducked under the line")
+        speaker.finishSpeaking()
+        XCTAssertEqual(restores, 1)
+        XCTAssertEqual(listener.startCount, 0)
+    }
+
+    func testAQuestionCutShortByAPauseOpensNoMic() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true)
+        speaker.holdLines = true
+        tickThrough(c, to: 1500)
+        c.pauseSession()            // stops the line → it ends → stale
+        XCTAssertEqual(listener.startCount, 0, "no mic after the session was paused")
+        XCTAssertFalse(c.listening)
+        c.resumeSession()
+        XCTAssertEqual(listener.startCount, 0)
+    }
+
+    /// A phone call or an alarm cut the synthesizer off mid-line: no
+    /// didFinish, no didCancel. Nothing else closed the cycle — `busy` stayed
+    /// set, the bed ducked, and the coach said nothing for the rest of the
+    /// block (audit 2026-09-22, C41).
+    func testALineWhoseEndIsNeverReportedStillGoesOn() {
+        let c = makeController(estimateMin: 25, level: .calm, voiceReplies: true, lineTimeoutSec: 0.05)
+        speaker.holdLines = true
+        speaker.stopEndsLines = false
+        listener.autoResult = nil
+        tickThrough(c, to: 1500)
+        XCTAssertEqual(listener.startCount, 0)
+        settle(0.3)
+        XCTAssertEqual(speaker.stopCount, 1, "the stuck line is stopped")
+        XCTAssertEqual(listener.startCount, 1, "and the question gets its answer window")
+        XCTAssertTrue(c.listening)
+        speaker.finishSpeaking()    // its end, reported late after all
+        XCTAssertEqual(listener.startCount, 1, "the window opens once")
+        listener.deliver("")
+        XCTAssertEqual(restores, 1)
+
+        // A speak-only line: the bed comes back, and the next milestone fires.
+        let coach = makeController(estimateMin: 25, level: .coach, voiceReplies: true, lineTimeoutSec: 0.05)
+        speaker.holdLines = true
+        speaker.stopEndsLines = false
+        tickThrough(coach, to: 750)
+        XCTAssertEqual(restores, 0)
+        settle(0.3)
+        XCTAssertEqual(restores, 1, "the bed is restored")
+        tickThrough(coach, from: 751, to: 1200)
+        XCTAssertEqual(speaker.spoken.count, 2, "the coach goes on: \(speaker.spoken)")
+    }
+
+    private func settle(_ seconds: Double) {
+        let e = expectation(description: "settle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { e.fulfill() }
+        wait(for: [e], timeout: seconds + 5)
+    }
+
     // ── GUARDRAIL: zero LLM / network in the copilot path ────────────────
 
     func testNoNetworkOrAssistantSymbolsReachableFromCopilotPath() {
@@ -425,5 +515,216 @@ final class FocusCopilotControllerTests: XCTestCase {
                                "copilot source \(rel) must not reference \"\(tok)\" (zero-LLM/network guardrail)")
             }
         }
+    }
+}
+
+// MARK: - the real on-device voice + ambient bed on the shared audio session
+// (audit 2026-09-22, C41 / C42) — AVAudioSession works in the simulator; what
+// only a phone can prove (the music resuming, the question audible) is in
+// the device checks.
+
+@MainActor
+final class CopilotAudioSessionTests: XCTestCase {
+    /// Permission callbacks held until the test answers them.
+    private final class Prompts: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: [@Sendable (Bool) -> Void] = []
+        func ask(_ granted: @escaping @Sendable (Bool) -> Void) { lock.withLock { pending.append(granted) } }
+        func answer(_ i: Int, _ granted: Bool) { let p = lock.withLock { pending[i] }; p(granted) }
+        var count: Int { lock.withLock { pending.count } }
+    }
+    private final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var n = 0
+        func hit() { lock.withLock { n += 1 } }
+        var count: Int { lock.withLock { n } }
+    }
+
+    override func setUp() {
+        super.setUp()
+        VoiceAudioOwnership.set(false, by: .app)
+        VoiceAudioOwnership.set(false, by: .callKit)
+    }
+    override func tearDown() {
+        VoiceAudioOwnership.set(false, by: .app)
+        VoiceAudioOwnership.set(false, by: .callKit)
+        AmbientAudio.shared.stop()
+        super.tearDown()
+    }
+
+    private func settle(_ seconds: Double) {
+        let e = expectation(description: "settle")
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { e.fulfill() }
+        wait(for: [e], timeout: seconds + 5)
+    }
+
+    /// First use: the window closed while the permission prompts were up
+    /// (the scene goes inactive under the alert → teardown → stop). The grant
+    /// then started recognition nobody read — a hot mic.
+    func testAStopDuringThePermissionPromptsNeverOpensTheMic() throws {
+        let prompts = Prompts()
+        let voice = VoiceController(authorize: { prompts.ask($0) })
+        guard voice.sttAvailable else { throw XCTSkip("no speech recognizer in this simulator") }
+        let done = Flag()
+        voice.startListening(onPartial: { _ in }, onFinal: { _ in }, onDone: { done.hit() })
+        XCTAssertEqual(prompts.count, 1)
+        voice.stopListening()
+        prompts.answer(0, true)
+        XCTAssertEqual(voice.micOpens, 0, "stopped while asking: the grant must not open the mic")
+        XCTAssertEqual(done.count, 1, "onDone still fires once")
+
+        // Two windows waiting on prompts: only the newer one may open it.
+        let later = VoiceController(authorize: { prompts.ask($0) })
+        later.startListening(onPartial: { _ in }, onFinal: { _ in }, onDone: {})
+        later.startListening(onPartial: { _ in }, onFinal: { _ in }, onDone: {})
+        prompts.answer(1, true)
+        XCTAssertEqual(later.micOpens, 0, "the superseded window's grant opens nothing")
+        prompts.answer(2, false)
+        XCTAssertEqual(later.micOpens, 0)
+    }
+
+    /// Talk (or a call) holds the session: the Assistant's read-aloud landing
+    /// mid-Talk switched it to .playback — Talk's mic went dead ("Couldn't
+    /// access the microphone") and the line talked over the realtime voice.
+    func testSpeechAndDictationLeaveALiveVoiceSessionAlone() throws {
+        let s = AVAudioSession.sharedInstance()
+        try s.setCategory(.playAndRecord, mode: .voiceChat, options: [])
+        VoiceAudioOwnership.set(true, by: .app)
+        let voice = VoiceController(authorize: { $0(true) })
+        let finished = expectation(description: "finished")
+        voice.speak("Five minutes left — keep going or wrap up?") { finished.fulfill() }
+        wait(for: [finished], timeout: 2)
+        XCTAssertEqual(s.category, .playAndRecord, "the session is Talk's")
+        let done = expectation(description: "done")
+        voice.startListening(onPartial: { _ in }, onFinal: { _ in }, onDone: { done.fulfill() })
+        wait(for: [done], timeout: 2)
+        XCTAssertEqual(voice.micOpens, 0)
+        XCTAssertEqual(s.category, .playAndRecord)
+    }
+
+    /// Nothing handed the session back: one spoken line left the user's music
+    /// ducked (and one dictation left it paused) for as long as the app ran.
+    func testTheSessionIsHandedBackOnceALineHasEnded() {
+        let voice = VoiceController(authorize: { $0(false) })
+        let finished = expectation(description: "finished")
+        voice.speak("Captured. That line is long enough to still be playing when it is stopped.") { finished.fulfill() }
+        voice.stopSpeaking()
+        wait(for: [finished], timeout: 5)
+        XCTAssertEqual(voice.sessionReleases, 0, "not before the grace")
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(voice.sessionReleases, 1, "handed back with notifyOthersOnDeactivation")
+
+        // Not while a voice session holds it.
+        let held = VoiceController(authorize: { $0(false) })
+        let spoke = expectation(description: "spoke")
+        held.speak("Got it.") { spoke.fulfill() }
+        VoiceAudioOwnership.set(true, by: .callKit)
+        held.stopSpeaking()
+        wait(for: [spoke], timeout: 5)
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(held.sessionReleases, 0, "never deactivated under a call")
+    }
+
+    /// Swiping the sheet away (or closing Focus) mid-line or mid-dictation
+    /// stops it and frees the controller at once — it is the view's @State.
+    /// The release rode on a weak self, and a line's end on the
+    /// synthesizer's weak delegate: neither came, and the music stayed
+    /// ducked or paused for as long as the app ran.
+    func testTheSessionIsHandedBackAfterTheOwnerHasLetGoOfTheVoice() throws {
+        let releases = Flag()
+        var reading: VoiceController? = VoiceController(authorize: { $0(false) }, deactivate: { releases.hit() })
+        reading?.speak("Here is a reply long enough to still be playing when the sheet is swiped away.")
+        reading?.stopSpeaking()
+        reading = nil
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(releases.count, 1, "handed back although its owner has gone")
+
+        // Mid-dictation (still at the permission prompts: the dictation is
+        // wanted, the session is ours).
+        let prompts = Prompts()
+        var dictating: VoiceController? = VoiceController(authorize: { prompts.ask($0) }, deactivate: { releases.hit() })
+        guard dictating?.sttAvailable == true else { throw XCTSkip("no speech recognizer in this simulator") }
+        dictating?.startListening(onPartial: { _ in }, onFinal: { _ in }, onDone: {})
+        dictating?.stopListening()
+        dictating = nil
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(releases.count, 2)
+    }
+
+    func testANewLineInsideTheGraceKeepsTheSession() {
+        let voice = VoiceController(authorize: { $0(false) })
+        let first = expectation(description: "first")
+        voice.speak("That's your block.") { first.fulfill() }
+        voice.stopSpeaking()
+        wait(for: [first], timeout: 5)
+        let second = expectation(description: "second")
+        voice.speak("Added five minutes.") { second.fulfill() }   // inside the grace
+        settle(VoiceController.releaseGraceSec + 0.1)
+        XCTAssertEqual(voice.sessionReleases, 0, "a line is playing — the first release is void")
+        voice.stopSpeaking()
+        wait(for: [second], timeout: 5)
+        settle(VoiceController.releaseGraceSec + 0.3)
+        XCTAssertEqual(voice.sessionReleases, 1)
+    }
+
+    /// A call answered in-app, then Focus opened with the ambient bed on:
+    /// .playback took the call's mic (dead air), and leaving Focus
+    /// deactivated the call's session.
+    func testTheAmbientBedNeverTakesTheSessionFromALiveCall() throws {
+        let s = AVAudioSession.sharedInstance()
+        try s.setCategory(.playAndRecord, mode: .voiceChat, options: [])
+        VoiceAudioOwnership.set(true, by: .callKit)
+        AmbientAudio.shared.start()
+        XCTAssertFalse(AmbientAudio.shared.isRunning, "the bed waits for the call")
+        XCTAssertEqual(s.category, .playAndRecord, "the call keeps its input")
+    }
+
+    /// The copilot ducked (paused) the bed, and a call was answered before
+    /// it restored it: the restore can't play into the call's session, and
+    /// left it paused but "running" — start() then refused it after the
+    /// call, and it stayed silent until Focus was left.
+    func testABedDuckedWhenACallTookTheSessionCanStartAgainAfterIt() throws {
+        AmbientAudio.shared.start()
+        guard AmbientAudio.shared.isRunning else { throw XCTSkip("no audio output route in this simulator") }
+        AmbientAudio.shared.duck()                      // a coach line
+        VoiceAudioOwnership.set(true, by: .callKit)     // a call answered meanwhile
+        AmbientAudio.shared.restore()
+        XCTAssertFalse(AmbientAudio.shared.isRunning, "stopped, not paused and counted as playing")
+        VoiceAudioOwnership.set(false, by: .callKit)    // the call has ended
+        AmbientAudio.shared.start()                     // the next updateAudio
+        XCTAssertTrue(AmbientAudio.shared.isRunning)
+    }
+
+    /// The copilot's listen window left the session record-only; the bed was
+    /// restarted into it and played nothing for the rest of the session.
+    func testRestoringTheBedAfterAListenWindowMakesTheSessionPlaybackAgain() throws {
+        AmbientAudio.shared.start()
+        guard AmbientAudio.shared.isRunning else { throw XCTSkip("no audio output route in this simulator") }
+        AmbientAudio.shared.duck()
+        let s = AVAudioSession.sharedInstance()
+        try s.setCategory(.record, mode: .measurement, options: .duckOthers)
+        AmbientAudio.shared.restore()
+        XCTAssertEqual(s.category, .playback, "the bed can be heard again")
+    }
+
+    // MARK: VoiceAudioOwnership
+
+    func testOwnershipIsPerOwnerAndAFailedActivationLetsGo() {
+        VoiceAudioOwnership.set(true, by: .callKit)
+        VoiceAudioOwnership.set(true, by: .app)
+        VoiceAudioOwnership.set(false, by: .app)    // Talk ended during the call
+        XCTAssertTrue(VoiceAudioOwnership.isHeld, "the call still holds it")
+        VoiceAudioOwnership.set(false, by: .callKit)
+        XCTAssertFalse(VoiceAudioOwnership.isHeld)
+        // A Talk start whose activation threw (the mic busy) left the flag
+        // set for the rest of the process.
+        struct Busy: Error {}
+        XCTAssertThrowsError(try VoiceAudioOwnership.holding(.app) { throw Busy() })
+        XCTAssertFalse(VoiceAudioOwnership.isHeld)
+        var released = 0
+        VoiceAudioOwnership.unlessHeld { released += 1 }
+        VoiceAudioOwnership.set(true, by: .app)
+        VoiceAudioOwnership.unlessHeld { released += 1 }
+        XCTAssertEqual(released, 1, "no release while held")
     }
 }

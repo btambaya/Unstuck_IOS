@@ -28,6 +28,11 @@ final class AmbientAudio {
 
     func start() {
         guard !running else { return }
+        // A live Talk session or call owns the shared session: switching it
+        // to .playback takes the conversation's mic away (dead air on a
+        // call), and the bed would be fed into that mic besides. The bed
+        // waits; the next updateAudio starts it (audit 2026-09-22, C42).
+        guard !VoiceAudioOwnership.isHeld else { return }
         configureSession()
         let format = engine.outputNode.inputFormat(forBus: 0)
         // A 0-channel / 0-rate output format (no audio route — e.g. the
@@ -94,6 +99,17 @@ final class AmbientAudio {
         guard duckedForCopilot else { return }
         duckedForCopilot = false
         guard running else { return }
+        // A Talk session or call took the session while the bed was ducked:
+        // it can't play in theirs. Stopped, not left paused — a paused bed
+        // still counted as running, so start() refused it after the call and
+        // it stayed silent until Focus was left (audit 2026-09-22, C42). The
+        // next updateAudio starts it again.
+        guard !VoiceAudioOwnership.isHeld else { teardown(); return }
+        // The copilot's listen window left the session record-only (and its
+        // speech .spokenAudio with .duckOthers): an engine restarted into a
+        // .record session renders nothing, so the bed stayed silent while
+        // `running` said it played (audit 2026-09-22, C41). Ours again first.
+        configureSession()
         try? engine.start()
     }
 
@@ -110,7 +126,8 @@ final class AmbientAudio {
         #if os(iOS)
         // Never deactivate the shared session under a live voice conversation —
         // it would silence the call with no error anywhere (audit, 2026-09-11).
-        if !VoiceAudioOwnership.isHeld {
+        // Checked atomically with a Talk start's hold (audit 2026-09-22, C42).
+        VoiceAudioOwnership.unlessHeld {
             try? AVAudioSession.sharedInstance().setActive(false, options: [.notifyOthersOnDeactivation])
         }
         #endif

@@ -26,7 +26,9 @@ final class VoiceControllerSpeaker: CopilotSpeaker {
     /// itself a no-op if no voice exists, so this stays true.
     var canSpeak: Bool { true }
 
-    func speak(_ text: String) { voice.speak(text) }
+    func speak(_ text: String, onFinish: @escaping @MainActor () -> Void) {
+        voice.speak(text) { Task { @MainActor in onFinish() } }
+    }
     func stop() { voice.stopSpeaking() }
 }
 
