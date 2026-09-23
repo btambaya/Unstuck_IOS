@@ -35,9 +35,13 @@
 // hydrate would take it (audit 2026-09-22, C29; Android CatchUp.repairUnseen
 // parity, which takes only a newer one). A copy stamped by a fast clock is
 // "newer" than every server edit made inside that skew, so last-write-wins
-// kept the stale row until its next edit. sessions and reason_logs page by
-// migration 064's server-stamped `updated_at`, not by the event times their
-// writers set.
+// kept the stale row until its next edit. profile_facts is the exception: its
+// hydrate keeps a strictly newer local fact (a save whose push is not queued
+// yet), so the sweep takes only a newer one there. Each take re-checks, in the
+// same transaction as its write, that nothing was queued for the row and that
+// the row has not moved since its stamp was compared. sessions and reason_logs
+// page by migration 064's server-stamped `updated_at`, not by the event times
+// their writers set.
 //
 // Two tables have no monotonic column on the server at all (`cal_blocks` has no
 // timestamp; `captures.archived_at` moves without `created_at` moving), so they
@@ -105,14 +109,21 @@ public actor CatchUpPuller {
         /// gets a new key, so a mark measured on the old column is never read
         /// as one on the new (audit 2026-09-22, C29).
         var cursorKey: String? = nil
-        /// `SELECT id, <stamp>` over the local table when the local row keeps
-        /// `column` as its stamp — only then can the sweep tell that this
-        /// device holds another copy than the server (audit 2026-09-22, C29).
-        var localStampSQL: String? = nil
-        /// The sweep's apply for such a table: the server row as it is, with
-        /// no last-write-wins — the caller has checked that no local write is
-        /// queued for it, which is the hydrate's rule (C29).
-        var adopt: (@Sendable (Data, AppDatabase) -> ApplyVerdict)? = nil
+        /// The local column that holds `column` when the local row keeps it as
+        /// its stamp — only then can the sweep tell that this device holds
+        /// another copy than the server (audit 2026-09-22, C29).
+        var localStampColumn: String? = nil
+        /// The table's hydrate keeps a strictly newer local row, so the sweep
+        /// takes only a server copy stamped newer than this device's, never
+        /// just a different one. profile_facts: ProfileFactsService writes the
+        /// row BEFORE its push is queued, and taking the server's copy in that
+        /// gap reverted a save or a "forget" (C29).
+        var keepsNewerLocal = false
+        /// The sweep's write: the server row as it is, with no last-write-wins,
+        /// on the sweep's own connection — the guards that no local write is
+        /// queued and that the row hasn't moved run in the same transaction
+        /// (C29). No `store`, no sweep takes for the table.
+        var store: (@Sendable (Data, Database) throws -> Void)? = nil
 
         var cursorName: String { cursorKey ?? name }
     }
@@ -294,7 +305,7 @@ public actor CatchUpPuller {
         var afterId: String?
         var pages = 0
         var complete = false
-        let stampColumn = table.localStampSQL == nil ? nil : table.column
+        let stampColumn = table.localStampColumn == nil ? nil : table.column
         while pages < 40 {
             pages += 1
             let page: [IdStamp]
@@ -326,16 +337,17 @@ public actor CatchUpPuller {
 
     /// Take the rows the cursor could not see (audit 2026-09-22, C29): ones
     /// the server has and this device doesn't, and — where the local row keeps
-    /// the cursor column as its stamp — ones whose stamps differ. A row with a
-    /// queued local write or delete is left alone, checked again right before
-    /// each write; the rest take the server's copy (`adopt`, else the table's
-    /// own apply).
+    /// the cursor column as its stamp — ones whose stamps differ (are older
+    /// here, for `keepsNewerLocal`). A row with a queued local write or delete
+    /// is left alone; `storeIfUnchanged` checks that again, and that the row
+    /// hasn't moved, in the transaction that writes the server's copy.
     private func repair(_ table: DeltaTable, serverIds: Set<String>, serverStamps: [String: String],
                         localIds: Set<String>, pending: Set<String>, into outcome: inout Outcome) async -> Int {
-        let localStamps = table.localStampSQL.map { sql in
+        guard let store = table.store else { return 0 }
+        let localStamps = table.localStampColumn.map { column in
             (try? db.writer.read { conn -> [String: String] in
                 var out: [String: String] = [:]
-                for row in try Row.fetchAll(conn, sql: sql) {
+                for row in try Row.fetchAll(conn, sql: "SELECT id, \(column) FROM \(table.name)") {
                     if let id: String = row[0], let stamp: String = row[1] { out[id] = stamp }
                 }
                 return out
@@ -349,7 +361,7 @@ public actor CatchUpPuller {
             if localIds.contains(id) {
                 guard let serverMs = serverStamps[id].flatMap(Time.parseMillis),
                       let localMs = localStamps[id].flatMap(Time.parseMillis),
-                      serverMs != localMs else { continue }
+                      table.keepsNewerLocal ? serverMs > localMs : serverMs != localMs else { continue }
             }
             want.append(id)
         }
@@ -369,14 +381,47 @@ public actor CatchUpPuller {
                 return took
             }
             for raw in rows {
-                guard let id = Self.stringField("id", in: raw),
-                      !Self.hasPendingDelete(table: table.name, rowId: id, db: db),
-                      !Self.hasPendingWrite(table: table.name, rowId: id, db: db) else { continue }
-                if (table.adopt ?? table.apply)(raw, db) == .applied { took += 1 }
+                guard let id = Self.stringField("id", in: raw) else { continue }
+                // What this device held when the stamps were compared: nothing
+                // (a row missing here), or that stamp.
+                let seen = localIds.contains(id) ? localStamps[id] : nil
+                if Self.storeIfUnchanged(raw, id: id, seen: seen, table: table.name,
+                                         stampColumn: table.localStampColumn, store: store, db: db) {
+                    took += 1
+                }
             }
         }
         outcome.rowsRepaired += took
         return took
+    }
+
+    /// One sweep write, in ONE transaction with its guards: skipped when a
+    /// local write or delete got queued for the row, or when the row moved
+    /// since its stamp was compared (`seen`; nil = it was missing here) — a
+    /// realtime echo, a direct write or a local edit that landed while the
+    /// sweep was reading. Checked in separate reads, the older copy the sweep
+    /// had fetched overwrote it (audit 2026-09-22, C29).
+    static func storeIfUnchanged(_ raw: Data, id: String, seen: String?, table: String, stampColumn: String?,
+                                 store: @Sendable (Data, Database) throws -> Void, db: AppDatabase) -> Bool {
+        (try? db.writer.write { conn -> Bool in
+            guard !(try OutboxStore.pending(in: conn)).contains(where: { $0.tableName == table && $0.rowId == id })
+            else { return false }
+            let current = try Row.fetchOne(conn, sql: "SELECT \(stampColumn ?? "id") FROM \(table) WHERE id = ?",
+                                           arguments: [id])
+            if let seen {
+                guard let current, (current[0] as String?) == seen else { return false }
+            } else {
+                guard current == nil else { return false }
+            }
+            try store(raw, conn)
+            return true
+        }) ?? false
+    }
+
+    /// A sweep `store` that writes `Row`'s model as it is.
+    static func storing<Row: Decodable & Sendable, Model: PersistableRecord>(
+        _ type: Row.Type, _ model: @escaping @Sendable (Row) -> Model) -> @Sendable (Data, Database) throws -> Void {
+        { raw, conn in try model(JSONDecoder().decode(Row.self, from: raw)).upsert(conn) }
     }
 
     // MARK: - guards
@@ -430,12 +475,8 @@ public actor CatchUpPuller {
                    },
                    delete: { id, db in try? db.deleteById(TaskItem.self, id: id) },
                    reconcileDeletes: true,
-                   localStampSQL: "SELECT id, updatedAt FROM tasks",
-                   adopt: { raw, db in
-                       guard let row = try? JSONDecoder().decode(TaskRow.self, from: raw) else { return .failed }
-                       guard (try? db.save(row.model())) != nil else { return .failed }
-                       return .applied
-                   }),
+                   localStampColumn: "updatedAt",
+                   store: CatchUpPuller.storing(TaskRow.self) { $0.model() }),
 
         DeltaTable(name: "sessions", column: "updated_at",
                    apply: { raw, db in
@@ -448,7 +489,8 @@ public actor CatchUpPuller {
                    },
                    delete: { id, db in try? db.deleteById(Session.self, id: id) },
                    reconcileDeletes: true,
-                   cursorKey: "sessions.updated_at"),
+                   cursorKey: "sessions.updated_at",
+                   store: CatchUpPuller.storing(SessionRow.self) { $0.model() }),
 
         DeltaTable(name: "reason_logs", column: "updated_at",
                    apply: { raw, db in
@@ -461,7 +503,8 @@ public actor CatchUpPuller {
                    },
                    delete: { id, db in try? db.deleteById(ReasonLog.self, id: id) },
                    reconcileDeletes: true,
-                   cursorKey: "reason_logs.updated_at"),
+                   cursorKey: "reason_logs.updated_at",
+                   store: CatchUpPuller.storing(ReasonLogRow.self) { $0.model() }),
 
         DeltaTable(name: "collections", column: "updated_at",
                    apply: { raw, db in
@@ -482,7 +525,14 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(ItemCollection.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   // Only a list missing here is taken, so it has no membership
+                   // to keep: catchUp re-reads it right after (`tookLists`).
+                   store: { raw, conn in
+                       var list = try JSONDecoder().decode(CollectionRow.self, from: raw).model()
+                       list.members = []
+                       try list.upsert(conn)
+                   }),
 
         DeltaTable(name: "tags", column: "updated_at",
                    apply: { raw, db in
@@ -494,7 +544,8 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(TagRow.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   store: CatchUpPuller.storing(TagDbRow.self) { $0.model() }),
 
         DeltaTable(name: "life_areas", column: "updated_at",
                    apply: { raw, db in
@@ -506,7 +557,8 @@ public actor CatchUpPuller {
                        return .applied
                    },
                    delete: { id, db in try? db.deleteById(LifeArea.self, id: id) },
-                   reconcileDeletes: true),
+                   reconcileDeletes: true,
+                   store: CatchUpPuller.storing(LifeAreaDbRow.self) { $0.model() }),
 
         // profile_facts are soft-deleted (`active=false` tombstones) so a
         // missing id never means "deleted" — the sweep never drops one, but it
@@ -523,12 +575,9 @@ public actor CatchUpPuller {
                    },
                    delete: { _, _ in },
                    reconcileDeletes: false,
-                   localStampSQL: "SELECT id, updatedAt FROM profile_facts",
-                   adopt: { raw, db in
-                       guard let row = try? JSONDecoder().decode(ProfileFactRow.self, from: raw) else { return .failed }
-                       guard (try? db.save(row.model())) != nil else { return .failed }
-                       return .applied
-                   }),
+                   localStampColumn: "updatedAt",
+                   keepsNewerLocal: true,
+                   store: CatchUpPuller.storing(ProfileFactRow.self) { $0.model() }),
 
         // call_requests: direct writes only (no outbox op to guard), a touch
         // trigger on `updated_at` (migration 051) so every status change the
@@ -547,12 +596,8 @@ public actor CatchUpPuller {
                    },
                    delete: { id, db in try? db.deleteById(CallRequest.self, id: id) },
                    reconcileDeletes: true,
-                   localStampSQL: "SELECT id, updated_at FROM call_requests",
-                   adopt: { raw, db in
-                       guard let row = try? JSONDecoder().decode(CallRequest.self, from: raw) else { return .failed }
-                       guard (try? db.writer.write({ try row.upsert($0) })) != nil else { return .failed }
-                       return .applied
-                   }),
+                   localStampColumn: "updated_at",
+                   store: CatchUpPuller.storing(CallRequest.self) { $0 }),
     ]
 
     /// Table names the cursor pull covers (diagnostics + tests).
