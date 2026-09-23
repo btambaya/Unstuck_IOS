@@ -14,6 +14,8 @@
 //   the outcome reporter persists, flushes in order and retries.
 
 import XCTest
+import UnstuckCore
+import UnstuckData
 import UnstuckSync
 @testable import Unstuck
 
@@ -1200,5 +1202,88 @@ final class CallsOutcomeReporterTests: XCTestCase {
         XCTAssertEqual(rec.sent.map(\.callId), ["c1"])
         XCTAssertEqual(log.delays, [2, 5, 15], "2 s / 5 s between the three attempts, 15 s before the re-enqueued item is retried")
         XCTAssertTrue(r.queue.isEmpty)
+    }
+}
+
+// MARK: - the receipt-time anchor check over the real store (web/Android audit 2026-09-23, A6)
+//
+// A task or block made on the web / Android shortly before its call — or the
+// block a lead-anchored call follows — is often not in this phone's store yet
+// (a suspended app has no realtime). That must ring: send-call already checked
+// the anchor against the database. Reading "not here" as "gone" ended the
+// call `stale` — terminal and silent, no ring, no retry, no notice. Only what
+// THIS device knows retires a call: the row is here and done / skipped, or
+// its delete is still queued in the outbox.
+
+@MainActor
+final class AppCallEnvironmentAnchorTests: XCTestCase {
+    private var model: AppModel!
+    private var db: AppDatabase!
+    private var env: AppCallEnvironment!
+    private let stamp = "2026-09-23T09:50:00.000Z"
+
+    override func setUp() async throws {
+        try await super.setUp()
+        model = AppModel()
+        model.startUITestMode()
+        db = try XCTUnwrap(model.db)
+        env = AppCallEnvironment(model: model)
+    }
+
+    private func task(done: Bool = false) -> TaskItem {
+        TaskItem(id: "a6-task", name: "Call the dentist", estimateMin: 15, done: done,
+                 createdAt: stamp, updatedAt: stamp)
+    }
+    private func block(done: Bool = false, skipped: Bool = false) -> CalBlock {
+        CalBlock(id: "a6-block", taskId: "a6-task", taskName: "Call the dentist", startTime: "10:00",
+                 durationMinutes: 15, date: "2026-09-23", kind: .task, done: done, skipped: skipped)
+    }
+    private func queueDelete(_ table: String, _ id: String) throws {
+        try OutboxStore(db).enqueue(table: table, rowId: id, kind: .delete, nowISO: stamp)
+    }
+
+    func testATaskMadeOnAnotherDeviceAndNotSyncedHereYetRings() {
+        XCTAssertTrue(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"), "unknown, not gone")
+        XCTAssertTrue(env.anchorIsLive(taskId: "a6-task", blockId: nil), "a task-only call the same")
+    }
+
+    func testTheTaskIsHereButItsBlockHasNotSyncedYetRings() throws {
+        try db.save(task())
+        XCTAssertTrue(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"))
+    }
+
+    func testALiveTaskAndBlockThisPhoneHoldsRing() throws {
+        try db.save(task())
+        try db.save(block())
+        XCTAssertTrue(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"))
+        XCTAssertTrue(env.anchorIsLive(taskId: "a6-task", blockId: nil))
+    }
+
+    func testWhatThisPhoneKnowsIsOverIsStillStale() throws {
+        try db.save(task(done: true))
+        try db.save(block())
+        XCTAssertFalse(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"), "task done")
+        try db.save(task())
+        try db.save(block(done: true))
+        XCTAssertFalse(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"), "block done")
+        try db.save(block(skipped: true))
+        XCTAssertFalse(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"), "block skipped")
+    }
+
+    func testATaskOrBlockDeletedHereWhoseDeleteIsStillQueuedIsStale() throws {
+        try queueDelete("tasks", "a6-task")
+        XCTAssertFalse(env.anchorIsLive(taskId: "a6-task", blockId: nil))
+        XCTAssertFalse(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"))
+
+        let box = OutboxStore(db)
+        for op in try box.pending() { try box.markDone(try XCTUnwrap(op.opSeq)) }
+        try db.save(task())
+        try queueDelete("cal_blocks", "a6-block")
+        XCTAssertFalse(env.anchorIsLive(taskId: "a6-task", blockId: "a6-block"))
+        XCTAssertTrue(env.anchorIsLive(taskId: "a6-task", blockId: nil), "the task itself still stands")
+    }
+
+    func testACallWithNoTaskAnchorHasNothingToCheck() {
+        XCTAssertTrue(env.anchorIsLive(taskId: nil, blockId: nil))
     }
 }

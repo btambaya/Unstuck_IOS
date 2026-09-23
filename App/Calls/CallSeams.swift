@@ -86,7 +86,10 @@ protocol CallEnvironment: AnyObject {
     /// A focus session is live (started, paused or not) → the call ends as `busy`.
     var isFocusSessionLive: Bool { get }
     /// The task/block the call anchors to still stands. `nil` taskId → true.
-    /// Task done/deleted, or block done/skipped/gone → false (→ `stale`).
+    /// False (→ `stale`) only for what this device KNOWS: the task is done or
+    /// its delete is queued here, or the block is done / skipped / its delete
+    /// is queued. A row not synced here yet is unknown → true (ring; send-call
+    /// already checked it server-side — web/Android audit 2026-09-23, A6).
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool
     /// The user's own allowed-hours guard (Settings → Calls from Unstuck).
     func isWithinCallHours(_ date: Date) -> Bool

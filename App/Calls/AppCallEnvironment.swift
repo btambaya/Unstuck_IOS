@@ -7,6 +7,7 @@ import ActivityKit
 import Foundation
 import UIKit
 import UnstuckCore
+import UnstuckData
 import UnstuckShared
 import UnstuckSync
 import UserNotifications
@@ -41,15 +42,33 @@ final class AppCallEnvironment: CallEnvironment {
         return !Activity<FocusSessionAttributes>.activities.isEmpty
     }
 
+    /// A row this phone has not synced yet is UNKNOWN, not gone (web/Android
+    /// audit 2026-09-23, A6): a suspended app has no realtime, so a task or
+    /// block made on the web / Android just before its call — or the block a
+    /// lead-anchored call follows — is often missing here, and reading that
+    /// as gone ended the call `stale` (terminal, silent: no ring, no retry, no
+    /// notice). send-call already checked the anchor against the database
+    /// before it pushed, so a missing row rings with the payload's own label.
+    /// Only what THIS device knows retires the call: the row is here and done
+    /// (task) / done or skipped (block), or its delete is still queued in the
+    /// outbox (removed here, not yet on the server).
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool {
         guard let taskId else { return true }
-        guard let m = model, let repo = m.taskRepo else { return true }   // no store yet → ring
-        guard let task = (try? repo.fetch(id: taskId)) ?? nil else { return false }
-        if task.done { return false }
+        guard let m = model, let repo = m.taskRepo, let db = m.db else { return true }   // no store yet → ring
+        let queuedDeletes = ((try? OutboxStore(db).pending()) ?? []).filter { $0.kind == .delete }
+        func deleteQueued(_ table: String, _ id: String) -> Bool {
+            queuedDeletes.contains { $0.tableName == table && $0.rowId == id }
+        }
+        if let task = (try? repo.fetch(id: taskId)) ?? nil {
+            if task.done { return false }
+        } else if deleteQueued("tasks", taskId) {
+            return false
+        }
         guard let blockId else { return true }
-        let blocks = (try? m.db?.blocks(forTask: taskId)) ?? []
-        guard let block = blocks.first(where: { $0.id == blockId }) else { return false }
-        return !block.done && !block.skipped
+        if let block = (try? db.fetchById(CalBlock.self, id: blockId)) ?? nil {
+            return !block.done && !block.skipped
+        }
+        return !deleteQueued("cal_blocks", blockId)
     }
 
     func isWithinCallHours(_ date: Date) -> Bool { CallSettings.isWithinWindow(date) }

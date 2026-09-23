@@ -7,7 +7,8 @@
 //                     ├─ calls switched off   → end .declinedElsewhere, outcome declined, notify
 //                     ├─ outside call hours   → end .declinedElsewhere, outcome declined, notify
 //                     ├─ focus session live   → end .answeredElsewhere, outcome busy, notify
-//                     ├─ anchor gone          → end .remoteEnded, outcome stale (silent)
+//                     ├─ anchor known over    → end .remoteEnded, outcome stale (silent);
+//                     │                         one not synced here yet rings (web/Android audit 2026-09-23, A6)
 //                     └─ else ring; 30 s unanswered → .unanswered, outcome missed —
 //                        the "I called about X" notification is handed to the
 //                        REPORTER and posted only once call-outcome answers
