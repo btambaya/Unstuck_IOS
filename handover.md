@@ -43,7 +43,7 @@ phases land. Newest status at the top.
 
 
 
-## App-confirm links (pending build 88) — branch feat/app-confirm-links, not shipped
+## App-confirm links (build 88) — branch feat/app-confirm-links, not shipped
 
 **Why** (owner decision 2026-09-23, "Proper fix in the apps"): an app sign-up's email carried Supabase's own link, which ends
 at `unstuck://auth-callback?code=…`. A phone opens that; a COMPUTER can't — dead end. Shared contract with web + Android:
@@ -79,6 +79,25 @@ at `unstuck://auth-callback?code=…`. A phone opens that; a COMPUTER can't — 
   sign out and tap it → "already been used … just sign in". (4) An email from an OLDER build (auth-callback link) still opens the
   app signed in. (5) Forgot password still opens "Set a new password". (6) Sign up with an address that already has an account →
   the "already exists" line + Sign in instead / Forgot password. Never use made-up addresses on prod; delete test accounts after.
+
+## Where things stand (2026-09-23, late night) — build 88: sign-up links that work anywhere; UI tests green again
+
+- **Web W16 root fix (live 20:15):** prod templates 01 (sign-up) + 02 (magic link) branch on RedirectTo —
+  `unstuck://auth-callback` (every build ≤ 87) → Supabase's ConfirmationURL, unchanged; `unstuck://auth-confirm` (build 88+,
+  Android vc104+) → https://unstucknow.io/auth/app-confirm/?token_hash=…&type=…; anything else (the web) → /auth/confirm/?token_hash=….
+  Password reset untouched. Plan/rollback: unstuck/supabase/email-templates/TOKENHASH-SWITCH.md. Ahmad's real sign-up test passed
+  (confirmed on first click, "You're in"; re-opened link → carried on signed in).
+- **Build 88:** signUp + signInWithOTP pass `unstuck://auth-confirm`; the AASA claims /auth/app-confirm(/*) (Apple CDN already
+  serving it); the link is verified in-app with verifyOTP(tokenHash:type:). Signed in as someone else → "Already signed in" alert,
+  the link is not used. Sign-up with an already-registered email → "An account with this email already exists. Sign in instead."
+  with Sign in instead / Forgot password?. See "App-confirm links (build 88)" below for the device test.
+- **UI tests:** the 4 b87 failures were stale tests (list rows are Buttons since b84; the Share picker moved in b59; the assistant
+  sheet was never actually dismissed) — fixed, no app bugs. `-only-testing:UnstuckUITests` on build 88 = 22 run, 0 failures.
+  OPEN (test infra): in ONE xcodebuild run of app unit tests THEN UI tests on the same simulator, every demo-boot UI test opened on
+  the tour welcome (77 failures; results kept at scratchpad/results/b88all-combined-run.xcresult). Each suite alone is green. Run the
+  two targets separately until that's understood.
+- **Web (unstuck main):** the sign-up page now says "already registered" (supabase-js 2.106 drops the user from no-session sign-ups;
+  lib/supabase/signup-tell.ts reads the identity count off the wire; upgrading to ≥ 2.117 is the long-term fix).
 
 ## Where things stand (2026-09-23, night) — build 87: daily voice minutes
 
