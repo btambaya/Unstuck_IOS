@@ -122,6 +122,13 @@ final class AppModel {
     @ObservationIgnored private var timezonePushedFor: String?
     /// Live as long as the model; the app has one AppModel for its lifetime.
     @ObservationIgnored private var timezoneObserver: NSObjectProtocol?
+    /// The recurrence top-up's gate + serialisation (stage 2, C21): one run in
+    /// flight, one trailing re-run, and callers that arrived meanwhile resume
+    /// once it is done.
+    @ObservationIgnored private var topUpGate = RecurrenceTopUpGate()
+    @ObservationIgnored private var topUpRunning = false
+    @ObservationIgnored private var topUpTrailing: Bool?
+    @ObservationIgnored private var topUpWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var dayChangeObserver: NSObjectProtocol?
     /// Generation counters so a push that succeeds can only clear the
     /// pending-push flag its own change set.
@@ -968,8 +975,9 @@ final class AppModel {
                 self.pushTimezoneIfNeeded()
                 // Repeating tasks whose 8-week horizon has run out since the
                 // last edit (topUpRecurrenceHorizon). After the hydrate, so it
-                // sees the account's real blocks rather than an empty store.
-                self.topUpRecurrenceHorizon()
+                // sees the account's real blocks rather than an empty store —
+                // and only if that hydrate's cal_blocks read succeeded.
+                Task { await self.topUpRecurrenceHorizon(pullFirst: false) }
                 // Hands-free ops whose target wasn't in the local store before
                 // this hydrate (a widget "Done" on a task pulled just now) are
                 // retried the moment the store is faithful, then flushed.
@@ -1036,14 +1044,17 @@ final class AppModel {
                     guard let self else { return }
                     self.timezonePushedFor = nil   // force the push: the zone changed
                     self.pushTimezoneIfNeeded()
-                    self.topUpRecurrenceHorizon()
+                    // A catch-up first, then the top-up (stage 2, C21): never
+                    // against a store that may be a minute stale.
+                    await self.topUpRecurrenceHorizon(pullFirst: true)
                 }
             }
         // A new day: repeating tasks get their horizon extended (see
-        // topUpRecurrenceHorizon) for an app that stays open for weeks.
+        // topUpRecurrenceHorizon) for an app that stays open for weeks —
+        // after a catch-up, like the time-zone change.
         dayChangeObserver = NotificationCenter.default.addObserver(
             forName: .NSCalendarDayChanged, object: nil, queue: .main) { [weak self] _ in
-                Task { @MainActor in self?.topUpRecurrenceHorizon() }
+                Task { @MainActor in await self?.topUpRecurrenceHorizon(pullFirst: true) }
             }
 
         // Register Live Activity per-update push tokens as they're issued.
@@ -2122,20 +2133,63 @@ final class AppModel {
     /// deleted or unscheduled occurrences on every launch and at midnight. It
     /// now only extends past the series' last occurrence, at the series'
     /// usual time (recurrenceTopUp), and never deletes.
-    func topUpRecurrenceHorizon() {
-        guard let write = coordinator?.write, let repo = taskRepo else { return }
-        let tasks = (try? repo.all()) ?? []
-        let templates = tasks.filter { $0.recurrence != nil && !$0.done }
+    ///
+    /// STAGE 2 (audit 2026-09-22 C21, "same id for same day"): every tail day
+    /// is minted with its deterministic id, insert-if-absent WITHOUT rule H's
+    /// retime (a stale top-up must never move a row another device's user
+    /// retimed), so two devices extending the same tail land on one row. The
+    /// run is serialised (one in flight, one trailing), its writes are awaited
+    /// inside it, and it only runs after a SUCCESSFUL cal_blocks read with
+    /// fewer rows than the cap, once per local day per user (and again on a
+    /// time-zone change) — RecurrenceTopUpGate. `pullFirst` runs a freshness
+    /// pull before judging (the day / time-zone observers); the hydrate hook
+    /// has just pulled. Each minted day is mirrored to Google once its insert
+    /// is confirmed (rule G; owner decision "every day, everywhere").
+    func topUpRecurrenceHorizon(pullFirst: Bool) async {
+        if topUpRunning {
+            topUpTrailing = (topUpTrailing ?? false) || pullFirst
+            await withCheckedContinuation { topUpWaiters.append($0) }
+            return
+        }
+        topUpRunning = true
+        var next: Bool? = pullFirst
+        while let pull = next {
+            topUpTrailing = nil
+            await performRecurrenceTopUp(pullFirst: pull)
+            next = topUpTrailing
+        }
+        topUpRunning = false
+        let waiters = topUpWaiters
+        topUpWaiters.removeAll()
+        for w in waiters { w.resume() }
+    }
+
+    private func performRecurrenceTopUp(pullFirst: Bool) async {
+        guard let coord = coordinator, let uid = coord.auth.currentUserId, let repo = taskRepo else { return }
+        let log = Logger(subsystem: "io.unstucknow.app", category: "recurrence")
+        let pull = pullFirst ? await coord.pullForRecurrenceTopUp() : await coord.lastCalBlocksPull()
+        guard coord.auth.currentUserId == uid else { return }
+        let today = Clock.todayISO()
+        let zone = TimeZone.current.identifier
+        let verdict = topUpGate.verdict(pull: pull, userId: uid, today: today, timeZone: zone)
+        guard verdict == .run, let pull else {
+            if verdict == .truncated {
+                log.notice("horizon top-up skipped: the cal_blocks read hit the row cap")
+            }
+            return
+        }
+        topUpGate.recordRun(pull: pull, userId: uid, today: today, timeZone: zone)
+        let templates = ((try? repo.all()) ?? []).filter { $0.recurrence != nil && !$0.done }
         guard !templates.isEmpty else { return }
         // Grouped once: a per-template filter over every block was O(n·m).
         let byTask = Dictionary(grouping: (try? db?.fetchAllCalBlocks()) ?? []) { $0.taskId ?? "" }
-        let today = Clock.todayISO()
         let toAdd = templates.flatMap { recurrenceTopUp(task: $0, existingBlocks: byTask[$0.id] ?? [], todayIso: today) }
         guard !toAdd.isEmpty else { return }
-        let now = Self.isoNow()
-        Logger(subsystem: "io.unstucknow.app", category: "recurrence")
-            .notice("horizon top-up: \(toAdd.count, privacy: .public) occurrence(s) across \(templates.count, privacy: .public) task(s)")
-        Task { for b in toAdd { try? await write.upsertCalBlock(b, nowISO: now) } }
+        log.notice("horizon top-up: \(toAdd.count, privacy: .public) occurrence(s) across \(templates.count, privacy: .public) task(s)")
+        for b in toAdd {
+            guard coord.auth.currentUserId == uid else { return }
+            await saveBlockInserting(b, retimeIfTaken: false, unpark: false)
+        }
     }
 
     func deleteTask(_ id: String) {

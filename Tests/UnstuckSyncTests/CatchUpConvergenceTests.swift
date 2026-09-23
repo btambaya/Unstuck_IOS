@@ -596,3 +596,227 @@ private actor CountingCatchUp {
         return out
     }
 }
+
+// MARK: - stage 2: two devices, one series, deterministic occurrence ids
+//
+// deterministic-occurrence-ids.md §4.1 "two-device twin test": two in-memory
+// stores, each with its own WriteThrough + OutboxFlusher + Hydrator, sharing
+// ONE fake server with ON CONFLICT (id) DO NOTHING semantics, the filtered
+// retime, and plain merge upserts. Before stage 2 each device minted the same
+// tail day with its own random id: two rows, two reminders, two Google events.
+
+/// The shared server. Rows are JSON (Data) so the actor stays Sendable.
+private actor TwinServer: SyncGatewayProtocol, SyncReadGatewayProtocol {
+    private var rows: [String: [String: Data]] = [:]
+    private(set) var insertsIgnored = 0
+    private(set) var retimed = 0
+
+    private func object(_ data: Data) -> [String: Any] {
+        ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+    }
+    private func encoded<Row: Encodable>(_ row: Row, userId: String) throws -> [String: Any] {
+        var obj = object(try JSONEncoder().encode(row))
+        obj["user_id"] = userId
+        return obj
+    }
+
+    func seed(_ table: String, _ data: Data) {
+        guard let id = object(data)["id"] as? String else { return }
+        rows[table, default: [:]][id] = data
+    }
+    func blocks() -> [CalBlock] {
+        (rows["cal_blocks"] ?? [:]).values.compactMap { try? JSONDecoder().decode(CalBlockRow.self, from: $0).model() }
+    }
+
+    // writes
+    func upsert<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws {
+        let incoming = try encoded(row, userId: userId)
+        guard let id = incoming["id"] as? String else { return }
+        var merged = rows[table]?[id].map(object) ?? [:]
+        for (k, v) in incoming { merged[k] = v }
+        rows[table, default: [:]][id] = try JSONSerialization.data(withJSONObject: merged)
+    }
+    func delete(table: String, id: String) async throws {
+        rows[table]?.removeValue(forKey: id)
+    }
+    func insertIfAbsent<Row: Encodable & Sendable>(_ row: Row, table: String, userId: String) async throws -> Bool {
+        let incoming = try encoded(row, userId: userId)
+        guard let id = incoming["id"] as? String else { return false }
+        guard rows[table]?[id] == nil else { insertsIgnored += 1; return false }
+        rows[table, default: [:]][id] = try JSONSerialization.data(withJSONObject: incoming)
+        return true
+    }
+    func retimeIfOpen(table: String, id: String, date: String, startTime: String, durationMinutes: Int) async throws -> Data? {
+        guard let data = rows[table]?[id] else { return nil }
+        var obj = object(data)
+        guard obj["date"] as? String == date, obj["done"] as? Bool == false, obj["skipped"] as? Bool == false else { return nil }
+        obj["start_time"] = startTime
+        obj["duration_minutes"] = durationMinutes
+        let out = try JSONSerialization.data(withJSONObject: obj)
+        rows[table]?[id] = out
+        retimed += 1
+        return out
+    }
+
+    // reads
+    func fetchAll<Row: Decodable & Sendable>(_ type: Row.Type, table: String) async throws -> [Row] {
+        (rows[table] ?? [:]).values.compactMap { try? JSONDecoder().decode(Row.self, from: $0) }
+    }
+    func fetchAllRaw(table: String) async throws -> [Data] {
+        Array((rows[table] ?? [:]).values)
+    }
+}
+
+final class TwinOccurrenceTests: XCTestCase {
+    private let seriesId = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+    private let today = "2026-09-23"
+    private let now = "2026-09-23T10:00:00.000Z"
+    private var server: TwinServer!
+
+    private struct Device {
+        let db: AppDatabase
+        let write: WriteThrough
+        let flusher: OutboxFlusher
+        let hydrator: Hydrator
+    }
+
+    private var series: TaskItem {
+        TaskItem(id: seriesId, name: "Gym", estimateMin: 30, recurrence: .daily(until: nil),
+                 createdAt: "2026-09-01T08:00:00.000Z", updatedAt: "2026-09-01T08:00:00.000Z")
+    }
+    private func day(_ o: Int) -> String { LocalDate.addDays(today, o) }
+    private func id(_ o: Int) -> String { occurrenceId(taskId: seriesId, date: day(o)) }
+    private func occurrence(_ o: Int, _ time: String = "07:00") -> CalBlock {
+        CalBlock(id: id(o), taskId: seriesId, taskName: "Gym", startTime: time, durationMinutes: 30, date: day(o), kind: .task)
+    }
+
+    /// A device holding the same STALE store: the series minted through +52,
+    /// its frontier three days short of the horizon (+55).
+    private func device() throws -> Device {
+        let db = try AppDatabase.makeInMemory()
+        try db.save(series)
+        for o in 1...52 { try db.save(occurrence(o)) }
+        return Device(db: db, write: WriteThrough(db: db), flusher: OutboxFlusher(gateway: server, db: db),
+                      hydrator: Hydrator(gateway: server, db: db))
+    }
+
+    override func setUp() async throws {
+        server = TwinServer()
+        for o in 1...52 { await server.seed("cal_blocks", try JSONEncoder().encode(CalBlockRow(occurrence(o)))) }
+    }
+
+    /// What AppModel.topUpRecurrenceHorizon writes: the pure tail, each day
+    /// minted insert-if-absent without rule H.
+    private func topUp(_ d: Device) async throws {
+        for b in recurrenceTopUp(task: series, existingBlocks: try d.db.fetchAllCalBlocks(), todayIso: today) {
+            try await d.write.insertCalBlockIfAbsent(b, retimeIfTaken: false, nowISO: now)
+        }
+    }
+
+    private func serverBlocksByDate() async -> [String: [CalBlock]] {
+        Dictionary(grouping: await server.blocks().filter { $0.taskId == seriesId }, by: \.date)
+    }
+
+    func testTwoDevicesToppingUpTheSameStaleSeriesLandOnOneRowPerDay() async throws {
+        let a = try device(), b = try device()
+        try await topUp(a)
+        try await topUp(b)
+        XCTAssertEqual(try a.db.fetchAllCalBlocks().count, 55)
+        XCTAssertEqual(try b.db.fetchAllCalBlocks().count, 55)
+        await a.flusher.flush(userId: "u1")
+        await b.flusher.flush(userId: "u1")
+
+        let byDate = await serverBlocksByDate()
+        XCTAssertEqual(byDate.count, 55)
+        for o in 1...55 {
+            XCTAssertEqual(byDate[day(o)]?.map(\.id), [id(o)], "exactly one row for +\(o), with its deterministic id")
+        }
+        let ignored = await server.insertsIgnored
+        XCTAssertEqual(ignored, 3, "B's three mints were the same rows, ignored")
+        XCTAssertEqual(try OutboxStore(a.db).count(), 0)
+        XCTAssertEqual(try OutboxStore(b.db).count(), 0)
+    }
+
+    /// A moved the day's occurrence; B, stale, mints that day again. The
+    /// server keeps A's row where A put it, and B converges on it after its
+    /// catch-up — no block on the day it left.
+    func testAStaleMintNeverPullsAMovedOccurrenceBack() async throws {
+        let a = try device(), b = try device()
+        try await topUp(a)
+        await a.flusher.flush(userId: "u1")
+        var moved = try XCTUnwrap(a.db.fetchById(CalBlock.self, id: id(54)))
+        moved.date = day(60)
+        try await a.write.upsertCalBlock(moved, nowISO: now)
+        await a.flusher.flush(userId: "u1")
+
+        try await topUp(b)   // B never saw +53…+55
+        XCTAssertEqual(try b.db.fetchById(CalBlock.self, id: id(54))?.date, day(54), "B's stale local mint")
+        await b.flusher.flush(userId: "u1")
+        let onServer = await server.blocks().first { $0.id == id(54) }
+        XCTAssertEqual(onServer?.date, day(60), "the server row id(D) is still at E")
+
+        let pulled = await b.hydrator.hydrateFullReplaceTable("cal_blocks")
+        XCTAssertTrue(pulled)
+        XCTAssertEqual(try b.db.fetchById(CalBlock.self, id: id(54))?.date, day(60), "B converged on A's move")
+        XCTAssertFalse(try b.db.fetchAllCalBlocks().contains { $0.taskId == seriesId && $0.date == day(54) },
+                       "and has no block on the day it left")
+    }
+
+    /// Rule H: B, stale, re-plans the series to 16:00. The days A minted that B
+    /// never saw are retimed on the server rather than silently kept at 07:00;
+    /// a day A had moved stays where A put it.
+    func testAStaleUserMintRetimesTheDaysOpenOccurrenceButNotAMovedOne() async throws {
+        let a = try device(), b = try device()
+        try await topUp(a)
+        await a.flusher.flush(userId: "u1")
+        // A moves +55 to +60 first; +53 and +54 stay at 07:00.
+        var moved = try XCTUnwrap(a.db.fetchById(CalBlock.self, id: id(55)))
+        moved.date = day(60)
+        try await a.write.upsertCalBlock(moved, nowISO: now)
+        await a.flusher.flush(userId: "u1")
+
+        // B's Schedule on the series at 16:00, on its stale store: rewrites
+        // +1…+52 in place, mints the rest as user mints.
+        let existing = try b.db.fetchAllCalBlocks()
+        let plan = regenerateForTask(task: series, recurrence: series.recurrence, existingBlocks: existing, todayIso: today,
+                                     startTime: "16:00", startDate: LocalDate.parse(day(1)))
+        XCTAssertEqual(plan.toRetime.count, 52)
+        XCTAssertTrue(plan.toDelete.isEmpty)
+        for r in plan.toRetime { try await b.write.upsertCalBlock(r, nowISO: now) }
+        for m in plan.toUpsert { try await b.write.insertCalBlockIfAbsent(m, retimeIfTaken: true, nowISO: now) }
+        await b.flusher.flush(userId: "u1")
+
+        let byDate = await serverBlocksByDate()
+        for o in 1...54 {
+            XCTAssertEqual(byDate[day(o)]?.count, 1, "one row for +\(o)")
+            XCTAssertEqual(byDate[day(o)]?.first?.startTime, "16:00", "+\(o) runs at B's new time")
+        }
+        XCTAssertEqual(byDate[day(56)]?.map(\.id), [id(56)], "the day nobody had is inserted")
+        let movedOnServer = await server.blocks().first { $0.id == id(55) }
+        XCTAssertEqual(movedOnServer?.date, day(60), "a moved occurrence is never pulled back")
+        XCTAssertEqual(movedOnServer?.startTime, "07:00", "nor retimed: its date no longer matches")
+        XCTAssertNil(byDate[day(55)], "the day A moved away from stays empty (rule A)")
+        let retimes = await server.retimed
+        XCTAssertEqual(retimes, 2, "+53 and +54: open, on their date")
+    }
+
+    // MARK: the top-up's gate (§3c, §f)
+
+    func testTopUpGateRunsOnlyAfterAFreshSuccessfulUntruncatedPull() {
+        var gate = RecurrenceTopUpGate()
+        let first = CalBlocksPull(seq: 1, at: Date(), rowCount: 120)
+        XCTAssertEqual(gate.verdict(pull: nil, userId: "u1", today: today, timeZone: "Europe/London"), .noPull)
+        XCTAssertEqual(gate.verdict(pull: CalBlocksPull(seq: 1, at: Date(), rowCount: 1000), userId: "u1", today: today,
+                                    timeZone: "Europe/London"), .truncated)
+        XCTAssertEqual(gate.verdict(pull: first, userId: "u1", today: today, timeZone: "Europe/London"), .run)
+        gate.recordRun(pull: first, userId: "u1", today: today, timeZone: "Europe/London")
+        XCTAssertEqual(gate.verdict(pull: first, userId: "u1", today: day(1), timeZone: "Europe/London"), .pullNotAdvanced,
+                       "a new day still waits for a pull that succeeded")
+        let second = CalBlocksPull(seq: 2, at: Date(), rowCount: 120)
+        XCTAssertEqual(gate.verdict(pull: second, userId: "u1", today: today, timeZone: "Europe/London"), .alreadyRanToday)
+        XCTAssertEqual(gate.verdict(pull: second, userId: "u1", today: day(1), timeZone: "Europe/London"), .run, "the next day")
+        XCTAssertEqual(gate.verdict(pull: second, userId: "u1", today: today, timeZone: "America/New_York"), .run,
+                       "a time-zone change")
+        XCTAssertEqual(gate.verdict(pull: first, userId: "u2", today: today, timeZone: "Europe/London"), .run, "another account")
+    }
+}
