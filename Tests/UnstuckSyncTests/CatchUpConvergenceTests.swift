@@ -619,12 +619,26 @@ final class CatchUpConvergenceTests: XCTestCase {
         XCTAssertEqual(try db.fetchById(TaskItem.self, id: "a")?.name, "Web v2")
     }
 
-    /// The sweep never takes a row this device has a queued write for, and
-    /// never overwrites a local copy that is NEWER than the server's.
-    func testTheSweepLeavesPendingAndNewerLocalRowsAlone() async throws {
-        let mine = task("t1", "My newer copy", updatedAt: "2026-09-12T09:30:00.000Z")
-        try db.save(mine)
-        await server.put("tasks", try serverRow(task("t1", "Older server copy", updatedAt: "2026-09-12T09:00:00.000Z")))
+    /// The row a fast clock stamped ahead wins every last-write-wins compare
+    /// against the server's real edits inside that skew — the realtime echo
+    /// and the pull both dropped them, and the row stayed stale until its next
+    /// edit. With no local write queued for it, the server's copy is the truth
+    /// (the launch hydrate's rule): the sweep takes it.
+    func testTheSweepTakesTheServersEditOfARowAFastClockStampedAhead() async throws {
+        let ahead = task("t1", "Made on a fast clock", updatedAt: "2026-09-12T09:30:00.000Z")
+        try db.save(ahead)
+        await server.put("tasks", try serverRow(task("t1", "Renamed on the web", updatedAt: "2026-09-12T09:20:00.000Z")))
+        try SyncCursorStore(db).advance(userId: uid, table: "tasks", to: "2026-09-12T09:30:00.000Z")
+        let puller = makePuller()
+
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: false)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.name, "Made on a fast clock", "the premise")
+        _ = await puller.catchUp(userId: uid, reconcileDeletions: true)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.name, "Renamed on the web")
+    }
+
+    /// The sweep never takes a row this device has a queued write for.
+    func testTheSweepLeavesARowWithAQueuedWriteAlone() async throws {
         let pending = task("t2", "Queued rename", updatedAt: "2026-09-12T09:05:00.000Z")
         try db.save(pending)
         await server.put("tasks", try serverRow(task("t2", "Server t2", updatedAt: "2026-09-12T09:10:00.000Z")))
@@ -639,7 +653,6 @@ final class CatchUpConvergenceTests: XCTestCase {
         try SyncCursorStore(db).advance(userId: uid, table: "tasks", to: "2026-09-12T10:00:00.000Z")
 
         let outcome = await puller.catchUp(userId: uid, reconcileDeletions: true)
-        XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t1")?.name, "My newer copy")
         XCTAssertEqual(try db.fetchById(TaskItem.self, id: "t2")?.name, "Queued rename")
         XCTAssertEqual(outcome.rowsRepaired, 0)
     }

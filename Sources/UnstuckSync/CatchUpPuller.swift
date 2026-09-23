@@ -30,10 +30,14 @@
 // another device and flushed later lands BEHIND this device's cursor, and a
 // fast clock drags the cursor past real server edits. The same sweep therefore
 // also takes what the server has that this device lacks, or — where both sides
-// keep the cursor column as the row stamp — holds an older stamp of (audit
-// 2026-09-22, C29; Android CatchUp.repairUnseen parity). sessions and
-// reason_logs page by migration 064's server-stamped `updated_at`, not by the
-// event times their writers set.
+// keep the cursor column as the row stamp — holds a different stamp of, when
+// no local write is queued for it: the server's copy, exactly as the launch
+// hydrate would take it (audit 2026-09-22, C29; Android CatchUp.repairUnseen
+// parity, which takes only a newer one). A copy stamped by a fast clock is
+// "newer" than every server edit made inside that skew, so last-write-wins
+// kept the stale row until its next edit. sessions and reason_logs page by
+// migration 064's server-stamped `updated_at`, not by the event times their
+// writers set.
 //
 // Two tables have no monotonic column on the server at all (`cal_blocks` has no
 // timestamp; `captures.archived_at` moves without `created_at` moving), so they
@@ -103,8 +107,12 @@ public actor CatchUpPuller {
         var cursorKey: String? = nil
         /// `SELECT id, <stamp>` over the local table when the local row keeps
         /// `column` as its stamp — only then can the sweep tell that this
-        /// device holds an older copy than the server (audit 2026-09-22, C29).
+        /// device holds another copy than the server (audit 2026-09-22, C29).
         var localStampSQL: String? = nil
+        /// The sweep's apply for such a table: the server row as it is, with
+        /// no last-write-wins — the caller has checked that no local write is
+        /// queued for it, which is the hydrate's rule (C29).
+        var adopt: (@Sendable (Data, AppDatabase) -> ApplyVerdict)? = nil
 
         var cursorName: String { cursorKey ?? name }
     }
@@ -318,9 +326,10 @@ public actor CatchUpPuller {
 
     /// Take the rows the cursor could not see (audit 2026-09-22, C29): ones
     /// the server has and this device doesn't, and — where the local row keeps
-    /// the cursor column as its stamp — ones the server holds a strictly newer
-    /// stamp of. Each goes through the table's own apply, with the pull's
-    /// guards: a row with a queued local write or delete is left alone.
+    /// the cursor column as its stamp — ones whose stamps differ. A row with a
+    /// queued local write or delete is left alone, checked again right before
+    /// each write; the rest take the server's copy (`adopt`, else the table's
+    /// own apply).
     private func repair(_ table: DeltaTable, serverIds: Set<String>, serverStamps: [String: String],
                         localIds: Set<String>, pending: Set<String>, into outcome: inout Outcome) async -> Int {
         let localStamps = table.localStampSQL.map { sql in
@@ -340,7 +349,7 @@ public actor CatchUpPuller {
             if localIds.contains(id) {
                 guard let serverMs = serverStamps[id].flatMap(Time.parseMillis),
                       let localMs = localStamps[id].flatMap(Time.parseMillis),
-                      serverMs > localMs else { continue }
+                      serverMs != localMs else { continue }
             }
             want.append(id)
         }
@@ -361,8 +370,9 @@ public actor CatchUpPuller {
             }
             for raw in rows {
                 guard let id = Self.stringField("id", in: raw),
-                      !Self.hasPendingDelete(table: table.name, rowId: id, db: db) else { continue }
-                if table.apply(raw, db) == .applied { took += 1 }
+                      !Self.hasPendingDelete(table: table.name, rowId: id, db: db),
+                      !Self.hasPendingWrite(table: table.name, rowId: id, db: db) else { continue }
+                if (table.adopt ?? table.apply)(raw, db) == .applied { took += 1 }
             }
         }
         outcome.rowsRepaired += took
@@ -420,7 +430,12 @@ public actor CatchUpPuller {
                    },
                    delete: { id, db in try? db.deleteById(TaskItem.self, id: id) },
                    reconcileDeletes: true,
-                   localStampSQL: "SELECT id, updatedAt FROM tasks"),
+                   localStampSQL: "SELECT id, updatedAt FROM tasks",
+                   adopt: { raw, db in
+                       guard let row = try? JSONDecoder().decode(TaskRow.self, from: raw) else { return .failed }
+                       guard (try? db.save(row.model())) != nil else { return .failed }
+                       return .applied
+                   }),
 
         DeltaTable(name: "sessions", column: "updated_at",
                    apply: { raw, db in
@@ -508,7 +523,12 @@ public actor CatchUpPuller {
                    },
                    delete: { _, _ in },
                    reconcileDeletes: false,
-                   localStampSQL: "SELECT id, updatedAt FROM profile_facts"),
+                   localStampSQL: "SELECT id, updatedAt FROM profile_facts",
+                   adopt: { raw, db in
+                       guard let row = try? JSONDecoder().decode(ProfileFactRow.self, from: raw) else { return .failed }
+                       guard (try? db.save(row.model())) != nil else { return .failed }
+                       return .applied
+                   }),
 
         // call_requests: direct writes only (no outbox op to guard), a touch
         // trigger on `updated_at` (migration 051) so every status change the
@@ -527,7 +547,12 @@ public actor CatchUpPuller {
                    },
                    delete: { id, db in try? db.deleteById(CallRequest.self, id: id) },
                    reconcileDeletes: true,
-                   localStampSQL: "SELECT id, updated_at FROM call_requests"),
+                   localStampSQL: "SELECT id, updated_at FROM call_requests",
+                   adopt: { raw, db in
+                       guard let row = try? JSONDecoder().decode(CallRequest.self, from: raw) else { return .failed }
+                       guard (try? db.writer.write({ try row.upsert($0) })) != nil else { return .failed }
+                       return .applied
+                   }),
     ]
 
     /// Table names the cursor pull covers (diagnostics + tests).
