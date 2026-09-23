@@ -257,52 +257,15 @@ private struct CalendarSyncBar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 8) {
-                if vm.connections.isEmpty {
-                    Button { reconnecting = false; showDisclosure = true } label: {
-                        Text(busy ? "Connecting…" : "＋ Connect Google Calendar")
-                            .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
-                            .padding(.horizontal, 12).padding(.vertical, 8)
-                            .background(theme.palette.bg2, in: Capsule())
-                    }.buttonStyle(.plain).disabled(busy)
-                } else {
-                    Text(busy ? "Syncing…"
-                         : (model.calendarNeedsReauth
-                            ? "Google needs to be reconnected"
-                            : vm.connections.map { "Synced · \($0.accountEmail)" }.joined(separator: ", ")))
-                        .font(UFont.sans(12))
-                        .foregroundStyle(model.calendarNeedsReauth && !busy ? theme.palette.red : theme.palette.ink3)
-                        .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
-                    // The refresh token is dead (401 / invalid_grant, or the
-                    // server's needs_reauth flag): "Sync now" can only fail, so
-                    // offer the re-consent instead — the ordinary connect flow
-                    // over the SAME account (the server returns the same
-                    // connection id and clears the flag).
-                    if model.calendarNeedsReauth {
-                        Button { reconnecting = true; showDisclosure = true } label: {
-                            Text("Reconnect Google")
-                                .font(UFont.sans(12, .semibold))
-                                .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
-                                .padding(.horizontal, 8).padding(.vertical, 4)
-                        }.buttonStyle(.plain).disabled(busy)
-                    } else {
-                        Button { sync() } label: {
-                            Text("Sync now")
-                                .font(UFont.sans(12, .medium))
-                                .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
-                                .padding(.horizontal, 8).padding(.vertical, 4)
-                        }.buttonStyle(.plain).disabled(busy)
-                    }
-                    // Destructive — confirm first (it drops all synced events).
-                    Button { confirmDisconnect = true } label: {
-                        Text("Disconnect")
-                            .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                    }.buttonStyle(.plain).disabled(busy)
-                }
+            if model.calendarNeedsReauth && !vm.connections.isEmpty {
+                reauthCard
+            } else {
+                syncRow
             }
-            .padding(.horizontal, 18).padding(.vertical, 4)
-            if let caption = error ?? (model.calendarNeedsReauth ? model.calendarLastError : nil) {
+            // Only this bar's own, already plain-worded failures. The server's
+            // raw lastError ("invalid_grant (400)") is never shown — the card
+            // above says what it means (Ahmad, 2026-09-23).
+            if let caption = error {
                 Text(caption).font(UFont.sans(11)).foregroundStyle(theme.palette.red)
                     .padding(.horizontal, 18).padding(.bottom, 6)
             }
@@ -324,6 +287,69 @@ private struct CalendarSyncBar: View {
         } message: {
             Text(GoogleConnectCopy.disclosure)
         }
+    }
+
+    /// The refresh token is dead (401 / invalid_grant, or the server's
+    /// needs_reauth flag): "Sync now" can only fail, so the bar becomes a card
+    /// that says so in plain words and offers the re-consent — the ordinary
+    /// connect flow over the SAME account (the server returns the same
+    /// connection id and clears the flag).
+    private var reauthCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(GoogleConnectCopy.reauthTitle)
+                .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+            Text(GoogleConnectCopy.reauthBody(account: vm.connections.first?.accountEmail))
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 14) {
+                Button { reconnecting = true; showDisclosure = true } label: {
+                    Text(busy ? "Connecting…" : "Reconnect")
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
+                        .padding(.horizontal, 14).padding(.vertical, 7)
+                        .background(theme.palette.ink, in: Capsule())
+                }.buttonStyle(.plain).disabled(busy)
+                // Destructive — confirm first (it drops all synced events).
+                Button { confirmDisconnect = true } label: {
+                    Text("Disconnect").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                }.buttonStyle(.plain).disabled(busy)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .padding(.horizontal, 18).padding(.vertical, 6)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var syncRow: some View {
+        HStack(spacing: 8) {
+            if vm.connections.isEmpty {
+                Button { reconnecting = false; showDisclosure = true } label: {
+                    Text(busy ? "Connecting…" : "＋ Connect Google Calendar")
+                        .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(theme.palette.bg2, in: Capsule())
+                }.buttonStyle(.plain).disabled(busy)
+            } else {
+                Text(busy ? "Syncing…"
+                     : vm.connections.map { "Synced · \($0.accountEmail)" }.joined(separator: ", "))
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                    .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                Button { sync() } label: {
+                    Text("Sync now")
+                        .font(UFont.sans(12, .medium))
+                        .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                }.buttonStyle(.plain).disabled(busy)
+                // Destructive — confirm first (it drops all synced events).
+                Button { confirmDisconnect = true } label: {
+                    Text("Disconnect")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .padding(.horizontal, 8).padding(.vertical, 4)
+                }.buttonStyle(.plain).disabled(busy)
+            }
+        }
+        .padding(.horizontal, 18).padding(.vertical, 4)
     }
 
     private func sync() {

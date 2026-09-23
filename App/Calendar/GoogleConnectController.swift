@@ -30,6 +30,19 @@ enum GoogleConnectCopy {
     static func title(reconnect: Bool) -> String {
         reconnect ? "Reconnect Google Calendar?" : "Connect Google Calendar?"
     }
+
+    /// The sync bar once Google has stopped accepting Unstuck's access (a 401,
+    /// `invalid_grant`, or the server's needs_reauth flag). Plain words only:
+    /// the bar used to print the provider's raw error under the row —
+    /// "invalid_grant (400)" — which tells a user nothing (Ahmad, 2026-09-23).
+    /// The raw error stays in CalendarSyncStatus for diagnostics.
+    static let reauthTitle = "Google Calendar stopped syncing"
+
+    static func reauthBody(account: String?) -> String {
+        let who = account.map { " (\($0))" } ?? ""
+        return "Google signed Unstuck out of your calendar\(who), so new events won’t show here "
+            + "and your scheduled tasks won’t reach it. Reconnect to pick up where you left off."
+    }
 }
 
 @MainActor

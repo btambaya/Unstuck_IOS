@@ -364,6 +364,20 @@ final class CalendarConnectSeedTests: XCTestCase {
 // copy now, no toggle — the same words as web (sync-flow.tsx) and Android.
 
 final class GoogleConnectDisclosureTests: XCTestCase {
+    /// The reconnect card never shows the provider's raw error ("invalid_grant
+    /// (400)") — plain words, and the account when there is one (Ahmad,
+    /// 2026-09-23).
+    func testTheReconnectCardSpeaksPlainly() {
+        XCTAssertEqual(GoogleConnectCopy.reauthTitle, "Google Calendar stopped syncing")
+        let body = GoogleConnectCopy.reauthBody(account: "maya@example.com")
+        XCTAssertTrue(body.contains("(maya@example.com)"), body)
+        XCTAssertTrue(body.contains("Reconnect to pick up where you left off."), body)
+        for raw in ["invalid_grant", "400", "401", "needs_reauth", "token"] {
+            XCTAssertFalse(body.lowercased().contains(raw), "no raw error words: \(raw)")
+        }
+        XCTAssertFalse(GoogleConnectCopy.reauthBody(account: nil).contains("()"))
+    }
+
     func testTheDisclosureSaysScheduledTasksAreAddedToTheMainGoogleCalendar() {
         let text = GoogleConnectCopy.disclosure
         XCTAssertTrue(text.contains("Each task you schedule becomes an event on your main Google Calendar"))
