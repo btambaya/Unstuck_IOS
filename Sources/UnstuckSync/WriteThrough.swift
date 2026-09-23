@@ -228,9 +228,25 @@ public actor WriteThrough {
     @discardableResult
     public func stampCalBlockMapping(id: String, eventId: String, connectionId: String,
                                      nowISO: String) throws -> MappingStamp {
+        try writeCalBlockMapping(id: id, eventId: eventId, connectionId: connectionId, nowISO: nowISO) { _ in true }
+    }
+
+    /// The Google event of a SKIPPED occurrence was deleted (audit
+    /// 2026-09-22, C24): take the mapping off the row as it is now — only
+    /// while the row still names that event — so un-skipping INSERTs a fresh
+    /// event. Google keeps a deleted event as "cancelled" for a while, so
+    /// PATCHing the old id is no reliable way back. `.unchanged` = the row
+    /// no longer carries that event.
+    @discardableResult
+    public func clearCalBlockMapping(id: String, eventId: String, nowISO: String) throws -> MappingStamp {
+        try writeCalBlockMapping(id: id, eventId: nil, connectionId: nil, nowISO: nowISO) { $0.externalEventId == eventId }
+    }
+
+    private func writeCalBlockMapping(id: String, eventId: String?, connectionId: String?, nowISO: String,
+                                      applies: (CalBlock) -> Bool) throws -> MappingStamp {
         let result = try db.transaction { conn -> MappingStamp in
             guard var row = try CalBlock.fetchOne(conn, key: id) else { return .gone }
-            guard row.kind != .external, !id.hasPrefix("g_") else { return .unchanged }
+            guard row.kind != .external, !id.hasPrefix("g_"), applies(row) else { return .unchanged }
             if try OutboxStore.hasInsertFamilyOp(in: conn, table: "cal_blocks", rowId: id) { return .insertUnresolved }
             guard row.externalEventId != eventId || row.externalConnectionId != connectionId else { return .unchanged }
             row.externalEventId = eventId
@@ -381,13 +397,20 @@ public actor WriteThrough {
     /// cancel any still-queued upsert first: a cal_block upsert carries
     /// dependsOn=task.id, so it can be held back while the delete (no
     /// dependsOn) flushes ahead of it — which would re-create the block
-    /// server-side AFTER the delete (spec §1.8).
-    public func deleteCalBlock(id: String, nowISO: String) throws {
+    /// server-side AFTER the delete (spec §1.8). Returns our row as it was
+    /// deleted (nil = not here, or a g_ import): read on this actor with no
+    /// suspension before the delete, so a Google stamp can't land in between
+    /// and the caller deletes the event the row really carried (audit
+    /// 2026-09-22, C24).
+    @discardableResult
+    public func deleteCalBlock(id: String, nowISO: String) throws -> CalBlock? {
         guard !id.hasPrefix("g_") else {
             try db.deleteById(CalBlock.self, id: id)
-            return
+            return nil
         }
+        let row = try db.fetchById(CalBlock.self, id: id)
         try deleteAndEnqueue(CalBlock.self, table: "cal_blocks", id: id, nowISO: nowISO)
+        return row
     }
 
     public func deleteTask(id: String, nowISO: String) throws {

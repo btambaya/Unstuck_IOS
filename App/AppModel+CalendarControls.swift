@@ -79,35 +79,41 @@ extension AppModel {
     /// sync bar flips back to "Connect" immediately (a later hydrate reaches the
     /// same state). Mirrors Android SyncCoordinator.disconnectCalendar, looped
     /// over every connection.
-    func disconnectCalendar() {
-        guard let db, let calendar = coordinator?.calendar,
-              let write = coordinator?.write else { return }
+    ///
+    /// A connection is purged ONLY once the server confirms its revoke. A
+    /// failed revoke (offline, a 5xx) used to purge it anyway: the bar said
+    /// "Connect" while the server kept the refresh token, the next pull —
+    /// which lists connections from the server — brought every meeting back,
+    /// and the next hydrate the connection. Now it stays, and false tells the
+    /// bar to say the disconnect didn't happen (audit 2026-09-22, C26).
+    func disconnectCalendar() async -> Bool {
+        guard let db, let calendar = googleCalls, let write else { return false }
         let connections = (try? Repository<CalendarConnection>(db, orderColumn: "connectedAt").all()) ?? []
-        guard !connections.isEmpty else { return }
+        guard !connections.isEmpty else { return true }
         let now = Self.isoNow()
-        Task {
-            for conn in connections {
-                // Best-effort server revoke — a failure still purges locally
-                // (the row's gone server-side or will be on the next hydrate).
-                try? await calendar.disconnect(connectionId: conn.id)
-                // Drop the connection row + its external mirror blocks locally.
-                try? db.deleteById(CalendarConnection.self, id: conn.id)
-                // A /connections answer read before the revoke must not put
-                // the row back (audit 2026-09-22, C18).
-                await self.coordinator?.noteLocalConnectionsWrite()
-                let external = ((try? db.fetchExternalCalBlocks()) ?? [])
-                    .filter { $0.externalConnectionId == conn.id }
-                for b in external {
-                    try? await write.deleteCalBlock(id: b.id, nowISO: now)
-                }
+        var revoked = 0
+        for conn in connections {
+            do { try await calendar.disconnect(connectionId: conn.id) } catch { continue }
+            revoked += 1
+            // Drop the connection row + its external mirror blocks locally.
+            try? db.deleteById(CalendarConnection.self, id: conn.id)
+            // A /connections answer read before the revoke must not put
+            // the row back (audit 2026-09-22, C18).
+            await coordinator?.noteLocalConnectionsWrite()
+            let external = ((try? db.fetchExternalCalBlocks()) ?? [])
+                .filter { $0.externalConnectionId == conn.id }
+            for b in external {
+                _ = try? await write.deleteCalBlock(id: b.id, nowISO: now)
             }
-            await self.coordinator?.resetCalendarStatus()
-            self.calendarSyncStatus = nil
-            // Re-read the server's post-disconnect list: a pull whose
-            // /connections answer landed between the revoke and the local
-            // delete can still be importing that account's meetings; with no
-            // connection left this pull purges them (audit 2026-09-22, C18).
-            await self.coordinator?.pullCalendar()
         }
+        guard revoked > 0 else { return false }
+        await coordinator?.resetCalendarStatus()
+        calendarSyncStatus = nil
+        // Re-read the server's post-disconnect list: a pull whose
+        // /connections answer landed between the revoke and the local
+        // delete can still be importing that account's meetings; with no
+        // connection left this pull purges them (audit 2026-09-22, C18).
+        await coordinator?.pullCalendar()
+        return revoked == connections.count
     }
 }

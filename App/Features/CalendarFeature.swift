@@ -250,6 +250,7 @@ private struct CalendarSyncBar: View {
     @State private var busy = false
     @State private var error: String?
     @State private var confirmDisconnect = false
+    @State private var disconnecting = false
     /// Connect / Reconnect asked for: the disclosure is up (`reconnecting`
     /// picks its title).
     @State private var showDisclosure = false
@@ -271,7 +272,7 @@ private struct CalendarSyncBar: View {
             }
         }
         .alert("Disconnect Google Calendar?", isPresented: $confirmDisconnect) {
-            Button("Disconnect", role: .destructive) { model.disconnectCalendar() }
+            Button("Disconnect", role: .destructive) { disconnect() }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("Synced events are removed from your calendar. Your tasks are unaffected.")
@@ -331,7 +332,7 @@ private struct CalendarSyncBar: View {
                         .background(theme.palette.bg2, in: Capsule())
                 }.buttonStyle(.plain).disabled(busy)
             } else {
-                Text(busy ? "Syncing…"
+                Text(busy ? (disconnecting ? "Disconnecting…" : "Syncing…")
                      : vm.connections.map { "Synced · \($0.accountEmail)" }.joined(separator: ", "))
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                     .lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
@@ -362,6 +363,19 @@ private struct CalendarSyncBar: View {
                     : "Couldn't sync with Google. Check your connection and try again."
             }
             busy = false
+        }
+    }
+
+    /// The bar flips to "Connect" only once the server has revoked access; a
+    /// failed revoke keeps the connection and says so, instead of looking
+    /// done while the server still holds the token (audit 2026-09-22, C26).
+    private func disconnect() {
+        busy = true; disconnecting = true; error = nil
+        Task {
+            if !(await model.disconnectCalendar()) {
+                error = "Couldn't disconnect Google. Check your connection and try again."
+            }
+            busy = false; disconnecting = false
         }
     }
 

@@ -85,8 +85,9 @@ final class AppModel {
     /// Serial also means a push reads the row after the previous one stamped
     /// it, instead of two quick saves both INSERTing an event. DELETES go
     /// first: a delete never waits behind a burst of pushes (the row is
-    /// already gone, so a delete lost to a kill is never retried).
-    @ObservationIgnored private var googleDeletes: [CalBlock] = []
+    /// already gone, so only the GoogleWriteBacklog can bring a lost delete
+    /// back).
+    @ObservationIgnored private var googleDeletes: [GoogleDelete] = []
     /// Queued pushes, one per row (a push reads the row when its turn comes,
     /// so a second request for a queued row adds nothing).
     @ObservationIgnored private var googlePushes: [GooglePush] = []
@@ -94,10 +95,16 @@ final class AppModel {
     /// Test seam: every Google push of a cal_block that actually goes out.
     @ObservationIgnored var onGoogleMirrorDispatched: ((CalBlock) -> Void)?
     /// Test seam: every Google delete as its turn comes.
-    @ObservationIgnored var onGoogleDeleteDispatched: ((CalBlock) -> Void)?
+    @ObservationIgnored var onGoogleDeleteDispatched: ((GoogleDelete) -> Void)?
     /// Test seam: hold the Google worker (calls queue up, none runs) until
     /// `resumeGoogleCalls()`.
     @ObservationIgnored var googleCallsPaused = false
+    /// Test seam: the calendar-sync calls the Google write-back and the
+    /// disconnect make (production: the coordinator's CalendarClient).
+    @ObservationIgnored var googleCallsOverride: GoogleEventCalls?
+    /// The Google write-back backlog for the XCUITest / unit-test boot
+    /// (memory only). Production reads the coordinator's.
+    @ObservationIgnored var uiTestGoogleBacklog: GoogleWriteBacklog?
     // Per-collection serial RPC queue. The optimistic local write happens
     // synchronously on the main actor; the server RPC dispatch is chained so two
     // rapid edits to the same shared collection can't reach the server out of
@@ -880,6 +887,7 @@ final class AppModel {
         uiTestMirrorGate?.setOnAwaitedRowLanded { [weak self] id in
             Task { @MainActor in self?.queueGooglePush(id) }
         }
+        uiTestGoogleBacklog = GoogleWriteBacklog(defaults: nil, currentUser: { "ui-test" })
         if heavy { HeavyDemoSeed.seedIfNeeded(database) } else { DemoSeed.seed(database) }
         // The demo persona has a NAME. Without one the greeting falls back to
         // "Good evening Unstuck." — correct behaviour, but it reads as a bug in
@@ -1163,7 +1171,12 @@ final class AppModel {
         // authority). Belt-and-braces beside the channel's socket monitor.
         if isPartnerCoFocusCandidate(cachedLiveSession) { liveCoFocus?.reexchange() }
         guard let coord = coordinator else { return }
-        Task { await coord.syncNow() }
+        Task {
+            await coord.syncNow()
+            // The network has just answered: Google write-backs that failed
+            // or were cut off by a kill go out again (audit 2026-09-22, C24).
+            self.retryGoogleBacklog()
+        }
     }
 
     /// Whether the app is currently foregrounded, as last reported. Read by
@@ -1807,6 +1820,13 @@ final class AppModel {
         // we un-tick it for the other members.
         let promoted = (try? taskRepo?.fetch(id: id)) ?? nil
         do { try await write.deleteTask(id: id, nowISO: Self.isoNow()) } catch { return false }
+        // Its blocks go through deleteBlockAwaiting, as the assistant's
+        // delete_task does, so each pushed block's Google event is deleted
+        // too. The server's cascade removed the rows but never the events,
+        // and once no local block carried an event's id the next pull brought
+        // it back as a read-only "meeting" with the task's name (audit
+        // 2026-09-22, C24).
+        for b in (try? db?.blocks(forTask: id)) ?? [] { await deleteBlockAwaiting(b) }
         if let promoted { notifyTaskReopenedIfShared(promoted) }
         return true
     }
@@ -1983,7 +2003,10 @@ final class AppModel {
         // insert (an earlier incarnation, or the row this mint just retimed):
         // pushing it after an IGNORED outcome would stamp this device's copy
         // over another device's row. The insert's outcome pushes it instead.
-        if outcome.queued { googlePushes.removeAll { $0.blockId == block.id } }
+        if outcome.queued {
+            googlePushes.removeAll { $0.blockId == block.id }
+            googleBacklog?.clearPush(blockId: block.id)
+        }
         return outcome
     }
 
@@ -2026,13 +2049,30 @@ final class AppModel {
         runGoogleWorker()
     }
 
+    /// One Google delete: the block and the event it was pushed as (nil =
+    /// never pushed, or a Google import — nothing to delete in Google).
+    struct GoogleDelete: Equatable {
+        let id: String
+        let eventId: String?
+        let connectionId: String?
+    }
+
+    /// Queue the Google half of a block delete. A pushed event is recorded in
+    /// the backlog first, so a delete that fails or is cut off by a kill is
+    /// retried after the next sync, and the pull never imports the event
+    /// meanwhile (audit 2026-09-22, C24).
     func queueGoogleDelete(_ block: CalBlock) {
-        googleDeletes.append(block)
+        let eventId = isExternalBlock(block) ? nil : block.externalEventId.flatMap { $0.isEmpty ? nil : $0 }
+        if let eventId {
+            googleBacklog?.recordDelete(PendingGoogleDelete(blockId: block.id, eventId: eventId,
+                                                            connectionId: block.externalConnectionId))
+        }
+        googleDeletes.append(GoogleDelete(id: block.id, eventId: eventId, connectionId: block.externalConnectionId))
         runGoogleWorker()
     }
 
     private enum GoogleCall {
-        case delete(CalBlock)
+        case delete(GoogleDelete)
         case push(GooglePush)
     }
 
@@ -2051,9 +2091,9 @@ final class AppModel {
         googleWorker = Task { @MainActor [weak self] in
             while let call = self?.takeGoogleCall() {
                 switch call {
-                case .delete(let block):
-                    self?.onGoogleDeleteDispatched?(block)
-                    await self?.deleteGoogleEvent(for: block)
+                case .delete(let delete):
+                    self?.onGoogleDeleteDispatched?(delete)
+                    await self?.deleteGoogleEvent(delete)
                 case .push(let push):
                     await self?.runGooglePush(push)
                 }
@@ -2061,14 +2101,22 @@ final class AppModel {
         }
     }
 
-    /// One push, when its turn comes.
+    /// One push, when its turn comes. A push that fails (offline, a 5xx) is
+    /// recorded in the backlog and goes out again after the next sync; one
+    /// that went through, or has nothing left to push, is cleared (audit
+    /// 2026-09-22, C24 — scheduling offline used to leave the block without
+    /// its event until its next edit).
     private func runGooglePush(_ push: GooglePush) async {
         // Rule G again at DISPATCH, not only when the push was asked for: the
         // row may have been deleted and minted again while this push waited,
         // and the new incarnation's insert is unresolved. Deferred, the push
         // becomes "mirror wanted" and the insert's outcome decides.
-        if let gate = mirrorGate, !gate.requestMirror(rowId: push.blockId) { return }
+        if let gate = mirrorGate, !gate.requestMirror(rowId: push.blockId) {
+            googleBacklog?.clearPush(blockId: push.blockId)
+            return
+        }
         guard let fresh = (try? db?.fetchById(CalBlock.self, id: push.blockId)) ?? nil else {
+            googleBacklog?.clearPush(blockId: push.blockId)
             // A confirmed mint whose row is missing for a moment: its own
             // delete's realtime echo landed after the re-mint (hazard d). Wait
             // for the INSERT echo / the next pull instead of dropping the push.
@@ -2077,10 +2125,41 @@ final class AppModel {
             }
             return
         }
-        guard isTaskBlock(fresh) else { return }
+        guard isTaskBlock(fresh) else { googleBacklog?.clearPush(blockId: push.blockId); return }
         onGoogleMirrorDispatched?(fresh)
-        await mirrorBlockToGoogle(fresh)
+        if await mirrorBlockToGoogle(fresh) {
+            googleBacklog?.clearPush(blockId: push.blockId)
+        } else {
+            googleBacklog?.recordPush(blockId: push.blockId)
+        }
     }
+
+    /// Queue again every Google write-back that has not gone through — run
+    /// after a sync, when the network has just answered. A recorded delete
+    /// whose event a task block carries again is dropped, not sent (audit
+    /// 2026-09-22, C24). Not while the token is dead or Google is rate
+    /// limiting us: every call would fail the same way.
+    func retryGoogleBacklog() {
+        guard let backlog = googleBacklog, !calendarNeedsReauth,
+              (calendarSyncStatus?.backoffUntil ?? .distantPast) <= Date() else { return }
+        let deletes = backlog.deletes()
+        let pushes = backlog.pushes()
+        guard !deletes.isEmpty || !pushes.isEmpty else { return }
+        let inUse = Set(((try? db?.fetchAllCalBlocks()) ?? []).filter { isTaskBlock($0) }.compactMap(\.externalEventId))
+        for d in deletes {
+            if inUse.contains(d.eventId) { backlog.clearDelete(eventId: d.eventId); continue }
+            guard !googleDeletes.contains(where: { $0.eventId == d.eventId }) else { continue }
+            googleDeletes.append(GoogleDelete(id: d.blockId, eventId: d.eventId, connectionId: d.connectionId))
+        }
+        for id in pushes { queueGooglePush(id) }
+        runGoogleWorker()
+    }
+
+    /// The Google write-back backlog (see GoogleWriteBacklog).
+    var googleBacklog: GoogleWriteBacklog? { coordinator?.googleBacklog ?? uiTestGoogleBacklog }
+
+    /// The calendar-sync calls behind the Google write-back and disconnect.
+    var googleCalls: GoogleEventCalls? { googleCallsOverride ?? coordinator?.calendar }
 
     /// Test seam: the queued Google calls have all run.
     func awaitGoogleMirrors() async {
@@ -2098,10 +2177,17 @@ final class AppModel {
     /// any queued push; the executor must not wait on the network.
     func deleteBlockAwaiting(_ block: CalBlock) async {
         guard let write else { return }
-        try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())
+        // The Google half deletes the event of the row AS IT WAS DELETED: a
+        // push's stamp can land between the caller's read and this delete
+        // (drag a task, then delete it a second later from a menu opened
+        // before the INSERT returned), and the caller's copy then has no
+        // event id — the event stayed in Google and came back as a meeting
+        // (audit 2026-09-22, C24).
+        let deleted = (try? await write.deleteCalBlock(id: block.id, nowISO: Self.isoNow())) ?? nil
         mirrorGate?.forget(rowId: block.id)   // its cancelled insert will never resolve
         googlePushes.removeAll { $0.blockId == block.id }   // nothing left to push
-        queueGoogleDelete(block)
+        googleBacklog?.clearPush(blockId: block.id)
+        queueGoogleDelete(deleted ?? block)
     }
 
     /// `unschedule` (AppModel+CalendarControls), awaited: reconcile Google for a
@@ -2113,7 +2199,7 @@ final class AppModel {
         if let block = (try? db?.fetchById(CalBlock.self, id: blockId)) ?? nil {
             await deleteBlockAwaiting(block)
         } else if let write {
-            try? await write.deleteCalBlock(id: blockId, nowISO: Self.isoNow())
+            _ = try? await write.deleteCalBlock(id: blockId, nowISO: Self.isoNow())
         }
     }
 
@@ -2374,12 +2460,35 @@ final class AppModel {
     /// STAMPED with (`externalConnectionId`, set at INSERT), else the first
     /// connection for a legacy un-stamped block.
     private func googleConnection(for block: CalBlock) -> CalendarConnection? {
+        googleConnection(stamped: block.externalConnectionId)
+    }
+
+    private func googleConnection(stamped id: String?) -> CalendarConnection? {
         guard let database = db else { return nil }
-        if let id = block.externalConnectionId, !id.isEmpty,
+        if let id, !id.isEmpty,
            let stamped = (try? database.fetchById(CalendarConnection.self, id: id)) ?? nil {
             return stamped
         }
         return (try? database.firstCalendarConnection()) ?? nil
+    }
+
+    /// Where the WEB pushed before it moved to "primary" (web audit
+    /// 2026-09-23, W13): the connection's first selected calendar, when that
+    /// is not the primary one. A web-era event there 404s on primary, so a
+    /// move from iOS re-inserted it on primary and a delete from iOS left it
+    /// — the original then came back from the pull as a duplicate meeting
+    /// (audit 2026-09-22, C24 / calendar#17). Port of web deleteLegacyCopy.
+    static func legacyPushCalendarId(_ conn: CalendarConnection) -> String? {
+        guard let first = conn.selectedCalendarIds.first, !first.isEmpty, first != "primary",
+              first.lowercased() != conn.accountEmail.lowercased() else { return nil }
+        return first
+    }
+
+    /// Best-effort: remove a web-era copy of `eventId` from the legacy
+    /// calendar (the server answers "not there" as success).
+    private func deleteLegacyCopy(eventId: String, conn: CalendarConnection, calls: GoogleEventCalls) async {
+        guard let legacy = Self.legacyPushCalendarId(conn) else { return }
+        try? await calls.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: legacy)
     }
 
     /// The Google half of saveBlock — task blocks only (the caller gates).
@@ -2388,15 +2497,31 @@ final class AppModel {
     /// select pushed rows by that column — un-stamped rows made both a
     /// no-op), and on a PATCH that answers 404 `event_gone` (deleted in
     /// Google) clears the stale id and falls through to a fresh INSERT.
-    private func mirrorBlockToGoogle(_ block: CalBlock) async {
-        guard let write = coordinator?.write, let calendar = coordinator?.calendar,
-              let conn = googleConnection(for: block) else { return }
+    /// A SKIPPED occurrence has no Google event: its event is deleted and
+    /// nothing is inserted for it (audit 2026-09-22, C24 — "Skip this day"
+    /// INSERTed an event for the day the user cancelled). False = a call
+    /// failed and should be retried (offline, a 5xx, a 429); true = done, or
+    /// nothing to mirror (no connection).
+    private func mirrorBlockToGoogle(_ block: CalBlock) async -> Bool {
+        guard let write, let calendar = googleCalls,
+              let conn = googleConnection(for: block) else { return true }
         let range = blockToIsoRange(block)
         // Always write task blocks to the user's PRIMARY calendar —
         // selectedCalendarIds can include read-only/subscribed calendars
         // (which 403 on insert). "primary" is Google's alias for the
         // main, always-writable calendar (Android pushBlockUpsert).
         let calId = "primary"
+        if block.skipped {
+            guard let eventId = block.externalEventId, !eventId.isEmpty else { return true }
+            do {
+                try await calendar.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: calId)
+            } catch {
+                return false
+            }
+            await deleteLegacyCopy(eventId: eventId, conn: conn, calls: calendar)
+            _ = try? await write.clearCalBlockMapping(id: block.id, eventId: eventId, nowISO: Self.isoNow())
+            return true
+        }
         if let eventId = block.externalEventId {
             do {
                 try await calendar.patchEvent(eventId: eventId, connectionId: conn.id, calendarId: calId,
@@ -2406,22 +2531,30 @@ final class AppModel {
                     _ = try? await write.stampCalBlockMapping(id: block.id, eventId: eventId, connectionId: conn.id,
                                                               nowISO: Self.isoNow())
                 }
-                return
+                return true
             } catch CalendarSyncError.eventGone {
-                // gone in Google → re-create below (the stamp replaces the stale id)
+                // gone in Google → re-create below (the stamp replaces the stale
+                // id); a web-era original on the legacy calendar goes first, so
+                // the re-insert MOVES it rather than duplicating it.
+                await deleteLegacyCopy(eventId: eventId, conn: conn, calls: calendar)
             } catch {
-                return   // offline / transient: the next save retries the PATCH
+                return false   // offline / transient: retried after the next sync
             }
         }
         guard let newId = try? await calendar.insertEvent(
             connectionId: conn.id, calendarId: calId,
-            summary: block.taskName, start: range.start, end: range.end) else { return }
+            summary: block.taskName, start: range.start, end: range.end) else { return false }
         // The new mapping goes onto the row as it is NOW, never onto the copy
         // that was pushed (rule G; an edit made during the call survives).
         switch (try? await write.stampCalBlockMapping(id: block.id, eventId: newId, connectionId: conn.id,
                                                        nowISO: Self.isoNow())) ?? .gone {
         case .stamped, .unchanged:
-            break
+            // A pull that ran while the INSERT was in flight saw the new event
+            // on no task block and imported it as a meeting: drop that echo
+            // now rather than on the next pull (audit 2026-09-22, C24).
+            for echo in ((try? db?.fetchExternalCalBlocks()) ?? []) where echo.externalEventId == newId {
+                _ = try? await write.deleteCalBlock(id: echo.id, nowISO: Self.isoNow())
+            }
         case .gone:
             // Deleted while the event was being created: don't resurrect the
             // row with a stamp, drop the new event.
@@ -2433,6 +2566,7 @@ final class AppModel {
             try? await calendar.deleteEvent(eventId: newId, connectionId: conn.id, calendarId: calId)
             _ = mirrorGate?.requestMirror(rowId: block.id)
         }
+        return true
     }
 
     /// Delete a block locally + on Google (if it was pushed). External g_
@@ -2442,14 +2576,22 @@ final class AppModel {
         Task { await deleteBlockAwaiting(block) }
     }
 
-    /// The Google half of deleteBlock.
-    private func deleteGoogleEvent(for block: CalBlock) async {
-        guard let eventId = block.externalEventId, !isExternalBlock(block),
-              let calendar = coordinator?.calendar,
-              let conn = googleConnection(for: block) else { return }
+    /// The Google half of deleteBlock. Cleared from the backlog once Google
+    /// confirms (the server answers "already gone" as success); a failure —
+    /// or no connection to send it on yet — leaves it there for the next
+    /// retry (audit 2026-09-22, C24).
+    private func deleteGoogleEvent(_ delete: GoogleDelete) async {
+        guard let eventId = delete.eventId, let calendar = googleCalls,
+              let conn = googleConnection(stamped: delete.connectionId) else { return }
         // Task blocks are inserted on "primary" — delete there too, on the
         // connection the block is stamped with.
-        try? await calendar.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: "primary")
+        do {
+            try await calendar.deleteEvent(eventId: eventId, connectionId: conn.id, calendarId: "primary")
+        } catch {
+            return
+        }
+        await deleteLegacyCopy(eventId: eventId, conn: conn, calls: calendar)
+        googleBacklog?.clearDelete(eventId: eventId)
     }
 
     /// Move a block to a new day/time (drag-to-reschedule) + bump the task's
@@ -2562,6 +2704,7 @@ final class AppModel {
         // Read the verdict now rather than waiting for the status hook's hop to
         // the main actor: the bar's caption keys a 429 off `backoffUntil`.
         calendarSyncStatus = await coord.calendarStatus
+        if ok { retryGoogleBacklog() }
         return ok
     }
 

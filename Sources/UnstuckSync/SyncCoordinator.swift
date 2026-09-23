@@ -106,6 +106,10 @@ public actor SyncCoordinator {
     /// cal_block, and a push for a row whose insert is still unresolved waits
     /// for `setOnInsertResolved`. The flusher owns and brackets it.
     public nonisolated let mirrorGate: InsertMirrorGate
+    /// The Google write-backs that have not reached Google yet (audit
+    /// 2026-09-22, C24): the app records and retries them, the pull never
+    /// imports a pending delete's event as a meeting.
+    public nonisolated let googleBacklog: GoogleWriteBacklog
     private let hydrator: Hydrator
     private let catchUpPuller: CatchUpPuller
     private let realtime: RealtimeMirror
@@ -141,6 +145,7 @@ public actor SyncCoordinator {
         self.assistant = AssistantClient(provider.client)
         self.calls = CallsClient(provider.client)
         self.callsMirror = CallRequestsMirror(db)
+        self.googleBacklog = GoogleWriteBacklog(defaults: .standard, currentUser: { auth.currentUserId })
         // Rule G's gate (stage 2) is shared: the flusher brackets every insert
         // with it, and the realtime mirror and the cal_blocks pull release a
         // confirmed push that is waiting for its row.
@@ -450,7 +455,7 @@ public actor SyncCoordinator {
             // outbox (audit 2026-09-22, C18).
             for b in ((try? db.fetchExternalCalBlocks()) ?? []) where b.id.hasPrefix("g_") {
                 guard auth.currentUserId == uid else { return true }
-                try? await write.deleteCalBlock(id: b.id, nowISO: Self.isoNow())
+                _ = try? await write.deleteCalBlock(id: b.id, nowISO: Self.isoNow())
             }
             return true
         }
@@ -466,9 +471,10 @@ public actor SyncCoordinator {
         // a bare YYYY-MM-DD is rejected (400) and silently yields zero events.
         // Send full instants; reconcile locally with the date-only bounds.
         let f = ISO8601DateFormatter()
-        let pull: CalendarClient.CalendarPull
+        let toISO = f.string(from: toExclusive)
+        let firstPage: CalendarClient.CalendarPull
         do {
-            pull = try await calendar.pullEvents(from: f.string(from: fromDate), to: f.string(from: toExclusive))
+            firstPage = try await calendar.pullEvents(from: f.string(from: fromDate), to: toISO)
         } catch CalendarSyncError.rateLimited {
             guard auth.currentUserId == uid else { return true }
             calendarBackoffUntil = Date().addingTimeInterval(Self.calendarRateLimitBackoff)
@@ -484,6 +490,15 @@ public actor SyncCoordinator {
             return false   // offline / 5xx: nothing to reconcile, nothing to delete
         }
         guard auth.currentUserId == uid else { return true }
+        // A calendar that came back as one full page was cut short by the
+        // server (C25): read the rest of the window before judging anything.
+        let client = calendar
+        let (pull, truncated) = await Self.readRemainingPages(
+            firstPage, pageSize: Self.googleEventsPageSize, maxRounds: Self.calendarPageFollowUps
+        ) { from, connectionId in
+            try await client.pullEvents(from: from, to: toISO, connectionId: connectionId)
+        }
+        guard auth.currentUserId == uid else { return true }
         for failure in pull.failures where failure.needsReauth {
             status.needsReauthConnectionIds.insert(failure.connectionId)
             if status.lastError == nil { status.lastError = failure.reason }
@@ -492,11 +507,20 @@ public actor SyncCoordinator {
             calendarBackoffUntil = Date().addingTimeInterval(Self.calendarRateLimitBackoff)
             status.backoffUntil = calendarBackoffUntil
         }
-        let failed = Set(pull.failures.map(\.connectionId))
+        // A calendar Google no longer lets the account read (404 / 410:
+        // unshared, deleted) is not a failure: its meetings really are gone.
+        // Keyed by connection, it used to freeze that account's deletions on
+        // every pull for good, since the server never drops the calendar from
+        // the selection (audit 2026-09-22, C25). A connection read only in
+        // part (a transient failure, a window still cut short) keeps its
+        // meetings until a complete read says otherwise.
+        let failed = Set(pull.failures.filter { !$0.calendarGone }.map(\.connectionId)).union(truncated)
         let local = (try? db.fetchAllCalBlocks()) ?? []
         let plan = reconcileCalendarPull(events: pull.events, localBlocks: local,
                                          fromYmd: Clock.dateISO(fromDate), toYmd: Clock.dateISO(toDate),
-                                         allDayEventIds: pull.allDayEventIds, failedConnectionIds: failed)
+                                         allDayEventIds: pull.allDayEventIds, failedConnectionIds: failed,
+                                         pendingDeleteEventIds: googleBacklog.pendingDeleteEventIds(),
+                                         liveConnectionIds: Set(statuses.map(\.connection.id)))
         let now = Self.isoNow()
         // reconcileCalendarPull returns every in-window event whether or not it
         // changed; writing only the ones that differ keeps a foreground from
@@ -509,7 +533,7 @@ public actor SyncCoordinator {
         }
         for id in plan.toDelete {
             guard auth.currentUserId == uid else { return true }
-            try? await write.deleteCalBlock(id: id, nowISO: now)
+            _ = try? await write.deleteCalBlock(id: id, nowISO: now)
         }
         guard auth.currentUserId == uid else { return true }
         publishCalendarStatus(status)
@@ -519,6 +543,68 @@ public actor SyncCoordinator {
         // back-off above is already set for a 429, which is what picks "Google
         // is busy" over the connectivity caption (audit 2026-09-22, C18).
         return !pull.readNothing(from: statuses.map(\.connection))
+    }
+
+    /// calendar-sync reads ONE page per calendar (providers/google.ts
+    /// listCalendarEvents: maxResults=250, orderBy=startTime, nextPageToken
+    /// never followed) and reports nothing for the rest. A busy team calendar
+    /// lost everything after its 250th event in the window, and the reconcile
+    /// then deleted those meetings as "gone in Google" — they vanished, or
+    /// flickered as the page boundary moved (audit 2026-09-22, C25).
+    static let googleEventsPageSize = 250
+    /// Follow-up reads per pull before a connection is left "truncated".
+    static let calendarPageFollowUps = 4
+
+    /// Read what the server cut off: a calendar that came back with a full
+    /// page is read again for its connection from its last event's start
+    /// (Google returns every event still running then, so nothing between is
+    /// skipped; duplicates are dropped), until no calendar comes back full.
+    /// Returns the merged pull and the connections still cut short (no
+    /// progress, a follow-up that failed or reported a failing calendar, or
+    /// out of rounds) — their meetings are kept, never deletion-reconciled,
+    /// this pull. A follow-up's failures stay out of the pull's own: the
+    /// first read did answer, and "Sync now" must not call it a failed sync.
+    static func readRemainingPages(
+        _ first: CalendarClient.CalendarPull, pageSize: Int, maxRounds: Int,
+        fetch: @Sendable (_ from: String, _ connectionId: String) async throws -> CalendarClient.CalendarPull
+    ) async -> (CalendarClient.CalendarPull, Set<String>) {
+        func key(_ e: ExternalEvent) -> String { "\(e.connectionId)|\(e.calendarId)|\(e.id)" }
+        /// Per connection: the earliest last start among its full calendars.
+        func fullPages(_ events: [ExternalEvent]) -> [String: EpochMillis] {
+            var out: [String: EpochMillis] = [:]
+            for (_, group) in Dictionary(grouping: events, by: { "\($0.connectionId)|\($0.calendarId)" })
+            where group.count >= pageSize {
+                guard let last = group.compactMap({ Time.parseMillis($0.start) }).max() else { continue }
+                let conn = group[0].connectionId
+                out[conn] = min(out[conn] ?? last, last)
+            }
+            return out
+        }
+        // Sent as a UTC instant like the first read's bounds: Google's own
+        // "+01:00" offset would reach the function as a space in the query.
+        let utc = ISO8601DateFormatter()
+        var events = first.events
+        var allDay = first.allDayEventIds
+        var seen = Set(events.map(key))
+        var truncated = Set<String>()
+        var tails = fullPages(first.events)
+        var round = 0
+        while !tails.isEmpty {
+            guard round < maxRounds else { truncated.formUnion(tails.keys); break }
+            round += 1
+            var next: [String: EpochMillis] = [:]
+            for (conn, from) in tails.sorted(by: { $0.key < $1.key }) {
+                let fromISO = utc.string(from: Date(timeIntervalSince1970: from / 1000))
+                guard let more = try? await fetch(fromISO, conn) else { truncated.insert(conn); continue }
+                for e in more.events where seen.insert(key(e)).inserted { events.append(e) }
+                allDay.formUnion(more.allDayEventIds)
+                if more.failures.contains(where: { !$0.calendarGone }) { truncated.insert(conn) }
+                guard let again = fullPages(more.events)[conn] else { continue }
+                if again > from { next[conn] = again } else { truncated.insert(conn) }
+            }
+            tails = next
+        }
+        return (CalendarClient.CalendarPull(events: events, allDayEventIds: allDay, failures: first.failures), truncated)
     }
 
     private func publishCalendarStatus(_ status: CalendarSyncStatus) {
