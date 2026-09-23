@@ -1490,6 +1490,17 @@ final class AssistantToolsTests: XCTestCase {
         await eq("add_capture", #"{"tag":"idea"}"#, "error: body required")
     }
 
+    /// A session on a task shared WITH the user writes no own Session row, so
+    /// a capture tied to it waited in the outbox for one for ever (audit
+    /// 2026-09-22, C44).
+    func testAddCaptureDuringASessionSharedWithTheUserTiesItToNoSession() async {
+        var shared = liveSession("owners-task")
+        shared.sharedFocusLevel = .partner
+        api.live = shared
+        await prefix("add_capture", #"{"body":"Ask Sam about X"}"#, "ok: captured")
+        XCTAssertNil(api.captures.last?.sessionId)
+    }
+
     func testGetCapturesListsOpenNewestFirstExcludingArchived() async {
         api.tasks = [task("a", "Alpha")]
         api.captures = [capture("c1", "Oldest", at: "2026-09-01T08:00:00.000Z"), capture("c2", "Archived", at: "2026-09-01T09:00:00.000Z"),

@@ -364,4 +364,82 @@ final class WriteThroughTests: XCTestCase {
         XCTAssertNil(try db.fetchById(CalBlock.self, id: reMint.id)?.externalEventId)
         XCTAssertEqual(try box.count(), ops, "nothing queued behind the insert")
     }
+
+    // MARK: captures of a session that writes no Session row (audit 2026-09-22, C44)
+
+    private func uuid() -> String { UUID().uuidString.lowercased() }
+    private func captureOp(_ id: String) throws -> OutboxOp? {
+        try box.pending().last { $0.tableName == "captures" && $0.rowId == id }
+    }
+    private func payload(_ op: OutboxOp?) throws -> [String: Any] {
+        let data = try XCTUnwrap(op?.payload?.data(using: .utf8))
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    /// cancel_focus, a discard, a task shared with me: the session's row never
+    /// comes, so its captures are re-queued without it — and only its own.
+    func testDetachingASessionReleasesOnlyItsHeldCaptures() async throws {
+        let ended = uuid(), live = uuid()
+        let note = Capture(id: uuid(), taskId: nil, sessionId: ended, tag: .followUp, body: "call the bank", at: now)
+        let other = Capture(id: uuid(), taskId: nil, sessionId: live, tag: .idea, body: "later", at: now)
+        try await write.upsertCapture(note, nowISO: now)
+        try await write.upsertCapture(other, nowISO: now)
+        _ = try await write.setCaptureArchived(id: note.id, archivedAt: now, nowISO: now)
+        XCTAssertEqual(try captureOp(note.id)?.dependsOn, ended)
+
+        let released = try await write.detachCapturesFromSession(ended, nowISO: now)
+        XCTAssertEqual(released, 1)
+        let op = try captureOp(note.id)
+        XCTAssertNil(op?.dependsOn, "nothing left to wait for")
+        XCTAssertTrue(try payload(op)["session_id"] is NSNull)
+        XCTAssertEqual(try payload(op)["archived_at"] as? String, now, "the archive state travels with it")
+        XCTAssertEqual(try box.pending().filter { $0.rowId == note.id }.count, 1, "the held op is replaced, not duplicated")
+        XCTAssertNil(try db.fetchById(Capture.self, id: note.id)?.sessionId)
+        XCTAssertEqual(try captureOp(other.id)?.dependsOn, live, "a live session's capture still waits for its row")
+        let again = try await write.detachCapturesFromSession(ended, nowISO: now)
+        XCTAssertEqual(again, 0, "idempotent")
+    }
+
+    /// A displaced session whose task was deleted meanwhile: the captures drop
+    /// the dead task id too — captures.task_id references tasks(id).
+    func testDetachingCanDropATaskThatIsGone() async throws {
+        let sid = uuid(), gone = uuid()
+        let c = Capture(id: uuid(), taskId: gone, sessionId: sid, tag: .idea, body: "x", at: now)
+        try await write.upsertCapture(c, nowISO: now)
+        try await write.detachCapturesFromSession(sid, unlinkingTaskId: gone, nowISO: now)
+        XCTAssertTrue(try payload(captureOp(c.id))["task_id"] is NSNull)
+        XCTAssertNil(try db.fetchById(Capture.self, id: c.id)?.taskId)
+    }
+
+    /// Launch: captures an earlier run left behind a session that never wrote
+    /// its row are released; ones whose session is stored, queued or live, ones
+    /// queued this run, and ones with no stored row (un-parked) are left alone.
+    func testReleasingStrandedCapturesTouchesOnlyAnEarlierRunsOrphans() async throws {
+        let earlier = "2026-05-21T10:00:00.000Z", launch = "2026-05-21T11:00:00.000Z", later = "2026-05-21T11:30:00.000Z"
+        let stored = uuid(), queued = uuid(), live = uuid(), orphan = uuid(), endingNow = uuid()
+        try db.save(UnstuckCore.Session(id: stored, taskName: "S", actualSec: 60, completedAt: earlier))
+        try await write.upsertSession(UnstuckCore.Session(id: queued, taskName: "Q", actualSec: 60, completedAt: earlier), nowISO: earlier)
+        func cap(_ sid: String, at: String) async throws -> String {
+            let c = Capture(id: uuid(), sessionId: sid, tag: .idea, body: "x", at: at)
+            try await write.upsertCapture(c, nowISO: at)
+            return c.id
+        }
+        let onStored = try await cap(stored, at: earlier)
+        let onQueued = try await cap(queued, at: earlier)
+        let onLive = try await cap(live, at: earlier)
+        let stranded = try await cap(orphan, at: earlier)
+        let thisRun = try await cap(endingNow, at: later)
+        let unparked = uuid()
+        _ = try box.enqueue(table: "captures", rowId: unparked, kind: .upsert, payload: "{}", dependsOn: orphan, nowISO: earlier)
+
+        let released = try await write.releaseCapturesOfEndedSessions(liveSessionId: live, queuedBefore: launch, nowISO: later)
+        XCTAssertEqual(released, 1)
+        XCTAssertNil(try captureOp(stranded)?.dependsOn)
+        XCTAssertNil(try db.fetchById(Capture.self, id: stranded)?.sessionId)
+        XCTAssertEqual(try captureOp(onStored)?.dependsOn, stored)
+        XCTAssertEqual(try captureOp(onQueued)?.dependsOn, queued)
+        XCTAssertEqual(try captureOp(onLive)?.dependsOn, live)
+        XCTAssertEqual(try captureOp(thisRun)?.dependsOn, endingNow, "its row may be on its way")
+        XCTAssertEqual(try captureOp(unparked)?.dependsOn, orphan, "no row stored here to re-send")
+    }
 }

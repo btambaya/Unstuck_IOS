@@ -327,3 +327,247 @@ final class CollectionOwnerStateTests: XCTestCase {
         XCTAssertTrue(AppModel.collectionRPCRejectionMessage(fn: "something_new", listName: nil).contains("the shared list"))
     }
 }
+
+/// Focus accuracy (audit 2026-09-22, C37 C38 C39 C43 C44): the Focus screen
+/// acts on the STORED session (a lock-screen Resume / End or the assistant
+/// changed it behind the screen), a paused check-in only touches the session
+/// it was armed for, a pause reason never re-pauses, a session nobody watched
+/// is capped at its estimate + grace, and captures of a session that writes no
+/// Session row leave the phone.
+@MainActor
+final class FocusAccuracyTests: XCTestCase {
+    private let stamp = "2026-09-01T08:00:00.000Z"
+    private var nowMs: Double { Date().timeIntervalSince1970 * 1000 }
+
+    override func tearDown() {
+        PausedCheckinBudget.disarm()
+        super.tearDown()
+    }
+
+    private func task(_ id: String, estimate: Int = 25) -> TaskItem {
+        TaskItem(id: id, name: "Write report", estimateMin: estimate, createdAt: stamp, updatedAt: stamp)
+    }
+    private func boot() throws -> (AppModel, AppDatabase, LiveSessionStore) {
+        let model = AppModel()
+        model.startUITestMode()
+        let db = try XCTUnwrap(model.db)
+        let store = try XCTUnwrap(model.liveStore)
+        try store.set(nil)
+        return (model, db, store)
+    }
+    private func running(_ taskId: String, id: String = newUUID(), sinceMin: Double, estimate: Int = 25) -> LiveSession {
+        FocusTimer.start(.empty, taskId: taskId, estimateMin: estimate, now: nowMs - sinceMin * 60_000, newId: { id })
+    }
+    private func eventually(_ cond: () throws -> Bool) async rethrows -> Bool {
+        for _ in 0..<100 {
+            if try cond() { return true }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        return try cond()
+    }
+    private func captureOp(_ db: AppDatabase, _ id: String) throws -> OutboxOp? {
+        try OutboxStore(db).pending().last { $0.tableName == "captures" && $0.rowId == id }
+    }
+
+    // MARK: C37 — a control made off the Focus screen
+
+    func testAResumeOnTheLockScreenIsNotUndoneByTheStaleFocusScreen() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        // 25 min focused, paused 20 min ago — the Focus screen is up on it.
+        let paused = FocusTimer.pause(running("c37", sinceMin: 45, estimate: 50), now: nowMs - 20 * 60_000)
+        try store.set(paused)
+        let fm = FocusModel(task: task("c37", estimate: 50), store: store)
+        XCTAssertTrue(fm.live.paused)
+        // "Resume" on the lock screen 6 min ago writes the store only.
+        try store.set(FocusTimer.resume(paused, now: nowMs - 6 * 60_000))
+        // The screen still says PAUSED; its Resume shifted the start by the
+        // whole 20-min pause, erasing the 6 min focused since.
+        fm.resume()
+        let focused = FocusTimer.elapsedSec(try XCTUnwrap(store.get()), now: nowMs)
+        XCTAssertEqual(Double(focused), 31 * 60, accuracy: 5, "25 min before the pause + 6 since the lock-screen Resume")
+    }
+
+    func testDoneAfterALockScreenEndDoesNotLogTheSessionAgain() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        try store.set(running("c37", sinceMin: 10))
+        let fm = FocusModel(task: task("c37"), store: store)
+        try store.set(nil)   // End on the lock screen finalized + cleared it
+        XCTAssertNil(fm.finish(), "already logged where it ended — no second Session, recap or totalFocused bump")
+        XCTAssertNil(try store.get())
+    }
+
+    func testTheFocusScreenNeitherOverwritesNorResurrectsWhatChangedElsewhere() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        try store.set(running("c37", sinceMin: 10))
+        let fm = FocusModel(task: task("c37"), store: store)
+        // The assistant's extend_focus writes the store.
+        try store.set(FocusTimer.extend(try XCTUnwrap(store.get()), minutes: 10))
+        fm.pause()
+        XCTAssertEqual(try store.get()?.sessionEstimateMin, 35, "the screen's next save kept the old estimate")
+        XCTAssertEqual(try store.get()?.paused, true)
+        // Another session replaced it (ended here, a new one started elsewhere).
+        let other = running("c37-other", sinceMin: 1)
+        try store.set(other)
+        fm.resume()
+        fm.extendFocus(10)
+        XCTAssertFalse(fm.cancel())
+        XCTAssertEqual(try store.get(), other, "a stale screen never writes over another session")
+    }
+
+    func testOffScreenControlsTellAnOpenFocusScreenAndTheShadesEndClosesIt() async throws {
+        let (model, db, store) = try boot()
+        let t = task(newUUID())
+        try db.save(t)
+        try store.set(running(t.id, sinceMin: 5))
+        model.refreshLiveSession()
+        var tick = model.liveSessionOffScreenTick
+        model.pauseFocus()
+        XCTAssertGreaterThan(model.liveSessionOffScreenTick, tick, "Today's / the assistant's pause")
+        tick = model.liveSessionOffScreenTick
+        model.resumeFocus()
+        XCTAssertGreaterThan(model.liveSessionOffScreenTick, tick, "Today's / the assistant's resume")
+        model.pauseFocus()
+        tick = model.liveSessionOffScreenTick
+        let id = try XCTUnwrap(store.get()?.id)
+        await model.handlePushAction(.resumeSession(sessionId: id))
+        XCTAssertGreaterThan(model.liveSessionOffScreenTick, tick, "the paused check-in's Resume")
+        model.pauseFocus()
+        model.router.focusTask = t
+        await model.handlePushAction(.endSession(sessionId: id))
+        XCTAssertNil(try store.get())
+        XCTAssertNil(model.router.focusTask, "left up, its Done logged the session a second time")
+    }
+
+    // MARK: C38 — a paused check-in acts on its own session only
+
+    func testACheckinActsOnlyOnThePausedSessionItWasArmedFor() {
+        let live = running("b", id: "B", sinceMin: 5)
+        let paused = FocusTimer.pause(live, now: nowMs)
+        XCTAssertFalse(AppModel.pausedCheckinActsOn(live, sessionId: "B"), "never a running session")
+        XCTAssertFalse(AppModel.pausedCheckinActsOn(paused, sessionId: "A"), "another session's nag")
+        XCTAssertTrue(AppModel.pausedCheckinActsOn(paused, sessionId: "B"))
+        XCTAssertTrue(AppModel.pausedCheckinActsOn(paused, sessionId: nil), "a nag an earlier build armed, on a paused session")
+        XCTAssertFalse(AppModel.pausedCheckinActsOn(nil, sessionId: nil))
+    }
+
+    func testAnOldSessionsCheckinCannotEndTheNewOne() async throws {
+        let (model, db, store) = try boot()
+        let b = task(newUUID())
+        try db.save(b)
+        let live = running(b.id, sinceMin: 9)
+        try store.set(live)
+        await model.handlePushAction(.endSession(sessionId: newUUID()))   // "Did you step away? A"
+        await model.handlePushAction(.endSession(sessionId: nil))         // the same nag from an earlier build
+        await model.handlePushAction(.resumeSession(sessionId: newUUID()))
+        XCTAssertEqual(try store.get(), live, "B keeps running, unlogged")
+    }
+
+    func testDisplacingAPausedSessionCancelsItsCheckin() throws {
+        let (model, db, store) = try boot()
+        let a = task(newUUID())
+        try db.save(a)
+        try store.set(FocusTimer.pause(running(a.id, sinceMin: 10), now: nowMs - 60_000))
+        // A's ~14-min nag is armed, 10 min to go.
+        UserDefaults.standard.set(Date().timeIntervalSince1970 + 600, forKey: PausedCheckinBudget.fireAtKey)
+        model.finalizeDisplacedFocus(forNewTaskId: newUUID())
+        XCTAssertNil(UserDefaults.standard.object(forKey: PausedCheckinBudget.fireAtKey),
+                     "left armed, it fired during the new session and its End ended that one")
+    }
+
+    // MARK: C39 — picking a pause reason
+
+    func testPausingAPausedSessionKeepsWhenItWasPaused() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        try store.set(running("c39", sinceMin: 10))
+        let fm = FocusModel(task: task("c39"), store: store)
+        fm.pause()
+        let pausedAt = try XCTUnwrap(fm.live.pausedAt)
+        Thread.sleep(forTimeInterval: 0.02)
+        fm.pause()   // the reason sheet's choice after Pause
+        XCTAssertEqual(fm.live.pausedAt, pausedAt, "the time spent choosing a reason is not focus")
+        XCTAssertEqual(try store.get()?.pausedAt, pausedAt)
+    }
+
+    // MARK: C43 — a session nobody watched
+
+    func testADisplacedForgottenSessionIsCappedAtItsEstimatePlusGrace() async throws {
+        let (model, db, store) = try boot()
+        let a = task(newUUID())
+        try db.save(a)
+        try store.set(running(a.id, sinceMin: 16 * 60))   // "← Out", forgotten overnight
+        model.finalizeDisplacedFocus(forNewTaskId: newUUID())
+        let landed = try await eventually { (try db.fetchById(TaskItem.self, id: a.id)?.totalFocused ?? 0) > 0 }
+        XCTAssertTrue(landed)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: a.id)?.totalFocused,
+                       25 * 60 + AppModel.sharedFocusCapGraceSec, "not 16 hours")
+    }
+
+    func testTheShadesEndOnAForgottenSessionIsCapped() async throws {
+        let (model, db, store) = try boot()
+        let a = task(newUUID())
+        try db.save(a)
+        let paused = FocusTimer.pause(running(a.id, sinceMin: 16 * 60), now: nowMs - 60_000)
+        try store.set(paused)
+        await model.handlePushAction(.endSession(sessionId: paused.id))
+        let landed = try await eventually { (try db.fetchById(TaskItem.self, id: a.id)?.totalFocused ?? 0) > 0 }
+        XCTAssertTrue(landed)
+        XCTAssertEqual(try db.fetchById(TaskItem.self, id: a.id)?.totalFocused, 25 * 60 + AppModel.sharedFocusCapGraceSec)
+    }
+
+    func testTheFocusScreenAsksOnlyPastTheEstimatePlusGrace() {
+        let now = nowMs
+        let forgotten = running("c43", sinceMin: 16 * 60)
+        let over = FocusModel.overlongElapsedSec(forgotten, now: now)
+        XCTAssertEqual(Double(over?.raw ?? 0), 16 * 3600, accuracy: 2)
+        XCTAssertEqual(over?.capped, 25 * 60 + AppModel.sharedFocusCapGraceSec)
+        XCTAssertNil(FocusModel.overlongElapsedSec(running("c43", sinceMin: 40), now: now), "a long but real session logs as it is")
+        XCTAssertNil(FocusModel.overlongElapsedSec(running("c43", sinceMin: 16 * 60, estimate: 24 * 60), now: now),
+                     "extended to fit")
+    }
+
+    // MARK: C44 — captures of a session with no Session row
+
+    func testCancellingFocusReleasesTheCapturesHeldOnItsSession() async throws {
+        let (model, db, store) = try boot()
+        let t = task(newUUID())
+        try db.save(t)
+        let live = running(t.id, sinceMin: 5)
+        try store.set(live)
+        let sid = try XCTUnwrap(live.id)
+        let cid = newUUID()
+        await model.saveCaptureAwaiting(Capture(id: cid, taskId: t.id, sessionId: sid, tag: .followUp, body: "call the bank", at: stamp))
+        XCTAssertEqual(try captureOp(db, cid)?.dependsOn, sid, "waits for the session's row")
+        AppModelAssistantState(model: model, assistant: model.assistant).cancelFocus()   // "cancel it, don't log it"
+        let released = try await eventually { try self.captureOp(db, cid)?.dependsOn == nil }
+        XCTAssertTrue(released, "no Session row will ever come")
+        XCTAssertNil(try db.fetchById(Capture.self, id: cid)?.sessionId)
+    }
+
+    func testADisplacedSessionOfADeletedTaskSendsItsCapturesWithoutEither() async throws {
+        let (model, db, store) = try boot()
+        let gone = newUUID()
+        let live = running(gone, sinceMin: 5)
+        try store.set(live)
+        let cid = newUUID()
+        await model.saveCaptureAwaiting(Capture(id: cid, taskId: gone, sessionId: live.id, tag: .idea, body: "x", at: stamp))
+        model.finalizeDisplacedFocus(forNewTaskId: newUUID())
+        let released = try await eventually { try self.captureOp(db, cid)?.dependsOn == nil }
+        XCTAssertTrue(released)
+        let row = try XCTUnwrap(db.fetchById(Capture.self, id: cid))
+        XCTAssertNil(row.sessionId)
+        XCTAssertNil(row.taskId, "captures.task_id references tasks(id): the dead id would be refused")
+        let payload = try XCTUnwrap(captureOp(db, cid)?.payload?.data(using: .utf8))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        XCTAssertTrue(obj["task_id"] is NSNull)
+        XCTAssertTrue(obj["session_id"] is NSNull)
+    }
+
+    func testACaptureDuringASessionSharedWithMeIsTiedToNoSession() throws {
+        let store = LiveSessionStore(try AppDatabase.makeInMemory())
+        let shared = FocusModel(task: task("owners-task"), store: store, sharedLevel: .partner)
+        XCTAssertNil(shared.captureSessionId, "that session writes no own Session row to wait for")
+        try store.set(nil)
+        let own = FocusModel(task: task("mine"), store: store)
+        XCTAssertEqual(own.captureSessionId, own.live.id)
+    }
+}

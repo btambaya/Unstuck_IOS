@@ -144,32 +144,71 @@ final class FocusModel {
     }
 
     func pause() {
+        guard syncFromStore() else { return }
+        // Already paused (the reason sheet after Pause, "Save for later" on a
+        // paused session): pausing again moved pausedAt to now, crediting the
+        // time since the real pause as focus, and re-armed the nag from there
+        // (audit 2026-09-22, C39).
+        guard !live.paused else { return }
         live = FocusTimer.pause(live, now: Self.now()); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: true, estimateMin: live.sessionEstimateMin)
         // The local ~14-min nag is armed here; the daily push budget is
         // settled when it actually FIRES (AppModel.armPausedCheckin), not now.
-        PausedCheckinBudget.arm(taskName: task.name)
+        PausedCheckinBudget.arm(taskName: task.name, sessionId: live.id)
     }
     func resume() {
+        // Resumed on the lock screen meanwhile: resuming the stale paused copy
+        // shifted the start by the whole pause, erasing the focus since (C37).
+        guard syncFromStore(), live.paused else { return }
         live = FocusTimer.resume(live, now: Self.now()); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: false, estimateMin: live.sessionEstimateMin)
         PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
     }
 
     /// Re-read the store after a REMOTE control was applied (AppModel's
-    /// shared-session channel): replace `live` with the stored state — no
-    /// persist, no side effects (the applier already drove the Live Activity
-    /// and the check-in scheduler).
-    func syncFromStore() {
-        guard let updated = (try? store?.get()) ?? nil, updated.id == live.id else { return }
-        live = updated
+    /// shared-session channel) or a local one made off this screen, and before
+    /// every control here: the shade's Resume / End, Today's card and the
+    /// assistant change the store behind this screen, and acting on the stale
+    /// copy lost the focus since a lock-screen Resume or logged a session
+    /// ended there a second time (audit 2026-09-22, C37). Replaces `live` with
+    /// the stored state — no persist, no side effects (whoever changed it
+    /// already drove the Live Activity and the check-in scheduler). False when
+    /// the store no longer holds this session (ended or replaced elsewhere):
+    /// the caller then does nothing. No store (tests) or an unreadable one →
+    /// the copy stands.
+    @discardableResult
+    func syncFromStore() -> Bool {
+        guard let store else { return true }
+        let stored: LiveSession?
+        do { stored = try store.get() } catch { return true }
+        guard let stored, stored.sessionStart != nil, stored.id == live.id else { return false }
+        live = stored
+        return true
+    }
+
+    /// The session a capture taken here is tied to — none on a task shared
+    /// WITH me: that session never writes an own Session row, and a capture
+    /// tied to it waited in the outbox for one for ever (audit 2026-09-22, C44).
+    var captureSessionId: String? { sharedLevel == nil ? live.id : nil }
+
+    /// This session's elapsed, and the estimate + grace it is capped to off
+    /// this screen, when it has run past that cap — "← Out" keeps a session
+    /// running, and one left overnight reads as hours. The screen asks before
+    /// logging it (log the capped time, all of it, or discard) instead of
+    /// logging it all (audit 2026-09-22, C43). nil = an ordinary finish.
+    static func overlongElapsedSec(_ live: LiveSession, now: Double) -> (raw: Int, capped: Int)? {
+        let raw = FocusTimer.elapsedSec(live, now: now)
+        let capped = AppModel.cappedSharedElapsedSec(rawSec: raw, estimateMin: live.sessionEstimateMin)
+        return raw > capped ? (raw, capped) : nil
     }
 
     /// Stop the session + return the Session row (reusing the live id so
     /// captures taken during the session join back) + elapsed seconds, for the
-    /// view to hand to AppModel.finishFocus.
+    /// view to hand to AppModel.finishFocus. nil when the session already
+    /// ended off this screen — it is logged there, never twice (C37).
     @discardableResult
-    func finish() -> (session: Session, elapsedSec: Int) {
+    func finish() -> (session: Session, elapsedSec: Int)? {
+        guard syncFromStore() else { return nil }
         let elapsed = FocusTimer.elapsedSec(live, now: Self.now())
         // Attribute the Session to the TEMPLATE for an occurrence focus (so the
         // analytics + totalFocused continuity stay on the series, never a row
@@ -185,21 +224,30 @@ final class FocusModel {
         return (session, elapsed)
     }
 
-    func cancel() {
+    /// Drop the session unlogged. False (nothing done) when it already ended
+    /// or was replaced off this screen — never wipe a session that isn't this one.
+    @discardableResult
+    func cancel() -> Bool {
+        guard syncFromStore() else { return false }
         live = FocusTimer.cancel(live)
         persist()
         LiveActivityController.shared.end()
         PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
+        return true
     }
 
     var treatment: FocusTreatment { live.treatment }
-    func setTreatment(_ t: FocusTreatment) { live = FocusTimer.setTreatment(live, t); persist() }
+    func setTreatment(_ t: FocusTreatment) {
+        guard syncFromStore() else { return }
+        live = FocusTimer.setTreatment(live, t); persist()
+    }
     var sessionId: String? { live.id }
 
     /// Extend the session estimate (overrun check-in: "+10" / "in the zone").
     /// Also reflects the new estimate on the Live Activity — extend previously
     /// never updated it, so the lock-screen progress kept the stale estimate.
     func extendFocus(_ minutes: Int) {
+        guard syncFromStore() else { return }
         live = FocusTimer.extend(live, minutes: minutes); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0,
                                              paused: live.paused, estimateMin: live.sessionEstimateMin)
@@ -247,6 +295,9 @@ struct FocusView: View {
     @State private var showReflect = false
     @State private var reflectMin = 0
     @State private var reflectSel: String?
+    /// A finish past the estimate + grace waiting on "log or discard?" (C43).
+    @State private var overlongFinish: OverlongFinish?
+    private struct OverlongFinish { let markDone: Bool; let rawSec: Int; let cappedSec: Int }
 
     // Hands-Free Focus Copilot (Phase 1). The VoiceController is the same
     // on-device $0 STT/TTS layer the assistant uses (no LLM/network here). The
@@ -313,6 +364,7 @@ struct FocusView: View {
                 // finalize the displaced clock first — capped ledger write
                 // under the OLD sessionId — so its elapsed isn't silently lost.
                 if let adopted { model.finalizeDisplacedForAdoption(adopted, taskId: focusId) }
+                let before = (try? model.liveStore?.get()) ?? nil
                 let newFM = FocusModel(task: task, store: model.liveStore,
                                 defaultTreatment: model.settings.defaultTreatment,
                                 occurrence: occ.map { ($0.template.id, $0.template.name, $0.block.id) },
@@ -325,6 +377,14 @@ struct FocusView: View {
                 newFM.onPersist = { [weak model] in model?.refreshLiveSession() }
                 newFM.onConsumePausedCheckin = { [weak model] in model?.consumePausedCheckinBudget() }
                 fm = newFM
+                // A paused session this screen did not re-attach to as-is — the
+                // series' session re-pointed to another day (FocusTimer.start
+                // resumes it), or adopted over — takes its "Did you step away?"
+                // nag with it: left armed, its End ended the running session
+                // (audit 2026-09-22, C38).
+                if let before, before.paused, !(newFM.live.id == before.id && newFM.live.paused) {
+                    model.cancelPausedCheckin()
+                }
                 // The init's persist() ran before onPersist was wired — seed once.
                 model.refreshLiveSession()
                 startCopilotIfEnabled(newFM)
@@ -339,18 +399,18 @@ struct FocusView: View {
         }
         .confirmationDialog("Why are you pausing?", isPresented: $showReasons, titleVisibility: .visible) {
             ForEach(reasons, id: \.self) { reason in
-                // For the "Save for later" flow the session is already paused; we
-                // just record the reason and then exit after it lands.
+                // Both flows (Pause and "Save for later") paused BEFORE opening
+                // this sheet; a reason only records why — pausing again here
+                // counted the time spent choosing as focus (audit 2026-09-22,
+                // C39). "Save for later" then exits once it lands.
                 Button(reason) {
-                    if exitAfterReason { model.saveReasonLog(ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow())); exitAfterReason = false; dismiss() }
-                    else { pauseWith(reason) }
+                    logPauseReason(reason)
+                    if exitAfterReason { exitAfterReason = false; dismiss() }
                 }
             }
             Button("Just pause", role: .cancel) {
-                // Save-for-later already paused + coordinated the check-in, so here
-                // we only need to exit; the Pause-button flow still pauses now.
+                // Already paused + check-in coordinated; only Save-for-later exits.
                 if exitAfterReason { exitAfterReason = false; dismiss() }
-                else { fm?.pause(); coordinateCheckin() }
             }
         }
         .confirmationDialog("Leave focus?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
@@ -359,21 +419,28 @@ struct FocusView: View {
         } message: {
             Text("Your timer keeps running — you can pick it back up from Today.")
         }
+        // Done / End for now on a session past its estimate + grace (C43).
+        .confirmationDialog(overlongFinish.map { "This session ran \(fmtHrs($0.rawSec / 60))" } ?? "",
+                            isPresented: Binding(get: { overlongFinish != nil },
+                                                 set: { if !$0 { overlongFinish = nil } }),
+                            titleVisibility: .visible, presenting: overlongFinish) { o in
+            Button("Log \(fmtHrs(o.cappedSec / 60))") { finishSession(markDone: o.markDone, capAt: o.cappedSec) }
+            Button("Log all \(fmtHrs(o.rawSec / 60))") { finishSession(markDone: o.markDone, capAt: .max) }
+            Button("Discard this session", role: .destructive) { discardSession() }
+            Button("Cancel", role: .cancel) {}
+        } message: { o in
+            Text("That's well past its \(fmtHrs(fm?.live.sessionEstimateMin ?? task.estimateMin)) estimate — was the timer left running? Discarding logs none of it\(o.markDone ? " and leaves the task open" : "").")
+        }
         .sheet(isPresented: $showCapture) { captureSheet }
         .sheet(isPresented: $showReflect, onDismiss: { dismiss() }) { reflectSheet }
         // A REMOTE control was applied to the shared session (AppModel's
         // channel): mirror it into this screen's FocusModel — or, on a remote
         // end, leave quietly (the applier already finalized + recapped with
         // "<name> ended the session"). Never re-persists / re-broadcasts.
-        .onChange(of: model.sharedSessionRemoteTick) { _, _ in
-            guard let fm else { return }
-            let live = model.liveSession
-            if live?.sessionStart == nil || live?.id != fm.live.id {
-                dismiss()
-            } else {
-                fm.syncFromStore()
-            }
-        }
+        .onChange(of: model.sharedSessionRemoteTick) { _, _ in mirrorStoredSession() }
+        // The same for a control made OFF this screen — the paused check-in's
+        // Resume, Today's card, the assistant (audit 2026-09-22, C37).
+        .onChange(of: model.liveSessionOffScreenTick) { _, _ in mirrorStoredSession() }
         // Leaving keeps the session RUNNING (one true shared session — the
         // session is task-scoped, resumable from the Today live card, and the
         // channel is AppModel's, so remote controls keep applying off-screen).
@@ -389,6 +456,13 @@ struct FocusView: View {
             if phase != .active { teardownCopilot(); AmbientAudio.shared.stop() }
             else if let fm { updateAudio(fm) }
         }
+    }
+
+    /// Mirror the stored session into this screen's FocusModel, or leave when
+    /// it ended / was replaced. Never re-persists / re-broadcasts.
+    private func mirrorStoredSession() {
+        guard let fm else { return }
+        if !fm.syncFromStore() { dismiss() }
     }
 
     /// Ambient loop plays while focusing when the Settings ambient bed is on
@@ -423,7 +497,7 @@ struct FocusView: View {
                 guard !body.isEmpty, let fm else { return }
                 let captureTaskId = fm.occurrence?.templateId ?? task.id
                 model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId,
-                                          sessionId: fm.sessionId, tag: .followUp,
+                                          sessionId: fm.captureSessionId, tag: .followUp,
                                           body: body, at: AppModel.isoNow()))
             }
         )
@@ -811,13 +885,30 @@ struct FocusView: View {
     /// For a partner-shared session, fm.finish() → persist → refreshLiveSession
     /// broadcasts `ended: true` (rev+1) on the shared channel BEFORE teardown, so
     /// the partner finalizes the same session with the same id.
-    private func finishSession(markDone: Bool) {
+    ///
+    /// `capAt` is the answer to the over-long prompt (C43): nil asks when the
+    /// session ran past its estimate + grace; otherwise at most that many
+    /// seconds are logged (`.max` = all of it).
+    private func finishSession(markDone: Bool, capAt: Int? = nil) {
         guard let fm else { return }
+        // Ended off this screen meanwhile (shade End): it is logged there — a
+        // second finish logged it twice with a second recap (C37).
+        guard fm.syncFromStore() else { dismiss(); return }
+        // A session on a task shared WITH me is capped by its own paths.
+        if capAt == nil, fm.sharedLevel == nil,
+           let over = FocusModel.overlongElapsedSec(fm.live, now: FocusModel.now()) {
+            overlongFinish = OverlongFinish(markDone: markDone, rawSec: over.raw, cappedSec: over.capped)
+            return
+        }
         teardownCopilot()
         // Capture the shared-control bookkeeping BEFORE finish() clears it —
         // it routes the OWNER's accrual through the exactly-once ledger.
         let preFinish = fm.live
-        let result = fm.finish()
+        guard var result = fm.finish() else { dismiss(); return }
+        if let capAt, capAt < result.elapsedSec {
+            result.elapsedSec = capAt
+            result.session.actualSec = capAt
+        }
         if fm.sharedLevel != nil {
             // Shared focus (T3, Option B): reflect the elapsed onto the OWNER's
             // task via log_shared_focus and (partner/assign) optionally complete
@@ -848,6 +939,18 @@ struct FocusView: View {
         // Show the momentary reflection (Android parity); its onDismiss closes Focus.
         reflectMin = max(1, Int((Double(result.elapsedSec) / 60.0).rounded()))
         showReflect = true
+    }
+
+    /// The over-long prompt's Discard (C43): the session ends with nothing
+    /// logged and the task left as it was; the captures taken during it go up
+    /// without the Session row that now never comes (C44).
+    private func discardSession() {
+        guard let fm else { return }
+        let sessionId = fm.live.id
+        guard fm.cancel() else { dismiss(); return }
+        teardownCopilot()
+        model.releaseCaptures(ofSession: sessionId)
+        dismiss()
     }
 
     // End-of-session reflection (Android ReflectSheet) — momentary; nothing is
@@ -916,11 +1019,8 @@ struct FocusView: View {
         .presentationDetents([.medium])
     }
 
-    private func pauseWith(_ reason: String) {
+    private func logPauseReason(_ reason: String) {
         model.saveReasonLog(ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow()))
-        fm?.pause()
-        copilot?.pauseSession()
-        coordinateCheckin()
     }
 
     /// FocusModel.pause() pre-schedules the local paused-too-long notif; PEEK
@@ -940,7 +1040,7 @@ struct FocusView: View {
         // Attach captures to the TEMPLATE for an occurrence focus (task.id is the
         // block id there) so they show on the series' detail, not a phantom row.
         let captureTaskId = fm?.occurrence?.templateId ?? task.id
-        model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId, sessionId: fm?.sessionId, tag: captureTag, body: text, at: AppModel.isoNow()))
+        model.saveCapture(Capture(id: newUUID(), taskId: captureTaskId, sessionId: fm?.captureSessionId, tag: captureTag, body: text, at: AppModel.isoNow()))
         captureTag = .followUp
     }
 }

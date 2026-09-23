@@ -308,7 +308,11 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         // A body over the 500-character cap is truncated — and SAID (no silent
         // fallbacks, rules §1).
         let cut = body.count > 500
-        let c = Capture(id: newUUID(), taskId: t?.id, sessionId: (live?.sessionStart != nil) ? live?.id : nil,
+        // Not tied to a session on a task shared WITH the user: it writes no
+        // own Session row, and the capture waited for one for ever (audit
+        // 2026-09-22, C44).
+        let c = Capture(id: newUUID(), taskId: t?.id,
+                        sessionId: (live?.sessionStart != nil && live?.sharedFocusLevel == nil) ? live?.id : nil,
                         tag: tag, body: String(body.prefix(500)), at: now())
         await api.upsertCapture(c)
         return "ok: captured id=\(c.id) [\(tag.rawValue)] \"\(c.body)\"\(t.map { " on \"\($0.name)\"" } ?? "")\(cut ? " (cut to 500 characters — say so)" : "")"
