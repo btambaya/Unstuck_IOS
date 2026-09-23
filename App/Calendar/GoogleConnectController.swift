@@ -60,7 +60,7 @@ final class GoogleConnectController: NSObject, ASWebAuthenticationPresentationCo
     /// HTTPS redirect registered on the web Google client; the
     /// /calendar-callback page bounces to unstuck://calendar-callback, which
     /// ASWebAuthenticationSession (callbackURLScheme "unstuck") captures.
-    private let redirectUri = "https://unstuck-602.pages.dev/calendar-callback"
+    private let redirectUri = "https://unstucknow.io/calendar-callback"
     private var session: ASWebAuthenticationSession?
 
     init(_ calendar: CalendarClient) { self.calendar = calendar }
