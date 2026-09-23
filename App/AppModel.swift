@@ -98,6 +98,11 @@ final class AppModel {
     /// Test seam: hold the Google worker (calls queue up, none runs) until
     /// `resumeGoogleCalls()`.
     @ObservationIgnored var googleCallsPaused = false
+    /// Begins background time and returns its release — a UIApplication
+    /// background task in production (a test seam). The outbox flushes hold
+    /// it (audit 2026-09-22, C31).
+    @ObservationIgnored var backgroundTime: CallsOutcomeReporter.BackgroundTime =
+        CallsOutcomeReporter.systemBackgroundTime(named: "unstuck.outbox-flush")
     // Per-collection serial RPC queue. The optimistic local write happens
     // synchronously on the main actor; the server RPC dispatch is chained so two
     // rapid edits to the same shared collection can't reach the server out of
@@ -942,7 +947,10 @@ final class AppModel {
     /// scenePhase .active handler turns it on when a scene connects. A
     /// DECLINED / MISSED ring on a killed app ends CallKit's call at once;
     /// the outcome reporter holds background time from that report until it
-    /// is sent, which covers this boot too (CallsOutcomeReporter).
+    /// is sent, which covers this boot too (CallsOutcomeReporter). A shade
+    /// action (Reschedule / End …) on an app that isn't running boots it the
+    /// same way, and holds its own time until the action is applied
+    /// (PushActionHub, audit 2026-09-22, C31).
     func startWithoutScene() async {
         guard coordinator == nil else { return }
         #if DEBUG
@@ -1013,6 +1021,12 @@ final class AppModel {
         // the optimistic row back to the server's copy + say so once.
         await coord.setOnCollectionRPCRejected { [weak self] collectionId, fn, error in
             Task { @MainActor in self?.handleCollectionRPCRejected(collectionId: collectionId, fn: fn, error: error) }
+        }
+        // Every write's post-write flush holds background time until it
+        // lands (audit 2026-09-22, C31): a write made just before the app was
+        // suspended used to wait in the outbox for the next open.
+        await coord.setFlushBackgroundTime { [weak self] in
+            await self?.beginBackgroundTime() ?? {}
         }
         // A minted occurrence's insert resolved (stage 2): a Google push that
         // waited for it goes out now — once, and never for an ignored insert.
@@ -1133,6 +1147,48 @@ final class AppModel {
         // The microphone for calls booked elsewhere (C13) — the scenePhase
         // hook no-ops on a cold launch, for the same reason as the route above.
         startCallMicrophoneBackstop()
+    }
+
+    // MARK: background time for the outbox (audit 2026-09-22, C31)
+    //
+    // The app asked iOS for no time at all: the outbox went up only through
+    // the 1.5 s post-write debounce, and iOS suspends an app it isn't asked
+    // to keep, mid-request included. A tick made just before locking, a
+    // Reschedule from the lock screen, a focus End from the shade reached
+    // the server only at the next open — while the web, the other phone and
+    // the server's calls read the old row.
+
+    /// A shade action's flush waits this long (Android's 8 s inside goAsync).
+    static let shadeActionFlushLimit: TimeInterval = 8
+    /// The flush when the app leaves the screen (iOS allows ~30 s).
+    static let backgroundFlushLimit: TimeInterval = 20
+
+    /// `backgroundTime`, begun now; the release can be called from anywhere.
+    func beginBackgroundTime() -> @Sendable () async -> Void {
+        let release = backgroundTime { }
+        return { await release() }
+    }
+
+    /// `work` inside background time, waited on for at most `limit`. Never
+    /// cancelled: a flush cut mid-prune would push task edits the prune
+    /// should have merged (C9). Past `limit` it runs on while iOS allows, and
+    /// whatever didn't land is retried by the next drain.
+    func withBackgroundTime(limit: TimeInterval, _ work: @escaping @Sendable () async -> Void) async {
+        let release = backgroundTime { }
+        _ = await AuthService.firstWithin(limit) { await work(); return true }
+        release()
+    }
+
+    /// Push the outbox now, inside background time (`withBackgroundTime`).
+    func flushHoldingBackgroundTime(limit: TimeInterval) async {
+        guard let coordinator else { return }
+        await withBackgroundTime(limit: limit) { await coordinator.flushNow() }
+    }
+
+    /// The app just left the screen: push what is queued now rather than
+    /// after the debounce — and whatever an earlier failed drain left behind.
+    func flushOnBackground() {
+        Task { await flushHoldingBackgroundTime(limit: Self.backgroundFlushLimit) }
     }
 
     /// Foreground/manual sync trigger (scenePhase .active, BG refresh):

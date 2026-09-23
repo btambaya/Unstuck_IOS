@@ -1203,6 +1203,76 @@ final class CallsOutcomeReporterTests: XCTestCase {
         XCTAssertEqual(log.delays, [2, 5, 15], "2 s / 5 s between the three attempts, 15 s before the re-enqueued item is retried")
         XCTAssertTrue(r.queue.isEmpty)
     }
+
+    // MARK: a snooze is sent against the instant the user asked for (audit 2026-09-22, C31)
+
+    final class TestClock: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value: Date
+        init(_ start: Date) { value = start }
+        var now: Date { lock.withLock { value } }
+        func advance(_ seconds: TimeInterval) { lock.withLock { value = value.addingTimeInterval(seconds) } }
+    }
+
+    /// "Call me back in 20", and the network is down for 3 minutes: the
+    /// report asks for the 17 minutes left, so the ring lands when asked —
+    /// call-outcome books `now + snoozeMinutes` when the report arrives.
+    func testASnoozeHeldBackAsksForTheMinutesLeftToTheAskedInstant() async {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_790_000_000))
+        let r = CallsOutcomeReporter(defaults: suite, sleep: { _ in }, now: { clock.now })
+        r.report(callId: "c1", callKitId: uuid, outcome: .snoozed, snoozeMinutes: 20, outcomeNotes: ["pay rent"])
+        clock.advance(3 * 60)
+        let rec = Recorder()
+        r.attach(send: rec.sender())
+        await settle(r)
+        XCTAssertEqual(rec.sent.map(\.outcome), [.snoozed])
+        XCTAssertEqual(rec.sent.first?.snooze, 17)
+        XCTAssertEqual(rec.sent.first?.notes, ["pay rent"])
+    }
+
+    /// Sent at once, it asks for exactly what the user said; a few minutes
+    /// late past the instant, the ring still goes out (the server's floor).
+    func testASnoozeSentOnTimeKeepsItsMinutesAndALateOneRingsNow() async {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_790_000_000))
+        let r = CallsOutcomeReporter(defaults: suite, sleep: { _ in }, now: { clock.now })
+        let rec = Recorder()
+        r.attach(send: rec.sender())
+        r.report(callId: "c1", callKitId: uuid, outcome: .snoozed, snoozeMinutes: 20, outcomeNotes: nil)
+        await settle(r)
+        XCTAssertEqual(rec.sent.last?.snooze, 20)
+
+        let late = CallsOutcomeReporter.Item(callId: "c2", callKitId: nil, outcome: .snoozed, snooze: 20, notes: nil,
+                                             snoozeUntil: clock.now.addingTimeInterval(-4 * 60))
+        XCTAssertEqual(late.onTheWire(at: clock.now).outcome, .snoozed)
+        XCTAssertEqual(late.onTheWire(at: clock.now).snooze, 1)
+    }
+
+    /// An evening's snooze reaches the server the next morning: the ring's
+    /// window is long gone, so it goes up `stale` — never a ring at 07:50
+    /// for last night's wrap-up.
+    func testASnoozeWhoseInstantIsLongPastGoesUpStale() async {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_790_000_000))
+        let r = CallsOutcomeReporter(defaults: suite, sleep: { _ in }, now: { clock.now })
+        r.report(callId: "c1", callKitId: uuid, outcome: .snoozed, snoozeMinutes: 20, outcomeNotes: ["wrap-up"])
+        clock.advance(10 * 3600)
+        // Persisted with its instant: a relaunch the next morning sends it.
+        let relaunch = CallsOutcomeReporter(defaults: suite, sleep: { _ in }, now: { clock.now })
+        let rec = Recorder()
+        relaunch.attach(send: rec.sender())
+        await settle(relaunch)
+        XCTAssertEqual(rec.sent.map(\.outcome), [.stale])
+        XCTAssertNil(rec.sent.first?.snooze)
+        XCTAssertEqual(rec.sent.first?.notes, ["wrap-up"], "the notes still land")
+        XCTAssertTrue(relaunch.queue.isEmpty)
+    }
+
+    /// A snooze an older build persisted (no instant) goes up as it was.
+    func testASnoozeWithNoInstantIsSentAsQueued() {
+        let legacy = CallsOutcomeReporter.Item(callId: "c1", callKitId: nil, outcome: .snoozed, snooze: 15, notes: nil)
+        XCTAssertEqual(legacy.onTheWire(at: Date()), legacy)
+        let done = CallsOutcomeReporter.Item(callId: "c1", callKitId: nil, outcome: .done, snooze: nil, notes: nil)
+        XCTAssertEqual(done.onTheWire(at: Date()), done)
+    }
 }
 
 // MARK: - the receipt-time anchor check over the real store (web/Android audit 2026-09-23, A6)
@@ -1285,5 +1355,138 @@ final class AppCallEnvironmentAnchorTests: XCTestCase {
 
     func testACallWithNoTaskAnchorHasNothingToCheck() {
         XCTAssertTrue(env.anchorIsLive(taskId: nil, blockId: nil))
+    }
+}
+
+// MARK: - background time for the outbox and the shade's background actions (audit 2026-09-22, C31)
+//
+// Nothing asked iOS for time: a lock-screen Reschedule or End was buffered
+// in memory with the completion called at once (a cold launch has no scene
+// to run start()), and the flush that would carry any write waited for the
+// next open. The seams: AppModel.backgroundTime / withBackgroundTime and
+// PushActionHub's boot / background time / deadline.
+
+@MainActor
+final class ShadeActionBackgroundTimeTests: XCTestCase {
+    typealias FakeBackgroundTime = CallsOutcomeReporterTests.FakeBackgroundTime
+
+    @MainActor
+    final class Log {
+        var entries: [String] = []
+        var done = false
+        var boots = 0
+    }
+
+    private func name(_ a: PushAction) -> String {
+        switch a {
+        case .open: return "open"
+        case .startFocus: return "startFocus"
+        case .reschedule: return "reschedule"
+        case .resumeSession: return "resume"
+        case .snoozeCheckin: return "snooze"
+        case .endSession: return "end"
+        }
+    }
+
+    /// The flush runs inside background time, released once it's done.
+    func testWorkRunsInsideBackgroundTimeAndLetsGoAfter() async {
+        let bg = FakeBackgroundTime()
+        let model = AppModel()
+        model.backgroundTime = bg.make()
+        let log = Log()
+        await model.withBackgroundTime(limit: 5) {
+            await MainActor.run { log.entries.append("work begun=\(bg.begun) released=\(bg.released)") }
+        }
+        XCTAssertEqual(log.entries, ["work begun=1 released=0"])
+        XCTAssertEqual(bg.released, 1)
+    }
+
+    /// A slow link: the wait ends at the limit and the time is let go, but
+    /// the flush itself is never cancelled (a cut prune pushes unmerged ops).
+    func testASlowFlushLetsGoAtTheLimitWithoutBeingCancelled() async throws {
+        let bg = FakeBackgroundTime()
+        let model = AppModel()
+        model.backgroundTime = bg.make()
+        let log = Log()
+        await model.withBackgroundTime(limit: 0.05) {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            let cancelled = Task.isCancelled
+            await MainActor.run { log.entries.append("finished cancelled=\(cancelled)"); log.done = true }
+        }
+        XCTAssertEqual(bg.released, 1, "let go at the limit")
+        XCTAssertTrue(log.entries.isEmpty, "the flush is still running")
+        for _ in 0..<100 where !log.done { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(log.entries, ["finished cancelled=false"])
+    }
+
+    /// End tapped on the paused check-in of an app iOS had reclaimed: the
+    /// model is booted, and the post (so the system's completion) waits until
+    /// the End has run, holding background time the whole way.
+    func testABackgroundActionOnAColdLaunchBootsTheModelAndWaitsUntilApplied() async throws {
+        let hub = PushActionHub()
+        let bg = FakeBackgroundTime()
+        hub.backgroundTime = bg.make()
+        let log = Log()
+        hub.bootApp = { log.boots += 1 }
+        let posting = Task { @MainActor in
+            await hub.post(.endSession)
+            log.done = true
+        }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(log.boots, 1, "the model is started for it")
+        XCTAssertEqual(bg.begun, 1)
+        XCTAssertFalse(log.done, "the completion waits for the action")
+
+        hub.setHandler { [self] a in log.entries.append(name(a)) }
+        await posting.value
+        XCTAssertEqual(log.entries, ["end"])
+        XCTAssertEqual(bg.released, 1)
+    }
+
+    /// Already running: applied at once, inside background time.
+    func testABackgroundActionOnARunningAppRunsInsideBackgroundTime() async {
+        let hub = PushActionHub()
+        let bg = FakeBackgroundTime()
+        hub.backgroundTime = bg.make()
+        let log = Log()
+        hub.bootApp = { log.boots += 1 }
+        hub.setHandler { [self] a in log.entries.append("\(name(a)) held=\(bg.begun - bg.released)") }
+        await hub.post(.reschedule(taskId: "t1", blockId: "b1", taskName: "Call dentist", drifted: false))
+        XCTAssertEqual(log.entries, ["reschedule held=1"])
+        XCTAssertEqual(bg.released, 1)
+        XCTAssertEqual(log.boots, 0)
+    }
+
+    /// A tap that opens the app is buffered for start() as before — the
+    /// scene's own launch runs it; nothing waits and nothing is booted.
+    func testAForegroundTapIsBufferedWithoutWaiting() async throws {
+        let hub = PushActionHub()
+        let bg = FakeBackgroundTime()
+        hub.backgroundTime = bg.make()
+        let log = Log()
+        hub.bootApp = { log.boots += 1 }
+        await hub.post(.open(deepLink: "unstuck://today"))
+        XCTAssertEqual(log.boots, 0)
+        XCTAssertEqual(bg.begun, 0)
+        hub.setHandler { [self] a in log.entries.append(name(a)) }
+        for _ in 0..<100 where log.entries.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(log.entries, ["open"])
+    }
+
+    /// No model ever comes up: the completion is called at the deadline and
+    /// the time let go; the action still runs if the model starts later.
+    func testABackgroundActionGivesUpAtTheDeadline() async throws {
+        let hub = PushActionHub()
+        let bg = FakeBackgroundTime()
+        hub.backgroundTime = bg.make()
+        hub.bootApp = {}
+        hub.deadline = 0.05
+        await hub.post(.snoozeCheckin(taskName: "Deep work"))
+        XCTAssertEqual(bg.begun, 1)
+        XCTAssertEqual(bg.released, 1)
+        let log = Log()
+        hub.setHandler { [self] a in log.entries.append(name(a)) }
+        for _ in 0..<100 where log.entries.isEmpty { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(log.entries, ["snooze"])
     }
 }

@@ -122,6 +122,8 @@ public actor SyncCoordinator {
     private let prevUserKey = "unstuck.prevUserId"
     private var observeTask: Task<Void, Never>?
     private var flushKick: Task<Void, Never>?
+    /// Held by every post-write flush (`setFlushBackgroundTime`); nil = none.
+    private var flushBackgroundTime: BackgroundTime?
 
     public init(provider: SupabaseClientProvider, db: AppDatabase) {
         let gateway = SyncGateway(provider.client)
@@ -276,6 +278,16 @@ public actor SyncCoordinator {
     /// Fired on the flusher's executor: hop to the app's actor for real work.
     public func setOnInsertResolved(_ hook: @escaping @Sendable (InsertResolution) -> Void) async {
         await flusher.setOnInsertResolved(hook)
+    }
+
+    /// Begins background time and returns its release, callable once from
+    /// anywhere. The app's is a UIApplication background task, which iOS
+    /// takes back (ending it) about 30 s after the app leaves the screen.
+    public typealias BackgroundTime = @Sendable () async -> @Sendable () async -> Void
+
+    /// Background time for the post-write flush (see `debouncedFlush`).
+    public func setFlushBackgroundTime(_ hold: BackgroundTime?) {
+        flushBackgroundTime = hold
     }
 
     /// The last `cal_blocks` read that succeeded this session (nil = none yet).
@@ -572,11 +584,25 @@ public actor SyncCoordinator {
 
     private func scheduleDebouncedFlush() {
         flushKick?.cancel()
+        let hold = flushBackgroundTime
         flushKick = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            guard !Task.isCancelled else { return }
-            await self?.flushNow()
+            await Self.debouncedFlush(delayNs: 1_500_000_000, hold: hold) { [weak self] in await self?.flushNow() }
         }
+    }
+
+    /// The post-write flush: after the debounce, unless a newer write replaced
+    /// it (cancelled). It holds background time from the write until that
+    /// flush is done or replaced (audit 2026-09-22, C31). Nothing asked iOS for
+    /// time before, so a tick, a lock-screen Reschedule or a focus End made
+    /// just before the app was suspended sat in the outbox until the next
+    /// open while the web, the other phone and the server's calls read the
+    /// old row. A replaced flush lets go; the one replacing it holds its own.
+    /// Past iOS's limit the ops simply wait in the outbox, as before.
+    static func debouncedFlush(delayNs: UInt64, hold: BackgroundTime?, flush: @Sendable () async -> Void) async {
+        let release = await hold?()
+        try? await Task.sleep(nanoseconds: delayNs)
+        if !Task.isCancelled { await flush() }
+        await release?()
     }
 
     /// Sign out, but first: (1) drain queued offline writes (bounded 5s,

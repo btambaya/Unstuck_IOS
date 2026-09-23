@@ -507,4 +507,44 @@ final class HydratorPruneTests: XCTestCase {
         XCTAssertTrue(upserts.isEmpty, "the unpruned op must not be sent over the newer server row")
         XCTAssertEqual(try box.count(), 1, "it stays queued, to be parked and pruned at the next sign-in")
     }
+
+    // MARK: - the post-write flush holds background time (audit 2026-09-22, C31)
+
+    private actor Events {
+        var log: [String] = []
+        func add(_ e: String) { log.append(e) }
+    }
+
+    /// A tick right before the phone locks: the flush it kicks runs inside
+    /// background time, begun at the write and let go only once it's done.
+    func testAPostWriteFlushHoldsBackgroundTimeUntilItIsDone() async {
+        let events = Events()
+        await SyncCoordinator.debouncedFlush(delayNs: 1_000_000,
+                                             hold: {
+                                                 await events.add("hold")
+                                                 return { await events.add("release") }
+                                             },
+                                             flush: { await events.add("flush") })
+        let log = await events.log
+        XCTAssertEqual(log, ["hold", "flush", "release"])
+    }
+
+    /// A newer write replaces the pending flush: the replaced one never
+    /// flushes and lets its time go (the newer one holds its own).
+    func testAReplacedPostWriteFlushLetsGoWithoutFlushing() async {
+        let events = Events()
+        let kick = Task {
+            await SyncCoordinator.debouncedFlush(delayNs: 10_000_000_000,
+                                                 hold: {
+                                                     await events.add("hold")
+                                                     return { await events.add("release") }
+                                                 },
+                                                 flush: { await events.add("flush") })
+        }
+        while await events.log.isEmpty { await Task.yield() }
+        kick.cancel()
+        await kick.value
+        let log = await events.log
+        XCTAssertEqual(log, ["hold", "release"])
+    }
 }

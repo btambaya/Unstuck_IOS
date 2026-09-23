@@ -87,8 +87,9 @@ final class PushAppDelegate: NSObject, UIApplicationDelegate, UNUserNotification
     // PushAppDelegate.userNotificationCenter(_:didReceive:)" on Thread 13).
     // With the handler form we do the work on the main actor and invoke the
     // system completion FROM the main actor, so UIKit's snapshot work runs on
-    // the main thread. (The system still holds the completion until called —
-    // the iOS analog of Android's goAsync() — so no begin/endBackgroundTask.)
+    // the main thread. (The completion is the iOS analog of Android's
+    // goAsync(): a background action's completion waits until PushActionHub
+    // has applied it and flushed, under a background task of its own — C31.)
     /// Carries a UN* completion block across the main-actor hop. The blocks
     /// aren't imported `@Sendable`, but passing one to the main actor and
     /// calling it exactly once THERE is the whole point of the crash fix.
