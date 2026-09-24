@@ -145,7 +145,7 @@ final class InsightsReadEmptyDataTests: XCTestCase {
     func testSessionsWithNoTaskLinkGetAnHonestEstimatesLine() {
         let orphan = Session(id: "x", taskName: "Ad hoc", actualSec: 900, completedAt: ago(1))
         let out = render(Data(sessions: [orphan]))
-        XCTAssertTrue(out.contains("Focus: 0h 15m across 1 session, median 15m."))
+        XCTAssertTrue(out.contains("Focus: 15m across 1 session, median 15m."))
         XCTAssertTrue(out.contains("Estimates: no sessions linked to an estimated task yet."))
         XCTAssertFalse(out.contains("Re-entry"))
         XCTAssertFalse(out.contains("Worth noticing"))
@@ -247,7 +247,7 @@ final class InsightsReadDatesAndBudgetTests: XCTestCase {
     func testBlockDatesCompareAsLocalCalendarDaysEvenLateAtNight() {
         let lateNight = Calendar.current.date(bySettingHour: 23, minute: 30, second: 0, of: Time.civil(2026, 9, 2))!
         let out = render(Data(blocks: [block("2026-09-02", 45), block("2026-09-03", 45)], now: lateNight))
-        XCTAssertTrue(out.contains("Planned: 1 calendar block (0h 45m) dated in this window."), out)
+        XCTAssertTrue(out.contains("Planned: 1 calendar block (45m) dated in this window."), out)
     }
 
     func testStaysUnderTheCapWithLongNamesDroppingInsightDetailFirst() {
@@ -296,6 +296,45 @@ final class InsightsReadAlignedDefinitionsTests: XCTestCase {
         let out = render(Data(tasks: [t], sessions: sessions))
         // 19 s and 37 s don't count; the 30-hour timer counts for 90 min (3 × 30).
         XCTAssertTrue(out.contains("Focus: 1h 30m across 1 session"), out)
+    }
+
+    // MARK: cross-platform rules (analytics review, 2026-09-24)
+
+    /// An area on a task that isn't in the user's list is its own line, by
+    /// name, after the user's areas — never folded into "No area" (web's rule).
+    func testByAreaShowsAnAreaOutsideTheUsersListUnderItsOwnName() {
+        let errands = task("e", "Post office", lifeArea: "Errands")
+        let garden = task("g", "Weed the beds", lifeArea: "Gardening")
+        let loose = task("n", "Loose end")
+        let sessions = [sess(errands, SEP, 1, 9, 0, 3600), sess(garden, SEP, 1, 11, 0, 1800), sess(loose, SEP, 1, 13, 0, 1800)]
+        let out = renderInsights(tasks: [errands, garden, loose], sessions: sessions, captures: [], reasons: [], blocks: [],
+                                 now: FIXED_NOW, window: .week, areas: ["Errands", "Work"])
+        XCTAssertTrue(out.contains("By area: Errands 1.0h, Gardening 0.5h, No area 0.5h."), out)
+    }
+
+    /// get_insights' minutes are the page's: floor((sec + 30) / 60), written
+    /// like the review — 99.5 min is "1h 40m", never the floored "1h 39m".
+    func testFocusMinutesRoundLikeThePage() {
+        let t = task("a", "Write report", estimateMin: 60)
+        let out = render(Data(tasks: [t], sessions: [sess(t, SEP, 1, 9, 0, 5970)],
+                              blocks: [block("2026-09-01", 60), block("2026-09-02", 60)]))
+        XCTAssertTrue(out.contains("Focus: 1h 40m across 1 session, median 1h 40m."), out)
+        XCTAssertTrue(out.contains("Planned: 2 calendar blocks (2h) dated in this window."), out)
+        XCTAssertEqual(fmtFocusSec(5969), "1h 39m")   // 99.48 min
+        XCTAssertEqual(fmtFocusSec(5970), "1h 40m")   // 99.5 min
+        XCTAssertEqual(fmtFocusSec(29), "0m")
+        XCTAssertEqual(fmtFocusSec(3600), "1h")
+    }
+
+    /// A runaway timer's captures are placed from its REAL start (completedAt −
+    /// what it really ran), not from its clamped length, which put them hours
+    /// "before the start" and dropped them (Android's rule).
+    func testInterruptionsPlaceARunawayTimersCapturesFromItsRealStart() {
+        let t = task("a", "Write report")   // estimate 30 → counts at most 90 min
+        let run = sess(t, SEP, 1, 9, 0, 6 * 3600, "run")   // 09:00 → 15:00, forgotten
+        let caps = [capture(.idea, SEP, 1, 9, 5, "run"), capture(.idea, SEP, 1, 9, 10, "run"), capture(.idea, SEP, 1, 9, 20, "run")]
+        let out = render(Data(tasks: [t], sessions: [run], captures: caps))
+        XCTAssertTrue(out.contains("Interruptions: 3 captures mid-session, most around 3–6 min in."), out)
     }
 
     func testInterruptionsNeedThreeLinkedCaptures() {

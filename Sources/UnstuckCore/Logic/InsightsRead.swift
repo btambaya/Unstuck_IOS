@@ -79,8 +79,12 @@ public func windowLabel(_ window: InsightsWindow) -> String {
 
 // MARK: - small formatters
 
-/// Identical to the DeepDive "Focus this week" stat: `2h 45m`.
-private func fmtHM(_ sec: Int) -> String { "\(sec / 3600)h \((sec % 3600) / 60)m" }
+/// Seconds as the Insights page shows them: rounded minutes,
+/// floor((sec + 30) / 60), written `45m` / `2h` / `1h 5m` — the page's
+/// Focused card and get_period_review use the same rule, so the model never
+/// quotes a number a minute off the screen ("1h 39m" for the page's 1h 40m;
+/// same rule on web and Android).
+func fmtFocusSec(_ sec: Int) -> String { fmtFocusDur(roundedMinutes(sec)) }
 
 /// `Wed 2 Sep` — local getters only.
 private func fmtDay(_ d: Date) -> String {
@@ -148,7 +152,10 @@ public func renderInsights(
 ) -> String {
     let start = insightsWindowStart(window, now: now)
     let lo: EpochMillis? = start.map { $0.timeIntervalSince1970 * 1000 }
-    let sessions = countableSessions(allSessions).filter { inWindow($0.completedAt, lo: lo) }
+    // Raw rows in the window (the interruptions line places a runaway at its
+    // real start), and the D1-counted ones every focus number uses.
+    let rawSessions = allSessions.filter { inWindow($0.completedAt, lo: lo) }
+    let sessions = countableSessions(rawSessions)
     let captures = allCaptures.filter { inWindow($0.at, lo: lo) }
     let reasonLogs = reasons.filter { inWindow($0.at, lo: lo) }
     let nowMs: EpochMillis = now.timeIntervalSince1970 * 1000
@@ -165,16 +172,17 @@ public func renderInsights(
         lines.append("Focus: no focus sessions in this window.")
     } else {
         let totalSec = sessions.reduce(0) { $0 + $1.actualSec }
-        lines.append("Focus: \(fmtHM(totalSec)) across \(plural(sessions.count, "session")), median \(jsRound(Double(medianSec(sessions)) / 60))m.")
+        lines.append("Focus: \(fmtFocusSec(totalSec)) across \(plural(sessions.count, "session")), median \(fmtFocusSec(medianSec(sessions))).")
 
-        // By area over the user's own areas + "No area" — the screen's
-        // "When focus happens" bars, series for series.
+        // By area: the screen's "When focus happens" series, series for
+        // series — the user's areas, any other area a task carries under its
+        // own name, then "No area".
         let areaNames = (userAreas?.isEmpty == false) ? userAreas! : DEFAULT_AREAS
-        let bars = weekdayAreaHours(sessions, tasks, areas: areaNames)
+        let bars = weekdayAreaBars(sessions, tasks, areas: areaNames)
         var areaLines: [String] = []
-        for (i, area) in (areaNames + [NO_AREA_LABEL]).enumerated() {
-            let hours = bars.reduce(0.0) { $0 + $1.data[i] }
-            if hours > 0 { areaLines.append("\(area) \(toFixed1(hours))h") }
+        for (i, series) in bars.series.enumerated() {
+            let hours = bars.days.reduce(0.0) { $0 + $1.data[i] }
+            if hours > 0 { areaLines.append("\(series.name) \(toFixed1(hours))h") }
         }
         if !areaLines.isEmpty {
             lines.append("By area: \(areaLines.joined(separator: ", ")).")
@@ -215,7 +223,7 @@ public func renderInsights(
 
     // Interruptions: Report histogram — captures written mid-session, by
     // minutes in. Shown (here and on screen) from 3 linked captures.
-    let bins = interruptionBins(captures, sessions)
+    let bins = interruptionBins(captures, rawSessions)
     let linked = bins.reduce(0, +)
     if linked >= INTERRUPTIONS_MIN_LINKED {
         let peakIdx = bins.firstIndex(of: bins.max() ?? 0) ?? 0
@@ -263,7 +271,7 @@ public func renderInsights(
     }
     if !planned.isEmpty {
         let mins = planned.reduce(0) { $0 + $1.durationMinutes }
-        lines.append("Planned: \(plural(planned.count, "calendar block")) (\(fmtHM(mins * 60))) dated in this window.")
+        lines.append("Planned: \(plural(planned.count, "calendar block")) (\(fmtFocusDur(mins))) dated in this window.")
     }
 
     // Worth noticing: the Report's own narrative cards.

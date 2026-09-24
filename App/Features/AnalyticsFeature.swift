@@ -38,7 +38,9 @@ struct InsightsSnapshot {
     let weekly: [TrendPoint]
     let trend: [TrendPoint]
     let weekday: [StackedBar]
-    let areaNames: [String]
+    /// The bars' series, in slot order: the user's areas, any other area a
+    /// task carries (by name), then "No area" (AreaSeries.area == nil).
+    let areaSeries: [AreaSeries]
     let dots: [CalibrationDot]
     let interruptions: [Int]
     let comeBack: [Int]
@@ -144,8 +146,8 @@ final class AnalyticsModel {
     }
 
     /// Drive the stacked bars from the user's OWN areas (DEFAULT_AREAS dropped
-    /// every custom/renamed area's hours — Android parity); the core adds the
-    /// trailing "No area" series.
+    /// every custom/renamed area's hours — Android parity); the core adds any
+    /// other area a task carries, by name, then "No area" (web's rule).
     var areaNames: [String] {
         let names = lifeAreas.map { $0.name }
         return names.isEmpty ? DEFAULT_AREAS : names
@@ -165,12 +167,16 @@ final class AnalyticsModel {
         let f = periodFacts(data, p.window)
         let today = PeriodTime.at(Int64((now.timeIntervalSince1970 * 1000).rounded(.down))).day
         let wSessions = f.sessions.map(\.session)
+        // The same sessions as stored: the interruptions chart places a
+        // runaway timer at its REAL start (the clamped copy put it hours late).
+        let rawById = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+        let wRaw = wSessions.map { rawById[$0.id] ?? $0 }
+        let bars = weekdayAreaBars(wSessions, tasks, areas: areaNames)
         let nowMs = now.timeIntervalSince1970 * 1000
         // Calendar weeks from the first activity's week through this one.
         let weeksSinceFirst = earliest.map {
             max(1, civilDaysBetween(LocalDate.mondayOf($0), LocalDate.mondayOf(today)) / 7 + 1)
         } ?? 1
-        let names = areaNames
         let secs = wSessions.map(\.actualSec).sorted()
         let lastWeek: PeriodHeadline? = (kind == .week && offset == 0)
             ? periodHeadline(data, resolveInsightsPeriod(.week, offset: 1, now: now, earliest: earliest)) : nil
@@ -188,10 +194,10 @@ final class AnalyticsModel {
                                selectedFrom: kind == .all ? nil : p.from, now: now,
                                count: kind == .month ? min(26, max(6, offset + 1))
                                    : kind == .all ? min(26, weeksSinceFirst) : min(26, max(8, offset + 1))),
-            weekday: weekdayAreaHours(wSessions, tasks, areas: names),
-            areaNames: names,
+            weekday: bars.days,
+            areaSeries: bars.series,
             dots: calibrationDots(wSessions, tasks),
-            interruptions: interruptionBins(f.captures, wSessions),
+            interruptions: interruptionBins(f.captures, wRaw),
             comeBack: pauseLengthBins(f.pauses),
             heatmap: focusHourGrid(wSessions),
             slips: slipping(tasks, now: nowMs),
@@ -835,9 +841,10 @@ struct AnalyticsView: View {
     @ViewBuilder
     private func stackedBars(_ title: String, _ vm: AnalyticsModel, _ snap: InsightsSnapshot) -> some View {
         let bars = snap.weekday
-        // The user's own areas + the trailing "No area" series (no task, no
-        // area, or an area since deleted) — ink4, like an unmatched area.
-        let areas = snap.areaNames + [NO_AREA_LABEL]
+        // The series in slot order: the user's own areas, any other area a
+        // task carries (ink4, like any unmatched name), then "No area" (ink4).
+        let series = snap.areaSeries
+        let areas = series.map(\.name)
         let maxV = max(bars.map { $0.data.reduce(0, +) }.max() ?? 0, 0.001)
         let legend = areas.enumerated().filter { i, _ in bars.contains { ($0.data.count > i ? $0.data[i] : 0) > 0 } }.map(\.element)
         Card {
@@ -852,7 +859,7 @@ struct AnalyticsView: View {
                                     let frac = min(max(v / maxV, 0), 1)
                                     if frac > 0 {
                                         Rectangle()
-                                            .fill(areaColor(forName: i < areas.count - 1 ? areas[i] : nil, vm))
+                                            .fill(areaColor(forName: i < series.count ? series[i].area : nil, vm))
                                             .frame(width: geo.size.width * frac)
                                     }
                                 }
@@ -867,7 +874,7 @@ struct AnalyticsView: View {
                     }
                 }
                 FlowLegend(areas: legend, color: { name in
-                    areaColor(forName: name == NO_AREA_LABEL ? nil : name, vm)
+                    areaColor(forName: series.first { $0.name == name }?.area, vm)
                 }).padding(.top, 4)
             }
             .frame(maxWidth: .infinity, alignment: .leading)

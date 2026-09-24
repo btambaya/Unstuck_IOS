@@ -43,6 +43,41 @@ phases land. Newest status at the top.
 
 
 
+## James's assistant reports + analytics alignment (branch polish/ios, 2026-09-24) — not shipped yet
+
+Same behaviour is being built on web and Android the same night; keep the wording in step.
+
+- **Wrong date (A1).** `schedule_task` refuses a WEEKLY series on a day it doesn't repeat on (James's Saturday park run
+  landed on Sunday 20 Sep): `rejectOffSeriesDay` (UnstuckCore/Logic/SeriesWeekday.swift) names the nearest real days in
+  plain words ("Saturday 19 September (2026-09-19) or Saturday 26 September …"); nothing is written. The SAME call made
+  again in the turn/voice session (`TurnScratch.offDayRefused`) is the model confirming a one-off the user asked for —
+  it goes through and the ok-result says "— a one-off on Sunday 20 September; the series stays on Saturday". A day
+  that already holds one of the task's occurrences (a one-off moved there earlier) is not checked — retiming it goes
+  straight through, as on web and Android.
+  `set_task_recurrence` weekly refuses when the slot placed EARLIER THIS TURN (create_task/schedule_task with a date,
+  `scratch.placedBlocks`) is on a day the new days don't include (`rejectOffSeriesPlacement`) — the create-on-Sunday-then-
+  weekly-Saturday variant that started the series a week late. create_task itself never makes a series, so it has no check.
+- **Receipts (A2).** "Undo all" is the turn that JUST finished only (`AssistantModel.undoAllTarget(_:nowMs:)`, Android's
+  rule: newest displayed turn with receipts, no user message after it, landed ≤ 15 min ago, still has an Undo) and asks
+  first, naming every change (alert in AssistantSheet). A commit keeps the LIVE copy of older turns
+  (`mergeCommitted`), so an Undo tapped mid-turn stays used. Confirm-first is enforced in CODE:
+  `AssistantHarness.confirmFirstRefusal` runs before any registry `confirmFirst` tool (delete_task, delete_list,
+  leave_list, delete_area, delete_tag, cancel_focus) and refuses unless the user's latest message asks for it by name,
+  points at what the assistant just named ("delete it"), asks sweepingly ("delete all my done tasks"), or is a yes to the
+  assistant's previous delete question (`ConfirmFirst.allows`, UnstuckCore/Logic/ConfirmFirst.swift). A yes is a short
+  answer that starts with one ("I'll do it on Friday" / "please add milk" are not), it answers the thing the QUESTION
+  named (not another name earlier in the reply), and a message that opens with a no ("No, leave it") asks only for
+  what it names. TEXT harness only — the voice path (Talk + calls, `runVoiceTool`) is not gated yet.
+- **Analytics (B), picked rules, all three apps:** an area outside the user's list is its own series by name
+  (`areaSeries`/`weekdayAreaBars`, web's rule; "No area" only when some session has none); repeating series sort kept →
+  due → name; the voice review flag clears only on `.createResponse`/`.commitAndRespond` (already so since 5316fe2, now
+  pinned with the echo test); a runaway's START for golden hours + interruptions = completedAt − what it really ran,
+  weighted by its counted length (`realSessionStartMs`, Android's rule; callers now pass RAW sessions to `goldenHours`
+  and `interruptionBins`, which run the D1 filter themselves; a capture "before the start" lands in bin 0 like web and
+  Android); "All time" starts at the earliest task created / task DONE / counted session end (a reopened task's old
+  completion no longer counts); `get_insights` minutes are floor((sec+30)/60) written 45m / 2h / 1h 5m (Focus, median,
+  Planned).
+
 ## AI-consent gate (branch launch/ai-consent-ios, 2026-09-24) — not shipped yet
 
 **Why:** Apple guideline 5.1.2(i) — disclose and get explicit permission before personal data goes to a third-party AI.

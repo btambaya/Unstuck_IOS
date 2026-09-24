@@ -83,8 +83,9 @@ private func fmtRange(_ start: Int, _ end: Int) -> String {
 }
 
 /// The user's proven focus window, from the last 60 days of sessions. Each
-/// session's START hour (completedAt minus actualSec, local time) is weighted
-/// by actualSec — one long deep-work block outvotes a scatter of two-minute
+/// session's START hour (completedAt minus the time it really ran, local
+/// time) is weighted by its counted (D1) seconds — one long deep-work block
+/// outvotes a scatter of two-minute
 /// dabs. Requires ≥10 qualifying sessions, else nil (don't invent a pattern
 /// from noise).
 ///
@@ -99,13 +100,18 @@ public func goldenHours(_ sessions: [Session], now: Date) -> GoldenHours? {
     var bins = Array(repeating: 0, count: 24)
     var total = 0
     var count = 0
+    // Pass the RAW sessions: the D1 filter runs here. A session counts for
+    // its D1 length (a 5-second start not at all; a forgotten timer can't
+    // outvote real sessions), but its START hour comes from how long it
+    // REALLY ran — a timer forgotten overnight "started" at 4am when read
+    // from its clamped length (Android's rule, 1c616da, now on all three).
     for s in sessions {
-        guard s.actualSec > 0 else { continue }
+        guard let counted = countedSec(s), counted > 0 else { continue }
         guard let endMs = LocalTime.parseMillis(s.completedAt), endMs >= windowStart, endMs <= nowMs else { continue }
-        let start = Date(timeIntervalSince1970: (endMs - Double(s.actualSec) * 1000) / 1000)
+        let start = Date(timeIntervalSince1970: (endMs - Double(max(0, s.actualSec)) * 1000) / 1000)
         let startHour = Time.calendar.component(.hour, from: start)
-        bins[startHour] += s.actualSec
-        total += s.actualSec
+        bins[startHour] += counted
+        total += counted
         count += 1
     }
     if count < 10 || total <= 0 { return nil }

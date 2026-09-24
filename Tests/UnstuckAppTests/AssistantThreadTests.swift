@@ -220,6 +220,62 @@ final class AssistantThreadTests: XCTestCase {
         ])
         XCTAssertEqual(turn.undoableReceipts.count, 1)
     }
+
+    // MARK: "Undo all" — only the turn that just finished (James, build 51)
+
+    private func created(_ name: String, _ id: String) -> Receipt {
+        Receipt(icon: .plus, label: "Created “\(name)”", undo: .deleteTask(id: id))
+    }
+    private func reply(_ id: String, at: Double?, _ receipts: Receipt...) -> AssistantTurn {
+        AssistantTurn(ChatMessage(role: "assistant", content: "Done."), id: id, at: at, receipts: receipts.isEmpty ? nil : receipts)
+    }
+    private let now: Double = 1_790_000_000_000
+    private let minute: Double = 60_000
+
+    func testUndoAllTargetsTheTurnThatJustFinished() {
+        let t = reply("m1", at: now - 2 * minute, created("Milk", "a"),
+                      Receipt(icon: .calendar, label: "Scheduled “Milk”"), created("Eggs", "b"))
+        let display = [user("add milk and eggs", at: now - 3 * minute), t]
+        XCTAssertEqual(AssistantModel.undoAllTarget(display, nowMs: now)?.id, "m1")
+        XCTAssertEqual(AssistantModel.undoAllTarget(display, nowMs: now)?.undoableReceipts.map(\.label),
+                       ["Created “Milk”", "Created “Eggs”"])
+        // A turn that landed a moment after the clock was read still counts.
+        XCTAssertEqual(AssistantModel.undoAllTarget([reply("m2", at: now + 30_000, created("Bins", "c"))], nowMs: now)?.id, "m2")
+    }
+
+    func testUndoAllNeverReachesBackToAnOlderTurn() {
+        let milk = reply("m1", at: now - 5 * minute, created("Milk", "a"), created("Eggs", "b"))
+        // A later question — the chip used to stay on milk/eggs for ever.
+        XCTAssertNil(AssistantModel.undoAllTarget([milk, user("what's on today?", at: now - 2 * minute),
+                                                   reply("m2", at: now - minute)], nowMs: now))
+        // James's 20:35 reply: its only card was "Deleted" (no Undo), and the
+        // chip read "Undo all 2 changes" from an earlier turn.
+        let deleted = reply("m3", at: now - minute, Receipt(icon: .trash, label: "Deleted “Pack ski gear checklist”"))
+        XCTAssertNil(AssistantModel.undoAllTarget([milk, deleted], nowMs: now))
+        // 15 minutes is the limit; no landing time, no chip.
+        XCTAssertNil(AssistantModel.undoAllTarget([reply("m1", at: now - 16 * minute, created("Milk", "a"))], nowMs: now))
+        XCTAssertNotNil(AssistantModel.undoAllTarget([reply("m1", at: now - 15 * minute, created("Milk", "a"))], nowMs: now))
+        XCTAssertNil(AssistantModel.undoAllTarget([reply("m1", at: nil, created("Milk", "a"))], nowMs: now))
+        // Every Undo already used.
+        var used = created("Milk", "a"); used.undone = true
+        XCTAssertNil(AssistantModel.undoAllTarget([reply("m1", at: now - minute, used)], nowMs: now))
+    }
+
+    /// An Undo tapped on an older receipt while a turn runs survives the
+    /// turn's commit — the start-of-turn copy used to reset it.
+    func testACommitKeepsTheLiveCopyOfOlderTurns() {
+        let old = reply("m1", at: now - 5 * minute, created("Milk", "a"))
+        let ask = user("and bread", at: now - minute)
+        var undone = old
+        undone.receipts?[0].undone = true
+        let voice = AssistantTurn(ChatMessage(role: "assistant", content: "While we talked:"), id: "v1", at: now, local: true)
+        let working = [old, ask, reply("m2", at: now, created("Bread", "c"))]
+        let merged = AssistantModel.mergeCommitted(current: [undone, ask, voice], working: working, baseIds: [old.id, ask.id])
+        XCTAssertEqual(merged.map(\.id), ["m1", ask.id, "m2", "v1"])
+        XCTAssertEqual(merged[0].receipts?[0].undone, true)
+        XCTAssertEqual(merged[2].receipts?.map(\.label), ["Created “Bread”"])
+    }
+
 }
 
 // MARK: - share confirm

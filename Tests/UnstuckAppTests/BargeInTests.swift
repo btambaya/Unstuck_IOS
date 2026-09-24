@@ -2379,4 +2379,39 @@ final class BargeInTests: XCTestCase {
         _ = ok.handle(.responseAlreadyActive, now: 1.5)   // another create collided with its reply
         XCTAssertFalse(ok.pendingCreate)
     }
+
+    // MARK: the review flag and the loudspeaker (analytics review, 2026-09-24)
+
+    /// The voice review flag (VoiceIntegrityGuard.periodReviewed) clears only
+    /// when the app answers a REAL user turn — the client calls
+    /// userTurnAnswered() on exactly `.createResponse` / `.commitAndRespond`
+    /// (VoiceRealtimeClient). The loudspeaker echo of the spoken review fires
+    /// speech_started and even transcribes, but the controller turns it into
+    /// no answer, so the flag survives it and the review is never bounced as
+    /// a false claim. Android's rule; the same on all three.
+    func testTheReviewsOwnEchoNeverClearsTheReviewFlag() {
+        var g = VoiceIntegrityGuard()
+        func apply(_ cmds: [BargeInCommand]) {
+            for c in cmds where c == .createResponse || c == .commitAndRespond { g.userTurnAnswered() }
+        }
+        g.toolFinished("get_period_review", result: "ok: review of last week (Mon 14 Sep – Sun 20 Sep).")
+        var c = speaking(.speaker)
+        said(&c, "You finished the report and kept Stretch five days.")
+        apply(c.handle(.speechStarted(itemId: "echo"), now: 1.0))
+        apply(c.handle(.speechStopped, now: 1.3))
+        apply(c.handle(.transcription(text: "you finished the report and kept stretch five days", itemId: "echo", final: true), now: 1.4))
+        apply(c.handle(.tick, now: 2.0))
+        XCTAssertTrue(g.periodReviewed, "echo is not a user turn")
+        g.responseCreated()
+        g.transcriptDelta("You also completed \"Tax return\".")
+        XCTAssertFalse(g.shouldCorrect(), "the rest of the review still reads as a review")
+        // The user's real next question is answered — and only then does the review stop vouching.
+        apply(c.handle(.responseDone(id: "r1", status: "completed"), now: 3.0))
+        apply(c.handle(.playbackDrained, now: 3.2))
+        apply(c.handle(.speechStarted(itemId: "q"), now: 5))
+        apply(c.handle(.speechStopped, now: 6))
+        apply(c.handle(.transcription(text: "what have I got left today", itemId: "q", final: true), now: 6.3))
+        apply(c.handle(.tick, now: 6.8))
+        XCTAssertFalse(g.periodReviewed)
+    }
 }
