@@ -947,6 +947,7 @@ final class AppModel {
         }
         uiTestGoogleBacklog = GoogleWriteBacklog(defaults: nil, currentUser: { "ui-test" })
         if heavy { HeavyDemoSeed.seedIfNeeded(database) } else { DemoSeed.seed(database) }
+        if ProcessInfo.processInfo.environment["UITEST_LONG_LIST"] == "1" { DemoSeed.seedLongCollection(database) }
         // The demo persona has a NAME. Without one the greeting falls back to
         // "Good evening Unstuck." — correct behaviour, but it reads as a bug in
         // a marketing screenshot. "Maya" is the persona the web seed already
@@ -975,7 +976,12 @@ final class AppModel {
         if ProcessInfo.processInfo.environment["UITEST_TOUR"] == "1" {
             TourStore().save { $0 = TourState(eligible: true) }
         } else {
-            TourStore.clear()
+            // WRITE an empty state rather than remove the key: a removed key
+            // falls through to any device-level value for this bundle id (one
+            // simulator carries `{"eligible":true}` in data/Library/Preferences/
+            // io.unstucknow.app.plist from a `simctl … defaults write`), and
+            // that armed the welcome card over Today on every demo boot there.
+            TourStore().save { $0 = TourState() }
         }
         // Debug hook: jump straight into Focus on launch (crash isolation).
         if ProcessInfo.processInfo.environment["UITEST_FOCUS"] == "1",

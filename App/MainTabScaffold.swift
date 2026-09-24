@@ -22,6 +22,21 @@ struct MainTabScaffold: View {
                          onSelect: { router.tab = $0 },
                          fabLabel: fabAction.accessibilityLabel,
                          onFab: { tapFab() })
+                // Pinned to the bottom of the SCREEN, so the keyboard slides up
+                // over it like a system tab bar (and away again on dismiss).
+                // As a plain child of this keyboard-avoiding ZStack it rode up
+                // to sit ON the keyboard, over the bottom ~60 pt of the tab's
+                // scroll view — exactly where a ScrollView parks a focused
+                // field (flush with the keyboard), so an item being edited or
+                // added at the bottom of a collection vanished under the bar
+                // (Ahmad, build 97). The tab content keeps its keyboard
+                // avoidance; only the bar opts out. The flexible frame is what
+                // lets it opt out: it spans the ZStack down to the keyboard
+                // edge, so ignoring the keyboard inset stretches it to the
+                // screen's bottom safe edge and the bar aligns there. Its empty
+                // area takes no touches.
+                .frame(maxHeight: .infinity, alignment: .bottom)
+                .ignoresSafeArea(.keyboard, edges: .bottom)
         }
             .background(theme.palette.bg.ignoresSafeArea())
             .sheet(item: $router.activeSheet, onDismiss: { model.flushPendingDeepLink() }) { sheet in

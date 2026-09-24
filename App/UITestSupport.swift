@@ -126,6 +126,21 @@ extension DemoSeed {
         try? db.save(TaskItem(id: "t-garage", name: "Clear out the garage", estimateMin: 90, done: true, lifeArea: "Personal",
                               moveCount: 3, completedAt: iso(-3_000), createdAt: iso(-21 * 86_400), updatedAt: now))
     }
+
+    /// UITEST_LONG_LIST: a collection taller than the screen (12 items), the
+    /// shape of Ahmad's "sync up" list from 2026-09-24 — editing a row near its
+    /// bottom is where the keyboard covered the row and the bottom nav rode up
+    /// over the keyboard. Seeded, not typed: the demo boot has no
+    /// SyncCoordinator, so an item added through the UI never lands.
+    static func seedLongCollection(_ db: AppDatabase) {
+        let now = iso(0)
+        let bodies = ["Review TestFlight feedback", "Voice minutes pricing", "Play Store listing copy",
+                      "Missed-call re-ring", "Sharing polish", "Analytics dashboard", "Onboarding copy pass",
+                      "App Store screenshots", "Launch date", "Support inbox", "Press kit", "Beta invite list"]
+        try? db.save(ItemCollection(id: "col-sync", name: "Sync up", color: "indigo", subtitle: nil,
+                                    items: bodies.enumerated().map { i, b in CollectionItem(id: "s\(i)", body: b, at: now) },
+                                    sortOrder: -1, archived: false))
+    }
 }
 
 // MARK: - bulk-turn repro (UITEST_ASSISTANT_BULK)

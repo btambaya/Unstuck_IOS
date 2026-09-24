@@ -43,6 +43,40 @@ phases land. Newest status at the top.
 
 
 
+## Keyboard over a long collection: the bottom nav stays under the keyboard (branch listkbd/ios, 2026-09-24) — not shipped yet
+
+Ahmad (build 97, a ~9-item shared list): holding an item near the bottom to edit it — the keyboard covered the row,
+the list wouldn't bring it into view, and the bottom nav rode up and sat ON TOP of the keyboard.
+
+- **Root cause (measured, iPhone 17 Pro sim, real software keyboard).** `MainTabScaffold` drew `BottomNavBar` as the
+  bottom-aligned child of a `ZStack` that respects the keyboard safe area, so SwiftUI's keyboard avoidance lifted the
+  bar to the keyboard's top edge (bar y 479–539, keyboard from 539). The tab's ScrollView parks a focused field
+  flush against the keyboard (edited row's field y 519–539) — the exact band the bar now covered, because the bar is
+  a sibling overlay the ScrollView knows nothing about (the tab roots' `padding(.bottom, 96)` is scroll room, not an
+  inset the scroll-to-focused-field honours). Same for the add field (auto-focused on open, and via the +).
+- **Fix (one place).** The bar is pinned to the bottom of the SCREEN:
+  `.frame(maxHeight: .infinity, alignment: .bottom).ignoresSafeArea(.keyboard, edges: .bottom)` on `BottomNavBar` in
+  `MainTabScaffold`. The keyboard slides up over it like a system tab bar (and off it on dismiss); the tab content
+  keeps its keyboard avoidance, so the focused row / add field sits just above the keyboard and the list scrolls
+  freely. Nothing else moves when there is no keyboard (the flexible frame's empty area takes no touches).
+- **Scope.** The only text fields in tab content (under the bar) are Collections': grid search, the detail's title
+  rename, the add field, the item edit field — all covered by the scaffold fix. Today / Tasks / Calendar tab content
+  has no text field (capture, new task, task editor, assistant, settings, share, palette are all sheets, which never
+  carried the bar).
+- **Test:** `CollectionKeyboardUITests` (appended to `UITests/AppSmokeUITests.swift`) on the demo boot +
+  `UITEST_LONG_LIST=1` (a 12-item "Sync up" list, `DemoSeed.seedLongCollection`): opens it, holds the last row, adds
+  at the bottom via the +, light + dark — asserts the field is wholly above the keyboard, the nav is not above it, the
+  list still scrolls, and the nav is back at the bottom after. RED before (bar y 487–533 over the keyboard at 583,
+  field 518–539 under the bar), GREEN after. Screenshots: `TEST_RUNNER_LISTKBD_SHOTS_DIR` / `…_SHOT_PREFIX`.
+  Simulator gotcha: with a hardware keyboard attached the software keyboard sits off screen until XCUITest types, so
+  the test types a space + delete before measuring.
+- **Also (DEBUG demo boot only):** simulator 7265C136 (iPhone 17 Pro) carries a DEVICE-level
+  `data/Library/Preferences/io.unstucknow.app.plist` with `unstuck.tour.v1 = {"eligible":true}` (a `simctl … defaults
+  write` from July). `TourStore.clear()` only removes the app-domain value, so the fallback armed the tour welcome over
+  Today on every demo boot there and every AppSmoke test failed "never reached Today". `startUITestMode` now WRITES an
+  empty tour state instead of clearing it (UITEST_TOUR boots unchanged).
+- **Not touched:** colours ("Shared with N" indigo — separate pass). Android: separate branch.
+
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 
 Ahmad: "Can the plus just be on same line as everything". The coral + was a 56-pt square lifted 28 pt above the bar
