@@ -110,7 +110,11 @@ struct VoiceIntegrityGuard: Sendable {
     /// get_period_review returned ok: since the user last spoke — the spoken
     /// review ("you finished the chapter draft…") is a later response than
     /// the one that carried the call, so a per-response flag isn't enough.
-    /// Cleared when the user's next speech starts (week-review-spec.md §5.4).
+    /// Cleared when the app answers the user's NEXT turn (week-review-spec.md
+    /// §5.4) — not on a raw `speech_started`, which on the loudspeaker also
+    /// fires for the echo of the review itself and would re-arm the guard
+    /// against the very reply it was cleared for (a corrective there forces
+    /// a tool call, `tool_choice: required`).
     var periodReviewed = false
 
     /// The corrective injected as a hidden user item (verbatim from the web).
@@ -141,8 +145,10 @@ struct VoiceIntegrityGuard: Sendable {
         nextResponseToolBacked = result.hasPrefix("ok:") && Self.counts(name)
         if name == "get_period_review" && result.hasPrefix("ok:") { periodReviewed = true }
     }
-    /// The user started speaking: a new turn, so an earlier review no longer vouches.
-    mutating func userSpeechStarted() { periodReviewed = false }
+    /// The app is answering a new USER turn (the barge-in controller's
+    /// `.createResponse` after a real turn, or push-to-talk's release): an
+    /// earlier review no longer vouches. Echo and coughs never get here.
+    mutating func userTurnAnswered() { periodReviewed = false }
     /// A cancelled/incomplete response (barge-in) is not a claim.
     mutating func responseCancelled() { wasCorrection = false }
 
@@ -937,8 +943,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 voiceLog.notice("voice truncate at \(cut.audioEndMs, privacy: .public) ms of \((heard?.receivedFrames ?? 0) * 1000 / AudioTruncation.sampleRate, privacy: .public) ms")
                 send(cut.event(id: Self.truncateEventPrefix + String(n)))
             case .deleteItem(let id): send(["type": "conversation.item.delete", "item_id": id])
-            case .createResponse: send(["type": "response.create"])
+            case .createResponse:
+                // Only ever a user turn's answer (tryAsk): tool continuations,
+                // correctives and the opening go out as `.clientCreate`.
+                withLock { _guard.userTurnAnswered() }
+                send(["type": "response.create"])
             case .commitAndRespond:
+                withLock { _guard.userTurnAnswered() }
                 send(["type": "input_audio_buffer.commit"])
                 send(["type": "response.create"])
             case .startConfirmTimer(let ms):
@@ -1175,7 +1186,6 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // DUCKS (−12 dB) and starts the confirm timer; the state machine
             // turns it into response.cancel + flush + mute (a real barge-in)
             // or a restore (a blip that speech_stopped ends first).
-            withLock { _guard.userSpeechStarted() }
             dispatch(.speechStarted(itemId: ev["item_id"] as? String))
         case "input_audio_buffer.speech_stopped":
             dispatch(.speechStopped)

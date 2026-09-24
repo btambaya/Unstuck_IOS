@@ -634,12 +634,12 @@ struct AnalyticsView: View {
                         HStack {
                             Text(s.name).font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
                             Spacer(minLength: 6)
-                            Text(seriesCaption(s)).font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                            Text(seriesCaption(s, soFar: snap.period.clipped)).font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
                         }
                         dotRow(s.dots)
                     }
                     .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("\(s.name): \(seriesCaption(s))")
+                    .accessibilityLabel("\(s.name): \(seriesCaption(s, soFar: snap.period.clipped))")
                 }
                 if snap.series.count > 5 {
                     Text("+\(snap.series.count - 5) more").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
@@ -649,10 +649,14 @@ struct AnalyticsView: View {
         }
     }
 
-    private func seriesCaption(_ s: SeriesRhythm) -> String {
-        var c = s.dueSoFar > 0 ? "kept \(s.kept) of \(s.dueSoFar) so far" : "coming up"
-        if s.skipped > 0 { c += " · \(s.skipped) skipped" }
-        return c
+    /// "kept 5 of 6" for a finished week or month; "… so far" while it runs;
+    /// "1 skipped" when every day was skipped on purpose; "coming up" only
+    /// when nothing is due yet.
+    private func seriesCaption(_ s: SeriesRhythm, soFar: Bool) -> String {
+        var parts: [String] = []
+        if s.dueSoFar > 0 { parts.append("kept \(s.kept) of \(s.dueSoFar)\(soFar ? " so far" : "")") }
+        if s.skipped > 0 { parts.append("\(s.skipped) skipped") }
+        return parts.isEmpty ? "coming up" : parts.joined(separator: " · ")
     }
 
     /// Filled = done, dash = skipped on purpose, hollow = open, faint = today or later.

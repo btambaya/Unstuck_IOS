@@ -603,7 +603,7 @@ final class AssistantHarnessTests: XCTestCase {
         g.responseCreated()
         g.transcriptDelta("You've also completed \"Tax return\".")
         XCTAssertFalse(g.shouldCorrect())
-        g.userSpeechStarted()
+        g.userTurnAnswered()
         g.responseCreated()
         g.transcriptDelta("You skipped \"Stretch\" on purpose.")
         XCTAssertTrue(g.shouldCorrect(), "a new user turn — the old review vouches for nothing")

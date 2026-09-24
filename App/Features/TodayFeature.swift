@@ -102,7 +102,7 @@ final class TodayModel {
             for try await snap in repo.observeTasksAndBlocks() {
                 areas = snap.areas
                 sessions = snap.sessions
-                weekFocus = UnstuckCore.weekFocusMin(sessions: snap.sessions, now: Date())
+                weekFocusCache = nil   // new sessions → recount on the next read
                 // all/blocks assignment triggers recomputeSnapshot via didSet;
                 // set blocks last so the final recompute sees both.
                 all = snap.tasks
@@ -203,8 +203,20 @@ final class TodayModel {
     /// (D1-filtered sessions, periodFacts, rounded minutes): the old rolling
     /// 7 days showed "This week · 1h 35m" over a Week tab reading nothing
     /// (cross-check P0-8).
-    /// Computed once per store snapshot (not per render — Today redraws often).
-    private(set) var weekFocus: (thisWeek: Int, lastWeek: Int) = (0, 0)
+    /// Counted once per store snapshot AND local day (not per render — Today
+    /// redraws often): keyed on the day too, so a Today left open over Sunday
+    /// night doesn't carry last week's total into Monday as "This week".
+    func weekFocus(now: Date = Date()) -> (thisWeek: Int, lastWeek: Int) {
+        // Read `sessions` on every call, cache hit or not, so the view that
+        // shows the pill stays subscribed to new sessions (Observation).
+        let current = sessions
+        let day = Clock.dateISO(now)
+        if let c = weekFocusCache, c.day == day { return c.value }
+        let value = UnstuckCore.weekFocusMin(sessions: current, now: now)
+        weekFocusCache = (day, value)
+        return value
+    }
+    @ObservationIgnored private var weekFocusCache: (day: String, value: (thisWeek: Int, lastWeek: Int))?
 
     // MARK: nudges (quiet, in-app — Android AppViewModel.nudges parity)
 
@@ -395,8 +407,9 @@ struct TodayView: View {
     /// it reads "Last week · …" and opens Insights on last week.
     @ViewBuilder
     private var weekPill: some View {
-        let f = vm?.weekFocus ?? (thisWeek: 0, lastWeek: 0)
-        let early = LocalDate.dayOfWeek(Clock.todayISO()) == 1 || LocalDate.dayOfWeek(Clock.todayISO()) == 2
+        let f = vm?.weekFocus() ?? (thisWeek: 0, lastWeek: 0)
+        let dow = LocalDate.dayOfWeek(Clock.todayISO())   // 0 = Sunday, 1 = Monday
+        let early = dow == 1 || dow == 2
         let showLast = f.thisWeek == 0 && f.lastWeek > 0 && early
         let min = showLast ? f.lastWeek : f.thisWeek
         if min > 0 {

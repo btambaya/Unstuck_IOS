@@ -447,7 +447,11 @@ extension AppModel {
         // armed it fired during the NEW session, naming the old task, and its
         // End ended the new one (audit 2026-09-22, C38).
         cancelPausedCheckin()
-        let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
+        let nowMs = Date().timeIntervalSince1970 * 1000
+        // Displacing a PAUSED session ends its pause too — the reason log gets
+        // how long it lasted, like every other path that ends a pause (P0-3).
+        if let closed = FocusTimer.closedPauseLog(cur, now: nowMs) { saveReasonLog(closed) }
+        let elapsed = FocusTimer.elapsedSec(cur, now: nowMs)
         // Nobody is watching this clock: "← Out" keeps a session running, and a
         // forgotten one measures wall-clock time — a whole night logged as one
         // session. Capped at the estimate + grace like the shared paths below
@@ -477,8 +481,10 @@ extension AppModel {
             releaseCaptures(ofSession: cur.id, unlinkingTaskId: cur.taskId)
             return
         }
+        // The session's own plan (estimate + extends), not the task default —
+        // the D1 cap and calibration read it (analytics P1-13).
         saveSession(Session(id: cur.id ?? newUUID(), taskId: prev.id, taskName: prev.name,
-                            estimateMin: prev.estimateMin, actualSec: capped, completedAt: Self.isoNow()))
+                            estimateMin: cur.sessionEstimateMin, actualSec: capped, completedAt: Self.isoNow()))
         // One true shared session: an OWNER session on a partner-shared task
         // accrues via the exactly-once ledger with the SHARED session id — the
         // direct bump would double-count against the partner's finalize of the

@@ -638,23 +638,25 @@ public func seriesRhythm(_ data: PeriodData, from: String, to: String, today: St
 public struct UnstuckWin: Equatable, Sendable {
     public let taskId: String
     public let name: String
-    /// Local calendar days from the day it was added to the day it was done.
+    /// Whole days (24 h) from when it was added to when it was done.
     public let waitedDays: Int
     public let moves: Int
 }
 
 public let WIN_WAITED_DAYS = 7
 public let WIN_MOVES = 2
+private let MS_PER_DAY: Int64 = 86_400_000
 
 /// Plain tasks finished in the window that had waited a week or more, or had
 /// been moved twice or more. Longest wait first.
 public func gotUnstuck(_ f: PeriodFacts) -> [UnstuckWin] {
     f.plainDone.compactMap { d -> UnstuckWin? in
-        // Calendar days, as a person counts them ("added Monday, done the
-        // Monday after" = waited 7 days).
-        let created = PeriodTime.parse(d.task.createdAt)?.day
-        let waited = created.map { max(0, CivilDay.between($0, d.at.day)) } ?? 0
-        let moves = d.task.moveCount ?? 0
+        // Elapsed time, floor((completedAt − createdAt) / 24 h) — the same
+        // count web (unstuckWins) and Android (unstuckWins) use, so a task
+        // is a win on all three or on none.
+        let created = PeriodTime.ms(d.task.createdAt)
+        let waited = created.map { d.at.ms > $0 ? Int((d.at.ms - $0) / MS_PER_DAY) : 0 } ?? 0
+        let moves = max(0, d.task.moveCount ?? 0)
         guard waited >= WIN_WAITED_DAYS || moves >= WIN_MOVES else { return nil }
         return UnstuckWin(taskId: d.task.id, name: reviewCleanName(d.task.name), waitedDays: waited, moves: moves)
     }.sorted {

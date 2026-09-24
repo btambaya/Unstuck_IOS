@@ -3081,14 +3081,17 @@ final class AppModel {
         return ok
     }
 
+    // `write` (the coordinator's, else the UI-test write-through) like every
+    // other writer, so the in-memory UI-test store records sessions and pause
+    // lengths too — Insights reads both.
     func saveSession(_ session: Session) {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         let now = Self.isoNow()
         Task { try? await write.upsertSession(session, nowISO: now) }
     }
 
     func saveReasonLog(_ log: ReasonLog) {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         let now = Self.isoNow()
         Task { try? await write.upsertReasonLog(log, nowISO: now) }
     }

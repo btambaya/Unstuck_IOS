@@ -253,7 +253,8 @@ final class PeriodFactsTests: XCTestCase {
             XCTAssertEqual([h.done, h.focusMin, h.sessions, h.showedUp, h.days], [5, 65, 2, 4, 4])
             XCTAssertEqual([h.prevDone, h.prevFocusMin], [7, 140])
             let f = periodFacts(data, p.window)
-            XCTAssertEqual(gotUnstuck(f), [UnstuckWin(taskId: "t04", name: "Gym bag", waitedDays: 10, moves: 0)])
+            // Added Sat 12 Sep 09:00, done Tue 22 Sep 08:00 → 9 whole days (web + Android count the same).
+            XCTAssertEqual(gotUnstuck(f), [UnstuckWin(taskId: "t04", name: "Gym bag", waitedDays: 9, moves: 0)])
             XCTAssertEqual(stillOpenOn(data, day: "2026-09-24"), 2)
             let series = seriesRhythm(data, from: p.from, to: p.to, today: "2026-09-24")
             XCTAssertEqual(series.first?.dots.map(\.state), [.done, .done, .open, .upcoming])
@@ -305,6 +306,27 @@ final class PeriodFactsTests: XCTestCase {
         }
     }
 
+    /// "Waited a week" is elapsed time (floor((done − added) / 24 h)), the
+    /// definition web and Android use — not calendar days, which called a task
+    /// added Monday night and done the next Monday morning a week-long wait.
+    func testGotUnstuckCountsElapsedDaysOrMoves() throws {
+        try withZone("UTC") {
+            func done(_ id: String, created: String, completed: String, moves: Int? = nil) -> TaskItem {
+                TaskItem(id: id, name: id, estimateMin: 25, done: true, moveCount: moves, completedAt: completed, createdAt: created, updatedAt: created)
+            }
+            let tasks = [
+                done("six-days-23h", created: "2026-09-14T21:00:00Z", completed: "2026-09-21T09:00:00Z"),
+                done("seven-days", created: "2026-09-14T09:00:00Z", completed: "2026-09-21T09:00:00Z"),
+                done("moved-twice", created: "2026-09-20T09:00:00Z", completed: "2026-09-21T10:00:00Z", moves: 2),
+                done("quick", created: "2026-09-21T08:00:00Z", completed: "2026-09-21T11:00:00Z", moves: 1),
+            ]
+            let data = PeriodData(tasks: tasks, blocks: [], sessions: [])
+            let f = periodFacts(data, PeriodWindow(from: "2026-09-21", to: "2026-09-27"))
+            XCTAssertEqual(gotUnstuck(f), [UnstuckWin(taskId: "seven-days", name: "seven-days", waitedDays: 7, moves: 0),
+                                           UnstuckWin(taskId: "moved-twice", name: "moved-twice", waitedDays: 1, moves: 2)])
+        }
+    }
+
     func testNeutralDeltas() {
         XCTAssertEqual(neutralDelta(0), "same")
         XCTAssertEqual(neutralDelta(2), "+2")
@@ -325,5 +347,113 @@ final class PeriodFactsTests: XCTestCase {
         XCTAssertNil(CivilDay.parse("2026-02-30"))
         XCTAssertNil(CivilDay.parse("0099-01-01"))
         XCTAssertEqual(CivilDay.range("2026-09-29", "2026-10-02"), ["2026-09-29", "2026-09-30", "2026-10-01", "2026-10-02"])
+    }
+}
+
+// MARK: - the Insights page and get_period_review tell the same story
+
+/// Both read ONE aggregation (periodFacts). For every shared vector that asks
+/// about a week or a month, the page's period (resolveInsightsPeriod) must be
+/// the review's span with the review's comparison window, and the headline
+/// the page draws — Done, Focused, sessions, Showed up, and the numbers it
+/// compares with — must be the numbers the assistant reads out.
+final class PageAndReviewAgreeTests: XCTestCase {
+    private func plural(_ n: Int, _ one: String) -> String { "\(n) \(n == 1 ? one : one + "s")" }
+
+    func testTheInsightsHeadlineIsTheReviewForEveryWeekAndMonthVector() throws {
+        let file = try loadVectors()
+        var checked: [String] = []
+        for v in file.vectors where v.expect.hasPrefix("ok:") {
+            let d = try XCTUnwrap(file.datasets[v.dataset], v.id)
+            try withZone(v.tz) {
+                let now = prNow(v.now)
+                let today = PeriodTime.at(Int64(now.timeIntervalSince1970 * 1000)).day
+                let args = PeriodReviewArgs(period: v.args["period"]?.string, date: v.args["date"]?.string,
+                                            from: v.args["from"]?.string, to: v.args["to"]?.string)
+                guard case .success(let r) = resolvePeriod(args, today: today) else { return XCTFail(v.id) }
+                let kind: InsightsPeriodKind
+                let offset: Int
+                switch r.period {
+                case "this_week", "last_week", "week_of":
+                    kind = .week
+                    offset = CivilDay.between(r.from, CivilDay.monday(today)) / 7
+                case "this_month", "last_month", "month_of":
+                    kind = .month
+                    let (y0, m0, _) = CivilDay.ymd(CivilDay.num(today)), (y1, m1, _) = CivilDay.ymd(CivilDay.num(r.from))
+                    offset = (y0 * 12 + m0) - (y1 * 12 + m1)
+                default:
+                    return   // days / dates: the page has no such span
+                }
+                let data = PeriodData(tasks: d.tasks, blocks: d.blocks, sessions: d.sessions, captures: d.captures, reasons: d.reasons)
+                let p = resolveInsightsPeriod(kind, offset: offset, now: now, earliest: nil)
+                XCTAssertEqual([p.from, p.end], [r.from, r.end], v.id)
+                XCTAssertEqual(p.clipped, r.clipped, v.id)
+                XCTAssertEqual(p.days, r.days, v.id)
+                let prev = try XCTUnwrap(p.prev, v.id)
+                XCTAssertEqual([prev.from, prev.to], [r.prevFrom, r.prevTo], v.id)
+
+                let h = periodHeadline(data, p)
+                let prevSessions = periodFacts(data, prev).sessions.count
+                let text = v.expect
+                if text.contains(": nothing recorded — ") {
+                    XCTAssertEqual([h.done, h.sessions, h.focusMin], [0, 0, 0], v.id)
+                } else {
+                    // Done
+                    if h.done == 0 { XCTAssertTrue(text.contains("\nDone: nothing marked done.\n"), v.id) }
+                    if h.plainDone > 0 { XCTAssertTrue(text.contains("\nDone: \(plural(h.plainDone, "task")) — "), v.id) }
+                    if h.repeatingDone > 0 { XCTAssertTrue(text.contains("\(plural(h.repeatingDone, "repeating check-off")) — "), v.id) }
+                    // Focused + sessions
+                    switch h.sessions {
+                    case 0: XCTAssertTrue(text.contains("\nFocus: no focus sessions logged.\n"), v.id)
+                    case 1: XCTAssertTrue(text.contains("\nFocus: 1 session, \(fmtFocusDur(h.focusMin)) on "), v.id)
+                    default: XCTAssertTrue(text.contains("\nFocus: \(h.sessions) sessions, \(fmtFocusDur(h.focusMin)) in all, "), v.id)
+                    }
+                    // Showed up (the review's "active N of M days"; the length cap may drop the Also line)
+                    if text.contains("\nAlso: ") && h.days >= 2 {
+                        XCTAssertTrue(text.contains("active \(h.showedUp) of \(h.days) days"), v.id)
+                    }
+                }
+                // The comparison the page's neutral changes are built from.
+                let prevDone = try XCTUnwrap(h.prevDone), prevMin = try XCTUnwrap(h.prevFocusMin)
+                if prevDone == 0 && prevSessions == 0 {
+                    if !(text.contains(": nothing recorded — ") && !text.contains("\nBefore that (")) {
+                        XCTAssertTrue(text.contains("): nothing done and no focus logged."), v.id)
+                    }
+                } else {
+                    XCTAssertTrue(text.contains("): done \(h.done) vs \(prevDone) ("), v.id)
+                    XCTAssertTrue(text.contains(", focus \(fmtFocusDur(h.focusMin)) vs \(fmtFocusDur(prevMin)) ("), v.id)
+                    XCTAssertTrue(text.contains(", sessions \(h.sessions) vs \(prevSessions) ("), v.id)
+                }
+                checked.append(v.id)
+            }
+        }
+        // Weeks and months in UTC, New York, across DST and another year.
+        XCTAssertEqual(checked.sorted(), ["V1-last-week", "V10-history-floor", "V11-this-month", "V12-monday-note",
+                                          "V13-length-cap", "V15-stamp-grammar", "V16-hard-cut-keeps-tail", "V17-dst-week",
+                                          "V18-other-year", "V19-padded-args", "V2-this-week-so-far", "V4-week-of",
+                                          "V6-empty-month", "V8-timezone"])
+    }
+
+    /// A forgotten timer and an accidental start: the review, the page and
+    /// the Today pill all go through the ONE D1 filter.
+    func testTheReviewThePageAndThePillShareTheSessionFilter() throws {
+        try withZone("UTC") {
+            let now = prNow("2026-09-24T15:30:00.000Z")
+            let task = TaskItem(id: "t1", name: "Deep work", estimateMin: 25, createdAt: "2026-09-01T09:00:00Z", updatedAt: "2026-09-01T09:00:00Z")
+            let sessions = [
+                Session(id: "runaway", taskId: "t1", taskName: "Deep work", estimateMin: 25, actualSec: 35 * 3600,
+                        completedAt: "2026-09-22T09:00:00Z"),                      // left running overnight → 85 min
+                Session(id: "blip", taskId: "t1", taskName: "Deep work", estimateMin: 25, actualSec: 19,
+                        completedAt: "2026-09-23T09:00:00Z"),                      // an accidental start → nothing
+            ]
+            let review = renderPeriodReview(args: PeriodReviewArgs(period: "this_week"), tasks: [task], blocks: [],
+                                            sessions: sessions, captures: [], reasons: [], now: now,
+                                            historyFloor: nil, blocksPartial: false)
+            XCTAssertTrue(review.contains("\nFocus: 1 session, 1h 25m on \"Deep work\".\n"), review)
+            let data = PeriodData(tasks: [task], blocks: [], sessions: sessions)
+            let h = periodHeadline(data, resolveInsightsPeriod(.week, offset: 0, now: now, earliest: nil))
+            XCTAssertEqual([h.focusMin, h.sessions, h.showedUp], [85, 1, 1])
+            XCTAssertEqual(weekFocusMin(sessions: sessions, now: now).thisWeek, 85)
+        }
     }
 }
