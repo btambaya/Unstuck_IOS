@@ -205,4 +205,97 @@ final class SharePeopleCardShots: XCTestCase {
             app.terminate()
         }
     }
+
+    // MARK: New task → "Share with…" (the one row + the pre-create picker)
+
+    /// New task → More options: the ONE "Share with…" row with nothing picked,
+    /// the pre-create Share screen it opens, two people picked at different
+    /// grades (Maya · Can edit, Zubair · Can view) with Someone new + Invite
+    /// with a link below, and the row's summary afterwards —
+    /// light + dark. PNGs go to SHARE_ROW_SHOTS_DIR (TEST_RUNNER_-prefixed for
+    /// xcodebuild; default /tmp/unstuck-share-row-shots). Each step asserts the
+    /// screen it shoots actually rendered.
+    func testNewTaskShareRowShots() throws {
+        let env = ProcessInfo.processInfo.environment
+        let dir = URL(fileURLWithPath: env["SHARE_ROW_SHOTS_DIR"] ?? "/tmp/unstuck-share-row-shots")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        func shot(_ name: String) {
+            try? XCUIScreen.main.screenshot().pngRepresentation.write(to: dir.appendingPathComponent("\(name).png"))
+        }
+        for dark in [false, true] {
+            let theme = dark ? "dark" : "light"
+            let app = launch(Config(name: "share-row-\(theme)", people: "7,0", dark: dark))
+            let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+            let allow = springboard.buttons["Allow"].firstMatch
+            if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(600_000) }
+
+            let newTask = app.buttons["New task"].firstMatch
+            expect(newTask, "[\(theme)] the demo boot never showed the + (New task)", timeout: 40)
+            guard newTask.exists else {
+                shot("\(theme)-FAILED-boot"); print("BOOT-TREE \(app.debugDescription)")
+                app.terminate(); continue
+            }
+            newTask.tap()
+            expect(app.staticTexts["What's on your mind?"].firstMatch, "[\(theme)] the New task sheet did not open")
+            let nameField = app.textFields["new-task-name"]
+            if nameField.waitForExistence(timeout: 4) {
+                nameField.tap(); nameField.typeText("Plan the team offsite")
+            }
+            let more = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'More options'")).firstMatch
+            expect(more, "[\(theme)] no 'More options' disclosure")
+            guard more.exists else { app.terminate(); continue }
+            // Scroll the disclosure clear of the keyboard, open it, and bring
+            // the Share row up.
+            app.swipeUp(); usleep(500_000)
+            more.tap(); usleep(600_000)
+            let row = app.buttons["new-task-share-row"].firstMatch
+            expect(row, "[\(theme)] the Share with… row is missing under More options")
+            guard row.exists else { shot("\(theme)-FAILED"); app.terminate(); continue }
+            app.swipeUp(); usleep(600_000)
+            XCTAssertEqual(row.label, "Share with", "[\(theme)] the row's VoiceOver label")
+            XCTAssertEqual(row.value as? String, "Only you", "[\(theme)] nothing picked reads Only you")
+            shot("01-row-nothing-picked-\(theme)")
+
+            row.tap()
+            let bar = app.navigationBars["Share"].firstMatch
+            expect(bar, "[\(theme)] the row did not open the Share screen")
+            guard bar.exists else { shot("\(theme)-FAILED-share"); app.terminate(); continue }
+            usleep(900_000)
+            shot("02-picker-open-\(theme)")
+
+            // Maya at the default Can edit …
+            let choose = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Choose someone'")).firstMatch
+            expect(choose, "[\(theme)] no 'Choose someone' row in the pre-create Share screen")
+            if choose.exists {
+                choose.tap(); usleep(800_000)
+                let maya = app.buttons["Share with Maya Chen"].firstMatch
+                expect(maya, "[\(theme)] Maya is not in the picker")
+                if maya.exists { maya.tap(); usleep(900_000) }
+            }
+            // … Zubair at Can view.
+            let view = app.segmentedControls.buttons["Can view"].firstMatch
+            expect(view, "[\(theme)] the Can edit / Can view switch is missing")
+            if view.exists { view.tap(); usleep(400_000) }
+            if choose.waitForExistence(timeout: 4) {
+                choose.tap(); usleep(800_000)
+                let zubair = app.buttons["Share with Zubair Kazaure"].firstMatch
+                expect(zubair, "[\(theme)] Zubair is not in the picker")
+                if zubair.exists { zubair.tap(); usleep(900_000) }
+            }
+            expect(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Maya Chen, Can edit'")).firstMatch,
+                   "[\(theme)] Maya is not shown as picked at Can edit")
+            expect(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Zubair Kazaure, Can view'")).firstMatch,
+                   "[\(theme)] Zubair is not shown as picked at Can view")
+            shot("03-picker-two-picked-\(theme)")
+            expect(app.buttons["Invite with a link"].firstMatch, "[\(theme)] pre-create's connect-invite link is missing")
+            XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Share a link'")).firstMatch.exists,
+                           "[\(theme)] a task link can't exist before the task")
+
+            app.navigationBars["Share"].buttons["Done"].firstMatch.tap(); usleep(900_000)
+            expect(row, "[\(theme)] back on the New task sheet")
+            XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view", "[\(theme)] the row's spoken summary")
+            shot("04-row-two-picked-\(theme)")
+            app.terminate()
+        }
+    }
 }

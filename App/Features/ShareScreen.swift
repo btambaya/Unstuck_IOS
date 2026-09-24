@@ -26,6 +26,15 @@
 // mode — no grade control, one button per person, and the explainer "it
 // becomes their task; you keep view".
 //
+// PRE-CREATE mode (New task → "Share with…", 2026-09-24): the same screen
+// for a task that doesn't exist yet. Its transport is a DraftShareTransport
+// — the roster comes from the live one, but every share / grade change /
+// removal / typed address lands in a local ShareDraft that the New task
+// sheet reads back and shares on submit. What needs the task to exist is
+// hidden: "Share a link" (replaced by the connect-invite link the old inline
+// "Add someone" panel made), the pending-invite list (queued addresses show
+// in its place), and Report / Block on a picked row.
+//
 // ShareScreenModel talks to the backends through ShareScreenTransport (a
 // seam so the model is unit-tested with a fake); LiveShareTransport wires
 // it to CircleClient (task_share / task_unshare / roster), TaskShareClient
@@ -110,6 +119,15 @@ protocol ShareScreenTransport: AnyObject {
     /// when the server blocked them. Replaces the device-local blocklist that
     /// nothing server-side read (audit 2026-09-22, C10).
     func block(userId: String) async -> Bool
+    /// `circle-invite {}` — a connect-only join link (no item rides on it):
+    /// pre-create mode's stand-in for "Share a link", as the New task sheet's
+    /// old "Add someone → Generate link" panel made.
+    func inviteToConnect() async -> ShareLinkOutcome
+}
+
+extension ShareScreenTransport {
+    /// Transports that never mint connect links (test fakes) refuse honestly.
+    func inviteToConnect() async -> ShareLinkOutcome { .failed(reason: "not_configured") }
 }
 
 /// The live seam — AppModel's coordinator clients. A nil coordinator (demo /
@@ -171,9 +189,81 @@ final class LiveShareTransport: ShareScreenTransport {
         await model?.coordinator?.share.link(collectionId: collectionId, role: role) ?? .failed(reason: "not_configured")
     }
     func block(userId: String) async -> Bool { await model?.blockUser(userId: userId) ?? false }
+    func inviteToConnect() async -> ShareLinkOutcome {
+        guard let circle = model?.coordinator?.circle else { return .failed(reason: "not_configured") }
+        let r = await circle.invite(email: nil)
+        if let link = r.link, !link.isEmpty { return .ok(url: link) }
+        return .failed(reason: r.error ?? "invite_failed")
+    }
 }
 
 enum ShareTransportError: Error { case notSignedIn }
+
+// MARK: - pre-create (New task → "Share with…")
+
+/// The Share screen's transport for a task that doesn't exist yet. Reads
+/// (the roster) and the connect-invite link go to `base` (live, or the
+/// UITest demo roster); every write lands in `draft`, locally — nothing is
+/// shared until the New task sheet submits (`ShareDraft.userShares` /
+/// `.emailShares` → `AppModel.applyCreateShares`). @Observable so the New
+/// task sheet's "Share with…" summary follows the picks live.
+@MainActor
+@Observable
+final class DraftShareTransport: ShareScreenTransport {
+    private(set) var draft: ShareDraft
+    @ObservationIgnored private let base: any ShareScreenTransport
+    /// The last roster read — names for a pick (`shareTask` carries only an id).
+    @ObservationIgnored private var roster: [CircleMember] = []
+
+    init(base: any ShareScreenTransport, draft: ShareDraft = ShareDraft()) {
+        self.base = base
+        self.draft = draft
+    }
+
+    func listCircle() async -> [CircleMember] {
+        let r = await base.listCircle()
+        roster = r
+        return r
+    }
+    /// The picked connections, as if they were the task's shares.
+    func taskShares(taskId: String) async -> [ShareForTask] {
+        draft.people.compactMap { p in
+            guard case .user(let id) = p.recipient else { return nil }
+            return ShareForTask(shareId: p.id, recipientUserId: id, recipientName: p.name, level: p.access.taskLevel)
+        }
+    }
+    /// The queued addresses, where the pending invites would be.
+    func taskPendingInvites(taskId: String) async -> [TaskSharePendingInvite] {
+        draft.emails.map { TaskSharePendingInvite(id: $0.id, email: $0.name, level: $0.access.taskLevel) }
+    }
+    func shareTask(taskId: String, userId: String, level: ShareLevel) async throws {
+        let name = roster.first { $0.memberUserId == userId }?.memberName
+            ?? draft.pick(forUser: userId)?.name ?? ""
+        draft.pick(userId: userId, name: name, access: ShareAccess(taskLevel: level) ?? .edit)
+    }
+    func unshareTask(shareId: String) async -> Bool { draft.remove(id: shareId) }
+    func shareTaskByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
+        draft.addEmail(email, access: ShareAccess(taskLevel: level) ?? .edit) ? .invited : .failed(reason: "invalid_email")
+    }
+    func cancelTaskInvite(taskId: String, inviteId: String) async -> Bool { draft.remove(id: inviteId) }
+    /// Needs the task — the pre-create screen never offers it.
+    func taskLink(taskId: String, level: ShareLevel) async -> ShareLinkOutcome { .failed(reason: "not_found") }
+    /// The recipient hears on submit, from the real share.
+    func notifyTaskShare(taskId: String, recipientId: String) async {}
+    // A new task is never a list.
+    func collectionMembers(collectionId: String) async -> [CollectionMemberInfo] { [] }
+    func shareCollection(collectionId: String, email: String?, userId: String?, role: String) async -> ShareOutcome { .error }
+    func unshareCollection(collectionId: String, userId: String) async -> Bool { false }
+    func cancelCollectionInvite(collectionId: String, email: String) async -> Bool { false }
+    func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome { .failed(reason: "not_found") }
+    /// A block is about the person, not the task — real, and it drops the pick.
+    func block(userId: String) async -> Bool {
+        let ok = await base.block(userId: userId)
+        if ok { draft.remove(id: ShareDraftPick.id(forUser: userId)) }
+        return ok
+    }
+    func inviteToConnect() async -> ShareLinkOutcome { await base.inviteToConnect() }
+}
 
 // MARK: - screen model
 
@@ -189,6 +279,10 @@ final class ShareScreenModel {
 
     let target: ShareTarget
     let mode: Mode
+    /// The task doesn't exist yet (New task → "Share with…"): the transport
+    /// is a DraftShareTransport, and every line says what WILL happen on
+    /// "Add task" (`shareDraftResultLine`), never "Shared with…".
+    let preCreate: Bool
     @ObservationIgnored private let transport: any ShareScreenTransport
 
     /// The grade the next share uses (People tap, Someone new, the link).
@@ -220,10 +314,11 @@ final class ShareScreenModel {
     static let emailBusyId = "email"
     static let linkBusyId = "link"
 
-    init(target: ShareTarget, mode: Mode = .share, transport: any ShareScreenTransport) {
+    init(target: ShareTarget, mode: Mode = .share, transport: any ShareScreenTransport, preCreate: Bool = false) {
         self.target = target
         self.mode = mode
         self.transport = transport
+        self.preCreate = preCreate
     }
 
     /// Subscribe to the live signals (once) + load. Idempotent.
@@ -453,6 +548,30 @@ final class ShareScreenModel {
         }
     }
 
+    /// Pre-create's link: a connect-only invite (the old inline "Add someone
+    /// → Generate link"). Whoever opens it becomes one of your people and
+    /// shows up in People to pick; nothing about the task rides on it.
+    @discardableResult
+    func makeInviteLink() async -> String? {
+        guard busyId == nil else { return nil }
+        busyId = Self.linkBusyId
+        error = nil
+        defer { busyId = nil }
+        switch await transport.inviteToConnect() {
+        case .ok(let url):
+            lastLink = url
+            result = shareDraftResultLine(.linkCopied(kind: .task))
+            return url
+        case .failed(let reason):
+            switch ShareFailure(reason: reason) {
+            case _ where reason == "circle_full": error = "Your circle is full."
+            case .network, .server: error = "Couldn't make a link — try again."
+            case let f: error = f.message
+            }
+            return nil
+        }
+    }
+
     // MARK: plumbing
 
     /// Run one write under `busyId`, translate its outcome into the result /
@@ -463,7 +582,7 @@ final class ShareScreenModel {
         defer { busyId = nil }
         do {
             let r = try await op()
-            result = shareResultLine(r)
+            result = preCreate ? shareDraftResultLine(r) : shareResultLine(r)
         } catch let e as ShareActionError {
             error = e.failure.message
         } catch {
@@ -499,6 +618,12 @@ struct ShareScreen: View {
     @ScaledMetric(relativeTo: .body) private var monogramSize: CGFloat = 22
     let target: ShareTarget
     var mode: ShareScreenModel.Mode = .share
+    /// Pre-create mode (New task → "Share with…"): picks land in this draft,
+    /// not on the server — the New task sheet shares on submit. Hides what
+    /// needs the task to exist (Share a link, Report / Block on a row).
+    var draft: DraftShareTransport? = nil
+
+    private var preCreate: Bool { draft != nil }
 
     @State private var vm: ShareScreenModel?
     @State private var linkToShare: ShareLinkItem?
@@ -525,7 +650,7 @@ struct ShareScreen: View {
                         peopleSection(vm)
                         if mode == .share {
                             someoneNewSection(vm)
-                            linkSection(vm)
+                            if preCreate { inviteLinkSection(vm) } else { linkSection(vm) }
                         }
                     } else {
                         ProgressView().frame(maxWidth: .infinity).padding(.top, 24)
@@ -541,7 +666,8 @@ struct ShareScreen: View {
         }
         .presentationDetents([.large])
         .task {
-            let m = vm ?? model.makeShareScreenModel(target: target, mode: mode)
+            let m = vm ?? draft.map { ShareScreenModel(target: target, mode: .share, transport: $0, preCreate: true) }
+                ?? model.makeShareScreenModel(target: target, mode: mode)
             vm = m
             m.start()
         }
@@ -580,10 +706,14 @@ struct ShareScreen: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(target.name.isEmpty ? (target.kind == .task ? "Untitled task" : "Untitled list") : target.name)
+            Text(target.name.isEmpty
+                 ? (preCreate ? "New task" : target.kind == .task ? "Untitled task" : "Untitled list")
+                 : target.name)
                 .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
-            Text(mode == .share
+            Text(preCreate
+                 ? "Pick who gets this task — they'll see it in their “Shared with you” once you add it. To hand it over entirely, use “Hand over to…” on the task after."
+                 : mode == .share
                  ? "Anyone you share with sees this \(target.kind.noun) in their “Shared with you”."
                  : handOverExplainer)
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
@@ -625,7 +755,9 @@ struct ShareScreen: View {
             if vm.loading && vm.people.isEmpty {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
             } else if vm.people.isEmpty {
-                Text(mode == .share
+                Text(preCreate
+                     ? "No one yet — add someone by email below, or invite them with a link."
+                     : mode == .share
                      ? "No one yet — add someone by email below, or share a link."
                      : "No one to hand this to yet — connect with someone from the Share screen first.")
                     .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
@@ -709,7 +841,7 @@ struct ShareScreen: View {
                     .buttonStyle(.plain)
                     .disabled(vm.busyId != nil)   // a second tap must not open the menu mid-write
                     .accessibilityLabel("\(row.name), \(row.statusLabel ?? "shared"). Change access")
-                    .accessibilityHint("Report or remove them")
+                    .accessibilityHint(preCreate ? "Change or remove them" : "Report or remove them")
             } else {
                 Button { Task { await vm.tap(row) } } label: { personRowContent(vm, row, busy: false) }
                     .buttonStyle(.plain)
@@ -841,11 +973,16 @@ struct ShareScreen: View {
             }
         }
         Divider()
-        if row.email != nil || target.kind == .task {
-            Button { reportTarget = row } label: { Label("Report…", systemImage: "flag") }
-        }
-        Button(role: .destructive) { blockTarget = row } label: {
-            Label("Block \(row.name)…", systemImage: "hand.raised")
+        // Pre-create: nothing is shared yet, so there is nothing to report or
+        // cut off here — Report / Block live on the task once it exists (and
+        // Block in Settings › People).
+        if !preCreate {
+            if row.email != nil || target.kind == .task {
+                Button { reportTarget = row } label: { Label("Report…", systemImage: "flag") }
+            }
+            Button(role: .destructive) { blockTarget = row } label: {
+                Label("Block \(row.name)…", systemImage: "hand.raised")
+            }
         }
         Button(role: .destructive) {
             Task { await vm.setAccess(row, nil) }
@@ -873,16 +1010,20 @@ struct ShareScreen: View {
                 Button { Task { await vm.shareWithEmail() } } label: {
                     // `bg` on `ink` (the app's filled-chip pair) — a literal
                     // white on dark `ink` (L 0.96) was invisible in dark mode.
-                    Text(busy ? "Sharing…" : "Share").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
+                    // Pre-create only queues the address, so the verb is "Add".
+                    Text(busy ? (preCreate ? "Adding…" : "Sharing…") : (preCreate ? "Add" : "Share"))
+                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 14).padding(.vertical, 9)
                         .background(theme.palette.ink, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                         .frame(minHeight: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .disabled(busy || vm.email.trimmingCharacters(in: .whitespaces).isEmpty)
-                .accessibilityLabel("Share by email")
+                .accessibilityLabel(preCreate ? "Add by email" : "Share by email")
             }
-            Text("Has an account? They get it right away. No account yet? We email them an invite — it's theirs the moment they sign up.")
+            Text(preCreate
+                 ? "Has an account? They get it when you add the task. No account yet? We email them an invite then — it's theirs the moment they sign up."
+                 : "Has an account? They get it right away. No account yet? We email them an invite — it's theirs the moment they sign up.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 .fixedSize(horizontal: false, vertical: true)
             if !vm.pending.isEmpty {
@@ -897,8 +1038,14 @@ struct ShareScreen: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(p.email).font(UFont.sans(13)).foregroundStyle(theme.palette.ink2).lineLimit(1)
-                Text("Invited · waiting for them to sign up · \(p.access.label.lowercased())")
-                    .font(UFont.sans(11)).foregroundStyle(theme.palette.amberInk)
+                if preCreate {
+                    // Queued, not sent — no amber "waiting" state yet.
+                    Text("Gets it when you add the task · \(p.access.label.lowercased())")
+                        .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                } else {
+                    Text("Invited · waiting for them to sign up · \(p.access.label.lowercased())")
+                        .font(UFont.sans(11)).foregroundStyle(theme.palette.amberInk)
+                }
             }
             Spacer(minLength: 8)
             if vm.busyId == p.id {
@@ -910,7 +1057,7 @@ struct ShareScreen: View {
                         .frame(width: 32, height: 32).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Cancel invite to \(p.email)")
+                .accessibilityLabel(preCreate ? "Remove \(p.email)" : "Cancel invite to \(p.email)")
             }
         }
         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -947,6 +1094,43 @@ struct ShareScreen: View {
             .accessibilityLabel("Share a link, \(vm.access.label)")
             .accessibilityHint("Whoever opens it is connected to you and gets this \(target.kind.noun)")
             Text("Whoever opens it is connected to you and gets this \(target.kind.noun) — \(vm.access.label.lowercased()). The link works once and expires in 14 days.")
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Pre-create's link section: the task can't ride on a link before it
+    /// exists, so this is the connect invite the New task sheet's inline "Add
+    /// someone → Generate link" made — copied + handed to the system share
+    /// sheet, like "Share a link".
+    private func inviteLinkSection(_ vm: ShareScreenModel) -> some View {
+        let busy = vm.busyId == ShareScreenModel.linkBusyId
+        return VStack(alignment: .leading, spacing: 10) {
+            SectionLabel("Invite with a link")
+            Button {
+                Task {
+                    if let url = await vm.makeInviteLink() {
+                        UIPasteboard.general.string = url
+                        if let u = URL(string: url) { linkToShare = ShareLinkItem(url: u) }
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "link").font(.system(size: 13, weight: .semibold))
+                    Text(busy ? "Making a link…" : "Invite with a link").font(UFont.sans(14, .medium))
+                    Spacer()
+                    Image(systemName: "square.and.arrow.up").font(.system(size: 13))
+                }
+                .foregroundStyle(theme.palette.ink)
+                .padding(.horizontal, 14).padding(.vertical, 12)
+                .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line))
+            }
+            .buttonStyle(.plain)
+            .disabled(busy)
+            .accessibilityLabel("Invite with a link")
+            .accessibilityHint("Whoever opens it is connected to you")
+            Text("Not connected yet? Whoever opens it becomes one of your people — then pick them above, or share the task with them once it's created.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 .fixedSize(horizontal: false, vertical: true)
         }

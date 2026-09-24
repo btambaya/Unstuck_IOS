@@ -703,9 +703,14 @@ extension AppModel {
     /// server before sharing. Per-recipient failures are RETURNED for a caller
     /// that wants to surface them; the create flow deliberately discards them to
     /// stay non-blocking (a dropped share is re-addable from the Share sheet).
+    /// `emails` are the addresses typed into the pre-create Share screen's
+    /// "Someone new" — each goes through `share-task add` after the user
+    /// shares (an existing account gets it at once, anyone else an invite; the
+    /// edge function notifies them itself). A failed address is returned too.
     @discardableResult
-    func applyCreateShares(task: TaskItem, shares: [(user: String, level: ShareLevel)]) async -> [String] {
-        guard !shares.isEmpty else { return [] }
+    func applyCreateShares(task: TaskItem, shares: [(user: String, level: ShareLevel)],
+                           emails: [(email: String, level: ShareLevel)] = []) async -> [String] {
+        guard !shares.isEmpty || !emails.isEmpty else { return [] }
         // Deterministically enqueue the tasks upsert (addTask already did this
         // fire-and-forget; re-issuing is idempotent and removes the timing race),
         // then drain the outbox so the row is server-side before task_share.
@@ -722,6 +727,15 @@ extension AppModel {
                 failed.append(user)   // surfaced to the caller, not swallowed
             }
         }
+        var sharedByEmail = false
+        for (email, level) in emails {
+            switch await coordinator?.taskShare.add(taskId: task.id, email: email, level: level) {
+            case .shared?: sharedByEmail = true
+            case .invited?: break
+            case .failed?, nil: failed.append(email)
+            }
+        }
+        if sharedByEmail { await shareState.refresh() }   // badges / Delegated at once
         return failed
     }
 
@@ -760,6 +774,16 @@ extension AppModel {
         }
         #endif
         return ShareScreenModel(target: target, mode: mode, transport: LiveShareTransport(model: self))
+    }
+
+    /// The pre-create Share screen's transport (New task → "Share with…"):
+    /// the roster from the live transport (or the UITest demo roster), every
+    /// pick held locally until the New task sheet submits.
+    func makeShareDraftTransport() -> DraftShareTransport {
+        #if DEBUG
+        if let demo = DemoShareTransport.fromEnvironment() { return DraftShareTransport(base: demo) }
+        #endif
+        return DraftShareTransport(base: LiveShareTransport(model: self))
     }
 
     /// Report a person you shared a task or list with (App Store 1.2 safety) —

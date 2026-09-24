@@ -95,6 +95,9 @@ private final class FakeShareTransport: ShareScreenTransport {
         return true
     }
     func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome { linkRoles.append(role); return linkOutcome }
+    var connectInviteOutcome: ShareLinkOutcome = .ok(url: "https://unstucknow.io/circle/join?code=connect")
+    var connectInvites = 0
+    func inviteToConnect() async -> ShareLinkOutcome { connectInvites += 1; return connectInviteOutcome }
     func block(userId: String) async -> Bool {
         blocks.append((userId, loads))
         guard blockOk else { return false }
@@ -869,5 +872,195 @@ final class RecurringEntryPointTests: XCTestCase {
         XCTAssertFalse(model.sharedTaskAllowsTick("rep"))
         XCTAssertTrue(model.sharedTaskAllowsTick("plain"))
         XCTAssertTrue(model.sharedTaskAllowsTick("not-loaded-yet"), "the level (checked by every caller) decides")
+    }
+}
+
+// MARK: - pre-create (New task → "Share with…", 2026-09-24)
+
+/// The Share screen for a task that doesn't exist yet: the SAME model over a
+/// DraftShareTransport. Every pick is held locally (nothing reaches the
+/// server until the New task sheet submits), the lines say what WILL happen,
+/// and the draft maps to the calls submit makes.
+@MainActor
+final class ShareScreenPreCreateTests: XCTestCase {
+    private var fake: FakeShareTransport!
+    private var draft: DraftShareTransport!
+
+    override func setUp() {
+        super.setUp()
+        fake = FakeShareTransport()
+        fake.circle = [
+            CircleMember(id: "c1", relationshipLabel: "Coach", level: "view", status: "active", inviteCode: nil,
+                         memberUserId: "u1", memberName: "Maya Chen", createdAt: "2026-09-17T09:00:00Z"),
+            CircleMember(id: "c2", relationshipLabel: nil, level: "view", status: "active", inviteCode: nil,
+                         memberUserId: "u2", memberName: "Zubair", createdAt: "2026-09-17T09:01:00Z"),
+        ]
+        draft = DraftShareTransport(base: fake)
+    }
+
+    private func preCreateModel() -> ShareScreenModel {
+        ShareScreenModel(target: .task(id: "", name: "Draft the deck"), transport: draft, preCreate: true)
+    }
+
+    private func assertNothingReachedTheServer(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(fake.sharedTask.isEmpty, "no task_share before the task exists", file: file, line: line)
+        XCTAssertTrue(fake.notified.isEmpty, "no share-notify before the task exists", file: file, line: line)
+        XCTAssertTrue(fake.unshared.isEmpty, file: file, line: line)
+        XCTAssertTrue(fake.emailShares.isEmpty, "no share-task add before the task exists", file: file, line: line)
+        XCTAssertTrue(fake.cancelledTaskInvites.isEmpty, file: file, line: line)
+        XCTAssertTrue(fake.linkLevels.isEmpty, "no task link before the task exists", file: file, line: line)
+    }
+
+    func testTheRosterComesFromTheLiveTransportAndNothingIsPickedYet() async {
+        let vm = preCreateModel()
+        await vm.load()
+        XCTAssertEqual(vm.people.map(\.userId), ["u1", "u2"])
+        XCTAssertTrue(vm.people.allSatisfy { !$0.isShared })
+        XCTAssertEqual(vm.access, .edit, "default grade is Can edit, as on the Share screen")
+        XCTAssertTrue(draft.draft.isEmpty)
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Only you")
+    }
+
+    func testATapHoldsThePickLocallyAtTheChosenGrade() async {
+        let vm = preCreateModel()
+        await vm.load()
+        await vm.tap(vm.people[0])
+        assertNothingReachedTheServer()
+        XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u1", level: .partner)])
+        XCTAssertEqual(draft.draft.picks.first?.name, "Maya Chen", "the name comes from the roster")
+        XCTAssertEqual(vm.people[0].access, .edit, "the row shows the pick (reloaded from the draft)")
+        XCTAssertEqual(vm.result, "Maya will get it when you add the task — they can edit.")
+        XCTAssertNil(vm.error)
+
+        vm.access = .view
+        await vm.tap(vm.people[1])
+        XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u1", level: .partner),
+                                                ShareDraftUserShare(userId: "u2", level: .view)])
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Maya · edit, Zubair · view")
+        assertNothingReachedTheServer()
+    }
+
+    func testChangingAndRemovingAPickStaysLocal() async {
+        let vm = preCreateModel()
+        await vm.load()
+        await vm.tap(vm.people[1])
+        await vm.setAccess(vm.people[1], .view)
+        XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u2", level: .view)])
+        XCTAssertEqual(vm.result, "Zubair will be able to view.")
+        await vm.setAccess(vm.people[1], nil)
+        XCTAssertTrue(draft.draft.isEmpty)
+        XCTAssertNil(vm.people[1].access)
+        XCTAssertEqual(vm.result, "Zubair won't get it.")
+        assertNothingReachedTheServer()
+    }
+
+    func testSomeoneNewQueuesTheAddressForSubmit() async {
+        let vm = preCreateModel()
+        await vm.load()
+        vm.email = "  Sam@Example.com "
+        await vm.shareWithEmail()
+        assertNothingReachedTheServer()
+        XCTAssertEqual(draft.draft.emailShares, [ShareDraftEmailShare(email: "sam@example.com", level: .partner)])
+        XCTAssertEqual(vm.pending, [SharePendingRow(id: "email:sam@example.com", email: "sam@example.com", access: .edit)])
+        XCTAssertEqual(vm.result, "sam@example.com will get it when you add the task.")
+        XCTAssertEqual(vm.email, "", "the field clears after a queued address")
+
+        await vm.cancelPending(vm.pending[0])
+        XCTAssertTrue(draft.draft.isEmpty)
+        XCTAssertTrue(vm.pending.isEmpty)
+        XCTAssertEqual(vm.result, "sam@example.com won't get it.")
+        assertNothingReachedTheServer()
+    }
+
+    func testAnAddressThatIsNotOneIsRefusedLocally() async {
+        let vm = preCreateModel()
+        await vm.load()
+        vm.email = "not an email"
+        await vm.shareWithEmail()
+        XCTAssertEqual(vm.error, "That doesn't look like an email address.")
+        XCTAssertTrue(draft.draft.isEmpty)
+    }
+
+    func testReopeningPinsThePicksWithTheirGrades() async {
+        let first = preCreateModel()
+        await first.load()
+        await first.tap(first.people[1])
+        // The sheet is closed and "Share with…" tapped again: a NEW model over
+        // the SAME draft — the picks sit first, with their grade.
+        let again = preCreateModel()
+        await again.load()
+        XCTAssertEqual(again.pinnedIds, [again.people[1].id])
+        let split = sharePeopleSplit(again.people, pinned: again.pinnedIds, handOver: false)
+        XCTAssertEqual(split.withAccess.map(\.userId), ["u2"])
+        XCTAssertEqual(split.withAccess.first?.statusLabel, "Can edit")
+        XCTAssertEqual(split.candidates.map(\.userId), ["u1"])
+    }
+
+    func testTheSelectionMapsToTheCallsSubmitMakes() async {
+        let vm = preCreateModel()
+        await vm.load()
+        await vm.tap(vm.people[0])                     // Maya · Can edit
+        vm.access = .view
+        await vm.tap(vm.people[1])                     // Zubair · Can view
+        vm.email = "sam@example.com"
+        await vm.shareWithEmail()                      // sam · Can view
+        await vm.setAccess(vm.people[0], .view)        // Maya → Can view
+        // Exactly what NewTaskSheet.submit hands applyCreateShares.
+        let shares = draft.draft.userShares.map { (user: $0.userId, level: $0.level) }
+        let emails = draft.draft.emailShares.map { (email: $0.email, level: $0.level) }
+        XCTAssertEqual(shares.map(\.user), ["u1", "u2"])
+        XCTAssertEqual(shares.map(\.level), [.view, .view])
+        XCTAssertEqual(emails.map(\.email), ["sam@example.com"])
+        XCTAssertEqual(emails.map(\.level), [.view])
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Maya, Zubair, sam · can view")
+        assertNothingReachedTheServer()
+    }
+
+    func testTheInviteLinkIsAConnectInviteNotATaskLink() async {
+        let vm = preCreateModel()
+        await vm.load()
+        let url = await vm.makeInviteLink()
+        XCTAssertEqual(url, "https://unstucknow.io/circle/join?code=connect")
+        XCTAssertEqual(fake.connectInvites, 1)
+        XCTAssertTrue(fake.linkLevels.isEmpty, "the task can't ride on a link before it exists")
+        XCTAssertEqual(vm.lastLink, url)
+        XCTAssertTrue(vm.result?.hasPrefix("Invite link copied") == true)
+
+        fake.connectInviteOutcome = .failed(reason: "circle_full")
+        let none = await vm.makeInviteLink()
+        XCTAssertNil(none)
+        XCTAssertEqual(vm.error, "Your circle is full.")
+        fake.connectInviteOutcome = .failed(reason: "invite_failed")
+        _ = await vm.makeInviteLink()
+        XCTAssertEqual(vm.error, "Couldn't make a link — try again.")
+    }
+
+    func testTheExistingTaskScreenIsUnchanged() async {
+        // Same fake, NOT pre-create: a tap still shares on the server with
+        // the server's line.
+        let vm = ShareScreenModel(target: .task(id: "t1", name: "Draft the deck"), transport: fake)
+        await vm.load()
+        XCTAssertFalse(vm.preCreate)
+        await vm.tap(vm.people[0])
+        XCTAssertEqual(fake.sharedTask.count, 1)
+        XCTAssertEqual(vm.result, "Shared with Maya — they can edit.")
+    }
+
+    func testTheAppModelHandsOutAnEmptyDraft() {
+        let model = AppModel()
+        model.startUITestMode()
+        let d = model.makeShareDraftTransport()
+        XCTAssertTrue(d.draft.isEmpty)
+        XCTAssertEqual(shareDraftSummary(d.draft.picks), ShareDraftSummary(text: "Only you", spoken: "Only you"))
+    }
+
+    func testCreateSharesWithoutABackendReportTheAddressesAndNeverThrow() async {
+        let model = AppModel()
+        model.startUITestMode()
+        let task = TaskItem(id: "t-new", name: "Buy stamps", estimateMin: 25, createdAt: AppModel.isoNow(), updatedAt: AppModel.isoNow())
+        let none = await model.applyCreateShares(task: task, shares: [], emails: [])
+        XCTAssertEqual(none, [])
+        let failed = await model.applyCreateShares(task: task, shares: [], emails: [(email: "sam@example.com", level: .partner)])
+        XCTAssertEqual(failed, ["sam@example.com"], "no coordinator ⇒ the address is reported, creation is untouched")
     }
 }

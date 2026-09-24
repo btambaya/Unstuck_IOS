@@ -43,6 +43,48 @@ phases land. Newest status at the top.
 
 
 
+## New task → "Share with…": one row + the Share screen (branch sharerow/ios, 2026-09-24) — not shipped yet
+
+Ahmad, on the New task sheet's Share section (a big card per connected person, each with a full-width
+"Off | Can edit | Can view" switch): "This is terrible" — he chose "One row + picker".
+
+- **The row.** Under More options, Share is ONE row: "Share with…" · up to three overlapping monograms (the Share
+  screen's "has it" disc — ink/bg pair) · a one-line summary · chevron. Summary = `shareDraftSummary`
+  (Sources/UnstuckCore/Logic/ShareDraft.swift): "Only you" · "James · can edit" · "James, Anna · can edit" ·
+  "James · edit, Anna · view" · "James + 3 more" once it passes 28 characters; a single over-long name is cut with
+  "…"; two picks with the same first name keep full names. Never wraps at default sizes (`ViewThatFits` drops the
+  monograms first, `lineLimit(1)` last); at accessibility sizes the title and summary stack. VoiceOver: "Share
+  with, <spoken summary>, button" (spoken = "James and Anna can edit", never truncated). Id `new-task-share-row`.
+- **The picker is the Share screen**, in a new PRE-CREATE mode: `ShareScreen(target: .task(id: "", name:), draft:)`.
+  Its transport is `DraftShareTransport` (ShareScreen.swift): the roster comes from the live transport (or the
+  UITEST_SHARE_PEOPLE demo roster), every write lands in a local `ShareDraft`. So the grade switch (default Can
+  edit), the who-has-it card with the Can edit / Can view / Remove menu, the searchable "Choose someone" picker and
+  "Someone new" all work unchanged. `ShareScreenModel.preCreate` swaps the result lines for
+  `shareDraftResultLine` ("Maya will get it when you add the task — they can edit.", never "Shared with…").
+- **Hidden in pre-create:** "Share a link" (a task link needs the task) → replaced by **"Invite with a link"**, the
+  connect-only `circle-invite {}` link the old inline "Add someone → Generate link" panel made (new transport
+  method `inviteToConnect`, default `.failed("not_configured")` for fakes); the pending-invite list for the task
+  (queued addresses show there instead, "Gets it when you add the task · can edit", ✕ removes); Report… and Block…
+  on a picked row (nothing is shared yet — both still exist on the task's own Share screen / Settings › People).
+  The header explains hand-over is on the task afterwards (grades at creation stay Can edit / Can view, as the
+  inline section had).
+- **Submit** is the same path, fed from the draft: `draft.userShares` → `applyCreateShares(task:shares:)` exactly
+  as before (flush the insert, then task_share + share-notify), plus NEW `emails:` → `share-task add` per queued
+  address after the flush (existing account = shared at once, else an invite). Fire-and-forget: a failed share
+  never blocks creation. The keyboard is put away before the Share screen opens (UIKit otherwise hands focus back
+  to the name field on close and scrolls the sheet to the top).
+- **Removed from NewTaskSheet:** the per-member cards, `shareLevels`, the sheet's own `CircleModel` (+ its
+  `.task`/`.onDisappear`), the inline invite panel and explainer. Nothing else in the sheet changed.
+- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 22) — summary 0/1/2/many, mixed grades, long names, addresses,
+  collisions, budget sweep; selection → submit mapping; pre-create lines. `ShareScreenPreCreateTests`
+  (UnifiedSharingScreenTests.swift, 11) — the model over a DraftShareTransport: nothing reaches the server, picks /
+  grade changes / removals / queued addresses land in the draft, re-open pins the picks, the invite link is a
+  connect invite, the mapping submit hands `applyCreateShares`. Screenshots: `SharePeopleCardShots.testNewTaskShareRowShots`
+  (light + dark; writes to SHARE_ROW_SHOTS_DIR, default /tmp/unstuck-share-row-shots).
+- **Merge note:** another branch edits NewTaskSheet for the remembered estimate; this branch touches only the share
+  state block, the removed circle `.task`/`.onDisappear` lines around `.onAppear(perform: seedPrefill)`, the share
+  section functions and the share block at the end of `submit()`.
+
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 
 Ahmad: "Can the plus just be on same line as everything". The coral + was a 56-pt square lifted 28 pt above the bar
