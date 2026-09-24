@@ -169,6 +169,19 @@ enum TourScript {
     /// strings the `today` clips speak.
     static let stepsAwaitingNarration: Set<String> = []
 
+    /// Clips that are still in the bundle (the Xcode project lists every
+    /// file, and it is not regenerated here) but whose recorded words no
+    /// longer match the step copy, so they are NEVER played —
+    /// `TourAudioPlayer.url(forStep:)` answers nil for them. Slim settings
+    /// (2026-09-24): `personalization.m4a` narrates "theme, accent, density,
+    /// text size" and "your focus defaults" (gone from Settings), and
+    /// `finish-more.m4a` says "reopen this tour from Settings → Account" (now
+    /// "Settings → Replay the tour"). Listen is hidden on the personalization
+    /// step and Tell-me-more on finish expands silently — the web drops the
+    /// same two entries (components/tour/tour-audio.ts). Re-record both from
+    /// the CURRENT text (Cherry recipe above), then empty this set.
+    static let staleClips: Set<String> = ["personalization", "finish-more"]
+
     static let essential: [TourStep] = [
         TourStep(
             id: "welcome", stage: "Welcome", view: .today, target: nil,

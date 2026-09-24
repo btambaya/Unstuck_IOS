@@ -97,9 +97,12 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   areas/tags/"areas & tags" → Tasks tab + Areas & tags sheet (so `open_screen areas` too); unknown/bare → the hub
   (the server's bare `unstuck://settings` stays hub → People).
 - **Tour**: personalization → section "Appearance", new copy; every "Settings → Account → Product tour" → "Settings →
-  Replay the tour" (panel confirm, welcome footer, finish `more`, TOUR_QA — the web's exact strings). ⚠ `personalization.m4a` and
-  `finish-more.m4a` still speak the OLD words (accent/density; Settings → Account) — re-record with the web clips
-  (shared files) before shipping. The pause-confirm footer is now one line (TourPanelMeasureTests pin 67 → 49 pt).
+  Replay the tour" (panel confirm, welcome footer, finish `more`, TOUR_QA — the web's exact strings). `personalization.m4a` and
+  `finish-more.m4a` still speak the OLD words (accent/density; Settings → Account), so they are PARKED:
+  `TourScript.staleClips` makes `TourAudioPlayer.url(forStep:)` answer nil for them (the files stay — the gitignored
+  project lists them), Listen is hidden on the personalization step and finish's Tell-me-more expands silently —
+  the same two entries the web dropped from tour-audio.ts. To close: re-record both from the current text (Cherry
+  recipe below; the key only lives server-side), then empty `staleClips` (TourAudioManifestTests pins the set). The pause-confirm footer is now one line (TourPanelMeasureTests pin 67 → 49 pt).
 - **Copy**: "Settings › Calls" → "Settings › Notifications & calls" (CallTools device guard, CallMeSection, call
   notices, AIConsent.callsTurnedOffNote); "Settings › Interface" → "Assistant & privacy"; interview lines name What
   Unstuck remembers / Assistant & privacy; RITUAL_LABELS use the routine names (Morning plan / Evening wind-down /
@@ -130,7 +133,8 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   must be exactly the seven, People opens; TourUITests `testFullTourAppearanceStepIsScopedToAppearance` (the full
   tour's Appearance step: Text size works under the panel, Back to the hub is swallowed); `SettingsShots` (in
   HomeShots.swift) writes the hub + every screen light/dark + the moved controls to /tmp/unstuck-settings-shots.
-  Still open (not code): the two tour m4a clips above; switches keep the indigo `primary` tint (ask Ahmad with a
+  The two stale tour clips are now parked in code (see Tour above; the web did the same). Still open (not code):
+  re-record them; switches keep the indigo `primary` tint (ask Ahmad with a
   screenshot before changing); Talk's new switch sits above End, so a very long caption on a small phone can run
   under it (captions already could run under End).
 

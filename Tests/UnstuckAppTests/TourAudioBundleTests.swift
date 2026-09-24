@@ -22,12 +22,24 @@ final class TourAudioBundleTests: XCTestCase {
 
     func testEveryStepsClipsResolveFromTheAppBundleAndDecode() throws {
         for s in allSteps {
-            XCTAssertTrue(TourAudioPlayer.hasAudio(forStep: s.id),
-                          "'\(s.id)': narration clip is not in the app bundle — Listen would be hidden")
-            let url = try XCTUnwrap(TourAudioPlayer.url(forStep: s.id))
-            let p = try AVAudioPlayer(contentsOf: url)
-            XCTAssertGreaterThan(p.duration, 1, "'\(s.id)': narration clip decodes to nothing")
+            // A clip that no longer matches its step is never offered
+            // (TourScript.staleClips — slim settings) — Listen is hidden there.
+            if TourScript.staleClips.contains(s.id) {
+                XCTAssertFalse(TourAudioPlayer.hasAudio(forStep: s.id),
+                               "'\(s.id)': a stale narration clip must never play")
+            } else {
+                XCTAssertTrue(TourAudioPlayer.hasAudio(forStep: s.id),
+                              "'\(s.id)': narration clip is not in the app bundle — Listen would be hidden")
+                let url = try XCTUnwrap(TourAudioPlayer.url(forStep: s.id))
+                let p = try AVAudioPlayer(contentsOf: url)
+                XCTAssertGreaterThan(p.duration, 1, "'\(s.id)': narration clip decodes to nothing")
+            }
             guard s.more != nil else { continue }
+            if TourScript.staleClips.contains("\(s.id)-more") {
+                XCTAssertFalse(TourAudioPlayer.hasMoreAudio(forStep: s.id),
+                               "'\(s.id)': a stale Tell-me-more clip must never play")
+                continue
+            }
             XCTAssertTrue(TourAudioPlayer.hasMoreAudio(forStep: s.id),
                           "'\(s.id)': Tell-me-more clip is not in the app bundle")
             let moreURL = try XCTUnwrap(TourAudioPlayer.url(forStep: "\(s.id)-more"))
