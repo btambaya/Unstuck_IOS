@@ -175,6 +175,9 @@ enum AssistantHarness {
         // what the USER did ("You finished …") is a review, not a claim
         // (week-review-spec.md §5.4). Every other turn keeps the guard as is.
         var periodReviewed = false
+        // The assistant's last visible reply before this message — what a
+        // bare "yes" answers (the confirm-first check).
+        let previousReply = previousVisibleReply(base)
 
         for i in 0..<maxIterations {
             if deps.isCancelled() { return .cancelled }
@@ -272,7 +275,16 @@ enum AssistantHarness {
                 for call in reply.toolCalls {
                     let args = ToolArgs(json: call.function.arguments)
                     CrashBreadcrumbs.drop("tool.run \(call.function.name)")
-                    var result = await runAssistantTool(name: call.function.name, args: args, api: deps.api, scratch: deps.scratch)
+                    // Confirm-first in CODE (ConfirmFirst.swift): a destructive
+                    // tool the user didn't ask for this turn never runs — the
+                    // model gets the refusal and asks instead.
+                    var result: String
+                    if let refusal = confirmFirstRefusal(call.function.name, args: args, userText: text,
+                                                         previousReply: previousReply, api: deps.api, scratch: deps.scratch) {
+                        result = refusal
+                    } else {
+                        result = await runAssistantTool(name: call.function.name, args: args, api: deps.api, scratch: deps.scratch)
+                    }
                     CrashBreadcrumbs.drop("tool.done \(call.function.name) \(result.hasPrefix("error") ? "err" : "ok")")
                     if result.hasPrefix("ok:") {
                         if call.function.name == "get_period_review" { periodReviewed = true }
@@ -319,6 +331,52 @@ enum AssistantHarness {
                                      receipts: receipts.isEmpty ? nil : receipts))
         deps.commit(working, true)
         return .reply(closing)
+    }
+
+    // MARK: confirm-first
+
+    /// The assistant's last reply the user SAW before their latest message
+    /// (`base` ends with that message): not a hidden bounce, not a round's
+    /// tool-call narration, not a local line.
+    nonisolated static func previousVisibleReply(_ base: [AssistantTurn]) -> String? {
+        let before = base.last?.role == "user" ? base.dropLast() : base[...]
+        return before.last {
+            $0.role == "assistant" && !$0.isHidden && !$0.isLocal && !$0.hasToolCalls
+                && !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }?.text
+    }
+
+    /// The refusal for a confirm-first tool (the registry's `confirm: true`
+    /// set) the user hasn't asked for this turn — nil = run it. A target that
+    /// can't be resolved runs too: the executor's own "not found" answers it.
+    static func confirmFirstRefusal(_ name: String, args: ToolArgs, userText: String, previousReply: String?,
+                                    api: AssistantAppState, scratch: TurnScratch) -> String? {
+        guard ToolRegistry.confirmFirst.contains(name) else { return nil }
+        let target: String?
+        switch name {
+        case "delete_task":
+            guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return nil }
+            target = t.name
+        case "delete_list", "leave_list":
+            guard let c = findList(args.str("listId"), api: api, scratch: scratch) else { return nil }
+            target = c.name
+        case "delete_area":
+            let n = (args.str("name") ?? "").lowercased()
+            guard let row = api.getAreaRows().first(where: { $0.name.lowercased() == n }) else { return nil }
+            target = row.name
+        case "delete_tag":
+            let n = (args.str("name") ?? "").lowercased()
+            guard let row = api.getTagRows().first(where: { $0.name.lowercased() == n }) else { return nil }
+            target = row.name
+        case "cancel_focus":
+            guard let live = api.getLiveFocus(), live.sessionStart != nil else { return nil }
+            target = api.getTasks().first { $0.id == live.taskId }?.name
+        default:
+            target = nil
+        }
+        if ConfirmFirst.allows(tool: name, target: target, userText: userText, previousAssistant: previousReply) { return nil }
+        CrashBreadcrumbs.drop("tool.confirmFirst refused \(name)")
+        return ConfirmFirst.refusal(tool: name, target: target)
     }
 }
 

@@ -2526,6 +2526,71 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertEqual(api.completedShared, ["c1:i1"])
         XCTAssertTrue(api.reopenedShared.isEmpty)
     }
+
+    // MARK: A1 — a weekly series on a day it doesn't repeat on (James, build 51)
+
+    /// Sunday 13 Sep: "put Park run on Saturday at 8:30" — the model sent the
+    /// 20th (a Sunday). It used to write a Sunday slot plus Saturdays from the
+    /// 26th, skipping the coming Saturday. Now nothing is written and the
+    /// result names the coming Saturday; the corrected call lands on it.
+    func testScheduleTaskRefusesAWeeklySeriesOnADayItDoesntRepeatOn() async {
+        api.today = "2026-09-13"
+        api.tasks = [task("p", "Park run", recurrence: .weekly(daysOfWeek: [6], until: nil))]
+        let r = await run("schedule_task", #"{"taskId":"p","date":"2026-09-20","startTime":"08:30"}"#)
+        XCTAssertTrue(r.hasPrefix("error: \"Park run\" repeats every Saturday, but 2026-09-20 is a Sunday — nothing was scheduled."), r)
+        XCTAssertTrue(r.contains("Saturday 19 September (2026-09-19)"), r)
+        XCTAssertEqual(api.blocks, [], "nothing written")
+        XCTAssertNil(assistantReceipt(name: "schedule_task", args: ToolArgs(json: "{}"), result: r, tasks: api.tasks, facts: []))
+        await eq("schedule_task", #"{"taskId":"p","date":"2026-09-19","startTime":"08:30"}"#, "ok: scheduled \"Park run\" 2026-09-19 08:30")
+        XCTAssertTrue(api.blocks.contains { $0.date == "2026-09-19" && $0.startTime == "08:30" })
+        XCTAssertTrue(api.blocks.allSatisfy { LocalDate.dayOfWeek($0.date) == 6 }, "Saturdays only")
+    }
+
+    /// "I can't do Saturday, put it on Sunday" still works: the model repeats
+    /// the call it was refused, and the result says it is a one-off.
+    func testTheSameOffDayCallRepeatedIsAOneOffMove() async {
+        api.today = "2026-09-13"
+        api.tasks = [task("p", "Park run", recurrence: .weekly(daysOfWeek: [6], until: nil))]
+        api.blocks = [block("s19", "p", "2026-09-19", "08:30"), block("s26", "p", "2026-09-26", "08:30")]
+        await prefix("schedule_task", #"{"taskId":"p","date":"2026-09-20"}"#, "error: \"Park run\" repeats every Saturday")
+        XCTAssertEqual(api.blocks.map(\.date), ["2026-09-19", "2026-09-26"])
+        await eq("schedule_task", #"{"taskId":"p","date":"2026-09-20"}"#,
+                 "ok: scheduled \"Park run\" 2026-09-20 08:30 (kept its existing time — say so) — a one-off on Sunday 20 September; the series stays on Saturday")
+        XCTAssertEqual(api.blocks.first { $0.id == "s19" }?.date, "2026-09-20", "this Saturday's run moved to the Sunday")
+        XCTAssertEqual(api.blocks.first { $0.id == "s26" }?.date, "2026-09-26")
+        // A later turn is a fresh scratch: it is refused again.
+        scratch = TurnScratch()
+        await prefix("schedule_task", #"{"taskId":"p","date":"2026-09-27"}"#, "error: \"Park run\" repeats every Saturday")
+    }
+
+    /// The variant: create_task on the wrong day, then weekly on Saturday. The
+    /// series used to start on the 26th (the Sunday slot dropped), skipping
+    /// the coming Saturday. Refused before anything changes; placing it on the
+    /// Saturday first makes the series start there.
+    func testSetTaskRecurrenceRefusesASlotPlacedThisTurnOnAnotherDay() async {
+        api.today = "2026-09-13"
+        let made = await run("create_task", #"{"name":"Park run","date":"2026-09-20","startTime":"08:30"}"#)
+        XCTAssertTrue(made.hasPrefix("ok: created task"), made)
+        let id = api.tasks[0].id
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(id)","kind":"weekly","daysOfWeek":[6]}"#)
+        XCTAssertTrue(r.hasPrefix("error: \"Park run\" was just put on Sunday 20 September (2026-09-20), which isn't one of the days asked for (Saturday) — nothing changed."), r)
+        XCTAssertNil(api.tasks[0].recurrence)
+        XCTAssertEqual(api.blocks.map(\.date), ["2026-09-20"])
+        await eq("schedule_task", #"{"taskId":"\#(id)","date":"2026-09-19","startTime":"08:30"}"#, "ok: scheduled \"Park run\" 2026-09-19 08:30")
+        await eq("set_task_recurrence", #"{"taskId":"\#(id)","kind":"weekly","daysOfWeek":[6]}"#, "ok: \"Park run\" now repeats weekly on Sat at 08:30")
+        let upcoming = api.blocks.filter { $0.date >= "2026-09-13" }.map(\.date).sorted()
+        XCTAssertEqual(upcoming.first, "2026-09-19", "the series starts on the coming Saturday")
+        XCTAssertTrue(upcoming.allSatisfy { LocalDate.dayOfWeek($0) == 6 })
+    }
+
+    func testSetTaskRecurrenceRepeatedUnchangedStartsWhereTheSlotIs() async {
+        api.today = "2026-09-13"
+        _ = await run("create_task", #"{"name":"Park run","date":"2026-09-20","startTime":"08:30"}"#)
+        let id = api.tasks[0].id
+        await prefix("set_task_recurrence", #"{"taskId":"\#(id)","kind":"weekly","daysOfWeek":[6]}"#, "error: \"Park run\" was just put on Sunday")
+        await prefix("set_task_recurrence", #"{"taskId":"\#(id)","kind":"weekly","daysOfWeek":[6]}"#, "ok: \"Park run\" now repeats weekly on Sat")
+        XCTAssertEqual(api.tasks[0].recurrence, .weekly(daysOfWeek: [6], until: nil))
+    }
 }
 
 

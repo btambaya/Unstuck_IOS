@@ -56,8 +56,8 @@ final class AssistantHarnessTests: XCTestCase {
                          finishReason: finishReason))
     }
 
-    private func runTurn(_ userText: String, _ transport: ScriptedTransport) async -> AssistantHarness.Outcome {
-        let base = [AssistantTurn(ChatMessage(role: "user", content: userText), at: 1)]
+    private func runTurn(_ userText: String, _ transport: ScriptedTransport, after prior: [AssistantTurn] = []) async -> AssistantHarness.Outcome {
+        let base = prior + [AssistantTurn(ChatMessage(role: "user", content: userText), at: 1)]
         let scratch = TurnScratch()
         let api = self.api
         let deps = AssistantHarness.Deps(
@@ -644,5 +644,91 @@ final class AssistantHarnessTests: XCTestCase {
         XCTAssertEqual(g.correctionsLeft, 0)
         g.responseCreated(); g.transcriptDelta("Done — saved again."); XCTAssertFalse(g.shouldCorrect(), "capped per session")
         XCTAssertTrue(VoiceIntegrityGuard.correctiveText.hasPrefix("(integrity check from the app, not the user:"))
+    }
+
+    // MARK: confirm-first in code (James, build 51: ✓ Deleted cards nobody asked for)
+
+    /// The tool result the model saw for its call in round `round`.
+    private func toolResult(_ t: ScriptedTransport, round: Int) -> String? {
+        t.asks[round].last { $0.role == "tool" }?.content
+    }
+
+    func testADeleteTheUserDidntAskForNeverRuns() async {
+        api.tasks = [task("g", "Gym"), task("s", "Pack ski gear checklist")]
+        let t = ScriptedTransport([
+            call("delete_task", #"{"taskId":"s"}"#),
+            call("delete_task", #"{"taskId":"g"}"#, id: "c2"),
+            text("Do you want me to delete those two?"),
+        ])
+        let outcome = await runTurn("Add travel to Skipton for tomorrow at 3pm for 3 hours", t)
+        XCTAssertEqual(outcome, .reply("Do you want me to delete those two?"))
+        XCTAssertEqual(api.tasks.map(\.id), ["g", "s"], "nothing was deleted")
+        XCTAssertEqual(toolResult(t, round: 1), ConfirmFirst.refusal(tool: "delete_task", target: "Pack ski gear checklist"))
+        XCTAssertEqual(toolResult(t, round: 2), ConfirmFirst.refusal(tool: "delete_task", target: "Gym"))
+        XCTAssertNil(visible.last?.receipts, "no ✓ Deleted card")
+    }
+
+    func testADeleteTheUserAskedForRuns() async {
+        api.tasks = [task("g", "Gym")]
+        let t = ScriptedTransport([call("delete_task", #"{"taskId":"g"}"#), text("Gym's gone.")])
+        _ = await runTurn("delete the gym task", t)
+        XCTAssertEqual(api.tasks, [])
+        XCTAssertEqual(visible.last?.receipts?.map(\.label), ["Deleted “Gym”"])
+    }
+
+    func testAYesToTheAssistantsDeleteQuestionRuns() async {
+        api.tasks = [task("g", "Gym")]
+        let prior = [AssistantTurn(ChatMessage(role: "user", content: "gym's not happening any more"), at: 0),
+                     AssistantTurn(ChatMessage(role: "assistant", content: "Want me to delete “Gym”?"), at: 0.5)]
+        let t = ScriptedTransport([call("delete_task", #"{"taskId":"g"}"#), text("Gym's gone.")])
+        _ = await runTurn("yes", t, after: prior)
+        XCTAssertEqual(api.tasks, [])
+        // …and a no leaves it.
+        reset()
+        api.tasks = [task("g", "Gym")]
+        let n = ScriptedTransport([call("delete_task", #"{"taskId":"g"}"#), text("Okay, keeping it.")])
+        _ = await runTurn("no, keep it", n, after: prior)
+        XCTAssertEqual(api.tasks.map(\.id), ["g"])
+    }
+
+    func testCancelFocusAndListsAreGatedToo() async {
+        api.tasks = [task("w", "Write report")]
+        api.live = liveSession("w")
+        let t = ScriptedTransport([call("cancel_focus", "{}"), text("Want me to cancel it?")])
+        _ = await runTurn("what's next after this?", t)
+        XCTAssertEqual(api.focusCalls, [], "the session keeps running")
+        XCTAssertTrue(toolResult(t, round: 1)?.hasPrefix("error: not cancelled") == true)
+        let ok = ScriptedTransport([call("cancel_focus", "{}"), text("Cancelled.")])
+        _ = await runTurn("cancel this session", ok)
+        XCTAssertEqual(api.focusCalls, ["cancel"])
+
+        api.collections = [list("l1", "Groceries")]
+        let d = ScriptedTransport([call("delete_list", #"{"listId":"l1"}"#), text("Delete Groceries?")])
+        _ = await runTurn("add oat milk", d)
+        XCTAssertEqual(api.collections.map(\.id), ["l1"])
+        XCTAssertTrue(toolResult(d, round: 1)?.hasPrefix("error: not deleted — the user hasn't asked to delete the list \"Groceries\"") == true)
+    }
+
+    /// A non-destructive tool is never gated, and an id the executor can't
+    /// find gets the executor's own answer.
+    func testOnlyConfirmFirstToolsAreGated() async {
+        api.tasks = [task("g", "Gym")]
+        let t = ScriptedTransport([call("delete_task", #"{"taskId":"nope"}"#), call("complete_task", #"{"taskId":"g"}"#, id: "c2"), text("Done with Gym.")])
+        _ = await runTurn("finished gym", t)
+        XCTAssertEqual(toolResult(t, round: 1), "error: task not found")
+        XCTAssertTrue(api.tasks[0].done)
+    }
+
+    func testThePreviousReplyIsTheLastOneTheUserSaw() {
+        let turns = [
+            AssistantTurn(ChatMessage(role: "assistant", content: "Delete “Gym”?"), at: 1),
+            AssistantTurn(ChatMessage(role: "assistant", content: "narration",
+                                      toolCalls: [ToolCall(id: "c", type: "function", function: ToolFunction(name: "get_tasks", arguments: "{}"))]), at: 2),
+            AssistantTurn(ChatMessage(role: "user", content: "(hidden)"), hidden: true),
+            AssistantTurn(ChatMessage(role: "assistant", content: "Morning!"), at: 3, local: true),
+            AssistantTurn(ChatMessage(role: "user", content: "yes"), at: 4),
+        ]
+        XCTAssertEqual(AssistantHarness.previousVisibleReply(turns), "Delete “Gym”?")
+        XCTAssertNil(AssistantHarness.previousVisibleReply([AssistantTurn(ChatMessage(role: "user", content: "yes"), at: 4)]))
     }
 }

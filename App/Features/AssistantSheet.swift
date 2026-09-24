@@ -37,6 +37,10 @@ struct AssistantSheet: View {
     /// The get-to-know-you interview, hosted in this thread while the account
     /// hasn't finished or skipped it (InterviewThread). nil once done.
     @State private var interview: InterviewThreadDriver?
+    /// The turn "Undo all"'s confirmation was opened for — pinned, so a turn
+    /// landing (or the 15-minute window lapsing) while it is open never
+    /// re-targets it under the user's finger (Android A17).
+    @State private var confirmUndoAllFor: String?
     @SwiftUI.FocusState private var fieldFocused: Bool
 
     private static let chipsAnchor = "assistant.chips"
@@ -98,6 +102,25 @@ struct AssistantSheet: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .fullScreenCover(isPresented: $showVoice) { VoiceModeScreen() }
+        // "Undo all" names every change it will revert before it runs.
+        .alert("Undo these changes?", isPresented: Binding(
+            get: { confirmUndoAllFor != nil },
+            set: { if !$0 { confirmUndoAllFor = nil } }
+        ), presenting: confirmUndoAllFor) { turnId in
+            let n = assistant.undoAllReceipts(turnId: turnId).count
+            Button("Undo \(n) change\(n == 1 ? "" : "s")", role: .destructive) {
+                confirmUndoAllFor = nil
+                // Only while it is still the turn Undo all offers.
+                guard assistant.undoAllTarget?.turnId == turnId else { return }
+                Task { @MainActor in
+                    await assistant.undoAll(turnId: turnId)
+                    refreshContext()
+                }
+            }
+            Button("Keep them", role: .cancel) { confirmUndoAllFor = nil }
+        } message: { turnId in
+            Text(assistant.undoAllReceipts(turnId: turnId).map(\.label).joined(separator: "\n"))
+        }
         // The AI-consent ask for a first message or Talk from this panel.
         .aiConsentSheet(.assistant)
         .task {
@@ -385,14 +408,11 @@ struct AssistantSheet: View {
 
     private func refreshContext() { ctx = buildAssistantContext(model) }
 
+    /// Only the turn that just finished (AssistantModel.undoAllTarget); the
+    /// tap opens a confirmation naming what it reverts.
     private var undoAll: (count: Int, run: () -> Void)? {
         guard let target = assistant.undoAllTarget else { return nil }
-        return (target.count, {
-            Task { @MainActor in
-                await assistant.undoAll(turnId: target.turnId)
-                refreshContext()
-            }
-        })
+        return (target.count, { confirmUndoAllFor = target.turnId })
     }
 
     /// A chip tap sends its message through the NORMAL guardrailed agent path —

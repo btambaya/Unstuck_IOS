@@ -270,17 +270,27 @@ final class AssistantModel {
             stylePreference: { [weak self] text in self?.saveStylePreference(text) },
             commit: { [weak self] working, persist in
                 guard let self, self.historyEpoch == epoch else { return }   // thread was cleared — drop
-                // MERGE, don't replace: turns appended to the thread meanwhile
-                // (a voice session's receipts, the check-in line) must survive.
-                let have = Set(working.map(\.id))
-                let baseIds = Set(base.map(\.id))
-                let appendedMeanwhile = self.turns.filter { !have.contains($0.id) && !baseIds.contains($0.id) }
-                self.turns = working + appendedMeanwhile
+                self.turns = Self.mergeCommitted(current: self.turns, working: working, baseIds: Set(base.map(\.id)))
                 if persist { self.persist() }
             },
             now: { Self.nowMillis() },
             isCancelled: { Task.isCancelled }
         )
+    }
+
+    /// A running turn's thread merged into the live one. MERGE, don't
+    /// replace: turns appended meanwhile (a voice session's receipts, the
+    /// check-in line) survive, and the turns the run started from keep their
+    /// LIVE copies — an Undo tapped on an older receipt while the turn ran
+    /// was reset by the start-of-turn copy, bringing its Undo (and that
+    /// turn's "Undo all" count) back. The loop only appends, so its copies
+    /// of those turns carry nothing new.
+    nonisolated static func mergeCommitted(current: [AssistantTurn], working: [AssistantTurn], baseIds: Set<String>) -> [AssistantTurn] {
+        let live = Dictionary(current.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let have = Set(working.map(\.id))
+        let merged = working.map { w in baseIds.contains(w.id) ? (live[w.id] ?? w) : w }
+        let appendedMeanwhile = current.filter { !have.contains($0.id) && !baseIds.contains($0.id) }
+        return merged + appendedMeanwhile
     }
 
     /// Receipt for one executed call, resolving undo targets against the
@@ -571,11 +581,38 @@ final class AssistantModel {
         persist()
     }
 
-    /// The LAST turn that still has undoable changes — the "Undo all N changes"
-    /// affordance. nil once every receipt has been used.
+    /// How long "Undo all" stays on offer after its turn lands (Android
+    /// UNDO_ALL_WINDOW_MS).
+    nonisolated static let undoAllWindowMs: Double = 15 * 60_000
+
+    /// The turn "Undo all" reverts: the one that JUST finished — the newest
+    /// displayed turn with receipts, with no message of the user's after it,
+    /// landed within `undoAllWindowMs` — while it still has an Undo left.
+    /// Never an older turn: it used to be the last turn with ANY unused Undo
+    /// in the 200-turn thread, so a reply whose only card was "Deleted" (no
+    /// Undo) sat over "Undo all 2 changes" from an earlier turn, and one tap
+    /// reverted work from days before (James, build 51; Android A17).
+    nonisolated static func undoAllTarget(_ display: [AssistantTurn], nowMs: Double) -> AssistantTurn? {
+        guard let i = display.lastIndex(where: { !($0.receipts ?? []).isEmpty }) else { return nil }
+        let turn = display[i]
+        if display[(i + 1)...].contains(where: { $0.role == "user" }) { return nil }
+        // Only an upper bound: a turn that landed a moment ago can read as
+        // slightly in the future against a clock read earlier.
+        guard let at = turn.at, nowMs - at <= undoAllWindowMs else { return nil }
+        return turn.undoableReceipts.isEmpty ? nil : turn
+    }
+
+    /// The "Undo all N changes" affordance — see the static rule. nil once
+    /// that turn's receipts are used, it is 15 minutes old, or the user has
+    /// moved on.
     var undoAllTarget: (turnId: String, count: Int)? {
-        guard let turn = turns.last(where: { !$0.undoableReceipts.isEmpty }) else { return nil }
+        guard let turn = Self.undoAllTarget(Self.displayTurns(turns), nowMs: Self.nowMillis()) else { return nil }
         return (turn.id, turn.undoableReceipts.count)
+    }
+
+    /// What "Undo all" on `turnId` would revert — named in its confirmation.
+    func undoAllReceipts(turnId: String) -> [Receipt] {
+        turns.first { $0.id == turnId }?.undoableReceipts ?? []
     }
 
     /// One-tap revert of every still-undoable change on `turnId`.

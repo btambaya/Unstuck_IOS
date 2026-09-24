@@ -249,6 +249,11 @@ final class TurnScratch {
     /// Task id → the block schedule_task placed for it this turn, which a
     /// set_task_recurrence after it takes as the series' day and time.
     var placedBlocks: [String: String] = [:]
+    /// Off-day placements of a weekly series already refused once this
+    /// turn/session (SeriesWeekday.swift). The SAME call made again is the
+    /// model confirming a one-off the user asked for, so it goes through —
+    /// and its result says it is a one-off.
+    var offDayRefused: Set<String> = []
     init() {}
 }
 
@@ -679,6 +684,20 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         if let bad = rejectBadStartTime(args.str("startTime")) { return bad + " Nothing was scheduled." }
         let startTime = args.str("startTime").flatMap(normalizeClockTime)
         if let past = rejectPastDate(api, date) { return past }
+        // A weekly series on a day it doesn't repeat on is almost always the
+        // model's date maths ("Saturday" → 2026-09-20, a Sunday: James's park
+        // run, 2026-09-13) — refused with the series' nearest days, nothing
+        // written. The same call repeated is a one-off the user asked for.
+        var oneOff = ""
+        if isOffSeriesDay(t.recurrence, date: date) {
+            let key = "schedule|\(t.id)|\(date)"
+            if !scratch.offDayRefused.contains(key),
+               let refusal = rejectOffSeriesDay(taskName: t.name, recurrence: t.recurrence, date: date, today: api.todayIso()) {
+                scratch.offDayRefused.insert(key)
+                return refusal
+            }
+            oneOff = offSeriesDayNote(recurrence: t.recurrence, date: date)
+        }
         // No time given AND the task has never had one: don't guess — ask,
         // suggesting a slot (Ahmad, 2026-09-01: "when confused, prompt").
         let own = api.getBlocks().first { $0.taskId == t.id && !$0.done && !$0.skipped && !$0.startTime.isEmpty }
@@ -689,7 +708,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         guard let landed = await scheduleTask(api, t, date: date, startTime: startTime, scratch: scratch) else {
             return "error: \"\(t.name)\" is already done on \(date) — nothing changed"
         }
-        return "ok: scheduled \"\(t.name)\" \(date) \(landed)\(startTime == nil ? " (kept its existing time — say so)" : "")"
+        return "ok: scheduled \"\(t.name)\" \(date) \(landed)\(startTime == nil ? " (kept its existing time — say so)" : "")\(oneOff)"
 
     case "update_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }
@@ -769,6 +788,21 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // materialised a single day) and report ok — refuse and ask instead.
         if kind == "weekly" && days.isEmpty { return "error: weekly needs daysOfWeek (0=Sunday … 6=Saturday) — ask which days" }
         if kind == nil || kind == "none", t.recurrence == nil { return "error: \"\(t.name)\" doesn't repeat — nothing changed" }
+        // The slot placed for it earlier THIS turn (create_task / schedule_task
+        // with a date) on a day the new weekly days don't include: the park-run
+        // variant — create_task on Sunday 20 Sep, then weekly on Saturday,
+        // dropped the Sunday slot and started the series on the 26th, skipping
+        // the coming Saturday. Refused before anything is written; the same
+        // call repeated means the user wants it to start there.
+        if kind == "weekly", let placedId = scratch.placedBlocks[t.id],
+           let placed = api.getBlocks().first(where: { $0.id == placedId && !$0.done && !$0.skipped && $0.date >= api.todayIso() }) {
+            let key = "recurrence|\(t.id)|\(placed.date)|\(days.sorted().map(String.init).joined(separator: ","))"
+            if !scratch.offDayRefused.contains(key),
+               let refusal = rejectOffSeriesPlacement(taskName: t.name, placedDate: placed.date, daysOfWeek: days, today: api.todayIso()) {
+                scratch.offDayRefused.insert(key)
+                return refusal
+            }
+        }
         let rec: Recurrence?
         switch kind {
         case "daily": rec = .daily(until: until)
