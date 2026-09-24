@@ -195,6 +195,26 @@ enum CallSettings {
         return "This iPhone only takes calls \(clock.range(start, end)), so a check-in after a block that ends outside those hours is declined here."
     }
 
+    /// `CallToolLogic.timeGuard`'s refusal as the USER reads it, or nil when
+    /// the time passes. The guard's own `error:` string is written for the
+    /// model — machine HH:MM, "ask for a later time", the free windows — and
+    /// the task editor showed it raw: "08:50 today is already past (it's
+    /// 14:00 now). Ask for a later time …" on a 12-hour phone (2026-09-24).
+    /// `fix` is the screen's own next step ("pick a shorter lead or move the
+    /// task"). Times in the phone's 12/24-hour clock.
+    static func bookingRefusal(_ callAt: Date, now: Date, fix: String, clock: ClockFormat = .device,
+                               calendar: Calendar = .current) -> String? {
+        guard CallToolLogic.timeGuard(callAt, now: now, calendar: calendar) != nil else { return nil }
+        let callDay = CallToolLogic.ymd(callAt, calendar: calendar), today = CallToolLogic.ymd(now, calendar: calendar)
+        if callDay < today || (callDay == today && minuteOfDay(callAt, calendar: calendar) <= minuteOfDay(now, calendar: calendar)) {
+            return "\(clock.time(callAt, calendar: calendar)) has already passed — \(fix)."
+        }
+        if !isWithinServerWindow(callAt, calendar: calendar) {
+            return "Calls can only be booked between \(clock.time(serverWindowStart)) and \(clock.time(serverWindowEnd)) — \(fix)."
+        }
+        return "That time can't be booked — \(fix)."
+    }
+
     /// Can a call actually ring on this phone? Calls on here, and a
     /// call_requests row mirrored (any platform, any status) or a proactive
     /// call switched on — the moment to ask for the microphone (audit

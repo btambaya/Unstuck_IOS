@@ -396,8 +396,10 @@ struct CallSettingsView: View {
             testState = .failed("Calls can only be booked between \(clock.time(CallSettings.serverWindowStart)) and \(clock.time(CallSettings.serverWindowEnd)) — try the test call inside that window.")
             return
         }
-        if let e = CallToolLogic.timeGuard(at, now: now) {
-            testState = .failed(e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst + ".")
+        // Any other refusal, in the user's words and clock (the guard's own
+        // `error:` string carries the model's machine HH:MM).
+        if let refusal = CallSettings.bookingRefusal(at, now: now, fix: "try the test call again in a minute", clock: clock) {
+            testState = .failed(refusal)
             return
         }
         if !CallSettings.isWithinWindow(at) {
@@ -441,9 +443,3 @@ struct CallSettingsView: View {
     }
 }
 
-private extension String {
-    var capitalizedFirst: String {
-        guard let f = first else { return self }
-        return f.uppercased() + dropFirst()
-    }
-}

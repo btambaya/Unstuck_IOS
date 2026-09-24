@@ -235,8 +235,10 @@ struct CallMeSection: View {
     private func save() {
         guard let store, let callAt, let block = nextBlock,
               let uid = model.coordinator?.auth.currentUserId else { return }
-        if let e = CallToolLogic.timeGuard(callAt, now: Date()) {
-            error = e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst
+        // In the user's words and clock — timeGuard's `error:` string is the
+        // model's (machine HH:MM + "ask for a later time"; 2026-09-24).
+        if let refusal = CallSettings.bookingRefusal(callAt, now: Date(), fix: "pick a shorter lead or move the task") {
+            error = refusal
             return
         }
         // The button is disabled while the hint applies to a booking or a
@@ -289,9 +291,3 @@ struct CallMeSection: View {
     }
 }
 
-private extension String {
-    var capitalizedFirst: String {
-        guard let f = first else { return self }
-        return f.uppercased() + dropFirst()
-    }
-}

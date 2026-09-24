@@ -651,6 +651,33 @@ final class CallScriptTests: XCTestCase {
         XCTAssertNil(CallToolLogic.timeGuard(date(2026, 9, 3, 6, 0), now: now, calendar: cal), "tomorrow at the window edge")
     }
 
+    /// The task editor / test call show timeGuard's refusal in the user's own
+    /// words and clock — never the model's "08:50 today is already past (it's
+    /// 15:00 now). Ask for a later time …" with machine HH:MM (2026-09-24).
+    func testBookingRefusalIsTheUsersWordsInThePhonesClock() {
+        let now = date(2026, 9, 2, 15, 0)
+        let fix = "pick a shorter lead or move the task"
+        XCTAssertEqual(CallSettings.bookingRefusal(date(2026, 9, 2, 8, 50), now: now, fix: fix, clock: .h12, calendar: cal),
+                       "8:50 AM has already passed — pick a shorter lead or move the task.")
+        XCTAssertEqual(CallSettings.bookingRefusal(date(2026, 9, 2, 8, 50), now: now, fix: fix, clock: .h24, calendar: cal),
+                       "08:50 has already passed — pick a shorter lead or move the task.")
+        XCTAssertEqual(CallSettings.bookingRefusal(date(2026, 9, 2, 15, 0), now: now, fix: fix, clock: .h24, calendar: cal),
+                       "15:00 has already passed — pick a shorter lead or move the task.", "the current minute is past, like timeGuard")
+        XCTAssertNotNil(CallSettings.bookingRefusal(date(2026, 9, 1, 16, 0), now: now, fix: fix, clock: .h24, calendar: cal),
+                        "yesterday")
+        XCTAssertEqual(CallSettings.bookingRefusal(date(2026, 9, 3, 5, 30), now: now, fix: fix, clock: .h12, calendar: cal),
+                       "Calls can only be booked between 6:00 AM and 11:00 PM — pick a shorter lead or move the task.")
+        XCTAssertEqual(CallSettings.bookingRefusal(date(2026, 9, 3, 5, 30), now: now, fix: fix, clock: .h24, calendar: cal),
+                       "Calls can only be booked between 06:00 and 23:00 — pick a shorter lead or move the task.")
+        XCTAssertNil(CallSettings.bookingRefusal(date(2026, 9, 2, 15, 1), now: now, fix: fix, clock: .h12, calendar: cal))
+        XCTAssertNil(CallSettings.bookingRefusal(date(2026, 9, 3, 6, 0), now: now, fix: fix, clock: .h12, calendar: cal))
+        for d in [date(2026, 9, 2, 8, 50), date(2026, 9, 3, 5, 30), date(2026, 9, 1, 16, 0)] {
+            let line = CallSettings.bookingRefusal(d, now: now, fix: fix, clock: .h12, calendar: cal) ?? ""
+            XCTAssertFalse(line.contains("error"), line)
+            XCTAssertFalse(line.contains("Ask for"), line)
+        }
+    }
+
     /// 20 notes × 300 chars (web MAX_CALL_NOTES); a string splits on NEWLINES
     /// only — a note may contain ";".
     func testNotesArgAcceptsArrayOrLinesAndCapsLikeTheWeb() {

@@ -58,6 +58,11 @@ editor lines, the "Rescheduled" notification, the interview's Before/After chips
 tool args + results, AssistantContext, call instructions + day context, `hoursLabel` with no clock (the model's
 `error:` strings), storage/API/Google HH:MM, logs, the web-port `hourSpanLabel` in read_insights. Pure Core display
 helpers take `clock: ClockFormat = .device`; tests pin `.h12` / `.h24` (ClockFormatTests + the touched suites).
+Review pass (same day): a `timeGuard` refusal is never shown raw any more — the task editor's "Call me" Book/Update
+and the test call use `CallSettings.bookingRefusal` ("8:50 AM has already passed — pick a shorter lead or move the
+task"), not the model's "08:50 today is already past (it's 14:00 now). Ask for a later time …"; the "Plan a quiet
+weekend" chip's message (the user's own bubble) says "nothing before 10:00" / "10 AM"; a 12-hour range drops the
+start's marker only when the end follows it in the same half-day (an overnight "1:00 AM–12:30 AM" keeps both).
 
 ## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
 

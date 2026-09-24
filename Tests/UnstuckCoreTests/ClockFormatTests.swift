@@ -46,7 +46,12 @@ final class ClockFormatTests: XCTestCase {
         XCTAssertEqual(c.time(hour: 9, minute: 5), "9:05 AM")
         XCTAssertEqual(c.time(hour: 0, minute: 15), "12:15 AM")
         XCTAssertEqual(c.time(hour: 12, minute: 0), "12:00 PM")
+        XCTAssertEqual(c.time(hour: 0, minute: 0), "12:00 AM", "midnight")
+        XCTAssertEqual(c.time(hour: 11, minute: 59), "11:59 AM")
+        XCTAssertEqual(c.time(hour: 12, minute: 1), "12:01 PM", "just past noon")
         XCTAssertEqual(c.time("23:59"), "11:59 PM")
+        XCTAssertEqual(c.time("24:00"), "12:00 AM", "24:00 is the next midnight")
+        XCTAssertEqual(ClockFormat.h24.time(hour: 12, minute: 0), "12:00")
     }
 
     func testWholeHoursIn12HourAreShort() {
@@ -63,6 +68,12 @@ final class ClockFormatTests: XCTestCase {
         XCTAssertEqual(c.range(startMinutes: 14 * 60, endMinutes: 15 * 60 + 30), "2:00–3:30 PM")
         XCTAssertEqual(c.range(startMinutes: 11 * 60 + 30, endMinutes: 12 * 60 + 30), "11:30 AM–12:30 PM")
         XCTAssertEqual(c.range("22:00", "02:00"), "10:00 PM–2:00 AM")
+        XCTAssertEqual(c.range(start: "23:00", durationMinutes: 90), "11:00 PM–12:30 AM")
+        // An overnight span that ends in the SAME half-day keeps both markers —
+        // "1:00–12:30 AM" / "8:00–7:00 PM" would read as a short range.
+        XCTAssertEqual(c.range("01:00", "00:30"), "1:00 AM–12:30 AM")
+        XCTAssertEqual(c.range("20:00", "19:00"), "8:00 PM–7:00 PM")
+        XCTAssertEqual(c.range(startMinutes: 9 * 60, endMinutes: 9 * 60 + 24 * 60 + 30), "9:00 AM–9:30 AM")
         XCTAssertEqual(c.hourSpan(10), "10–11 AM")
         XCTAssertEqual(c.hourSpan(11), "11 AM–12 PM")
         XCTAssertEqual(c.hourSpan(0), "12–1 AM")

@@ -138,15 +138,19 @@ public struct ClockFormat: Sendable, Hashable {
     }
 
     /// "14:00–15:30" / "2:00–3:30 PM" / "11:30 AM–12:30 PM". Minutes since
-    /// midnight; an end past midnight wraps ("23:00–00:30").
+    /// midnight; an end past midnight wraps ("23:00–00:30"). 12-hour drops the
+    /// start's marker only when the end follows it within the same half-day —
+    /// an overnight span that lands in the same half ("1:00 AM–12:30 AM",
+    /// "8:00 PM–7:00 PM") keeps both, or it would read as a short range.
     public func range(startMinutes: Int, endMinutes: Int) -> String {
         switch cycle {
         case .h24:
             return "\(time(minutes: startMinutes))–\(time(minutes: endMinutes))"
         case .h12:
             let (sh, sm) = Self.split(startMinutes)
-            let (eh, _) = Self.split(endMinutes)
-            if marker(sh) == marker(eh) {
+            let (eh, em) = Self.split(endMinutes)
+            let span = endMinutes - startMinutes
+            if marker(sh) == marker(eh), eh * 60 + em >= sh * 60 + sm, span >= 0, span < 12 * 60 {
                 return "\(Self.hour12(sh)):\(Self.pad2(sm))–\(time(minutes: endMinutes))"
             }
             return "\(time(minutes: startMinutes))–\(time(minutes: endMinutes))"
