@@ -299,7 +299,7 @@ func buildVoiceInstructions(_ api: AssistantAppState) -> String {
         + "WHEN CONFUSED OR MISSING A DETAIL (which task, which day, what time): don't guess and don't claim — ask ONE short question and offer a suggestion ('Friday at 9, or a time you prefer?'), then act on their answer. Never invent or announce a day or time they didn't give. "
         + "Actions happen ONLY via tool calls: never say you added or scheduled something unless the tool ran this turn. "
         + "When the user asks you to do something (add a task, "
-        + "schedule, add to a list), call the matching tool, then say what's now true in one short sentence. "
+        + "schedule, add to a list), call the matching tool, then say in one short, plain sentence what changed. "
         + "Reference "
         + "existing tasks/lists by their id from the state below. In TOOL ARGUMENTS dates are YYYY-MM-DD and times 24h HH:MM; "
         + "for \"tomorrow\" or a weekday name, copy the date from upcoming in the state below — never work it out yourself. "
