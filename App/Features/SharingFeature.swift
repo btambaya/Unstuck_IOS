@@ -285,7 +285,12 @@ struct SharedWithYouGroup: View {
             VStack(alignment: .leading, spacing: 6) {
                 if !visible.isEmpty {
                     GroupHeader(mode == .completed ? "Shared with you · completed" : "Shared with you")
-                    ForEach(visible) { s in row(s, todayISO: today) }
+                    ForEach(visible) { s in
+                        SharedWithYouRow(s: s, todayISO: today, makeCoFocus: makeCoFocus,
+                                         suppressPresenceTaskId: suppressPresenceTaskId, onToggle: onToggle) {
+                            detailTarget = SharedDetailTarget(id: s.taskId)
+                        }
+                    }
                 }
             }
             .padding(.bottom, 8)
@@ -296,18 +301,31 @@ struct SharedWithYouGroup: View {
             }
         }
     }
+}
 
-    private func row(_ s: SharedWithMe, todayISO: String) -> some View {
+/// One "shared with you" row — also mounted on its own by Tasks › Completed,
+/// which interleaves finished shares with your own rows by completion time.
+struct SharedWithYouRow: View {
+    @Environment(\.uTheme) private var theme
+    let s: SharedWithMe
+    let todayISO: String
+    var makeCoFocus: ((String) -> CoFocusModel)? = nil
+    var suppressPresenceTaskId: String? = nil
+    let onToggle: (String, Bool) -> Void   // (taskId, nextDone)
+    let onOpen: () -> Void
+
+    var body: some View {
         // No tick on a repeating share (C3): it would end the owner's series.
         let canComplete = shareCanTickDone(s)
         // The owner's slot, in words — "Sat 04:30 · 45m · from Anna" — so a
         // shared task reads like your own scheduled row; just "from Anna" when
-        // nothing is planned (or against a pre-052 server).
+        // nothing is planned (or against a pre-052 server). A DONE share never
+        // reads "Overdue" (its past slot is just "Fri 08:45 · 25m").
         let slot = sharedSlotLabel(nextDate: s.nextDate, nextStartTime: s.nextStartTime,
                                    nextDurationMinutes: s.nextDurationMinutes, nextDone: s.nextDone,
-                                   nextStartAt: s.nextStartAt, todayISO: todayISO)
+                                   nextStartAt: s.nextStartAt, done: s.done, todayISO: todayISO)
         let subtitle = slot.map { "\($0) · from \(shortName(s.ownerName))" } ?? "from \(shortName(s.ownerName))"
-        return HStack(spacing: 12) {
+        HStack(spacing: 12) {
             if canComplete {
                 Button { onToggle(s.taskId, !s.done) } label: {
                     Image(systemName: s.done ? "checkmark.circle.fill" : "circle")
@@ -343,7 +361,7 @@ struct SharedWithYouGroup: View {
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
             .strokeBorder(theme.palette.line2, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
         .contentShape(Rectangle())
-        .onTapGesture { detailTarget = SharedDetailTarget(id: s.taskId) }
+        .onTapGesture(perform: onOpen)
         .accessibilityHint("Opens the shared task")
     }
 }
