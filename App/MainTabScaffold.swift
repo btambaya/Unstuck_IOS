@@ -10,6 +10,8 @@ import UnstuckDesign
 
 struct MainTabScaffold: View {
     @State private var showCallTalk = false
+    /// A software keyboard is on screen — the bottom nav hides under it.
+    @State private var keyboardUp = false
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
 
@@ -35,10 +37,32 @@ struct MainTabScaffold: View {
                 // edge, so ignoring the keyboard inset stretches it to the
                 // screen's bottom safe edge and the bar aligns there. Its empty
                 // area takes no touches.
+                //
+                // And while a keyboard is up the bar is HIDDEN, not just
+                // covered: the iOS 26 keyboard is translucent, so a bar left
+                // under it showed through as a blurred coral smear (the +)
+                // along the keyboard's bottom row. Hidden = no ghost, no
+                // VoiceOver stops on tabs nobody can see, no taps. The slot
+                // keeps its place, so nothing jumps when the keyboard goes.
+                .opacity(keyboardUp ? 0 : 1)
+                .allowsHitTesting(!keyboardUp)
+                .accessibilityHidden(keyboardUp)
+                .animation(.easeOut(duration: 0.18), value: keyboardUp)
                 .frame(maxHeight: .infinity, alignment: .bottom)
                 .ignoresSafeArea(.keyboard, edges: .bottom)
         }
             .background(theme.palette.bg.ignoresSafeArea())
+            // Every keyboard frame change says where the keyboard will END.
+            // Off screen (hidden, or a hardware keyboard holding the software
+            // one below the edge) → the bar shows; on screen → it hides. (A
+            // keyboard raised in a sheet hides it too — behind the sheet, and
+            // back when the sheet's keyboard goes.)
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { note in
+                keyboardUp = Self.keyboardIsOnScreen(note)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                keyboardUp = false
+            }
             .sheet(item: $router.activeSheet, onDismiss: { model.flushPendingDeepLink() }) { sheet in
                 switch sheet {
                 case .newTask: NewTaskSheet(defaultEstimate: model.settings.focusDefaultMin)
@@ -134,6 +158,27 @@ struct MainTabScaffold: View {
             // focused text field), so hand the resolved action to it.
             model.router.collectionFabRequest = .init(action: action)
         }
+    }
+
+    // MARK: - keyboard (the bottom nav hides while one is on screen)
+
+    /// Whether the keyboard in a will-change-frame / will-show note ENDS on
+    /// screen. Since iOS 16 the note's object is the screen it is on.
+    private static func keyboardIsOnScreen(_ note: Notification) -> Bool {
+        guard let end = (note.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? NSValue)?.cgRectValue
+        else { return false }
+        let screen = (note.object as? UIScreen)?.bounds
+            ?? UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.screen.bounds }.first
+        guard let screen else { return false }
+        return keyboardCovers(end: end, screen: screen)
+    }
+
+    /// More than a hairline of the keyboard's end frame is on the screen. A
+    /// hardware keyboard parks the software one at (or below) the bottom edge
+    /// — that is not "up", and the bar must stay.
+    nonisolated static func keyboardCovers(end: CGRect, screen: CGRect) -> Bool {
+        guard !end.isNull, end.height > 0 else { return false }
+        return end.intersection(screen).height > 1
     }
 
     /// Presented only while the assistant is enabled — turning the kill-switch

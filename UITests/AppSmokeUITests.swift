@@ -48,6 +48,10 @@ final class AppSmokeUITests: XCTestCase {
         let b = app.buttons[label].firstMatch
         XCTAssertTrue(b.waitForExistence(timeout: 8), "bottom nav '\(label)' is missing",
                       file: file, line: line)
+        // The nav hides while a software keyboard is up, but XCUITest still
+        // lists its buttons — a tap there would land on the content instead.
+        XCTAssertTrue(b.isHittable, "bottom nav '\(label)' is not tappable (is a keyboard up?)",
+                      file: file, line: line)
         b.tap()
         usleep(700_000)
     }
@@ -288,6 +292,20 @@ final class AppSmokeUITests: XCTestCase {
         expect(app.staticTexts["Groceries"].firstMatch, "the seeded Groceries list is missing")
         app.staticTexts["Groceries"].firstMatch.tap(); usleep(800_000)
         expect(app.buttons["Add to this collection"].firstMatch, "the collection detail did not open")
+        // The detail auto-focuses its add field, and the bottom nav hides while
+        // the software keyboard is up (build 97 fix) — put the keyboard away
+        // first, as a person would; the walk under test is leaving the tab from
+        // the nav. A simulator with a hardware keyboard keeps the software one
+        // off screen until something is typed, so type a no-op first: this is
+        // then the phone case (keyboard on screen, nav hidden) on every simulator.
+        if app.keyboards.count > 0 {
+            app.typeText(" "); app.typeText(XCUIKeyboardKey.delete.rawValue); usleep(600_000)
+            XCTAssertFalse(app.buttons["Today"].firstMatch.isHittable,
+                           "the bottom nav should be hidden while the add field's keyboard is up")
+            app.staticTexts["Groceries"].firstMatch.tap(); usleep(500_000)
+            app.typeText("\n"); usleep(900_000)
+            XCTAssertEqual(app.keyboards.count, 0, "could not clear the add field's focus")
+        }
         tapNav("Today")                    // no back tap — straight out of the tab
         tapNav("Collections")
         XCTAssertTrue(app.buttons["New collection"].firstMatch.waitForExistence(timeout: 6),
@@ -331,6 +349,7 @@ final class CollectionKeyboardUITests: XCTestCase {
     }
 
     private let lastItem = "Beta invite list"
+    private let firstItem = "Review TestFlight feedback"
 
     override func setUpWithError() throws {
         continueAfterFailure = true
@@ -372,14 +391,24 @@ final class CollectionKeyboardUITests: XCTestCase {
     private var hasFocus: Bool { app.keyboards.count > 0 }
     /// The software keyboard is actually up on screen.
     private var keyboardOnScreen: Bool { keyboard.exists && keyboard.frame.minY < app.frame.height - 40 }
+    /// The keyboard's real top edge. The `Keyboard` element is only the key
+    /// area; the typing-predictions strip sits ~44 pt above it and covers
+    /// whatever is under it just the same.
+    private var keyboardTop: CGFloat {
+        guard keyboardOnScreen else { return app.frame.height }
+        let predictions = app.otherElements["Typing Predictions"].firstMatch
+        let strip = predictions.exists ? predictions.frame.minY : .infinity
+        return min(keyboard.frame.minY, strip)
+    }
 
-    /// The row being edited: its text field if exposed on its own, else the
-    /// row element that carries the text.
+    /// The text field of the row being edited.
     private func edited(_ body: String) -> XCUIElement {
-        let tf = app.textFields.matching(NSPredicate(format: "value == %@", body)).firstMatch
-        if tf.exists { return tf }
-        return app.descendants(matching: .any)
-            .matching(NSPredicate(format: "label CONTAINS %@ OR value CONTAINS %@", body, body)).firstMatch
+        app.textFields.matching(NSPredicate(format: "value == %@", body)).firstMatch
+    }
+    /// The whole card of the row being edited (the row button that holds the field).
+    private func editedRow(_ body: String) -> XCUIElement {
+        app.buttons.containing(NSPredicate(format: "elementType == %d AND value == %@",
+                                           XCUIElement.ElementType.textField.rawValue, body)).firstMatch
     }
 
     private func rect(_ r: CGRect) -> String { String(format: "y %.0f…%.0f", r.minY, r.maxY) }
@@ -402,27 +431,79 @@ final class CollectionKeyboardUITests: XCTestCase {
     }
 
     /// Log where the keyboard, the nav and `field` are, and assert the
-    /// contract: `field` wholly above the keyboard (and above the nav if the
-    /// nav is somehow drawn there), and no nav above the keyboard.
+    /// contract: the whole of `card` (the edited row, or the add pill — the
+    /// field grown by `grow`) wholly above the keyboard (and above the nav if
+    /// the nav is somehow drawn there), and no nav visible while it's up.
     @discardableResult
-    private func measure(_ tag: String, _ field: XCUIElement,
+    private func measure(_ tag: String, _ field: XCUIElement, card: XCUIElement? = nil, grow: CGFloat = 0,
                          file: StaticString = #filePath, line: UInt = #line) -> CGRect {
         let screen = app.frame.height
         let kb = keyboardOnScreen ? keyboard.frame : .null
-        let kbTop = kb.isNull ? screen : kb.minY
+        let kbTop = keyboardTop
         let navShown = nav.exists && nav.isHittable
         let navRect = navShown ? nav.frame : .null
         let navAboveKeyboard = !kb.isNull && navShown && navRect.maxY <= kbTop + 1
         let f = field.exists ? field.frame : .null
+        let c: CGRect = {
+            if let card { return card.exists ? card.frame : .null }
+            return f.isNull ? .null : f.insetBy(dx: 0, dy: -grow)
+        }()
         let limit = navAboveKeyboard ? min(kbTop, navRect.minY) : kbTop
-        let fieldClear = !f.isNull && f.maxY <= limit + 0.5 && f.minY >= 0
-        print("LISTKBD [\(tag)] screen=\(Int(screen)) keyboard=\(kb.isNull ? "none" : rect(kb)) "
+        let clear = !c.isNull && !f.isNull && c.maxY <= limit + 0.5 && f.minY >= 0
+        print("LISTKBD [\(tag)] screen=\(Int(screen)) keyboardTop=\(Int(kbTop)) keys=\(kb.isNull ? "none" : rect(kb)) "
               + "nav=\(navShown ? rect(navRect) : "hidden") navAboveKeyboard=\(navAboveKeyboard) "
-              + "field=\(f.isNull ? "missing" : rect(f)) fieldClear=\(fieldClear)")
+              + "field=\(f.isNull ? "missing" : rect(f)) card=\(c.isNull ? "missing" : rect(c)) clear=\(clear)")
         XCTAssertFalse(kb.isNull, "[\(tag)] the software keyboard is not on screen", file: file, line: line)
-        XCTAssertTrue(fieldClear, "[\(tag)] the field (\(f.isNull ? "missing" : rect(f))) is not wholly visible above the keyboard top \(Int(kbTop))\(navAboveKeyboard ? " and the nav top \(Int(navRect.minY))" : "")", file: file, line: line)
-        XCTAssertFalse(navAboveKeyboard, "[\(tag)] the bottom nav (\(rect(navRect))) sits on top of the keyboard (\(rect(kb)))", file: file, line: line)
+        XCTAssertTrue(clear, "[\(tag)] the row (\(c.isNull ? "missing" : rect(c))) is not wholly visible above the keyboard top \(Int(kbTop))\(navAboveKeyboard ? " and the nav top \(Int(navRect.minY))" : "")", file: file, line: line)
+        XCTAssertFalse(navAboveKeyboard, "[\(tag)] the bottom nav (\(rect(navRect))) sits on top of the keyboard (top \(Int(kbTop)))", file: file, line: line)
+        // Hidden, not merely covered: the iOS 26 keyboard is translucent, and a
+        // bar left under it shows through as a blurred coral smear (the +).
+        // Checked where the + sits with no keyboard (under the keyboard now)
+        // AND where it would sit had the bar ridden up onto the keyboard.
+        if let plus = plusFrame, let barBottom = homeBarBottom {
+            let under = coralness(in: plus.insetBy(dx: 6, dy: 6))
+            let riding = coralness(in: plus.offsetBy(dx: 0, dy: kbTop - barBottom).insetBy(dx: 6, dy: 6))
+            print("LISTKBD [\(tag)] coralness where the + would be: under the keyboard \(under), riding on it \(riding)")
+            XCTAssertLessThan(under, 24, "[\(tag)] the bar's coral + shows through the keyboard", file: file, line: line)
+            XCTAssertLessThan(riding, 24, "[\(tag)] the bar's coral + is drawn on top of the keyboard", file: file, line: line)
+        }
         return f
+    }
+
+    /// The add pill: its text field plus the pill's 12-pt vertical padding.
+    private let addPillPadding: CGFloat = 12
+
+    /// Where the bar's + sits with the keyboard down (read once, on open).
+    private var plusFrame: CGRect?
+    /// The bar's bottom edge with the keyboard down (its tab buttons end 6 pt above it).
+    private var homeBarBottom: CGFloat?
+
+    /// How coral a patch of the screen is: the largest red-minus-blue over a
+    /// grid of samples (the keyboard's greys sit at or below 0; the blurred +
+    /// through it reads 40+).
+    private func coralness(in pts: CGRect) -> Int {
+        let shot = XCUIScreen.main.screenshot().image
+        guard let cg = shot.cgImage else { return 0 }
+        let scale = shot.scale
+        let px = CGRect(x: pts.minX * scale, y: pts.minY * scale, width: pts.width * scale, height: pts.height * scale).integral
+        guard let crop = cg.cropping(to: px) else { return 0 }
+        let w = crop.width, h = crop.height
+        var bytes = [UInt8](repeating: 0, count: w * h * 4)
+        let drawn: Bool = bytes.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(crop, in: CGRect(x: 0, y: 0, width: w, height: h)); return true
+        }
+        guard drawn else { return 0 }
+        var worst = Int.min
+        for y in stride(from: 0, to: h, by: max(1, h / 8)) {
+            for x in stride(from: 0, to: w, by: max(1, w / 8)) {
+                let i = (y * w + x) * 4
+                worst = max(worst, Int(bytes[i]) - Int(bytes[i + 2]))
+            }
+        }
+        return worst
     }
 
     /// Drop keyboard focus the way the smoke test does: open the title's inline
@@ -453,7 +534,7 @@ final class CollectionKeyboardUITests: XCTestCase {
         row.press(forDuration: 0.8)
         raiseKeyboard()
         usleep(500_000)
-        return measure(tag, edited(lastItem))
+        return measure(tag, edited(lastItem), card: editedRow(lastItem))
     }
 
     func testEditAndAddAtTheBottomStayAboveTheKeyboard() throws {
@@ -461,6 +542,11 @@ final class CollectionKeyboardUITests: XCTestCase {
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let allow = springboard.buttons["Allow"].firstMatch
         if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(800_000) }
+        // Where the + sits with no keyboard — the spot to check for a ghost of it later.
+        let plus = app.buttons["New task"].firstMatch
+        XCTAssertTrue(plus.waitForExistence(timeout: 4), "the bar's + is missing on Today")
+        plusFrame = plus.frame
+        homeBarBottom = nav.frame.maxY + 6
 
         app.buttons["Collections"].firstMatch.tap(); usleep(700_000)
         let list = app.staticTexts["Sync up"].firstMatch
@@ -472,7 +558,7 @@ final class CollectionKeyboardUITests: XCTestCase {
         // 0 · The detail focuses its add field on open — with the keyboard up
         // that field is the bottom of a long list.
         raiseKeyboard()
-        measure("open-add-focused", addField)
+        measure("open-add-focused", addField, grow: addPillPadding)
         shot("\(prefix)-open")
 
         // 1 · Hold the LAST row to edit it (the reported case).
@@ -480,15 +566,18 @@ final class CollectionKeyboardUITests: XCTestCase {
         shot(prefix)
         dumpTree("\(prefix)-edit-tree")
 
-        // The list must still scroll with the keyboard up: a flick up moves the
-        // row up (or it is already as high as the content allows), and a flick
-        // down brings it back into view — never lost under the keyboard.
+        // The list must still scroll freely with the keyboard up: a flick up
+        // moves the row up (or it is already as high as the content allows);
+        // a flick down may carry it under the keyboard (the user moved it), and
+        // flicking back up brings it out again.
         app.swipeUp(); usleep(800_000)
-        let up = measure("edit-last-swiped-up", edited(lastItem))
+        let up = measure("edit-last-swiped-up", edited(lastItem), card: editedRow(lastItem))
         print("LISTKBD [edit-last-swiped-up] moved \(Int(first.minY - up.minY))pt")
         shot("\(prefix)-edit-scrolled")
         app.swipeDown(); usleep(800_000)
         print("LISTKBD [edit-last-swiped-down] field=\(rect(edited(lastItem).frame))")
+        app.swipeUp(); usleep(500_000); app.swipeUp(); usleep(800_000)
+        measure("edit-last-swiped-back-up", edited(lastItem), card: editedRow(lastItem))
 
         // Done editing → the keyboard goes and the nav is back at the bottom.
         app.typeText("\n")
@@ -498,20 +587,87 @@ final class CollectionKeyboardUITests: XCTestCase {
         print("LISTKBD [after-edit] nav=\(rect(nav.frame))")
         shot("\(prefix)-edit-done")
 
+        // 1b · The FIRST row too (top of the list, right under the header).
+        dropFocus()
+        for _ in 0..<4 { app.swipeDown(); usleep(400_000) }
+        let firstRow = app.buttons[firstItem].firstMatch
+        XCTAssertTrue(firstRow.waitForExistence(timeout: 4) && firstRow.isHittable, "the first row is not on screen")
+        firstRow.press(forDuration: 0.8)
+        raiseKeyboard()
+        usleep(500_000)
+        measure("edit-first", edited(firstItem), card: editedRow(firstItem))
+        shot("\(prefix)-edit-first")
+        app.typeText("\n")
+        XCTAssertTrue(waitUntil { !self.hasFocus }, "submitting the first-row edit did not dismiss the keyboard")
+        XCTAssertTrue(nav.waitForExistence(timeout: 4) && nav.isHittable, "the bottom nav did not come back after the first-row edit")
+
         // 2 · Add a new item at the bottom: the + puts the cursor in the add field.
         app.buttons["Add to this collection"].firstMatch.tap()
         XCTAssertTrue(waitUntil { self.hasFocus }, "the + did not focus the add field")
         app.typeText("Book the venue")
         XCTAssertTrue(waitUntil { self.keyboardOnScreen }, "the software keyboard never came on screen")
-        measure("add-bottom", addField)
+        measure("add-bottom", addField, grow: addPillPadding)
         shot("\(prefix)-add")
 
         // 3 · Dark: the same two states.
         XCUIDevice.shared.appearance = .dark
         usleep(1_500_000)
-        measure("add-bottom-dark", addField)
+        measure("add-bottom-dark", addField, grow: addPillPadding)
         shot("\(prefix)-dark-add")
         editLastItem("edit-last-dark")
         shot("\(prefix)-dark")
+    }
+
+    /// Keyboards that are NOT the collection's: a sheet's (New task — closed
+    /// with its keyboard still up) and the Collections grid's search. While
+    /// one is up the bar is hidden; once it goes the bar is back where it was,
+    /// tappable, and its + works.
+    func testBarComesBackAfterSheetAndSearchKeyboards() throws {
+        XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 15), "the demo boot never reached Today")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = springboard.buttons["Allow"].firstMatch
+        if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(800_000) }
+        let plus = app.buttons["New task"].firstMatch
+        XCTAssertTrue(plus.waitForExistence(timeout: 4), "the bar's + is missing on Today")
+        plusFrame = plus.frame
+        let home = nav.frame
+        homeBarBottom = home.maxY + 6
+
+        // New task sheet: type with the keyboard up, then Close it as it is.
+        plus.tap()
+        let name = app.textFields["new-task-name"]
+        XCTAssertTrue(name.waitForExistence(timeout: 6), "the New task sheet did not open")
+        name.tap(); name.typeText("Buy stamps")
+        XCTAssertTrue(waitUntil { self.keyboardOnScreen }, "no software keyboard in the New task sheet")
+        shot("\(prefix)-sheet-keyboard")
+        app.buttons["Close"].firstMatch.tap()
+        XCTAssertTrue(waitUntil { !self.hasFocus && self.nav.exists && self.nav.isHittable },
+                      "the bar did not come back after the sheet closed with its keyboard up")
+        XCTAssertEqual(nav.frame.minY, home.minY, accuracy: 1, "the bar is not back where it was")
+        XCTAssertTrue(plus.isHittable, "the + is not hittable after the sheet's keyboard went")
+        shot("\(prefix)-sheet-closed")
+
+        // The Collections grid's search field.
+        app.buttons["Collections"].firstMatch.tap(); usleep(700_000)
+        let search = app.textFields.matching(NSPredicate(format: "placeholderValue == 'Search collections'")).firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 6), "the Collections search field is missing")
+        search.tap(); search.typeText("Sync")
+        XCTAssertTrue(waitUntil { self.keyboardOnScreen }, "no software keyboard for the search")
+        measure("grid-search", search)
+        shot("\(prefix)-grid-search")
+        app.typeText("\n")
+        XCTAssertTrue(waitUntil { !self.hasFocus && self.nav.exists && self.nav.isHittable },
+                      "the bar did not come back after the search keyboard went")
+        XCTAssertEqual(nav.frame.minY, home.minY, accuracy: 1, "the bar is not back where it was")
+        // Hittable, not just present: with its glyph exposed, the + came back
+        // from the hidden state as a button wrapping an "Add" image that an
+        // accessibility hit test (VoiceOver touch, XCUITest) could not find.
+        let newCollection = app.buttons["New collection"].firstMatch
+        XCTAssertTrue(newCollection.waitForExistence(timeout: 4) && newCollection.isHittable,
+                      "the grid's + is not hittable after the keyboard went")
+        newCollection.tap()
+        XCTAssertTrue(app.staticTexts["NEW COLLECTION"].firstMatch.waitForExistence(timeout: 6),
+                      "the bar's + did not open New collection once the keyboard was gone")
+        shot("\(prefix)-grid-plus-works")
     }
 }

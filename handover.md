@@ -43,7 +43,7 @@ phases land. Newest status at the top.
 
 
 
-## Keyboard over a long collection: the bottom nav stays under the keyboard (branch listkbd/ios, 2026-09-24) — not shipped yet
+## Keyboard over a long collection: the bottom nav hides while typing (branch listkbd/ios, 2026-09-24) — not shipped yet
 
 Ahmad (build 97, a ~9-item shared list): holding an item near the bottom to edit it — the keyboard covered the row,
 the list wouldn't bring it into view, and the bottom nav rode up and sat ON TOP of the keyboard.
@@ -76,6 +76,36 @@ the list wouldn't bring it into view, and the bottom nav rode up and sat ON TOP 
   Today on every demo boot there and every AppSmoke test failed "never reached Today". `startUITestMode` now WRITES an
   empty tour state instead of clearing it (UITEST_TOUR boots unchanged).
 - **Not touched:** colours ("Shared with N" indigo — separate pass). Android: separate branch.
+- **Review pass (same branch).** Root cause re-checked against the before tree: tab content 62–539, bar 487–533,
+  edited field 519–539 under it, keyboard (its predictions strip) from 539. Three leftovers fixed:
+  1. *Coral ghost.* Pinned under the keyboard, the bar showed THROUGH the translucent iOS 26 keyboard as a blurred
+     coral smear (the +) along the bottom row — red-minus-blue 45 at the +'s spot in every shot. `MainTabScaffold`
+     now also HIDES the bar while a keyboard is on screen (`keyboardWillChangeFrame` end frame vs the screen —
+     `keyboardCovers(end:screen:)`, unit-tested in `BarKeyboardTests`; a hardware keyboard parking the software one
+     off screen doesn't count): opacity 0, no hit testing, `accessibilityHidden` (XCUITest still lists the buttons,
+     so the UI test checks pixels: red-minus-blue < 24 where the + would be). The slot keeps its place, so nothing
+     jumps; the tour anchor stays registered. A keyboard in a sheet / the tour window hides it too (behind them) —
+     back when that keyboard goes.
+  2. *Row half under the keyboard.* The ScrollView parks the focused TEXT flush on the keyboard, so the edited row's
+     card lost its bottom 10 pt and the add pill half its height. `.safeAreaPadding(.bottom, 20)` on the detail's
+     ScrollView is honoured by that scroll: the card now ends 10 pt (row) / 20 pt (pill) above the keyboard.
+  3. *The + lost its accessibility hit point after a keyboard.* Measured: with the bar pinned (with or without the
+     hiding) the + came back from a keyboard as a Button wrapping a separate "Add" image, and `isHittable` went false
+     (hit point {-1,-1}) — the original, unpinned bar did not do this. The glyph in `CoralFab` is now
+     `accessibilityHidden` (the Button carries the label): the + stays one element and hittable. Finger taps were
+     never affected.
+  - The test measured against the `Keyboard` element (583 = the keys) — 44 pt too low; it now uses the predictions
+    strip (539), checks the whole card, the first row too, scrolling back after a flick down, and no coral where the
+    + would be (under the keyboard, or riding on it). New `testBarComesBackAfterSheetAndSearchKeyboards`: New task
+    sheet closed with its keyboard up → bar back where it was; grid search → bar hidden, back after return, + hittable
+    and opens New collection.
+  - Behaviour to know: opening a collection auto-focuses its add field, so on a phone the nav is hidden there until
+    the keyboard goes (return on the empty field, Back, or finishing an edit). `AppSmokeUITests.testFabCreatesWhat…`
+    now puts the keyboard away before leaving the tab from the nav (it failed on sim 5CD157AA, which shows the
+    software keyboard on focus), and its `tapNav` asserts the button is hittable — XCUITest lists a hidden nav's
+    buttons, and a tap there silently lands on the content.
+  - Tried and dropped: hiding WITHOUT the pin (bar vanishes on will-show, back on did-hide). Same a11y quirk, and the
+    bar would show a beat late; the pinned bar fades out under the keyboard and back in as it leaves.
 
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 

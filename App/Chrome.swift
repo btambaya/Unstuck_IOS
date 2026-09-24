@@ -120,6 +120,11 @@ struct CoralFab: View {
             Image(systemName: "plus")
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(.white)
+                // Decorative: the Button carries the label. Left exposed, the
+                // glyph came back from a keyboard hiding the bar as a separate
+                // "Add" image inside the button, and an accessibility hit test
+                // on the + (VoiceOver touch, XCUITest) no longer found it.
+                .accessibilityHidden(true)
                 .frame(width: Self.side, height: Self.side)
                 .background(theme.palette.coral,
                             in: RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
