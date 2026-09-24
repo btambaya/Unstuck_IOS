@@ -275,13 +275,14 @@ public func visibleShares<T: ShareVisibilityItem>(
 /// Short day label for a block date relative to today: "Today", "Tomorrow",
 /// the weekday ("Sat") inside the coming week, else "Sat 12 Sep". A PAST date
 /// reads "Overdue · Fri" — the same wording the Backlog uses for a missed
-/// recurring occurrence. "" for an unparseable date.
-public func sharedDayLabel(_ iso: String, todayISO: String) -> String {
+/// recurring occurrence — unless the task is `done`: a finished task is never
+/// "Overdue", its past slot just reads "Fri". "" for an unparseable date.
+public func sharedDayLabel(_ iso: String, todayISO: String, done: Bool = false) -> String {
     let parts = iso.split(separator: "-").map { Int($0) }
     guard parts.count == 3, let y = parts[0], let m = parts[1], let d = parts[2] else { return "" }
     if iso == todayISO { return "Today" }
     let day = Time.civil(y, m, d)
-    if iso < todayISO { return "Overdue · \(Time.weekdayShort(iso))" }
+    if iso < todayISO { return done ? Time.weekdayShort(iso) : "Overdue · \(Time.weekdayShort(iso))" }
     let tp = todayISO.split(separator: "-").map { Int($0) }
     if tp.count == 3, let ty = tp[0], let tm = tp[1], let td = tp[2] {
         let diff = Time.wholeDaysBetween(day, Time.civil(ty, tm, td))
@@ -298,15 +299,16 @@ public func sharedDayLabel(_ iso: String, todayISO: String) -> String {
 /// phone) / "Sat 4:30 AM · 45m" (12-hour) — from the owner's next block, in
 /// the RECIPIENT's zone when `nextStartAt` is given, in the recipient's clock.
 /// nil when nothing is placed (no block, or only a finished past one), so the
-/// row falls back to just "from <owner>".
+/// row falls back to just "from <owner>". `done` = the TASK is complete: its
+/// past slot drops the "Overdue ·" prefix (a completed row never says Overdue).
 public func sharedSlotLabel(nextDate: String?, nextStartTime: String?, nextDurationMinutes: Int?,
-                            nextDone: Bool? = nil, nextStartAt: String? = nil,
+                            nextDone: Bool? = nil, nextStartAt: String? = nil, done: Bool = false,
                             todayISO: String = Clock.todayISO(), timeZone: TimeZone = .current,
                             clock: ClockFormat = .device) -> String? {
     guard nextDone != true,
           let slot = sharedLocalSlot(nextDate: nextDate, nextStartTime: nextStartTime, nextStartAt: nextStartAt,
                                      timeZone: timeZone) else { return nil }
-    var out = sharedDayLabel(slot.date, todayISO: todayISO)
+    var out = sharedDayLabel(slot.date, todayISO: todayISO, done: done)
     if let t = slot.time, !t.isEmpty { out += " \(clock.time(t))" }
     if let m = nextDurationMinutes, m > 0 { out += " · \(m)m" }
     return out

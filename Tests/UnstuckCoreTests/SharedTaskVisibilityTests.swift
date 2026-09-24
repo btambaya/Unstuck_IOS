@@ -373,6 +373,22 @@ final class SharedSlotLabelTests: XCTestCase {
                                      nextDone: true, todayISO: TODAY))
     }
 
+    /// A COMPLETED shared task never reads "Overdue" (owner bug 2026-09-24:
+    /// "Hike — Overdue · Fri 8:45 am · 25m · from James" under Completed).
+    func testCompletedTaskNeverShowsOverdue() {
+        XCTAssertEqual(sharedDayLabel("2026-05-15", todayISO: TODAY, done: true), "Fri")
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-15", nextStartTime: "08:45", nextDurationMinutes: 25,
+                                       done: true, todayISO: TODAY, clock: .h24),
+                       "Fri 08:45 · 25m")
+        // Today / future slots read the same whether done or not.
+        XCTAssertEqual(sharedSlotLabel(nextDate: TODAY, nextStartTime: "09:00", nextDurationMinutes: 25,
+                                       done: true, todayISO: TODAY, clock: .h24), "Today 09:00 · 25m")
+        XCTAssertEqual(sharedDayLabel("2026-05-23", todayISO: TODAY, done: true), "Sat")
+        // Still open → still Overdue.
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-15", nextStartTime: "08:45", nextDurationMinutes: 25,
+                                       done: false, todayISO: TODAY, clock: .h24), "Overdue · Fri 08:45 · 25m")
+    }
+
     func testPlannedLabelForTheDetail() {
         XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-23", nextStartTime: "04:30", nextDurationMinutes: 45, nextDone: false, clock: .h24),
                        "Planned Sat, May 23 · 04:30 · 45m")

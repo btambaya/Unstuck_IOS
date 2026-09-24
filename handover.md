@@ -66,6 +66,26 @@ is optional: absent, null or blank all decode to nil.
 - Tests: 4 new tests in `CallsMirrorTests`: optional decode, the moments list, the card → entry mapping and links, and
   the dedupe. Deploy: works before or after migration 084; the tap is exact only once the senders store `deep_link`.
 
+## Completed folds by when it was finished; a done row never says "Overdue" (branch donegroups/ios, 2026-09-24) — not shipped yet
+
+Ahmad (screenshot of Tasks › Completed, one long list): "make them collapsible — last 24 hours, 48 hours, last week".
+Rule (same on web/Android): pure `completedSection` / `groupCompleted` (Sources/UnstuckCore/Logic/CompletedSections.swift)
+put each row in Today · Yesterday · Earlier this week · Last week · Earlier by `completedAt`, LOCAL midnights, weeks
+start MONDAY (forced, not the device locale), first match wins (so on a Monday Sunday is Yesterday; on a Tuesday
+"Earlier this week" is empty and Sunday is Last week); missing/garbage `completedAt` → Earlier; future → Today;
+newest first per section; empty sections omitted. Day maths goes through the Calendar (DST-safe).
+UI (TasksFeature.swift `completedList`): finished shares no longer sit in a separate "Shared with you · completed"
+group under Completed — they interleave with your own rows by their `completedAt` (`CompletedEntry`); each section
+header is the `SectionLabel` eyebrow "YESTERDAY · 4" + a chevron, a Button (VoiceOver: "Yesterday, 4 tasks",
+value Expanded/Collapsed). Default open: Today + Yesterday; fold state persists per device in
+`@AppStorage("tasks.completed.openSections")`. The shared row is now `SharedWithYouRow` (SharingFeature.swift), used
+by SharedWithYouGroup and by Completed (whose detail sheet TasksView hosts via `sharedDetail`).
+Overdue bug: a finished share read "Overdue · Fri 8:45 am · 25m · from James" — `sharedSlotLabel`/`sharedDayLabel`
+take `done:`; a done task's past slot reads just "Fri 08:45 · 25m". (Own completed rows never got the Overdue chip —
+`overdueLabels` only covers open missed occurrences.) Tests: `CompletedSectionsTests` (boundaries to the second,
+00:00, Mon/Tue/Sun as today, zones, both London DST changes, ordering/omission) +
+`SharedSlotLabelTests.testCompletedTaskNeverShowsOverdue`.
+
 ## Push times follow the phone's clock (branch pushclock/ios, 2026-09-24) — not shipped yet
 
 The reminder push + in-app card said "Starts in 10 min — 3:00 PM." on Ahmad's 24-hour iPhone: the SERVER wrote the

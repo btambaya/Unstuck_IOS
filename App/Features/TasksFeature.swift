@@ -108,6 +108,13 @@ struct TasksView: View {
     @State private var showNotifCenter = false
     /// The row whose "Share…" context action opened the Share screen.
     @State private var shareTarget: ShareTarget?
+    /// A finished share tapped under Completed (its rows live outside
+    /// SharedWithYouGroup there, so the detail sheet is hosted here).
+    @State private var sharedDetail: SharedDetailTarget?
+    /// Completed › the sections the user has OPEN (comma-joined raw values),
+    /// kept per device. Default: Today + Yesterday open, the rest folded.
+    @AppStorage("tasks.completed.openSections") private var completedOpenRaw =
+        CompletedSection.allCases.filter(\.expandedByDefault).map(\.rawValue).joined(separator: ",")
 
     // Tab order mirrors the web TaskListPane / Android: Backlog first (the
     // triage stack), then All / Today / Upcoming / Later / Recurring / Completed.
@@ -124,6 +131,7 @@ struct TasksView: View {
             TaskEditor(task: task)
         }
         .sheet(item: $shareTarget) { target in ShareScreen(target: target) }
+        .sheet(item: $sharedDetail) { target in SharedTaskDetailSheet(taskId: target.id, block: target.block) }
         .sheet(isPresented: $showSettings) { SettingsView() }
         .sheet(isPresented: $showPalette) { CommandPalette() }
         .sheet(isPresented: $showNotifCenter, onDismiss: { model.flushPendingDeepLink() }) { NotificationCenterView() }
@@ -356,8 +364,10 @@ struct TasksView: View {
         // your own tasks (the view picks the mode), and a finished one lands
         // under Completed. Later / Recurring never mount it. Delegation stays
         // an All/Today-only group. Today is area-agnostic here, like the rows
-        // + Delegated (the area pill bites on the other tabs).
-        let showShared = vm.view != .later && vm.view != .recurring
+        // + Delegated (the area pill bites on the other tabs). Under Completed
+        // the finished shares interleave with your own rows by completion time
+        // (completedList), so the separate group isn't mounted there.
+        let showShared = vm.view != .later && vm.view != .recurring && vm.view != .completed
         let showDelegated = vm.view == .all || vm.view == .today
         ScrollView {
             LazyVStack(spacing: 6) {
@@ -374,85 +384,146 @@ struct TasksView: View {
                                    activeArea: vm.view == .today ? nil : vm.activeArea,
                                    now: Date().timeIntervalSince1970 * 1000) { t in editing = t }
                 }
-                if rows.isEmpty {
-                    Text("No \(vm.view.rawValue.lowercased()) tasks.")
-                        .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 32)
+                if vm.view == .completed {
+                    completedList(vm, rows: rows)
+                } else if rows.isEmpty {
+                    emptyList(vm)
                 } else {
-                    ForEach(rows) { task in
-                        // Precomputed once per snapshot (vm.occurrenceIds) — was
-                        // two full-table DB reads + a JSON decode PER ROW in body.
-                        let isOccurrence = vm.occurrenceIds.contains(task.id)
-                        // A missed recurring occurrence surfaced in Backlog: show
-                        // why it's here ("Overdue · Fri") instead of the misleading
-                        // template-age chip.
-                        let overdueLabel = vm.overdueLabels[task.id]
-                        TaskRowView(
-                            task: task,
-                            areaColor: areaColor(task.lifeArea, vm.areas),
-                            ageDays: (vm.view == .backlog && overdueLabel == nil) ? vm.ageDays(task) : nil,
-                            overdueLabel: overdueLabel,
-                            isRecurring: task.recurrence != nil || isOccurrence,
-                            // My outgoing view/partner shares on this row.
-                            shareWith: (model.shareState.badges[task.id] ?? []).map(\.recipientName),
-                            // A repeating TEMPLATE row (Recurring tab) has no per-day
-                            // done — hide the circle and open it to edit the series.
-                            // Occurrence + plain rows get the leading done-circle.
-                            canToggleDone: task.recurrence == nil,
-                            // Open the row as-is (incl. a projected occurrence,
-                            // id = block id). TaskEditor resolves the template for
-                            // field edits and routes done/skip to the occurrence —
-                            // so this must NOT pre-resolve to the template (that
-                            // would drop occurrence mode: Skip-today, per-day done).
-                            onOpen: { editing = task },
-                            // Leading done-circle (matches Today) — toggles without
-                            // opening the row; for an occurrence it marks that day.
-                            onToggleDone: { model.toggleDone(task) },
-                            // Tag chips set the active tag filter (Android parity)
-                            // instead of opening the row.
-                            onTagTap: { vm.activeTag = $0 }
-                        )
-                        // Android's row has no checkbox (completion lives in the
-                        // detail sheet). Preserve the iOS toggleDone path via a
-                        // long-press menu so the resting look stays 1:1. For a
-                        // recurring OCCURRENCE row, toggleDone marks just that day's
-                        // block, plus a "Skip this day" that cancels the one day
-                        // without ending the series.
-                        .contextMenu {
-                            // A template row (Recurring tab) has no per-day done —
-                            // open it to edit the series instead.
-                            if task.recurrence == nil {
-                                Button {
-                                    model.toggleDone(task)
-                                } label: {
-                                    Label(task.done ? "Mark not done" : "Mark done",
-                                          systemImage: task.done ? "circle" : "checkmark.circle")
-                                }
-                            }
-                            if isOccurrence {
-                                Button(role: .destructive) {
-                                    model.skipOccurrence(task.id)
-                                } label: {
-                                    Label("Skip this day", systemImage: "calendar.badge.minus")
-                                }
-                            }
-                            Button { editing = task } label: {
-                                Label(task.recurrence != nil ? "Edit series" : "Edit", systemImage: "pencil")
-                            }
-                            // "Share…" from the row (unified sharing v1); an
-                            // occurrence row (id = block id) shares from its editor.
-                            if !isOccurrence {
-                                Button { shareTarget = .task(id: task.id, name: task.name) } label: {
-                                    Label("Share…", systemImage: "person.badge.plus")
-                                }
-                            }
-                        }
-                    }
+                    ForEach(rows) { task in taskRow(task, vm) }
                 }
             }
             .padding(.horizontal, 18)
             .padding(.bottom, BottomNavBar.clearance)   // clear the bottom nav
+        }
+    }
+
+    private func emptyList(_ vm: TasksModel) -> some View {
+        Text("No \(vm.view.rawValue.lowercased()) tasks.")
+            .font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 32)
+    }
+
+    // MARK: Completed, folded by when it was finished
+
+    private var completedOpen: Set<CompletedSection> {
+        Set(completedOpenRaw.split(separator: ",").compactMap { CompletedSection(rawValue: String($0)) })
+    }
+
+    private func toggleCompleted(_ section: CompletedSection) {
+        var open = completedOpen
+        if open.contains(section) { open.remove(section) } else { open.insert(section) }
+        withAnimation(.easeInOut(duration: 0.2)) {
+            completedOpenRaw = CompletedSection.allCases.filter(open.contains).map(\.rawValue).joined(separator: ",")
+        }
+    }
+
+    /// Tasks › Completed: your finished rows + finished shares, in
+    /// Today / Yesterday / Earlier this week / Last week / Earlier sections
+    /// (`groupCompleted`, newest first), each folding under its header.
+    @ViewBuilder
+    private func completedList(_ vm: TasksModel, rows: [TaskItem]) -> some View {
+        let shares = visibleShares(model.shareState.sharedWithMe, mode: .completed, activeArea: vm.activeArea)
+        let entries = rows.map(CompletedEntry.own) + shares.map(CompletedEntry.shared)
+        let groups = groupCompleted(entries, completedAt: \.completedAt, now: Date().timeIntervalSince1970 * 1000)
+        if groups.isEmpty {
+            emptyList(vm)
+        } else {
+            let todayISO = Clock.todayISO()
+            let open = completedOpen
+            ForEach(groups, id: \.section) { group in
+                let isOpen = open.contains(group.section)
+                CompletedSectionHeader(section: group.section, count: group.items.count, isOpen: isOpen) {
+                    toggleCompleted(group.section)
+                }
+                if isOpen {
+                    ForEach(group.items) { entry in
+                        switch entry {
+                        case .own(let task):
+                            taskRow(task, vm)
+                        case .shared(let share):
+                            SharedWithYouRow(s: share, todayISO: todayISO,
+                                             makeCoFocus: { model.makeCoFocusModel(taskId: $0) },
+                                             onToggle: { taskId, done in
+                                                 Task { try? await model.shareState.completeSharedTask(taskId: taskId, done: done) }
+                                             },
+                                             onOpen: { sharedDetail = SharedDetailTarget(id: share.taskId) })
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// One of your own rows (the task-list card + its long-press menu).
+    @ViewBuilder
+    private func taskRow(_ task: TaskItem, _ vm: TasksModel) -> some View {
+        // Precomputed once per snapshot (vm.occurrenceIds) — was
+        // two full-table DB reads + a JSON decode PER ROW in body.
+        let isOccurrence = vm.occurrenceIds.contains(task.id)
+        // A missed recurring occurrence surfaced in Backlog: show
+        // why it's here ("Overdue · Fri") instead of the misleading
+        // template-age chip.
+        let overdueLabel = vm.overdueLabels[task.id]
+        TaskRowView(
+            task: task,
+            areaColor: areaColor(task.lifeArea, vm.areas),
+            ageDays: (vm.view == .backlog && overdueLabel == nil) ? vm.ageDays(task) : nil,
+            overdueLabel: overdueLabel,
+            isRecurring: task.recurrence != nil || isOccurrence,
+            // My outgoing view/partner shares on this row.
+            shareWith: (model.shareState.badges[task.id] ?? []).map(\.recipientName),
+            // A repeating TEMPLATE row (Recurring tab) has no per-day
+            // done — hide the circle and open it to edit the series.
+            // Occurrence + plain rows get the leading done-circle.
+            canToggleDone: task.recurrence == nil,
+            // Open the row as-is (incl. a projected occurrence,
+            // id = block id). TaskEditor resolves the template for
+            // field edits and routes done/skip to the occurrence —
+            // so this must NOT pre-resolve to the template (that
+            // would drop occurrence mode: Skip-today, per-day done).
+            onOpen: { editing = task },
+            // Leading done-circle (matches Today) — toggles without
+            // opening the row; for an occurrence it marks that day.
+            onToggleDone: { model.toggleDone(task) },
+            // Tag chips set the active tag filter (Android parity)
+            // instead of opening the row.
+            onTagTap: { vm.activeTag = $0 }
+        )
+        // Android's row has no checkbox (completion lives in the
+        // detail sheet). Preserve the iOS toggleDone path via a
+        // long-press menu so the resting look stays 1:1. For a
+        // recurring OCCURRENCE row, toggleDone marks just that day's
+        // block, plus a "Skip this day" that cancels the one day
+        // without ending the series.
+        .contextMenu {
+            // A template row (Recurring tab) has no per-day done —
+            // open it to edit the series instead.
+            if task.recurrence == nil {
+                Button {
+                    model.toggleDone(task)
+                } label: {
+                    Label(task.done ? "Mark not done" : "Mark done",
+                          systemImage: task.done ? "circle" : "checkmark.circle")
+                }
+            }
+            if isOccurrence {
+                Button(role: .destructive) {
+                    model.skipOccurrence(task.id)
+                } label: {
+                    Label("Skip this day", systemImage: "calendar.badge.minus")
+                }
+            }
+            Button { editing = task } label: {
+                Label(task.recurrence != nil ? "Edit series" : "Edit", systemImage: "pencil")
+            }
+            // "Share…" from the row (unified sharing v1); an
+            // occurrence row (id = block id) shares from its editor.
+            if !isOccurrence {
+                Button { shareTarget = .task(id: task.id, name: task.name) } label: {
+                    Label("Share…", systemImage: "person.badge.plus")
+                }
+            }
         }
     }
 
@@ -548,5 +619,57 @@ struct TaskRowView: View {
             .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(theme.palette.line))
         }.buttonStyle(.plain)
+    }
+}
+
+/// A Completed row: one of your tasks or a task shared with you.
+private enum CompletedEntry: Identifiable {
+    case own(TaskItem)
+    case shared(SharedWithMe)
+
+    var id: String {
+        switch self {
+        case .own(let t): return "task:\(t.id)"
+        case .shared(let s): return "share:\(s.id)"
+        }
+    }
+
+    var completedAt: String? {
+        switch self {
+        case .own(let t): return t.completedAt
+        case .shared(let s): return s.completedAt
+        }
+    }
+}
+
+/// "YESTERDAY · 4 ⌄" — the section-label eyebrow as a fold toggle.
+private struct CompletedSectionHeader: View {
+    @Environment(\.uTheme) private var theme
+    let section: CompletedSection
+    let count: Int
+    let isOpen: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 6) {
+                SectionLabel("\(section.label) · \(count)")
+                Spacer(minLength: 8)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(theme.palette.ink3)
+                    .rotationEffect(.degrees(isOpen ? 0 : -90))
+            }
+            .padding(.horizontal, 2)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(section.label), \(count) \(count == 1 ? "task" : "tasks")")
+        .accessibilityValue(isOpen ? "Expanded" : "Collapsed")
+        .accessibilityHint(isOpen ? "Collapses this section" : "Expands this section")
+        .accessibilityAddTraits(.isButton)
+        .accessibilityIdentifier("completed-section-\(section.rawValue)")
     }
 }
