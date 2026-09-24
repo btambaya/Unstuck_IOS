@@ -150,6 +150,8 @@ struct UnstuckApp: App {
                         // A 12/24-hour switch made in iOS Settings while we were
                         // away shows on the next render (2026-09-24).
                         ClockFormat.refreshDevice()
+                        // …and in the server's push text (register-push-token `clock`).
+                        model.reregisterPushIfClockChanged()
                         // Merge any Siri-queued hands-free writes into the outbox
                         // BEFORE syncNow so they flush on this same foreground.
                         model.drainSiriWriteQueue()

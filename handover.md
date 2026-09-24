@@ -43,6 +43,20 @@ phases land. Newest status at the top.
 
 
 
+## Push times follow the phone's clock (branch pushclock/ios, 2026-09-24) — not shipped yet
+
+The reminder push + in-app card said "Starts in 10 min — 3:00 PM." on Ahmad's 24-hour iPhone: the SERVER wrote the
+time (send-task-reminder `fmtTime`, fixed 12-hour). Contract (all three platforms): register-push-token takes an
+optional `clock` "12h" | "24h", stored on this device's `device_tokens` row + mirrored to
+`notification_preferences.clock` (migration 083); the senders format per device (null → 12h, today's text).
+iOS: `PushClient.register(… clock: ClockFormat.Cycle = ClockFormat.device.cycle)` puts `clock` in EVERY
+registration (launch, token arrival, auth transition, VoIP-only). The body is now `PushClient.RegisterBody`, built by
+the pure `registerBody(…)` (same token rules as before: empty/nil token omitted). Foreground:
+`AppModel.reregisterPushIfClockChanged()` (UnstuckApp .active, right after `ClockFormat.refreshDevice()`) re-registers
+only when the device clock differs from the one the last SUCCESSFUL register sent — one comparison per foreground.
+Tests: `PushClientBodyTests` (Tests/UnstuckSyncTests) — both clocks, the wire keys, empty tokens omitted, VoIP-only.
+Deploy order: migration 083 + register-push-token + senders first; an old server ignores the extra field.
+
 ## Three small fixes (branch small/ios, 2026-09-24) — not shipped yet
 
 - **VoiceOver on a shared-list notification.** The notification centre card is read "<kind label>: <title>", and

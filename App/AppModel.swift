@@ -1447,7 +1447,29 @@ final class AppModel {
         // device row the unregister was about to delete (audit 2026-09-22, C36).
         guard signedIn, PushRegistrar.accountSignedIn != false, let coord = coordinator else { return }
         let deviceId = UIDevice.current.identifierForVendor?.uuidString ?? "unknown-device"
-        Task { try? await coord.push.register(deviceId: deviceId, apnsToken: tokenHex) }
+        let clock = ClockFormat.device.cycle
+        Task {
+            do {
+                try await coord.push.register(deviceId: deviceId, apnsToken: tokenHex, clock: clock)
+                pushClockSent = clock
+            } catch {}
+        }
+    }
+
+    /// The 12/24-hour clock the last successful register-push-token carried.
+    @ObservationIgnored private var pushClockSent: ClockFormat.Cycle?
+
+    /// Foreground: a 24-Hour Time switch made in iOS Settings while we were
+    /// away reaches the server now, so the next reminder push reads in the new
+    /// clock (2026-09-24). One comparison per foreground; a register call only
+    /// when the setting really changed since the last one went up.
+    func reregisterPushIfClockChanged() {
+        guard let sent = pushClockSent, sent != ClockFormat.device.cycle else { return }
+        if let hex = PushRegistrar.shared.apnsTokenHex {
+            registerPush(hex)
+        } else if PushRegistrar.shared.voipTokenHex != nil {
+            registerPush("")   // VoIP-only device (see AppCallEnvironment)
+        }
     }
 
     /// Best-effort usage-analytics ping on sign-in (platform + device; the

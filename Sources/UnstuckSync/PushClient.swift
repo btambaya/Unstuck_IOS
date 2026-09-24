@@ -4,6 +4,7 @@
 
 import Foundation
 import Supabase
+import UnstuckCore
 import os
 
 public struct PushClient: Sendable {
@@ -43,37 +44,68 @@ public struct PushClient: Sendable {
     /// - `voipToken`: the PushKit VoIP token (hex); defaults to
     ///   `voipTokenProvider`. The server sends CallKit calls to it and falls
     ///   back to a time-sensitive alert push when it's absent.
+    /// - `clock`: the phone's 12/24-hour setting (`ClockFormat.device`), so a
+    ///   clock time the SERVER writes into a push or in-app card ("Starts in
+    ///   10 min — 15:00.") reads like every time on screen (2026-09-24).
     public func register(
         deviceId: String,
         apnsToken: String?,
         voipToken: String? = nil,
         liveActivityPushToStartToken: String? = nil,
         timezone: String = TimeZone.current.identifier,
-        apnsEnvironment: String = PushClient.defaultApnsEnvironment
+        apnsEnvironment: String = PushClient.defaultApnsEnvironment,
+        clock: ClockFormat.Cycle = ClockFormat.device.cycle
     ) async throws {
-        struct Body: Encodable {
-            let deviceId: String
-            let apnsToken: String?
-            let voipToken: String?
-            let liveActivityPushToStartToken: String?
-            // Always sent explicitly and non-optionally (spec 10 §1.8 gotcha 1):
-            // the edge fn happens to fall through to its 'ios' branch when
-            // platform is absent, but that implicit coupling must not be
-            // relied on.
-            let platform: String
-            let timezone: String
-            let apnsEnvironment: String
-        }
-        let apns = (apnsToken?.isEmpty ?? true) ? nil : apnsToken
-        let voip = voipToken ?? Self.voipTokenProvider?()
         try await client.functions.invoke(
             "register-push-token",
-            options: FunctionInvokeOptions(method: .post, body: Body(
-                deviceId: deviceId, apnsToken: apns,
-                voipToken: (voip?.isEmpty ?? true) ? nil : voip,
+            options: FunctionInvokeOptions(method: .post, body: Self.registerBody(
+                deviceId: deviceId, apnsToken: apnsToken,
+                voipToken: voipToken ?? Self.voipTokenProvider?(),
                 liveActivityPushToStartToken: liveActivityPushToStartToken,
-                platform: "ios",
-                timezone: timezone, apnsEnvironment: apnsEnvironment)))
+                timezone: timezone, apnsEnvironment: apnsEnvironment, clock: clock)))
+    }
+
+    /// register-push-token's body. JSONEncoder omits a nil field, so an absent
+    /// token leaves the server's copy alone.
+    struct RegisterBody: Encodable, Equatable {
+        let deviceId: String
+        let apnsToken: String?
+        let voipToken: String?
+        let liveActivityPushToStartToken: String?
+        // Always sent explicitly and non-optionally (spec 10 §1.8 gotcha 1):
+        // the edge fn happens to fall through to its 'ios' branch when
+        // platform is absent, but that implicit coupling must not be
+        // relied on.
+        let platform: String
+        let timezone: String
+        let apnsEnvironment: String
+        /// "12h" / "24h" — stored on this device's row (and as the user's
+        /// latest choice); the server formats that device's push times with it.
+        let clock: String
+    }
+
+    /// Pure: the body `register` posts. An empty token counts as none.
+    static func registerBody(
+        deviceId: String, apnsToken: String?, voipToken: String?,
+        liveActivityPushToStartToken: String?, timezone: String,
+        apnsEnvironment: String, clock: ClockFormat.Cycle
+    ) -> RegisterBody {
+        RegisterBody(
+            deviceId: deviceId,
+            apnsToken: (apnsToken?.isEmpty ?? true) ? nil : apnsToken,
+            voipToken: (voipToken?.isEmpty ?? true) ? nil : voipToken,
+            liveActivityPushToStartToken: liveActivityPushToStartToken,
+            platform: "ios",
+            timezone: timezone, apnsEnvironment: apnsEnvironment,
+            clock: clockField(clock))
+    }
+
+    /// The wire value of register-push-token's `clock` field.
+    public static func clockField(_ cycle: ClockFormat.Cycle) -> String {
+        switch cycle {
+        case .h12: return "12h"
+        case .h24: return "24h"
+        }
     }
 
     /// Delete this device's token rows on sign-out so the previous user's
