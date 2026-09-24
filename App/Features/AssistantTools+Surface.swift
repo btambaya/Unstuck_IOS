@@ -580,21 +580,25 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
 
     // ── SETTINGS ──
     case "get_settings":
+        // Slim settings (2026-09-24): the web's vocabulary — focus options,
+        // background noise on/off, the routines by their panel names — and
+        // nothing that names a control that no longer exists.
         let s = api.getSettings()
         func onOff(_ b: Bool) -> String { b ? "on" : "off" }
         let budget: String = {
             if s.usableWeekdayMin == nil && s.usableWeekendMin == nil { return "not set" }
             return [s.usableWeekdayMin.map { "weekdays \($0)m" }, s.usableWeekendMin.map { "weekends \($0)m" }].compactMap { $0 }.joined(separator: ", ")
         }()
-        let rituals = ["morning", "evening", "friday", "sunday"].map { "\($0) \(onOff(s.rituals[$0] ?? false))" }.joined(separator: ", ")
+        let rituals = RitualKey.allCases.map { "\(routineName($0)) \(onOff(s.rituals[$0.rawValue] ?? false))" }.joined(separator: ", ")
         return "ok: settings:\n"
             + "- notifications: \(s.notificationLevel)\n"
             + "- reminder lead: \(s.reminderLeadMin == 0 ? "off" : "\(s.reminderLeadMin) minutes before a task")\n"
             + "- usable minutes: \(budget)\n"
-            + "- focus defaults: \(s.focusDefaultMin)m sessions, \(s.focusOverrunMin == 0 ? "no overrun grace" : "\(s.focusOverrunMin)m overrun grace"), soft exit \(onOff(s.focusSoftExit)), pause reasons \(onOff(s.focusPauseReasons))\n"
+            + "- focus options: new tasks default to \(s.focusDefaultMin) min, check in when the timer runs over: \(s.focusOverrunMin == 0 ? "never" : "after \(s.focusOverrunMin) min"), ask before leaving \(onOff(s.focusSoftExit)), ask why pausing \(onOff(s.focusPauseReasons))\n"
             + "- theme: \(s.theme)\n"
-            + "- ambient sound: \(s.ambient)\n"
-            + "- rituals: \(rituals)"
+            + "- text size: \(s.textSize)\n"
+            + "- background noise: \(s.ambient)\n"
+            + "- routines (web assistant panel): \(rituals)"
 
     case "set_usable_minutes":
         let wd = args.int("weekdayMin")
@@ -623,9 +627,12 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         if !["morning", "evening", "friday", "sunday"].contains(r) { return "error: ritual must be morning, evening, friday, or sunday" }
         let on = args.bool("on") ?? true
         let cur = api.getSettings().rituals[r] ?? false
-        if cur == on { return "error: the \(r) moment is already \(on ? "on" : "off") — nothing changed" }
-        guard api.setRitual(r, on: on) else { return "error: couldn't save the \(r) moment — it is still \(cur ? "on" : "off")" }
-        return "ok: \(r) moment \(on ? "on" : "off")"
+        // Said by the routine's name (Morning plan, …) — the words the web
+        // assistant's Routines switches show (slim settings, web parity).
+        let name = RitualKey(rawValue: r).map(routineName) ?? r
+        if cur == on { return "error: \(name) is already \(on ? "on" : "off") — nothing changed" }
+        guard api.setRitual(r, on: on) else { return "error: couldn't save \(name) — it is still \(cur ? "on" : "off")" }
+        return "ok: \(name) \(on ? "on" : "off")"
 
     case "set_theme":
         let theme = (args.str("theme") ?? "").lowercased()
@@ -635,27 +642,45 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         return "ok: theme set to \(theme)"
 
     case "set_focus_defaults":
+        // The focus options (Focus ⋯ Options) + the estimate new tasks start
+        // with. Only what CHANGES is written and named (web parity).
+        let cur = api.getSettings()
         let dm = args.int("defaultMinutes")
         let om = args.int("overrunMinutes")
         let se = args.bool("softExit")
         let pr = args.bool("pauseReasons")
         if dm == nil && om == nil && se == nil && pr == nil { return "error: give at least one of defaultMinutes, overrunMinutes, softExit, pauseReasons" }
-        if let dm, ![15, 25, 45].contains(dm) { return "error: defaultMinutes must be 15, 25 or 45" }
-        if let om, ![0, 5, 10].contains(om) { return "error: overrunMinutes must be 0, 5 or 10" }
-        guard api.setFocusDefaults(defaultMinutes: dm, overrunMinutes: om, softExit: se, pauseReasons: pr) else { return "error: couldn't save — try again" }
-        var parts: [String] = []
-        if let dm { parts.append("\(dm)m sessions") }
-        if let om { parts.append(om == 0 ? "no overrun grace" : "\(om)m overrun grace") }
-        if let se { parts.append("soft exit \(se ? "on" : "off")") }
-        if let pr { parts.append("pause reasons \(pr ? "on" : "off")") }
-        return "ok: focus defaults — \(parts.joined(separator: ", "))"
+        if let dm, ![15, 25, 45].contains(dm) { return "error: defaultMinutes must be 15, 25, or 45" }
+        if let om, ![0, 5, 10].contains(om) { return "error: overrunMinutes must be 0 (none), 5, or 10" }
+        let newDm = dm.flatMap { $0 == cur.focusDefaultMin ? nil : $0 }
+        let newOm = om.flatMap { $0 == cur.focusOverrunMin ? nil : $0 }
+        let newSe = se.flatMap { $0 == cur.focusSoftExit ? nil : $0 }
+        let newPr = pr.flatMap { $0 == cur.focusPauseReasons ? nil : $0 }
+        var changes: [String] = []
+        if let newDm { changes.append("new tasks default to \(newDm) min") }
+        if let newOm { changes.append("check in when the timer runs over: \(newOm == 0 ? "never" : "after \(newOm) min")") }
+        if let newSe { changes.append("ask before leaving \(newSe ? "on" : "off")") }
+        if let newPr { changes.append("ask why pausing \(newPr ? "on" : "off")") }
+        if changes.isEmpty { return "error: the focus options already have those values — nothing changed" }
+        guard api.setFocusDefaults(defaultMinutes: newDm, overrunMinutes: newOm, softExit: newSe, pauseReasons: newPr) else {
+            return "error: couldn't save the focus options — nothing changed"
+        }
+        return "ok: focus options — \(changes.joined(separator: ", "))"
 
     case "set_ambient_sound":
-        let sound = (args.str("sound") ?? "").lowercased()
-        if !["off", "brown", "pink"].contains(sound) { return "error: sound must be off, brown, or pink" }
-        if api.getSettings().ambient == sound { return "error: ambient sound is already \(sound) — nothing changed" }
-        guard api.setAmbientSound(sound) else { return "error: couldn't save — try again" }
-        return "ok: ambient sound \(sound == "off" ? "off" : "set to \(sound) noise")"
+        // One speaker button now: brown (and an older schema's pink, or a
+        // plain "on") all mean ON. The registry offers only off / brown.
+        let raw = (args.str("sound") ?? "").lowercased()
+        let want: String
+        switch raw {
+        case "off": want = "off"
+        case "brown", "pink", "on": want = "on"
+        default: return "error: sound must be off or brown (on)"
+        }
+        let cur = api.getSettings().ambient
+        if cur == want { return "error: background noise is already \(want) — nothing changed" }
+        guard api.setAmbientSound(want) else { return "error: couldn't change the background noise — it is still \(cur)" }
+        return "ok: background noise \(want)"
 
     case "forget_fact":
         let id = args.str("factId")

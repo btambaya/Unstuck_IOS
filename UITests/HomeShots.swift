@@ -91,3 +91,215 @@ final class HomeShots: XCTestCase {
         save("03-assistant-interview")
     }
 }
+
+// Slim Settings screenshots (2026-09-24) — the hub and every screen it pushes,
+// in light and dark, plus the controls that moved OUT of Settings onto the
+// screens they change (Focus ⋯ Options, the Tasks "Edit" pill's Areas & tags
+// sheet, Talk's "Noisy room? Hold to talk", the share screen's "Manage
+// people") and the one-line Calls block without the AI OK. Not a behaviour
+// test; a failure means a screen it claims to have shot didn't render.
+//
+//   xcodebuild test … -only-testing:UnstuckUITests/SettingsShots \
+//     TEST_RUNNER_SETTINGS_SHOTS_DIR=/path/to/out
+//
+// Output dir: the SETTINGS_SHOTS_DIR env var, else /tmp/unstuck-settings-shots.
+final class SettingsShots: XCTestCase {
+    private var app: XCUIApplication!
+    private lazy var outDir: URL = {
+        let env = ProcessInfo.processInfo.environment["SETTINGS_SHOTS_DIR"]
+        return URL(fileURLWithPath: env?.isEmpty == false ? env! : "/tmp/unstuck-settings-shots")
+    }()
+
+    override func setUpWithError() throws {
+        continueAfterFailure = true
+        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        app = XCUIApplication()
+        app.launchEnvironment["UITEST_SEED"] = "1"
+        addUIInterruptionMonitor(withDescription: "system-alert") { alert in
+            for label in ["Allow", "Don’t Allow", "OK", "Continue"] where alert.buttons[label].exists {
+                alert.buttons[label].tap(); return true
+            }
+            return false
+        }
+        XCUIDevice.shared.appearance = .light
+    }
+
+    override func tearDown() {
+        XCUIDevice.shared.appearance = .light
+    }
+
+    private func save(_ name: String) {
+        usleep(700_000)
+        let png = XCUIScreen.main.screenshot().pngRepresentation
+        try? png.write(to: outDir.appendingPathComponent("\(name).png"))
+    }
+
+    private func expect(_ e: XCUIElement, _ why: String, timeout: TimeInterval = 8,
+                        file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(e.waitForExistence(timeout: timeout), why, file: file, line: line)
+    }
+
+    private func launchToToday() {
+        app.launch()
+        XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 15),
+                      "the demo boot never reached Today")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = springboard.buttons["Allow"].firstMatch
+        if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(800_000) }
+    }
+
+    /// A confirmation dialog's cancel button — on iOS 26 it may only be
+    /// "tap outside".
+    private func cancelDialog(_ label: String) {
+        let b = app.buttons[label].firstMatch
+        if b.exists && b.isHittable { b.tap() } else {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.04, dy: 0.5)).tap()
+        }
+        usleep(900_000)
+    }
+
+    private func row(_ id: String) -> XCUIElement { app.descendants(matching: .any)["settings-row-\(id)"].firstMatch }
+
+    private func back() {
+        app.navigationBars.buttons.firstMatch.tap(); usleep(700_000)
+    }
+
+    /// Every Settings screen, in the current appearance.
+    private func shootSettings(_ mode: String) {
+        let avatar = app.buttons["Account and settings"].firstMatch
+        expect(avatar, "the Today header avatar is missing")
+        avatar.tap()
+        expect(row("account"), "Settings did not open")
+        save("\(mode)-01-hub")
+
+        row("account").tap()
+        expect(app.staticTexts["Your account."].firstMatch, "Account did not open")
+        save("\(mode)-02-account")
+        back()
+
+        row("notifications").tap()
+        expect(app.staticTexts["How Unstuck reaches you."].firstMatch, "Notifications & calls did not open")
+        save("\(mode)-03-notifications-top")
+        app.swipeUp(); usleep(500_000)
+        save("\(mode)-04-notifications-calls")
+        app.swipeUp(); usleep(500_000)
+        save("\(mode)-05-notifications-bottom")
+        back()
+
+        row("assistant").tap()
+        expect(app.staticTexts["What the AI can see."].firstMatch, "Assistant & privacy did not open")
+        save("\(mode)-06-assistant")
+        let remembers = app.descendants(matching: .any)["settings-remembers"].firstMatch
+        expect(remembers, "What Unstuck remembers row is missing")
+        remembers.tap()
+        expect(app.staticTexts["What Unstuck remembers."].firstMatch, "What Unstuck remembers did not open")
+        save("\(mode)-07-remembers")
+        back()
+        back()
+
+        row("people").tap()
+        expect(app.staticTexts["People you share with."].firstMatch, "People did not open")
+        save("\(mode)-08-people")
+        back()
+
+        row("appearance").tap()
+        expect(app.staticTexts["How it looks."].firstMatch, "Appearance did not open")
+        save("\(mode)-09-appearance")
+        back()
+
+        row("feedback").tap()
+        usleep(1_200_000)
+        save("\(mode)-10-feedback")
+        app.swipeDown(velocity: .fast); usleep(900_000)
+        if !row("account").isHittable { app.swipeDown(velocity: .fast); usleep(900_000) }
+
+        app.buttons["Done"].firstMatch.tap(); usleep(900_000)
+    }
+
+    func testSettingsLightAndDark() throws {
+        launchToToday()
+        shootSettings("light")
+        XCUIDevice.shared.appearance = .dark
+        usleep(1_500_000)
+        shootSettings("dark")
+
+        // Talk: "Noisy room? Hold to talk" moved here from Settings.
+        app.buttons["Assistant"].firstMatch.tap()
+        let talk = app.buttons["Talk"].firstMatch
+        expect(talk, "the Talk button is missing")
+        talk.tap()
+        expect(app.descendants(matching: .any)["talk-hold-to-talk"].firstMatch, "Talk has no hold-to-talk switch")
+        save("dark-11-talk")
+    }
+
+    func testMovedControlsAndCallsWithoutTheAIOK() throws {
+        app.launchEnvironment["UITEST_AI_CONSENT"] = "0"
+        app.launchEnvironment["UITEST_FOCUS"] = "1"
+        launchToToday()
+        // Focus ⋯ Options — the focus settings that used to live in Settings.
+        let options = app.buttons["focus-options"].firstMatch
+        expect(options, "the Focus screen has no ⋯ Options button", timeout: 12)
+        save("moved-01-focus")
+        options.tap()
+        expect(app.staticTexts["Check in when I run over"].firstMatch, "Focus options did not open")
+        save("moved-02-focus-options")
+        // The sheet's own Done — the Focus screen has a "Done" (finish) too.
+        app.navigationBars["Focus options"].buttons["Done"].firstMatch.tap(); usleep(900_000)
+        XCTAssertFalse(app.staticTexts["Check in when I run over"].firstMatch.exists, "Focus options did not close")
+
+        // "Ask before I leave" offers "don't ask again" on the question itself.
+        app.buttons["← Out"].firstMatch.tap(); usleep(900_000)
+        expect(app.buttons["Leave and don't ask again"].firstMatch, "the leave question has no don't-ask-again")
+        save("moved-03-leave-confirm")
+        cancelDialog("Stay")
+        app.buttons["Pause"].firstMatch.tap(); usleep(900_000)
+        expect(app.buttons["Don't ask again"].firstMatch, "the pause question has no don't-ask-again")
+        save("moved-04-pause-reasons")
+        cancelDialog("Just pause")
+        app.buttons["← Out"].firstMatch.tap(); usleep(1_200_000)
+        XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 6), "leaving Focus did not return to the app")
+
+        // Tasks → "Edit" → Areas & tags.
+        app.buttons["Tasks"].firstMatch.tap(); usleep(900_000)
+        let edit = app.buttons["tasks-edit-areas"].firstMatch
+        expect(edit, "Tasks has no Edit pill on the area row")
+        save("moved-05-tasks-edit-pill")
+        edit.tap()
+        expect(app.staticTexts["The parts of your life."].firstMatch, "the Areas & tags sheet did not open")
+        save("moved-06-areas-tags")
+        app.swipeUp(); usleep(600_000)
+        save("moved-07-areas-tags-tags")
+        app.navigationBars.buttons["Done"].firstMatch.tap(); usleep(900_000)
+
+        // A list's Share screen → "Manage people" → People.
+        app.buttons["Collections"].firstMatch.tap(); usleep(900_000)
+        let groceries = app.staticTexts["Groceries"].firstMatch
+        expect(groceries, "the seeded Groceries list is missing")
+        groceries.press(forDuration: 1.2)
+        let share = app.buttons["Share…"].firstMatch
+        expect(share, "the list card has no Share…")
+        share.tap()
+        let manage = app.buttons["share-manage-people"].firstMatch
+        expect(manage, "the share screen has no Manage people link")
+        save("moved-08-share-manage-people")
+        manage.tap()
+        expect(app.staticTexts["People you share with."].firstMatch, "Manage people did not open People")
+        save("moved-09-share-people")
+        app.navigationBars.buttons.firstMatch.tap(); usleep(600_000)
+        app.buttons["Done"].firstMatch.tap(); usleep(900_000)
+
+        // Notifications & calls without the AI OK: the Calls block is one line.
+        app.buttons["Today"].firstMatch.tap(); usleep(900_000)
+        app.buttons["Account and settings"].firstMatch.tap()
+        expect(row("notifications"), "Settings did not open")
+        row("notifications").tap()
+        expect(app.staticTexts["How Unstuck reaches you."].firstMatch, "Notifications & calls did not open")
+        app.swipeUp(); usleep(600_000)
+        expect(app.buttons["settings-calls-turn-on"].firstMatch, "the one-line Calls block is missing")
+        save("moved-10-calls-need-ai")
+        back()
+        row("assistant").tap()
+        expect(app.staticTexts["What the AI can see."].firstMatch, "Assistant & privacy did not open")
+        save("moved-11-assistant-sharing-off")
+    }
+}

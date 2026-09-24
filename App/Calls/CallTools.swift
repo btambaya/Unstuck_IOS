@@ -16,8 +16,8 @@
 // gives); the only iOS-local strings are the network failure, the
 // "changed underneath me" compare-and-set miss, and this phone's own switch
 // and hours (CallToolLogic.deviceGuard — it would decline the call on receipt):
-//   error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first
-//   error: <HH:MM> is outside this iPhone's call hours (<start>–<end>), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls
+//   error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Notifications & calls first
+//   error: <HH:MM> is outside this iPhone's call hours (<start>–<end>), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Notifications & calls
 //     (refusing the end minute itself, the hours read "<start>–<end>; the latest it rings is <end − 1 min>")
 // On iOS a request_call / update_call `ok:` line may also end with
 // CallToolLogic.micRefusedNote (dispatch only — `run` never adds it).
@@ -450,11 +450,11 @@ enum CallToolLogic {
                             start: String = CallSettings.windowStart, end: String = CallSettings.windowEnd,
                             calendar: Calendar = .current) -> String? {
         if !enabled {
-            return "error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Calls first"
+            return "error: calls are off on this iPhone, so it would decline this call — tell them to switch Calls on in Settings › Notifications & calls first"
         }
         if !CallSettings.isWithinWindow(callAt, start: start, end: end, calendar: calendar) {
             let hours = CallSettings.hoursLabel(start: start, end: end, refusing: CallSettings.minuteOfDay(callAt, calendar: calendar))
-            return "error: \(CallSettings.hhmm(callAt, calendar: calendar)) is outside this iPhone's call hours (\(hours)), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Calls"
+            return "error: \(CallSettings.hhmm(callAt, calendar: calendar)) is outside this iPhone's call hours (\(hours)), so it would decline this call — ask them for a time inside those hours, or tell them they can widen them in Settings › Notifications & calls"
         }
         return nil
     }

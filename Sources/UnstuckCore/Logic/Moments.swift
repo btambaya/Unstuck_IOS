@@ -77,12 +77,15 @@ public struct RitualLabel: Equatable, Sendable {
     public let sub: String
 }
 
-/// Settings / interview copy — verbatim from the web's RITUAL_LABELS.
+/// Interview copy — the web's RITUAL_LABELS, under the routine names the web
+/// assistant panel uses (slim-settings plan: "Morning plan" is not the morning
+/// summary notification nor the morning call). The phones no longer show
+/// these in Settings: the routines render only in the web assistant panel.
 public let RITUAL_LABELS: [RitualLabel] = [
-    RitualLabel(key: .morning, label: "Morning briefing", sub: "Your day, one decision, at your first open"),
-    RitualLabel(key: .evening, label: "Evening sweep", sub: "Carry what didn’t happen — no guilt attached"),
-    RitualLabel(key: .friday, label: "Friday review", sub: "Your week in three minutes, one question"),
-    RitualLabel(key: .sunday, label: "Sunday runway", sub: "A look at next week before it lands on you"),
+    RitualLabel(key: .morning, label: routineName(.morning), sub: "Your day, one decision, at your first open"),
+    RitualLabel(key: .evening, label: routineName(.evening), sub: "Carry what didn’t happen — no guilt attached"),
+    RitualLabel(key: .friday, label: routineName(.friday), sub: "Your week in three minutes, one question"),
+    RitualLabel(key: .sunday, label: routineName(.sunday), sub: "A look at next week before it lands on you"),
 ]
 
 // MARK: - State + output types

@@ -128,6 +128,9 @@ final class FakeEnvironment: CallEnvironment {
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool { anchorLive }
     func isWithinCallHours(_ date: Date) -> Bool { hoursCheckedAt.append(date); return withinHours }
     var isCallsEnabled: Bool { callsEnabled }
+    /// The AI Assistant switch on this phone (Settings › Assistant & privacy).
+    var assistantEnabled = true
+    var isAssistantEnabled: Bool { assistantEnabled }
     /// The account's AI-consent OK (AIConsent).
     var aiConsent = true
     var hasAIConsent: Bool { aiConsent }
@@ -325,7 +328,7 @@ final class CallCoordinatorTests: XCTestCase {
     }
 
     func testCallsSwitchedOffDeclinesQuietlyWithNotification() {
-        // The master switch (Settings › Calls) — Android's `enabled`: the call
+        // The master switch (Settings › Notifications & calls) — Android's `enabled`: the call
         // is declined like the outside-hours rule, with the honest reason.
         env.callsEnabled = false
         env.withinHours = false   // the switch is checked first
@@ -374,6 +377,58 @@ final class CallCoordinatorTests: XCTestCase {
         sut.reportIncoming(payload())
         XCTAssertEqual(reporter.outcomes, [.declined])
         XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.off.\(Self.callId)"])
+    }
+
+    // MARK: - the AI Assistant switched off (slim settings, 2026-09-24)
+
+    func testACallWithTheAssistantOffIsDeclinedNotMissed() {
+        // "Off hides the Assistant, Talk and calls": a call IS the assistant,
+        // so it is declined on arrival — `declined`, never `missed`, so the
+        // server doesn't ring it again — and the notes still land, quietly,
+        // with the way back on.
+        env.assistantEnabled = false
+        env.withinHours = false   // the switch is checked before the hours
+        sut.reportIncoming(payload())
+        XCTAssertEqual(provider.incoming.count, 1, "still reported (Apple rule)")
+        XCTAssertEqual(provider.ended.map(\.reason), [.declinedElsewhere])
+        XCTAssertEqual(reporter.outcomes, [.declined])
+        XCTAssertNil(reporter.pendingMissNotification, "never a missed call — no re-ring")
+        XCTAssertEqual(notifier.posted.count, 1)
+        let n = notifier.posted[0]
+        XCTAssertEqual(n.id, "unstuck.call.assistant.\(Self.callId)")
+        XCTAssertEqual(n.title, "I called about speak to James")
+        XCTAssertTrue(n.body.hasPrefix("Ask about the invoice\nConfirm Friday"))
+        XCTAssertTrue(n.body.contains("Settings › Assistant & privacy"))
+        XCTAssertTrue(n.quiet, "declined by a rule here — never breaks through Do Not Disturb")
+        XCTAssertNil(sut.active)
+        XCTAssertTrue(clock.pending.isEmpty, "no ring timer")
+        sut.audioSessionDidActivate()
+        XCTAssertTrue(launcher.started.isEmpty, "never connected to the assistant")
+    }
+
+    func testTheCallsSwitchIsCheckedBeforeTheAssistantSwitch() {
+        env.callsEnabled = false
+        env.assistantEnabled = false
+        sut.reportIncoming(payload())
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.off.\(Self.callId)"])
+    }
+
+    func testTheAssistantSwitchIsCheckedBeforeTheAIConsentOK() {
+        env.assistantEnabled = false
+        env.aiConsent = false
+        sut.reportIncoming(payload())
+        XCTAssertEqual(reporter.outcomes, [.declined])
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.assistant.\(Self.callId)"])
+    }
+
+    func testAFallbackTapWithTheAssistantOffNeverOpensTalk() {
+        env.assistantEnabled = false
+        var handed: [CallSession] = []
+        sut.onFallbackAnswer = { handed.append($0) }
+        sut.handleFallbackTap(payload())
+        XCTAssertTrue(handed.isEmpty, "Talk never opens")
+        XCTAssertEqual(reporter.outcomes, [.declined])
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.assistant.\(Self.callId)"])
     }
 
     func testAFallbackTapWithoutTheAIConsentOKNeverOpensTalk() {

@@ -1,10 +1,22 @@
-// Settings — matches the Android SettingsScreen hub: a "SETTINGS" eyebrow, a
-// "How Unstuck behaves." serif-italic title, and a single rounded surface card
-// of hairline-separated rows. The hub links to pushed sub-screens (Account,
-// Focus, Sound, Accessibility, Interface) plus the existing Notifications,
-// Insights, Backup, and Areas/Tags rows — each wired to live behavior via
-// model.settings (device-local UserDefaults store) or the AppModel account
-// methods. No dead toggles: every control here drives real behavior.
+// Settings — the slim hub (PLAN.md "Slim Settings", approved 2026-09-24).
+// Only what you set once: who you are, how Unstuck reaches you, what the AI
+// can see, who you share with, and how the app looks.
+//
+//   ┌ Name / email                    › ┐  Account
+//   Notifications & calls             ›    (section id "Notifications")
+//   Assistant & privacy               ›    (section id "Assistant")
+//   People                            ›
+//   Appearance                        ›
+//   Send feedback                          (the feedback sheet)
+//   Replay the tour                        (locked while a tour runs)
+//   Terms · Privacy · Unstuck 1.1.1 (96)
+//
+// Things that change one screen live on it now: focus options → the Focus
+// screen's ⋯ Options, background noise → its speaker button, hold-to-talk →
+// Talk, areas & tags → the Tasks "Edit" pill, Insights → Today's week pill.
+// Every section is a PUSHED sub-screen: the guided tour's scoped lockdown
+// needs the navigation stack deeper than the root (TourView
+// `pushedSettingsSectionRect`), so Appearance is never inline on the hub.
 
 import SwiftUI
 import UIKit
@@ -16,24 +28,22 @@ struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
-    @State private var exportURL: URL?
 
-    /// Deep-link a section on first appearance (the guided tour presents
-    /// Settings open on Notifications / Interface; the assistant's
-    /// open_screen lands on People / Areas — the iOS analogue of the web
-    /// `?section=` seed).
+    /// Deep-link a section on first appearance (the guided tour opens
+    /// Settings on Notifications / Appearance; the assistant's open_screen and
+    /// `unstuck://settings?section=…` land on any of them — old names too,
+    /// via SettingsDestination's aliases).
     private let initialSection: String?
-    @State private var showNotificationsSection = false
-    @State private var showInterfaceSection = false
-    @State private var showPeopleSection = false
-    @State private var showAreasSection = false
+    @State private var path: [SettingsDestination] = []
+    @State private var seeded = false
+    @State private var showFeedback = false
 
     init(section: String? = nil) {
         self.initialSection = section
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     SectionLabel("Settings").foregroundStyle(theme.palette.primaryDeep)
@@ -42,16 +52,10 @@ struct SettingsView: View {
                         .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
                         .padding(.top, 4).padding(.bottom, 14)
 
-                    hubCard
-
-                    // The build, for bug reports — one faint line, not a card
-                    // (the old About card's Theme duplicated Interface and
-                    // "Backend: Supabase" meant nothing to anyone; Ahmad 2026-09-24).
-                    Text("Unstuck \(Self.appVersion)")
-                        .font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 18)
-                        .accessibilityLabel("Version \(Self.appVersion)")
+                    accountCard
+                    screensCard.padding(.top, 14)
+                    actionsCard.padding(.top, 14)
+                    footer.padding(.top, 14)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 18)
@@ -65,140 +69,174 @@ struct SettingsView: View {
                     Button("Done") { dismiss() }
                 }
             }
-            .sheet(item: $exportURL) { url in
-                // Delete the full-PII dump once the share finishes/cancels so
-                // it doesn't linger in tmp (makeExportFile sweeps stragglers).
-                ActivityView(items: [url]) { AppModel.removeExportFile(url) }
-            }
-            // Programmatic section pushes (tour deep-link). These coexist with
-            // the NavigationLink rows above — same destinations, different entry.
-            .navigationDestination(isPresented: $showNotificationsSection) { NotificationSettingsView() }
-            .navigationDestination(isPresented: $showInterfaceSection) { InterfaceSettingsView() }
-            .navigationDestination(isPresented: $showPeopleSection) { ConnectionsView() }
-            .navigationDestination(isPresented: $showAreasSection) { TagsAreasView() }
-            .onAppear {
-                switch initialSection {
-                case "Notifications": showNotificationsSection = true
-                case "Interface": showInterfaceSection = true
-                case "People": showPeopleSection = true
-                case "Areas", "Areas & tags": showAreasSection = true
-                default: break
+            .navigationDestination(for: SettingsDestination.self) { destination in
+                switch destination {
+                case .account: AccountSettingsView()
+                case .notifications: NotificationSettingsView()
+                case .assistant: AssistantPrivacySettingsView()
+                case .people: ConnectionsView()
+                case .appearance: AppearanceSettingsView()
+                case .hub, .feedback, .focus, .areas: EmptyView()   // never pushed
                 }
             }
-        }
-    }
-
-    // MARK: hub card — one grouped surface, hairline-separated rows
-
-    private var hubCard: some View {
-        VStack(spacing: 0) {
-            navRow("Account") { AccountSettingsView() }
-            divider
-            navRow("Focus") { FocusSettingsView() }
-            divider
-            navRow("Sound") { SoundSettingsView() }
-            divider
-            navRow("Accessibility") { AccessibilitySettingsView() }
-            divider
-            navRow("Interface") { InterfaceSettingsView() }
-
-            divider
-            // The assistant's memory — every fact it has learned, editable and
-            // deletable, plus which recurring moments it runs (web FactsPanel).
-            navRow("What Unstuck knows") { FactsPanelView() }
-
-            divider
-            // Notification level (Calm/Balanced/Coach) + reminder lead.
-            navRow("Notifications") { NotificationSettingsView() }
-
-            divider
-            // "Unstuck calls you": allowed hours, default lead, test call.
-            navRow("Calls from Unstuck") { CallSettingsView() }
-
-            divider
-            // Trusted circle — the people you share tasks + lists with.
-            navRow("People") { ConnectionsView() }
-
-            divider
-            navRow("Insights") { AnalyticsView() }
-
-            divider
-            // Backup: export everything as a JSON snapshot you keep.
-            actionRow("Backup", sub: "A full JSON snapshot of your data.") {
-                exportURL = model.makeExportFile()
-            }
-
-            divider
-            navRow("Areas & tags") { TagsAreasView() }
-
-            divider
-            // Legal (App Store 1.2 / 5.1.1 — terms + privacy reachable in-app).
-            actionRow("Terms of Use", sub: "unstucknow.io/terms") {
-                if let u = URL(string: "https://unstucknow.io/terms") { UIApplication.shared.open(u) }
-            }
-            divider
-            actionRow("Privacy Policy", sub: "unstucknow.io/privacy") {
-                if let u = URL(string: "https://unstucknow.io/privacy") { UIApplication.shared.open(u) }
+            .sheet(isPresented: $showFeedback) { FeedbackSheet() }
+            .onAppear {
+                guard !seeded else { return }
+                seeded = true
+                let destination = SettingsDestination.from(section: initialSection)
+                if destination.isSettingsScreen { path = [destination] }
+                else if destination == .feedback { showFeedback = true }
             }
         }
-        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
     }
 
-    /// "1.0 (5)" from the bundle — never hardcode (it drifted to 0.1.0 once).
-    private static var appVersion: String {
-        let info = Bundle.main.infoDictionary
-        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
-        let build = info?["CFBundleVersion"] as? String ?? "?"
-        return "\(version) (\(build))"
-    }
+    // MARK: the account card — name + email, into Account
 
-    // MARK: row builders
-
-    private var divider: some View {
-        Rectangle().fill(theme.palette.line).frame(height: 1)
-    }
-
-    /// A row that navigates to `destination`, with a trailing chevron.
-    @ViewBuilder
-    private func navRow<Destination: View>(_ label: String, @ViewBuilder destination: @escaping () -> Destination) -> some View {
-        NavigationLink { destination() } label: {
-            HStack {
-                Text(label).font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink)
-                Spacer()
-                chevron
+    private var accountCard: some View {
+        NavigationLink(value: SettingsDestination.account) {
+            HStack(spacing: 12) {
+                Text(model.avatarInitials)
+                    .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.greenInk)
+                    .frame(width: 40, height: 40)
+                    .background(theme.palette.greenSoft, in: Circle())
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.currentUserName ?? "Your account")
+                        .font(UFont.sans(15, .semibold)).foregroundStyle(theme.palette.ink)
+                        .lineLimit(1)
+                    Text(model.currentEmail ?? "Name, password, export, sign out")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .lineLimit(1)
+                }
+                Spacer(minLength: 8)
+                SettingsChevron()
             }
             .padding(.horizontal, 16).padding(.vertical, 14)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // Stable handle for UI tests. Settings is a SHEET over Today, so its
-        // rows share one accessibility tree with whatever is behind them, and
-        // plain labels collide ("Focus" once also named the Start-Next hero's
-        // button, which sorted first and was — correctly — not hittable under
-        // the sheet, so a label lookup tapped the wrong element and failed).
-        .accessibilityIdentifier("settings-row-\(label)")
+        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Account, \(model.currentUserName ?? model.currentEmail ?? "your account")")
+        // Fixed test handles — never the label (Settings is a SHEET over
+        // Today, so labels collide with what's behind it).
+        .accessibilityIdentifier("settings-row-account")
     }
 
-    /// A tappable row with a label, a subtitle, and a trailing chevron.
-    private func actionRow(_ label: String, sub: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    // MARK: the four screens
+
+    private var screensCard: some View {
+        SettingsCard {
+            hubRow(.notifications, "Notifications & calls", sub: "Reminders, check-ins and calls", id: "notifications")
+            CardDivider()
+            hubRow(.assistant, "Assistant & privacy", sub: "The AI, and what it remembers", id: "assistant")
+            CardDivider()
+            hubRow(.people, "People", sub: "Who you share tasks and lists with", id: "people")
+            CardDivider()
+            hubRow(.appearance, "Appearance", sub: "Light or dark, and text size", id: "appearance")
+        }
+    }
+
+    private func hubRow(_ destination: SettingsDestination, _ label: String, sub: String, id: String) -> some View {
+        NavigationLink(value: destination) {
             HStack {
-                VStack(alignment: .leading, spacing: 4) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(label).font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink)
                     Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 }
-                Spacer()
-                chevron
+                Spacer(minLength: 8)
+                SettingsChevron()
             }
-            .padding(.horizontal, 16).padding(.vertical, 14)
+            .padding(.horizontal, 16).padding(.vertical, 13)
             .contentShape(Rectangle())
-        }.buttonStyle(.plain)
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("settings-row-\(id)")
     }
 
-    private var chevron: some View {
-        Image(systemName: "chevron.right")
-            .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.palette.ink3)
+    // MARK: the two one-tap actions
+
+    private var actionsCard: some View {
+        SettingsCard {
+            actionRow("Send feedback", sub: "Tell us what's working, or isn't", id: "feedback") {
+                showFeedback = true
+            }
+            CardDivider()
+            // Resume an UNFINISHED run at its saved step; a finished or fresh
+            // tour restarts at the welcome card (web semantics). Locked while a
+            // tour runs.
+            actionRow("Replay the tour", sub: "A short walk through Unstuck", id: "tour",
+                      locked: model.tourRunning) {
+                model.tour.openExplicit()
+            }
+        }
+    }
+
+    private func actionRow(_ label: String, sub: String, id: String, locked: Bool = false,
+                           action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(label).font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink)
+                    Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                }
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 13)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(locked)
+        .opacity(locked ? 0.45 : 1)
+        .accessibilityIdentifier("settings-row-\(id)")
+    }
+
+    // MARK: footer — Terms · Privacy · version
+
+    /// Legal (App Store 1.2 / 5.1.1): Terms and Privacy stay one tap from the
+    /// hub — real buttons with a 44-pt hit area and labels. The build, for
+    /// bug reports.
+    private var footer: some View {
+        HStack(spacing: 0) {
+            footerLink("Terms", url: "https://unstucknow.io/terms", label: "Terms of Use", id: "settings-terms")
+            Text("·").accessibilityHidden(true)
+            footerLink("Privacy", url: "https://unstucknow.io/privacy", label: "Privacy Policy", id: "settings-privacy")
+            Text("·").accessibilityHidden(true)
+            Text("Unstuck \(Self.appVersion)")
+                .font(UFont.mono(11))
+                .padding(.leading, 7)
+                .accessibilityLabel("Version \(Self.appVersion)")
+        }
+        .font(UFont.sans(12))
+        .foregroundStyle(theme.palette.ink3)
+        .frame(maxWidth: .infinity)
+    }
+
+    private func footerLink(_ title: String, url: String, label: String, id: String) -> some View {
+        Button {
+            if let u = URL(string: url) { UIApplication.shared.open(u) }
+        } label: {
+            // Even padding (not a min width) keeps the "·" gaps equal; with it
+            // "Terms" still clears 44 pt wide.
+            Text(title).underline()
+                .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
+                .padding(.horizontal, 7)
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(.isLink)
+        .accessibilityIdentifier(id)
+    }
+
+    /// "1.1.1 (96)" from the bundle — never hardcode (it drifted to 0.1.0 once).
+    private static var appVersion: String {
+        let info = Bundle.main.infoDictionary
+        let version = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "\(version) (\(build))"
     }
 }
 
@@ -248,58 +286,94 @@ struct CardDivider: View {
     var body: some View { Rectangle().fill(theme.palette.line).frame(height: 1) }
 }
 
-/// A label + segmented-choice row (Android's SegRow). Generic over a list of
-/// (key, label) options; the binding holds the key.
-private struct SegRow: View {
+struct SettingsChevron: View {
+    @Environment(\.uTheme) private var theme
+    var body: some View {
+        Image(systemName: "chevron.right")
+            .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.palette.ink3)
+            .accessibilityHidden(true)
+    }
+}
+
+/// A small plain line under a card or row.
+struct SettingsNote: View {
+    @Environment(\.uTheme) private var theme
+    let text: String
+    var body: some View {
+        Text(text)
+            .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// A label (+ an optional plain line) and a row of choices. Selection is the
+/// app's black-and-white pair (ink fill, bg text) — never a colour accent.
+/// Generic over (key, label) options; `selected` holds the key.
+struct SettingsChoiceRow: View {
     @Environment(\.uTheme) private var theme
     let label: String
+    var sub: String? = nil
     let options: [(key: String, label: String)]
     let selected: String
     let onSelect: (String) -> Void
 
     var body: some View {
-        HStack(spacing: 10) {
-            Text(label).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-            Spacer()
-            HStack(spacing: 4) {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                if let sub {
+                    Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            HStack(spacing: 6) {
                 ForEach(options, id: \.key) { opt in
                     let isOn = opt.key == selected
                     Button { onSelect(opt.key) } label: {
                         Text(opt.label)
-                            .font(UFont.sans(12, .medium))
-                            .foregroundStyle(isOn ? Color.white : theme.palette.ink2)
-                            .padding(.horizontal, 11).padding(.vertical, 6)
-                            .background(isOn ? AnyShapeStyle(theme.palette.primary) : AnyShapeStyle(theme.palette.bg2),
-                                        in: Capsule())
-                            // 44pt hit area; negative padding keeps the row's drawn height.
-                            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
-                    }.buttonStyle(.plain)
-                        .accessibilityLabel(opt.label)
-                        .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
+                            .font(UFont.sans(13, isOn ? .semibold : .regular))
+                            .foregroundStyle(isOn ? theme.palette.bg : theme.palette.ink2)
+                            .padding(.horizontal, 14).padding(.vertical, 7)
+                            .background(isOn ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+                            .overlay(Capsule().stroke(theme.palette.line2))
+                            // 44pt hit area; negative padding keeps the drawn height.
+                            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -7)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(label): \(opt.label)")
+                    .accessibilityAddTraits(isOn ? [.isButton, .isSelected] : .isButton)
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 16).padding(.vertical, 12)
     }
 }
 
-/// A label + Switch row (Android's ToggleRow). The whole row is tappable.
-private struct ToggleRow: View {
+/// A label (+ an optional plain line) and a switch. The whole row is tappable.
+struct SettingsToggleRow: View {
     @Environment(\.uTheme) private var theme
     let label: String
+    var sub: String? = nil
     let isOn: Binding<Bool>
 
     var body: some View {
         Toggle(isOn: isOn) {
-            Text(label).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(label).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                if let sub {
+                    Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
         .tint(theme.palette.primary)
-        .padding(.horizontal, 16).padding(.vertical, 8)
+        .padding(.horizontal, 16).padding(.vertical, 10)
     }
 }
 
-/// A tappable label + value row (Android's SettingRow). Used for Account fields.
-private struct SettingTapRow: View {
+/// A tappable label + value row (Android's SettingRow).
+struct SettingTapRow: View {
     @Environment(\.uTheme) private var theme
     let label: String
     let value: String?
@@ -308,6 +382,7 @@ private struct SettingTapRow: View {
     /// reads, but it can't be tapped and looks inert. Belt-and-braces behind
     /// the tour's hit-test lockdown — see AppModel.tourRunning.
     var locked = false
+    var chevron = true
     var onTap: (() -> Void)?
 
     var body: some View {
@@ -317,12 +392,16 @@ private struct SettingTapRow: View {
                     Text(label)
                         .font(UFont.sans(13, .semibold))
                         .foregroundStyle(destructive ? theme.palette.red : theme.palette.ink)
-                    if let value { Text(value).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3) }
+                    if let value {
+                        Text(value).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer()
-                if onTap != nil {
+                if onTap != nil && chevron {
                     Image(systemName: "chevron.right")
                         .font(.system(size: 12, weight: .semibold)).foregroundStyle(theme.palette.ink3)
+                        .accessibilityHidden(true)
                 }
             }
             .padding(.horizontal, 16).padding(.vertical, 14)
@@ -334,119 +413,53 @@ private struct SettingTapRow: View {
     }
 }
 
-// MARK: - Focus
+// MARK: - Appearance
 
-private struct FocusSettingsView: View {
+/// Theme + Text size — the only look controls left (Decision 1). Accent, High
+/// contrast and the in-app Reduce motion are gone: the default palette stays
+/// as it is, and the phone's own settings cover the rest.
+struct AppearanceSettingsView: View {
     @Environment(AppModel.self) private var model
-    @Environment(\.uTheme) private var theme
+
     var body: some View {
         @Bindable var settings = model.settings
-        SettingsScaffold(eyebrow: "Settings · Focus", title: "How focus mode behaves.") {
+        SettingsScaffold(eyebrow: "Settings · Appearance", title: "How it looks.") {
             SettingsCard {
-                SegRow(label: "Default focus length",
-                       options: [("15", "15"), ("25", "25"), ("45", "45")],
-                       selected: String(settings.focusDefaultMin)) { v in
-                    settings.focusDefaultMin = Int(v) ?? 25
+                SettingsChoiceRow(label: "Theme",
+                                  options: [("system", "System"), ("light", "Light"), ("dark", "Dark")],
+                                  selected: settings.theme.rawValue) { v in
+                    settings.theme = ThemePref(rawValue: v) ?? .system
                 }
                 CardDivider()
-                SegRow(label: "Soft overrun",
-                       options: [("0", "Off"), ("5", "5"), ("10", "10")],
-                       selected: String(settings.focusOverrunMin)) { v in
-                    settings.focusOverrunMin = Int(v) ?? 0
+                SettingsChoiceRow(label: "Text size",
+                                  sub: "On top of your iPhone's own text size.",
+                                  options: TextSizePref.allCases.map { ($0.rawValue, $0.label) },
+                                  selected: settings.textSize.rawValue) { v in
+                    settings.textSize = TextSizePref(rawValue: v) ?? .standard
                 }
-                CardDivider()
-                ToggleRow(label: "Hide right rail while focusing", isOn: $settings.focusCollapseRail)
-                CardDivider()
-                ToggleRow(label: "Soft exit", isOn: $settings.focusSoftExit)
-                CardDivider()
-                ToggleRow(label: "Pause reasons", isOn: $settings.focusPauseReasons)
-                CardDivider()
-                // Hands-Free Focus Copilot (Phase 1): on-device spoken progress
-                // alerts during a block; Voice replies adds a short mic window
-                // after a prompt. Coach off disables Voice replies.
-                ToggleRow(label: "Spoken focus coach", isOn: $settings.focusSpokenCoach)
-                CardDivider()
-                ToggleRow(label: "Voice replies", isOn: $settings.focusVoiceReplies)
-                    .opacity(settings.focusSpokenCoach ? 1 : 0.4)
-                    .disabled(!settings.focusSpokenCoach)
             }
-            Text("Default focus length sets the estimate on a new task. Soft overrun decides how long past the estimate before the check-in appears.")
-                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                .padding(.top, 10)
-            Text("Spoken focus coach reads gentle progress alerts aloud while you focus — how often follows your Notifications level (Calm / Balanced / Coach). Voice replies opens a brief on-device mic after a prompt so you can say \u{201C}add ten\u{201D}, \u{201C}stop\u{201D}, or \u{201C}keep going\u{201D} hands-free. Both stay on your device — no recording is ever stored or sent.")
-                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+            SettingsNote(text: "Areas and tags live on Tasks. Focus options live on the Focus screen.")
                 .padding(.top, 10)
         }
+        .navigationTitle("Appearance")
     }
 }
 
-// MARK: - Sound
+// MARK: - Assistant & privacy
 
-private struct SoundSettingsView: View {
+/// The AI switch, the OK to share with OpenAI, what it remembers, and the
+/// stored conversations. The whole screen stays when the Assistant is off —
+/// you can still see and delete what it knows.
+struct AssistantPrivacySettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
-    var body: some View {
-        @Bindable var settings = model.settings
-        SettingsScaffold(eyebrow: "Settings · Sound", title: "Quiet by default.") {
-            SettingsCard {
-                ToggleRow(label: "Start chime", isOn: $settings.soundStartChime)
-                CardDivider()
-                ToggleRow(label: "Overrun bell", isOn: $settings.soundOverrunBell)
-                CardDivider()
-                ToggleRow(label: "Completion sound", isOn: $settings.soundCompletion)
-                CardDivider()
-                SegRow(label: "Ambient",
-                       options: [("off", "Off"), ("brown", "Brown"), ("pink", "Pink")],
-                       selected: settings.ambient.rawValue) { v in
-                    settings.ambient = AmbientSound(rawValue: v) ?? .off
-                }
-            }
-            Text("Ambient plays a soft noise bed while you focus. iOS generates one procedural brown-noise bed — “Pink” maps to the same loop.")
-                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                .padding(.top, 10)
-        }
-    }
-}
-
-// MARK: - Accessibility
-
-private struct AccessibilitySettingsView: View {
-    @Environment(AppModel.self) private var model
-    var body: some View {
-        @Bindable var settings = model.settings
-        SettingsScaffold(eyebrow: "Settings · Accessibility", title: "Adjust to your brain.") {
-            SettingsCard {
-                ToggleRow(label: "Reduce motion", isOn: $settings.reduceMotion)
-                CardDivider()
-                // +2 DynamicTypeSize steps on top of Density — Android's
-                // largerType 1.15× fontScale analogue.
-                ToggleRow(label: "Larger type", isOn: $settings.largerType)
-                CardDivider()
-                // Android `highContrast`. Stored for parity (SettingsState); the
-                // palette can stiffen hairlines/contrast off this flag.
-                ToggleRow(label: "High contrast", isOn: $settings.highContrast)
-            }
-        }
-    }
-}
-
-// MARK: - Interface
-
-private struct InterfaceSettingsView: View {
-    @Environment(AppModel.self) private var model
-    @Environment(\.uTheme) private var theme
-    /// Voice hold-to-talk (VoiceRealtimeClient.holdToTalkKey): the Talk screen
-    /// reads it at connect time — turn_detection null, mic open only while the
-    /// button is held. A device-level preference, so UserDefaults, not the
-    /// synced SettingsState.
-    @AppStorage(VoiceRealtimeClient.holdToTalkKey) private var voiceHoldToTalk = false
-    /// nil = idle; otherwise the line shown under "Clear Assistant history".
+    /// nil = idle; otherwise the line shown under "Delete conversation history".
     @State private var clearHistoryResult: String?
     @State private var clearing = false
 
     private var clearHistoryState: String {
-        if clearing { return "Clearing…" }
-        return clearHistoryResult ?? "Delete what you've said to it (kept 90 days)"
+        if clearing { return "Deleting…" }
+        return clearHistoryResult ?? "What you've said to it is kept 90 days. Delete it now."
     }
 
     /// Server-side delete of this user's stored conversations
@@ -460,68 +473,58 @@ private struct InterfaceSettingsView: View {
             defer { clearing = false }
             do {
                 let n = try await prefs.deleteAssistantHistory()
-                clearHistoryResult = n == 0 ? "Nothing was stored" : "Cleared \(n) stored line\(n == 1 ? "" : "s")"
+                clearHistoryResult = n == 0 ? "Nothing was stored." : "Deleted \(n) stored line\(n == 1 ? "" : "s")."
             } catch {
-                clearHistoryResult = "Couldn't clear it — try again"
+                clearHistoryResult = "Couldn't delete it. Try again."
             }
         }
     }
 
     var body: some View {
         @Bindable var settings = model.settings
-        SettingsScaffold(eyebrow: "Settings · Interface", title: "How things look.") {
+        SettingsScaffold(eyebrow: "Settings · Assistant & privacy", title: "What the AI can see.") {
             SettingsCard {
-                SegRow(label: "Theme",
-                       options: [("system", "System"), ("light", "Light"), ("dark", "Dark")],
-                       selected: settings.theme.rawValue) { v in
-                    settings.theme = ThemePref(rawValue: v) ?? .system
-                }
-                CardDivider()
-                SegRow(label: "Accent",
-                       options: [("indigo", "Indigo"), ("rose", "Rose"), ("forest", "Forest")],
-                       selected: settings.accent.rawValue) { v in
-                    settings.accent = Accent(rawValue: v) ?? .indigo
-                }
-                CardDivider()
-                SegRow(label: "Density",
-                       options: [("compact", "Compact"), ("regular", "Regular"), ("comfy", "Comfy")],
-                       selected: settings.density.rawValue) { v in
-                    settings.density = DensityPref(rawValue: v) ?? .regular
-                }
-                CardDivider()
                 // The AI kill-switch the privacy policy promises. OFF removes
-                // the ✦ launcher, the panel and voice entirely, and open-
-                // assistant deep links are ignored.
-                ToggleRow(label: "AI Assistant", isOn: $settings.assistantEnabled)
-                if settings.assistantEnabled {
-                    CardDivider()
-                    // Barge-in fallback for noisy rooms / open speakers: the mic
-                    // opens only while the Talk screen's button is held.
-                    ToggleRow(label: "Voice: hold to talk", isOn: $voiceHoldToTalk)
-                }
-                CardDivider()
-                // The control the privacy policy promises (§9.5, §17):
-                // conversations are kept 90 days, and the user can clear them
-                // now. Turning the Assistant off only stops FUTURE logging —
-                // before this there was no way to remove what was already
-                // stored short of deleting the account (audit 2026-09-21).
-                SettingTapRow(label: "Clear Assistant history",
-                              value: clearHistoryState, locked: model.tourRunning) {
-                    clearAssistantHistory()
-                }
+                // the ✦ launcher, the panel and voice entirely, open-assistant
+                // deep links are ignored, and calls are declined on arrival.
+                SettingsToggleRow(label: "AI Assistant",
+                                  sub: "Off hides the Assistant, Talk and calls.",
+                                  isOn: $settings.assistantEnabled)
+                    .accessibilityIdentifier("settings-ai-assistant")
                 CardDivider()
                 // The OK to send what they type or say to OpenAI (AIConsent).
                 AIDataSharingRow()
-            }
-            Text("Turn the AI Assistant off to remove it completely — no launcher, no panel, no voice. Nothing is sent to the model unless you ask it something.")
-                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                .padding(.top, 10)
-            if settings.assistantEnabled {
-                Text("Hold to talk turns off automatic listening in Talk: press and hold the button while you speak and release to send — handy in a noisy room or on speaker. Calls from Unstuck always listen automatically.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                    .padding(.top, 6)
+                CardDivider()
+                NavigationLink {
+                    FactsPanelView()
+                } label: {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("What Unstuck remembers")
+                                .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                            Text("See, change or forget what it has learned about you.")
+                                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        }
+                        Spacer()
+                        SettingsChevron()
+                    }
+                    .padding(.horizontal, 16).padding(.vertical, 14)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settings-remembers")
+                CardDivider()
+                // The control the privacy policy promises (§9.5, §17):
+                // conversations are kept 90 days, and the user can delete them
+                // now. Always shown — turning the Assistant off only stops
+                // FUTURE logging. Locked during the tour.
+                SettingTapRow(label: "Delete conversation history",
+                              value: clearHistoryState, locked: model.tourRunning, chevron: false) {
+                    clearAssistantHistory()
+                }
             }
         }
+        .navigationTitle("Assistant & privacy")
         // AI data sharing → on asks with the same sheet as everywhere else.
         .aiConsentSheet(.settings)
     }
@@ -542,8 +545,8 @@ private struct AIDataSharingRow: View {
             })) {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("AI data sharing").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-                    Text(on ? "On — what you ask the assistant goes to OpenAI so it can answer."
-                            : "Off — the assistant asks before anything is sent.")
+                    Text(on ? "On. What you ask the Assistant goes to OpenAI so it can answer."
+                            : "Off. The Assistant asks before anything is sent.")
                         .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -559,7 +562,7 @@ private struct AIDataSharingRow: View {
 
 // MARK: - Account
 
-private struct AccountSettingsView: View {
+struct AccountSettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
@@ -568,7 +571,6 @@ private struct AccountSettingsView: View {
     @State private var showName = false
     @State private var showPassword = false
     @State private var showDelete = false
-    @State private var showFeedback = false
     @State private var message: String?
     @State private var messageIsError = false
     @State private var signOutWarning: String?
@@ -578,41 +580,25 @@ private struct AccountSettingsView: View {
             SettingsCard {
                 SettingTapRow(label: "Display name", value: model.currentUserName ?? "Set a name") { showName = true }
                 CardDivider()
-                SettingTapRow(label: "Signed in", value: model.currentEmail ?? "—")   // static info — no tap
-                CardDivider()
                 SettingTapRow(label: model.hasPassword ? "Change password" : "Add a password",
-                              value: "Update your sign-in password") { showPassword = true }
+                              value: model.hasPassword ? "Update the password you sign in with"
+                                                       : "Sign in with a password as well") { showPassword = true }
                 CardDivider()
                 // The account-danger rows are LOCKED while the guided tour is
                 // running (round 4): the tour's hit-test lockdown already
                 // scopes the settings exemption to the pushed section, and
                 // this is the belt-and-braces the contract asks for — a
                 // sign-out / delete / export mid-tour used to leave the
-                // running lockdown live over AuthView.
-                SettingTapRow(label: "Export everything", value: "A full JSON snapshot of your data.",
+                // running lockdown live over AuthView. The label stays
+                // "Export everything": the privacy policy names it.
+                SettingTapRow(label: "Export everything",
+                              value: "Download a copy of everything you've put in Unstuck",
                               locked: model.tourRunning) {
                     exportURL = model.makeExportFile()
                 }
                 CardDivider()
-                // Guided product tour — resume an UNFINISHED run at its saved
-                // step; a finished or fresh tour RESTARTS at the welcome card
-                // (the web's Settings → Account → Product tour semantics).
-                SettingTapRow(label: "Product tour", value: "Replay the guided walkthrough",
-                              locked: model.tourRunning) {
-                    model.tour.openExplicit()
-                }
-                CardDivider()
-                // Feedback moved OUT of the assistant panel in the redesign —
-                // this is now its only entry point (web parity).
-                SettingTapRow(label: "Send feedback", value: "Tell us what’s working (or isn’t)") {
-                    showFeedback = true
-                }
-                CardDivider()
-                SettingTapRow(label: "Delete my account", value: "Permanently removes your data",
-                              destructive: true, locked: model.tourRunning) { showDelete = true }
-                CardDivider()
-                SettingTapRow(label: "Sign out", value: "End this session",
-                              destructive: true, locked: model.tourRunning) {
+                SettingTapRow(label: "Sign out", value: "End this session on this iPhone",
+                              locked: model.tourRunning, chevron: false) {
                     // Edits still queued: say where they go before they're
                     // parked (audit 2026-09-22, C36). What the server refused
                     // — and everything held behind it — never syncs from a
@@ -622,6 +608,10 @@ private struct AccountSettingsView: View {
                         quarantined: max(model.quarantinedSyncCount, model.stuckChanges))
                     if signOutWarning == nil { model.signOut(); dismiss() }
                 }
+                CardDivider()
+                // Last row, same path and depth as before (App Store 5.1.1(v)).
+                SettingTapRow(label: "Delete my account", value: "Permanently removes your data",
+                              destructive: true, locked: model.tourRunning) { showDelete = true }
             }
             if let message {
                 Text(message)
@@ -630,7 +620,10 @@ private struct AccountSettingsView: View {
                     .padding(.top, 10)
             }
         }
+        .navigationTitle("Account")
         .sheet(item: $exportURL) { url in
+            // Delete the full-PII dump once the share finishes/cancels so it
+            // doesn't linger in tmp (makeExportFile sweeps stragglers).
             ActivityView(items: [url]) { AppModel.removeExportFile(url) }
         }
         .alert("Sign out with changes unsynced?",
@@ -640,7 +633,6 @@ private struct AccountSettingsView: View {
         } message: {
             Text(signOutWarning ?? "")
         }
-        .sheet(isPresented: $showFeedback) { FeedbackSheet() }
         .sheet(isPresented: $showName) {
             DisplayNameSheet(initial: model.currentUserName ?? "") { name in
                 Task {

@@ -467,6 +467,27 @@ final class TourAudioManifestTests: XCTestCase {
         XCTAssertEqual(inFull?.body, today.body)
     }
 
+    /// Slim settings (2026-09-24): two clips still speak the old Settings —
+    /// personalization.m4a ("theme, accent, density…") and finish-more.m4a
+    /// ("…from Settings → Account"). They stay on disk (the Xcode project lists
+    /// every file) but are never offered, exactly like the web's tour-audio.ts;
+    /// pinned so re-recording them is the only way to empty the set.
+    func testTheStaleSlimSettingsClipsAreParkedNotPlayed() {
+        XCTAssertEqual(TourScript.staleClips, ["personalization", "finish-more"])
+        for clip in TourScript.staleClips {
+            XCTAssertTrue(exists("\(clip).m4a"), "'\(clip).m4a' must stay on disk (the project lists it)")
+            XCTAssertNil(TourAudioPlayer.url(forStep: clip), "'\(clip)' must never be offered")
+        }
+        XCTAssertFalse(TourAudioPlayer.hasAudio(forStep: "personalization"), "Listen is hidden on that step")
+        XCTAssertFalse(TourAudioPlayer.hasMoreAudio(forStep: "finish"), "finish's Tell-me-more expands silently")
+        XCTAssertTrue(TourAudioPlayer.hasAudio(forStep: "finish"), "finish's narration names no Settings path — it stays")
+        // The copy those clips would have to match once re-recorded.
+        let personalization = TourScript.full.first { $0.id == "personalization" }!
+        XCTAssertFalse(personalization.narration.contains("accent"))
+        let finish = TourScript.essential.first { $0.id == "finish" }!
+        XCTAssertTrue(finish.more?.contains("Settings → Replay the tour") == true)
+    }
+
     func testEveryStepHasANarrationClip() {
         for s in allSteps where !awaiting.contains(s.id) {
             XCTAssertTrue(exists("\(s.id).m4a"), "missing narration clip for '\(s.id)'")

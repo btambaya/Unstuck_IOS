@@ -289,6 +289,9 @@ struct FocusView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
     @Environment(\.scenePhase) private var scenePhase
+    /// The phone's own Reduce Motion (the in-app switch is gone — slim
+    /// settings, 2026-09-24): the ring snaps instead of easing.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let task: TaskItem
     /// Non-nil when this Focus is on a task shared WITH me (partner/assign). The
     /// live session logs onto the OWNER's task via log_shared_focus (T3) rather
@@ -306,11 +309,16 @@ struct FocusView: View {
     @State private var captures: [Capture] = []
     @State private var captureTag: CaptureTag = .followUp
     @State private var captureText = ""
-    /// Header mute toggle. Seeded from the Settings ambient choice in .task so
-    /// the speaker starts in the state the user picked (off → muted).
-    @State private var soundOn = true
+    /// The speaker button — it IS the background-noise setting now (slim
+    /// settings, 2026-09-24): seeded from the stored choice in .task, and a
+    /// tap both plays/stops the bed and remembers it. It used to be gated on a
+    /// separate Settings "Ambient" value that defaulted to Off, so the button
+    /// flipped its icon and played nothing.
+    @State private var soundOn = false
     @State private var soundSeeded = false
-    /// Soft-exit confirm ("Leave focus?") — Android parity: the timer keeps
+    /// Focus ⋯ Options (the focus settings that used to live in Settings).
+    @State private var showOptions = false
+    /// Soft-exit confirm ("Leave this session?") — Android parity: the timer keeps
     /// running and stays resumable from Today; we just stop showing it.
     @State private var showLeaveConfirm = false
     // End-of-session reflection (Android ReflectSheet) — shown after Done /
@@ -362,9 +370,9 @@ struct FocusView: View {
         }
         .animation(.easeInOut(duration: 0.25), value: model.liveCoFocus?.peers.count)
         .task {
-            // Seed the mute toggle from the Settings ambient choice (off →
-            // start muted) once, before the first audio update.
-            if !soundSeeded { soundOn = model.settings.ambient != .off; soundSeeded = true }
+            // Seed the speaker from the remembered choice once, before the
+            // first audio update.
+            if !soundSeeded { soundOn = model.settings.ambient.isOn; soundSeeded = true }
             if fm == nil {
                 // Recurring occurrence? Run the session on the template, mark the
                 // day's block on finish. Resolve before finalize/start so the
@@ -432,16 +440,42 @@ struct FocusView: View {
                     if exitAfterReason { exitAfterReason = false; dismiss() }
                 }
             }
+            // The question is optional (slim settings): this turns it off —
+            // Focus ⋯ Options → "Ask why I'm pausing" turns it back on.
+            Button("Don't ask again") {
+                model.settings.focusPauseReasons = false
+                if exitAfterReason { exitAfterReason = false; dismiss() }
+            }
             Button("Just pause", role: .cancel) {
                 // Already paused + check-in coordinated; only Save-for-later exits.
                 if exitAfterReason { exitAfterReason = false; dismiss() }
             }
         }
-        .confirmationDialog("Leave focus?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
+        // Titled with the option's own words ("Ask before I leave a session").
+        .confirmationDialog("Leave this session?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
             Button("Leave") { dismiss() }
+            // Focus ⋯ Options → "Ask before I leave a session" turns it back on.
+            Button("Leave and don't ask again") {
+                model.settings.focusSoftExit = false
+                dismiss()
+            }
             Button("Stay", role: .cancel) {}
         } message: {
-            Text("Your timer keeps running — you can pick it back up from Today.")
+            Text("Your timer keeps running. You can pick it back up from Today.")
+        }
+        .sheet(isPresented: $showOptions) { FocusOptionsSheet() }
+        // "Talk me through the session" switched in ⋯ Options mid-session:
+        // start the coach now, or stop it (mic and speech) at once.
+        .onChange(of: model.settings.focusSpokenCoach) { _, on in
+            guard let fm else { return }
+            if on {
+                guard copilot == nil, fm.live.sessionStart != nil else { return }
+                startCopilotIfEnabled(fm)
+                if fm.live.paused { copilot?.pauseSession() }
+            } else {
+                teardownCopilot()
+                copilot = nil
+            }
         }
         // Done / End for now on a session past its estimate + grace (C43).
         .confirmationDialog(overlongFinish.map { "This session ran \(fmtHrs($0.rawSec / 60))" } ?? "",
@@ -497,13 +531,11 @@ struct FocusView: View {
         if !fm.syncFromStore() { dismiss() }
     }
 
-    /// Ambient loop plays while focusing when the Settings ambient bed is on
-    /// (off | brown | pink — iOS generates one procedural brown bed; pink reuses
-    /// it) AND the header mute toggle is on. Android plays it for every
-    /// treatment, so we no longer gate on treatment == .ambient.
+    /// The background noise plays while the speaker button is on — the
+    /// button is the setting (iOS generates one procedural brown bed). Android
+    /// plays it for every treatment, so it isn't gated on treatment.
     private func updateAudio(_ fm: FocusModel) {
-        if soundOn && model.settings.ambient != .off { AmbientAudio.shared.start() }
-        else { AmbientAudio.shared.stop() }
+        if soundOn { AmbientAudio.shared.start() } else { AmbientAudio.shared.stop() }
     }
 
     // MARK: - Hands-Free Focus Copilot wiring
@@ -614,14 +646,34 @@ struct FocusView: View {
                 if let copilot, copilot.canCapture {
                     talkCaptureBtn(copilot)
                 }
-                // Sound toggle (ambient loop) lives where Android's mute-less
-                // header has space; keeps the existing soundOn behavior.
-                Button { soundOn.toggle(); updateAudio(fm) } label: {
+                // The speaker button: background noise on/off, remembered for
+                // the next session (it replaced Settings → Sound → Ambient).
+                Button {
+                    soundOn.toggle()
+                    model.settings.ambient = soundOn ? .brown : .off
+                    updateAudio(fm)
+                } label: {
                     Image(systemName: soundOn ? "speaker.wave.2" : "speaker.slash")
                         .font(.system(size: 15)).foregroundStyle(.white.opacity(0.6))
                         .frame(width: 32, height: 32)
                         .background(.white.opacity(0.10), in: Circle())
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
+                        .padding(.vertical, -6)
                 }.buttonStyle(.plain)
+                    .accessibilityLabel(soundOn ? "Background noise on" : "Background noise off")
+                    .accessibilityHint("Turns the background noise on or off")
+                // ⋯ Options: how a session behaves (the focus settings that
+                // used to live in Settings).
+                Button { showOptions = true } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white.opacity(0.6))
+                        .frame(width: 32, height: 32)
+                        .background(.white.opacity(0.10), in: Circle())
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
+                        .padding(.vertical, -6)
+                }.buttonStyle(.plain)
+                    .accessibilityLabel("Focus options")
+                    .accessibilityIdentifier("focus-options")
             }
             .padding(.bottom, 8)
 
@@ -699,7 +751,7 @@ struct FocusView: View {
             let estimateSec = FocusTimer.estimateSec(fm.live)
             let remaining = max(0, estimateSec - elapsed)
             let progress = estimateSec > 0 ? min(1, max(0, Double(elapsed) / Double(estimateSec))) : 0
-            // Soft-overrun grace from Settings · Focus (minutes; 0 = Never →
+            // Overrun check-in from Focus ⋯ Options (minutes; 0 = Never →
             // .infinity, so the timer never escalates to the overrun check-in).
             let graceSec = model.settings.focusOverrunMin <= 0 ? Double.infinity : Double(model.settings.focusOverrunMin) * 60
             let state = FocusTimer.deriveState(fm.live, now: now, overrunGraceSec: graceSec)
@@ -734,7 +786,7 @@ struct FocusView: View {
                 }
 
                 if fm.treatment == .ambient {
-                    ProgressRing(progress: progress, paused: isPaused, animated: !model.settings.reduceMotion)
+                    ProgressRing(progress: progress, paused: isPaused, animated: !reduceMotion)
                         .frame(width: 220, height: 220)
                         .padding(.bottom, 20)
                 }
@@ -1095,7 +1147,7 @@ struct FocusView: View {
 struct ProgressRing: View {
     let progress: Double
     let paused: Bool
-    /// When false (Settings · Accessibility → Reduce motion), the arc snaps to
+    /// When false (the phone's Reduce Motion), the arc snaps to
     /// each per-second value instead of easing between them.
     var animated: Bool = true
 
@@ -1143,5 +1195,66 @@ struct WhiteOrbit: View {
                 .offset(x: ring / 2)
         }
         .frame(width: size, height: size)
+    }
+}
+
+/// Focus ⋯ Options (slim settings, 2026-09-24): how a session behaves — the
+/// focus settings that used to live in Settings, now on the screen they change.
+/// Same stored keys, so the assistant's set_focus_defaults still reaches them.
+/// The estimate a new task starts with isn't here: the New Task sheet
+/// remembers the last one picked.
+struct FocusOptionsSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        @Bindable var settings = model.settings
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    SettingsCard {
+                        SettingsChoiceRow(label: "Check in when I run over",
+                                          sub: "How long after time's up before Unstuck asks how it's going.",
+                                          options: [("0", "Never"), ("5", "5 min"), ("10", "10 min")],
+                                          selected: String(settings.focusOverrunMin)) { v in
+                            settings.focusOverrunMin = Int(v) ?? 5
+                        }
+                        CardDivider()
+                        SettingsToggleRow(label: "Ask before I leave a session",
+                                          sub: "A quick check before you leave. Your timer keeps running either way.",
+                                          isOn: $settings.focusSoftExit)
+                        CardDivider()
+                        SettingsToggleRow(label: "Ask why I'm pausing",
+                                          sub: "One tap on a reason. It helps you spot patterns later.",
+                                          isOn: $settings.focusPauseReasons)
+                        CardDivider()
+                        SettingsToggleRow(label: "Talk me through the session",
+                                          sub: "Short spoken updates: halfway, five minutes left, time's up. How often is set in Settings → Notifications & calls.",
+                                          isOn: $settings.focusSpokenCoach)
+                        CardDivider()
+                        // Greyed out (never hidden) while the coach is off, and
+                        // then it says what to turn on first. "add five" is what
+                        // the coach asks at time's up (FocusCopilot).
+                        SettingsToggleRow(label: "Voice replies",
+                                          sub: settings.focusSpokenCoach
+                                              ? "After a question, answer out loud: “add five”, “stop” or “keep going”. It listens on this phone for a few seconds; nothing is recorded."
+                                              : "Turn on “Talk me through the session” first.",
+                                          isOn: $settings.focusVoiceReplies)
+                            .opacity(settings.focusSpokenCoach ? 1 : 0.4)
+                            .disabled(!settings.focusSpokenCoach)
+                    }
+                }
+                .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 24)
+            }
+            .background(theme.palette.bg.ignoresSafeArea())
+            .navigationTitle("Focus options")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
     }
 }

@@ -27,38 +27,111 @@ final class SettingsStateTests: XCTestCase {
         // These must stay TRUE on a first launch (no stored value).
         XCTAssertTrue(s.focusSoftExit)
         XCTAssertTrue(s.focusPauseReasons)
-        XCTAssertTrue(s.focusCollapseRail)
-        XCTAssertTrue(s.soundStartChime)
-        XCTAssertTrue(s.soundOverrunBell)
+        XCTAssertTrue(s.focusSpokenCoach)
+        XCTAssertTrue(s.assistantEnabled)
     }
 
-    func testFalseDefaultingBoolsDefaultFalseWhenUnset() {
+    func testFalseDefaultingValuesDefaultOffWhenUnset() {
         let s = SettingsState(defaults: freshDefaults())
         s.load()
-        XCTAssertFalse(s.reduceMotion)
-        XCTAssertFalse(s.largerType)
-        XCTAssertFalse(s.highContrast)
-        XCTAssertFalse(s.soundCompletion)
+        XCTAssertFalse(s.focusVoiceReplies)
+        XCTAssertEqual(s.ambient, .off)
+        XCTAssertFalse(s.ambient.isOn)
+        XCTAssertEqual(s.textSize, .standard)
     }
 
     func testStoredFalseOverridesTrueDefault() {
         let d = freshDefaults()
         d.set(false, forKey: "unstuck.focusSoftExit")   // user turned it OFF
-        d.set(false, forKey: "unstuck.soundStartChime")
+        d.set(false, forKey: "unstuck.focusSpokenCoach")
         let s = SettingsState(defaults: d)
         s.load()
         XCTAssertFalse(s.focusSoftExit, "an explicitly-stored false must survive")
-        XCTAssertFalse(s.soundStartChime)
+        XCTAssertFalse(s.focusSpokenCoach)
         // An unset true-default bool is unaffected.
         XCTAssertTrue(s.focusPauseReasons)
     }
 
     func testStoredTrueOverridesFalseDefault() {
         let d = freshDefaults()
-        d.set(true, forKey: "unstuck.reduceMotion")
+        d.set(true, forKey: "unstuck.focusVoiceReplies")
         let s = SettingsState(defaults: d)
         s.load()
-        XCTAssertTrue(s.reduceMotion)
+        XCTAssertTrue(s.focusVoiceReplies)
+    }
+
+    // MARK: slim settings (2026-09-24)
+
+    /// Density + Larger type merged into Text size: a device that set them
+    /// keeps its size on the first read, before Text size has its own key.
+    func testTextSizeIsReadFromTheOldControlsUntilChosen() {
+        let comfy = freshDefaults()
+        comfy.set("comfy", forKey: "unstuck.density")
+        XCTAssertEqual(SettingsState.loaded(defaults: comfy).textSize, .larger)
+
+        let compact = freshDefaults()
+        compact.set("compact", forKey: "unstuck.density")
+        XCTAssertEqual(SettingsState.loaded(defaults: compact).textSize, .smaller)
+
+        let larger = freshDefaults()
+        larger.set("compact", forKey: "unstuck.density")
+        larger.set(true, forKey: "unstuck.largerType")
+        XCTAssertEqual(SettingsState.loaded(defaults: larger).textSize, .larger, "Larger type wins")
+
+        // Once chosen, its own key wins over the old ones — which stay.
+        let s = SettingsState.loaded(defaults: comfy)
+        s.textSize = .smaller
+        XCTAssertEqual(comfy.string(forKey: SettingsState.textSizeKey), "smaller")
+        XCTAssertEqual(SettingsState.loaded(defaults: comfy).textSize, .smaller)
+        XCTAssertEqual(comfy.string(forKey: "unstuck.density"), "comfy", "the old value is never wiped")
+    }
+
+    func testAnUnrecognisedTextSizeFallsBackToTheOldControlsThenDefault() {
+        let d = freshDefaults()
+        d.set("huge", forKey: SettingsState.textSizeKey)
+        XCTAssertEqual(SettingsState.loaded(defaults: d).textSize, .standard)
+        XCTAssertEqual(TextSizePref.standard.typeStepShift, 0)
+    }
+
+    /// Accent, High contrast, the in-app Reduce motion, Hide rail and the
+    /// three sounds are gone: stored values are NOT wiped, just never read —
+    /// and loading or changing anything else never touches them.
+    func testRemovedControlsAreNeitherReadNorWiped() {
+        let d = freshDefaults()
+        let removed: [String: Any] = [
+            "unstuck.accent": "rose", "unstuck.highContrast": true, "unstuck.reduceMotion": true,
+            "unstuck.focusCollapseRail": false, "unstuck.soundStartChime": false,
+            "unstuck.soundOverrunBell": false, "unstuck.soundCompletion": true,
+        ]
+        for (k, v) in removed { d.set(v, forKey: k) }
+        let s = SettingsState.loaded(defaults: d)
+        s.theme = .dark
+        s.textSize = .larger
+        s.ambient = .brown
+        for (k, v) in removed {
+            XCTAssertEqual(d.object(forKey: k) as? NSObject, v as? NSObject, "\(k) must stay as stored")
+        }
+    }
+
+    /// The speaker button IS the background-noise setting: on stores brown
+    /// (old builds read it), and a stored pink — the same loop — reads as on.
+    func testBackgroundNoiseReadsPinkAsOnAndStoresBrown() {
+        let d = freshDefaults()
+        d.set("pink", forKey: "unstuck.ambient")
+        let s = SettingsState.loaded(defaults: d)
+        XCTAssertTrue(s.ambient.isOn)
+        s.ambient = .off
+        XCTAssertEqual(d.string(forKey: "unstuck.ambient"), "off")
+        s.ambient = .brown
+        XCTAssertEqual(d.string(forKey: "unstuck.ambient"), "brown")
+    }
+
+    /// Read before AppModel exists (a killed-state VoIP launch).
+    func testTheStoredAssistantSwitchIsReadableWithoutAModel() {
+        let d = freshDefaults()
+        XCTAssertTrue(SettingsState.storedAssistantEnabled(d), "on unless turned off")
+        d.set(false, forKey: SettingsState.assistantEnabledKey)
+        XCTAssertFalse(SettingsState.storedAssistantEnabled(d))
     }
 
     /// The AI kill-switch (privacy policy §21). ON unless the user turned it
@@ -99,11 +172,11 @@ final class SettingsStateTests: XCTestCase {
     func testEnumScalarsHydrateAndFallBack() {
         let d = freshDefaults()
         d.set("dark", forKey: "unstuck.theme")
-        d.set("garbage", forKey: "unstuck.density")   // unrecognised → default
+        d.set("garbage", forKey: "unstuck.ambient")   // unrecognised → default
         let s = SettingsState(defaults: d)
         s.load()
         XCTAssertEqual(s.theme, .dark)
-        XCTAssertEqual(s.density, .regular, "an unrecognised raw value falls back to the default")
+        XCTAssertEqual(s.ambient, .off, "an unrecognised raw value falls back to the default")
     }
 
     func testLoadDoesNotWriteBackDefaults() {
@@ -115,6 +188,7 @@ final class SettingsStateTests: XCTestCase {
         XCTAssertNil(d.object(forKey: "unstuck.focusSoftExit"),
                      "loading a default value must not persist it")
         XCTAssertNil(d.object(forKey: "unstuck.theme"))
+        XCTAssertNil(d.object(forKey: SettingsState.textSizeKey), "a migrated Text size isn't written until chosen")
     }
 
     func testSettingAValueAfterLoadPersists() {
@@ -153,5 +227,83 @@ final class SignOutWarningTests: XCTestCase {
         XCTAssertTrue(mixed.hasPrefix("2 changes haven’t reached the server yet."), mixed)
         XCTAssertTrue(mixed.contains("sync the next time you sign in here"), mixed)
         XCTAssertTrue(mixed.contains("2 changes the server couldn’t accept stay on this iPhone only"), mixed)
+    }
+}
+
+// MARK: - where a Settings link lands (slim settings, 2026-09-24)
+
+/// Every entry point that names a Settings section — `unstuck://settings`
+/// links (server, old builds), the assistant's open_screen, the web's
+/// capitalised `?section=` ids — lands on the slim structure: old names are
+/// aliases, the bare link stays the hub, areas/tags open the Tasks sheet.
+@MainActor
+final class SettingsLinkRoutingTests: XCTestCase {
+    private var model: AppModel!
+
+    override func setUp() {
+        super.setUp()
+        model = AppModel()
+        model.startUITestMode()
+    }
+
+    private func land(_ link: String) -> AppRouter.Sheet? {
+        model.router.dismissAllPresentations()
+        model.router.pendingDeepLink = nil
+        model.routeDeepLink(link)
+        return model.router.activeSheet
+    }
+
+    func testTheBareLinkStaysTheHub() {
+        // The server sends it on purpose (invites, shares): People is one tap.
+        XCTAssertEqual(land("unstuck://settings"), .settings(section: nil))
+    }
+
+    func testOldAndNewSectionNamesLandOnTheSlimScreens() {
+        let table: [(String, String?)] = [
+            ("Notifications", "Notifications"), ("calls", "Notifications"), ("Calls", "Notifications"),
+            ("Interface", "Appearance"), ("accessibility", "Appearance"), ("Appearance", "Appearance"),
+            ("memory", "Assistant"), ("AI", "Assistant"), ("Assistant", "Assistant"),
+            ("People", "People"), ("circle", "People"),
+            ("Backup", "Account"), ("export", "Account"), ("Account", "Account"),
+            ("feedback", "Feedback"),
+            ("focus", nil), ("Sound", nil),   // nothing running → the hub
+            ("insights", nil), ("nonsense", nil),
+        ]
+        for (section, want) in table {
+            XCTAssertEqual(land("unstuck://settings?section=\(section)"), .settings(section: want), section)
+        }
+    }
+
+    func testAreasAndTagsOpenTheTasksSheet() {
+        for section in ["areas", "Areas", "tags", "Areas%20%26%20tags"] {
+            model.router.select(.today)
+            XCTAssertEqual(land("unstuck://settings?section=\(section)"), .areasTags, section)
+            XCTAssertEqual(model.router.tab, .tasks, section)
+        }
+    }
+
+    func testTheAssistantsOpenScreenTargets() {
+        model.router.dismissAllPresentations()
+        XCTAssertTrue(model.openScreen("settings"))
+        XCTAssertEqual(model.router.activeSheet, .settings(section: nil))
+        model.router.dismissAllPresentations(); model.router.pendingDeepLink = nil
+        XCTAssertTrue(model.openScreen("notifications"))
+        XCTAssertEqual(model.router.activeSheet, .settings(section: "Notifications"))
+        model.router.dismissAllPresentations(); model.router.pendingDeepLink = nil
+        XCTAssertTrue(model.openScreen("people"))
+        XCTAssertEqual(model.router.activeSheet, .settings(section: "People"))
+        model.router.dismissAllPresentations(); model.router.pendingDeepLink = nil
+        XCTAssertTrue(model.openScreen("areas"))
+        XCTAssertEqual(model.router.activeSheet, .areasTags)
+        XCTAssertEqual(model.router.tab, .tasks)
+    }
+
+    func testALinkArrivingOverAnOpenSheetIsDeferredThenLands() {
+        model.router.present(.inbox)
+        model.routeDeepLink("unstuck://settings?section=Interface")
+        XCTAssertEqual(model.router.pendingDeepLink, "unstuck://settings?section=Interface",
+                       "dismiss first, then present — two sheets on one host no-op")
+        model.flushPendingDeepLink()
+        XCTAssertEqual(model.router.activeSheet, .settings(section: "Appearance"))
     }
 }

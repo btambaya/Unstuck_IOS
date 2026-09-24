@@ -1,13 +1,17 @@
-// "What Unstuck knows" — every fact the assistant has learned, visible and
+// "What Unstuck remembers" — every fact the assistant has learned, visible and
 // deletable (iOS port of components/settings/facts-panel.tsx). Memory
 // transparency is part of the same consent surface as the AI toggle
 // (docs/ai-gateway-brainstorm.md): nothing is stored silently, and forgetting
 // is immediate, everywhere (soft-delete tombstones sync through profile_facts).
 //
-// Settings → "What Unstuck knows". Lists each ACTIVE fact with its category
-// chip + date (the date it refers to when set, else when it was last
-// updated), edit-in-place, forget one, "Forget everything" (confirmed), an
-// add row, and the four ritual toggles (which recurring moments run).
+// Settings → Assistant & privacy → "What Unstuck remembers" (slim settings,
+// 2026-09-24). Lists each ACTIVE fact with its plain category (About me /
+// Routine / Limits / Likes / Other) + date (the date it refers to when set,
+// else when it was last updated), edit-in-place, forget one, "Forget
+// everything" (confirmed) and an add row. It stays when the Assistant is off —
+// you can always see and delete what it knows; only "Add" hides then. The
+// routine switches (morning / evening / Friday / Sunday) left for the web
+// assistant panel: nothing on the phones runs them.
 
 import SwiftUI
 import UnstuckCore
@@ -26,9 +30,10 @@ struct FactsPanelView: View {
     @State private var confirmForgetAll = false
 
     var body: some View {
-        SettingsScaffold(eyebrow: "Settings · Memory", title: "What Unstuck knows about you.") {
-            Text("The assistant’s memory — built from your answers and conversations. These facts are shared with our AI provider (which doesn’t train on them) so it can personalise your help. Delete anything; it forgets immediately, everywhere.")
+        SettingsScaffold(eyebrow: "Settings · Assistant & privacy", title: "What Unstuck remembers.") {
+            Text("What the Assistant has learned from your answers and conversations. It shares these with our AI provider (which doesn’t train on them) so its help fits your life. Forget anything and it’s gone at once, everywhere.")
                 .font(UFont.sans(12.5)).foregroundStyle(theme.palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.bottom, 12)
 
             SettingsCard {
@@ -43,8 +48,11 @@ struct FactsPanelView: View {
                         factRow(f)
                     }
                 }
-                CardDivider()
-                addRow
+                // Adding needs the Assistant; seeing and forgetting never do.
+                if model.settings.assistantEnabled {
+                    CardDivider()
+                    addRow
+                }
             }
 
             if !facts.isEmpty {
@@ -57,22 +65,8 @@ struct FactsPanelView: View {
                     .accessibilityLabel("Forget everything the assistant has learned")
             }
 
-            Text("Moments it runs for you")
-                .font(UFont.sans(13.5, .semibold)).foregroundStyle(theme.palette.ink)
-                .padding(.top, 18).padding(.bottom, 8)
-            SettingsCard {
-                ForEach(Array(RITUAL_LABELS.enumerated()), id: \.element.key) { i, r in
-                    if i > 0 { CardDivider() }
-                    RitualToggleRow(label: r.label, sub: r.sub,
-                                    isOn: Binding(get: { model.paPrefs.rituals[r.key] },
-                                                  set: { model.paPrefs.setRitual(r.key, on: $0) }))
-                }
-            }
-            Text("Your tone is derived from these facts — tell it “keep me honest” or “gently” and it adapts. No separate dial.")
-                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                .padding(.top, 10)
         }
-        .navigationTitle("What Unstuck knows")
+        .navigationTitle("What Unstuck remembers")
         .task { await observe() }
         .alert("Forget everything?", isPresented: $confirmForgetAll) {
             Button("Forget everything", role: .destructive) { model.profileFacts?.clear() }
@@ -106,7 +100,7 @@ struct FactsPanelView: View {
 
     private func factRow(_ f: ProfileFact) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(f.category.rawValue.uppercased())
+            Text(f.category.plainLabel.uppercased())
                 .font(UFont.mono(9.5, .semibold)).tracking(0.6)
                 .foregroundStyle(theme.palette.coral)
                 .padding(.horizontal, 6).padding(.vertical, 2)
@@ -140,11 +134,11 @@ struct FactsPanelView: View {
         return HStack(spacing: 8) {
             Menu {
                 ForEach(ProfileFactCategory.allCases, id: \.self) { c in
-                    Button(c.rawValue.capitalized) { draftCategory = c }
+                    Button(c.plainLabel) { draftCategory = c }
                 }
             } label: {
                 HStack(spacing: 3) {
-                    Text(draftCategory.rawValue).font(UFont.sans(12))
+                    Text(draftCategory.plainLabel).font(UFont.sans(12))
                     Image(systemName: "chevron.down").font(.system(size: 9, weight: .semibold))
                 }
                 .foregroundStyle(theme.palette.ink2)
@@ -208,25 +202,6 @@ enum FactDate {
     }
 }
 
-/// Label + sub + switch — one ritual (Settings variant of the interview chips).
-struct RitualToggleRow: View {
-    @Environment(\.uTheme) private var theme
-    let label: String
-    let sub: String
-    let isOn: Binding<Bool>
-
-    var body: some View {
-        Toggle(isOn: isOn) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(label).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-                Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-            }
-        }
-        .tint(theme.palette.primary)
-        .padding(.horizontal, 16).padding(.vertical, 8)
-    }
-}
-
 /// Edit one fact's text (category + date stay). Save re-stores it.
 private struct FactEditSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -242,7 +217,7 @@ private struct FactEditSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            SectionLabel("Edit · \(fact.category.rawValue)")
+            SectionLabel("Edit · \(fact.category.plainLabel)")
             TextField("The fact", text: $value, axis: .vertical)
                 .font(UFont.sans(16)).textFieldStyle(.plain)
                 .lineLimit(2...5)

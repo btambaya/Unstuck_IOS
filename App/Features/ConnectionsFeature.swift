@@ -282,9 +282,10 @@ struct ConnectionsView: View {
     @State private var vm: CircleModel?
 
     var body: some View {
-        SettingsScaffold(eyebrow: "Settings · People", title: "Sit with someone.") {
-            Text("Everyone you share a task or a list with lands here — one place, no double invites. You share from the task itself; this is where you add or remove people.")
+        SettingsScaffold(eyebrow: "Settings · People", title: "People you share with.") {
+            Text("Everyone you share a task or a list with, in one place. You share from the task or list itself; here you add or remove people.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.bottom, 16)
 
             if let vm {
@@ -292,7 +293,7 @@ struct ConnectionsView: View {
                 WaitingSection(vm: vm)
                 BlockedSection(vm: vm)
                 AddSomeoneSection(vm: vm).padding(.top, 22)
-                RedeemSection(vm: vm).padding(.top, 22)
+                RedeemSection(vm: vm).padding(.top, 18)
             } else {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
             }
@@ -303,6 +304,7 @@ struct ConnectionsView: View {
             m.start()
         }
         .onDisappear { vm?.stop() }
+        .navigationTitle("People")
     }
 }
 
@@ -591,7 +593,7 @@ private struct AddSomeoneSection: View {
     private var formBody: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Their email (optional)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-            TextField("name@example.com", text: $email)
+            TextField(String("name@example.com"), text: $email)   // String: a key would autolink the address blue
                 .textFieldStyle(.roundedBorder)
                 .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
                 .submitLabel(.done)
@@ -604,7 +606,7 @@ private struct AddSomeoneSection: View {
             HStack(spacing: 8) {
                 Button(action: submit) {
                     Text(busy ? "Working…" : (email.trimmingCharacters(in: .whitespaces).isEmpty ? "Generate link" : "Send invite"))
-                        .font(UFont.sans(14, .semibold)).foregroundStyle(.white)
+                        .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 16).padding(.vertical, 9)
                         .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                 }.buttonStyle(.plain).disabled(busy)
@@ -642,7 +644,7 @@ private struct AddSomeoneSection: View {
                         copied = true
                         Task { try? await Task.sleep(nanoseconds: 1_800_000_000); copied = false }
                     } label: {
-                        Text("Copy link").font(UFont.sans(14, .semibold)).foregroundStyle(.white)
+                        Text("Copy link").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.bg)
                             .padding(.horizontal, 16).padding(.vertical, 9)
                             .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                     }.buttonStyle(.plain)
@@ -698,8 +700,24 @@ private struct RedeemSection: View {
     @State private var code = ""
     @State private var busy = false
     @State private var message: (ok: Bool, text: String)?
+    /// The code box stays behind a link (slim settings) — most people join by
+    /// tapping the invite link, not by typing a code.
+    @State private var open = false
 
     var body: some View {
+        if open { form } else {
+            Button { open = true } label: {
+                Text("Have an invite code?")
+                    .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink2)
+                    .underline()
+                    .frame(minHeight: 44).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("people-invite-code")
+        }
+    }
+
+    private var form: some View {
         VStack(alignment: .leading, spacing: 10) {
             SectionLabel("Have an invite code?")
             SettingsCard {
@@ -714,7 +732,7 @@ private struct RedeemSection: View {
                             .onSubmit(submit)
                         Button(action: submit) {
                             Text(busy ? "Joining…" : "Join")
-                                .font(UFont.sans(14, .semibold)).foregroundStyle(.white)
+                                .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.bg)
                                 .padding(.horizontal, 16).padding(.vertical, 9)
                                 .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                         }.buttonStyle(.plain)

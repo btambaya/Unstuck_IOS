@@ -1,5 +1,5 @@
 // The user-visible half of the crash trail: after a session that faulted, the
-// feedback composer (Settings → Account → Send feedback) must OFFER the
+// feedback composer (Settings → Send feedback) must OFFER the
 // report — visibly, toggleable, on by default. That is what turns the next
 // "it crashed" one-liner into something with a stack in it.
 //
@@ -30,19 +30,11 @@ final class CrashReportAttachUITests: XCTestCase {
         usleep(1_200_000)
 
         // By IDENTIFIER: Settings is a sheet over Today, so a bare label query
-        // can resolve to something behind it.
-        let account = app.buttons["settings-row-Account"].firstMatch
-        XCTAssertTrue(account.waitForExistence(timeout: 10), "Settings never opened")
-        account.tap()
-        XCTAssertTrue(app.staticTexts["Your account."].firstMatch.waitForExistence(timeout: 8),
-                      "Settings → Account never opened")
-
-        let feedback = app.staticTexts["Send feedback"].firstMatch
-        for _ in 0..<12 where !feedback.exists || !feedback.isHittable {
-            app.swipeUp(); usleep(300_000)
-        }
-        XCTAssertTrue(feedback.waitForExistence(timeout: 10), "Account → Send feedback missing")
-        XCTAssertTrue(feedback.isHittable, "Account → Send feedback never scrolled into reach")
+        // can resolve to something behind it. Send feedback is a one-tap hub
+        // row since the slim settings (2026-09-24).
+        let feedback = app.buttons["settings-row-feedback"].firstMatch
+        XCTAssertTrue(feedback.waitForExistence(timeout: 10), "Settings never opened (no Send feedback row)")
+        XCTAssertTrue(feedback.isHittable, "Send feedback isn't reachable on the hub")
         feedback.tap()
         usleep(1_000_000)
 

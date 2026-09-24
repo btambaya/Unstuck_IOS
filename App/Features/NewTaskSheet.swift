@@ -464,7 +464,7 @@ struct NewTaskSheet: View {
                 }
             } else {
                 Text("Their email (optional)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                TextField("name@example.com", text: $inviteEmail)
+                TextField(String("name@example.com"), text: $inviteEmail)   // String: a key would autolink the address blue
                     .textFieldStyle(.roundedBorder)
                     .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
                     .submitLabel(.done)
@@ -844,6 +844,12 @@ struct NewTaskSheet: View {
         let now = AppModel.isoNow()
         let (recurrence, seriesStart) = buildRecurrence(startDate: effectiveDateNow())
         let later = whenSel == "Later"
+
+        // The sheet remembers the estimate (slim settings, 2026-09-24): the
+        // next new task starts at the last one picked. Same key as the old
+        // Settings "Default focus length", so the assistant's
+        // set_focus_defaults still sets it.
+        model.settings.focusDefaultMin = estimate
 
         var t = model.addTask(
             name: trimmed, estimateMin: estimate,
