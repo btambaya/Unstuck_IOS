@@ -341,7 +341,7 @@ struct SharedWithYouGroup: View {
         .padding(.horizontal, 13).padding(.vertical, 11)
         .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-            .strokeBorder(theme.palette.primarySoft, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+            .strokeBorder(theme.palette.line2, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
         .contentShape(Rectangle())
         .onTapGesture { detailTarget = SharedDetailTarget(id: s.taskId) }
         .accessibilityHint("Opens the shared task")
@@ -559,7 +559,7 @@ struct SharedTaskDetailSheet: View {
                     Image(systemName: "calendar").font(.system(size: 11, weight: .semibold))
                     Text(planned).font(UFont.sans(12.5, .medium))
                 }
-                .foregroundStyle(theme.palette.primaryDeep)
+                .foregroundStyle(theme.palette.ink2)
                 .accessibilityElement(children: .combine)
             }
 
@@ -650,7 +650,7 @@ struct SharedTaskDetailSheet: View {
                     }
                     .foregroundStyle(d.done ? theme.palette.ink2 : theme.palette.bg)
                     .padding(.horizontal, 16).padding(.vertical, 10)
-                    .background(d.done ? AnyShapeStyle(theme.palette.bg2) : AnyShapeStyle(theme.palette.primary), in: Capsule())
+                    .background(d.done ? AnyShapeStyle(theme.palette.bg2) : AnyShapeStyle(theme.palette.ink), in: Capsule())
                 }.buttonStyle(.plain)
             }
 
@@ -664,9 +664,9 @@ struct SharedTaskDetailSheet: View {
                     Image(systemName: "timer").font(.system(size: 12, weight: .semibold))
                     Text(sharedFocusActionLabel(d.level)).font(UFont.sans(13, .semibold))
                 }
-                .foregroundStyle(theme.palette.primaryDeep)
+                .foregroundStyle(theme.palette.ink)
                 .padding(.horizontal, 16).padding(.vertical, 10)
-                .background(theme.palette.primarySoft, in: Capsule())
+                .background(theme.palette.bg2, in: Capsule())
             }.buttonStyle(.plain)
         }
         .padding(.top, 2)
@@ -753,7 +753,7 @@ struct DelegatedGroup: View {
             .padding(.horizontal, 13).padding(.vertical, 11)
             .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .strokeBorder(theme.palette.primarySoft, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+                .strokeBorder(theme.palette.line2, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
         }.buttonStyle(.plain)
     }
 }
@@ -775,16 +775,17 @@ private struct GroupHeader: View {
     }
 }
 
-/// The quiet primary-tinted status chip on shared/delegated rows.
+/// The quiet neutral status chip on shared/delegated rows.
 private struct StatusChip: View {
     @Environment(\.uTheme) private var theme
     let text: String
     init(_ text: String) { self.text = text }
     var body: some View {
         Text(text)
-            .font(UFont.sans(10.5, .bold)).foregroundStyle(theme.palette.primaryDeep)
+            .font(UFont.sans(10.5, .bold)).foregroundStyle(theme.palette.ink2)
             .padding(.horizontal, 9).padding(.vertical, 2)
-            .background(theme.palette.primarySoft, in: Capsule())
+            .background(theme.palette.bg2, in: Capsule())
+            .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
     }
 }
 
@@ -803,9 +804,10 @@ struct ShareWithPill: View {
                 Text(names.count == 1 ? shortName(names[0]) : "\(names.count)")
                     .font(UFont.sans(10, .bold))
             }
-            .foregroundStyle(theme.palette.primaryDeep)
+            .foregroundStyle(theme.palette.ink2)
             .padding(.horizontal, 7).padding(.vertical, 2)
-            .background(theme.palette.primarySoft, in: Capsule())
+            .background(theme.palette.bg2, in: Capsule())
+            .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
             .accessibilityLabel("Shared with \(names.joined(separator: ", "))")
         }
     }
@@ -1086,9 +1088,10 @@ struct PartnerPresence: View {
                                 Text(sitting ? "Sitting with them" : "Sit with them")
                                     .font(UFont.sans(11, .bold))
                             }
-                            .foregroundStyle(sitting ? theme.palette.bg : theme.palette.primaryDeep)
+                            .foregroundStyle(sitting ? theme.palette.bg : theme.palette.ink2)
                             .padding(.horizontal, 10).padding(.vertical, 3)
-                            .background(sitting ? theme.palette.primary : theme.palette.primarySoft, in: Capsule())
+                            .background(sitting ? theme.palette.ink : theme.palette.bg2, in: Capsule())
+                            .overlay(Capsule().strokeBorder(sitting ? Color.clear : theme.palette.line2, lineWidth: 1))
                         }.buttonStyle(.plain)
                     }
                     // The same running/paused timer the owner sees — shared view.

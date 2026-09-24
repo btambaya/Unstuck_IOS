@@ -37,7 +37,7 @@ struct CaptureTagPicker: View {
 /// Tag → accent color, identical to the Inbox card mapping (Android tagColor).
 func captureTagColor(_ tag: CaptureTag, _ theme: UTheme) -> Color {
     switch tag {
-    case .followUp: return theme.palette.primaryDeep
+    case .followUp: return theme.palette.ink2
     case .idea: return theme.palette.amber
     case .edit: return theme.palette.blue
     case .question: return theme.palette.green

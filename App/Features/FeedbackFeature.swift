@@ -182,7 +182,7 @@ struct FeedbackForm: View {
                             .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                     }
                 }
-                .tint(theme.palette.coral)
+                .unstuckSwitch()
                 .disabled(sending)
                 .accessibilityLabel("Attach the last crash report")
             }

@@ -423,12 +423,10 @@ struct VoiceModeScreen: View {
         // is a no-op while we're merely listening, so it is disabled then.
         let live = session.isLive && session.state != .connecting
         let canInterrupt = session.canInterrupt
-        let orbColor: Color
-        switch session.state {
-        case .speaking: orbColor = theme.palette.coral
-        case .thinking: orbColor = theme.palette.amber
-        default: orbColor = theme.palette.primary
-        }
+        // Coral in every state (listening, speaking, connecting, error) —
+        // Ahmad, 2026-09-24: the voice orb is coral, never the old indigo —
+        // except thinking, which keeps its amber.
+        let orbColor: Color = session.state == .thinking ? theme.palette.amber : theme.palette.coral
         return VStack(spacing: 24) {
             PulsingOrb(active: live,
                        color: orbColor,
@@ -541,7 +539,7 @@ private struct HoldToTalkSwitch: View {
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
         }
-        .tint(theme.palette.primary)
+        .unstuckSwitch()
         .padding(.horizontal, 16).padding(.vertical, 10)
         .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         .frame(maxWidth: 340)
@@ -567,9 +565,9 @@ private struct HoldToTalkButton: View {
             Text(pressed ? "Release to send" : "Hold to talk")
         }
         .font(UFont.sans(15, .semibold))
-        .foregroundStyle(pressed ? Color.white : theme.palette.ink)
+        .foregroundStyle(pressed ? theme.palette.bg : theme.palette.ink)
         .padding(.horizontal, 20).padding(.vertical, 12)
-        .background(pressed ? theme.palette.primary : theme.palette.bg2, in: Capsule())
+        .background(pressed ? theme.palette.ink : theme.palette.bg2, in: Capsule())
         .scaleEffect(pressed ? 1.04 : 1)
         .animation(.easeOut(duration: 0.12), value: pressed)
         .contentShape(Capsule())

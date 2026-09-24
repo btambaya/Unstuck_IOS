@@ -262,7 +262,7 @@ func sharedBlockPlannedLabel(_ b: SharedBlock, timeZone: TimeZone = .current,
 
 // MARK: - Shared block views (read-only)
 
-/// A shared block on the Day grid — dashed primary outline, a soft fill, the
+/// A shared block on the Day grid — dashed neutral outline, a bg2 fill, the
 /// title + owner. Display-only: the caller attaches ONLY a tap (→ detail);
 /// never `.draggable`, never a context menu, never the edit sheet.
 struct SharedBlockCard: View {
@@ -275,7 +275,7 @@ struct SharedBlockCard: View {
         VStack(alignment: .leading, spacing: 1) {
             HStack(spacing: 4) {
                 Image(systemName: "person.2.fill").font(.system(size: 9))
-                    .foregroundStyle(theme.palette.primaryDeep)
+                    .foregroundStyle(theme.palette.ink2)
                 Text(sharedBlockLabel(taskName: block.title, sharer: block.ownerName, compact: true))
                     .font(UFont.sans(12, .medium)).lineLimit(1)
                     .strikethrough(block.done)
@@ -288,10 +288,10 @@ struct SharedBlockCard: View {
         }
         .padding(.horizontal, 6).padding(.vertical, 2)
         .frame(width: width, height: height, alignment: .topLeading)
-        .background(theme.palette.primarySoft.opacity(0.45))
+        .background(theme.palette.bg2)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
-            .strokeBorder(theme.palette.primary, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
+            .strokeBorder(theme.palette.ink3, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(block.title), shared by \(shortName(block.ownerName)), \(ClockFormat.device.time(block.startTime)), \(block.durationMinutes) minutes")
@@ -327,10 +327,10 @@ struct SharedWeekBlock: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(1)
-        .background(theme.palette.primarySoft.opacity(0.45))
+        .background(theme.palette.bg2)
         .clipShape(RoundedRectangle(cornerRadius: 3))
         .overlay(RoundedRectangle(cornerRadius: 3)
-            .strokeBorder(theme.palette.primary, style: StrokeStyle(lineWidth: 0.8, dash: [3, 2])))
+            .strokeBorder(theme.palette.ink3, style: StrokeStyle(lineWidth: 0.8, dash: [3, 2])))
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(block.title), shared by \(shortName(block.ownerName))")
@@ -352,7 +352,7 @@ struct MonthMarksRow: View {
             }
             if marks.shared > 0 {
                 Circle()
-                    .strokeBorder(theme.palette.primaryDeep, style: StrokeStyle(lineWidth: 1, dash: [1.5, 1]))
+                    .strokeBorder(theme.palette.ink2, style: StrokeStyle(lineWidth: 1, dash: [1.5, 1]))
                     .frame(width: 5, height: 5)
             }
         }
@@ -411,12 +411,12 @@ struct MonthDayPeekSheet: View {
                         // A series' day opens THAT day's occurrence (the block
                         // id), not the series (audit 2026-09-22, C3).
                         return PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
-                                       done: blockIsDone(b, task: t), tint: theme.palette.primaryDeep, dashed: false,
+                                       done: blockIsDone(b, task: t), tint: theme.palette.ink, dashed: false,
                                        action: b.taskId.map { MonthPeekAction.task(t?.recurrence != nil ? b.id : $0) })
                     })
                     section("Shared with you", shared.map { sb in
                         PeekRow(id: sb.blockId, title: sb.title, meta: "\(slotText(sb.startTime, sb.durationMinutes)) · \(sharerDisplayName(sb.ownerName))",
-                                done: sb.done, tint: theme.palette.primaryDeep, dashed: true,
+                                done: sb.done, tint: theme.palette.ink2, dashed: true,
                                 action: .shared(SharedDetailTarget(id: sb.taskId, block: sb)))
                     })
                     section("In the calendar", events.map { b in

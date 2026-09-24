@@ -50,8 +50,11 @@ struct TourPanel: View {
     @State private var askHeight: CGFloat = 0
     @FocusState private var askFocused: Bool
 
-    /// FIXED answer-bubble colors (web: oklch(0.93 0.04 280) / oklch(0.25 0.02 280)).
-    private static let answerBg = OKLCH(0.93, 0.04, 280).color
+    /// FIXED answer-bubble colors (light in both schemes, as on the web). The
+    /// fill was the pale indigo oklch(0.93 0.04 280) — the `primarySoft` tint
+    /// by value — until the colour sweep (Ahmad, 2026-09-24: no indigo
+    /// accents); it keeps its lightness with the neutral `line` chroma.
+    private static let answerBg = OKLCH(0.93, 0.005, 280).color
     private static let answerInk = OKLCH(0.25, 0.02, 280).color
     private static let thinkingInk = OKLCH(0.42, 0.02, 280).color
 
@@ -236,7 +239,7 @@ struct TourPanel: View {
     private func header(_ step: TourStep) -> some View {
         HStack(spacing: 10) {
             ZStack {
-                Circle().fill(theme.palette.primarySoft).frame(width: 26, height: 26)
+                Circle().fill(theme.palette.bg2).frame(width: 26, height: 26)
                 Mark(size: 16)
             }
             VStack(alignment: .leading, spacing: 5) {
@@ -249,8 +252,8 @@ struct TourPanel: View {
                 HStack(spacing: 4) {
                     ForEach(Array(tour.steps.enumerated()), id: \.element.id) { i, _ in
                         Capsule()
-                            .fill(i == tour.index ? theme.palette.primary
-                                  : i < tour.index ? theme.palette.primarySoft : theme.palette.line2)
+                            .fill(i == tour.index ? theme.palette.ink
+                                  : i < tour.index ? theme.palette.ink3 : theme.palette.line2)
                             .frame(width: i == tour.index ? 16 : 6, height: 6)
                             .animation(.easeOut(duration: 0.16), value: tour.index)
                     }
@@ -297,7 +300,7 @@ struct TourPanel: View {
                     .frame(height: 4)
                     .overlay(alignment: .leading) {
                         GeometryReader { geo in
-                            Capsule().fill(theme.palette.primary)
+                            Capsule().fill(theme.palette.ink)
                                 .frame(width: max(0, geo.size.width * tour.audio.progress))
                         }
                     }

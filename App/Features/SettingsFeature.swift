@@ -46,7 +46,7 @@ struct SettingsView: View {
         NavigationStack(path: $path) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    SectionLabel("Settings").foregroundStyle(theme.palette.primaryDeep)
+                    SectionLabel("Settings")
                         .padding(.top, 4)
                     Text("How Unstuck behaves.")
                         .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
@@ -255,7 +255,7 @@ struct SettingsScaffold<Content: View>: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 0) {
-                SectionLabel(eyebrow).foregroundStyle(theme.palette.primaryDeep).padding(.top, 4)
+                SectionLabel(eyebrow).padding(.top, 4)
                 Text(title)
                     .font(UFont.serifItalic(26)).foregroundStyle(theme.palette.ink)
                     .padding(.top, 4).padding(.bottom, 12)
@@ -367,7 +367,7 @@ struct SettingsToggleRow: View {
                 }
             }
         }
-        .tint(theme.palette.primary)
+        .unstuckSwitch()
         .padding(.horizontal, 16).padding(.vertical, 10)
     }
 }
@@ -551,7 +551,7 @@ private struct AIDataSharingRow: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .tint(theme.palette.primary)
+            .unstuckSwitch()
             .disabled(model.tourRunning)
             .accessibilityIdentifier("settings-ai-data-sharing")
             AIConsentNoteLine(host: .settings)

@@ -171,15 +171,15 @@ struct TourSpotlight: View {
                             }
                             .compositingGroup()
                         }
-                    // Ring — 2px primary + a soft 22% outer halo; the pulse is
+                    // Ring — 2px ink + a soft 22% outer halo; the pulse is
                     // killed by reduce-motion (system or in-app setting).
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(theme.palette.primary.opacity(0.22), lineWidth: 6)
+                        .stroke(theme.palette.ink.opacity(0.22), lineWidth: 6)
                         .frame(width: ring.width + 8, height: ring.height + 8)
                         .position(x: ring.midX - screen.minX, y: ring.midY - screen.minY)
                         .scaleEffect(pulseScale, anchor: anchorPoint(for: ring, in: screen))
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(theme.palette.primary, lineWidth: 2)
+                        .stroke(theme.palette.ink, lineWidth: 2)
                         .frame(width: ring.width, height: ring.height)
                         .position(x: ring.midX - screen.minX, y: ring.midY - screen.minY)
                 }

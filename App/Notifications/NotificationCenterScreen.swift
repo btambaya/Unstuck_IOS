@@ -149,7 +149,7 @@ struct NotificationCenterView: View {
         switch notificationAccent(kind: kind) {
         case .amber: return theme.palette.amber
         case .green: return theme.palette.green
-        case .primaryDeep: return theme.palette.primaryDeep
+        case .ink: return theme.palette.ink2
         case .coral: return theme.palette.coral
         }
     }

@@ -80,7 +80,7 @@ struct CallMeSection: View {
                     Toggle("", isOn: Binding(get: { enabled }, set: { toggle($0) }))
                         .labelsHidden()
                         .disabled(!canBook || busy || !loaded)
-                        .tint(theme.palette.primary)
+                        .unstuckSwitch()
                 }
                 if !canBook {
                     Text("Schedule it first — the call rings a few minutes before the task starts.")

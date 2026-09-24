@@ -127,7 +127,7 @@ private struct AreasSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Areas").foregroundStyle(theme.palette.primaryDeep)
+            SectionLabel("Areas")
             Text("The parts of your life.")
                 .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
             Text("Each task can sit in one area. Tap an area on Tasks to see only its tasks.")
@@ -277,7 +277,7 @@ private struct TagsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Tags").foregroundStyle(theme.palette.primaryDeep)
+            SectionLabel("Tags")
             Text("Your tags.")
                 .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
             Text("A task can have as many tags as you like, from any area.")

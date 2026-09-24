@@ -268,7 +268,6 @@ struct AnalyticsView: View {
     private func content(_ vm: AnalyticsModel, _ snap: InsightsSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             SectionLabel("Reflection · \(snap.period.title)")
-                .foregroundStyle(theme.palette.primaryDeep)
                 .padding(.top, 4)
             Text(deep ? "Let's look closer. Calmly." : "Observations, not a score.")
                 .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
@@ -788,7 +787,7 @@ struct AnalyticsView: View {
                     ForEach(captureTagOrder, id: \.self) { tag in
                         let n = kinds[tag] ?? 0
                         LabeledBar(label: tag.rawValue, frac: Double(n) / Double(maxN),
-                                   value: "\(n)", color: theme.palette.primary)
+                                   value: "\(n)", color: theme.palette.ink2)
                     }
                 }
             }
@@ -975,7 +974,7 @@ struct AnalyticsView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         } else {
-            histogram("How fast you come back", bins, theme.palette.primary,
+            histogram("How fast you come back", bins, theme.palette.ink2,
                       axis: ["<5m", "15m", "30m+"], caption: "Pause to resume, in 5-minute steps.")
         }
     }

@@ -118,7 +118,35 @@ public struct Chip: View {
     }
 }
 
-/// Eyebrow / section label — mono, uppercase, tracked.
+public extension Palette {
+    /// The ON colour of every switch / toggle: the brand coral (Ahmad,
+    /// 2026-09-24 — shown the Notifications & calls screen with the old
+    /// indigo switch). Never `coralDeep`, never `primary`. OFF keeps the
+    /// system track; the thumb stays the system white.
+    var switchOn: Color { coral }
+}
+
+/// Paints a `Toggle` (switch style) the brand way: ON = coral. Use this on
+/// EVERY switch instead of a hand-picked `.tint` so no switch drifts back to
+/// indigo or the system green/blue.
+public struct UnstuckSwitchTint: ViewModifier {
+    @Environment(\.uTheme) private var theme
+    public init() {}
+    public func body(content: Content) -> some View {
+        content.tint(theme.palette.switchOn)
+    }
+}
+
+public extension View {
+    /// ON = coral for the switches inside (see `Palette.switchOn`).
+    func unstuckSwitch() -> some View { modifier(UnstuckSwitchTint()) }
+}
+
+/// Eyebrow / section label — mono, uppercase, tracked. Neutral `ink3` — the
+/// eyebrows are never an accent. Recolour only through `color:`: the Text
+/// paints its own style, so an outer `.foregroundStyle(…)` does NOT reach it
+/// (the old `SectionLabel(…).foregroundStyle(primaryDeep)` call sites were
+/// no-ops for that reason and were removed in the colour sweep, 2026-09-24).
 public struct SectionLabel: View {
     @Environment(\.uTheme) private var theme
     let text: String

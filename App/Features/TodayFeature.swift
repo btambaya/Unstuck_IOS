@@ -405,7 +405,7 @@ struct TodayView: View {
     // directly under the week pill — the way into the assistant and Talk.
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            SectionLabel(dateEyebrow).foregroundStyle(theme.palette.primaryDeep)
+            SectionLabel(dateEyebrow)
             Text(GreetingName.line(greeting: greeting, firstName: GreetingName.firstName(model.currentUserName)))
                 .font(UFont.serifItalic(28)).foregroundStyle(theme.palette.ink)
                 .lineLimit(1).minimumScaleFactor(0.7)
@@ -656,9 +656,10 @@ struct TodayView: View {
                         Text(t.lifeArea ?? "—").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                         // Tags inline on the same line as the area (matches Android + the Tasks list).
                         ForEach(Array((t.tags ?? []).prefix(3)), id: \.self) { tn in
-                            Text("#\(tn)").font(UFont.sans(10, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                            Text("#\(tn)").font(UFont.sans(10, .medium)).foregroundStyle(theme.palette.ink2)
                                 .padding(.horizontal, 7).padding(.vertical, 2)
-                                .background(theme.palette.primarySoft, in: Capsule())
+                                .background(theme.palette.bg2, in: Capsule())
+                                .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
                         }
                         // "Shared with N" — my outgoing view/partner shares on this row.
                         ShareWithPill(names: (model.shareState.badges[t.id] ?? []).map(\.recipientName))
@@ -754,7 +755,7 @@ struct TodayView: View {
                 }
                 vm.dismissNudge(n.id)
             } label: {
-                Text(n.action).font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                Text(n.action).font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
             }.buttonStyle(.plain)
             Button { vm.dismissNudge(n.id) } label: {
                 Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)

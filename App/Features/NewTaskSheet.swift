@@ -472,7 +472,7 @@ struct NewTaskSheet: View {
                 if everyWeeks >= 2 { startsRow }
             }
             if repeatKind != .none {
-                Toggle("Ends on a date", isOn: $untilOn).font(UFont.sans(14))
+                Toggle("Ends on a date", isOn: $untilOn).font(UFont.sans(14)).unstuckSwitch()
                 if untilOn { DatePicker("Until", selection: $until, in: Date()..., displayedComponents: .date).font(UFont.sans(14)) }
             }
         }
@@ -494,9 +494,9 @@ struct NewTaskSheet: View {
                             Text("#\(name)").font(UFont.sans(12, .medium))
                             Text("✕").font(UFont.sans(11))
                         }
-                        .foregroundStyle(theme.palette.primaryDeep)
+                        .foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(theme.palette.primarySoft, in: Capsule())
+                        .background(theme.palette.ink, in: Capsule())
                     }
                     .buttonStyle(.plain)
                 }
@@ -536,7 +536,7 @@ struct NewTaskSheet: View {
                     if on { tags.removeAll { $0 == tag.name } } else { tags.append(tag.name) }
                 } label: {
                     HStack(spacing: 8) {
-                        Text(on ? "✓" : " ").font(UFont.sans(13)).foregroundStyle(theme.palette.primaryDeep).frame(width: 12)
+                        Text(on ? "✓" : " ").font(UFont.sans(13)).foregroundStyle(theme.palette.ink).frame(width: 12)
                         Text("#\(tag.name)").font(UFont.sans(13)).foregroundStyle(theme.palette.ink)
                         Spacer()
                     }
@@ -550,7 +550,7 @@ struct NewTaskSheet: View {
                     if !tags.contains(name) { tags.append(name) }
                     tagQuery = ""
                 } label: {
-                    Text("Create \"\(q)\"").font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                    Text("Create \"\(q)\"").font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink)
                         .padding(.horizontal, 14).padding(.vertical, 10)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }

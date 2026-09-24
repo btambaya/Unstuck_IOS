@@ -50,7 +50,7 @@ tests with no Xcode project or code signing:
 | `UnstuckCore` | Pure domain models + full logic layer incl. reminder planning + calendar-pull reconcile (no UI/Supabase) | ✅ done + tested (204 tests) |
 | `UnstuckData` | GRDB local store + outbox + live session | ✅ done + tested (16 tests) |
 | `UnstuckSync` | supabase-swift wiring + offline-first sync engine (flusher hardening tested via a gateway fake) | ✅ done (22 tests; networked paths runtime-validated in-app) |
-| `UnstuckDesign` | Brand-v2 oklch tokens + Theme + SwiftUI components | ✅ done (8 tests) |
+| `UnstuckDesign` | Brand-v2 oklch tokens + Theme + SwiftUI components (every switch: `.unstuckSwitch()`, ON = coral) | ✅ done (8 tests) |
 | `UnstuckShared` | App-Group snapshot + Live Activity attributes + Focus Filter flag | ✅ done |
 | App `App/Features/*` + `App/Notifications/*` | Today, Tasks (+recurrence), Focus (+treatments/reasons/captures), Calendar (+Google connect/pull/push), Lists/Collections (+sharing), Tags & Areas, Insights, Settings, Onboarding, Command palette, reminder scheduler + Notification Center | ✅ built |
 | `Widgets/` | Start Next widget + Focus Live Activity / Dynamic Island | ✅ builds |

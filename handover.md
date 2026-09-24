@@ -113,6 +113,65 @@ a side-by-side cross-check found differences and ONE behaviour was decided for i
   "remembers the last estimate" (`model.settings.focusDefaultMin = estimate` in `submit()`) and this branch's share
   row; ShareScreen keeps main's "Manage people" link (hidden in pre-create since the final pass) and placeholder form.
 
+## Colour sweep: coral ON switches, no indigo accents (branch colour/ios, 2026-09-24) — not shipped yet
+
+Ahmad, shown the Notifications & calls screen with an indigo "on" switch: every ON switch/toggle is the brand CORAL
+(#E89077, `palette.coral` — never `coralDeep`); every other indigo (`primary` / `primaryDeep` / `primarySoft`) use a
+user can see moves to the standing rule (links + inline actions ink, secondary text ink2, chips the ink/bg pair, eyebrows
+ink3, the voice orb coral). The palette tokens themselves are untouched — only their USES changed.
+
+- **Switches**: `View.unstuckSwitch()` + `Palette.switchOn` (= coral) in UnstuckDesign/Components.swift. Every Toggle
+  uses it: `SettingsToggleRow` (Assistant & privacy + the Focus options sheet), AI data sharing, the Calls master switch
+  + Morning / Evening / After-a-block, "Call me about this", Talk's "Noisy room? Hold to talk", New task's "Ends on a
+  date" (was the SYSTEM GREEN — it had no tint), feedback's "Attach the last crash report". OFF track + white thumb are
+  the system's. Use `.unstuckSwitch()` on any new switch, never a hand-picked `.tint`. (The assistant sheet's "Read
+  replies aloud" is a Menu checkmark, not a switch.)
+- **Links / inline actions → ink**: Auth "New here? Create an account" / "Sign in instead" / Terms + Privacy links;
+  Calendar "Sync now" + both "Today"s; People "Copy link" ×2 + "Unblock"; Today nudge action; Captures "Promote →";
+  editor "Promote to task →", tag-picker ✓ + "Create “…”", New task "Add someone". Secondary text → ink2: editor
+  recurrence "Clear", Collections "SHARED" + "Shared with N" / "Shared with you · …", promoted-item label, shared task
+  "Planned …" line.
+- **Eyebrows**: Auth "WELCOME BACK"/"BEGIN AGAIN", "SET A NEW PASSWORD" and Focus "SESSION COMPLETE" were plain Text in
+  primaryDeep (rendered indigo) → ink3. The `SectionLabel(…).foregroundStyle(primaryDeep)` sites (Settings hub + section
+  eyebrows, Today date, Areas/Tags, Calendar "This week", Insights "Reflection", Onboarding ×2) were NO-OPS — SectionLabel
+  paints its own Text ink3, the outer style never reaches it (the web found the same: greeting-header.tsx) — so they
+  always rendered grey; the dead modifiers are removed (render unchanged; `AccentTests.testSectionLabelIgnores…` pins it,
+  mutation-checked). The design file (_design) paints eyebrows primaryDeep, but the owner rule (no indigo accents) wins.
+- **Chips / pills**: Tasks bucket pills → selected = ink fill + bg text for EVERY tab (was a per-tab soft tint; Later's was
+  indigo), unselected keep their small dot (Later's dot grey); row `#tag` chips (Today + Tasks), share StatusChip +
+  ShareWithPill → bg2 + ink2 + line2 ring; the chosen tags in both tag pickers → ink/bg (they ARE selected); the
+  tag-filter banner → bg2/ink2/line2; "Sit with them" → ink/bg when on, bg2/ink2/line2 off; shared-detail "Complete"
+  → ink fill, "Focus with them" → bg2 + ink; shared/delegated row dashed borders → line2.
+- **Voice**: the orb is coral in every state but thinking (amber) — listening/connecting/idle/error were indigo; the
+  held Hold-to-talk capsule → ink fill + bg text (was indigo + white).
+- **Calendar**: shared blocks (Day + Week) → bg2 fill + dashed ink3 outline, person icon ink2; month "shared" ring +
+  legend → ink2; peek rows planned ink / shared ink2; "Focus planned" rollup → bg2 + ink; month heat → bg2→ink3 (ink3
+  is at the old indigo's lightness, so the text flip keeps its contrast).
+- **Tour**: mark discs → bg2; progress dots current ink / done ink3 / future line2; listen progress → ink; spotlight ring
+  + halo → ink; "SUGGESTED" → bg2 + ink2, recommended card stroke → ink. **Assistant home** resume-tour card → bg2.
+- **Insights**: "Captures by kind" bars + "How fast you come back" histogram → ink2.
+- **Categories**: capture tag "follow-up" colour (Inbox + CaptureTagPicker + editor chips) indigo → ink2; notification
+  centre dot for morning brief / evening preview / daily nudge → ink2 (`NotificationAccent.primaryDeep` renamed `.ink`,
+  ReminderPlanTests updated). Android `tagColor` / `accentFor` still map these to indigo — port with the Android sweep.
+- **Left as they are (not accents)**: the life-area / collection colour token "indigo" (a user-picked category colour,
+  shared with web + Android, still the default for a new area/collection — the Work area dot, Insights "When focus
+  happens" bars); the Focus room's deep-indigo radial background (FocusFeature + TourDemoFocus bgTop OKLCH 0.30/0.10/280 —
+  a designed surface); the tour scrim (20,18,40). (The tour Ask answer bubble WAS on this list — a fixed OKLCH
+  0.93/0.04/280, i.e. `primarySoft` by value; the review moved it to the neutral 0.93/0.005/280, same lightness, still
+  fixed-light in both schemes. The web's tour-panel.tsx still has the lavender — port with the web sweep.)
+  The widget has no switches and no palette colours; its Done/Start buttons use the system accent (blue — the widget
+  target has no AccentColor). Change any of these only with a screenshot to Ahmad first.
+- **Evidence**: `ColourShots` (in UITests/HomeShots.swift — no new files) walks Today, Tasks (+ tag filter, Later), the
+  editor, Calendar week/month, Insights (+ deep dive), Captures, Settings (N&C, A&P, People), Talk (+ hold on), Focus
+  options, the tour (welcome + a spotlit step) and the signed-out auth screen, light AND dark, and ASSERTS each ON switch
+  it meets is coral by sampling the track's pixels (AI data sharing, the Calls switch, hold-to-talk, Focus options).
+  Output: `COLOUR_SHOTS_DIR` env, else /tmp/unstuck-colour-shots. Review pass added `testColourListsNewTaskAppearance`
+  (shared lists via the new `UITEST_SHARED_LIST=1` demo seed — "SHARED" card label + "Shared with 2" / "Shared with
+  you · you can edit"; New task's "Ends on a date" switch, ASSERTED coral; Appearance) and `testColourTourAsk` (dark
+  welcome + the Ask answer bubble, ASSERTED neutral not lavender). `launchToToday` declines a tour welcome another run
+  left armed on a shared sim, and `dismissSheet` drags from the sheet's own header (the fixed 6% point missed on
+  iPhone 17). Also fixed in review: New task's toggle had `.unstuckSwitch()` twice.
+
 ## Slim Settings (branch settings/ios, 2026-09-24) — not shipped yet
 
 Ahmad approved PLAN.md ("Slim Settings", scratchpad swt/PLAN.md) the same day: ALL of it before launch (Phase A +
@@ -184,7 +243,7 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   brown / pink / on (pink/on = on) → "ok: background noise on"; set_ritual answers by the routine's name ("ok:
   Morning plan on", "error: Sunday plan-ahead is already off — nothing changed") — web 7f24584's wording.
 - Colour: every new choice row / chip is the ink/bg pair (`SettingsChoiceRow`, level radio, lead chips); switches
-  keep the tint they had (primary) — not changed without a screenshot to Ahmad.
+  were left on primary here — Ahmad has since picked CORAL for every ON switch (see "Colour sweep" above).
 - Tests: `SlimSettingsTests` (core: aliases, text-size merge, plain copy, calls block), SettingsStateTests (merge,
   never-read-never-wiped, pink = on, stored assistant switch), CallCoordinatorTests (assistant off → declined, order,
   fallback tap), AssistantToolsTests (new tool wording), TourDataTests, UI: AppSmoke `testSettingsSubScreens` (the
