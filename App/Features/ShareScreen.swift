@@ -33,7 +33,9 @@
 // sheet reads back and shares on submit. What needs the task to exist is
 // hidden: "Share a link" (replaced by the connect-invite link the old inline
 // "Add someone" panel made), the pending-invite list (queued addresses show
-// in its place), and Report / Block on a picked row.
+// in its place), and Report / Block on a picked row. A picked row's menu is
+// Can edit / Can view / Hand over / Remove — the same four as web and
+// Android (Hand over = level `assign`, held like the rest until submit).
 //
 // ShareScreenModel talks to the backends through ShareScreenTransport (a
 // seam so the model is unit-tested with a fake); LiveShareTransport wires
@@ -229,17 +231,17 @@ final class DraftShareTransport: ShareScreenTransport {
     func taskShares(taskId: String) async -> [ShareForTask] {
         draft.people.compactMap { p in
             guard case .user(let id) = p.recipient else { return nil }
-            return ShareForTask(shareId: p.id, recipientUserId: id, recipientName: p.name, level: p.access.taskLevel)
+            return ShareForTask(shareId: p.id, recipientUserId: id, recipientName: p.name, level: p.level)
         }
     }
     /// The queued addresses, where the pending invites would be.
     func taskPendingInvites(taskId: String) async -> [TaskSharePendingInvite] {
-        draft.emails.map { TaskSharePendingInvite(id: $0.id, email: $0.name, level: $0.access.taskLevel) }
+        draft.emails.map { TaskSharePendingInvite(id: $0.id, email: $0.name, level: $0.level) }
     }
     func shareTask(taskId: String, userId: String, level: ShareLevel) async throws {
         let name = roster.first { $0.memberUserId == userId }?.memberName
             ?? draft.pick(forUser: userId)?.name ?? ""
-        draft.pick(userId: userId, name: name, access: ShareAccess(taskLevel: level) ?? .edit)
+        draft.pick(userId: userId, name: name, level: level)   // `assign` = Hand over, held too
     }
     func unshareTask(shareId: String) async -> Bool { draft.remove(id: shareId) }
     func shareTaskByEmail(taskId: String, email: String, level: ShareLevel) async -> TaskShareOutcome {
@@ -393,6 +395,18 @@ final class ShareScreenModel {
         case .share:
             guard !row.isShared else { return }
             await grant(row, access: access, isNew: true)
+        }
+    }
+
+    /// PRE-CREATE: hand the new task over to `row` (level `assign`) from
+    /// their row's menu — Can edit / Can view / Hand over / Remove, as on web
+    /// and Android. Held in the draft like any pick; submit sends it. (A real
+    /// task's hand-over is its own mode, `.handOver`.)
+    func handOver(_ row: SharePersonRow) async {
+        guard preCreate, busyId == nil, case .task(let id, _) = target else { return }
+        await perform(row.id) {
+            try await self.transport.shareTask(taskId: id, userId: row.userId, level: .assign)
+            return .handedOver(name: row.name)
         }
     }
 
@@ -712,7 +726,7 @@ struct ShareScreen: View {
                 .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
             Text(preCreate
-                 ? "Pick who gets this task — they'll see it in their “Shared with you” once you add it. To hand it over entirely, use “Hand over to…” on the task after."
+                 ? "Pick who gets this task — they'll see it in their “Shared with you” once you add it."
                  : mode == .share
                  ? "Anyone you share with sees this \(target.kind.noun) in their “Shared with you”."
                  : handOverExplainer)
@@ -975,7 +989,8 @@ struct ShareScreen: View {
     /// The picker for someone who already has the item: Can edit ✓ / Can
     /// view / Report… / Block… / Remove or "Take it back". Block is offered
     /// on EVERY shared row, task or list, and confirms first — it used to be
-    /// lists-with-an-email only (audit 2026-09-22, C10).
+    /// lists-with-an-email only (audit 2026-09-22, C10). Pre-create: Can
+    /// edit / Can view / Hand over / Remove (web and Android's four).
     /// System menus own their colours — not restyled.
     @ViewBuilder
     private func accessMenu(_ vm: ShareScreenModel, _ row: SharePersonRow) -> some View {
@@ -983,7 +998,14 @@ struct ShareScreen: View {
             Button {
                 Task { await vm.setAccess(row, a) }
             } label: {
-                if row.access == a { Label(a.label, systemImage: "checkmark") } else { Text(a.label) }
+                if row.access == a && !row.handedOver { Label(a.label, systemImage: "checkmark") } else { Text(a.label) }
+            }
+        }
+        if preCreate {
+            Button {
+                Task { await vm.handOver(row) }
+            } label: {
+                if row.handedOver { Label("Hand over", systemImage: "checkmark") } else { Text("Hand over") }
             }
         }
         Divider()
@@ -1000,7 +1022,7 @@ struct ShareScreen: View {
         }
         Button(role: .destructive) {
             Task { await vm.setAccess(row, nil) }
-        } label: { Label(row.handedOver ? "Take it back" : "Remove", systemImage: "xmark") }
+        } label: { Label(row.handedOver && !preCreate ? "Take it back" : "Remove", systemImage: "xmark") }
     }
 
     /// The Find field — the unselected chip capsule stretched to a field.

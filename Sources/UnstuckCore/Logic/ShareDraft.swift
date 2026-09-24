@@ -7,13 +7,19 @@
 //
 //   • ShareDraft           — the local picks: connections (task_share by id)
 //                            and typed addresses (share-task add by email),
-//                            each at a grade, in pick order.
+//                            each at a level, in pick order.
 //   • shareDraftSummary    — the row's trailing text ("Only you",
 //                            "James · can edit", "James · edit, Anna · view",
-//                            "James + 3 more") + its spoken form.
+//                            "James + 3 more · can edit") + its spoken form.
 //   • shareDraftResultLine — the Share screen's honest line in pre-create
 //                            mode ("Maya will get it when you add the task…"),
 //                            never "Shared with…" for a task that isn't there.
+//
+// ONE behaviour on iOS, Android and web (decided 2026-09-24 after the three
+// were compared side by side): the grades are Can edit / Can view / Hand over
+// (the same `partner` / `view` / `assign` levels the others send), a typed
+// address is held until the task is added, and the summary follows the rule
+// on `shareDraftSummary` verbatim — ShareDraftTests carries the shared cases.
 //
 // Pure + Sendable, unit-tested in ShareDraftTests.
 
@@ -32,13 +38,25 @@ public struct ShareDraftPick: Equatable, Sendable, Identifiable {
     public let recipient: Recipient
     /// The display name (a connection's name; the address for an email).
     public var name: String
-    public var access: ShareAccess
+    /// The `task_share.p_level` submit sends: `partner` (Can edit), `view`
+    /// (Can view) or `assign` (Hand over — connections only).
+    public var level: ShareLevel
 
-    public init(recipient: Recipient, name: String, access: ShareAccess) {
+    public init(recipient: Recipient, name: String, level: ShareLevel) {
         self.recipient = recipient
         self.name = name
-        self.access = access
+        // A hand-over is never an email grade (the server has no one to hand
+        // it to until they sign up) — held as Can edit, as on web.
+        if case .email = recipient, level == .assign { self.level = .partner } else { self.level = level }
     }
+
+    public init(recipient: Recipient, name: String, access: ShareAccess) {
+        self.init(recipient: recipient, name: name, level: access.taskLevel)
+    }
+
+    /// Can edit / Can view; nil when handed over.
+    public var access: ShareAccess? { ShareAccess(taskLevel: level) }
+    public var handedOver: Bool { level == .assign }
 
     /// Stable across grade changes: "user:<id>" / "email:<address>".
     public var id: String {
@@ -72,9 +90,10 @@ public struct ShareDraftEmailShare: Equatable, Sendable {
     }
 }
 
-/// The New task sheet's local share selection. Grades are the Share screen's
-/// two — Can edit / Can view (the inline section offered Off / Can edit /
-/// Can view; "Hand over to…" stays a post-creation action).
+/// The New task sheet's local share selection. A picked person's grade is
+/// Can edit / Can view / Hand over (the menu on their row); a typed address
+/// is Can edit / Can view. No limit on hand-overs — the server has none, and
+/// neither do web and Android.
 public struct ShareDraft: Equatable, Sendable {
     /// Pick order (the summary names people in the order they were picked).
     public private(set) var picks: [ShareDraftPick]
@@ -93,22 +112,26 @@ public struct ShareDraft: Equatable, Sendable {
         picks.filter { if case .email = $0.recipient { return true } else { return false } }
     }
 
-    /// Pick a connection at a grade, or change the grade of one already
+    /// Pick a connection at a level, or change the level of one already
     /// picked (their place in the order is kept). A blank id is ignored. A
     /// connection with no display name is "Someone" — what the Share screen's
     /// row calls them — never a blank (the row would read "them · can edit"
     /// beside an empty monogram).
-    public mutating func pick(userId: String, name: String, access: ShareAccess) {
+    public mutating func pick(userId: String, name: String, level: ShareLevel) {
         guard !userId.isEmpty else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let pick = ShareDraftPick(recipient: .user(id: userId), name: trimmed.isEmpty ? shareDraftUnnamed : trimmed,
-                                  access: access)
+                                  level: level)
         if let i = picks.firstIndex(where: { $0.id == pick.id }) {
-            picks[i].access = access
+            picks[i].level = level
             if !trimmed.isEmpty { picks[i].name = trimmed }
         } else {
             picks.append(pick)
         }
+    }
+
+    public mutating func pick(userId: String, name: String, access: ShareAccess) {
+        pick(userId: userId, name: name, level: access.taskLevel)
     }
 
     /// Add a typed address at a grade (normalised as the server does: trimmed,
@@ -120,18 +143,21 @@ public struct ShareDraft: Equatable, Sendable {
         guard isEmailLike(email) else { return false }
         let pick = ShareDraftPick(recipient: .email(email), name: email, access: access)
         if let i = picks.firstIndex(where: { $0.id == pick.id }) {
-            picks[i].access = access
+            picks[i].level = pick.level
         } else {
             picks.append(pick)
         }
         return true
     }
 
-    /// Change a pick's grade by its `id`. Unknown ids are ignored.
-    public mutating func setAccess(id: String, _ access: ShareAccess) {
+    /// Change a pick's level by its `id` (an address can't be handed over —
+    /// it stays Can edit). Unknown ids are ignored.
+    public mutating func setLevel(id: String, _ level: ShareLevel) {
         guard let i = picks.firstIndex(where: { $0.id == id }) else { return }
-        picks[i].access = access
+        picks[i] = ShareDraftPick(recipient: picks[i].recipient, name: picks[i].name, level: level)
     }
+
+    public mutating func setAccess(id: String, _ access: ShareAccess) { setLevel(id: id, access.taskLevel) }
 
     /// Drop a pick by its `id`. Returns whether anything was removed.
     @discardableResult
@@ -148,20 +174,20 @@ public struct ShareDraft: Equatable, Sendable {
 
     // MARK: submit mapping
 
-    /// The `task_share` calls submit makes, pick order — the grade maps
-    /// exactly as the Share screen's (Can edit → partner, Can view → view).
+    /// The `task_share` calls submit makes, pick order — Can edit → partner,
+    /// Can view → view, Hand over → assign (what web and Android send).
     public var userShares: [ShareDraftUserShare] {
         picks.compactMap { p in
             guard case .user(let id) = p.recipient else { return nil }
-            return ShareDraftUserShare(userId: id, level: p.access.taskLevel)
+            return ShareDraftUserShare(userId: id, level: p.level)
         }
     }
 
-    /// The `share-task add` calls submit makes, pick order.
+    /// The `share-task add` calls submit makes, pick order (never `assign`).
     public var emailShares: [ShareDraftEmailShare] {
         picks.compactMap { p in
             guard case .email(let e) = p.recipient else { return nil }
-            return ShareDraftEmailShare(email: e, level: p.access.taskLevel)
+            return ShareDraftEmailShare(email: e, level: p.level == .assign ? .partner : p.level)
         }
     }
 }
@@ -179,70 +205,95 @@ public struct ShareDraftSummary: Equatable, Sendable {
     }
 }
 
-/// The row's budget in characters: what fits beside "Share with…" and the
-/// chevron on the narrowest supported phone at the default text size. The
-/// view still truncates as a last resort, so this only decides the FORM.
+/// The row's budget in characters — the same 28 on iOS, Android and web. The
+/// row tries this first and only asks for a tighter budget when the line
+/// really doesn't fit (the grade still shows: names are what gets cut).
 public let shareDraftSummaryMaxLength = 28
 
-/// THE SUMMARY RULE.
-///  • nothing picked       → "Only you"
-///  • one grade for all    → "James · can edit", "James, Anna · can edit"
-///  • grades differ        → "James · edit, Anna · view"
-///  • longer than `maxLength` → "James + 3 more" (the first pick named)
-///  • one pick whose name alone is too long → the name is cut with "…"
-/// Names are first names ("James" from "James Wilson"; the local part of an
-/// address); two picks that would read the same keep their full names.
+/// THE SUMMARY RULE (one rule on all three apps; the FORM is decided by the
+/// number of picks, never by the length):
+///  • 0         → "Only you"
+///  • 1         → "James · can edit" | "· can view" | "· handed over"
+///  • 2, same   → "James, Anna · can edit"
+///  • 2, mixed  → "James · edit, Anna · view" (or "· handed over")
+///  • 3+        → "James + 2 more", plus " · can edit" / " · can view" /
+///                " · handed over" ONLY when everyone has the same grade
+///  • longer than `maxLength` → the NAMES are cut with "…" (never the grade):
+///    each name is capped at the largest length that fits, so a short name
+///    stays whole and a long one gives way; never below one letter + "…".
+/// Names are first names ("James" from "James Wilson"; the part of an address
+/// before the @); a blank name is "Someone".
 public func shareDraftSummary(_ picks: [ShareDraftPick],
                               maxLength: Int = shareDraftSummaryMaxLength) -> ShareDraftSummary {
-    guard !picks.isEmpty else { return ShareDraftSummary(text: "Only you", spoken: "Only you") }
-    let names = shareDraftNames(picks)
-    let grades = picks.map(\.access)
-    let uniform = Set(grades).count == 1
-
-    let full: String
-    if uniform {
-        full = "\(names.joined(separator: ", ")) · can \(grades[0].verb)"
-    } else {
-        full = zip(names, grades).map { "\($0) · \($1.verb)" }.joined(separator: ", ")
-    }
+    guard let first = picks.first else { return ShareDraftSummary(text: "Only you", spoken: "Only you") }
+    let names = picks.map { shareDraftName($0.name) }
+    let uniform = picks.allSatisfy { $0.level == first.level }
 
     let text: String
-    if full.count <= maxLength {
-        text = full
-    } else if picks.count == 1 {
-        let suffix = " · can \(grades[0].verb)"
-        text = shareDraftTruncate(names[0], to: maxLength - suffix.count) + suffix
-    } else {
-        let suffix = " + \(picks.count - 1) more"
-        text = shareDraftTruncate(names[0], to: maxLength - suffix.count) + suffix
+    switch picks.count {
+    case 1:
+        text = shareDraftFit(names, maxLength) { "\($0[0]) · \(shareDraftGradePhrase(first.level))" }
+    case 2 where uniform:
+        text = shareDraftFit(names, maxLength) { "\($0[0]), \($0[1]) · \(shareDraftGradePhrase(first.level))" }
+    case 2:
+        text = shareDraftFit(names, maxLength) {
+            "\($0[0]) · \(shareDraftGradeWord(picks[0].level)), \($0[1]) · \(shareDraftGradeWord(picks[1].level))"
+        }
+    default:
+        let tail = " + \(picks.count - 1) more" + (uniform ? " · \(shareDraftGradePhrase(first.level))" : "")
+        text = shareDraftFit([names[0]], maxLength) { $0[0] + tail }
     }
 
     let spoken: String
     if uniform {
-        spoken = "\(shareDraftList(names)) can \(grades[0].verb)"
+        spoken = first.level == .assign ? "handed over to \(shareDraftList(names))"
+                                        : "\(shareDraftList(names)) can \(first.access?.verb ?? "edit")"
     } else {
-        spoken = zip(names, grades).map { "\($0) can \($1.verb)" }.joined(separator: ", ")
+        spoken = zip(names, picks).map { name, p in
+            p.level == .assign ? "handed over to \(name)" : "\(name) can \(p.access?.verb ?? "edit")"
+        }.joined(separator: ", ")
     }
     return ShareDraftSummary(text: text, spoken: spoken)
+}
+
+/// "can edit" / "can view" / "handed over" — the one grade everyone has.
+func shareDraftGradePhrase(_ level: ShareLevel) -> String {
+    switch level {
+    case .partner: return "can edit"
+    case .view: return "can view"
+    case .assign: return "handed over"
+    }
+}
+
+/// "edit" / "view" / "handed over" — each person's grade when they differ.
+func shareDraftGradeWord(_ level: ShareLevel) -> String {
+    switch level {
+    case .partner: return "edit"
+    case .view: return "view"
+    case .assign: return "handed over"
+    }
 }
 
 /// The name of a pick that has none (the Share screen's own fallback).
 public let shareDraftUnnamed = "Someone"
 
-/// First names, except where two picks would read the same — those keep
-/// their full name so "Maya, Maya" never happens. A blank name reads
-/// "Someone", never `shareShortName`'s "them".
-private func shareDraftNames(_ picks: [ShareDraftPick]) -> [String] {
-    let short = picks.map { p in
-        p.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? shareDraftUnnamed : shareShortName(p.name)
-    }
-    var counts: [String: Int] = [:]
-    for s in short { counts[s.lowercased(), default: 0] += 1 }
-    return zip(picks, short).map { p, s in
-        guard counts[s.lowercased(), default: 0] > 1 else { return s }
-        let full = p.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return full.isEmpty ? s : full
-    }
+/// A pick's name in the summary: the first name, the part of an address
+/// before the @, "Someone" when blank (never `shareShortName`'s "them").
+private func shareDraftName(_ raw: String) -> String {
+    raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? shareDraftUnnamed : shareShortName(raw)
+}
+
+/// `render(names)` when it fits in `budget`; otherwise the names are capped
+/// (water-filling: the largest cap whose total fits the room the fixed text
+/// leaves) and cut with "…" — the fixed text, the grade included, is never cut.
+private func shareDraftFit(_ names: [String], _ budget: Int, _ render: ([String]) -> String) -> String {
+    let full = render(names)
+    guard full.count > budget else { return full }
+    let room = budget - render(names.map { _ in "" }).count
+    let floor = 2   // one letter + "…"
+    var cap = names.map(\.count).max() ?? floor
+    while cap > floor, names.reduce(0, { $0 + min($1.count, cap) }) > room { cap -= 1 }
+    return render(names.map { shareDraftTruncate($0, to: cap) })
 }
 
 /// "Maya", "Maya and Zubair", "Maya, Zubair and Sam".
@@ -251,8 +302,8 @@ private func shareDraftList(_ names: [String]) -> String {
     return names.dropLast().joined(separator: ", ") + " and " + (names.last ?? "")
 }
 
-/// Cut to `limit` characters (grapheme clusters), ending in "…". Never below
-/// one character + the ellipsis.
+/// Cut to `limit` characters (grapheme clusters) including the closing "…".
+/// Never below one character + the ellipsis.
 private func shareDraftTruncate(_ s: String, to limit: Int) -> String {
     guard s.count > limit else { return s }
     let keep = max(1, limit - 1)
@@ -273,13 +324,15 @@ public func shareDraftResultLine(_ r: ShareResult) -> String {
         return "\(email) will get it when you add the task."
     case .accessChanged(let name, let access):
         return "\(shareShortName(name)) will be able to \(access.verb)."
+    case .handedOver(let name):
+        return "\(shareShortName(name)) will get it as their task when you add it — you keep view."
     case .removed(let name):
         return "\(shareShortName(name)) won't get it."
     case .inviteCancelled(let email):
         return "\(email) won't get it."
     case .linkCopied:
         return "Invite link copied — whoever opens it is connected to you, then you can pick them here."
-    case .handedOver, .blocked:
+    case .blocked:
         return shareResultLine(r)
     }
 }

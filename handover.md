@@ -46,51 +46,65 @@ phases land. Newest status at the top.
 ## New task → "Share with…": one row + the Share screen (branch sharerow/ios, 2026-09-24) — not shipped yet
 
 Ahmad, on the New task sheet's Share section (a big card per connected person, each with a full-width
-"Off | Can edit | Can view" switch): "This is terrible" — he chose "One row + picker".
+"Off | Can edit | Can view" switch): "This is terrible" — he chose "One row + picker". Built on all three apps, then
+a side-by-side cross-check found differences and ONE behaviour was decided for iOS, Android and web (the
+"align" pass, same day — see the last bullet group).
 
-- **The row.** Under More options, Share is ONE row: "Share with…" · up to three overlapping monograms (the Share
-  screen's "has it" disc — ink/bg pair) · a one-line summary · chevron. Summary = `shareDraftSummary`
-  (Sources/UnstuckCore/Logic/ShareDraft.swift): "Only you" · "James · can edit" · "James, Anna · can edit" ·
-  "James · edit, Anna · view" · "James + 3 more" once it passes 28 characters; a single over-long name is cut with
-  "…"; two picks with the same first name keep full names. Never wraps at default sizes (`ViewThatFits` drops the
-  monograms first, `lineLimit(1)` last); at accessibility sizes the title and summary stack. VoiceOver: "Share
-  with, <spoken summary>, button" (spoken = "James and Anna can edit", never truncated). Id `new-task-share-row`.
-- **The picker is the Share screen**, in a new PRE-CREATE mode: `ShareScreen(target: .task(id: "", name:), draft:)`.
-  Its transport is `DraftShareTransport` (ShareScreen.swift): the roster comes from the live transport (or the
-  UITEST_SHARE_PEOPLE demo roster), every write lands in a local `ShareDraft`. So the grade switch (default Can
-  edit), the who-has-it card with the Can edit / Can view / Remove menu, the searchable "Choose someone" picker and
-  "Someone new" all work unchanged. `ShareScreenModel.preCreate` swaps the result lines for
-  `shareDraftResultLine` ("Maya will get it when you add the task — they can edit.", never "Shared with…").
-- **Hidden in pre-create:** "Share a link" (a task link needs the task) → replaced by **"Invite with a link"**, the
-  connect-only `circle-invite {}` link the old inline "Add someone → Generate link" panel made (new transport
-  method `inviteToConnect`, default `.failed("not_configured")` for fakes); the pending-invite list for the task
-  (queued addresses show there instead, "Gets it when you add the task · can edit", ✕ removes); Report… and Block…
-  on a picked row (nothing is shared yet — both still exist on the task's own Share screen / Settings › People).
-  The header explains hand-over is on the task afterwards (grades at creation stay Can edit / Can view, as the
-  inline section had).
-- **Submit** is the same path, fed from the draft: `draft.userShares` → `applyCreateShares(task:shares:)` exactly
-  as before (flush the insert, then task_share + share-notify), plus NEW `emails:` → `share-task add` per queued
-  address after the flush (existing account = shared at once, else an invite). Fire-and-forget: a failed share
-  never blocks creation. The keyboard is put away before the Share screen opens (UIKit otherwise hands focus back
-  to the name field on close and scrolls the sheet to the top).
+- **The row.** Under More options, a **SHARE** section label (like Tags / Repeat), then ONE row: "Share with…" · up
+  to three overlapping monograms (the Share screen's "has it" disc — ink/bg pair) · a one-line summary · chevron.
+  Never wraps at default sizes: `ViewThatFits` drops the monograms first, then re-cuts the summary by the same
+  rule at tighter budgets (28 → 24 → 20 → 16 → 12; names give way, the grade stays), and only the last candidate
+  tail-truncates. At accessibility sizes the title and summary stack. VoiceOver: "Share with, <spoken summary>,
+  button" (spoken = "Maya and Zubair can edit" / "handed over to Maya, …", never truncated). Id `new-task-share-row`.
+- **THE SUMMARY RULE** (`shareDraftSummary`, Sources/UnstuckCore/Logic/ShareDraft.swift — one rule on all three
+  apps; the FORM goes by the number of picks, never by length): 0 → "Only you"; 1 → "James · can edit | can view |
+  handed over"; 2 at one grade → "James, Anna · can edit"; 2 mixed → "James · edit, Anna · view"; 3+ → "James + 2
+  more", plus " · can edit / can view / handed over" ONLY when everyone has the same grade. Past 28 characters the
+  NAMES are cut with "…" (water-filling: each name capped at the largest length that fits, a short name stays whole;
+  never below one letter + "…") so the grade always shows. First names; an address shows the part before the @;
+  blank = "Someone". No same-first-name special case (web / Android have none) — "Maya, Maya · can edit".
+  `ShareDraftTests.sharedCases` is the shared table (26 cases) the Android and web tests mirror.
+- **The picker is the Share screen**, in PRE-CREATE mode: `ShareScreen(target: .task(id: "", name:), draft:)`. Its
+  transport is `DraftShareTransport` (ShareScreen.swift): the roster comes from the live transport (or the
+  UITEST_SHARE_PEOPLE demo roster), every write lands in a local `ShareDraft` (picks carry a `ShareLevel`). The grade
+  switch (Can edit / Can view, default Can edit), the who-has-it card, the searchable "Choose someone" picker and
+  "Someone new" work unchanged. A picked person's menu is **Can edit / Can view / Hand over / Remove**
+  (`ShareScreenModel.handOver`, pre-create only → level `assign`, the level web and Android send; no one-hand-over
+  limit — the server, web and Android have none). Result lines: `shareDraftResultLine` ("Maya will get it when you
+  add the task — they can edit.", "Maya will get it as their task when you add it — you keep view.", never
+  "Shared with…").
+- **Someone new (pre-create)** = HELD: the button says "Add"; a typed address is listed as "Gets it when you add
+  the task · can edit" (✕ removes), counted in the row summary by its local part, and shared with THIS task on
+  save via `share-task add` (existing account → shared at once; no account → an invite claimed on sign-up).
+  Nothing is sent if the sheet is closed. An address is never a hand-over (held as Can edit).
+- **Hidden in pre-create:** "Share a link" (a task link needs the task) → replaced by the ONE **"Invite with a
+  link"** row, the connect-only `circle-invite {}` link (transport method `inviteToConnect`, default
+  `.failed("not_configured")` for fakes) — web and Android now have the same row; Report… and Block… on a picked
+  row (both still exist on the task's own Share screen / Settings › People). "Manage people" (from main's slim
+  Settings) stays — it pushes Settings › People inside the Share screen's own stack.
+- **Submit** is the same path, fed from the draft: `draft.userShares` (partner / view / assign) →
+  `applyCreateShares(task:shares:emails:)` (flush the insert, then task_share + share-notify per person, then
+  `share-task add` per held address). Fire-and-forget: a failed share never blocks creation. The keyboard is put
+  away before the Share screen opens (UIKit otherwise hands focus back to the name field on close).
+- **Monograms:** each disc tucks 4pt under the next and carries a 1.5pt ring OUTSIDE the disc in the row's surface
+  (web / Android's numbers) — 5.5pt of the disc beneath is covered, clear of its centred letter. Before, the ring was
+  a stroke centred on the edge with a 20 % overlap.
 - **Removed from NewTaskSheet:** the per-member cards, `shareLevels`, the sheet's own `CircleModel` (+ its
-  `.task`/`.onDisappear`), the inline invite panel and explainer. Nothing else in the sheet changed.
-- **Review fixes (same branch):** a connection with no display name is picked as "Someone" (the Share screen row's
-  own fallback) — it used to read "them · can edit" beside an empty monogram; and the Share screen's "Someone new"
-  placeholder is `Text(verbatim:)` — the LocalizedStringKey placeholder was parsed as Markdown, autolinking the
-  address into the system link blue so it read like a filled-in value (both modes; Connections' invite field still
-  has the old form).
-- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 23) — summary 0/1/2/many, mixed grades, long names, addresses,
-  collisions, blank names, budget sweep; selection → submit mapping; pre-create lines. `ShareScreenPreCreateTests`
-  (UnifiedSharingScreenTests.swift, 11) — the model over a DraftShareTransport: nothing reaches the server, picks /
-  grade changes / removals / queued addresses land in the draft, re-open pins the picks, the invite link is a
-  connect invite, the mapping submit hands `applyCreateShares`. Screenshots: `SharePeopleCardShots.testNewTaskShareRowShots`
-  (light + dark; writes to SHARE_ROW_SHOTS_DIR, default /tmp/unstuck-share-row-shots) — nothing picked, the picker +
-  its Choose someone list, then 1 / 2 / 3 picks (mixed grades → "Maya + 2 more") with the picker CLOSED and
-  REOPENED between picks, asserting the picks come back first with their grade and the switch resets to Can edit.
-- **Merge note:** another branch edits NewTaskSheet for the remembered estimate; this branch touches only the share
-  state block, the removed circle `.task`/`.onDisappear` lines around `.onAppear(perform: seedPrefill)`, the share
-  section functions and the share block at the end of `submit()`.
+  `.task`/`.onDisappear`), the inline invite panel and explainer.
+- **Review fixes:** a connection with no display name is picked as "Someone" (not "them"); the "Someone new"
+  placeholder can't be autolinked blue (main's `String(...)` form kept at the merge).
+- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 19 incl. the shared table, every-budget grade check, hand-over
+  as a level, addresses never handed over, spoken forms, pre-create lines). `ShareScreenPreCreateTests`
+  (UnifiedSharingScreenTests.swift, 14) — nothing reaches the server, picks / grade changes / hand-over / removals /
+  held addresses land in the draft, re-open pins the picks (a hand-over too), `handOver` is a no-op outside
+  pre-create, the invite link is a connect invite, the levels submit hands `applyCreateShares`. Screenshots:
+  `SharePeopleCardShots.testNewTaskShareRowShots` (light + dark; SHARE_ROW_SHOTS_DIR, default
+  /tmp/unstuck-share-row-shots) walks 01 nothing picked · 02/03 picker + Choose someone · 04 one · 05 two same ·
+  06 the person menu · 07 two mixed · 08 held address + Invite with a link · 09 three mixed · 10 three same ·
+  11 hand-over in the picker · 12 the row with a hand-over, closing and reopening the picker between steps.
+- **Merged main** (build 98, Settings slim-down) into this branch on 2026-09-24: NewTaskSheet keeps main's
+  "remembers the last estimate" (`model.settings.focusDefaultMin = estimate` in `submit()`) and this branch's share
+  row; ShareScreen keeps main's "Manage people" link and placeholder form.
 
 ## Slim Settings (branch settings/ios, 2026-09-24) — not shipped yet
 

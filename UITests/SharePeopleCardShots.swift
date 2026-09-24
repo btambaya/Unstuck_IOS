@@ -208,14 +208,16 @@ final class SharePeopleCardShots: XCTestCase {
 
     // MARK: New task → "Share with…" (the one row + the pre-create picker)
 
-    /// New task → More options: the ONE "Share with…" row with nothing
-    /// picked, the pre-create Share screen it opens and its "Choose someone"
-    /// list, then the row after 1 / 2 / 3 picks — the picker is CLOSED and
-    /// REOPENED between picks, so this also proves the picks survive a
-    /// reopen (they come back first, with their grade) — light + dark. PNGs go
-    /// to SHARE_ROW_SHOTS_DIR (TEST_RUNNER_-prefixed for xcodebuild; default
-    /// /tmp/unstuck-share-row-shots). Each step asserts the screen it shoots
-    /// actually rendered.
+    /// New task → More options: the SHARE-labelled "Share with…" row and the
+    /// pre-create Share screen it opens, walked through every form of the ONE
+    /// summary rule shared with web and Android — nothing picked, 1, 2 at one
+    /// grade, 2 mixed, 3+ mixed, 3+ at one grade — plus the picked person's
+    /// menu (Can edit / Can view / Hand over / Remove), a typed address held
+    /// until the task is added, "Invite with a link", and a hand-over. The
+    /// picker is CLOSED and REOPENED between steps, so this also proves picks
+    /// survive a reopen. Light + dark. PNGs go to SHARE_ROW_SHOTS_DIR
+    /// (TEST_RUNNER_-prefixed for xcodebuild; default
+    /// /tmp/unstuck-share-row-shots). Each step asserts what it shoots.
     func testNewTaskShareRowShots() throws {
         let env = ProcessInfo.processInfo.environment
         let dir = URL(fileURLWithPath: env["SHARE_ROW_SHOTS_DIR"] ?? "/tmp/unstuck-share-row-shots")
@@ -253,6 +255,7 @@ final class SharePeopleCardShots: XCTestCase {
             expect(row, "[\(theme)] the Share with… row is missing under More options")
             guard row.exists else { shot("\(theme)-FAILED"); app.terminate(); continue }
             app.swipeUp(); usleep(600_000)
+            expect(app.staticTexts["SHARE"].firstMatch, "[\(theme)] no SHARE section label above the row")
             XCTAssertEqual(row.label, "Share with", "[\(theme)] the row's VoiceOver label")
             XCTAssertEqual(row.value as? String, "Only you", "[\(theme)] nothing picked reads Only you")
             shot("01-row-nothing-picked-\(theme)")
@@ -260,7 +263,6 @@ final class SharePeopleCardShots: XCTestCase {
             let bar = app.navigationBars["Share"].firstMatch
             let choose = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Choose someone'")).firstMatch
             let editGrade = app.segmentedControls.buttons["Can edit"].firstMatch
-            let viewGrade = app.segmentedControls.buttons["Can view"].firstMatch
             /// Open the picker from the row; false (after asserting) if it didn't.
             func openPicker(_ step: String) -> Bool {
                 row.tap()
@@ -286,8 +288,27 @@ final class SharePeopleCardShots: XCTestCase {
             func picked(_ who: String) -> XCUIElement {
                 app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", who)).firstMatch
             }
+            /// Open a picked person's menu (the row is a Menu: "<name>, <grade>. Change access").
+            func openMenu(_ who: String) -> Bool {
+                let r = picked(who)
+                expect(r, "[\(theme)] \(who) is not listed as picked")
+                guard r.exists else { return false }
+                r.tap(); usleep(800_000)
+                expect(app.buttons["Hand over"].firstMatch, "[\(theme)] \(who)'s menu did not open (no Hand over)")
+                return app.buttons["Hand over"].firstMatch.exists
+            }
+            /// A menu item by its label — never the grade switch's segment of
+            /// the same name (Can edit / Can view appear in both).
+            func menuItem(_ label: String) -> XCUIElement {
+                let inMenu = app.collectionViews.buttons[label].firstMatch
+                if inMenu.exists { return inMenu }
+                let all = app.buttons.matching(NSPredicate(format: "label == %@", label))
+                    .allElementsBoundByIndex.filter { $0.isHittable }
+                let seg = app.segmentedControls.buttons[label].firstMatch
+                return all.first { !seg.exists || $0.frame != seg.frame } ?? inMenu
+            }
 
-            // 1 · Maya at the default Can edit.
+            // 1 · Maya at the default Can edit → "Maya · can edit".
             guard openPicker("open-1") else { app.terminate(); continue }
             XCTAssertTrue(editGrade.isSelected, "[\(theme)] the grade switch defaults to Can edit")
             shot("02-picker-open-\(theme)")
@@ -297,32 +318,71 @@ final class SharePeopleCardShots: XCTestCase {
             XCTAssertEqual(row.value as? String, "Maya can edit", "[\(theme)] one pick")
             shot("04-row-one-picked-\(theme)")
 
-            // 2 · REOPEN: Maya is still picked (first, at Can edit); Zubair at Can view.
+            // 2 · REOPEN: Maya is still picked; Zubair at Can edit → "Maya, Zubair · can edit".
             guard openPicker("reopen-2") else { app.terminate(); continue }
             expect(picked("Maya Chen, Can edit"), "[\(theme)] Maya's pick did not survive closing the picker")
-            expect(viewGrade, "[\(theme)] the Can edit / Can view switch is missing")
-            if viewGrade.exists { viewGrade.tap(); usleep(400_000) }
             pick("Zubair Kazaure")
-            expect(picked("Zubair Kazaure, Can view"), "[\(theme)] Zubair is not shown as picked at Can view")
-            shot("05-picker-two-picked-\(theme)")
+            closePicker()
+            XCTAssertEqual(row.value as? String, "Maya and Zubair can edit", "[\(theme)] two at one grade")
+            shot("05-row-two-same-grade-\(theme)")
+
+            // 3 · REOPEN: Zubair's menu is Can edit / Can view / Hand over /
+            // Remove (no Report / Block before the task exists) → Can view.
+            guard openPicker("reopen-3") else { app.terminate(); continue }
+            if openMenu("Zubair Kazaure, Can edit") {
+                for item in ["Can edit", "Can view", "Hand over", "Remove"] {
+                    XCTAssertTrue(menuItem(item).exists, "[\(theme)] the picked person's menu has no \(item)")
+                }
+                XCTAssertFalse(app.buttons["Report…"].exists, "[\(theme)] Report is for a task that exists")
+                shot("06-picker-person-menu-\(theme)")
+                menuItem("Can view").tap(); usleep(900_000)
+            }
+            expect(picked("Zubair Kazaure, Can view"), "[\(theme)] Zubair is not at Can view after the menu")
+            closePicker()
+            XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view", "[\(theme)] two, mixed")
+            shot("07-row-two-mixed-\(theme)")
+
+            // 4 · REOPEN: Someone new — the address is HELD, listed, counted.
+            guard openPicker("reopen-4") else { app.terminate(); continue }
+            XCTAssertTrue(editGrade.isSelected, "[\(theme)] a reopened picker starts on Can edit again")
+            let email = app.textFields["Email address"].firstMatch
+            expect(email, "[\(theme)] no Someone new field")
+            if email.exists {
+                email.tap(); email.typeText("sam@example.com"); usleep(300_000)
+                let add = app.buttons["Add by email"].firstMatch
+                expect(add, "[\(theme)] the Someone new button is not 'Add'")
+                if add.exists { add.tap(); usleep(900_000) }
+            }
+            let held = app.staticTexts["Gets it when you add the task · can edit"].firstMatch
+            expect(held, "[\(theme)] the typed address is not listed as held")
             expect(app.buttons["Invite with a link"].firstMatch, "[\(theme)] pre-create's connect-invite link is missing")
             XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Share a link'")).firstMatch.exists,
                            "[\(theme)] a task link can't exist before the task")
+            app.swipeUp(); usleep(600_000)
+            shot("08-picker-held-address-\(theme)")
             closePicker()
-            XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view", "[\(theme)] the row's spoken summary")
-            shot("06-row-two-picked-\(theme)")
+            XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view, sam can edit",
+                           "[\(theme)] three, mixed — spoken in full")
+            shot("09-row-three-mixed-\(theme)")
 
-            // 3 · REOPEN again: the switch is back on Can edit; Zoë at Can edit.
-            guard openPicker("reopen-3") else { app.terminate(); continue }
-            expect(picked("Zubair Kazaure, Can view"), "[\(theme)] Zubair's grade did not survive closing the picker")
-            XCTAssertTrue(editGrade.isSelected, "[\(theme)] a reopened picker starts on Can edit again")
-            pick("Zoë Müller")
-            expect(picked("Zoë Müller, Can edit"), "[\(theme)] Zoë is not shown as picked at Can edit")
-            shot("07-picker-three-picked-\(theme)")
+            // 5 · REOPEN: Zubair back to Can edit → everyone at one grade.
+            guard openPicker("reopen-5") else { app.terminate(); continue }
+            if openMenu("Zubair Kazaure, Can view") { menuItem("Can edit").tap(); usleep(900_000) }
             closePicker()
-            XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view, Zoë can edit",
-                           "[\(theme)] three picks, mixed grades — spoken in full")
-            shot("08-row-three-mixed-\(theme)")
+            XCTAssertEqual(row.value as? String, "Maya, Zubair and sam can edit", "[\(theme)] three at one grade")
+            shot("10-row-three-same-grade-\(theme)")
+
+            // 6 · REOPEN: hand the task over to Maya from her menu.
+            guard openPicker("reopen-6") else { app.terminate(); continue }
+            if openMenu("Maya Chen, Can edit") { app.buttons["Hand over"].firstMatch.tap(); usleep(900_000) }
+            expect(picked("Maya Chen, Handed over"), "[\(theme)] Maya is not shown as handed over")
+            expect(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'as their task when you add it'")).firstMatch,
+                   "[\(theme)] no pre-create hand-over line")
+            shot("11-picker-handed-over-\(theme)")
+            closePicker()
+            XCTAssertEqual(row.value as? String, "handed over to Maya, Zubair can edit, sam can edit",
+                           "[\(theme)] a hand-over in the mix")
+            shot("12-row-three-with-hand-over-\(theme)")
             app.terminate()
         }
     }

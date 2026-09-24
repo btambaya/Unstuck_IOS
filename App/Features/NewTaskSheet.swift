@@ -2,10 +2,10 @@
 // NewTaskSheet + web task-create-modal). Four serif questions instead of ten
 // stacked sections:
 //   What's on your mind? → When? (+ Time sub-row) → How long? → Which area?
-// then a collapsed "More options" disclosure holding Share/assign (per-task
-// circle sharing, applied on submit), Tags and Repeat. WHEN is mandatory; the
-// time auto-picks the first free slot for the date unless the user chooses
-// one. First step / reminder / capture drafts moved to TaskEditor — new tasks
+// then a collapsed "More options" disclosure holding Share (one "Share with…"
+// row → the pre-create Share screen, applied on submit), Tags and Repeat.
+// WHEN is mandatory; the time auto-picks the first free slot for the date
+// unless the user chooses one. First step / reminder / capture drafts moved to TaskEditor — new tasks
 // use the global default reminder. No priority picker (the web + DB don't
 // surface one). Editing an existing task still goes through TaskEditor.
 
@@ -22,6 +22,15 @@ struct NewTaskSheet: View {
     @Environment(\.uTheme) private var theme
     /// The "Share with…" row's monogram disc (same as the Share screen's).
     @ScaledMetric(relativeTo: .body) private var monogramSize: CGFloat = 22
+    /// How far each disc tucks under the next, and the row-coloured ring
+    /// around each — 4 + 1.5 (web and Android's numbers) covers at most 5.5pt
+    /// of the disc beneath, clear of its centred letter.
+    private static let monogramOverlap: CGFloat = 4
+    private static let monogramRing: CGFloat = 1.5
+    /// The row's summary budgets, widest first: 28 is the one rule's
+    /// (`shareDraftSummaryMaxLength`, same on web and Android); the tighter
+    /// ones only cut NAMES, so the grade still shows on a narrow row.
+    private static let summaryBudgets = [shareDraftSummaryMaxLength, 24, 20, 16, 12]   // five: see shareRow
     @Environment(\.dynamicTypeSize) private var typeSize
 
     let defaultEstimate: Int
@@ -68,10 +77,10 @@ struct NewTaskSheet: View {
     @State private var moreOpen = false
 
     // Per-task sharing: ONE "Share with…" row that opens the Share screen in
-    // pre-create mode. The picks (Can edit / Can view per person, typed
-    // addresses) are LOCAL create-state in the draft — the share RPCs fire on
-    // submit, after the task row exists. "Assign" is not a grade here: hand a
-    // task over from its editor ("Hand over to…") once it exists.
+    // pre-create mode. The picks (Can edit / Can view / Hand over per person,
+    // typed addresses held until the task is added) are LOCAL create-state in
+    // the draft — the share RPCs fire on submit, after the task row exists.
+    // Nothing is sent if the sheet is closed without adding the task.
     @State private var shareDraft: DraftShareTransport?
     @State private var showSharePicker = false
 
@@ -328,29 +337,43 @@ struct NewTaskSheet: View {
     /// LOCAL and the share RPCs fire on submit, after the task exists — a
     /// failed share never blocks creation. Ahmad 2026-09-24: a card per person
     /// with a full-width Off / Can edit / Can view switch was "terrible".
+    /// Labelled "SHARE" like the sections around it (Tags, Repeat) — the
+    /// same label web and Android put above the row.
     private var shareSection: some View {
         let picks = shareDraft?.draft.picks ?? []
         let summary = shareDraftSummary(picks)
-        return Button(action: openSharePicker) { shareRow(picks: picks, summary: summary) }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Share with")
-            .accessibilityValue(summary.spoken)
-            .accessibilityHint("Pick who gets this task")
-            .accessibilityIdentifier("new-task-share-row")
-            .sheet(isPresented: $showSharePicker) {
-                if let shareDraft {
-                    ShareScreen(target: .task(id: "", name: name.trimmingCharacters(in: .whitespacesAndNewlines)),
-                                draft: shareDraft)
-                }
+        return VStack(alignment: .leading, spacing: 7) {
+            SectionLabel("Share")
+            Button(action: openSharePicker) { shareRow(picks: picks, summary: summary) }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Share with")
+                .accessibilityValue(summary.spoken)
+                .accessibilityHint("Pick who gets this task")
+                .accessibilityIdentifier("new-task-share-row")
+        }
+        .sheet(isPresented: $showSharePicker) {
+            if let shareDraft {
+                ShareScreen(target: .task(id: "", name: name.trimmingCharacters(in: .whitespacesAndNewlines)),
+                            draft: shareDraft)
             }
+        }
     }
 
-    /// The row's face. One line at normal sizes — the summary truncates
-    /// (never wraps) and the monograms drop out first when space is short; at
+    /// The row's face. One line at normal sizes, never wrapped: when space is
+    /// short the monograms drop out first, then the summary is re-cut to a
+    /// tighter budget by the SAME rule (names give way, the grade stays), and
+    /// only past the last budget does the text itself truncate. At
     /// accessibility sizes "Share with…" and the summary stack.
     private func shareRow(picks: [ShareDraftPick], summary: ShareDraftSummary) -> some View {
-        let summaryText = Text(summary.text).font(UFont.sans(13))
-            .foregroundStyle(picks.isEmpty ? theme.palette.ink3 : theme.palette.ink2)
+        func line(_ text: String) -> some View {
+            Text(text).font(UFont.sans(13))
+                .foregroundStyle(picks.isEmpty ? theme.palette.ink3 : theme.palette.ink2)
+                .lineLimit(1)
+        }
+        let summaryText = line(summary.text)
+        // The same rule at each tighter budget (`summaryBudgets[0]` is
+        // `summary` itself).
+        let cut = Self.summaryBudgets.map { shareDraftSummary(picks, maxLength: $0).text }
         let title = Text("Share with…").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
         let chevron = Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
             .foregroundStyle(theme.palette.ink3)
@@ -359,7 +382,9 @@ struct NewTaskSheet: View {
                 HStack(spacing: 10) {
                     VStack(alignment: .leading, spacing: 4) {
                         title.fixedSize(horizontal: false, vertical: true)
-                        summaryText.lineLimit(2)
+                        Text(summary.text).font(UFont.sans(13))
+                            .foregroundStyle(picks.isEmpty ? theme.palette.ink3 : theme.palette.ink2)
+                            .lineLimit(2)
                     }
                     Spacer(minLength: 8)
                     chevron
@@ -372,9 +397,15 @@ struct NewTaskSheet: View {
                     ViewThatFits(in: .horizontal) {
                         HStack(spacing: 8) {
                             if !picks.isEmpty { shareMonograms(picks) }
-                            summaryText.lineLimit(1)
+                            summaryText
                         }
-                        summaryText.lineLimit(1).truncationMode(.tail)
+                        // Explicit candidates (not a ForEach): ViewThatFits
+                        // tries its direct children in order.
+                        summaryText
+                        line(cut[1])
+                        line(cut[2])
+                        line(cut[3])
+                        line(cut[4]).truncationMode(.tail)
                     }
                     chevron
                 }
@@ -389,17 +420,22 @@ struct NewTaskSheet: View {
 
     /// Up to three picked people, overlapping — the Share screen's "has it"
     /// monogram (ink disc, bg letter; selection is the black-and-white pair),
-    /// ringed in the row's surface so the overlap reads. Decorative: the
-    /// summary says who.
+    /// each ringed OUTSIDE its disc in the row's surface so the overlap reads.
+    /// The ring used to be a stroke centred on the disc edge with a 20 %
+    /// overlap, and the next disc bit into the letter beneath; now each disc
+    /// tucks 4pt under the next plus the 1.5pt ring — 5.5pt, clear of the
+    /// centred letter at every size. Decorative: the summary says who.
     private func shareMonograms(_ picks: [ShareDraftPick]) -> some View {
-        HStack(spacing: -monogramSize * 0.2) {
+        let ring = Self.monogramRing
+        return HStack(spacing: -(Self.monogramOverlap + ring * 2)) {
             ForEach(picks.prefix(3)) { p in
-                Text(String(p.name.prefix(1)).uppercased())
+                Text(String(p.name.trimmingCharacters(in: .whitespaces).prefix(1)).uppercased())
                     .font(UFont.sans(10, .semibold))
                     .foregroundStyle(theme.palette.bg)
                     .frame(width: monogramSize, height: monogramSize)
                     .background(theme.palette.ink, in: Circle())
-                    .overlay(Circle().stroke(theme.palette.surface, lineWidth: 1.5))
+                    .padding(ring)
+                    .background(theme.palette.surface, in: Circle())
             }
         }
         .accessibilityHidden(true)

@@ -1012,7 +1012,64 @@ final class ShareScreenPreCreateTests: XCTestCase {
         XCTAssertEqual(shares.map(\.level), [.view, .view])
         XCTAssertEqual(emails.map(\.email), ["sam@example.com"])
         XCTAssertEqual(emails.map(\.level), [.view])
-        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Maya, Zubair, sam · can view")
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Maya + 2 more · can view")
+        assertNothingReachedTheServer()
+    }
+
+    func testHandOverFromThePickedRowsMenuIsHeldAsAssign() async {
+        let vm = preCreateModel()
+        await vm.load()
+        await vm.tap(vm.people[1])                     // Zubair · Can edit
+        await vm.handOver(vm.people[1])                // → Hand over
+        assertNothingReachedTheServer()
+        XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u2", level: .assign)])
+        XCTAssertEqual(vm.result, "Zubair will get it as their task when you add it — you keep view.")
+        XCTAssertTrue(vm.people[1].handedOver, "the row reads Handed over (reloaded from the draft)")
+        XCTAssertEqual(vm.people[1].statusLabel, "Handed over")
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Zubair · handed over")
+
+        // Back to a grade from the same menu, then Remove.
+        await vm.setAccess(vm.people[1], .view)
+        XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u2", level: .view)])
+        XCTAssertEqual(vm.result, "Zubair will be able to view.")
+        await vm.handOver(vm.people[1])
+        await vm.setAccess(vm.people[1], nil)
+        XCTAssertTrue(draft.draft.isEmpty)
+        XCTAssertEqual(vm.result, "Zubair won't get it.")
+
+        // Reopening pins a handed-over pick first, like any other.
+        await vm.tap(vm.people[0])
+        await vm.handOver(vm.people[0])
+        let again = preCreateModel()
+        await again.load()
+        let split = sharePeopleSplit(again.people, pinned: again.pinnedIds, handOver: false)
+        XCTAssertEqual(split.withAccess.map(\.userId), ["u1"])
+        XCTAssertEqual(split.withAccess.first?.statusLabel, "Handed over")
+        assertNothingReachedTheServer()
+    }
+
+    func testHandOverIsPreCreateOnly() async {
+        // An existing task's Share screen hands over through its own mode —
+        // the share-mode menu call is a no-op there.
+        let vm = ShareScreenModel(target: .task(id: "t1", name: "Draft the deck"), transport: fake)
+        await vm.load()
+        await vm.handOver(vm.people[0])
+        XCTAssertTrue(fake.sharedTask.isEmpty)
+        XCTAssertNil(vm.result)
+    }
+
+    func testTheSubmitHandsTheHandOverToApplyCreateShares() async {
+        let vm = preCreateModel()
+        await vm.load()
+        await vm.tap(vm.people[0])
+        await vm.handOver(vm.people[0])
+        vm.access = .view
+        await vm.tap(vm.people[1])
+        let shares = draft.draft.userShares.map { (user: $0.userId, level: $0.level) }
+        XCTAssertEqual(shares.map(\.user), ["u1", "u2"])
+        XCTAssertEqual(shares.map(\.level), [.assign, .view], "the same levels web and Android send")
+        // Mixed with a hand-over: the names give way, both grades show.
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "M… · handed over, Z… · view")
         assertNothingReachedTheServer()
     }
 
