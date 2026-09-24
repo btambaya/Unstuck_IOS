@@ -43,6 +43,29 @@ phases land. Newest status at the top.
 
 
 
+## The bell shows every server card, not only calls (branch bellcards/ios, 2026-09-24) — not shipped yet
+
+A push swiped out of the tray left no record on the phone: the web bell reads every `notification_queue` card, but
+iOS read moment `call` only. `NotificationsClient.queueCards(moments:limit:)` now reads the moments in
+`NotificationQueueCards.moments`: call, session_recap, morning_brief, task_share, shared_task_done,
+shared_session_start/_end, collection_share/_activity/_task_done/_late, circle_invite, invite_claimed. NOT
+task_reminder/task_starting: the phone rings its own reminders locally, and Upcoming lists them. The read is
+`select *` so the new `deep_link` column (migration 084) is picked up once it exists and is absent before. Naming the
+column would fail the whole read on an un-migrated database, call cards included. `NotificationQueueCard.deepLink`
+is optional: absent, null or blank all decode to nil.
+- **Rows**: a call card is exactly as before. Any other card is shown as written, with its push's kind (every
+  `collection*` moment → `collection_share`), so the label and dot match the logged push. A tap routes the card's own
+  `unstuck://` deep_link, or else its moment's destination (`fallbackLink(forMoment:)`), through the same router a push
+  tap uses.
+- **No doubles** (`mergeRecent` / `sameEvent`): a card and a logged push within 5 min are one event when they have the
+  same copy, are both recaps, or have the same kind and the same id-carrying link (`collections/<id>`, `task/<id>`). The
+  list-update push is a clipped digest of its card. Matching is one-to-one, so a second card that the push cooldown
+  folded into one push still shows.
+- **Colour**: a non-call server card's dot is coral only while unread (newer than the previous open, captured as
+  `seenAtOpen` before `markAllSeen`). Once read, it takes its kind's tone, with coral folded to ink2.
+- Tests: 4 new tests in `CallsMirrorTests`: optional decode, the moments list, the card → entry mapping and links, and
+  the dedupe. Deploy: works before or after migration 084; the tap is exact only once the senders store `deep_link`.
+
 ## Push times follow the phone's clock (branch pushclock/ios, 2026-09-24) — not shipped yet
 
 The reminder push + in-app card said "Starts in 10 min — 3:00 PM." on Ahmad's 24-hour iPhone: the SERVER wrote the

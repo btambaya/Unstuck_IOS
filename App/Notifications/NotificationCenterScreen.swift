@@ -3,12 +3,15 @@
 // (scheduled task reminders in the next 2 days, computed live from the
 // blocks via the pure upcomingReminders) and "Recent" (the persisted
 // NotificationLog, newest first, MERGED with the server's `notification_queue`
-// cards of moment `call` — "Unstuck called you about X" — the way the web's
-// useNotificationQueue + mergeRecent do it, so a call the server rang shows
-// up on every device with the call's label and notes, read from the local
-// call_requests mirror). Tapping a task-linked row opens that task; any other
-// deep link routes through the app's deep-link handler. Opening the center
-// marks everything seen (clears the unread badge).
+// cards the way the web's useNotificationQueue + mergeRecent do it). The
+// cards are every moment the bell can show (`NotificationQueueCards.moments`):
+// a call the server rang ("Unstuck called you about X", with the call's notes
+// from the local call_requests mirror), recaps, the brief, and every sharing
+// moment — so a push swiped out of the tray still leaves its record here, and
+// one this phone already logged is not listed twice. Tapping a task-linked row
+// opens that task; any other deep link (a card's own `deep_link`, else its
+// moment's destination) routes through the app's deep-link handler, as a push
+// tap does. Opening the center marks everything seen (clears the unread badge).
 
 import SwiftUI
 import UnstuckCore
@@ -23,8 +26,11 @@ struct NotificationCenterView: View {
 
     @State private var tasks: [TaskItem] = []
     @State private var blocks: [CalBlock] = []
-    /// The server's call cards (notification_queue, moment `call`), as bell entries.
-    @State private var callCards: [NotificationLog.Entry] = []
+    /// The server's cards (notification_queue, `NotificationQueueCards.moments`), as bell entries.
+    @State private var serverCards: [NotificationLog.Entry] = []
+    /// When the bell was last opened BEFORE this open (the .task below marks
+    /// everything seen at once) — a server card newer than this is unread.
+    @State private var seenAtOpen: Double = NotificationLog.shared.lastSeenMs
     @Environment(\.scenePhase) private var scenePhase
     // Stable for this screen open (not a per-frame key) — Android parity.
     private let now = Date().timeIntervalSince1970 * 1000
@@ -45,14 +51,14 @@ struct NotificationCenterView: View {
                     }
                     SectionLabel("Recent")
                         .padding(.top, upcoming.isEmpty ? 4 : 18).padding(.bottom, 8)
-                    let recent = NotificationQueueCards.mergeRecent(local: log.items, queue: callCards)
+                    let recent = NotificationQueueCards.mergeRecent(local: log.items, queue: serverCards)
                     if recent.isEmpty {
                         Text("Nothing yet. Reminders and recaps will show up here.")
                             .font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
                             .padding(.vertical, 24)
                     } else {
                         ForEach(recent) { n in
-                            card(dot: accentColor(n.kind), title: n.title,
+                            card(dot: dotColor(n), title: n.title,
                                  meta: "\(n.body)  ·  \(relPast(now - n.at))",
                                  action: tapAction(for: n),
                                  kindLabel: notificationKindLabel(n.kind))
@@ -70,11 +76,11 @@ struct NotificationCenterView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
             }
         }
-        .task { await loadCallCards() }
+        .task { await loadServerCards() }
         .onChange(of: scenePhase) { _, phase in
             // postgres_changes has no replay and this screen holds no channel:
             // a return to the foreground while it is open is the catch-up.
-            if phase == .active { Task { await loadCallCards() } }
+            if phase == .active { Task { await loadServerCards() } }
         }
         .task {
             log.sweepDelivered()
@@ -89,15 +95,16 @@ struct NotificationCenterView: View {
         }
     }
 
-    /// The "Unstuck called you about X" cards: the server rows of moment
-    /// `call`, each matched to its call in the local mirror by label (the
-    /// card carries no id) so the row shows the notes that were read back.
-    /// Best-effort — offline keeps what was there.
-    private func loadCallCards() async {
+    /// The server's cards for every moment the bell shows. A `call` card is
+    /// matched to its call in the local mirror by label (the card carries no
+    /// id) so the row shows the notes that were read back; every other card
+    /// is shown as the server wrote it. Best-effort — offline keeps what was
+    /// there.
+    private func loadServerCards() async {
         guard let coord = model.coordinator else { return }
-        guard let cards = try? await coord.notifications.queueCards(moment: NotificationQueueCards.callMoment) else { return }
+        guard let cards = try? await coord.notifications.queueCards(moments: NotificationQueueCards.moments) else { return }
         let calls = (try? coord.callsMirror.all()) ?? []
-        callCards = cards.map { NotificationQueueCards.entry(from: $0, calls: calls) }
+        serverCards = cards.map { NotificationQueueCards.entry(from: $0, calls: calls) }
     }
 
     // Task links open the task; any other deep link (collection share,
@@ -118,6 +125,15 @@ struct NotificationCenterView: View {
     private func openTask(_ id: String) {
         model.routeDeepLinkAfterDismiss("unstuck://task/\(id)")
         dismiss()
+    }
+
+    /// A server card that isn't a call's: coral only while unread (newer than
+    /// the last open), otherwise its kind's tone with coral folded to ink —
+    /// the colour rules. Call cards and the local log keep their accents.
+    private func dotColor(_ n: NotificationLog.Entry) -> Color {
+        guard NotificationQueueCards.isQuietCard(n) else { return accentColor(n.kind) }
+        if n.at > seenAtOpen { return theme.palette.coral }
+        return notificationAccent(kind: n.kind) == .coral ? theme.palette.ink2 : accentColor(n.kind)
     }
 
     private func accentColor(_ kind: String) -> Color {
@@ -167,10 +183,47 @@ struct NotificationCenterView: View {
 }
 
 
-/// The server's in-app call cards → bell entries (pure; tested). Web parity:
+/// The server's in-app cards → bell entries (pure; tested). Web parity:
 /// `entryFromRow` + `mergeRecent` in lib/use-notification-queue.ts.
 enum NotificationQueueCards {
     static let callMoment = "call"
+
+    /// Every notification_queue moment the bell reads (the senders'
+    /// `moment`s — notify.ts callers + the writeCard senders). NOT the task
+    /// reminders (`task_reminder` / `task_starting`): this phone rings its
+    /// own reminders locally, in its own words, and lists what's coming under
+    /// Upcoming — the server's card would double every one of them.
+    static let moments = [
+        callMoment, "session_recap", "morning_brief",
+        "task_share", "shared_task_done", "shared_session_start", "shared_session_end",
+        "collection_share", "collection_activity", "collection_task_done", "collection_late",
+        "circle_invite", "invite_claimed",
+    ]
+
+    /// moment → the bell's kind: the `kind` the same event's push carries,
+    /// so the row reads (label, dot) like the push the phone logged. The
+    /// collection senders push every list moment as `collection_share`.
+    static func kind(forMoment moment: String) -> String {
+        moment.hasPrefix("collection") ? "collection_share" : moment
+    }
+
+    /// Where a card with no `deep_link` of its own goes — its moment's
+    /// destination, the one its push uses when it has no id to carry.
+    static func fallbackLink(forMoment moment: String) -> String {
+        switch moment {
+        case "session_recap": return "unstuck://today/recap"
+        case "morning_brief": return "unstuck://today/brief"
+        case "task_share", "shared_task_done", "shared_session_start", "shared_session_end":
+            return "unstuck://tasks"
+        case "circle_invite", "invite_claimed": return "unstuck://settings"
+        default: return moment.hasPrefix("collection") ? "unstuck://collections" : "unstuck://today"
+        }
+    }
+
+    /// A server card other than a call's (those keep their own dot).
+    static func isQuietCard(_ e: NotificationLog.Entry) -> Bool {
+        e.id.hasPrefix("q_") && e.kind != "call" && e.kind != skippedKind
+    }
     /// send-call writes `body = "Unstuck is calling about <label>"` on the
     /// card (the push's copy); the label is what we key the mirror on.
     static let callBodyPrefix = "Unstuck is calling about "
@@ -224,11 +277,20 @@ enum NotificationQueueCards {
         }
     }
 
-    /// A queue row → the bell's entry: kind `call`, "Unstuck called you about
-    /// <label>", the call's notes as the body (or the card's own copy when
-    /// no call matches), the anchored task as the destination (else Today).
+    /// A queue row → the bell's entry. Any moment but `call`: the card as
+    /// written, its kind the push's, its link its own `deep_link` (an
+    /// `unstuck://` one) else the moment's destination. A `call` card: kind
+    /// `call`, "Unstuck called you about <label>", the call's notes as the
+    /// body (or the card's own copy when no call matches), the anchored task
+    /// as the destination (else Today).
     static func entry(from card: NotificationQueueCard, calls: [CallRequest]) -> NotificationLog.Entry {
         let at = Time.parseMillis(card.createdAt) ?? 0
+        guard card.moment == callMoment else {
+            let own = card.deepLink.flatMap { $0.hasPrefix("unstuck://") ? $0 : nil }
+            return NotificationLog.Entry(id: "q_\(card.id)", kind: kind(forMoment: card.moment),
+                                         title: card.title, body: card.body,
+                                         deepLink: own ?? fallbackLink(forMoment: card.moment), at: at)
+        }
         if let skipped = skippedLabel(fromBody: card.body) {
             // The card's own plain words; a tap opens the call's task, as
             // any call card does.
@@ -251,17 +313,25 @@ enum NotificationQueueCards {
     }
 
     /// Fold the server cards into the local log: newest first, capped, a
-    /// server card that duplicates a local entry (same copy within 5 min, or
-    /// both recaps within 5 min) dropped. A local "I called about X" and the
-    /// server's "Unstuck called you about X" differ in copy on purpose — the
-    /// local one is the miss, the card is the record — so both stay.
+    /// server card that duplicates a push this phone logged dropped. A card
+    /// and a local entry within 5 min are one event when they have the same
+    /// copy, are both recaps, or are the same kind with the same id-carrying
+    /// link (`unstuck://collections/<id>`, `unstuck://task/<id>` — the list
+    /// update's push is a clipped digest of its card, so the copy differs).
+    /// One local entry answers for ONE card: two events the push cooldown
+    /// folded into one push still leave the second card. A local "I called
+    /// about X" and the server's "Unstuck called you about X" differ in copy
+    /// on purpose — the local one is the miss, the card is the record — so
+    /// both stay.
     static func mergeRecent(local: [NotificationLog.Entry], queue: [NotificationLog.Entry], cap: Int = cap) -> [NotificationLog.Entry] {
+        var used = Set<Int>()
         let deduped = queue.filter { q in
-            !local.contains { l in
-                guard abs(l.at - q.at) < nearMs else { return false }
-                if l.kind == "session_recap", q.kind == "session_recap" { return true }
-                return l.title == q.title && l.body == q.body
+            let hit = local.indices.first { i in
+                !used.contains(i) && sameEvent(local[i], q)
             }
+            guard let hit else { return true }
+            used.insert(hit)
+            return false
         }
         var seen = Set<String>()
         return (local + deduped)
@@ -269,6 +339,14 @@ enum NotificationQueueCards {
             .sorted { $0.at > $1.at }
             .prefix(cap)
             .map { $0 }
+    }
+
+    static func sameEvent(_ l: NotificationLog.Entry, _ q: NotificationLog.Entry) -> Bool {
+        guard abs(l.at - q.at) < nearMs else { return false }
+        if l.kind == "session_recap", q.kind == "session_recap" { return true }
+        if l.title == q.title && l.body == q.body { return true }
+        guard l.kind == q.kind, let link = q.deepLink, link == l.deepLink else { return false }
+        return link.hasPrefix("unstuck://collections/") || link.hasPrefix("unstuck://task/")
     }
 }
 
@@ -294,6 +372,8 @@ func notificationKindLabel(_ kind: String) -> String {
     case "task_share": return "Shared with you"
     case "collection_share": return "Shared list"
     case "invite_claimed": return "Someone joined"
+    case "circle_invite": return "Added to a circle"
+    case "shared_session_start", "shared_session_end": return "Shared session"
     case "shared_task_done": return "Shared task done"
     case "call", "call_missed": return "Call from Unstuck"
     case NotificationQueueCards.skippedKind: return "Call skipped"

@@ -311,4 +311,94 @@ final class CallsMirrorTests: XCTestCase {
         let many = (0..<30).map { entry("q_\($0)", kind: "call", title: "t\($0)", body: "", at: t + Double($0)) }
         XCTAssertEqual(NotificationQueueCards.mergeRecent(local: [], queue: many).count, NotificationQueueCards.cap)
     }
+
+    // MARK: every moment the bell shows (not only calls)
+
+    /// `deep_link` (migration 084) is optional on the wire: absent (older rows,
+    /// or the column not there yet — the read is `select *`), null and blank
+    /// all decode to nil; the row's other columns are ignored.
+    func testQueueCardDecodesTheDeepLinkOptionally() throws {
+        func decode(_ json: String) throws -> NotificationQueueCard {
+            try JSONDecoder().decode(NotificationQueueCard.self, from: Data(json.utf8))
+        }
+        let base = #""id":"r1","user_id":"u","moment":"collection_activity","title":"Zubair updated Groceries","body":"Added milk","status":"in_app","dedupe_key":"k","created_at":"2026-09-24T10:00:00.000Z""#
+        XCTAssertEqual(try decode("{\(base),\"deep_link\":\"unstuck://collections/L1\"}").deepLink, "unstuck://collections/L1")
+        XCTAssertNil(try decode("{\(base)}").deepLink)
+        XCTAssertNil(try decode("{\(base),\"deep_link\":null}").deepLink)
+        XCTAssertNil(try decode("{\(base),\"deep_link\":\"  \"}").deepLink)
+        XCTAssertEqual(try decode("{\(base)}").title, "Zubair updated Groceries")
+    }
+
+    func testTheBellReadsEverySharingMomentButNotTheRemindersThePhoneRingsItself() {
+        let m = Set(NotificationQueueCards.moments)
+        for needed in ["call", "collection_activity", "collection_share", "collection_task_done", "collection_late",
+                       "task_share", "invite_claimed", "circle_invite", "shared_task_done", "session_recap", "morning_brief"] {
+            XCTAssertTrue(m.contains(needed), needed)
+        }
+        XCTAssertFalse(m.contains("task_reminder"))
+        XCTAssertFalse(m.contains("task_starting"))
+    }
+
+    /// A non-call card is shown as the server wrote it, with its push's kind,
+    /// and taps through its own `deep_link` — else its moment's destination.
+    func testANonCallCardKeepsItsCopyAndRoutesThroughItsDeepLink() {
+        func card(_ moment: String, link: String? = nil) -> NotificationQueueCard {
+            NotificationQueueCard(id: "c-\(moment)", moment: moment, title: "Zubair updated Groceries",
+                                  body: "Added milk · ticked off bread", createdAt: "2026-09-24T10:00:00.000Z", deepLink: link)
+        }
+        let e = NotificationQueueCards.entry(from: card("collection_activity", link: "unstuck://collections/L1"), calls: [])
+        XCTAssertEqual(e.id, "q_c-collection_activity")
+        XCTAssertEqual(e.kind, "collection_share", "the kind its push carries")
+        XCTAssertEqual(e.title, "Zubair updated Groceries")
+        XCTAssertEqual(e.body, "Added milk · ticked off bread")
+        XCTAssertEqual(e.deepLink, "unstuck://collections/L1")
+        XCTAssertEqual(e.at, Time.parseMillis("2026-09-24T10:00:00.000Z"))
+        XCTAssertTrue(NotificationQueueCards.isQuietCard(e))
+        // No link of its own (older row / un-migrated): the moment's destination.
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("collection_activity"), calls: []).deepLink, "unstuck://collections")
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("collection_late"), calls: []).kind, "collection_share")
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("task_share"), calls: []).deepLink, "unstuck://tasks")
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("task_share", link: "unstuck://task/T1"), calls: []).deepLink, "unstuck://task/T1")
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("invite_claimed"), calls: []).deepLink, "unstuck://settings")
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("circle_invite"), calls: []).kind, "circle_invite")
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("session_recap"), calls: []).deepLink, "unstuck://today/recap")
+        // Only an app link is routed; anything else falls back.
+        XCTAssertEqual(NotificationQueueCards.entry(from: card("task_share", link: "https://evil.example"), calls: []).deepLink, "unstuck://tasks")
+        // A call card ignores a deep_link and stays exactly as before.
+        let call = NotificationQueueCard(id: "k", moment: "call", title: "Unstuck is calling",
+                                         body: "Unstuck is calling about the dentist", createdAt: "2026-09-24T10:00:00.000Z",
+                                         deepLink: "unstuck://call/abc")
+        let ce = NotificationQueueCards.entry(from: call, calls: [])
+        XCTAssertEqual(ce.kind, "call")
+        XCTAssertEqual(ce.deepLink, "unstuck://today")
+        XCTAssertFalse(NotificationQueueCards.isQuietCard(ce))
+        XCTAssertEqual(notificationKindLabel("circle_invite"), "Added to a circle")
+        XCTAssertEqual(notificationKindLabel("shared_session_end"), "Shared session")
+    }
+
+    /// A push this phone already logged hides its card: same copy, or (a list
+    /// update's push is a clipped digest) the same kind + id-carrying link.
+    /// One logged push answers for one card only.
+    func testACardThePhoneAlreadyLoggedAsAPushIsNotListedTwice() {
+        func entry(_ id: String, _ kind: String, _ title: String, _ body: String, _ link: String?, _ at: Double) -> NotificationLog.Entry {
+            NotificationLog.Entry(id: id, kind: kind, title: title, body: body, deepLink: link, at: at)
+        }
+        let t: Double = 1_800_000_000_000
+        let local = [
+            entry("l1", "collection_share", "Zubair updated Groceries", "Added milk, bread +3", "unstuck://collections/L1", t + 2_000),
+            entry("l2", "task_share", "A task was shared with you", "Maya shared “Pay rent”.", "unstuck://task/T1", t + 1_000),
+            entry("l3", "collection_share", "Done ✓", "Maya finished “Milk”", "unstuck://collections", t),
+        ]
+        let queue = [
+            entry("q_a", "collection_share", "Zubair updated Groceries", "Added milk, bread, eggs, jam, tea", "unstuck://collections/L1", t),
+            entry("q_b", "collection_share", "Zubair updated Groceries", "Ticked off milk", "unstuck://collections/L1", t + 60_000),
+            entry("q_c", "task_share", "A task was shared with you", "Maya shared “Pay rent”.", "unstuck://tasks", t),
+            entry("q_d", "collection_share", "Done ✓", "Maya finished “Bread”", "unstuck://collections", t + 500),
+            entry("q_e", "collection_share", "Zubair updated Groceries", "Added jam", "unstuck://collections/L1", t + 20 * 60_000),
+        ]
+        let merged = NotificationQueueCards.mergeRecent(local: local, queue: queue)
+        XCTAssertEqual(Set(merged.map(\.id)), ["l1", "l2", "l3", "q_b", "q_d", "q_e"],
+                       "q_a is l1's card (same list link), q_c is l2's (same copy); l1 answers for one card only, so q_b stays; a generic link with other copy (q_d) and a later update (q_e) stay")
+        XCTAssertEqual(merged.first?.id, "q_e", "newest first")
+    }
 }
