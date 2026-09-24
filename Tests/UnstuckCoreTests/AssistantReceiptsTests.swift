@@ -223,7 +223,7 @@ final class AssistantReceiptsTests: XCTestCase {
         XCTAssertEqual(r("set_usable_minutes", "ok: usable time set — weekdays 240 min")?.label, "usable time set — weekdays 240 min")
         XCTAssertEqual(r("set_notification_level", "ok: notifications set to calm")?.icon, .pencil)
         XCTAssertEqual(r("set_reminder_lead", "ok: reminders 10 min before")?.label, "reminders 10 min before")
-        XCTAssertEqual(r("set_ritual", "ok: morning moment on"), Receipt(icon: .pencil, label: "morning moment on"))
+        XCTAssertEqual(r("set_ritual", "ok: Morning plan on"), Receipt(icon: .pencil, label: "Morning plan on"))
     }
 
     func testCallToolsPartB() {

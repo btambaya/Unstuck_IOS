@@ -1,6 +1,6 @@
-// Device-local user preferences (theme / focus / sound / accessibility),
-// UserDefaults-backed and never synced — the iOS mirror of Android's
-// SettingsStore + SettingsState. Held as a single shared instance on
+// Device-local user preferences (theme / text size / focus options /
+// background noise / the AI switch), UserDefaults-backed and never synced —
+// the iOS mirror of Android's SettingsStore + SettingsState. Held as a single shared instance on
 // AppModel (`model.settings`) so the whole app observes one source of
 // truth; every property writes straight back to UserDefaults so the value
 // survives relaunch.
@@ -8,6 +8,12 @@
 // Notification LEVEL + reminder lead deliberately live in NotificationPrefs
 // (already wired to the scheduler) — this store only carries the scalars iOS
 // can act on locally.
+//
+// Slim Settings (PLAN.md, 2026-09-24): Accent, High contrast, the in-app
+// Reduce motion, "Hide right rail" and the three sounds (start chime, overrun
+// bell, completion — nothing ever played them) are gone. Their stored values
+// are NOT wiped; they are simply never read again. Density + Larger type
+// merged into one Text size (read once from the old keys, then its own key).
 
 import SwiftUI
 import UnstuckCore
@@ -26,18 +32,13 @@ extension ThemePref {
     }
 }
 
-/// Ambient sound bed for the focus "ambient" treatment. iOS generates brown
-/// noise procedurally (AmbientAudio); `pink` reuses the same bed (we expose
-/// the choice for Android parity, but both map to the one available loop).
+/// The stored background-noise value (the old Ambient setting's raw values,
+/// kept so older builds read it). iOS generates one procedural brown bed
+/// (AmbientAudio): the Focus screen's speaker button is the setting now —
+/// on stores `.brown`; a stored `pink` (the same loop) reads as on.
 enum AmbientSound: String, CaseIterable, Sendable {
     case off, brown, pink
-}
-
-/// Text density (Settings · Interface). Android folds this into one font
-/// scale (compact 0.94× / regular 1.0× / comfy 1.08×); iOS maps the same
-/// intent onto DynamicTypeSize steps (see `typeStepShift`).
-enum DensityPref: String, CaseIterable, Sendable {
-    case compact, regular, comfy
+    var isOn: Bool { self != .off }
 }
 
 @MainActor
@@ -54,92 +55,59 @@ final class SettingsState {
 
     init(defaults: UserDefaults = .standard) { self.d = defaults }
 
-    // MARK: Interface
+    // MARK: Appearance
 
     var theme: ThemePref = .system {
         didSet { if !loading { d.set(theme.rawValue, forKey: "unstuck.theme") } }
     }
 
-    /// Accent palette (indigo+coral default / periwinkle+rose / forest+amber).
-    /// Applied at the app root via `unstuckTheme(accent:)`.
-    var accent: Accent = .indigo {
-        didSet { if !loading { d.set(accent.rawValue, forKey: "unstuck.accent") } }
+    /// Settings → Appearance → Text size (Smaller / Default / Larger), applied
+    /// at the app root as DynamicTypeSize steps (`TextSizePref.typeStepShift`).
+    var textSize: TextSizePref = .standard {
+        didSet { if !loading { d.set(textSize.rawValue, forKey: Self.textSizeKey) } }
     }
-
-    /// Text density. Android: 0.94× / 1.0× / 1.08× font scale.
-    var density: DensityPref = .regular {
-        didSet { if !loading { d.set(density.rawValue, forKey: "unstuck.density") } }
-    }
+    nonisolated static let textSizeKey = "unstuck.textSize"
 
     /// The AI kill-switch the published privacy policy promises (§21: "Settings
-    /// → Interface → AI Assistant. Turn it off entirely"). Default ON; when OFF
-    /// there is no launcher, no panel, no voice, and open-assistant deep links
-    /// are ignored. Device-local, never synced. Settings · Interface.
+    /// → Assistant & privacy → AI Assistant. Turn it off entirely"). Default ON;
+    /// when OFF there is no launcher, no panel, no voice, open-assistant deep
+    /// links are ignored, and a call that arrives is declined (CallCoordinator).
+    /// Device-local, never synced.
     var assistantEnabled: Bool = true {
-        didSet { if !loading { d.set(assistantEnabled, forKey: "unstuck.assistantEnabled") } }
+        didSet { if !loading { d.set(assistantEnabled, forKey: Self.assistantEnabledKey) } }
     }
+    nonisolated static let assistantEnabledKey = "unstuck.assistantEnabled"
 
-    // MARK: Accessibility
-
-    var reduceMotion: Bool = false {
-        didSet { if !loading { d.set(reduceMotion, forKey: "unstuck.reduceMotion") } }
-    }
-
-    /// Larger type: Android applies +1.15× on top of density. iOS expresses
-    /// the same intent as +2 DynamicTypeSize steps (see `typeStepShift`).
-    var largerType: Bool = false {
-        didSet { if !loading { d.set(largerType, forKey: "unstuck.largerType") } }
-    }
-
-    /// High contrast (Android `highContrast`). Stored for parity; consumers can
-    /// stiffen hairlines / text contrast off this flag.
-    var highContrast: Bool = false {
-        didSet { if !loading { d.set(highContrast, forKey: "unstuck.highContrast") } }
-    }
-
-    /// Density + larger-type folded into one DynamicTypeSize step shift,
-    /// applied at the app root. All app fonts are `Font.custom(_:size:)`,
-    /// which scales relative to body — so shifting the type size scales
-    /// every text, like Android's LocalDensity fontScale multiplier.
-    var typeStepShift: Int {
-        var steps = 0
-        switch density {
-        case .compact: steps -= 1
-        case .comfy: steps += 1
-        case .regular: break
-        }
-        if largerType { steps += 2 }
-        return steps
+    /// Read before AppModel is up (a killed-state VoIP launch): ON unless the
+    /// user turned it off.
+    nonisolated static func storedAssistantEnabled(_ d: UserDefaults = .standard) -> Bool {
+        d.object(forKey: assistantEnabledKey) == nil ? true : d.bool(forKey: assistantEnabledKey)
     }
 
     // MARK: Focus
 
-    /// Default focus length / new-task estimate (minutes). Android: 25.
+    /// The estimate a new task starts with (minutes). The New Task sheet
+    /// remembers the last one picked here (same key, so the assistant's
+    /// set_focus_defaults still sets it). Android: 25.
     var focusDefaultMin: Int = 25 {
         didSet { if !loading { d.set(focusDefaultMin, forKey: "unstuck.focusDefaultMin") } }
     }
 
-    /// Soft overrun grace (minutes); 0 = Never. Android: 5.
+    /// Focus ⋯ Options → "Check in when I run over" (minutes); 0 = Never. Android: 5.
     var focusOverrunMin: Int = 5 {
         didSet { if !loading { d.set(focusOverrunMin, forKey: "unstuck.focusOverrunMin") } }
     }
 
-    /// When on, leaving focus via "← Out" records the session instead of
-    /// discarding it. Android: true.
+    /// Focus ⋯ Options → "Ask before I leave a session" (also "Don't ask
+    /// again" on that question). Android: true.
     var focusSoftExit: Bool = true {
         didSet { if !loading { d.set(focusSoftExit, forKey: "unstuck.focusSoftExit") } }
     }
 
-    /// When on, Pause asks "Why are you pausing?"; off pauses silently.
+    /// Focus ⋯ Options → "Ask why I'm pausing" (also "Don't ask again" on
+    /// that question); off pauses silently.
     var focusPauseReasons: Bool = true {
         didSet { if !loading { d.set(focusPauseReasons, forKey: "unstuck.focusPauseReasons") } }
-    }
-
-    /// Hide the right rail while focusing (Android `focusCollapseRail`). iOS has
-    /// no right rail in the focus surface today, so this is stored for parity;
-    /// the focus screen can honor it once a rail/side-panel exists. Android: true.
-    var focusCollapseRail: Bool = true {
-        didSet { if !loading { d.set(focusCollapseRail, forKey: "unstuck.focusCollapseRail") } }
     }
 
     /// Treatment a fresh focus session starts in. Android: AMBIENT.
@@ -149,7 +117,8 @@ final class SettingsState {
 
     /// Hands-Free Focus Copilot — spoken progress alerts during a focus block
     /// (HALFWAY / T-5 / AT_TIME / OVERRUN, gated by the notification level).
-    /// 100% on-device TTS, zero LLM. Default ON (speak-only). Settings · Focus.
+    /// 100% on-device TTS, zero LLM. Default ON (speak-only). Focus ⋯ Options →
+    /// "Talk me through the session".
     var focusSpokenCoach: Bool = true {
         didSet { if !loading { d.set(focusSpokenCoach, forKey: "unstuck.focusSpokenCoach") } }
     }
@@ -157,22 +126,15 @@ final class SettingsState {
     /// Hands-free VOICE replies — after a question prompt, open a short
     /// on-device mic window so you can say "add ten" / "stop" / "keep going"
     /// without touching the screen. Requires the spoken coach. Default OFF
-    /// (the mic is opt-in). Settings · Focus.
+    /// (the mic is opt-in). Focus ⋯ Options, under the coach.
     var focusVoiceReplies: Bool = false {
         didSet { if !loading { d.set(focusVoiceReplies, forKey: "unstuck.focusVoiceReplies") } }
     }
 
-    // MARK: Sound
+    // MARK: Background noise
 
-    var soundStartChime: Bool = true {
-        didSet { if !loading { d.set(soundStartChime, forKey: "unstuck.soundStartChime") } }
-    }
-    var soundOverrunBell: Bool = true {
-        didSet { if !loading { d.set(soundOverrunBell, forKey: "unstuck.soundOverrunBell") } }
-    }
-    var soundCompletion: Bool = false {
-        didSet { if !loading { d.set(soundCompletion, forKey: "unstuck.soundCompletion") } }
-    }
+    /// The Focus screen's speaker button — it IS the setting and remembers
+    /// on/off (`.brown` on, `.off` off; a stored `pink` reads as on).
     var ambient: AmbientSound = .off {
         didSet { if !loading { d.set(ambient.rawValue, forKey: "unstuck.ambient") } }
     }
@@ -186,24 +148,23 @@ final class SettingsState {
         loading = true
         defer { loading = false }
         theme = ThemePref(rawValue: d.string(forKey: "unstuck.theme") ?? "") ?? .system
-        accent = Accent(rawValue: d.string(forKey: "unstuck.accent") ?? "") ?? .indigo
-        density = DensityPref(rawValue: d.string(forKey: "unstuck.density") ?? "") ?? .regular
+        // Text size: its own key once chosen; until then, the old Density /
+        // Larger type values (never wiped) decide it.
+        if let stored = d.string(forKey: Self.textSizeKey), let pref = TextSizePref(rawValue: stored) {
+            textSize = pref
+        } else {
+            textSize = TextSizePref.migrated(density: d.string(forKey: "unstuck.density"),
+                                             largerType: d.bool(forKey: "unstuck.largerType"))
+        }
         // ON unless the user explicitly turned the assistant off.
-        assistantEnabled = d.object(forKey: "unstuck.assistantEnabled") == nil ? true : d.bool(forKey: "unstuck.assistantEnabled")
-        reduceMotion = d.bool(forKey: "unstuck.reduceMotion")   // default false
-        largerType = d.bool(forKey: "unstuck.largerType")       // default false
-        highContrast = d.bool(forKey: "unstuck.highContrast")   // default false
+        assistantEnabled = Self.storedAssistantEnabled(d)
         focusDefaultMin = d.object(forKey: "unstuck.focusDefaultMin") == nil ? 25 : d.integer(forKey: "unstuck.focusDefaultMin")
         focusOverrunMin = d.object(forKey: "unstuck.focusOverrunMin") == nil ? 5 : d.integer(forKey: "unstuck.focusOverrunMin")
         focusSoftExit = d.object(forKey: "unstuck.focusSoftExit") == nil ? true : d.bool(forKey: "unstuck.focusSoftExit")
         focusPauseReasons = d.object(forKey: "unstuck.focusPauseReasons") == nil ? true : d.bool(forKey: "unstuck.focusPauseReasons")
-        focusCollapseRail = d.object(forKey: "unstuck.focusCollapseRail") == nil ? true : d.bool(forKey: "unstuck.focusCollapseRail")
         defaultTreatment = FocusTreatment(rawValue: d.string(forKey: "unstuck.defaultTreatment") ?? "") ?? .ambient
         focusSpokenCoach = d.object(forKey: "unstuck.focusSpokenCoach") == nil ? true : d.bool(forKey: "unstuck.focusSpokenCoach")
         focusVoiceReplies = d.object(forKey: "unstuck.focusVoiceReplies") == nil ? false : d.bool(forKey: "unstuck.focusVoiceReplies")
-        soundStartChime = d.object(forKey: "unstuck.soundStartChime") == nil ? true : d.bool(forKey: "unstuck.soundStartChime")
-        soundOverrunBell = d.object(forKey: "unstuck.soundOverrunBell") == nil ? true : d.bool(forKey: "unstuck.soundOverrunBell")
-        soundCompletion = d.bool(forKey: "unstuck.soundCompletion")   // default false
         ambient = AmbientSound(rawValue: d.string(forKey: "unstuck.ambient") ?? "") ?? .off
     }
 }

@@ -27,7 +27,7 @@ final class AppModel {
     let settings = SettingsState.loaded()
     /// The gateway's device-local PA prefs (ritual toggles + dismissed moment
     /// ids) — ONE observable instance so the Today card, the interview picker,
-    /// Settings → "What Unstuck knows" and the `set_ritual` tool all see the
+    /// Settings → "What Unstuck remembers" and the `set_ritual` tool all see the
     /// same state. Wiped on sign-out (scrubDeviceLocalUserContent).
     let paPrefs = PAPrefs()
     private(set) var coordinator: SyncCoordinator?
@@ -173,7 +173,7 @@ final class AppModel {
     @ObservationIgnored private var ritualsPushGen = 0
     /// The opt-in proactive calls (morning plan / evening wrap-up / check-in
     /// after a block) — `notification_preferences.call_*` (migration 072).
-    /// Observed by Settings › Calls; the device cache is CallSettings.proactive,
+    /// Observed by Settings › Notifications & calls; the device cache is CallSettings.proactive,
     /// re-pushed on the next hydrate while `pendingProactivePush` is set.
     var callProactivePrefs: CallProactivePrefs = CallSettings.proactive
     @ObservationIgnored var callPrefsPushGen = 0
@@ -361,7 +361,7 @@ final class AppModel {
         return a
     }
 
-    /// The AI kill-switch (Settings → Interface → "AI Assistant"). OFF removes
+    /// The AI kill-switch (Settings → Assistant & privacy → "AI Assistant"). OFF removes
     /// the launcher, the panel and voice entirely — the promise the published
     /// privacy policy makes. Device-local, never synced.
     var assistantEnabled: Bool { settings.assistantEnabled }
@@ -502,7 +502,7 @@ final class AppModel {
         // Arm the ONE-TIME guided-tour auto-welcome for accounts that finish
         // onboarding after the tour shipped (it surfaces on the next Today
         // appearance). Existing accounts only ever reach the tour via
-        // Settings → Account → Product tour.
+        // Settings → Replay the tour.
         TourStore().save { $0.eligible = true }
 
         // Seed life areas (single source — only when empty).
@@ -3224,7 +3224,7 @@ enum AIConsentHost: Equatable {
     case callSettings
     /// A task's "Call me about this".
     case taskEditor
-    /// Settings → Interface → AI data sharing.
+    /// Settings → Assistant & privacy → AI data sharing.
     case settings
 }
 

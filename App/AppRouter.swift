@@ -14,8 +14,14 @@ final class AppRouter {
         /// this; Today's week-pill keeps its local sheet).
         case insights
         /// Settings presented router-side, optionally deep-linked to a section
-        /// ("Notifications" / "Interface") — the tour's settings steps.
+        /// ("Notifications" / "Appearance" — the tour's settings steps; any
+        /// SettingsDestination id or alias from a link or the assistant).
         case settings(section: String?)
+        /// Tasks → the "Edit" pill: one sheet for areas AND tags (they moved
+        /// out of Settings — slim settings, 2026-09-24). Router-owned so the
+        /// assistant's open_screen areas and the old `?section=areas` links
+        /// land on it too.
+        case areasTags
         var id: Int { hashValue }
     }
 
@@ -50,8 +56,8 @@ final class AppRouter {
     /// deep-link path dismisses it and presents the target on its onDismiss.
     var showTalk = false
     /// The Assistant panel, driven by the bottom-trailing ✦ launcher. Assistant
-    /// ONLY since the redesign — feedback moved to Settings → Account → "Send
-    /// feedback" (matching the web). Never set this directly: go through
+    /// ONLY since the redesign — feedback moved to Settings → "Send feedback"
+    /// (matching the web). Never set this directly: go through
     /// `AppModel.openAssistant()`, which honours the AI kill-switch.
     var showAssistant = false
     /// When set, the Focus surface is presented full-screen for this task.

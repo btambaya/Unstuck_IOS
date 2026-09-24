@@ -31,6 +31,7 @@ struct MainTabScaffold: View {
                 case .inbox: InboxView()
                 case .insights: NavigationStack { AnalyticsView() }
                 case .settings(let section): SettingsView(section: section)
+                case .areasTags: AreasTagsSheet()
                 }
             }
             // The Assistant panel. `showAssistant` is only ever set through

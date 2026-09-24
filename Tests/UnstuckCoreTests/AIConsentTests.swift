@@ -82,7 +82,7 @@ final class AIConsentTests: XCTestCase {
         let d = AIConsent.decline(.callsOnOpen)
         XCTAssertTrue(d.turnCallsOff)
         XCTAssertEqual(d.note, AIConsent.callsTurnedOffNote)
-        XCTAssertTrue(d.note.contains("Settings › Calls"))
+        XCTAssertTrue(d.note.contains("Settings › Notifications & calls"))
     }
 
     func testEveryActionHasAShortLine() {

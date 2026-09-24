@@ -22,7 +22,7 @@ import UnstuckCore
 import UnstuckDesign
 
 struct TourDemoFocus: View {
-    /// Kills the ring's easing (Settings · Accessibility → Reduce motion).
+    /// Kills the ring's easing (the phone's own Reduce Motion).
     let reduceMotion: Bool
     /// Current step id — the Capture pill is live ONLY on the capture step,
     /// and the demo sheet closes/resets on any step change (the surface stays

@@ -26,7 +26,9 @@ repo ([github.com/btambaya/Unstuck](https://github.com/btambaya/Unstuck)).
 > (agentic chat + realtime voice, rebuilt to the web cockpit on 2026-08-02)
 > became the AI gateway on 2026-09-02: cross-device memory (`profile_facts`),
 > the same 56 tools and honest harness as the web, a gateway card on Today
-> with a first-run interview, Settings → "What Unstuck knows", and "Unstuck
+> with a first-run interview, Settings → Assistant & privacy → "What Unstuck
+> remembers" (Settings is slim since 2026-09-24: Account, Notifications &
+> calls, Assistant & privacy, People, Appearance), and "Unstuck
 > calls you" (CallKit + VoIP push, calls booked by voice, text, or the task
 > editor). Talk's audio engine restarts on iOS configuration changes as of
 > build 52 (it used to die 100 ms in on real devices). Sharing is ONE Share

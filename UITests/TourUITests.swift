@@ -259,7 +259,7 @@ final class TourUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Pause the tour? Your progress is saved."]
             .firstMatch.waitForExistence(timeout: 6), "expected the inline pause confirm")
         XCTAssertTrue(app.staticTexts
-            .matching(NSPredicate(format: "label CONTAINS 'Settings → Account → Product tour'"))
+            .matching(NSPredicate(format: "label CONTAINS 'Settings → Replay the tour'"))
             .firstMatch.exists, "the confirm names the Settings path")
         snap("pause-01-confirm")
         app.buttons["Keep going"].firstMatch.tap()
@@ -299,6 +299,51 @@ final class TourUITests: XCTestCase {
         usleep(600_000)
         XCTAssertFalse(app.buttons["Resume tour"].exists, "✕ removes the chip for good")
         snap("pause-05-chip-dismissed")
+    }
+
+    /// Slim settings (2026-09-24): the FULL tour's personalization step opens
+    /// Settings → Appearance as a PUSHED screen, so the scoped lockdown holds —
+    /// Theme and Text size work under the panel, but Back (to the hub with
+    /// Sign out / Delete my account) is swallowed.
+    func testFullTourAppearanceStepIsScopedToAppearance() throws {
+        XCTAssertTrue(app.staticTexts["Welcome to Unstuck"].firstMatch.waitForExistence(timeout: 20))
+        app.staticTexts["Full guided tour"].firstMatch.tap()
+        expectStep("This is Unstuck", shot: "full-00-step1")
+        let target = app.staticTexts["Make it yours"].firstMatch
+        for _ in 0..<24 where !target.exists {
+            for label in ["Continue", "Open the Assistant", "Skip"] {
+                let b = app.buttons[label].firstMatch
+                if b.exists && b.isHittable { b.tap(); break }
+            }
+            usleep(1_600_000)
+        }
+        expectStep("Make it yours", shot: "full-01-personalization",
+                   body: "Pick light or dark and your text size here")
+        XCTAssertTrue(app.staticTexts["How it looks."].firstMatch.waitForExistence(timeout: 8),
+                      "the personalization step must open Settings → Appearance")
+        // Inside the pushed section the controls pass through…
+        let larger = app.buttons["Text size: Larger"].firstMatch
+        XCTAssertTrue(larger.waitForExistence(timeout: 6), "Text size must be reachable on the step")
+        larger.tap(); usleep(700_000)
+        XCTAssertTrue(app.buttons["Text size: Larger"].firstMatch.isSelected, "a Text size tap must land")
+        app.buttons["Text size: Default"].firstMatch.tap(); usleep(700_000)
+        // …but Back to the hub is swallowed (the bar is claimed).
+        let backButton = app.navigationBars["Appearance"].buttons.firstMatch
+        if backButton.exists {
+            backButton.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        } else {
+            app.coordinate(withNormalizedOffset: CGVector(dx: 0.09, dy: 0.108)).tap()
+        }
+        usleep(1_000_000)
+        XCTAssertTrue(app.staticTexts["How it looks."].firstMatch.exists,
+                      "Back must be swallowed on the step — the hub (Sign out / Delete) stays out of reach")
+        XCTAssertFalse(app.descendants(matching: .any)["settings-row-account"].firstMatch.isHittable,
+                       "the hub must not be reachable mid-tour")
+        snap("full-02-personalization-locked")
+        tapPrimary()
+        expectStep("You’re ready to begin", shot: "full-03-finish", body: "Pick one real next step")
+        tapPrimary("Begin")
+        XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 8))
     }
 
     /// ROUND-3 key-window handback: the Ask field makes the TOUR window key

@@ -26,7 +26,7 @@
 //  • One-time auto-welcome on Today for accounts that finish onboarding AFTER
 //    this shipped (TourState.eligible — armed in AppModel.completeOnboarding).
 //    Existing accounts are never ambushed.
-//  • Settings → Account → "Product tour" (openExplicit): resume at the saved
+//  • Settings → "Replay the tour" (openExplicit): resume at the saved
 //    step, or the welcome if fresh.
 
 import SwiftUI
@@ -212,7 +212,7 @@ final class TourModel {
         }
     }
 
-    /// Settings → Account → "Product tour": resume an UNFINISHED run at its
+    /// Settings → "Replay the tour": resume an UNFINISHED run at its
     /// saved step; a FINISHED (done) or fresh tour shows the welcome card over
     /// Today — web restart semantics, never a "resume" at the last step.
     func openExplicit() {
@@ -301,7 +301,7 @@ final class TourModel {
     func resumeFromChip() { resume() }
 
     /// Chip ✕ — the chip never returns for THIS run (persisted); the
-    /// Settings → Account → Product tour path remains.
+    /// Settings → Replay the tour path remains.
     func dismissChip() {
         let saved = store.save { $0.chipDismissed = true }
         chipEligible = tourChipEligible(saved)
@@ -718,6 +718,9 @@ final class TourModel {
 /// never ambush mid-task. Explicit opens show wherever asked.
 struct TourRootView: View {
     @Environment(AppModel.self) private var model
+    /// The phone's own Reduce Motion (the in-app switch is gone — slim
+    /// settings, 2026-09-24): the demo ring and the spotlight pulse follow it.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let tour = model.tour
@@ -791,11 +794,11 @@ struct TourRootView: View {
                 // Focus/capture steps: the tour's own DEMO focus surface —
                 // under the spotlight + panel, above the swallow layer.
                 if showDemo {
-                    TourDemoFocus(reduceMotion: model.settings.reduceMotion,
+                    TourDemoFocus(reduceMotion: reduceMotion,
                                   stepID: tour.currentStep.id)
                         .transition(.opacity)
                 }
-                TourSpotlight(rect: tour.targetRect, reduceMotion: model.settings.reduceMotion)
+                TourSpotlight(rect: tour.targetRect, reduceMotion: reduceMotion)
                     .allowsHitTesting(false)
                 // ONE panel with a flipping alignment — a single structural
                 // identity, so the dock flip is a frame change (not a remount)
@@ -895,7 +898,7 @@ struct TourWelcomeCard: View {
                     }
                     .padding(.top, 18)
                     // Quiet footer (round 2): the tour is never a commitment.
-                    Text("Pause anytime — pick it back up from Settings → Account → Product tour.")
+                    Text("Pause anytime — replay it from Settings → Replay the tour.")
                         .font(UFont.sans(11.5))
                         .lineSpacing(2.5)
                         .foregroundStyle(theme.palette.ink4)
@@ -1251,7 +1254,7 @@ private struct TourHostRoot: View {
     var body: some View {
         TourRootView()
             .environment(model)
-            .unstuckTheme(accent: model.settings.accent)
+            .unstuckTheme()
     }
 }
 
@@ -1259,7 +1262,7 @@ private struct TourHostRoot: View {
 /// scene. Mounted from MainTabScaffold (signed-in + onboarded only).
 struct TourWindowMounter: UIViewRepresentable {
     let model: AppModel
-    /// Follows Settings · Interface theme (nil = system).
+    /// Follows Settings · Appearance theme (nil = system).
     let colorSchemeOverride: ColorScheme?
 
     @MainActor

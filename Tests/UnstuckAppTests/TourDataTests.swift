@@ -7,6 +7,7 @@
 
 import SwiftUI
 import UIKit
+import UnstuckCore
 import UnstuckDesign
 import XCTest
 @testable import Unstuck
@@ -59,7 +60,13 @@ final class TourDataTests: XCTestCase {
         XCTAssertEqual(notif.view, .settings)
         XCTAssertEqual(notif.section, "Notifications")
         let pers = TourScript.full.first { $0.id == "personalization" }!
-        XCTAssertEqual(pers.section, "Interface")
+        XCTAssertEqual(pers.section, "Appearance")
+        // A PUSHED Settings screen (the scoped lockdown needs one), and the
+        // same place every alias of the old name lands.
+        XCTAssertEqual(SettingsDestination.from(section: pers.section), .appearance)
+        XCTAssertTrue(SettingsDestination.from(section: pers.section).isSettingsScreen)
+        XCTAssertTrue(SettingsDestination.from(section: notif.section).isSettingsScreen)
+        XCTAssertFalse(pers.body.contains("accent"), "no control that no longer exists")
     }
 
     func testFocusStepsPresentTheDemoSurface() {
@@ -130,7 +137,7 @@ final class TourDataTests: XCTestCase {
         XCTAssertTrue(tourAnswer(for: "Does it work OFFLINE?").contains("works offline"))
         // The restart answer names the ACTUAL Settings row label ("Product
         // tour" — SettingsFeature's Account card), not a phantom one.
-        XCTAssertTrue(tourAnswer(for: "how do I restart the tour").contains("Settings → Account → Product tour"))
+        XCTAssertTrue(tourAnswer(for: "how do I restart the tour").contains("Settings → Replay the tour"))
         XCTAssertTrue(tourAnswer(for: "why is unstuck different from a task manager")
             .contains("A planner assumes deciding is the hard part"))
         XCTAssertTrue(tourAnswer(for: "difference between partner and assign?").contains("Partner:"))
@@ -745,8 +752,11 @@ final class TourPanelMeasureTests: XCTestCase {
             tour.requestPause()
             let confirm = height(TourPanel(tour: tour, placement: expanded))
             tour.cancelPause()
-            XCTAssertEqual(confirm - controls, 67, accuracy: 1,
-                           "the inline pause confirm adds 67pt of FOOTER — a compile-time chrome "
+            // 49pt since the confirm names "Settings → Replay the tour" (one
+            // line; the old "Settings → Account → Product tour" wrapped to two
+            // and made it 67) — slim settings, 2026-09-24.
+            XCTAssertEqual(confirm - controls, 49, accuracy: 1,
+                           "the inline pause confirm adds 49pt of FOOTER — a compile-time chrome "
                            + "constant under-reports the panel by exactly that much")
         }
     }
@@ -786,8 +796,8 @@ final class TourPanelMeasureTests: XCTestCase {
     /// that its footer grew. The body's own geometry callback cannot — the copy
     /// above the footer is untouched when the confirm opens, so nothing about
     /// the body's height changes and `onGeometryChange` never fires. Without a
-    /// second trigger the rule keeps placing a 358pt panel that is really 425,
-    /// and the uncapped branch lets those 67pt run into the ring.
+    /// second trigger the rule keeps placing a 358pt panel that is really 407,
+    /// and the uncapped branch lets those 49pt run into the ring.
     func testTheReportedHeightFollowsTheFooterNotAConstant() {
         tourOn("today") { tour in
             let (window, _) = mount(TourPanel(tour: tour, placement: expanded))
@@ -797,8 +807,8 @@ final class TourPanelMeasureTests: XCTestCase {
             XCTAssertEqual(withControls, 358, accuracy: 2, "the panel's natural height")
             tour.requestPause()
             settle(window)
-            XCTAssertEqual(tour.panelExpandedHeight - withControls, 67, accuracy: 2,
-                           "the inline pause confirm makes the panel 67pt taller and the "
+            XCTAssertEqual(tour.panelExpandedHeight - withControls, 49, accuracy: 2,
+                           "the inline pause confirm makes the panel 49pt taller and the "
                            + "placement rule has to be told")
             tour.cancelPause()
             settle(window)

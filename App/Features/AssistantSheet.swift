@@ -6,7 +6,7 @@
 //
 // There is no "new chat": the sheet opens scrolled to the top of the chips
 // block, so the suggestions fill the viewport and scrolling UP reveals the
-// conversation's history. Feedback now lives in Settings → Account → "Send
+// conversation's history. Feedback now lives in Settings → "Send
 // feedback" (the panel is the assistant, nothing else).
 //
 // Everything the agent changes comes back as a deterministic ✓ receipt with

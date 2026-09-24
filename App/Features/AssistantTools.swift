@@ -173,9 +173,9 @@ protocol AssistantAppState: AnyObject {
     func setRitual(_ ritual: String, on: Bool) -> Bool
     /// "system" | "light" | "dark".
     func setTheme(_ theme: String) -> Bool
-    /// Only the non-nil fields change.
+    /// Only the non-nil fields change (Focus ⋯ Options + the new-task estimate).
     func setFocusDefaults(defaultMinutes: Int?, overrunMinutes: Int?, softExit: Bool?, pauseReasons: Bool?) -> Bool
-    /// "off" | "brown" | "pink".
+    /// Background noise — the Focus screen's speaker button: "on" | "off".
     func setAmbientSound(_ sound: String) -> Bool
     // ── first-run interview ──
     /// True until the get-to-know-you interview is finished or skipped on
@@ -209,9 +209,12 @@ struct FocusFinishOutcome: Equatable, Sendable {
     var ranSec: Int? = nil
 }
 
-/// The `get_settings` read (2026-09-20). Strings carry the registry's
-/// vocabulary (notification level calm/balanced/coach, theme
-/// system/light/dark, ambient off/brown/pink); nil budget = never set.
+/// The `get_settings` read (2026-09-20; slim settings 2026-09-24). Strings
+/// carry the registry's vocabulary (notification level calm/balanced/coach,
+/// theme system/light/dark, text size smaller/default/larger, background
+/// noise on/off); nil budget = never set. Nothing here names a control that
+/// no longer exists (accent, density, high contrast, in-app reduce motion,
+/// sounds, hide rail).
 struct AssistantSettingsSnapshot: Equatable, Sendable {
     var notificationLevel: String
     var reminderLeadMin: Int
@@ -222,6 +225,9 @@ struct AssistantSettingsSnapshot: Equatable, Sendable {
     var focusSoftExit: Bool
     var focusPauseReasons: Bool
     var theme: String
+    /// "smaller" | "default" | "larger" (Settings → Appearance → Text size).
+    var textSize: String = "default"
+    /// Background noise (the Focus screen's speaker button): "on" | "off".
     var ambient: String
     /// morning / evening / friday / sunday → on.
     var rituals: [String: Bool]

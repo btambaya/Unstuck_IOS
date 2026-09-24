@@ -92,6 +92,111 @@ Ahmad, on the New task sheet's Share section (a big card per connected person, e
   state block, the removed circle `.task`/`.onDisappear` lines around `.onAppear(perform: seedPrefill)`, the share
   section functions and the share block at the end of `submit()`.
 
+## Slim Settings (branch settings/ios, 2026-09-24) — not shipped yet
+
+Ahmad approved PLAN.md ("Slim Settings", scratchpad swt/PLAN.md) the same day: ALL of it before launch (Phase A +
+Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and rename the three "morning" things.
+
+- **Hub 14 → 7** (`SettingsFeature.swift`): Account card (name + email → Account) · Notifications & calls ·
+  Assistant & privacy · People · Appearance · Send feedback (the sheet) · Replay the tour (locked while a tour runs);
+  footer `Terms · Privacy · Unstuck 1.1.1 (96)` (real 44-pt buttons, a11y labels). NavigationStack(path:) of
+  `SettingsDestination` (UnstuckCore/Logic/SlimSettings.swift). Every section is a PUSHED screen — the tour's scoped
+  lockdown needs `nav.viewControllers.count > 1`, which is why Appearance is never inline on the hub.
+  Fixed test IDs: `settings-row-account|notifications|assistant|people|appearance|feedback|tour`, `settings-terms`,
+  `settings-privacy`; `settings-ai-data-sharing` kept.
+- **Account**: Display name · Password · Export everything ("Download a copy of everything you've put in Unstuck";
+  label kept for the privacy policy) · Sign out (unsynced warning kept) · Delete my account (last, red).
+- **Notifications & calls** (`NotificationSettingsScreen.swift`, id still `Notifications`): a status line only when
+  iOS notifications are off/never asked (Turn on → request or iOS Settings; hidden under UITEST_SEED) · "How much
+  Unstuck checks in" with `NotificationLevel.plainLine` (the old Android `blurb` is gone) + the coach-pace note ·
+  "Remind me before a task" Off/5/10/15 · the Calls block (`CallSettingsView`, now embedded): one line "Calls need the
+  Assistant and AI data sharing · Turn on" when either is off (`CallsBlockState`), else "Let Unstuck call this phone",
+  and only while it's on: "Only call between [06:00] and [23:00]", Morning call, Evening call, Call me after a focus
+  block (+ the existing will-it-ring warnings), "Try a test call"; fix-it lines only when broken (mic refused, no VoIP
+  token → "Try again"). The call-lead row is gone. Tour anchor `.notifBody` stays on the level card.
+- **Assistant & privacy**: AI Assistant ("Off hides the Assistant, Talk and calls") · AI data sharing (same row, id,
+  host `.settings`) · What Unstuck remembers › (FactsPanel: plain categories About me / Routine / Limits / Likes /
+  Other; always shown, only Add hides when the AI is off; the routine switches + tone note are gone from the phone —
+  nothing on iOS runs them, values stay in pa_rituals) · Delete conversation history (always shown, tour-locked).
+- **People**: title "People you share with."; the invite-code box sits behind "Have an invite code?".
+- **Appearance**: Theme + Text size (Smaller / Default / Larger = −1 / 0 / +2 DynamicTypeSize steps). `TextSizePref`
+  reads the old Density / Larger type once (Larger type wins; comfy → Larger, compact → Smaller) until
+  `unstuck.textSize` is written. Accent, High contrast, in-app Reduce motion, Hide rail and the three sounds are gone
+  from SettingsState: their keys are NOT wiped, just never read (test pins it). The root is `.unstuckTheme()` — the
+  default palette, unrepainted (UnstuckDesign's Accent code stays, unused). The focus ring + tour follow the phone's
+  `accessibilityReduceMotion`.
+- **Moved onto their screens**: Focus `⋯` (id `focus-options`) → `FocusOptionsSheet` (Check in when I run over
+  Never/5/10 · Ask before I leave · Ask why I'm pausing · Talk me through the session · Voice replies); the leave and
+  pause questions carry "Leave and don't ask again" / "Don't ask again"; flipping the coach mid-session starts/stops
+  it. **The speaker button is the background-noise setting** — `updateAudio` no longer needs `ambient != .off` (the
+  silent-button bug), a tap stores `.brown`/`.off`, a stored `pink` reads as on. Talk: "Noisy room? Hold to talk"
+  switch (`HoldToTalkSwitch`, same key `unstuck.voice.holdToTalk`; a live plain Talk reconnects in the new mode,
+  like the web; never shown on a call). New Task remembers the estimate (`focusDefaultMin` on submit); "Call me about
+  this" remembers the lead (`CallSettings.defaultLeadMin`, which request_call reads). Tasks: an "Edit" pill at the end
+  of the area row (`tasks-edit-areas`) → router sheet `.areasTags` (`AreasTagsSheet`, stale "flat on purpose" copy
+  gone). Share screen: "Manage people" (`share-manage-people`) pushes People. Insights: Today's week pill only.
+- **Calls with the Assistant off**: `CallEnvironment.isAssistantEnabled` (AppCallEnvironment reads the model or,
+  before it exists, `SettingsState.storedAssistantEnabled()`); receipt order signed-in → calls switch → **Assistant
+  switch** → AI consent → hours → focus → anchor; outcome `declined` (never `missed`, so no re-ring), quiet notice
+  `unstuck.call.assistant.<id>` "(the Assistant is off on this iPhone — Settings › Assistant & privacy)". The
+  fallback-B alert tap declines the same way. CallMeSection says so where a call is booked.
+- **Links** (`SettingsDestination.from`; since the copy canon: lower-case, "&" → "and", keep only letters and digits —
+  Android's rule — so dashes/underscores/"+"/spaces all fold; names written reduced): notifications/notification/calls → N&C; assistant/ai/
+  memory/knows/facts → A&P; interface/appearance/accessibility/theme → Appearance; people/connections/circle → People;
+  backup/export/account → Account; feedback → the feedback sheet; focus/sound → the live Focus screen, else the hub;
+  areas/tags/"areas & tags" → Tasks tab + Areas & tags sheet (so `open_screen areas` too); unknown/bare → the hub
+  (the server's bare `unstuck://settings` stays hub → People).
+- **Tour**: personalization → section "Appearance", new copy; every "Settings → Account → Product tour" → "Settings →
+  Replay the tour" (panel confirm, welcome footer, finish `more`, TOUR_QA — the web's exact strings). `personalization.m4a` and
+  `finish-more.m4a` still speak the OLD words (accent/density; Settings → Account), so they are PARKED:
+  `TourScript.staleClips` makes `TourAudioPlayer.url(forStep:)` answer nil for them (the files stay — the gitignored
+  project lists them), Listen is hidden on the personalization step and finish's Tell-me-more expands silently —
+  the same two entries the web dropped from tour-audio.ts. To close: re-record both from the current text (Cherry
+  recipe below; the key only lives server-side), then empty `staleClips` (TourAudioManifestTests pins the set). The pause-confirm footer is now one line (TourPanelMeasureTests pin 67 → 49 pt).
+- **Copy**: "Settings › Calls" → "Settings › Notifications & calls" (CallTools device guard, CallMeSection, call
+  notices, AIConsent.callsTurnedOffNote); "Settings › Interface" → "Assistant & privacy"; interview lines name What
+  Unstuck remembers / Assistant & privacy; RITUAL_LABELS use the routine names (Morning plan / Evening wind-down /
+  Friday look-back / Sunday plan-ahead).
+- **Assistant** (registry b9cf8a47412e8cdf regenerated by the web engineer, included): get_settings reports focus
+  options / text size / background noise on|off / routines by name (web wording); set_focus_defaults writes and
+  names only what changes ("error: … already have those values — nothing changed"); set_ambient_sound takes off /
+  brown / pink / on (pink/on = on) → "ok: background noise on"; set_ritual answers by the routine's name ("ok:
+  Morning plan on", "error: Sunday plan-ahead is already off — nothing changed") — web 7f24584's wording.
+- Colour: every new choice row / chip is the ink/bg pair (`SettingsChoiceRow`, level radio, lead chips); switches
+  keep the tint they had (primary) — not changed without a screenshot to Ahmad.
+- Tests: `SlimSettingsTests` (core: aliases, text-size merge, plain copy, calls block), SettingsStateTests (merge,
+  never-read-never-wiped, pink = on, stored assistant switch), CallCoordinatorTests (assistant off → declined, order,
+  fallback tap), AssistantToolsTests (new tool wording), TourDataTests, UI: AppSmoke `testSettingsSubScreens` (the
+  seven rows, footer, Appearance/N&C/A&P/Account), `testSettingsAndInsights` (week pill), CrashReportAttach (hub
+  Send feedback), TourUITests (pause copy).
+- **Verifier pass (same day)** — went through PLAN.md's control table row by row on the simulator; everything lands
+  where the plan says. Fixed: People's ink buttons (Generate link / Send invite, Copy link, Join) were white text on
+  the ink fill — invisible in dark mode — now the ink/bg pair; the three `name@example.com` placeholders
+  (People, Share, New Task) were LocalizedStringKeys, so markdown autolinked them system-blue — now plain Strings;
+  the Tasks "Edit" pill's ring lost its top/bottom to the ScrollView clip (inset ring + 1 pt row slack); the footer's
+  "·" gaps were uneven (min-width → even padding); the VoIP "Try again" got a 44-pt hit area;
+  `SettingsDestination` now takes every alias the web's `normalizeSection` does (sync/profile/password/delete,
+  a11y, sharing, "calls from unstuck", "send feedback"… — only `sound` differs, by the plan) and folds spaces the
+  same way. Tests added:
+  `SettingsLinkRoutingTests` (in SettingsStateTests.swift — every old/new `?section=`, bare link = hub, areas → Tasks
+  sheet, open_screen targets, deferred-over-a-sheet), AppSmoke `testFocus` opens Focus ⋯ Options, the hub row-ID set
+  must be exactly the seven, People opens; TourUITests `testFullTourAppearanceStepIsScopedToAppearance` (the full
+  tour's Appearance step: Text size works under the panel, Back to the hub is swallowed); `SettingsShots` (in
+  HomeShots.swift) writes the hub + every screen light/dark + the moved controls to /tmp/unstuck-settings-shots.
+  The two stale tour clips are now parked in code (see Tour above; the web did the same). Still open (not code):
+  re-record them; switches keep the indigo `primary` tint (ask Ahmad with a
+  screenshot before changing); Talk's new switch sits above End, so a very long caption on a small phone can run
+  under it (captions already could run under End).
+- **Copy canon (scratchpad swt/COPY-CANON.md, same day)** — one wording on all three platforms: N&C gets a
+  "Reminders" heading with "How much Unstuck checks in" / "Remind me before a task" as row titles; pace note "This
+  also sets how often Unstuck talks you through a focus session."; lead note "Reminders work even offline. Any task
+  can have its own time."; Calls: intro line above the switch (`CallSettingsView.introLine`), no sub-line while on,
+  "Off: this phone won't ring…", hours "Outside these hours it won't ring…", the three "Rings …" call lines, the test
+  call keeps its label and shows "Booking…" underneath. Focus ⋯ Options: the four canon sub-lines (pausing gained
+  one), Voice replies says "add five" (what the coach asks) and, greyed out while the coach is off, "Turn on “Talk me
+  through the session” first." Leave question: "Leave this session?" / "Your timer keeps running. You can pick it
+  back up from Today." / Leave · Leave and don't ask again · Stay. Aliases: the reduced-form matcher + `facts`.
+
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 
 Ahmad: "Can the plus just be on same line as everything". The coral + was a 56-pt square lifted 28 pt above the bar

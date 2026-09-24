@@ -100,15 +100,17 @@ struct UnstuckApp: App {
         WindowGroup {
             RootView()
                 .environment(model)
-                // Theme override (Settings · Interface): system=nil follows the
+                // Theme override (Settings · Appearance): system=nil follows the
                 // OS, light/dark force the scheme. This flows into colorScheme
-                // and thus unstuckTheme()'s palette resolution below.
+                // and thus unstuckTheme()'s palette resolution below. The
+                // default palette only — the Accent choice is gone (slim
+                // settings, 2026-09-24); a stored rose/forest is never read.
                 .preferredColorScheme(model.settings.theme.colorScheme)
-                .unstuckTheme(accent: model.settings.accent)
-                // Density + larger-type (Settings · Interface/Accessibility):
-                // shift DynamicTypeSize relative to the system size, the iOS
-                // analogue of Android's fontScale multiplier.
-                .modifier(TypeScale(steps: model.settings.typeStepShift))
+                .unstuckTheme()
+                // Text size (Settings · Appearance): shift DynamicTypeSize
+                // relative to the system size, the iOS analogue of Android's
+                // fontScale multiplier.
+                .modifier(TypeScale(steps: model.settings.textSize.typeStepShift))
                 .onOpenURL { model.handleDeepLink($0) }
                 // Universal Links (https invite link) arrive as a browsing-web
                 // user activity, NOT onOpenURL — route its URL through the same

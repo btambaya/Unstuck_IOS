@@ -131,7 +131,8 @@ public extension EnvironmentValues {
 
 public extension View {
     /// Inject the brand palette resolved from the current color scheme,
-    /// remapped for the chosen accent (Settings · Interface).
+    /// remapped for an accent. The app passes none (the default palette):
+    /// the Accent setting is gone (slim settings, 2026-09-24).
     func unstuckTheme(accent: Accent = .indigo) -> some View {
         modifier(UThemeResolver(accent: accent))
     }

@@ -227,7 +227,7 @@ struct TasksView: View {
         }
     }
 
-    // MARK: ROW 2 — area filter pills (selected = inverted ink)
+    // MARK: ROW 2 — area filter pills (selected = inverted ink) + "Edit"
 
     @ViewBuilder
     private func areaPills(_ vm: TasksModel) -> some View {
@@ -240,9 +240,33 @@ struct TasksView: View {
                         vm.activeArea = (vm.activeArea == a.name) ? nil : a.name
                     }
                 }
+                editAreasPill
             }
+            .padding(.vertical, 1)
         }
-        .padding(.bottom, 12)
+        .padding(.bottom, 11)
+    }
+
+    /// The end of the area row: add, rename, recolour or delete areas and
+    /// tags in one sheet (they moved here from Settings — slim settings).
+    private var editAreasPill: some View {
+        Button { model.router.present(.areasTags) } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "pencil").font(.system(size: 11, weight: .semibold))
+                    .accessibilityHidden(true)
+                Text("Edit").font(UFont.sans(12, .medium))
+            }
+            .foregroundStyle(theme.palette.ink2)
+            .padding(.horizontal, 12).padding(.vertical, 6)
+            // An INSET ring, and one point less of the negative padding than
+            // the filled pills: the horizontal ScrollView clips to the row, and
+            // a centred stroke on the capsule's edge lost its top and bottom.
+            .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
+            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -8)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Edit areas and tags")
+        .accessibilityIdentifier("tasks-edit-areas")
     }
 
     private func areaPill(_ title: String, selected: Bool, dot: Color?, action: @escaping () -> Void) -> some View {

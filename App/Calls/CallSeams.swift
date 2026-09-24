@@ -100,12 +100,18 @@ protocol CallEnvironment: AnyObject {
     /// is queued. A row not synced here yet is unknown → true (ring; send-call
     /// already checked it server-side — web/Android audit 2026-09-23, A6).
     func anchorIsLive(taskId: String?, blockId: String?) -> Bool
-    /// The user's own allowed-hours guard (Settings → Calls from Unstuck).
+    /// The user's own allowed-hours guard (Settings → Notifications & calls).
     func isWithinCallHours(_ date: Date) -> Bool
-    /// The master "Calls" switch on THIS phone (Settings › Calls; Android's
+    /// The master "Calls" switch on THIS phone (Settings › Notifications &
+    /// calls → "Let Unstuck call this phone"; Android's
     /// `enabled`). Off → a call that lands ends as `declined` quietly + the
     /// notes as a notification, exactly like the outside-hours rule.
     var isCallsEnabled: Bool { get }
+    /// The AI Assistant switch on THIS phone (Settings › Assistant & privacy).
+    /// Off hides the Assistant, Talk AND calls: a call that lands is declined
+    /// on arrival (`declined`, so no missed-call re-ring) with the notes as a
+    /// notification. Default true so a fake that doesn't care keeps ringing.
+    var isAssistantEnabled: Bool { get }
     /// The account has agreed to AI data sharing (AIConsent). A call is a
     /// conversation with the assistant — without the OK it never connects:
     /// it ends as `declined` quietly and the notes land as a notification.
@@ -121,6 +127,7 @@ protocol CallEnvironment: AnyObject {
 extension CallEnvironment {
     var isSessionKnown: Bool { true }
     var isCallsEnabled: Bool { true }
+    var isAssistantEnabled: Bool { true }
     func callWillRing() {}
 }
 

@@ -289,7 +289,23 @@ extension AppModel {
             return
         }
         if link == "unstuck://settings" || link.hasPrefix("unstuck://settings?") {
-            router.present(.settings(section: Self.settingsSection(in: link)))
+            // Slim settings (2026-09-24): every old section name is an alias
+            // (SettingsDestination). The bare link stays the hub — the server
+            // sends it on purpose for invites and shares; People is one tap.
+            switch SettingsDestination.from(link: link) {
+            case .areas:
+                // Areas & tags live on Tasks now: the tab + its sheet.
+                router.select(.tasks)
+                router.present(.areasTags)
+            case .focus where liveSession?.sessionStart != nil:
+                // Focus options live on the Focus screen: open the live
+                // session (its ⋯ Options). With nothing running, the hub.
+                openScreen("focus")
+            case .hub, .focus:
+                router.present(.settings(section: nil))
+            case let destination:
+                router.present(.settings(section: destination.rawValue))
+            }
             return
         }
         if link == "unstuck://tasks" || link.hasPrefix("unstuck://tasks") {
@@ -570,7 +586,7 @@ extension AppModel {
 
     // MARK: proactive calls (calls build-out; migration 072)
 
-    /// A toggle / time change in Settings › Calls: cache it, mark it pending,
+    /// A toggle / time change in Settings › Notifications & calls: cache it, mark it pending,
     /// and write `notification_preferences.call_*` through — the dispatcher
     /// reads those columns, so nothing rings until the write lands. A failed
     /// push stays pending and the next hydrate re-pushes it (never pulls the
@@ -642,7 +658,7 @@ extension AppModel {
         }
     }
 
-    /// Settings › Calls opened: re-read the server row (best-effort) so a
+    /// Settings › Notifications & calls opened: re-read the server row (best-effort) so a
     /// toggle flipped on another device shows here without waiting for the
     /// next gap trigger.
     func refreshCallProactivePrefs() {

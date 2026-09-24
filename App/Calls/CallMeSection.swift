@@ -48,15 +48,21 @@ struct CallMeSection: View {
     /// booked on the web, or moved with its block, into hours this phone
     /// declines (audit 2026-09-22, C12).
     private var hoursHint: String? {
-        guard let callAt, CallToolLogic.deviceGuard(callAt) != nil else { return nil }
+        guard let callAt else { return nil }
+        // A call IS the assistant: with it switched off, this phone declines
+        // the call on arrival (CallCoordinator) — say so where it's booked.
+        if !model.settings.assistantEnabled {
+            return "The Assistant is off on this iPhone, so it would decline this call. Turn it on in Settings › Assistant & privacy."
+        }
+        guard CallToolLogic.deviceGuard(callAt) != nil else { return nil }
         guard CallSettings.enabled else {
-            return "Calls are off on this iPhone, so it would decline this call. Switch them on in Settings › Calls."
+            return "Calls are off on this iPhone, so it would decline this call. Switch them on in Settings › Notifications & calls."
         }
         // Times in the phone's own 12/24-hour clock (2026-09-24).
         let clock = ClockFormat.device
         let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
                                             refusing: CallSettings.minuteOfDay(callAt), clock: clock)
-        return "\(clock.time(callAt, calendar: .current)) is outside this iPhone's call hours (\(hours)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Calls."
+        return "\(clock.time(callAt, calendar: .current)) is outside this iPhone's call hours (\(hours)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Notifications & calls."
     }
     /// Booking, or changing the ring time (lead / slot), meets the hint;
     /// a notes-only edit of an existing row doesn't — update_call's rule.
@@ -109,7 +115,14 @@ struct CallMeSection: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(CallSettings.leadOptions, id: \.self) { m in
-                        chip("\(m)m before", selected: lead == m) { lead = m }
+                        // Remembers the last pick (slim settings): the next
+                        // "Call me about this" — and the assistant's
+                        // request_call — start from it (the same key the old
+                        // Settings row wrote).
+                        chip("\(m)m before", selected: lead == m) {
+                            lead = m
+                            CallSettings.defaultLeadMin = m
+                        }
                     }
                 }
             }

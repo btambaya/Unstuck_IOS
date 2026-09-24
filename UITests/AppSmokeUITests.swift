@@ -10,7 +10,9 @@
 // One rule worth remembering here: Settings is a SHEET over Today, so its rows
 // share ONE accessibility tree with the Today screen behind them and bare
 // labels collide ("Focus" was both a Settings row and the since-removed
-// Start-Next hero's button). Address rows by identifier — `settings-row-<label>`.
+// Start-Next hero's button). Address rows by their FIXED identifiers —
+// `settings-row-account`, `-notifications`, `-assistant`, `-people`,
+// `-appearance`, `-feedback`, `-tour` (slim settings, 2026-09-24).
 
 import XCTest
 
@@ -127,6 +129,19 @@ final class AppSmokeUITests: XCTestCase {
                       "the row's Focus action did not start a session")
         usleep(700_000)
         snap("11-focus")
+
+        // Slim settings: the focus options live on the Focus screen's ⋯ now
+        // (they left Settings) — the sheet opens and closes on its own Done.
+        let options = app.buttons["focus-options"].firstMatch
+        expect(options, "the Focus screen has no ⋯ Options button")
+        options.tap()
+        expect(app.staticTexts["Check in when I run over"].firstMatch, "Focus ⋯ Options did not open")
+        XCTAssertTrue(app.staticTexts["Ask before I leave a session"].firstMatch.exists, "the leave option is missing")
+        XCTAssertTrue(app.staticTexts["Talk me through the session"].firstMatch.exists, "the coach option is missing")
+        snap("11b-focus-options")
+        app.navigationBars["Focus options"].buttons["Done"].firstMatch.tap()
+        usleep(700_000)
+        XCTAssertTrue(app.staticTexts["FOCUSING"].firstMatch.exists, "closing the options must leave the session running")
     }
 
     /// Tapping "Talk" must actually PRESENT the voice screen. Ahmad, 2026-09-09:
@@ -147,7 +162,7 @@ final class AppSmokeUITests: XCTestCase {
     /// The ✦ launcher → the Assistant panel: the suggestion card it opens on,
     /// the dictation mic, and the ⋯ options menu (which now carries read-aloud
     /// + Clear conversation). Feedback is NO longer here — it moved to
-    /// Settings → Account → "Send feedback".
+    /// Settings → "Send feedback".
     func testAssistantPanel() throws {
         launchToToday()
         let launcher = app.buttons["Assistant"].firstMatch
@@ -162,45 +177,81 @@ final class AppSmokeUITests: XCTestCase {
                       "the panel must open on the suggestion card")
         // Feedback must NOT live inside the assistant panel any more.
         XCTAssertFalse(app.buttons["Feedback"].firstMatch.exists,
-                       "feedback moved to Settings → Account")
+                       "feedback moved to Settings → Send feedback")
     }
 
-    /// The new Settings depth: the hub links into the Focus + Account sub-screens.
+    /// The slim hub (2026-09-24): an Account card, four screens, two one-tap
+    /// actions and the Terms · Privacy · version footer — and each screen is a
+    /// PUSHED sub-screen (the tour's scoped lockdown needs that).
     func testSettingsSubScreens() throws {
         launchToToday()
         let avatar = app.buttons["Account and settings"].firstMatch
         XCTAssertTrue(avatar.waitForExistence(timeout: 6), "the Today header avatar is missing")
         avatar.tap(); usleep(800_000)
 
-        let focusRow = app.buttons["settings-row-Focus"].firstMatch
-        expect(focusRow, "Settings hub is missing the Focus row")
-        focusRow.tap()
-        expect(app.staticTexts["How focus mode behaves."].firstMatch, "Settings → Focus did not open")
-        snap("14-settings-focus")
+        for id in ["account", "notifications", "assistant", "people", "appearance", "feedback", "tour"] {
+            expect(app.descendants(matching: .any)["settings-row-\(id)"].firstMatch, "Settings hub is missing the \(id) row")
+        }
+        XCTAssertTrue(app.buttons["settings-terms"].firstMatch.exists, "Terms must stay one tap from the hub")
+        XCTAssertTrue(app.buttons["settings-privacy"].firstMatch.exists, "Privacy must stay one tap from the hub")
+        // Exactly the seven rows — nothing else carries a hub-row handle, and
+        // the old rows (Focus, Sound, Accessibility, Interface, Insights,
+        // Backup, Areas & tags, Calls from Unstuck, What Unstuck knows) are gone.
+        let rowIds = Set(app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'settings-row-'"))
+            .allElementsBoundByIndex.map { $0.identifier })
+        XCTAssertEqual(rowIds, Set(["account", "notifications", "assistant", "people", "appearance", "feedback", "tour"]
+            .map { "settings-row-\($0)" }), "the hub must hold exactly the seven slim rows")
+        for gone in ["Sound", "Accessibility", "Interface", "Backup", "Areas & tags", "Calls from Unstuck", "What Unstuck knows"] {
+            XCTAssertFalse(app.staticTexts[gone].exists, "\(gone) must not be on the hub any more")
+        }
+        snap("08-settings")
+
+        app.buttons["settings-row-appearance"].firstMatch.tap()
+        expect(app.staticTexts["How it looks."].firstMatch, "Settings → Appearance did not open")
+        XCTAssertTrue(app.buttons["Text size: Larger"].firstMatch.exists, "Appearance → Text size is missing")
+        XCTAssertFalse(app.staticTexts["Accent"].exists, "Accent is gone")
+        snap("14-settings-appearance")
         let back = app.navigationBars.buttons.firstMatch
-        XCTAssertTrue(back.exists, "no back button out of Settings → Focus")
+        XCTAssertTrue(back.exists, "no back button out of Settings → Appearance")
         back.tap(); usleep(600_000)
 
-        let accountRow = app.buttons["settings-row-Account"].firstMatch
-        expect(accountRow, "Settings hub is missing the Account row")
+        app.buttons["settings-row-notifications"].firstMatch.tap()
+        expect(app.staticTexts["How Unstuck reaches you."].firstMatch, "Settings → Notifications & calls did not open")
+        XCTAssertTrue(app.staticTexts["Calm"].firstMatch.exists, "the level picker is missing")
+        snap("16-settings-notifications")
+        app.navigationBars.buttons.firstMatch.tap(); usleep(600_000)
+
+        app.buttons["settings-row-assistant"].firstMatch.tap()
+        expect(app.staticTexts["What the AI can see."].firstMatch, "Settings → Assistant & privacy did not open")
+        XCTAssertTrue(app.switches["settings-ai-data-sharing"].firstMatch.exists, "the AI data sharing consent row must stay")
+        snap("17-settings-assistant")
+        app.navigationBars.buttons.firstMatch.tap(); usleep(600_000)
+
+        app.buttons["settings-row-people"].firstMatch.tap()
+        expect(app.staticTexts["People you share with."].firstMatch, "Settings → People did not open")
+        XCTAssertTrue(app.buttons["people-invite-code"].firstMatch.exists, "the invite code sits behind its link")
+        snap("18-settings-people")
+        app.navigationBars.buttons.firstMatch.tap(); usleep(600_000)
+
+        let accountRow = app.descendants(matching: .any)["settings-row-account"].firstMatch
+        expect(accountRow, "Settings hub is missing the Account card")
         accountRow.tap()
         expect(app.staticTexts["Your account."].firstMatch, "Settings → Account did not open")
+        let delete = app.staticTexts["Delete my account"].firstMatch
+        for _ in 0..<6 where !delete.exists { app.swipeUp(); usleep(300_000) }
+        XCTAssertTrue(delete.exists, "Delete my account must stay reachable (App Store 5.1.1(v))")
         snap("15-settings-account")
     }
 
+    /// Insights left the Settings hub (slim settings): Today's week pill is
+    /// its one-tap way in.
     func testSettingsAndInsights() throws {
         launchToToday()
-        let avatar = app.buttons["Account and settings"].firstMatch
-        XCTAssertTrue(avatar.waitForExistence(timeout: 6), "the Today header avatar is missing")
-        avatar.tap(); usleep(900_000)
-        expect(app.buttons["settings-row-Account"].firstMatch, "Settings did not open")
-        snap("08-settings")
-
-        let insights = app.buttons["settings-row-Insights"].firstMatch
-        expect(insights, "Settings hub is missing the Insights row")
-        XCTAssertTrue(scrollIntoReach(insights), "the Insights row never became reachable")
-        insights.tap()
-        expect(app.navigationBars["Insights"], "Settings → Insights did not open")
+        let pill = app.buttons["week-pill"].firstMatch
+        expect(pill, "the Today week pill is missing")
+        pill.tap()
+        expect(app.navigationBars["Insights"], "the week pill did not open Insights")
         usleep(700_000); snap("09-insights")
     }
 

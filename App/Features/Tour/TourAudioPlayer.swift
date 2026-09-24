@@ -83,8 +83,12 @@ final class TourAudioPlayer {
     /// Locate a step's clip in the bundle: flat resource first (xcodegen adds
     /// the files to the app's resources phase → bundle root), then the
     /// TourAudio subdirectory (folder-reference layout), so either wiring works.
+    /// A clip whose words no longer match the step (`TourScript.staleClips`)
+    /// is never offered — the captions would show one product while the
+    /// voice described another.
     nonisolated static func url(forStep id: String) -> URL? {
-        Bundle.main.url(forResource: id, withExtension: "m4a")
+        guard !TourScript.staleClips.contains(id) else { return nil }
+        return Bundle.main.url(forResource: id, withExtension: "m4a")
             ?? Bundle.main.url(forResource: id, withExtension: "m4a", subdirectory: "TourAudio")
     }
 

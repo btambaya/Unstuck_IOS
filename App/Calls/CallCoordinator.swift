@@ -5,6 +5,9 @@
 //                     ├─ same uuid as the live call → duplicate push: state untouched
 //                     ├─ nobody signed in     → end .failed, silent (no outcome, no notes)
 //                     ├─ calls switched off   → end .declinedElsewhere, outcome declined, notify
+//                     ├─ AI Assistant off     → end .declinedElsewhere, outcome declined, notify
+//                     │                         (slim settings: "Off hides the Assistant, Talk
+//                     │                         and calls" — declined, so no missed-call re-ring)
 //                     ├─ no AI-consent OK     → end .declinedElsewhere, outcome declined, notify
 //                     │                         (never connected to the assistant — AIConsent)
 //                     ├─ outside call hours   → end .declinedElsewhere, outcome declined, notify
@@ -245,6 +248,14 @@ final class CallCoordinator {
         if !environment.isCallsEnabled {
             endSilently(session, reason: .declinedElsewhere, outcome: .declined,
                         notification: CallNotifications.callsOff(session))
+            return
+        }
+        // The AI Assistant is switched off on this phone (Settings → Assistant
+        // & privacy): a call IS the assistant, so it is declined on arrival —
+        // `declined`, never `missed`, so the server doesn't ring it again.
+        if !environment.isAssistantEnabled {
+            endSilently(session, reason: .declinedElsewhere, outcome: .declined,
+                        notification: CallNotifications.assistantOff(session))
             return
         }
         if !environment.hasAIConsent {
@@ -514,6 +525,13 @@ final class CallCoordinator {
         guard environment.isSessionKnown else { deferredFallbackTap = payload; return }
         guard environment.isSignedIn else { return }
         let session = CallSession(payload: payload, receivedAt: clock.now)
+        // The Assistant is off here: Talk never opens with the call —
+        // declined, and the notes land with the reason (the receipt rule's twin).
+        guard environment.isAssistantEnabled else {
+            report(session, .declined)
+            notifier.post(CallNotifications.assistantOff(session))
+            return
+        }
         // No AI-consent OK: Talk never opens with the call — declined, and
         // the notes land with the reason (the receipt rule's twin).
         guard environment.hasAIConsent else {
@@ -596,13 +614,19 @@ enum CallNotifications {
     }
     static func outsideHours(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.hours.\(s.callId)", title: "I called about \(s.label)",
-             body: body(s.notes) + "\n(outside your call hours — Settings › Calls)", quiet: true)
+             body: body(s.notes) + "\n(outside your call hours — Settings › Notifications & calls)", quiet: true)
     }
     /// The master switch is off on this phone: declined quietly, the notes
     /// still land (Android's `enabled` rule) — with the honest reason.
     static func callsOff(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.off.\(s.callId)", title: "I called about \(s.label)",
-             body: body(s.notes) + "\n(calls are off on this iPhone — Settings › Calls)", quiet: true)
+             body: body(s.notes) + "\n(calls are off on this iPhone — Settings › Notifications & calls)", quiet: true)
+    }
+    /// The AI Assistant is off on this phone: a call is the assistant, so it
+    /// was declined on arrival. Quiet, with the notes and the way back on.
+    static func assistantOff(_ s: CallSession) -> CallNotification {
+        make(s, id: "unstuck.call.assistant.\(s.callId)", title: "I called about \(s.label)",
+             body: body(s.notes) + "\n(the Assistant is off on this iPhone — Settings › Assistant & privacy)", quiet: true)
     }
     /// The account hasn't agreed to AI data sharing: the call never connected
     /// to the assistant. Declined quietly; the notes land with the way on.
@@ -610,7 +634,7 @@ enum CallNotifications {
     /// off while it rang) — a normal alert, like minutesUsed, so they see why.
     static func noAIConsent(_ s: CallSession, answered: Bool = false) -> CallNotification {
         make(s, id: "unstuck.call.consent.\(s.callId)", title: "I called about \(s.label)",
-             body: body(s.notes) + "\n(calls use the assistant — turn on AI data sharing in Settings › Interface to take them)",
+             body: body(s.notes) + "\n(calls use the assistant — turn on AI data sharing in Settings › Assistant & privacy to take them)",
              quiet: !answered, timeSensitive: false)
     }
     /// call_requests.outcome_notes for a call answered after the OK was turned off.
