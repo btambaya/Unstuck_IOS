@@ -18,6 +18,9 @@
 // derived state (the nav path + the live rows), and `AppRouter.tab`'s setter
 // clears it on any tab change, so no single lifecycle callback is load-bearing.
 
+import SwiftUI
+import UIKit
+import UnstuckDesign
 import XCTest
 @testable import Unstuck
 
@@ -192,5 +195,157 @@ final class FabActionTests: XCTestCase {
         router.clearCollectionsSurface()
         XCTAssertNil(router.collectionsSurface)
         XCTAssertNil(router.collectionFabRequest)
+    }
+}
+
+// MARK: - the bar's look: the + sits IN the tab row
+
+/// The + used to be a 56-pt square lifted 28 pt above the bar, covering the
+/// last row of whatever was scrolled under it. It is now the middle one of five
+/// equal slots, so it must render INSIDE the row: a 44-pt coral square,
+/// centred on the bar horizontally and on the tab cells vertically, with no
+/// coral above the bar's hairline. And the four tab labels share ONE baseline
+/// (the taller Collections symbol used to push its label ~3 pt lower).
+///
+/// The bar is rendered off-screen (ImageRenderer, 3x, 430 pt wide) in light
+/// and dark with Today and Collections active. PNGs are written ONLY when
+/// `UNSTUCK_RENDER_DIR` is set (design review; pass it to xcodebuild as
+/// `TEST_RUNNER_UNSTUCK_RENDER_DIR`), so normal runs write nothing.
+extension FabActionTests {
+
+    /// Bar-coloured band rendered above the bar: a + lifted out of the row
+    /// would show up (and fail) here.
+    fileprivate static let headroom: CGFloat = 40
+    fileprivate static let width: CGFloat = 430
+    private static let scale: CGFloat = 3
+
+    @MainActor
+    func testThePlusSitsInTheTabRow() throws {
+        let dir = ProcessInfo.processInfo.environment["UNSTUCK_RENDER_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+        for dark in [false, true] {
+            for active in [AppRouter.Tab.today, .lists] {
+                let name = "ios-\(dark ? "dark" : "light")-\(active == .today ? "today" : "lists")"
+                let renderer = ImageRenderer(content:
+                    BarShot(active: active)
+                        .unstuckTheme(accent: .indigo)
+                        .environment(\.colorScheme, dark ? .dark : .light)
+                        // The + carries the tour's UIKit anchor, which an image
+                        // can't draw (yellow placeholder behind the square).
+                        .environment(\.tourAnchorsEnabled, false))
+                renderer.scale = Self.scale
+                renderer.proposedSize = ProposedViewSize(width: Self.width, height: nil)
+                let image = try XCTUnwrap(renderer.cgImage, "\(name): the bar did not render")
+                if let dir {
+                    try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                    try XCTUnwrap(UIImage(cgImage: image).pngData())
+                        .write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).png"))
+                }
+
+                let pixels = try XCTUnwrap(RenderedPixels(image))
+                let palette = (dark ? Palette.dark : Palette.light).withAccent(.indigo, dark: dark)
+                let px = Self.scale
+                let barTop = Self.headroom * px
+                // Cells band = the bar minus its 8-pt top / 6-pt bottom padding.
+                let cellsMid = ((barTop + 8 * px) + (CGFloat(pixels.height) - 6 * px)) / 2
+
+                let coral = try XCTUnwrap(pixels.bounds(matching: palette.coral), "\(name): no coral + drawn")
+                XCTAssertGreaterThanOrEqual(coral.minY, barTop, "\(name): the + pokes above the bar")
+                XCTAssertEqual(coral.width, 44 * px, accuracy: 3, "\(name): the + is 44 pt")
+                XCTAssertEqual(coral.height, 44 * px, accuracy: 3, "\(name): the + is 44 pt")
+                XCTAssertEqual(coral.midX, Self.width * px / 2, accuracy: 3, "\(name): the + is the middle slot")
+                XCTAssertEqual(coral.midY, cellsMid, accuracy: 1.5 * px, "\(name): the + is centred on the tab cells")
+
+                // Slots 0, 1, 3, 4 of five are the tabs. Every label starts with
+                // a capital and has an ascender, so the top of its ink is a
+                // fair proxy for its baseline.
+                let tops = try [0, 1, 3, 4].map { slot in
+                    try XCTUnwrap(pixels.labelTop(slot: slot, of: 5, below: Int(barTop) + 2),
+                                  "\(name): no label drawn in slot \(slot)")
+                }
+                XCTAssertLessThanOrEqual(tops.max()! - tops.min()!, Int(px),
+                                         "\(name): tab labels off one baseline (tops \(tops))")
+            }
+        }
+    }
+}
+
+/// An RGBA8 sRGB copy of a render, rows top-down (a bitmap context's memory
+/// starts at the image's top row).
+private struct RenderedPixels {
+    let width: Int, height: Int
+    private var data: [UInt8]
+
+    init?(_ image: CGImage) {
+        width = image.width; height = image.height
+        data = [UInt8](repeating: 0, count: width * height * 4)
+        let (w, h) = (width, height)
+        guard let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
+        let drawn: Bool = data.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8,
+                                      bytesPerRow: w * 4, space: space,
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+            else { return false }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        if !drawn { return nil }
+    }
+
+    private func rgb(_ x: Int, _ y: Int) -> (Int, Int, Int) {
+        let i = (y * width + x) * 4
+        return (Int(data[i]), Int(data[i + 1]), Int(data[i + 2]))
+    }
+
+    /// Bounds of every pixel within a small tolerance of `color` — the +
+    /// square's fill. Anti-aliased edges and the white glyph drop out; the
+    /// square's straight edges still set the bounds.
+    func bounds(matching color: Color) -> CGRect? {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        UIColor(color).getRed(&r, green: &g, blue: &b, alpha: &a)
+        let t = (Int((r * 255).rounded()), Int((g * 255).rounded()), Int((b * 255).rounded()))
+        var minX = width, minY = height, maxX = -1, maxY = -1
+        for y in 0..<height {
+            for x in 0..<width {
+                let p = rgb(x, y)
+                if abs(p.0 - t.0) <= 6, abs(p.1 - t.1) <= 6, abs(p.2 - t.2) <= 6 {
+                    minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+                }
+            }
+        }
+        guard maxX >= 0 else { return nil }
+        return CGRect(x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1)
+    }
+
+    /// Top row of the LAST run of ink rows in one of `count` equal slots —
+    /// the label under the icon. "Ink" = far from the bar colour (read at the
+    /// top-left corner), so the faint active pill doesn't count.
+    func labelTop(slot: Int, of count: Int, below top: Int) -> Int? {
+        let bg = rgb(0, 0)
+        let x0 = slot * width / count, x1 = (slot + 1) * width / count
+        var lastRunTop: Int?
+        var previous = false
+        for y in top..<height {
+            let ink = (x0..<x1).contains { x in
+                let p = rgb(x, y)
+                return abs(p.0 - bg.0) + abs(p.1 - bg.1) + abs(p.2 - bg.2) > 150
+            }
+            if ink && !previous { lastRunTop = y }
+            previous = ink
+        }
+        return lastRunTop
+    }
+}
+
+/// The bar as the scaffold shows it, with a bar-coloured band above it.
+private struct BarShot: View {
+    @Environment(\.uTheme) private var theme
+    let active: AppRouter.Tab
+    var body: some View {
+        VStack(spacing: 0) {
+            theme.palette.bg.frame(height: FabActionTests.headroom)
+            BottomNavBar(active: active, onSelect: { _ in }, onFab: {})
+        }
+        .frame(width: FabActionTests.width)
+        .background(theme.palette.bg)
     }
 }
