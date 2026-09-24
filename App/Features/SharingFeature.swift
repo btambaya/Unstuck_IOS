@@ -608,11 +608,12 @@ struct SharedTaskDetailSheet: View {
     /// The "Planned …" / "Done …" line: the tapped calendar block's slot when
     /// the sheet was opened from one, else the projection's next block —
     /// both rendered in the recipient's zone when an instant is available.
-    static func plannedLabel(detail d: SharedTaskDetail, block: SharedBlock?, timeZone: TimeZone = .current) -> String? {
-        if let b = block { return sharedBlockPlannedLabel(b, timeZone: timeZone) }
+    static func plannedLabel(detail d: SharedTaskDetail, block: SharedBlock?, timeZone: TimeZone = .current,
+                             clock: ClockFormat = .device) -> String? {
+        if let b = block { return sharedBlockPlannedLabel(b, timeZone: timeZone, clock: clock) }
         return sharedPlannedLabel(nextDate: d.nextDate, nextStartTime: d.nextStartTime,
                                   nextDurationMinutes: d.nextDurationMinutes, nextDone: d.nextDone,
-                                  nextStartAt: d.nextStartAt, timeZone: timeZone)
+                                  nextStartAt: d.nextStartAt, timeZone: timeZone, clock: clock)
     }
 
     private func metaChips(_ d: SharedTaskDetail) -> [String] {

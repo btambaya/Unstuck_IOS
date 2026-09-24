@@ -294,30 +294,33 @@ public func sharedDayLabel(_ iso: String, todayISO: String) -> String {
     return f.string(from: day)
 }
 
-/// The slot line on a "shared with you" row — "Sat 04:30 · 45m" — from the
-/// owner's next block, in the RECIPIENT's zone when `nextStartAt` is given.
+/// The slot line on a "shared with you" row — "Sat 04:30 · 45m" (24-hour
+/// phone) / "Sat 4:30 AM · 45m" (12-hour) — from the owner's next block, in
+/// the RECIPIENT's zone when `nextStartAt` is given, in the recipient's clock.
 /// nil when nothing is placed (no block, or only a finished past one), so the
 /// row falls back to just "from <owner>".
 public func sharedSlotLabel(nextDate: String?, nextStartTime: String?, nextDurationMinutes: Int?,
                             nextDone: Bool? = nil, nextStartAt: String? = nil,
-                            todayISO: String = Clock.todayISO(), timeZone: TimeZone = .current) -> String? {
+                            todayISO: String = Clock.todayISO(), timeZone: TimeZone = .current,
+                            clock: ClockFormat = .device) -> String? {
     guard nextDone != true,
           let slot = sharedLocalSlot(nextDate: nextDate, nextStartTime: nextStartTime, nextStartAt: nextStartAt,
                                      timeZone: timeZone) else { return nil }
     var out = sharedDayLabel(slot.date, todayISO: todayISO)
-    if let t = slot.time, !t.isEmpty { out += " \(t)" }
+    if let t = slot.time, !t.isEmpty { out += " \(clock.time(t))" }
     if let m = nextDurationMinutes, m > 0 { out += " · \(m)m" }
     return out
 }
 
 /// The "Planned …" line in the shared-task detail — "Planned Sat, Sep 12 ·
 /// 04:30 · 45m" — from the `next_*` projection (or a tapped calendar block),
-/// in the recipient's zone when an instant is given. Unlike the row slot, a
-/// finished past block still reads (it says when the task WAS): "Done Fri,
-/// Sep 4 · 09:00 · 45m". nil when the task has never been scheduled.
+/// in the recipient's zone when an instant is given, in the recipient's
+/// 12/24-hour clock. Unlike the row slot, a finished past block still reads
+/// (it says when the task WAS): "Done Fri, Sep 4 · 09:00 · 45m". nil when the
+/// task has never been scheduled.
 public func sharedPlannedLabel(nextDate: String?, nextStartTime: String?, nextDurationMinutes: Int?,
                                nextDone: Bool?, nextStartAt: String? = nil,
-                               timeZone: TimeZone = .current) -> String? {
+                               timeZone: TimeZone = .current, clock: ClockFormat = .device) -> String? {
     guard let slot = sharedLocalSlot(nextDate: nextDate, nextStartTime: nextStartTime, nextStartAt: nextStartAt,
                                      timeZone: timeZone) else { return nil }
     let parts = slot.date.split(separator: "-").map { Int($0) }
@@ -326,7 +329,7 @@ public func sharedPlannedLabel(nextDate: String?, nextStartTime: String?, nextDu
     f.locale = Locale(identifier: "en_US")
     f.dateFormat = "EEE, MMM d"
     var out = "\(nextDone == true ? "Done" : "Planned") \(f.string(from: Time.civil(y, m, d)))"
-    if let t = slot.time, !t.isEmpty { out += " · \(t)" }
+    if let t = slot.time, !t.isEmpty { out += " · \(clock.time(t))" }
     if let mins = nextDurationMinutes, mins > 0 { out += " · \(mins)m" }
     return out
 }

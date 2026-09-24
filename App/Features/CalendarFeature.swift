@@ -502,8 +502,12 @@ private struct WeekView: View {
                 // Hour grid: time gutter + 7 day columns with positioned blocks.
                 HStack(alignment: .top, spacing: 0) {
                     VStack(spacing: 0) {
+                        // Hour gutter in the phone's clock — "14:00" / "2 PM",
+                        // the same labels as the Day grid (a bare "14" read
+                        // 24-hour on a 12-hour phone; 2026-09-24).
                         ForEach(wStart..<wEnd, id: \.self) { h in
-                            Text(String(format: "%02d", h)).font(UFont.mono(8))
+                            Text(ClockFormat.device.hourLabel(h)).font(UFont.mono(8))
+                                .lineLimit(1).minimumScaleFactor(0.7)
                                 .foregroundStyle(theme.palette.ink4)
                                 .frame(width: 26, height: wHour, alignment: .topLeading)
                         }
@@ -1010,7 +1014,8 @@ struct DayGridView: View {
             VStack(spacing: 0) {
                 ForEach(firstHour..<lastHour, id: \.self) { hour in
                     HStack(alignment: .top, spacing: 0) {
-                        Text(formatTime(String(format: "%02d:00", hour))).font(UFont.mono(10)).foregroundStyle(theme.palette.ink4)
+                        // "14:00" / "2 PM" — the phone's 12/24-hour clock (2026-09-24).
+                        Text(ClockFormat.device.hourLabel(hour)).font(UFont.mono(10)).foregroundStyle(theme.palette.ink4)
                             .frame(width: 64, alignment: .leading)
                             .padding(.leading, 12).padding(.top, 2)
                         Rectangle().fill(.clear).frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1097,7 +1102,7 @@ struct DayGridView: View {
             Text(block.taskName).font(UFont.sans(12, .medium)).lineLimit(1)
                 .strikethrough(done)
                 .foregroundStyle(done ? theme.palette.ink3 : theme.palette.ink)
-            if h > 34 { Text(formatTime(block.startTime)).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3) }
+            if h > 34 { Text(ClockFormat.device.time(block.startTime)).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3) }
         }
         .padding(.horizontal, 6).padding(.vertical, 2)
         .frame(width: width, height: h, alignment: .topLeading)
@@ -1207,7 +1212,7 @@ struct CalBlockEditSheet: View {
                         SectionLabel("Start time")
                         chipRow {
                             ForEach(times, id: \.self) { t in
-                                chip(formatTime(t), selected: live.startTime == t) {
+                                chip(ClockFormat.device.time(t), selected: live.startTime == t) {
                                     model.moveBlock(live, toDate: live.date, startTime: t)
                                 }
                             }

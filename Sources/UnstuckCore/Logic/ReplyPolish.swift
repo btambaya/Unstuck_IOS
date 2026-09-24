@@ -16,7 +16,10 @@
 //                 reply has ≥2 sentences; keep specific one-question offers.
 //  3. "!"       — "!" → "." at sentence end in a confirmation; greetings keep it.
 //  4. dates     — 2026-09-05 → "Sat 5 Sep" (year only when not this year),
-//                 14:30 → "2:30pm"; standalone tokens only.
+//                 14:30 → "2:30pm"; standalone tokens only. With a `clock`
+//                 (the app passes the device's), a time reads in the user's
+//                 own 12/24-hour clock instead — "2:30 PM" / "14:30" — so a
+//                 24-hour phone never gets a 12-hour reply (2026-09-24).
 //  5. markdown  — **bold** → plain; a single-item bullet list → a sentence.
 //  6. whitespace — doubled spaces collapsed, trimmed.
 //
@@ -30,10 +33,14 @@ public struct PolishOptions: Sendable {
     public var now: Date
     /// Calendar that decides which year "now" is in.
     public var calendar: Calendar
+    /// The user's clock for the time rule (`ClockFormat.device` in the app).
+    /// nil keeps the web's spoken form ("2:30pm", "2pm") — the shared vectors.
+    public var clock: ClockFormat?
 
-    public init(now: Date = Date(), calendar: Calendar = .current) {
+    public init(now: Date = Date(), calendar: Calendar = .current, clock: ClockFormat? = nil) {
         self.now = now
         self.calendar = calendar
+        self.clock = clock
     }
 }
 
@@ -45,7 +52,7 @@ public func polishReply(_ text: String, _ opts: PolishOptions = PolishOptions())
     out = ReplyPolish.stripOpener(out)
     out = ReplyPolish.stripCloser(out)
     out = ReplyPolish.restrainExclamations(out)
-    out = ReplyPolish.speakDatesAndTimes(out, thisYear: opts.calendar.component(.year, from: opts.now))
+    out = ReplyPolish.speakDatesAndTimes(out, thisYear: opts.calendar.component(.year, from: opts.now), clock: opts.clock)
     out = ReplyPolish.tidyWhitespace(out)
     return out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? trimmed : out
 }
@@ -306,7 +313,7 @@ enum ReplyPolish {
     private static let date = re("(^|[^A-Za-z0-9_/=-])(\\d{4})-(\\d{2})-(\\d{2})(?![A-Za-z0-9_/-])", [])
     private static let time = re("(^|[^A-Za-z0-9_:/=.-]|[-–—])([01]\\d|2[0-3]):([0-5]\\d)(?![0-9A-Za-z_:]|\\s*[ap]\\.?m\\b)")
 
-    static func speakDatesAndTimes(_ s: String, thisYear: Int) -> String {
+    static func speakDatesAndTimes(_ s: String, thisYear: Int, clock: ClockFormat? = nil) -> String {
         var ns = s as NSString
         var spans = protectedSpans(ns)
         var out = NSMutableString(string: s)
@@ -326,7 +333,9 @@ enum ReplyPolish {
             let pre = m.range(at: 1)
             if inSpan(m.range.location + pre.length, spans) { continue }
             guard let h = Int(ns.substring(with: m.range(at: 2))), let min = Int(ns.substring(with: m.range(at: 3))) else { continue }
-            out.replaceCharacters(in: m.range, with: ns.substring(with: pre) + spokenTime(hour: h, minute: min))
+            // A whole hour reads short in prose ("2 PM"); 24-hour stays "14:00".
+            let said = clock.map { $0.shortTime(minutes: h * 60 + min) } ?? spokenTime(hour: h, minute: min)
+            out.replaceCharacters(in: m.range, with: ns.substring(with: pre) + said)
         }
         return out as String
     }

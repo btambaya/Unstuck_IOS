@@ -1008,8 +1008,11 @@ struct AnalyticsView: View {
                 }
                 HStack(spacing: 0) {
                     Color.clear.frame(width: 30, height: 1)
-                    ForEach(["12am", "6am", "12pm", "6pm"], id: \.self) { h in
-                        Text(h).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
+                    // Axis ticks in the phone's clock — "00:00 06:00 12:00 18:00"
+                    // or "12 AM 6 AM 12 PM 6 PM" (2026-09-24).
+                    ForEach([0, 6, 12, 18], id: \.self) { h in
+                        Text(ClockFormat.device.hourLabel(h)).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
+                            .lineLimit(1)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -1025,7 +1028,7 @@ struct AnalyticsView: View {
 
     private func heatmapSummary(_ grid: Heatmap, _ days: [String]) -> String {
         guard let peak = peakFocusHour(grid) else { return "Hour by day focus heatmap. No focus recorded yet." }
-        return "Hour by day focus heatmap. Busiest: \(days[peak.day]) \(hourSpanLabel(peak.hour))."
+        return "Hour by day focus heatmap. Busiest: \(days[peak.day]) \(ClockFormat.device.hourSpan(peak.hour))."
     }
 }
 

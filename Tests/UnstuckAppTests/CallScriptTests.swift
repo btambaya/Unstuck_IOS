@@ -560,7 +560,7 @@ final class CallScriptTests: XCTestCase {
 
     func testProactiveTimeWarningCoversTheServerWindowThePhonesHoursAndTheSwitch() {
         func warn(_ t: String, enabled: Bool = true, start: String = "08:00", end: String = "21:00") -> String? {
-            CallSettings.proactiveTimeWarning(t, enabled: enabled, start: start, end: end)
+            CallSettings.proactiveTimeWarning(t, enabled: enabled, start: start, end: end, clock: .h24)
         }
         // Never booked at all — even with Calls off, that's the first thing to say.
         XCTAssertEqual(warn("05:45"), "Unstuck only calls between 06:00 and 23:00, so a call at 05:45 never rings.")
@@ -591,13 +591,30 @@ final class CallScriptTests: XCTestCase {
         XCTAssertNil(warn("junk"))
     }
 
+    /// The amber lines are READ, so they follow the phone's clock — a 12-hour
+    /// phone never sees "06:00 and 23:00" (2026-09-24). The model's `error:`
+    /// strings keep machine HH:MM (hoursLabel with no clock, above).
+    func testCallsLinesFollowThePhonesClock() {
+        XCTAssertEqual(CallSettings.proactiveTimeWarning("05:45", enabled: true, start: "08:00", end: "21:00", clock: .h12),
+                       "Unstuck only calls between 6:00 AM and 11:00 PM, so a call at 5:45 AM never rings.")
+        XCTAssertEqual(CallSettings.proactiveTimeWarning("20:58", enabled: true, start: "08:00", end: "21:00", clock: .h12),
+                       "Unstuck rings this call at about 9:00 PM, outside this iPhone's allowed hours (8:00 AM–9:00 PM; the latest it rings is 8:59 PM), so it's declined here — widen the hours above or pick another time.")
+        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: true, start: "08:00", end: "21:00", clock: .h12),
+                       "This iPhone only takes calls 8:00 AM–9:00 PM, so a check-in after a block that ends outside those hours is declined here.")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "06:00", end: "23:00", refusing: 23 * 60, clock: .h12),
+                       "6:00 AM–11:00 PM; the latest it rings is 10:59 PM")
+        XCTAssertEqual(CallSettings.hoursLabel(start: "06:00", end: "23:00", refusing: 23 * 60, clock: .h24),
+                       CallSettings.hoursLabel(start: "06:00", end: "23:00", refusing: 23 * 60),
+                       "24-hour display == the machine form")
+    }
+
     func testAfterBlockWarningWhenCallsAreOffOrTheHoursAreNarrower() {
-        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: false, start: "06:00", end: "23:00"),
+        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: false, start: "06:00", end: "23:00", clock: .h24),
                        "Calls are off on this iPhone, so these check-ins are declined here — switch them on above.")
         XCTAssertNil(CallSettings.afterBlockWarning(enabled: true, start: "06:00", end: "23:00"), "the defaults")
         XCTAssertNil(CallSettings.afterBlockWarning(enabled: true, start: "05:00", end: "23:30"))
         XCTAssertNil(CallSettings.afterBlockWarning(enabled: true, start: "00:00", end: "00:00"))
-        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: true, start: "08:00", end: "21:00"),
+        XCTAssertEqual(CallSettings.afterBlockWarning(enabled: true, start: "08:00", end: "21:00", clock: .h24),
                        "This iPhone only takes calls 08:00–21:00, so a check-in after a block that ends outside those hours is declined here.")
         XCTAssertNotNil(CallSettings.afterBlockWarning(enabled: true, start: "22:00", end: "07:00"), "overnight misses the day")
     }

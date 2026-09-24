@@ -87,7 +87,7 @@ struct TaskEditor: View {
     }
     private var scheduleText: String {
         if editTarget.later == true { return "Later" }
-        if let b = myBlocks.first { return "\(b.date.suffix(5)) \(formatTime(b.startTime))" }
+        if let b = myBlocks.first { return "\(b.date.suffix(5)) \(ClockFormat.device.time(b.startTime))" }
         return "Unscheduled"
     }
     private var statusText: String {
@@ -873,7 +873,7 @@ struct TaskEditor: View {
             model.scheduleTaskAt(next, date: dateIso, startTime: timeIso)
             ReminderScheduler.shared.resync()
         }
-        scheduledLabel = "\(dateIso.suffix(5)) \(formatTime(timeIso))"
+        scheduledLabel = "\(dateIso.suffix(5)) \(ClockFormat.device.time(timeIso))"
         showSchedule = false
     }
 
@@ -904,7 +904,7 @@ struct TaskEditor: View {
                 model.scheduleTaskAt(row, date: dateIso, startTime: timeIso)
                 ReminderScheduler.shared.resync()
             }
-            scheduledLabel = "\(dateIso.suffix(5)) \(formatTime(timeIso))"
+            scheduledLabel = "\(dateIso.suffix(5)) \(ClockFormat.device.time(timeIso))"
             showSchedule = false
             return
         }
@@ -913,7 +913,7 @@ struct TaskEditor: View {
             target.later = false
         }
         model.scheduleTaskAt(target, date: dateIso, startTime: timeIso)
-        scheduledLabel = "\(dateIso.suffix(5)) \(formatTime(timeIso))"
+        scheduledLabel = "\(dateIso.suffix(5)) \(ClockFormat.device.time(timeIso))"
         ReminderScheduler.shared.resync()
         showSchedule = false
     }

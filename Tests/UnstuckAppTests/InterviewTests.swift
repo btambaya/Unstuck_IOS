@@ -65,8 +65,20 @@ final class InterviewTests: XCTestCase {
         XCTAssertTrue(INTERVIEW_QUESTIONS.allSatisfy { !$0.chips.isEmpty }, "every step is tap-answerable")
     }
 
+    /// The two clock chips read in the phone's clock; the facts they save
+    /// don't change with it (2026-09-24).
+    func testNoGoChipsFollowThePhonesClock() {
+        let h24 = interviewQuestions(clock: .h24).first { $0.key == "nogo" }!
+        XCTAssertEqual(h24.chips.map(\.label), ["Before 09:00", "After 21:00", "Weekends", "No hard limits"])
+        let h12 = interviewQuestions(clock: .h12).first { $0.key == "nogo" }!
+        XCTAssertEqual(h24.chips.map(\.fact), h12.chips.map(\.fact), "the saved fact is the same in both clocks")
+        XCTAssertEqual(INTERVIEW_QUESTIONS.first { $0.key == "nogo" }!.chips.map(\.label),
+                       interviewQuestions(clock: .device).first { $0.key == "nogo" }!.chips.map(\.label))
+    }
+
     func testScriptCopyAndChipsMatchTheWeb() {
-        let q = Dictionary(uniqueKeysWithValues: INTERVIEW_QUESTIONS.map { ($0.key, $0) })
+        // Pinned to 12-hour: the two clock chips follow the phone (test below).
+        let q = Dictionary(uniqueKeysWithValues: interviewQuestions(clock: .h12).map { ($0.key, $0) })
         XCTAssertEqual(q["rhythm"]?.question, "When’s your head clearest?")
         XCTAssertEqual(q["rhythm"]?.chips.map(\.label), ["Morning", "Afternoon", "Evening", "It varies"])
         XCTAssertEqual(q["rhythm"]?.chips.map(\.fact), [
@@ -84,7 +96,7 @@ final class InterviewTests: XCTestCase {
         XCTAssertEqual(q["commitments"]?.question, "Regular commitments — gym, rehearsals, clubs, volunteering?")
         XCTAssertEqual(q["commitments"]?.chips.map(\.label), ["Not really"])
         XCTAssertEqual(q["nogo"]?.question, "When should I never schedule anything?")
-        XCTAssertEqual(q["nogo"]?.chips.map(\.label), ["Before 9am", "After 9pm", "Weekends", "No hard limits"])
+        XCTAssertEqual(q["nogo"]?.chips.map(\.label), ["Before 9 AM", "After 9 PM", "Weekends", "No hard limits"])
         XCTAssertEqual(q["nogo"]?.chips.map(\.fact), [
             "Never schedule anything before 9am", "Never schedule anything after 9pm",
             "Keep weekends free — never schedule work there", nil])

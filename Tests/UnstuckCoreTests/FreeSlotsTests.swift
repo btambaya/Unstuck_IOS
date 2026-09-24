@@ -94,14 +94,39 @@ final class FindConflictsTests: XCTestCase {
 
 final class FormatTimeTests: XCTestCase {
     func testFormats12Hour() {
-        XCTAssertEqual(formatTime("09:00"), "9:00 AM")
-        XCTAssertEqual(formatTime("14:30"), "2:30 PM")
-        XCTAssertEqual(formatTime("00:15"), "12:15 AM")
-        XCTAssertEqual(formatTime("12:00"), "12:00 PM")
+        XCTAssertEqual(formatTime("09:00", clock: .h12), "9:00 AM")
+        XCTAssertEqual(formatTime("14:30", clock: .h12), "2:30 PM")
+        XCTAssertEqual(formatTime("00:15", clock: .h12), "12:15 AM")
+        XCTAssertEqual(formatTime("12:00", clock: .h12), "12:00 PM")
+    }
+
+    /// A 24-hour phone reads 24-hour times — never "2:30 PM" next to "14:30"
+    /// (Ahmad, 2026-09-24).
+    func testFormats24Hour() {
+        XCTAssertEqual(formatTime("09:00", clock: .h24), "09:00")
+        XCTAssertEqual(formatTime("14:30", clock: .h24), "14:30")
+        XCTAssertEqual(formatTime("00:15", clock: .h24), "00:15")
+    }
+
+    func testDefaultFollowsTheDevice() {
+        XCTAssertEqual(formatTime("14:30"), ClockFormat.device.time("14:30"))
     }
 
     func testBlockTimeRange() {
         let b = mkBlock(startTime: "09:00", durationMinutes: 60, date: "2026-05-21")
-        XCTAssertEqual(blockTimeRange(b), "9:00 AM–10:00 AM")
+        XCTAssertEqual(blockTimeRange(b, clock: .h12), "9:00–10:00 AM")
+        XCTAssertEqual(blockTimeRange(b, clock: .h24), "09:00–10:00")
+        let noon = mkBlock(startTime: "11:30", durationMinutes: 60, date: "2026-05-21")
+        XCTAssertEqual(blockTimeRange(noon, clock: .h12), "11:30 AM–12:30 PM")
+    }
+
+    func testSlotLabelsFollowTheClock() {
+        let now = localDT(2026, 5, 21, 7, 0)
+        let h24 = findFreeSlots([], durationMin: 30, now: now, startDate: now, daysToScan: 1, limit: 1, clock: .h24)
+        let h12 = findFreeSlots([], durationMin: 30, now: now, startDate: now, daysToScan: 1, limit: 1, clock: .h12)
+        XCTAssertEqual(h24.first?.label, "Today · 08:00")
+        XCTAssertEqual(h12.first?.label, "Today · 8:00 AM")
+        XCTAssertEqual(h24.first?.startTime, "08:00", "the stored time stays machine HH:MM")
+        XCTAssertEqual(h12.first?.startTime, "08:00")
     }
 }

@@ -43,6 +43,22 @@ phases land. Newest status at the top.
 
 
 
+## One clock: the phone's 12/24-hour setting everywhere (branch clock/ios, 2026-09-24) — not shipped yet
+
+Ahmad: "On the calendar we need to be consistent — either 12 hour or 24h, not both." His 24-hour iPhone showed
+"THURSDAY · 2:02 PM" on Today next to 14:02 elsewhere; every screen hard-coded its own format. RULE: every clock time
+the user SEES goes through `UnstuckCore.ClockFormat` (Sources/UnstuckCore/Support/ClockFormat.swift) —
+`ClockFormat.device` (cached; dropped on NSLocale.currentLocaleDidChange and on every .active via `refreshDevice()`)
+follows Settings › 24-Hour Time (template "j" → 12h when it has a/b/B/h/K outside quotes). 24h "14:30", whole hours
+in tight spots "14:00" (never "14"); 12h "2:30 PM" / "2 PM" with the locale's AM/PM; ranges "14:00–15:30" /
+"2:00–3:30 PM". Routed: Today eyebrow, Day + Week grid hour labels, block chips, block-edit + New-task time chips,
+task-editor schedule line, shared blocks / month peek / shared rows + detail, collection "by" times, Insights heatmap
+axis + VoiceOver summary, receipts (schedule + call cards), the chat polish time rule, the Calls settings / task
+editor lines, the "Rescheduled" notification, the interview's Before/After chips. NOT routed (machine / model text):
+tool args + results, AssistantContext, call instructions + day context, `hoursLabel` with no clock (the model's
+`error:` strings), storage/API/Google HH:MM, logs, the web-port `hourSpanLabel` in read_insights. Pure Core display
+helpers take `clock: ClockFormat = .device`; tests pin `.h12` / `.h24` (ClockFormatTests + the touched suites).
+
 ## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
 
 Zubair asked for "every two weeks on Thursdays"; Ahmad approved it the same morning (week = ISO Monday; UI chips
