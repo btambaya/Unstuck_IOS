@@ -47,19 +47,22 @@ public struct NotificationsClient: Sendable {
 
     // MARK: wake-window calibration (migration 015 `wake_window_history`)
 
-    // MARK: notification_queue cards (the "Unstuck called you about X" card)
+    // MARK: notification_queue cards (the bell's server half)
 
     /// The server-side in-app cards for the signed-in user (RLS
-    /// `notification_queue_own`), one `moment` only, newest first — what the
-    /// web's `useNotificationQueue` reads (id, moment, title, body,
-    /// created_at). The bell reads moment `call` so a call the server rang
-    /// (answered, missed, or on a phone that couldn't take it) shows up as a
-    /// card on every device. Throws on transport failure; the caller keeps
-    /// what it had.
-    public func queueCards(moment: String, limit: Int = 30) async throws -> [NotificationQueueCard] {
+    /// `notification_queue_own`), for the given `moments`, newest first —
+    /// what the web's `useNotificationQueue` reads. The bell asks for every
+    /// moment it can show (calls, recaps, the brief, every sharing moment), so
+    /// a push swiped away still leaves its record.
+    ///
+    /// `select *`, not a column list: `deep_link` (migration 084) is read
+    /// where the column exists and is simply absent before it does. Naming it
+    /// would fail the whole read on an un-migrated database — call cards
+    /// included. Throws on transport failure; the caller keeps what it had.
+    public func queueCards(moments: [String], limit: Int = 30) async throws -> [NotificationQueueCard] {
         try await client.from("notification_queue")
-            .select("id, moment, title, body, created_at")
-            .eq("moment", value: moment)
+            .select()
+            .in("moment", values: moments)
             .order("created_at", ascending: false)
             .limit(limit)
             .execute().value
@@ -86,20 +89,27 @@ public struct NotificationsClient: Sendable {
 }
 
 /// One `notification_queue` row as the bell reads it (web `QueueRow`).
+/// `deepLink` is the `unstuck://` link the event's push carried (migration
+/// 084); nil on rows written before it, by a sender that had none, or when
+/// the column doesn't exist yet.
 public struct NotificationQueueCard: Codable, Sendable, Equatable, Identifiable {
     public var id: String
     public var moment: String
     public var title: String
     public var body: String
     public var createdAt: String
+    public var deepLink: String?
 
     enum CodingKeys: String, CodingKey {
         case id, moment, title, body
         case createdAt = "created_at"
+        case deepLink = "deep_link"
     }
 
-    public init(id: String, moment: String, title: String, body: String, createdAt: String) {
+    public init(id: String, moment: String, title: String, body: String, createdAt: String,
+                deepLink: String? = nil) {
         self.id = id; self.moment = moment; self.title = title; self.body = body; self.createdAt = createdAt
+        self.deepLink = deepLink
     }
 
     public init(from decoder: Decoder) throws {
@@ -109,6 +119,9 @@ public struct NotificationQueueCard: Codable, Sendable, Equatable, Identifiable 
         title = try c.decodeIfPresent(String.self, forKey: .title) ?? ""
         body = try c.decodeIfPresent(String.self, forKey: .body) ?? ""
         createdAt = try c.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        let link = try c.decodeIfPresent(String.self, forKey: .deepLink)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        deepLink = (link?.isEmpty ?? true) ? nil : link
     }
 }
 
