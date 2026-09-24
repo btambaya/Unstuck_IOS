@@ -24,6 +24,9 @@ final class AppModelAssistantState: AssistantAppState {
     // MARK: reads
 
     func getTasks() -> [TaskItem] { (try? model.taskRepo?.all()) ?? [] }
+    func calBlocksMayBeTruncated() async -> Bool {
+        await model.coordinator?.lastCalBlocksPull()?.mayBeTruncated == true
+    }
     func getBlocks() -> [CalBlock] { (try? model.db?.fetchAllCalBlocks()) ?? [] }
     func getCollections() -> [ItemCollection] { (try? model.db?.fetchAllCollections()) ?? [] }
     func getAreaRows() -> [LifeArea] { ((try? model.db?.fetchAllLifeAreas()) ?? []).sorted { $0.sortOrder < $1.sortOrder } }

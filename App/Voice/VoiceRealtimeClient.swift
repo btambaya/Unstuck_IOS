@@ -107,6 +107,11 @@ struct VoiceIntegrityGuard: Sendable {
     /// (`correctiveResponse`) out of a reply that had nothing to do.
     var nextResponseExempt = false
     private var exempt = false
+    /// get_period_review returned ok: since the user last spoke — the spoken
+    /// review ("you finished the chapter draft…") is a later response than
+    /// the one that carried the call, so a per-response flag isn't enough.
+    /// Cleared when the user's next speech starts (week-review-spec.md §5.4).
+    var periodReviewed = false
 
     /// The corrective injected as a hidden user item (verbatim from the web).
     static let correctiveText = "(integrity check from the app, not the user: you said you did or would do something, but no tool ran — nothing happened. Call the right tool NOW, with sensible defaults for anything you were not told (a call label can be a few words, a call time is context.now plus what they said); do not ask again what you already asked. Then say in a few words what the result was — no apology, no explanation.)"
@@ -134,7 +139,10 @@ struct VoiceIntegrityGuard: Sendable {
     mutating func toolDispatched(_ name: String) { if Self.counts(name) { toolCalled = true } }
     mutating func toolFinished(_ name: String, result: String) {
         nextResponseToolBacked = result.hasPrefix("ok:") && Self.counts(name)
+        if name == "get_period_review" && result.hasPrefix("ok:") { periodReviewed = true }
     }
+    /// The user started speaking: a new turn, so an earlier review no longer vouches.
+    mutating func userSpeechStarted() { periodReviewed = false }
     /// A cancelled/incomplete response (barge-in) is not a claim.
     mutating func responseCancelled() { wasCorrection = false }
 
@@ -143,7 +151,7 @@ struct VoiceIntegrityGuard: Sendable {
         if exempt { exempt = false; return false }
         if wasCorrection { wasCorrection = false; return false }
         if toolCalled || correctionsLeft <= 0 { return false }
-        if !looksLikeActionClaim(transcript) { return false }
+        if !looksLikeActionClaim(transcript, recap: periodReviewed) { return false }
         correctionsLeft -= 1
         wasCorrection = true
         return true
@@ -1167,6 +1175,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // DUCKS (−12 dB) and starts the confirm timer; the state machine
             // turns it into response.cancel + flush + mute (a real barge-in)
             // or a restore (a blip that speech_stopped ends first).
+            withLock { _guard.userSpeechStarted() }
             dispatch(.speechStarted(itemId: ev["item_id"] as? String))
         case "input_audio_buffer.speech_stopped":
             dispatch(.speechStopped)

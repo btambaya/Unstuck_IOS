@@ -560,6 +560,61 @@ final class AssistantHarnessTests: XCTestCase {
         XCTAssertEqual(window.map(\.role), ["user", "assistant", "user"])
     }
 
+    // MARK: period reviews (week-review-spec.md §5.4)
+
+    func testARecapOfWhatTheUserDidIsNotBouncedAfterAPeriodReview() async {
+        let review = ScriptedTransport([
+            call("get_period_review", #"{"period":"last_week"}"#),
+            text("You finished \"Draft chapter 3\" and skipped \"Stretch\" once."),
+        ])
+        let outcome = await runTurn("how was last week?", review)
+        XCTAssertEqual(outcome, .reply("You finished \"Draft chapter 3\" and skipped \"Stretch\" once."))
+        XCTAssertEqual(review.asks.count, 2, "no hidden corrective round")
+        // The same sentence on a turn WITHOUT an ok review still bounces.
+        reset()
+        let plain = ScriptedTransport([text("You finished \"Draft chapter 3\" and skipped \"Stretch\" once."), text("Which one?")])
+        _ = await runTurn("how was last week?", plain)
+        XCTAssertEqual(plain.asks.count, 2)
+        XCTAssertEqual(plain.asks[1].last?.content, AssistantHarness.correctiveText)
+        // An errored review vouches for nothing either.
+        reset()
+        let failed = ScriptedTransport([call("get_period_review", "{}"), text("You finished \"Draft chapter 3\"."), text("Sorry.")])
+        _ = await runTurn("how was it?", failed)
+        XCTAssertEqual(failed.asks.count, 3)
+    }
+
+    func testTheReviewFlagNeverWavesThroughTheAssistantsOwnClaim() async {
+        let t = ScriptedTransport([
+            call("get_period_review", #"{"period":"last_week"}"#),
+            text("I moved \"Tax return\" to Friday."),
+            text("Want me to move it?"),
+        ])
+        _ = await runTurn("how was last week?", t)
+        XCTAssertEqual(t.asks.count, 3, "an assistant-subject claim is still bounced on a review turn")
+    }
+
+    func testVoiceGuardTrustsARecapOnlyUntilTheUserSpeaksAgain() {
+        var g = VoiceIntegrityGuard()
+        g.toolDispatched("get_period_review")
+        g.toolFinished("get_period_review", result: "ok: review of last week (Mon 14 Sep – Sun 20 Sep).")
+        g.responseCreated()
+        g.transcriptDelta("You finished the report and skipped \"Stretch\" once.")
+        XCTAssertFalse(g.shouldCorrect(), "a spoken review of the user's week is not a claim")
+        g.responseCreated()
+        g.transcriptDelta("You've also completed \"Tax return\".")
+        XCTAssertFalse(g.shouldCorrect())
+        g.userSpeechStarted()
+        g.responseCreated()
+        g.transcriptDelta("You skipped \"Stretch\" on purpose.")
+        XCTAssertTrue(g.shouldCorrect(), "a new user turn — the old review vouches for nothing")
+        // An error from the tool never sets the flag.
+        var e = VoiceIntegrityGuard()
+        e.toolFinished("get_period_review", result: "error: period required — …")
+        e.responseCreated()
+        e.transcriptDelta("You skipped \"Stretch\" on purpose.")
+        XCTAssertTrue(e.shouldCorrect())
+    }
+
     // MARK: voice integrity guard
 
     func testVoiceGuardCorrectsAClaimWithoutAToolOnceAndNeverLoops() {

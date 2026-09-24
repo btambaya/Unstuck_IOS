@@ -255,7 +255,7 @@ final class AssistantModel {
             transport: transport,
             api: api,
             scratch: scratch,
-            context: { buildAssistantContext(api) },
+            context: { textRequestContext(api) },
             receipt: { [weak self] name, args, result in
                 guard let self else { return nil }
                 return self.receipt(name: name, args: args, result: result, scratch: scratch)

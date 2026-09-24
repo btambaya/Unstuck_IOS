@@ -682,7 +682,8 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
         let w = (args.str("window") ?? "week").lowercased()
         guard let window = InsightsWindow(rawValue: w) else { return "error: window must be week, month, or all" }
         var out = renderInsights(tasks: api.getTasks(), sessions: api.getSessions(), captures: api.getCaptures(),
-                                 reasons: api.getReasonLogs(), blocks: api.getBlocks(), now: Date(), window: window)
+                                 reasons: api.getReasonLogs(), blocks: api.getBlocks(), now: Date(), window: window,
+                                 areas: api.getAreas())
         // The week window starts on Monday: early in the week it is a day or
         // two of data. "How was my last week?" on a Monday was answered from
         // it as if it were the week before (Ahmad, 2026-09-20 23:46).
@@ -690,10 +691,25 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             let dow = LocalDate.dayOfWeek(api.todayIso())   // 0 = Sunday … 1 = Monday
             let daysIn = dow == 0 ? 7 : dow
             if daysIn <= 2 {
-                out += "\nnote: this is the CURRENT week, \(daysIn == 1 ? "today only" : "two days") so far — it says nothing about last week. If they asked about last week, say the app has no last-week window yet and offer the month (window: month)."
+                // The fallback clause is required: on the text path a server
+                // may not offer get_period_review (an old server, or the
+                // DISABLED_TOOL_CAPS kill switch) — week-review-spec.md §5.3.
+                out += "\nnote: this is the CURRENT week, \(daysIn == 1 ? "today only" : "two days") so far — it says nothing about last week. If they asked about last week, call get_period_review with period=last_week — or, if you don't have that tool, say this window can't show last week and offer the month (window: month)."
             }
         }
         return out
+
+    // "How has my week been?" — any past day / week / month, from the same
+    // periodFacts the Insights page draws (UnstuckCore/PeriodReview.swift).
+    // historyFloor is always nil on iOS: sessions and reason logs are delta
+    // tables that sweep every row the device lacks (spec §3.6).
+    case "get_period_review":
+        return renderPeriodReview(
+            args: PeriodReviewArgs(period: args.rawString("period"), date: args.rawString("date"),
+                                   from: args.rawString("from"), to: args.rawString("to")),
+            tasks: api.getTasks(), blocks: api.getBlocks(), sessions: api.getSessions(),
+            captures: api.getCaptures(), reasons: api.getReasonLogs(), now: Date(),
+            historyFloor: nil, blocksPartial: await api.calBlocksMayBeTruncated())
 
     // ── NAVIGATE ──
     case "open_screen":
