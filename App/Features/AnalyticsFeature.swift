@@ -219,6 +219,8 @@ struct AnalyticsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @State private var vm: AnalyticsModel?
+    /// Lists opened past their cut with "+N more" (keys: wins, open, series, slips).
+    @State private var expanded: Set<String> = []
     // Report/Deep-dive is persisted (not local @State) so it survives leaving
     // and re-entering Insights — Android route-persists this flag.
     @AppStorage("insights.deepDive") private var deep = false
@@ -515,6 +517,30 @@ struct AnalyticsView: View {
         return "Daily rhythm. " + parts.joined(separator: "; ")
     }
 
+    // MARK: "+N more" — every clipped list opens in place
+
+    private func cut(_ key: String, _ max: Int) -> Int { expanded.contains(key) ? Int.max : max }
+
+    /// "+N more ›" under a clipped list; tapping shows the rest, "Show less" folds it back.
+    @ViewBuilder
+    private func moreToggle(_ key: String, total: Int, max: Int) -> some View {
+        if total > max {
+            let open = expanded.contains(key)
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    if open { expanded.remove(key) } else { expanded.insert(key) }
+                }
+            } label: {
+                Text(open ? "Show less" : "+\(total - max) more ›")
+                    .font(UFont.sans(11, .semibold)).foregroundStyle(theme.palette.ink2)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(open ? "Show less" : "Show \(total - max) more")
+        }
+    }
+
     // MARK: got unstuck (quiet wins) — hidden when empty
 
     private func winsCard(_ wins: [UnstuckWin]) -> some View {
@@ -523,7 +549,7 @@ struct AnalyticsView: View {
                 Text("Things you got unstuck").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
                 Text("Finished after waiting a week or more, or after moving it around.")
                     .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                ForEach(Array(wins.prefix(3).enumerated()), id: \.offset) { _, w in
+                ForEach(Array(wins.prefix(cut("wins", 3)).enumerated()), id: \.offset) { _, w in
                     HStack(spacing: 8) {
                         Text(w.name).font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
                         Spacer(minLength: 6)
@@ -532,9 +558,7 @@ struct AnalyticsView: View {
                             .background(theme.palette.bg2, in: Capsule())
                     }
                 }
-                if wins.count > 3 {
-                    Text("+\(wins.count - 3) more").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                }
+                moreToggle("wins", total: wins.count, max: 3)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -585,7 +609,7 @@ struct AnalyticsView: View {
                 if !openTasks.isEmpty {
                     Text("Still open from earlier").font(UFont.sans(11, .semibold)).foregroundStyle(theme.palette.ink3)
                         .padding(.top, 2)
-                    ForEach(Array(openTasks.prefix(3).enumerated()), id: \.offset) { _, s in
+                    ForEach(Array(openTasks.prefix(cut("open", 3)).enumerated()), id: \.offset) { _, s in
                         HStack {
                             Text(s.task.name).font(UFont.sans(13)).foregroundStyle(theme.palette.ink).lineLimit(1)
                             Spacer(minLength: 6)
@@ -593,9 +617,7 @@ struct AnalyticsView: View {
                                 .font(UFont.mono(10)).foregroundStyle(theme.palette.ink3)
                         }
                     }
-                    if openTasks.count > 3 {
-                        Text("+\(openTasks.count - 3) more").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                    }
+                    moreToggle("open", total: openTasks.count, max: 3)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -635,7 +657,7 @@ struct AnalyticsView: View {
         Card {
             VStack(alignment: .leading, spacing: 10) {
                 Text("Repeating tasks").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-                ForEach(Array(snap.series.prefix(5).enumerated()), id: \.offset) { _, s in
+                ForEach(Array(snap.series.prefix(cut("series", 5)).enumerated()), id: \.offset) { _, s in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text(s.name).font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
@@ -647,9 +669,7 @@ struct AnalyticsView: View {
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel("\(s.name): \(seriesCaption(s, soFar: snap.period.clipped))")
                 }
-                if snap.series.count > 5 {
-                    Text("+\(snap.series.count - 5) more").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                }
+                moreToggle("series", total: snap.series.count, max: 5)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -777,7 +797,7 @@ struct AnalyticsView: View {
         if !snap.slips.isEmpty {
             SectionLabel("The slip detector").padding(.top, 18).padding(.bottom, 6)
             VStack(spacing: 6) {
-                ForEach(Array(snap.slips.prefix(8).enumerated()), id: \.offset) { _, s in
+                ForEach(Array(snap.slips.prefix(cut("slips", 8)).enumerated()), id: \.offset) { _, s in
                     Card {
                         HStack {
                             Text(s.name).font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink).lineLimit(1)
@@ -787,10 +807,8 @@ struct AnalyticsView: View {
                         .frame(maxWidth: .infinity)
                     }
                 }
-                if snap.slips.count > 8 {
-                    Text("+\(snap.slips.count - 8) more").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                moreToggle("slips", total: snap.slips.count, max: 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
 

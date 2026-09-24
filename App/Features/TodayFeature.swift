@@ -347,7 +347,11 @@ struct TodayView: View {
     // Today ScrollView so it stays fixed while the content scrolls beneath it.
     private var topBar: some View {
         HStack {
-                Mark(size: 24)
+                // The ring fills the same 32-pt box as the avatar (Mark draws its
+                // ring at ~72 % of its size, so 44 → a 32-pt ring), and both sit on
+                // the page's 18-pt margins — logo and avatar mirror each other.
+                Mark(size: 44).frame(width: 32, height: 32)
+                    .accessibilityHidden(true)
                 Spacer()
                 HStack(spacing: 2) {
                     // Inbox (MoveToInbox) → the capture triage tray; the coral dot
@@ -383,7 +387,7 @@ struct TodayView: View {
                         .accessibilityLabel("Account and settings")
                 }
             }
-            .padding(.leading, 18).padding(.trailing, 12).padding(.top, 8).padding(.bottom, 4)
+            .padding(.horizontal, 18).padding(.top, 8).padding(.bottom, 4)
     }
 
     // Greeting block — scrolls with the content (only topBar is pinned).
