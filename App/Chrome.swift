@@ -56,6 +56,15 @@ struct BottomNavBar: View {
     /// four icons share one line and all four labels one baseline.
     static let iconBox = CGSize(width: 24, height: 22)
 
+    /// How far a tab's content (and the assistant launcher) sits above the
+    /// bottom safe edge to clear this bar. The bar overlays the tab content
+    /// (MainTabScaffold's ZStack), so a scroll view pads its end by this much.
+    /// The bar is ~60 pt: an icon pill (22 + 2×4) + 2 + an 11-pt label ≈ 46,
+    /// the + is 44, plus 8 above and 6 below. 72 leaves a 12-pt gap above its
+    /// hairline. It was 96 while the + was lifted above the bar; with the +
+    /// inline that left ~36 pt of dead space under a list scrolled to its end.
+    static let clearance: CGFloat = 72
+
     private let tabs = AppRouter.Tab.allCases
 
     var body: some View {

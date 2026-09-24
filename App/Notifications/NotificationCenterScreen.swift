@@ -55,7 +55,7 @@ struct NotificationCenterView: View {
                             card(dot: accentColor(n.kind), title: n.title,
                                  meta: "\(n.body)  ·  \(relPast(now - n.at))",
                                  action: tapAction(for: n),
-                                 kindLabel: kindLabel(n.kind))
+                                 kindLabel: notificationKindLabel(n.kind))
                         }
                     }
                 }
@@ -118,27 +118,6 @@ struct NotificationCenterView: View {
     private func openTask(_ id: String) {
         model.routeDeepLinkAfterDismiss("unstuck://task/\(id)")
         dismiss()
-    }
-
-    /// Human-readable name for the dot's color-coded kind, so VoiceOver conveys
-    /// the meaning that's otherwise only in the accent color.
-    private func kindLabel(_ kind: String) -> String {
-        switch kind {
-        case "paused_checkin": return "Paused check-in"
-        case "atstart": return "Starting now"
-        case "drifted": return "Drifted"
-        case "session_recap": return "Session recap"
-        case "morning_brief": return "Morning brief"
-        case "evening_preview": return "Evening preview"
-        case "daily_nudge": return "Daily nudge"
-        case "task_share": return "Shared with you"
-        case "collection_share": return "List shared with you"
-        case "invite_claimed": return "Someone joined"
-        case "shared_task_done": return "Shared task done"
-        case "call", "call_missed": return "Call from Unstuck"
-        case NotificationQueueCards.skippedKind: return "Call skipped"
-        default: return "Notification"
-        }
     }
 
     private func accentColor(_ kind: String) -> Color {
@@ -290,5 +269,34 @@ enum NotificationQueueCards {
             .sorted { $0.at > $1.at }
             .prefix(cap)
             .map { $0 }
+    }
+}
+
+/// Human-readable name for a notification's color-coded kind, so VoiceOver
+/// conveys the meaning that's otherwise only in the dot's accent color. The
+/// card reads it as "<label>: <title>".
+///
+/// A kind only names the CHANNEL, not the event: `collection_share` carries a
+/// new share ("Maya shared Groceries") but also a shared list's updates
+/// ("Maya updated Groceries"), "Maya finished Milk" and the late-item nudges.
+/// Labelling all of them "List shared with you" told a VoiceOver user every
+/// edit was a fresh share; the neutral "Shared list" lets the title say what
+/// happened.
+func notificationKindLabel(_ kind: String) -> String {
+    switch kind {
+    case "paused_checkin": return "Paused check-in"
+    case "atstart": return "Starting now"
+    case "drifted": return "Drifted"
+    case "session_recap": return "Session recap"
+    case "morning_brief": return "Morning brief"
+    case "evening_preview": return "Evening preview"
+    case "daily_nudge": return "Daily nudge"
+    case "task_share": return "Shared with you"
+    case "collection_share": return "Shared list"
+    case "invite_claimed": return "Someone joined"
+    case "shared_task_done": return "Shared task done"
+    case "call", "call_missed": return "Call from Unstuck"
+    case NotificationQueueCards.skippedKind: return "Call skipped"
+    default: return "Notification"
     }
 }

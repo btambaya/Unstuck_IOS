@@ -452,7 +452,7 @@ struct TasksView: View {
                 }
             }
             .padding(.horizontal, 18)
-            .padding(.bottom, 96)   // clear the floating bottom nav
+            .padding(.bottom, BottomNavBar.clearance)   // clear the bottom nav
         }
     }
 

@@ -43,6 +43,25 @@ phases land. Newest status at the top.
 
 
 
+## Three small fixes (branch small/ios, 2026-09-24) — not shipped yet
+
+- **VoiceOver on a shared-list notification.** The notification centre card is read "<kind label>: <title>", and
+  `collection_share` was labelled "List shared with you" — but that kind also carries a shared list's updates
+  ("Maya updated Groceries"), "Maya finished Milk" and the late-item nudges, so every edit was announced as a new
+  share. The label is now the neutral "Shared list" and the title says what happened. The label map moved out of
+  the view into `notificationKindLabel(_:)` (App/Notifications/NotificationCenterScreen.swift) so it is tested.
+- **Task sheet Schedule on one day of a repeating task.** `TaskEditor.scheduleText` read `myBlocks.first` — the
+  series' OLDEST block — so today's 09-24 occurrence showed "09-23 17:00". It now reads the occurrence's own block
+  (`TaskEditor.scheduleLabel(later:occurrence:blocks:clock:)`); a plain task or the series itself is unchanged.
+- **Tab-root bottom padding 96 → `BottomNavBar.clearance` (72).** 96 was sized for the lifted +; with the + in the
+  row the bar is ~60 pt, so a list scrolled to its end had ~36 pt of dead space above the bar. Today, Tasks,
+  Collections (list + a collection's detail), Calendar (week, month, and the Day view's 84) and the assistant
+  launcher all use the one constant, so the launcher still sits level with the content's end and above the bar.
+  Sheets (Settings, Insights, Areas & tags, Notification settings) keep their 96 — they never sit over the bar.
+  The tour chip's own 92 is untouched.
+- Tests: `RepeatingFocusPriorTests` (Tests/UnstuckAppTests/Round2ParityTests.swift) — schedule label + kind label.
+  swift test 1501 green; UnstuckAppTests 1202 green.
+
 ## New task → "Share with…": one row + the Share screen (branch sharerow/ios, 2026-09-24) — not shipped yet
 
 Ahmad, on the New task sheet's Share section (a big card per connected person, each with a full-width
