@@ -91,3 +91,112 @@ final class HomeShots: XCTestCase {
         save("03-assistant-interview")
     }
 }
+
+// Calendar → Day → tap a task block: the Edit-block sheet's Mark done / Start
+// focus / Open task (Ahmad, 2026-09-24: "Can't complete a task from
+// calendar"). Demo boot + UITEST_CALENDAR (a daily "Take vitamins" series with
+// an occurrence at the current hour). Shoots the sheet on a plain task (open,
+// then done after its own Mark done), on the occurrence (open, then done), and
+// the two follow-ups (Open task → the editor, Start focus → Focus).
+//
+//   xcodebuild test … -only-testing:UnstuckUITests/CalendarBlockSheetShots \
+//     TEST_RUNNER_CALBLOCK_SHOTS_DIR=/path/to/out
+
+final class CalendarBlockSheetShots: XCTestCase {
+    private var app: XCUIApplication!
+    private lazy var outDir: URL = {
+        let env = ProcessInfo.processInfo.environment["CALBLOCK_SHOTS_DIR"]
+        return URL(fileURLWithPath: env?.isEmpty == false ? env! : "/tmp/unstuck-calblock-shots")
+    }()
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        app = XCUIApplication()
+        app.launchEnvironment["UITEST_SEED"] = "1"
+        app.launchEnvironment["UITEST_CALENDAR"] = "1"
+        XCUIDevice.shared.appearance = .light
+        app.launch()
+    }
+
+    private func save(_ name: String) {
+        try? XCUIScreen.main.screenshot().pngRepresentation.write(to: outDir.appendingPathComponent("\(name).png"))
+    }
+
+    private var toggle: XCUIElement { app.buttons["cal-block-toggle-done"].firstMatch }
+
+    /// Tap a block on the Day grid by its name and wait for its sheet.
+    private func openBlock(_ name: String, file: StaticString = #filePath, line: UInt = #line) {
+        let block = app.staticTexts[name].firstMatch
+        XCTAssertTrue(block.waitForExistence(timeout: 8), "no \(name) block on the Day grid", file: file, line: line)
+        block.tap()
+        XCTAssertTrue(app.buttons["cal-block-open"].firstMatch.waitForExistence(timeout: 6),
+                      "the Edit-block sheet for \(name) has no Open task", file: file, line: line)
+        usleep(900_000)
+    }
+
+    private func closeSheet() {
+        app.navigationBars.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["cal-block-open"].firstMatch.waitForNonExistence(timeout: 6))
+        usleep(500_000)
+    }
+
+    func testMarkDoneFocusAndOpenFromTheCalendarBlockSheet() throws {
+        // A fresh container asks for notification permission first.
+        let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").buttons["Allow"].firstMatch
+        if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(800_000) }
+        XCTAssertTrue(app.buttons["Day"].firstMatch.waitForExistence(timeout: 15), "the demo boot never reached Calendar")
+        usleep(1_000_000)
+
+        // Plain task, open → Mark done.
+        openBlock("Reply to Sarah")
+        XCTAssertEqual(toggle.label, "Mark done")
+        XCTAssertTrue(app.buttons["cal-block-focus"].exists)
+        save("01-plain-open")
+        toggle.tap()
+        XCTAssertTrue(toggle.waitForNonExistence(timeout: 6), "Mark done closes the sheet")
+        usleep(900_000)
+        save("02-grid-after-mark-done")
+
+        // Reopened: the same block now offers the undo.
+        openBlock("Reply to Sarah")
+        XCTAssertEqual(toggle.label, "Mark not done")
+        save("03-plain-done")
+        closeSheet()
+
+        // One day of a repeating series.
+        openBlock("Take vitamins")
+        XCTAssertEqual(toggle.label, "Mark done")
+        save("04-occurrence-open")
+        toggle.tap()
+        XCTAssertTrue(toggle.waitForNonExistence(timeout: 6))
+        usleep(900_000)
+        openBlock("Take vitamins")
+        XCTAssertEqual(toggle.label, "Mark not done", "only this day is done — and it can be undone")
+        save("05-occurrence-done")
+        XCUIDevice.shared.appearance = .dark
+        usleep(1_200_000)
+        save("06-occurrence-done-dark")
+        XCUIDevice.shared.appearance = .light
+        usleep(900_000)
+        closeSheet()
+
+        // Open task → the task editor on that task.
+        openBlock("Draft the Q3 proposal")
+        app.buttons["cal-block-open"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Share task"].firstMatch.waitForExistence(timeout: 8), "Open task opens the editor")
+        usleep(900_000)
+        save("07-open-task-editor")
+        app.navigationBars.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Share task"].firstMatch.waitForNonExistence(timeout: 6))
+        usleep(700_000)
+
+        // Start focus → the Focus screen.
+        openBlock("Draft the Q3 proposal")
+        app.buttons["cal-block-focus"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["cal-block-focus"].firstMatch.waitForNonExistence(timeout: 6))
+        XCTAssertTrue(app.buttons["Capture"].firstMatch.waitForExistence(timeout: 8), "Start focus opens Focus")
+        usleep(1_200_000)
+        save("08-start-focus")
+    }
+}

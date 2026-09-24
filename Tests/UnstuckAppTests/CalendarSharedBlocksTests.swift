@@ -413,3 +413,183 @@ final class GoogleConnectDisclosureTests: XCTestCase {
         XCTAssertEqual(GoogleConnectCopy.connectPill(busy: false, disconnecting: false), "＋ Connect Google Calendar")
     }
 }
+
+// MARK: - the Edit-block sheet's task actions (Ahmad, 2026-09-24: "Can't complete a task from calendar")
+//
+// Mark done / Mark not done, Start focus and Open task on a tapped calendar
+// block go through the SAME model paths a Today row uses — toggleDone(row),
+// router.beginFocus(row), router.detailTask = row — with the row Today shows:
+// the day's occurrence (id = block id) for a repeating series. The XCUITest
+// demo boot (in-memory GRDB + a local-only WriteThrough) is the seam; writes
+// are fire-and-forget, so the asserts poll.
+
+@MainActor
+final class CalBlockSheetActionTests: XCTestCase {
+    private var model: AppModel!
+    private var db: AppDatabase!
+    private let today = Clock.todayISO()
+    private var tomorrow: String { LocalDate.addDays(today, 1) }
+    private let t0 = "2026-09-01T08:00:00.000Z"
+
+    override func setUp() async throws {
+        try await super.setUp()
+        model = AppModel()
+        model.startUITestMode()
+        db = try XCTUnwrap(model.db)
+    }
+
+    /// Poll (60 × 50 ms) until `done` holds.
+    private func settle(_ done: () throws -> Bool) async throws {
+        for _ in 0..<60 {
+            if try done() { return }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private func storedTask(_ id: String) throws -> TaskItem? { try model.taskRepo?.fetch(id: id) }
+    private func storedBlock(_ id: String) throws -> CalBlock? { try db.fetchById(CalBlock.self, id: id) }
+    private func ops(_ table: String, _ id: String) throws -> [OutboxOp] {
+        try OutboxStore(db).pending().filter { $0.tableName == table && $0.rowId == id }
+    }
+
+    /// What the sheet computes for the block, from the live store (the
+    /// calendar's `vm.tasks` is the same observed table).
+    private func actions(_ blockId: String, assignedOut: Set<String> = []) throws -> CalBlockTaskActions? {
+        let block = try XCTUnwrap(try storedBlock(blockId))
+        return calBlockTaskActions(block, tasks: try XCTUnwrap(model.taskRepo).all(), assignedOutIds: assignedOut)
+    }
+
+    private func seedPlain(id: String = "cb-plain", done: Bool = false) throws {
+        try db.save(TaskItem(id: id, name: "Reply to the landlord", estimateMin: 15, done: done,
+                             completedAt: done ? t0 : nil, createdAt: t0, updatedAt: t0))
+        try db.save(CalBlock(id: "\(id)-blk", taskId: id, taskName: "Reply to the landlord", startTime: "10:00",
+                             durationMinutes: 15, date: today, kind: .task))
+    }
+
+    private func seedSeries(todayDone: Bool = false) throws {
+        try db.save(TaskItem(id: "cb-tpl", name: "Take vitamins", estimateMin: 5, recurrence: .daily(until: nil),
+                             createdAt: t0, updatedAt: t0))
+        try db.save(CalBlock(id: "cb-tpl-td", taskId: "cb-tpl", taskName: "Take vitamins", startTime: "08:00",
+                             durationMinutes: 5, date: today, kind: .task, done: todayDone,
+                             completedAt: todayDone ? "\(today)T08:05:00.000Z" : nil))
+        try db.save(CalBlock(id: "cb-tpl-tm", taskId: "cb-tpl", taskName: "Take vitamins", startTime: "08:00",
+                             durationMinutes: 5, date: tomorrow, kind: .task))
+    }
+
+    // MARK: plain task
+
+    func testMarkDoneCompletesThePlainTask() async throws {
+        try seedPlain()
+        let a = try XCTUnwrap(try actions("cb-plain-blk"))
+        XCTAssertEqual(a.toggleLabel, "Mark done")
+        model.toggleCalBlockDone(a)
+        try await settle { try self.storedTask("cb-plain")?.done == true }
+        let done = try XCTUnwrap(try storedTask("cb-plain"))
+        XCTAssertTrue(done.done)
+        XCTAssertNotNil(done.completedAt, "completion-stamped, as Today's circle does")
+        XCTAssertEqual(try ops("tasks", "cb-plain").count, 1, "the write is queued for sync")
+        XCTAssertEqual(try storedBlock("cb-plain-blk")?.done, false, "a plain task's done lives on the task")
+        XCTAssertEqual(try actions("cb-plain-blk")?.toggleLabel, "Mark not done", "the sheet now offers the undo")
+    }
+
+    func testMarkNotDoneReopensTheDoneTask() async throws {
+        try seedPlain(done: true)
+        let a = try XCTUnwrap(try actions("cb-plain-blk"))
+        XCTAssertTrue(a.done)
+        XCTAssertEqual(a.toggleLabel, "Mark not done")
+        model.toggleCalBlockDone(a)
+        try await settle { try self.storedTask("cb-plain")?.done == false }
+        let reopened = try XCTUnwrap(try storedTask("cb-plain"))
+        XCTAssertFalse(reopened.done)
+        XCTAssertNil(reopened.completedAt, "Today's uncheck clears the stamp")
+        XCTAssertEqual(try actions("cb-plain-blk")?.toggleLabel, "Mark done")
+    }
+
+    // MARK: recurring occurrence
+
+    /// Mark done on a day of a series ticks THAT day's block — never the
+    /// template (which would end the series) and never another day.
+    func testMarkDoneOnAnOccurrenceTicksOnlyThatDay() async throws {
+        try seedSeries()
+        let a = try XCTUnwrap(try actions("cb-tpl-td"))
+        XCTAssertTrue(a.isOccurrence)
+        model.toggleCalBlockDone(a)
+        try await settle { try self.storedBlock("cb-tpl-td")?.done == true }
+        let day = try XCTUnwrap(try storedBlock("cb-tpl-td"))
+        XCTAssertTrue(day.done)
+        XCTAssertNotNil(day.completedAt)
+        XCTAssertEqual(try ops("cal_blocks", "cb-tpl-td").count, 1, "the day's block is queued for sync")
+        XCTAssertEqual(try storedBlock("cb-tpl-tm")?.done, false, "tomorrow is untouched")
+        let tpl = try XCTUnwrap(try storedTask("cb-tpl"))
+        XCTAssertFalse(tpl.done, "the series keeps going")
+        XCTAssertNotNil(tpl.recurrence)
+        XCTAssertTrue(try ops("tasks", "cb-tpl").isEmpty, "no write to the template")
+        XCTAssertEqual(try actions("cb-tpl-td")?.toggleLabel, "Mark not done")
+    }
+
+    func testMarkNotDoneOnADoneOccurrenceReopensThatDay() async throws {
+        try seedSeries(todayDone: true)
+        let a = try XCTUnwrap(try actions("cb-tpl-td"))
+        XCTAssertEqual(a.toggleLabel, "Mark not done")
+        model.toggleCalBlockDone(a)
+        try await settle { try self.storedBlock("cb-tpl-td")?.done == false }
+        let day = try XCTUnwrap(try storedBlock("cb-tpl-td"))
+        XCTAssertFalse(day.done)
+        XCTAssertNil(day.completedAt)
+        XCTAssertFalse(day.skipped)
+        XCTAssertEqual(try storedTask("cb-tpl")?.done, false)
+    }
+
+    /// Start focus and Open task hand Today's row to Today's router paths —
+    /// for a series, the day's occurrence row (so Focus's Done ticks the day
+    /// and the editor opens on it).
+    func testFocusAndOpenOnAnOccurrenceUseTheDaysRow() throws {
+        try seedSeries()
+        let a = try XCTUnwrap(try actions("cb-tpl-td"))
+        model.performCalBlockFollowUp(.focus(a))
+        XCTAssertEqual(model.router.focusTask?.id, "cb-tpl-td")
+        XCTAssertNil(model.router.focusTask?.recurrence, "never the template")
+        XCTAssertNil(model.router.sharedFocus, "an own-task focus")
+        model.router.dismissAllPresentations()
+
+        model.performCalBlockFollowUp(.open(a))
+        XCTAssertEqual(model.router.detailTask?.id, "cb-tpl-td")
+        XCTAssertNil(model.router.detailTask?.recurrence)
+    }
+
+    func testFocusAndOpenOnAPlainTaskUseTheTask() throws {
+        try seedPlain()
+        let a = try XCTUnwrap(try actions("cb-plain-blk"))
+        model.performCalBlockFollowUp(.focus(a))
+        XCTAssertEqual(model.router.focusTask?.id, "cb-plain")
+        model.router.dismissAllPresentations()
+        model.performCalBlockFollowUp(.open(a))
+        XCTAssertEqual(model.router.detailTask?.id, "cb-plain")
+    }
+
+    // MARK: shared / external
+
+    /// A task I've assigned to someone is theirs to finish (T3): even a
+    /// bypassed button completes nothing and starts no focus; Open still works.
+    func testATaskIAssignedOutIsNeitherCompletedNorFocused() async throws {
+        try seedPlain()
+        let a = try XCTUnwrap(try actions("cb-plain-blk", assignedOut: ["cb-plain"]))
+        XCTAssertFalse(a.canToggleDone)
+        XCTAssertFalse(a.canFocus)
+        model.toggleCalBlockDone(a)
+        model.performCalBlockFollowUp(.focus(a))
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(try storedTask("cb-plain")?.done, false)
+        XCTAssertTrue(try ops("tasks", "cb-plain").isEmpty)
+        XCTAssertNil(model.router.focusTask)
+        model.performCalBlockFollowUp(.open(a))
+        XCTAssertEqual(model.router.detailTask?.id, "cb-plain")
+    }
+
+    /// A Google event is not a task: the sheet shows it no task actions.
+    func testAGoogleEventHasNoTaskActions() throws {
+        try db.save(CalBlock(id: "g_evt1", taskId: nil, taskName: "Standup", startTime: "09:00",
+                             durationMinutes: 15, date: today, externalEventId: "evt1", kind: .external))
+        XCTAssertNil(try actions("g_evt1"))
+    }
+}

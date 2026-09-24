@@ -126,6 +126,23 @@ extension DemoSeed {
         try? db.save(TaskItem(id: "t-garage", name: "Clear out the garage", estimateMin: 90, done: true, lifeArea: "Personal",
                               moveCount: 3, completedAt: iso(-3_000), createdAt: iso(-21 * 86_400), updatedAt: now))
     }
+
+    /// UITEST_CALENDAR: a daily "Take vitamins" series (yesterday / today /
+    /// tomorrow) at the current hour, so today's OCCURRENCE sits on the Day
+    /// grid between the seed's Sarah and proposal blocks — the calendar
+    /// Edit-block sheet's repeating case (screenshots).
+    static func seedCalendarExtras(_ db: AppDatabase) {
+        let now = iso(0)
+        let today = Clock.todayISO()
+        let h = min(max(Time.calendar.component(.hour, from: Date()), 6), 21)
+        try? db.save(TaskItem(id: "t-vitamins", name: "Take vitamins", estimateMin: 25, lifeArea: "Health",
+                              recurrence: .daily(until: nil), createdAt: iso(-7 * 86_400), updatedAt: now))
+        for k in -1...1 {
+            try? db.save(CalBlock(id: "occ-vitamins-\(k + 1)", taskId: "t-vitamins", taskName: "Take vitamins",
+                                  startTime: String(format: "%02d:00", h), durationMinutes: 25,
+                                  date: LocalDate.addDays(today, k), kind: .task))
+        }
+    }
 }
 
 // MARK: - bulk-turn repro (UITEST_ASSISTANT_BULK)
