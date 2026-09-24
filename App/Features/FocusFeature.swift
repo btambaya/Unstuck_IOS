@@ -38,6 +38,9 @@ final class FocusModel {
     /// has already FIRED by the time the session leaves the paused state
     /// (AppModel.consumePausedCheckinBudget). Set by FocusView; nil in tests.
     var onConsumePausedCheckin: (@MainActor () -> Void)?
+    /// Saves the pause's reason log once the pause ENDS, now carrying how long
+    /// it lasted (AppModel.saveReasonLog). Set by FocusView; nil in tests.
+    var onPauseClosed: (@MainActor (ReasonLog) -> Void)?
 
     init(task: TaskItem, store: LiveSessionStore?,
          defaultTreatment: FocusTreatment = .ambient,
@@ -160,7 +163,9 @@ final class FocusModel {
         // Resumed on the lock screen meanwhile: resuming the stale paused copy
         // shifted the start by the whole pause, erasing the focus since (C37).
         guard syncFromStore(), live.paused else { return }
-        live = FocusTimer.resume(live, now: Self.now()); persist()
+        let now = Self.now()
+        if let closed = FocusTimer.closedPauseLog(live, now: now) { onPauseClosed?(closed) }
+        live = FocusTimer.resume(live, now: now); persist()
         LiveActivityController.shared.update(sessionStartMs: live.sessionStart ?? 0, paused: false, estimateMin: live.sessionEstimateMin)
         PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
     }
@@ -216,6 +221,8 @@ final class FocusModel {
     @discardableResult
     func finish() -> (session: Session, elapsedSec: Int)? {
         guard syncFromStore() else { return nil }
+        // Finishing while paused ends the pause too — log its length.
+        if let closed = FocusTimer.closedPauseLog(live, now: Self.now()) { onPauseClosed?(closed) }
         let elapsed = FocusTimer.elapsedSec(live, now: Self.now())
         // Attribute the Session to the TEMPLATE for an occurrence focus (so the
         // analytics + totalFocused continuity stay on the series, never a row
@@ -241,6 +248,13 @@ final class FocusModel {
         LiveActivityController.shared.end()
         PausedCheckinBudget.cancel(consume: onConsumePausedCheckin)
         return true
+    }
+
+    /// Hold the pause's reason log on the (paused) live session until the pause ends.
+    func rememberPauseLog(_ log: ReasonLog) {
+        guard syncFromStore(), live.paused else { return }
+        live.pendingPauseLog = log
+        persist()
     }
 
     var treatment: FocusTreatment { live.treatment }
@@ -383,6 +397,7 @@ struct FocusView: View {
                 // LiveSessionCard reflects it without re-reading the store.
                 newFM.onPersist = { [weak model] in model?.refreshLiveSession() }
                 newFM.onConsumePausedCheckin = { [weak model] in model?.consumePausedCheckinBudget() }
+                newFM.onPauseClosed = { [weak model] log in model?.saveReasonLog(log) }
                 fm = newFM
                 // A paused session this screen did not re-attach to as-is — the
                 // series' session re-pointed to another day (FocusTimer.start
@@ -1040,7 +1055,12 @@ struct FocusView: View {
     }
 
     private func logPauseReason(_ reason: String) {
-        model.saveReasonLog(ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow()))
+        let log = ReasonLog(id: newUUID(), taskId: task.id, reason: reason, action: .pause, at: AppModel.isoNow())
+        model.saveReasonLog(log)
+        // Kept on the live session so whichever path ends the pause (Resume
+        // here, Today's card, the lock screen, the assistant) re-saves this
+        // same row with how long the pause lasted.
+        fm?.rememberPauseLog(log)
     }
 
     /// FocusModel.pause() pre-schedules the local paused-too-long notif; PEEK

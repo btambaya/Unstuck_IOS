@@ -33,6 +33,20 @@ final class UsableTodayTests: XCTestCase {
         XCTAssertEqual(usableToday(blocks: onlyMeetings, todayIso: TODAY).usableMins, 0)
     }
 
+    func testSkippedAndDoneBlocksAreNotTimeStillToUse() {
+        var skipped = block("s", minutes: 30, kind: .task)
+        skipped.skipped = true
+        var ticked = block("o", minutes: 20, kind: .task)
+        ticked.done = true
+        let doneTask = block("d", minutes: 40, kind: .task, taskId: "done-task")
+        let open = block("a", minutes: 45, kind: .task)
+        let u = usableToday(blocks: [skipped, ticked, doneTask, open], todayIso: TODAY, doneTaskIds: ["done-task"])
+        XCTAssertEqual(u.usableMins, 45)
+        XCTAssertEqual(u.totalScheduled, 45)
+        // A lone skipped block (the App Review demo's "30m usable") → nothing usable.
+        XCTAssertEqual(usableToday(blocks: [skipped], todayIso: TODAY).usableMins, 0)
+    }
+
     func testFmtHrsMatchesTheWebFormatter() {
         XCTAssertEqual(fmtHrs(0), "0m")
         XCTAssertEqual(fmtHrs(45), "45m")

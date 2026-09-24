@@ -35,8 +35,18 @@ private let MAX_NAME = 40
 
 private let DAY_SHORT = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 private let MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
-/// Heatmap columns (timeOfDayHeatmap): six 2-hour buckets from 7am, Mon–Fri only.
-private let HEAT_BUCKETS = ["7–9am", "9–11am", "11am–1pm", "1–3pm", "3–5pm", "5–7pm"]
+/// Rows of `focusHourGrid`: Monday-anchored.
+private let GRID_DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+/// Minimum linked captures before the interruptions line (and the screen's
+/// chart) says anything — below it the pattern is noise (cross-check P0-11).
+public let INTERRUPTIONS_MIN_LINKED = 3
+
+/// "10–11am", "11am–12pm", "11pm–12am" for the hour starting at `h`.
+public func hourSpanLabel(_ h: Int) -> String {
+    func parts(_ x: Int) -> (Int, String) { let v = ((x % 24) + 24) % 24; return (v % 12 == 0 ? 12 : v % 12, v < 12 ? "am" : "pm") }
+    let (a, sa) = parts(h), (b, sb) = parts(h + 1)
+    return sa == sb ? "\(a)–\(b)\(sb)" : "\(a)\(sa)–\(b)\(sb)"
+}
 /// Same display order as the DeepDive "Captures by kind" band.
 private let TAG_ORDER: [CaptureTag] = [.followUp, .idea, .edit, .question, .distraction]
 
@@ -123,6 +133,9 @@ private func verdictText(_ v: Verdict) -> String {
 
 // MARK: - the report
 
+/// `areas` = the user's own life areas in their order (the Insights screen's
+/// stacked bars); nil falls back to the defaults. Sessions go through the D1
+/// filter (`countableSessions`) exactly as on screen.
 public func renderInsights(
     tasks: [TaskItem],
     sessions allSessions: [Session],
@@ -130,11 +143,12 @@ public func renderInsights(
     reasons: [ReasonLog],
     blocks: [CalBlock],
     now: Date,
-    window: InsightsWindow
+    window: InsightsWindow,
+    areas userAreas: [String]? = nil
 ) -> String {
     let start = insightsWindowStart(window, now: now)
     let lo: EpochMillis? = start.map { $0.timeIntervalSince1970 * 1000 }
-    let sessions = allSessions.filter { inWindow($0.completedAt, lo: lo) }
+    let sessions = countableSessions(allSessions).filter { inWindow($0.completedAt, lo: lo) }
     let captures = allCaptures.filter { inWindow($0.at, lo: lo) }
     let reasonLogs = reasons.filter { inWindow($0.at, lo: lo) }
     let nowMs: EpochMillis = now.timeIntervalSince1970 * 1000
@@ -153,10 +167,12 @@ public func renderInsights(
         let totalSec = sessions.reduce(0) { $0 + $1.actualSec }
         lines.append("Focus: \(fmtHM(totalSec)) across \(plural(sessions.count, "session")), median \(jsRound(Double(medianSec(sessions)) / 60))m.")
 
-        // By area over the Report's default area order (web AREA_ORDER).
-        let bars = weekdayAreaHours(sessions, tasks)
+        // By area over the user's own areas + "No area" — the screen's
+        // "When focus happens" bars, series for series.
+        let areaNames = (userAreas?.isEmpty == false) ? userAreas! : DEFAULT_AREAS
+        let bars = weekdayAreaHours(sessions, tasks, areas: areaNames)
         var areaLines: [String] = []
-        for (i, area) in DEFAULT_AREAS.enumerated() {
+        for (i, area) in (areaNames + [NO_AREA_LABEL]).enumerated() {
             let hours = bars.reduce(0.0) { $0 + $1.data[i] }
             if hours > 0 { areaLines.append("\(area) \(toFixed1(hours))h") }
         }
@@ -164,16 +180,9 @@ public func renderInsights(
             lines.append("By area: \(areaLines.joined(separator: ", ")).")
         }
 
-        let grid = timeOfDayHeatmap(sessions)
-        var peak = (dow: -1, bucket: -1, hours: 0.0)
-        for (dow, row) in grid.enumerated() {
-            for (bucket, hours) in row.enumerated() where hours > peak.hours {
-                peak = (dow, bucket, hours)
-            }
-        }
-        if peak.hours > 0 {
-            // Heatmap rows are Mon..Fri (Monday-anchored index 0..4).
-            lines.append("Peak slot: \(DAY_SHORT[peak.dow + 1]) \(HEAT_BUCKETS[peak.bucket]) (\(jsRound(peak.hours * 60)) min).")
+        // The screen's hour × day grid: the busiest hour a session ran through.
+        if let peak = peakFocusHour(focusHourGrid(sessions)), peak.minutes > 0 {
+            lines.append("Peak slot: \(GRID_DAYS[peak.day]) \(hourSpanLabel(peak.hour)) (\(jsRound(peak.minutes)) min).")
         }
     }
 
@@ -204,19 +213,21 @@ public func renderInsights(
         lines.append("Pauses: \(plural(reasonLogs.count, "reason")) logged; top: \(top).")
     }
 
-    // Interruptions: Report histogram — captures written mid-session, by minutes in.
+    // Interruptions: Report histogram — captures written mid-session, by
+    // minutes in. Shown (here and on screen) from 3 linked captures.
     let bins = interruptionBins(captures, sessions)
     let linked = bins.reduce(0, +)
-    if linked > 0 {
+    if linked >= INTERRUPTIONS_MIN_LINKED {
         let peakIdx = bins.firstIndex(of: bins.max() ?? 0) ?? 0
         lines.append("Interruptions: \(plural(linked, "capture")) mid-session, most around \(peakIdx * 3)–\((peakIdx + 1) * 3) min in.")
     }
 
-    // Re-entry: DeepDive "Re-entry within 5m" — only when a gap was measurable.
-    let reentry = reEntryDistribution(sessions)
-    let gaps = reentry.reduce(0, +)
-    if gaps > 0 {
-        lines.append("Re-entry: \(pct(Double(reentry[0]) / Double(gaps)))% of \(plural(gaps, "return")) to a task came within 5 min.")
+    // Coming back: DeepDive "How fast you come back" — pause → resume, from
+    // the pause lengths logged on resume; only when some were timed.
+    let lengths = pauseLengthBins(reasonLogs)
+    let timed = lengths.reduce(0, +)
+    if timed > 0 {
+        lines.append("Coming back: \(lengths[0]) of \(plural(timed, "timed pause")) ended within 5 min.")
     }
 
     // Slipping: Report "Gentle friction" count + DeepDive slip detector names.

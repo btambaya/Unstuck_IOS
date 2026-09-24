@@ -310,6 +310,7 @@ final class AppModelAssistantState: AssistantAppState {
         let session = Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: name,
                               estimateMin: task?.estimateMin ?? cur.sessionEstimateMin, actualSec: elapsed,
                               completedAt: AppModel.isoNow())
+        if let closed = FocusTimer.closedPauseLog(cur, now: now) { model.saveReasonLog(closed) }   // a pause ends here too
         do { try store.set(FocusTimer.done(cur)) } catch { return nil }
         model.refreshLiveSession()
         LiveActivityController.shared.end()

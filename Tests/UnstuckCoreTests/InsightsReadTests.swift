@@ -106,11 +106,10 @@ final class InsightsReadSyntheticWeekTests: XCTestCase {
             "ok: Insights, week so far (Mon 31 Aug – Wed 2 Sep).",
             "Focus: 2h 45m across 5 sessions, median 30m.",
             "By area: Work 1.4h, Health 1.3h.",
-            "Peak slot: Wed 11am–1pm (60 min).",
+            "Peak slot: Wed 10–11am (60 min).",
             "Estimates: 40% of 5 estimated sessions landed within 5 min; 2 ran over, 1 ran under; actual vs estimate averages +7 min. Verdict: underestimating (things take longer than you plan).",
             "Pauses: 4 reasons logged; top: phone call 2x (12m), snack 1x (3m), email 1x.",
-            "Interruptions: 2 captures mid-session, most around 6–9 min in.",
-            "Re-entry: 33% of 3 returns to a task came within 5 min.",
+            "Coming back: 1 of 3 timed pauses ended within 5 min.",
             "Slipping: 1 task — \"Tax return\" (moved 4x, 1wk on list).",
             "Captures: 3 — follow-up 1, idea 1, distraction 1.",
             "Planned: 2 calendar blocks (1h 30m) dated in this window.",
@@ -211,9 +210,9 @@ final class InsightsReadSlippingTests: XCTestCase {
     func testListsAtMostFiveNamesAndCountsTheRest() {
         let tasks = (0..<8).map { i in task("t\(i)", "Chore \(i)", moveCount: 3 + i, createdAt: ago(1)) }
         let out = render(Data(tasks: tasks))
-        // slipping() itself caps at 6 — the same count the Report card shows.
-        XCTAssertTrue(out.contains("Slipping: 6 tasks — \"Chore 7\" (moved 10x, 0wk on list); \"Chore 6\""), out)
-        XCTAssertTrue(out.contains("\"Chore 3\" (moved 6x, 0wk on list) +1 more."), out)
+        // slipping() returns the full list — the same true count the Report card shows.
+        XCTAssertTrue(out.contains("Slipping: 8 tasks — \"Chore 7\" (moved 10x, 0wk on list); \"Chore 6\""), out)
+        XCTAssertTrue(out.contains("\"Chore 3\" (moved 6x, 0wk on list) +3 more."), out)
         XCTAssertFalse(out.contains("\"Chore 2\""))
     }
 }
@@ -263,5 +262,54 @@ final class InsightsReadDatesAndBudgetTests: XCTestCase {
         // Titles survive; the sub-lines were the first thing to go.
         XCTAssertTrue(out.contains("- Tuesdays are your strongest day."))
         XCTAssertFalse(out.contains("Stack harder work here."))
+    }
+}
+
+final class InsightsReadAlignedDefinitionsTests: XCTestCase {
+    func testRepeatingTemplatesAndLaterTasksAreNotSlips() {
+        var template = task("r", "Stretch", createdAt: ago(60))
+        template.recurrence = .daily(until: nil)
+        var parked = task("l", "Someday idea", moveCount: 5, createdAt: ago(60))
+        parked.later = true
+        let real = task("x", "Renew passport", moveCount: 3, createdAt: ago(1))
+        let out = render(Data(tasks: [template, parked, real]))
+        XCTAssertTrue(out.contains("Slipping: 1 task — \"Renew passport\""), out)
+        XCTAssertFalse(out.contains("Stretch"))
+        XCTAssertFalse(out.contains("Someday idea"))
+    }
+
+    func testByAreaUsesTheUsersOwnAreasPlusNoArea() {
+        let errands = task("e", "Post office", lifeArea: "Errands")
+        let loose = task("n", "Loose end")
+        let sessions = [sess(errands, SEP, 1, 9, 0, 3600), sess(loose, SEP, 1, 11, 0, 1800),
+                        Session(id: "free", taskName: "Focus session", actualSec: 1800, completedAt: ago(0.5))]
+        let out = renderInsights(tasks: [errands, loose], sessions: sessions, captures: [], reasons: [], blocks: [],
+                                 now: FIXED_NOW, window: .week, areas: ["Errands", "Work"])
+        XCTAssertTrue(out.contains("By area: Errands 1.0h, No area 1.0h."), out)
+    }
+
+    func testAccidentalAndRunawaySessionsGoThroughTheSameFilterAsTheScreen() {
+        let t = task("a", "Write report")
+        let sessions = [sess(t, SEP, 1, 9, 0, 19), sess(t, SEP, 1, 10, 0, 37),
+                        Session(id: "run", taskId: "a", taskName: "Write report", estimateMin: 30,
+                                actualSec: 30 * 3600, completedAt: ago(0.2))]
+        let out = render(Data(tasks: [t], sessions: sessions))
+        // 19 s and 37 s don't count; the 30-hour timer counts for 90 min (3 × 30).
+        XCTAssertTrue(out.contains("Focus: 1h 30m across 1 session"), out)
+    }
+
+    func testInterruptionsNeedThreeLinkedCaptures() {
+        var d = WEEK
+        d.captures = CAPTURES + [capture(.idea, SEP, 2, 10, 20, "s4")]
+        XCTAssertTrue(render(d).contains("Interruptions: 3 captures mid-session"), render(d))
+        XCTAssertFalse(render(WEEK).contains("Interruptions"))
+    }
+
+    func testHourSpanLabels() {
+        XCTAssertEqual(hourSpanLabel(0), "12–1am")
+        XCTAssertEqual(hourSpanLabel(10), "10–11am")
+        XCTAssertEqual(hourSpanLabel(11), "11am–12pm")
+        XCTAssertEqual(hourSpanLabel(12), "12–1pm")
+        XCTAssertEqual(hourSpanLabel(23), "11pm–12am")
     }
 }

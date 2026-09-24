@@ -498,7 +498,9 @@ extension AppModel {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
               Self.pausedCheckinActsOn(cur, sessionId: sessionId) else { return }
         cancelPausedCheckin()   // the nag fired (that's what was tapped) → claims its slot
-        let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
+        let now = Date().timeIntervalSince1970 * 1000
+        if let closed = FocusTimer.closedPauseLog(cur, now: now) { saveReasonLog(closed) }
+        let resumed = FocusTimer.resume(cur, now: now)
         try? liveStore.set(resumed)
         refreshLiveSession()
         LiveActivityController.shared.update(
@@ -517,6 +519,8 @@ extension AppModel {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil,
               Self.pausedCheckinActsOn(cur, sessionId: sessionId) else { return }
         cancelPausedCheckin()
+        // Ending from the paused nag ends the pause too — log its length.
+        if let closed = FocusTimer.closedPauseLog(cur, now: Date().timeIntervalSince1970 * 1000) { saveReasonLog(closed) }
         let elapsed = FocusTimer.elapsedSec(cur, now: Date().timeIntervalSince1970 * 1000)
         // Ended off the Focus screen — a session left running then paused can
         // measure a whole night: capped at the estimate + grace like the

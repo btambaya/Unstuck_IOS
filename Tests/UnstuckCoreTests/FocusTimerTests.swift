@@ -291,3 +291,44 @@ final class FocusTimerOccurrenceRepointTests: XCTestCase {
         XCTAssertNil(plain.occurrenceBlockId)
     }
 }
+
+/// The pause's reason log is kept on the live session and re-saved with the
+/// pause length when the pause ends (Insights "What pauses you" / "How fast
+/// you come back", analytics cross-check P0-3).
+final class FocusTimerPauseLengthTests: XCTestCase {
+    private let t0: EpochMillis = 1_789_480_800_000
+    private let log = ReasonLog(id: "r1", taskId: "t", reason: "Phone", action: .pause, at: "2026-09-15T14:00:05Z")
+
+    private func running() -> LiveSession {
+        LiveSession(id: "s1", taskId: "t", sessionStart: t0, sessionEstimateMin: 25, treatment: .ambient)
+    }
+
+    func testResumeHandsBackTheLogWithHowLongThePauseLasted() {
+        var paused = FocusTimer.pause(running(), now: t0 + 10 * 60_000)
+        paused.pendingPauseLog = log
+        let closed = FocusTimer.closedPauseLog(paused, now: t0 + 10 * 60_000 + 185_400)
+        XCTAssertEqual(closed?.id, "r1")                 // the SAME row → an upsert, not a second log
+        XCTAssertEqual(closed?.durationSec, 185)
+        XCTAssertEqual(closed?.reason, "Phone")
+        let resumed = FocusTimer.resume(paused, now: t0 + 10 * 60_000 + 185_400)
+        XCTAssertNil(resumed.pendingPauseLog)
+        XCTAssertNil(FocusTimer.closedPauseLog(resumed, now: t0 + 20 * 60_000))   // not paused → nothing
+    }
+
+    func testJustPauseHasNoLogAndANewPauseStartsClean() {
+        let paused = FocusTimer.pause(running(), now: t0 + 60_000)
+        XCTAssertNil(FocusTimer.closedPauseLog(paused, now: t0 + 120_000))
+        var stale = running()
+        stale.pendingPauseLog = log
+        XCTAssertNil(FocusTimer.pause(stale, now: t0 + 60_000).pendingPauseLog)
+        var ended = FocusTimer.pause(running(), now: t0 + 60_000)
+        ended.pendingPauseLog = log
+        XCTAssertNil(FocusTimer.done(ended).pendingPauseLog)
+    }
+
+    func testOldPersistedSessionsWithoutTheFieldStillDecode() throws {
+        let json = #"{"id":"s1","taskId":"t","sessionStart":1,"paused":true,"pausedAt":2,"sessionEstimateMin":25,"nudge80Fired":false,"overrunPromptFired":false,"treatment":"ambient"}"#
+        let ls = try JSONDecoder().decode(LiveSession.self, from: Data(json.utf8))
+        XCTAssertNil(ls.pendingPauseLog)
+    }
+}

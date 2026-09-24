@@ -94,7 +94,9 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
     // One warm line each — the model gets conclusions, never raw logs.
     let sp = struggleProfile(api.getStruggles(), api.getReasonLogs(), now: now)
     if let line = sp.line { ctx["struggle"] = .string(line) }
-    if let gh = goldenHours(api.getSessions(), now: now) {
+    // D1-filtered like every other focus number (a forgotten timer or a
+    // 5-second start must not decide when "your focus window" is).
+    if let gh = goldenHours(countableSessions(api.getSessions()), now: now) {
         ctx["focusWindow"] = .string("Their proven focus window: \(gh.label) — steer hard tasks there.")
     }
     // Patterns from schedule history + this week's gaps — proactive questions.

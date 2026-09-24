@@ -169,6 +169,7 @@ public enum FocusTimer {
         var next = cur
         next.paused = true
         next.pausedAt = now
+        next.pendingPauseLog = nil
         return next
     }
 
@@ -179,7 +180,18 @@ public enum FocusTimer {
         next.paused = false
         next.pausedAt = nil
         next.sessionStart = start + pausedDuration
+        next.pendingPauseLog = nil
         return next
+    }
+
+    /// The pause's reason log (kept on the session since the reason was
+    /// picked), completed with how long the pause lasted — for the caller to
+    /// save when the pause ENDS (resume, or finishing while paused). nil when
+    /// the session isn't paused or no reason was picked ("Just pause").
+    public static func closedPauseLog(_ cur: LiveSession, now: EpochMillis) -> ReasonLog? {
+        guard cur.paused, let pausedAt = cur.pausedAt, var log = cur.pendingPauseLog else { return nil }
+        log.durationSec = max(0, Int(((now - pausedAt) / 1000).rounded()))
+        return log
     }
 
     /// Ends the session: clears sessionStart so elapsed resets to 0 (the
@@ -191,6 +203,7 @@ public enum FocusTimer {
         next.sessionStart = nil
         next.paused = false
         next.pausedAt = nil
+        next.pendingPauseLog = nil
         return next
     }
 

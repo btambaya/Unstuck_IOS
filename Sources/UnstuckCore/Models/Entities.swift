@@ -195,8 +195,15 @@ public struct LiveSession: Codable, Equatable, Sendable {
     /// Display name of the participant whose remote `ended` finalized this
     /// session ("<name> ended the session" on the recap). nil otherwise.
     public var sharedSessionEndedBy: String?
+    /// The reason log written when the user picked why they paused, kept
+    /// until the pause ends: on resume (or finishing while paused) it is
+    /// re-saved with `durationSec` = how long the pause lasted, which is what
+    /// "What pauses you" and "How fast you come back" chart (analytics
+    /// cross-check P0-3). Optional → old persisted blobs keep decoding.
+    /// Device-local (not synced).
+    public var pendingPauseLog: ReasonLog?
 
-    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil, sharedSessionRev: Int? = nil, sharedSessionAtMs: Double? = nil, lastAppliedRev: Int? = nil, lastAppliedAtMs: Double? = nil, divergedOffline: Bool? = nil, sharedSessionEndedBy: String? = nil) {
+    public init(id: String?, taskId: String, sessionStart: Double? = nil, paused: Bool = false, pausedAt: Double? = nil, sessionEstimateMin: Int, nudge80Fired: Bool = false, overrunPromptFired: Bool = false, treatment: FocusTreatment, priorAccumulatedSec: Int? = nil, occurrenceBlockId: String? = nil, sharedFocusLevel: ShareLevel? = nil, sharedSessionRev: Int? = nil, sharedSessionAtMs: Double? = nil, lastAppliedRev: Int? = nil, lastAppliedAtMs: Double? = nil, divergedOffline: Bool? = nil, sharedSessionEndedBy: String? = nil, pendingPauseLog: ReasonLog? = nil) {
         self.id = id
         self.taskId = taskId
         self.sessionStart = sessionStart
@@ -215,5 +222,6 @@ public struct LiveSession: Codable, Equatable, Sendable {
         self.lastAppliedAtMs = lastAppliedAtMs
         self.divergedOffline = divergedOffline
         self.sharedSessionEndedBy = sharedSessionEndedBy
+        self.pendingPauseLog = pendingPauseLog
     }
 }

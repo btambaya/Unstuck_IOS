@@ -279,7 +279,10 @@ extension AppModel {
     /// un-freezes the Live Activity, and cancels the pending paused check-in.
     func resumeFocus() {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.paused else { return }
-        let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
+        let now = Date().timeIntervalSince1970 * 1000
+        // The pause's reason log gets how long the pause lasted (Insights P0-3).
+        if let closed = FocusTimer.closedPauseLog(cur, now: now) { saveReasonLog(closed) }
+        let resumed = FocusTimer.resume(cur, now: now)
         try? liveStore.set(resumed)
         refreshLiveSession()
         LiveActivityController.shared.update(

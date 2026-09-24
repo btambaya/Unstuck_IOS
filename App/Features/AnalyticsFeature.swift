@@ -16,6 +16,10 @@ import UnstuckDesign
 @Observable
 final class AnalyticsModel {
     var sessions: [Session] = []
+    /// `sessions` through the D1 filter (accidental < 1 min starts dropped,
+    /// runaway timers clamped) — every chart reads these, like the pill and
+    /// the assistant do.
+    var counted: [Session] = []
     var tasks: [TaskItem] = []
     var captures: [Capture] = []
     var reasonLogs: [ReasonLog] = []
@@ -56,6 +60,7 @@ final class AnalyticsModel {
                 tasks = snap.tasks
                 lifeAreas = snap.areas
                 sessions = snap.sessions
+                counted = countableSessions(snap.sessions)
             }
         } catch {}
     }
@@ -84,7 +89,7 @@ final class AnalyticsModel {
         }
     }
     private func inWindow(_ iso: String) -> Bool { (Time.parseMillis(iso) ?? 0) >= cutoff }
-    private var wSessions: [Session] { sessions.filter { inWindow($0.completedAt) } }
+    private var wSessions: [Session] { counted.filter { inWindow($0.completedAt) } }
     private var wCaptures: [Capture] { captures.filter { inWindow($0.at) } }
     private var wReasons: [ReasonLog] { reasonLogs.filter { inWindow($0.at) } }
 
@@ -123,8 +128,11 @@ final class AnalyticsModel {
     var dots: [CalibrationDot] { calibrationDots(wSessions, tasks) }
     var hasDots: Bool { !dots.isEmpty }
     var interruptions: [Int] { interruptionBins(wCaptures, wSessions) }
-    var reEntry: [Int] { reEntryDistribution(wSessions) }
-    var heatmap: Heatmap { timeOfDayHeatmap(wSessions) }
+    /// The interruptions chart shows from 3 linked captures (cross-check P0-11).
+    var showInterruptions: Bool { interruptions.reduce(0, +) >= INTERRUPTIONS_MIN_LINKED }
+    /// Pause → resume lengths (the pause's reason log gets its duration on resume).
+    var comeBack: [Int] { pauseLengthBins(wReasons) }
+    var heatmap: Heatmap { focusHourGrid(wSessions) }
     var slips: [SlipRow] { slipping(tasks) }                  // task-based, not windowed (Android parity)
     var pauses: [PauseBar] { pauseAnatomy(wReasons) }
     var captureKinds: [CaptureTag: Int] { captureBreakdown(wCaptures) }
@@ -135,15 +143,18 @@ final class AnalyticsModel {
         let secs = wSessions.map { $0.actualSec }.sorted()
         return secs.isEmpty ? 0 : Int((Double(secs[secs.count / 2]) / 60).rounded())
     }
-    /// Share of re-entries that came back within the first <5m bin.
-    var reEntryFastPct: Int {
-        let re = reEntry
-        let total = re.reduce(0, +)
-        return total == 0 ? 0 : Int((Double(re[0]) * 100 / Double(total)).rounded())
+    /// Share of timed pauses that ended within 5 min; nil before any pause
+    /// was timed (the screen says "—", not a fake 0%).
+    var backWithin5Pct: Int? {
+        let b = comeBack
+        let total = b.reduce(0, +)
+        return total == 0 ? nil : Int((Double(b[0]) * 100 / Double(total)).rounded())
     }
 }
 
 struct AnalyticsView: View {
+    /// Weeks back to open on (the Today pill opens LAST week early in a quiet week).
+    var initialWeekOffset: Int = 0
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @State private var vm: AnalyticsModel?
@@ -257,7 +268,10 @@ struct AnalyticsView: View {
             if vm.hasDots {
                 CalibrationScatter(dots: vm.dots, hitPct: vm.hitPct).padding(.top, 12)
             }
-            histogram("When interruptions happen", vm.interruptions, theme.palette.coral).padding(.top, 12)
+            if vm.showInterruptions {
+                histogram("When interruptions happen", vm.interruptions, theme.palette.coral,
+                          axis: ["0m", "15m", "30m+"]).padding(.top, 12)
+            }
             if !vm.insights.isEmpty {
                 SectionLabel("Worth noticing").padding(.top, 18).padding(.bottom, 6)
                 VStack(spacing: 8) {
@@ -289,8 +303,8 @@ struct AnalyticsView: View {
                          caption: "within 5 min")
             }
             HStack(spacing: 8) {
-                StatCard(label: "Re-entry <5m", value: vm.enoughData ? "\(vm.reEntryFastPct)%" : "—",
-                         caption: "fast comebacks")
+                StatCard(label: "Back <5m", value: vm.backWithin5Pct.map { "\($0)%" } ?? "—",
+                         caption: "of timed pauses")
                 StatCard(label: "Captures", value: vm.enoughData ? "\(vm.captureCount)" : "—",
                          caption: "kept this window")
             }
@@ -299,18 +313,29 @@ struct AnalyticsView: View {
 
         if !vm.pauses.isEmpty {
             SectionLabel("What pauses you").padding(.top, 18).padding(.bottom, 6)
+            // Real minutes once pauses are timed; until then (older pauses were
+            // never timed) the bars are the COUNT of pauses per reason — a row
+            // of 2% slivers reading "0m · 3" said nothing (cross-check P0-3).
+            let timed = vm.pauses.contains { $0.minutes > 0 }
             let maxMin = max(vm.pauses.map { $0.minutes }.max() ?? 0, 0.001)
+            let maxN = Double(max(vm.pauses.map { $0.count }.max() ?? 1, 1))
             Card {
-                VStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 8) {
                     ForEach(Array(vm.pauses.enumerated()), id: \.offset) { _, p in
-                        LabeledBar(label: p.reason, frac: p.minutes / maxMin,
-                                   value: "\(Int(p.minutes.rounded()))m · \(p.count)", color: theme.palette.coral)
+                        LabeledBar(label: p.reason,
+                                   frac: timed ? p.minutes / maxMin : Double(p.count) / maxN,
+                                   value: timed ? "\(Int(p.minutes.rounded()))m · \(p.count)×" : "\(p.count)×",
+                                   color: theme.palette.coral)
+                    }
+                    if !timed {
+                        Text("How often each reason came up. Pause lengths show here once you resume after a pause.")
+                            .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
                     }
                 }
             }
         }
 
-        histogram("How fast you come back", vm.reEntry, theme.palette.primary).padding(.top, 12)
+        comeBackChart(vm).padding(.top, 12)
 
         let kinds = vm.captureKinds
         if vm.captureCount > 0 {
@@ -340,6 +365,10 @@ struct AnalyticsView: View {
                         .frame(maxWidth: .infinity)
                     }
                 }
+                if vm.slips.count > 8 {
+                    Text("+\(vm.slips.count - 8) more").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
         }
 
@@ -355,7 +384,9 @@ struct AnalyticsView: View {
     @ViewBuilder
     private func stackedBars(_ title: String, _ vm: AnalyticsModel) -> some View {
         let bars = vm.weekday
-        let areas = vm.areaNames
+        // The user's own areas + the trailing "No area" series (no task, no
+        // area, or an area since deleted) — ink4, like an unmatched area.
+        let areas = vm.areaNames + [NO_AREA_LABEL]
         let maxV = max(bars.map { $0.data.reduce(0, +) }.max() ?? 0, 0.001)
         Card {
             VStack(alignment: .leading, spacing: 6) {
@@ -381,7 +412,9 @@ struct AnalyticsView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
                     }
                 }
-                FlowLegend(areas: areas, color: { areaColor(forName: $0, vm) }).padding(.top, 4)
+                FlowLegend(areas: areas.enumerated().filter { i, _ in
+                    i < areas.count - 1 || bars.contains { $0.data.last ?? 0 > 0 }
+                }.map(\.element), color: { areaColor(forName: $0, vm) }).padding(.top, 4)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -406,11 +439,15 @@ struct AnalyticsView: View {
     // MARK: histogram (interruptions / re-entry)
 
     @ViewBuilder
-    private func histogram(_ title: String, _ bins: [Int], _ color: Color) -> some View {
+    private func histogram(_ title: String, _ bins: [Int], _ color: Color, axis: [String] = [],
+                           caption: String? = nil) -> some View {
         let maxV = max(bins.max() ?? 0, 1)
         Card {
             VStack(alignment: .leading, spacing: 6) {
                 Text(title).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                if let caption {
+                    Text(caption).font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
+                }
                 HStack(alignment: .bottom, spacing: 4) {
                     ForEach(Array(bins.enumerated()), id: \.offset) { _, v in
                         let frac = min(max(Double(v) / Double(maxV), 0.02), 1)
@@ -421,6 +458,14 @@ struct AnalyticsView: View {
                     }
                 }
                 .frame(height: 80)
+                if !axis.isEmpty {
+                    HStack {
+                        ForEach(Array(axis.enumerated()), id: \.offset) { i, a in
+                            Text(a).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
+                            if i < axis.count - 1 { Spacer() }
+                        }
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -436,48 +481,72 @@ struct AnalyticsView: View {
         return "\(title). \(total) total, peak in bin \(peakIdx + 1) of \(bins.count)."
     }
 
-    // MARK: hour × day heatmap
+    // MARK: how fast you come back (pause → resume)
+
+    @ViewBuilder
+    private func comeBackChart(_ vm: AnalyticsModel) -> some View {
+        let bins = vm.comeBack
+        if bins.reduce(0, +) == 0 {
+            Card {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("How fast you come back").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                    Text("Time from pausing a focus session to resuming it. It fills in the next few times you pause and come back.")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        } else {
+            histogram("How fast you come back", bins, theme.palette.primary,
+                      axis: ["<5m", "15m", "30m+"], caption: "Pause to resume, in 5-minute steps.")
+        }
+    }
+
+    // MARK: hour × day heatmap (7 days × 24 hours, by the hours sessions ran)
 
     @ViewBuilder
     private func heatmap(_ vm: AnalyticsModel) -> some View {
-        let grid = vm.heatmap          // 5 weekday rows (Mon–Fri) × 6 buckets
+        let grid = vm.heatmap          // 7 rows (Mon–Sun) × 24 hours, focus minutes
         let maxV = max(grid.flatMap { $0 }.max() ?? 0, 0.001)
-        let days = ["Mon", "Tue", "Wed", "Thu", "Fri"]
+        let days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         Card {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
                 Text("Hour × day").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                Text("Every hour a session ran through, on every day.")
+                    .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
                 ForEach(Array(grid.enumerated()), id: \.offset) { d, row in
-                    HStack(spacing: 5) {
-                        Text(d < days.count ? days[d] : "").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3).frame(width: 30, alignment: .leading)
+                    HStack(spacing: 2) {
+                        Text(days[d]).font(UFont.sans(10)).foregroundStyle(theme.palette.ink3).frame(width: 28, alignment: .leading)
                         ForEach(Array(row.enumerated()), id: \.offset) { _, v in
                             let t = min(max(v / maxV, 0), 1)
                             // Interpolate bg2 → green (Android's lerp) so low-intensity
-                            // cells read as a tinted surface, not translucent green over
-                            // the card — `.opacity` let the card bleed through.
-                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            // cells read as a tinted surface, not translucent green.
+                            RoundedRectangle(cornerRadius: 2, style: .continuous)
                                 .fill(v <= 0 ? theme.palette.bg2 : lerpColor(theme.palette.bg2, theme.palette.green, 0.2 + 0.7 * t))
                                 .aspectRatio(1, contentMode: .fit)
                                 .frame(maxWidth: .infinity)
                         }
                     }
-                    .padding(.top, 2)
                 }
+                HStack(spacing: 0) {
+                    Color.clear.frame(width: 30, height: 1)
+                    ForEach(["12am", "6am", "12pm", "6pm"], id: \.self) { h in
+                        Text(h).font(UFont.mono(9)).foregroundStyle(theme.palette.ink3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                .padding(.top, 2)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
-        // Cells encode intensity by color only — call out the busiest day for
+        // Cells encode intensity by color only — call out the busiest slot for
         // VoiceOver instead of leaving the grid silent.
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(heatmapSummary(grid, days))
     }
 
     private func heatmapSummary(_ grid: Heatmap, _ days: [String]) -> String {
-        let totals = grid.map { $0.reduce(0, +) }
-        let grand = totals.reduce(0, +)
-        guard grand > 0 else { return "Hour by day focus heatmap. No focus recorded yet." }
-        let busiestDay = totals.indices.max { totals[$0] < totals[$1] }
-            .flatMap { $0 < days.count ? days[$0] : nil } ?? "—"
-        return "Hour by day focus heatmap. Busiest day \(busiestDay)."
+        guard let peak = peakFocusHour(grid) else { return "Hour by day focus heatmap. No focus recorded yet." }
+        return "Hour by day focus heatmap. Busiest: \(days[peak.day]) \(hourSpanLabel(peak.hour))."
     }
 }
 
