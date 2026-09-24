@@ -238,7 +238,7 @@ enum CallSettings {
 }
 
 /// The one-time nudge for a phone whose PushKit registration never produced a
-/// VoIP token: shown in Settings › Calls when, 10 s after a signed-in launch,
+/// VoIP token: shown in Settings › Notifications & calls when, 10 s after a signed-in launch,
 /// there is still no token, until the user taps retry (or a token lands).
 /// Pure — the registry and Settings supply the facts.
 enum VoipRegistrationNudge {

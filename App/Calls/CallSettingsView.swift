@@ -1,14 +1,25 @@
-// Settings → "Calls from Unstuck" (calls build-out, docs/calls-build-out.md
-// iOS §1): the master Calls on/off switch (device-local, applied on receipt),
-// the allowed hours (the phone's own guard) + the default lead for task-
-// anchored calls, the three OPT-IN proactive calls (morning plan / evening
-// wrap-up / check-in after a block — account-wide, written through
-// `notification_preferences.call_*` via AppModel.setCallProactivePrefs), the
-// one-time VoIP-registration nudge, and "Test call now" — a REAL
-// call_requests row (kind `test`) one minute from now so the whole server →
-// APNs VoIP → CallKit path rings the phone; a previous live test call is
-// cancelled first (Android's behaviour — the one-live-call-per-label rule
-// would refuse the retry otherwise).
+// Settings → Notifications & calls → Calls (slim settings, 2026-09-24; was
+// its own "Calls from Unstuck" screen — calls build-out, docs/calls-build-out.md
+// iOS §1). Embedded in NotificationSettingsView:
+//
+//   • without the Assistant or AI data sharing the whole block is ONE line
+//     ("Calls need … · Turn on") — a call can't connect to the assistant, and
+//     this phone declines it on arrival (CallCoordinator);
+//   • "Let Unstuck call this phone" — the master switch (device-local, applied
+//     on receipt); everything below shows only while it's on:
+//   • "Only call between [06:00] and [23:00]" — the phone's own guard, the one
+//     thing that stops a loud call at a bad time;
+//   • the three OPT-IN proactive calls (morning / evening / after a focus
+//     block — account-wide, written through `notification_preferences.call_*`
+//     via AppModel.setCallProactivePrefs);
+//   • "Try a test call" — a REAL call_requests row (kind `test`) one minute
+//     from now so the whole server → APNs VoIP → CallKit path rings the phone;
+//     a previous live test call is cancelled first (Android's behaviour — the
+//     one-live-call-per-label rule would refuse the retry otherwise);
+//   • fix-it lines only when something is broken (the microphone refused, no
+//     VoIP registration yet).
+// The default lead for task calls is gone from here: "Call me about this"
+// remembers the last lead picked (same key, which request_call reads).
 
 import AVFoundation
 import SwiftUI
@@ -26,7 +37,6 @@ struct CallSettingsView: View {
     @State private var micDenied = AVAudioApplication.shared.recordPermission == .denied
     @State private var windowStart = CallSettingsView.date(CallSettings.windowStart)
     @State private var windowEnd = CallSettingsView.date(CallSettings.windowEnd)
-    @State private var lead = CallSettings.defaultLeadMin
     @State private var testState: TestState = .idle
     @State private var showVoipNudge = false
     @State private var nudgeRetried = false
@@ -67,50 +77,31 @@ struct CallSettingsView: View {
     static let testCallNote = "This is what a call from Unstuck sounds like"
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0) {
-                explainer
-
-                masterSwitch.padding(.top, 14)
-                AIConsentNoteLine(host: .callSettings).padding(.top, 8)
-                if showVoipNudge { voipNudge.padding(.top, 10) }
-
-                SectionLabel("Allowed hours").padding(.top, 22).padding(.bottom, 8)
-                VStack(spacing: 0) {
-                    hourRow("From", $windowStart) { CallSettings.windowStart = CallSettings.hhmm($0) }
-                    Rectangle().fill(theme.palette.line).frame(height: 1)
-                    hourRow("Until", $windowEnd) { CallSettings.windowEnd = CallSettings.hhmm($0) }
+        let assistantOn = model.settings.assistantEnabled
+        let aiOn = model.aiConsentGranted
+        VStack(alignment: .leading, spacing: 0) {
+            switch CallsBlockState.resolve(assistantOn: assistantOn, aiSharingOn: aiOn, phoneSwitchOn: enabled) {
+            case .needsAssistant:
+                needsAssistantLine(assistantOn: assistantOn, aiOn: aiOn)
+            case .off, .on:
+                SettingsCard {
+                    masterSwitch
+                    if enabled {
+                        CardDivider()
+                        hoursRow
+                        CardDivider()
+                        proactiveRows
+                    }
                 }
-                .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
-                Text("A call outside these hours is declined quietly and you get the notes as a notification instead. Calls can only be booked between \(CallSettings.serverWindowStart) and \(CallSettings.serverWindowEnd).")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).padding(.top, 10)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                SectionLabel("Default lead for task calls").padding(.top, 22).padding(.bottom, 8)
-                HStack(spacing: 6) {
-                    ForEach(CallSettings.leadOptions, id: \.self) { m in leadChip(m) }
+                if enabled, micDenied {
+                    fixLine("Calls need the microphone. Turn it on for Unstuck in iOS Settings, or it will ring but can't hear you.")
+                        .padding(.top, 10)
                 }
-                Text("\"Call me about this\" on a scheduled task rings this many minutes before it starts.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).padding(.top, 10)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                SectionLabel("Calls Unstuck can make on its own").padding(.top, 22).padding(.bottom, 8)
-                proactiveCard
-                Text("All off unless you switch them on. Unstuck books them between \(CallSettings.serverWindowStart) and \(CallSettings.serverWindowEnd); this iPhone still declines one outside the allowed hours above, or while Calls is off.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3).padding(.top, 10)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                SectionLabel("Try it").padding(.top, 22).padding(.bottom, 8)
-                testCallCard
+                if enabled, showVoipNudge { voipNudge.padding(.top, 10) }
+                if enabled { testCallRow.padding(.top, 12) }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 18)
-            .padding(.bottom, 96)
+            AIConsentNoteLine(host: .callSettings).padding(.top, 8)
         }
-        .background(theme.palette.bg.ignoresSafeArea())
-        .navigationTitle("Calls from Unstuck")
-        .navigationBarTitleDisplayMode(.inline)
         // A call is a conversation with the assistant: switching Calls on,
         // a proactive call or a test call asks for the AI-consent OK first.
         .aiConsentSheet(.callSettings)
@@ -126,17 +117,45 @@ struct CallSettingsView: View {
         }
     }
 
-    // MARK: master switch + proactive calls
+    // MARK: the one line when calls can't connect
+
+    /// The Assistant or AI data sharing is off: calls can't connect, so the
+    /// block is one line — and "Turn on" switches on what's missing (the
+    /// sharing OK asks with the usual sheet).
+    private func needsAssistantLine(assistantOn: Bool, aiOn: Bool) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Text(CallsBlockState.needsLine(assistantOn: assistantOn, aiSharingOn: aiOn))
+                .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Button {
+                if !model.settings.assistantEnabled { model.settings.assistantEnabled = true }
+                if !model.aiConsentGranted { model.withAIConsent(.callsOn, from: .callSettings) {} }
+            } label: {
+                Text("Turn on")
+                    .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
+                    .padding(.horizontal, 14).padding(.vertical, 7)
+                    .background(theme.palette.ink, in: Capsule())
+                    .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -7)
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("settings-calls-turn-on")
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+        .accessibilityElement(children: .contain)
+    }
+
+    // MARK: master switch + hours + proactive calls
 
     private var masterSwitch: some View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
-                Text("Calls").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
-                Text(enabled ? (micDenied ? "Calls need microphone access — turn it on in iOS Settings, or you'll ring but can't be heard."
-                                          : model.aiConsentGranted ? "This iPhone rings for calls you book."
-                                          : "Calls use the assistant, so they need your OK for AI data sharing — until then a call arrives as a notification.")
-                             : "Off — a booked call is declined quietly here and you get the notes as a notification.")
-                    .font(UFont.sans(12)).foregroundStyle(micDenied && enabled ? theme.palette.red : theme.palette.ink3)
+                Text("Let Unstuck call this phone").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                Text(enabled ? "It rings when you ask for a call, or at the times you pick below."
+                             : "Off. A call booked for this iPhone is declined, and its notes arrive as a notification.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
@@ -159,33 +178,53 @@ struct CallSettingsView: View {
             }))
             .labelsHidden()
             .tint(theme.palette.primary)
-            .accessibilityLabel("Calls")
+            .accessibilityLabel("Let Unstuck call this phone")
+            .accessibilityIdentifier("settings-calls-switch")
         }
-        .padding(.horizontal, 16).padding(.vertical, 13)
-        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+        .padding(.horizontal, 16).padding(.vertical, 12)
     }
 
-    private var proactiveCard: some View {
-        let prefs = model.callProactivePrefs
-        return VStack(spacing: 0) {
-            proactiveRow("Morning planning call", sub: "Rings to walk through the day and plan it with you.",
-                         isOn: prefs.morningEnabled, time: prefs.morningTime,
-                         setOn: { var p = model.callProactivePrefs; p.morningEnabled = $0; model.setCallProactivePrefs(p) },
-                         setTime: { var p = prefs; p.morningTime = $0; model.setCallProactivePrefs(p) })
-            Rectangle().fill(theme.palette.line).frame(height: 1)
-            proactiveRow("Evening wrap-up call", sub: "Rings to go over what got done and what moves to tomorrow.",
-                         isOn: prefs.eveningEnabled, time: prefs.eveningTime,
-                         setOn: { var p = model.callProactivePrefs; p.eveningEnabled = $0; model.setCallProactivePrefs(p) },
-                         setTime: { var p = prefs; p.eveningTime = $0; model.setCallProactivePrefs(p) })
-            Rectangle().fill(theme.palette.line).frame(height: 1)
-            proactiveRow("Check in after a block", sub: "Rings when a block ends without its task marked done — how did it go?",
-                         isOn: prefs.afterBlockEnabled, time: nil,
-                         setOn: { var p = model.callProactivePrefs; p.afterBlockEnabled = $0; model.setCallProactivePrefs(p) },
-                         setTime: { _ in })
+    /// "Only call between [06:00] and [23:00]" — the only user guard on when
+    /// a loud call can ring.
+    private var hoursRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Only call between").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+            HStack(spacing: 8) {
+                DatePicker("From", selection: $windowStart, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .onChange(of: windowStart) { _, new in CallSettings.windowStart = CallSettings.hhmm(new) }
+                    .accessibilityLabel("Calls from")
+                Text("and").font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                DatePicker("Until", selection: $windowEnd, displayedComponents: .hourAndMinute)
+                    .labelsHidden()
+                    .onChange(of: windowEnd) { _, new in CallSettings.windowEnd = CallSettings.hhmm(new) }
+                    .accessibilityLabel("Calls until")
+                Spacer(minLength: 0)
+            }
+            Text("Outside these hours a call is declined quietly and its notes arrive as a notification.")
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
+        .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    @ViewBuilder
+    private var proactiveRows: some View {
+        let prefs = model.callProactivePrefs
+        proactiveRow("Morning call", sub: "Plan the day together.",
+                     isOn: prefs.morningEnabled, time: prefs.morningTime,
+                     setOn: { var p = model.callProactivePrefs; p.morningEnabled = $0; model.setCallProactivePrefs(p) },
+                     setTime: { var p = model.callProactivePrefs; p.morningTime = $0; model.setCallProactivePrefs(p) })
+        CardDivider()
+        proactiveRow("Evening call", sub: "Go over what got done and what moves to tomorrow.",
+                     isOn: prefs.eveningEnabled, time: prefs.eveningTime,
+                     setOn: { var p = model.callProactivePrefs; p.eveningEnabled = $0; model.setCallProactivePrefs(p) },
+                     setTime: { var p = model.callProactivePrefs; p.eveningTime = $0; model.setCallProactivePrefs(p) })
+        CardDivider()
+        proactiveRow("Call me after a focus block", sub: "When a block ends and its task isn't done yet.",
+                     isOn: prefs.afterBlockEnabled, time: nil,
+                     setOn: { var p = model.callProactivePrefs; p.afterBlockEnabled = $0; model.setCallProactivePrefs(p) },
+                     setTime: { _ in })
     }
 
     private func proactiveRow(_ title: String, sub: String, isOn: Bool, time: String?,
@@ -193,7 +232,7 @@ struct CallSettingsView: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(title).font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+                    Text(title).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
                     Text(sub).font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -222,10 +261,11 @@ struct CallSettingsView: View {
                                                       set: { setTime(CallSettings.hhmm($0)) }),
                                displayedComponents: .hourAndMinute)
                         .labelsHidden()
+                        .accessibilityLabel("\(title) at")
                 }
             }
             if isOn, let warning = proactiveWarning(time: time) {
-                Text(warning).font(UFont.sans(12)).foregroundStyle(theme.palette.amber)
+                Text(warning).font(UFont.sans(12)).foregroundStyle(theme.palette.amberInk)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -243,16 +283,22 @@ struct CallSettingsView: View {
         return CallSettings.proactiveTimeWarning(time, enabled: enabled, start: start, end: end)
     }
 
+    // MARK: fix-it lines (only when broken)
+
+    private func fixLine(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle").font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(theme.palette.amberInk).padding(.top, 1)
+                .accessibilityHidden(true)
+            Text(text).font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     /// One-time: PushKit produced no VoIP token 10 s after a signed-in launch.
     private var voipNudge: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.triangle").font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(theme.palette.amber).padding(.top, 1)
-                Text("Calls need Voice-over-IP registration on this iPhone — without it a call arrives as a notification you tap instead of a ring.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            fixLine("Calls can't reach this iPhone yet, so a call arrives as a notification you tap instead of a ring.")
             Button {
                 VoipPushRegistry.shared.retryRegistration()
                 nudgeRetried = true
@@ -261,7 +307,7 @@ struct CallSettingsView: View {
                     showVoipNudge = PushRegistrar.shared.voipTokenHex == nil && !CallSettings.voipNudgeDismissed
                 }
             } label: {
-                Text(nudgeRetried ? "Retrying…" : "Retry registration")
+                Text(nudgeRetried ? "Trying…" : "Try again")
                     .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                     .padding(.horizontal, 14).padding(.vertical, 7)
                     .background(theme.palette.ink, in: Capsule())
@@ -274,94 +320,36 @@ struct CallSettingsView: View {
         .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    // MARK: pieces
+    // MARK: test call
 
-    private var explainer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                Image(systemName: "phone.arrow.down.left").font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(theme.palette.primary)
-                Text("Ask, and Unstuck calls you").font(UFont.sans(16, .semibold)).foregroundStyle(theme.palette.ink)
-            }
-            Text("Say \"call me at three about the James meeting — remind me about A, B and C\", or tick \"Call me about this\" on a task. Your phone rings like a normal call, the notes are read back, then you can tick things off, add a thought, start a timer, or ask for a call-back — all by voice. Nothing is booked unless you ask.")
-                .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
-                .fixedSize(horizontal: false, vertical: true)
-            deviceStatus
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .padding(.top, 4)
-    }
-
-    private var deviceStatus: some View {
-        let ready = PushRegistrar.shared.voipTokenHex != nil
-        return HStack(spacing: 6) {
-            Circle().fill(ready ? theme.palette.green : theme.palette.ink3).frame(width: 7, height: 7)
-            Text(ready ? (enabled ? "This iPhone can take calls." : "This iPhone can take calls — they're switched off below.")
-                       : "Waiting for this iPhone's call token — calls fall back to a notification until it arrives.")
-                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(.top, 4)
-    }
-
-    private func hourRow(_ label: String, _ value: Binding<Date>, commit: @escaping (Date) -> Void) -> some View {
-        HStack {
-            Text(label).font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
-            Spacer()
-            DatePicker("", selection: value, displayedComponents: .hourAndMinute)
-                .labelsHidden()
-                .onChange(of: value.wrappedValue) { _, new in commit(new) }
-        }
-        .padding(.horizontal, 16).padding(.vertical, 8)
-    }
-
-    private func leadChip(_ m: Int) -> some View {
-        let selected = lead == m
-        return Button {
-            lead = m
-            CallSettings.defaultLeadMin = m
-        } label: {
-            Text("\(m)m")
-                .font(UFont.sans(12, .medium))
-                .foregroundStyle(selected ? .white : theme.palette.ink2)
-                .padding(.horizontal, 14).padding(.vertical, 7)
-                .background(selected ? theme.palette.primary : theme.palette.bg2, in: Capsule())
-        }.buttonStyle(.plain)
-    }
-
-    private var testCallCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Book a test call for one minute from now. Lock your phone — it rings through the real path (server → push → call screen).")
-                .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
-                .fixedSize(horizontal: false, vertical: true)
+    private var testCallRow: some View {
+        VStack(alignment: .leading, spacing: 6) {
             Button { model.withAIConsent(.callsOn, from: .callSettings) { bookTestCall() } } label: {
-                HStack(spacing: 8) {
-                    if testState == .booking { ProgressView().tint(.white) }
-                    Image(systemName: "phone.fill").font(.system(size: 13, weight: .semibold))
-                    Text(testState == .booking ? "Booking…" : "Test call now").font(UFont.sans(14, .semibold))
+                HStack(spacing: 6) {
+                    if testState == .booking { ProgressView().controlSize(.small) }
+                    Image(systemName: "phone").font(.system(size: 12, weight: .semibold))
+                        .accessibilityHidden(true)
+                    Text(testState == .booking ? "Booking a test call…" : "Try a test call")
+                        .font(UFont.sans(13, .semibold)).underline()
                 }
-                .foregroundStyle(.white)
-                .padding(.vertical, 11).frame(maxWidth: .infinity)
-                .background(theme.palette.primary, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                .foregroundStyle(theme.palette.ink)
+                .frame(minHeight: 44).contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .disabled(testState == .booking || model.coordinator == nil)
+            .accessibilityIdentifier("settings-test-call")
             switch testState {
             case .booked(let at):
-                Text("Booked — ringing at \(at). Lock your phone and wait.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.green)
+                Text("Booked. It rings at \(at). Lock your phone and wait.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.greenInk)
             case .failed(let why):
                 Text(why).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
+                    .fixedSize(horizontal: false, vertical: true)
             default:
-                EmptyView()
+                Text("We'll ring you in about a minute.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
     }
 
     private func bookTestCall() {
@@ -369,7 +357,7 @@ struct CallSettingsView: View {
             testState = .failed("Sign in first."); return
         }
         guard enabled else {
-            testState = .failed("Calls are off on this iPhone — switch them on above to try it.")
+            testState = .failed("Calls are off on this iPhone. Switch them on above to try it.")
             return
         }
         // A test call that rings and then can't hear them is worse than none:
@@ -378,7 +366,7 @@ struct CallSettingsView: View {
             Self.ensureMicrophone { granted in
                 micDenied = !granted
                 if granted { bookTestCall() } else {
-                    testState = .failed("Calls need microphone access — turn it on for Unstuck in iOS Settings.")
+                    testState = .failed("Calls need the microphone. Turn it on for Unstuck in iOS Settings.")
                 }
             }
             return
@@ -396,7 +384,7 @@ struct CallSettingsView: View {
         if !CallSettings.isWithinWindow(at) {
             let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
                                                 refusing: CallSettings.minuteOfDay(at))
-            testState = .failed("\(CallSettings.hhmm(at)) is outside your allowed hours (\(hours)) — the phone would decline it quietly. Widen the hours above to try it now.")
+            testState = .failed("\(CallSettings.hhmm(at)) is outside your call hours (\(hours)), so this iPhone would decline it. Widen the hours above to try it now.")
             return
         }
         testState = .booking
@@ -415,7 +403,7 @@ struct CallSettingsView: View {
                 try? store.mirror.upsert(row)
                 testState = .booked(CallSettings.hhmm(at))
             } catch {
-                testState = .failed("Couldn't book the test call — check your connection and try again.")
+                testState = .failed("Couldn't book the test call. Check your connection and try again.")
             }
         }
     }

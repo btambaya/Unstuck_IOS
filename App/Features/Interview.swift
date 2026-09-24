@@ -8,7 +8,7 @@
 // wrote it — and "done" is per PERSON, not per device: it's mirrored to
 // user_preferences.assistant_interview_done_at (migration 052) and re-applied
 // on every sign-in hydrate (AppModel.applyServerInterviewFlag). Everything
-// saved is visible (and deletable) in Settings → "What Unstuck knows".
+// saved is visible (and deletable) in Settings → Assistant & privacy → "What Unstuck remembers".
 //
 // Presented INSIDE the assistant thread (InterviewThread.swift) — one
 // question per local assistant turn, chips + Skip underneath — and asked

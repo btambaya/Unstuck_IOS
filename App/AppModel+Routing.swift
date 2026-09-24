@@ -75,6 +75,8 @@ extension AppModel {
         case "notifications":
             routeDeepLink("unstuck://settings?section=Notifications")
         case "areas":
+            // Areas & tags moved to Tasks (slim settings): the Tasks tab + its
+            // Areas & tags sheet, via the same alias the old links use.
             routeDeepLink("unstuck://settings?section=Areas")
         default:
             return false
@@ -99,25 +101,6 @@ extension AppModel {
         case "week": return .week
         case "month": return .month
         default: return .day
-        }
-    }
-
-    /// The `section=` of an `unstuck://settings?section=…` link, normalised to
-    /// the names SettingsView pushes (Notifications / Interface / People /
-    /// Areas). Case-insensitive; "Areas & tags" and "tags" mean Areas. nil =
-    /// the Settings hub.
-    nonisolated static func settingsSection(in link: String) -> String? {
-        guard let comps = URLComponents(string: link),
-              let raw = comps.queryItems?.first(where: { $0.name == "section" })?.value?
-                  .trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !raw.isEmpty
-        else { return nil }
-        switch raw {
-        case "notifications", "notification": return "Notifications"
-        case "interface": return "Interface"
-        case "people", "connections", "circle": return "People"
-        case "areas", "areas & tags", "areas-and-tags", "tags", "areas-tags": return "Areas"
-        default: return nil
         }
     }
 }

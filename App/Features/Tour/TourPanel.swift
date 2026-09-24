@@ -527,7 +527,7 @@ struct TourPanel: View {
                 .font(UFont.sans(13, .semibold))
                 .foregroundStyle(theme.palette.ink)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Pick it back up anytime from Settings → Account → Product tour.")
+            Text("Replay it anytime from Settings → Replay the tour.")
                 .font(UFont.sans(11.5))
                 .lineSpacing(2.5)
                 .foregroundStyle(theme.palette.ink3)

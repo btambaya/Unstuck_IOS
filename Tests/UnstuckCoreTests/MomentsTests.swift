@@ -536,7 +536,7 @@ final class RitualPrefsTests: XCTestCase {
         p[.sunday] = true
         XCTAssertTrue(p.sunday)
         XCTAssertEqual(RITUAL_LABELS.map { $0.key }, [.morning, .evening, .friday, .sunday])
-        XCTAssertEqual(RITUAL_LABELS[0].label, "Morning briefing")
+        XCTAssertEqual(RITUAL_LABELS[0].label, "Morning plan")
         XCTAssertEqual(RITUAL_LABELS[1].sub, "Carry what didn’t happen — no guilt attached")
     }
 }

@@ -845,6 +845,12 @@ struct NewTaskSheet: View {
         let (recurrence, seriesStart) = buildRecurrence(startDate: effectiveDateNow())
         let later = whenSel == "Later"
 
+        // The sheet remembers the estimate (slim settings, 2026-09-24): the
+        // next new task starts at the last one picked. Same key as the old
+        // Settings "Default focus length", so the assistant's
+        // set_focus_defaults still sets it.
+        model.settings.focusDefaultMin = estimate
+
         var t = model.addTask(
             name: trimmed, estimateMin: estimate,
             tags: tags.isEmpty ? nil : tags,

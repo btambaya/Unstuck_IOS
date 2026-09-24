@@ -413,7 +413,8 @@ final class AppModelAssistantState: AssistantAppState {
             usableWeekendMin: d.object(forKey: "unstuck.usableMinutesWeekend") == nil ? nil : d.integer(forKey: "unstuck.usableMinutesWeekend"),
             focusDefaultMin: s.focusDefaultMin, focusOverrunMin: s.focusOverrunMin,
             focusSoftExit: s.focusSoftExit, focusPauseReasons: s.focusPauseReasons,
-            theme: s.theme.rawValue, ambient: s.ambient.rawValue, rituals: rituals)
+            theme: s.theme.rawValue, textSize: s.textSize.rawValue,
+            ambient: s.ambient.isOn ? "on" : "off", rituals: rituals)
     }
 
     /// The budget lives on the server (`user_preferences.usable_minutes_*` —
@@ -445,9 +446,10 @@ final class AppModelAssistantState: AssistantAppState {
         model.paPrefs.setRitual(key, on: on)
         return model.paPrefs.rituals[key] == on
     }
-    // Theme / focus defaults / ambient are device-local SettingsState scalars
-    // (UserDefaults-backed, observed app-wide) — the same properties the
-    // Settings screen binds to, read back to confirm.
+    // Theme / focus options / background noise are device-local SettingsState
+    // scalars (UserDefaults-backed, observed app-wide) — the same properties
+    // Appearance, Focus ⋯ Options and the speaker button bind to, read back
+    // to confirm.
     func setTheme(_ theme: String) -> Bool {
         guard let pref = ThemePref(rawValue: theme) else { return false }
         model.settings.theme = pref
@@ -464,10 +466,16 @@ final class AppModelAssistantState: AssistantAppState {
             && (softExit.map { s.focusSoftExit == $0 } ?? true)
             && (pauseReasons.map { s.focusPauseReasons == $0 } ?? true)
     }
+    /// "on" stores the one bed iOS has (brown); "off" stops it next session.
     func setAmbientSound(_ sound: String) -> Bool {
-        guard let pref = AmbientSound(rawValue: sound) else { return false }
-        model.settings.ambient = pref
-        return model.settings.ambient == pref
+        let on: Bool
+        switch sound {
+        case "on": on = true
+        case "off": on = false
+        default: return false
+        }
+        model.settings.ambient = on ? .brown : .off
+        return model.settings.ambient.isOn == on
     }
 }
 

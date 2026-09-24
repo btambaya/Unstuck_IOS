@@ -1,4 +1,5 @@
-// Settings → Areas & tags. 1:1 with the Android AreasContent + TagsContent:
+// Tasks → "Edit" → Areas & tags (moved out of Settings — slim settings,
+// 2026-09-24; one sheet for both). 1:1 with the Android AreasContent + TagsContent:
 // each row shows a tappable color chip (opens a palette to RECOLOR), inline
 // RENAME, a per-row menu (Rename / Delete) with a delete-confirm, and a live
 // count — "<n> open" for areas (open, non-recurring tasks in that area) and a
@@ -64,6 +65,21 @@ final class TagsAreasModel {
     }
 }
 
+/// The Areas & tags sheet: Tasks' "Edit" pill, the assistant's open_screen
+/// areas, and old `unstuck://settings?section=areas` links all open it.
+struct AreasTagsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationStack {
+            TagsAreasView()
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
+                }
+        }
+        .presentationDetents([.large])
+    }
+}
+
 struct TagsAreasView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
@@ -111,11 +127,12 @@ private struct AreasSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Settings · Areas").foregroundStyle(theme.palette.primaryDeep)
-            Text("One list. The whole life.")
+            SectionLabel("Areas").foregroundStyle(theme.palette.primaryDeep)
+            Text("The parts of your life.")
                 .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
-            Text("Areas filter the same list — flat on purpose.")
+            Text("Each task can sit in one area. Tap an area on Tasks to see only its tasks.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.bottom, 6)
 
             ForEach(vm.areas.sorted { $0.sortOrder < $1.sortOrder }) { area in
@@ -260,11 +277,12 @@ private struct TagsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionLabel("Settings · Tags").foregroundStyle(theme.palette.primaryDeep)
-            Text("Your tag vocabulary.")
+            SectionLabel("Tags").foregroundStyle(theme.palette.primaryDeep)
+            Text("Your tags.")
                 .font(UFont.serifItalic(22)).foregroundStyle(theme.palette.ink)
-            Text("Tags cut across areas — apply as many as you like.")
+            Text("A task can have as many tags as you like, from any area.")
                 .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                .fixedSize(horizontal: false, vertical: true)
                 .padding(.bottom, 6)
 
             ForEach(vm.tags.sorted { $0.sortOrder < $1.sortOrder }) { tag in

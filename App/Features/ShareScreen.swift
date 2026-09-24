@@ -620,8 +620,22 @@ struct ShareScreen: View {
         let split = sharePeopleSplit(vm.people, pinned: vm.pinnedIds, handOver: mode == .handOver)
         let noun = mode == .share ? "People" : "Hand over to"
         VStack(alignment: .leading, spacing: 10) {
-            SectionLabel(split.withAccess.isEmpty ? noun : "\(noun) · \(split.withAccess.count)")
-                .accessibilityLabel("\(noun), \(split.withAccess.count)")
+            HStack(alignment: .firstTextBaseline) {
+                SectionLabel(split.withAccess.isEmpty ? noun : "\(noun) · \(split.withAccess.count)")
+                    .accessibilityLabel("\(noun), \(split.withAccess.count)")
+                Spacer(minLength: 8)
+                // Everyone you share with, in one place (Settings → People) —
+                // one push away from any share sheet (slim settings, 2026-09-24).
+                NavigationLink { ConnectionsView() } label: {
+                    Text("Manage people")
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink2)
+                        .underline()
+                        .frame(minHeight: 44).contentShape(Rectangle())
+                        .padding(.vertical, -12)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("share-manage-people")
+            }
             if vm.loading && vm.people.isEmpty {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)
             } else if vm.people.isEmpty {

@@ -4,7 +4,7 @@
 // still actionable.
 //
 // Since the assistant redesign the composer is NO LONGER inside the assistant
-// panel: its entry point is Settings → Account → "Send feedback" (matching the
+// panel: its entry point is Settings → "Send feedback" (matching the
 // web, which moved it out for the same reason — the panel is the assistant,
 // nothing else). The floating ✦ launcher below opens the Assistant.
 
@@ -39,7 +39,7 @@ struct AssistantLauncher: View {
 /// Overlays the launcher on a tab's ROOT content (bottom-trailing). Applied
 /// INSIDE each tab's NavigationStack so a pushed detail screen covers it —
 /// mirroring Android's `stack.isEmpty()` gate. Renders NOTHING while the AI
-/// kill-switch (Settings → Interface) is off.
+/// kill-switch (Settings → Assistant & privacy) is off.
 struct AssistantLauncherModifier: ViewModifier {
     @Environment(AppModel.self) private var model
     func body(content: Content) -> some View {
@@ -62,7 +62,7 @@ extension View {
     func assistantLauncher() -> some View { modifier(AssistantLauncherModifier()) }
 }
 
-/// The feedback composer as its own sheet — the Settings → Account entry point.
+/// The feedback composer as its own sheet — the Settings → "Send feedback" entry point.
 struct FeedbackSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme

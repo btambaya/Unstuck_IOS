@@ -1,5 +1,5 @@
 // Ports the gateway surfaces need from AppModel: the fact edit-in-place the
-// Settings "What Unstuck knows" panel uses (ProfileFactsService has save /
+// Settings "What Unstuck remembers" panel uses (ProfileFactsService has save /
 // remove / clear but no update). `profileFactsHydrated` and
 // `canonicalStruggles` live in AppModel.swift.
 

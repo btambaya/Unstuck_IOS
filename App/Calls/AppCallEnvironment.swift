@@ -79,6 +79,13 @@ final class AppCallEnvironment: CallEnvironment {
 
     var isCallsEnabled: Bool { CallSettings.enabled }
 
+    /// The AI Assistant switch — readable before AppModel is up (the same
+    /// UserDefaults key SettingsState writes; ON unless turned off).
+    var isAssistantEnabled: Bool {
+        if let m = model { return m.settings.assistantEnabled }
+        return SettingsState.storedAssistantEnabled()
+    }
+
     /// The device copy of the account's OK — readable before AppModel is up
     /// (sign-out wipes it, so it can only be the last account's).
     var hasAIConsent: Bool {

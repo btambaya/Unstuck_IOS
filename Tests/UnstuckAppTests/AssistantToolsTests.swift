@@ -1966,8 +1966,9 @@ final class AssistantToolsTests: XCTestCase {
         await eq("set_reminder_lead", "{}", "error: minutes must be 0 (off), 5, 10, or 15")
         api.reminderSaveOk = false
         await eq("set_reminder_lead", #"{"minutes":5}"#, "error: could not save (offline?)")
-        await eq("set_ritual", #"{"ritual":"Morning"}"#, "ok: morning moment on")
-        await eq("set_ritual", #"{"ritual":"sunday","on":false}"#, "ok: sunday moment off")
+        // Said by the routine's name (web parity, slim settings).
+        await eq("set_ritual", #"{"ritual":"Morning"}"#, "ok: Morning plan on")
+        await eq("set_ritual", #"{"ritual":"sunday","on":false}"#, "ok: Sunday plan-ahead off")
         await eq("set_ritual", #"{"ritual":"lunch"}"#, "error: ritual must be morning, evening, friday, or sunday")
         XCTAssertEqual(api.prefCalls, ["usable:120:-", "usable:90:240", "usable:120:-", "notif:calm", "notif:coach", "lead:10", "lead:0", "lead:5",
                                        "ritual:morning:true", "ritual:sunday:false"])
@@ -2402,33 +2403,42 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     func testGetSettingsAndTheSettingWritesReportRealOutcomes() async {
+        // Slim settings (2026-09-24): the web's vocabulary — focus options,
+        // text size, background noise on/off, routines by their panel names.
         await eq("get_settings", "{}",
                  "ok: settings:\n- notifications: balanced\n- reminder lead: 10 minutes before a task\n- usable minutes: not set\n"
-                 + "- focus defaults: 25m sessions, 5m overrun grace, soft exit on, pause reasons on\n- theme: system\n- ambient sound: off\n"
-                 + "- rituals: morning off, evening off, friday off, sunday on")
+                 + "- focus options: new tasks default to 25 min, check in when the timer runs over: after 5 min, ask before leaving on, ask why pausing on\n"
+                 + "- theme: system\n- text size: default\n- background noise: off\n"
+                 + "- routines (web assistant panel): Morning plan off, Evening wind-down off, Friday look-back off, Sunday plan-ahead on")
         XCTAssertTrue(READ_ONLY_TOOLS.contains("get_settings"))
         await eq("set_theme", #"{"theme":"Dark"}"#, "ok: theme set to dark")
         await eq("set_theme", #"{"theme":"dark"}"#, "error: the theme is already dark — nothing changed")
         await eq("set_theme", #"{"theme":"sepia"}"#, "error: theme must be system, light, or dark")
-        await eq("set_focus_defaults", #"{"defaultMinutes":45,"overrunMinutes":0,"softExit":false}"#, "ok: focus defaults — 45m sessions, no overrun grace, soft exit off")
+        await eq("set_focus_defaults", #"{"defaultMinutes":45,"overrunMinutes":0,"softExit":false}"#,
+                 "ok: focus options — new tasks default to 45 min, check in when the timer runs over: never, ask before leaving off")
         await eq("set_focus_defaults", "{}", "error: give at least one of defaultMinutes, overrunMinutes, softExit, pauseReasons")
-        await eq("set_focus_defaults", #"{"defaultMinutes":30}"#, "error: defaultMinutes must be 15, 25 or 45")
-        await eq("set_focus_defaults", #"{"overrunMinutes":7}"#, "error: overrunMinutes must be 0, 5 or 10")
-        await eq("set_ambient_sound", #"{"sound":"brown"}"#, "ok: ambient sound set to brown noise")
-        await eq("set_ambient_sound", #"{"sound":"brown"}"#, "error: ambient sound is already brown — nothing changed")
-        await eq("set_ambient_sound", #"{"sound":"rain"}"#, "error: sound must be off, brown, or pink")
-        await eq("set_ambient_sound", #"{"sound":"off"}"#, "ok: ambient sound off")
-        await eq("set_ritual", #"{"ritual":"sunday"}"#, "error: the sunday moment is already on — nothing changed")
+        await eq("set_focus_defaults", #"{"defaultMinutes":30}"#, "error: defaultMinutes must be 15, 25, or 45")
+        await eq("set_focus_defaults", #"{"overrunMinutes":7}"#, "error: overrunMinutes must be 0 (none), 5, or 10")
+        // Only what changes is written and named; nothing changing is an error.
+        await eq("set_focus_defaults", #"{"defaultMinutes":45,"pauseReasons":false}"#, "ok: focus options — ask why pausing off")
+        await eq("set_focus_defaults", #"{"softExit":false}"#, "error: the focus options already have those values — nothing changed")
+        // One speaker button: brown (or an old schema's pink, or "on") = on.
+        await eq("set_ambient_sound", #"{"sound":"brown"}"#, "ok: background noise on")
+        await eq("set_ambient_sound", #"{"sound":"pink"}"#, "error: background noise is already on — nothing changed")
+        await eq("set_ambient_sound", #"{"sound":"rain"}"#, "error: sound must be off or brown (on)")
+        await eq("set_ambient_sound", #"{"sound":"off"}"#, "ok: background noise off")
+        await eq("set_ambient_sound", #"{"sound":"on"}"#, "ok: background noise on")
+        await eq("set_ritual", #"{"ritual":"sunday"}"#, "error: Sunday plan-ahead is already on — nothing changed")
         _ = await run("set_usable_minutes", #"{"weekdayMin":240,"weekendMin":60}"#)
-        await contains("get_settings", "{}", "- theme: dark\n- ambient sound: off\n- rituals: morning off")
-        await contains("get_settings", "{}", "- usable minutes: weekdays 240m, weekends 60m\n- focus defaults: 45m sessions, no overrun grace, soft exit off, pause reasons on")
-        XCTAssertEqual(api.prefCalls, ["theme:dark", "focus:45:0:false:-", "ambient:brown", "ambient:off", "usable:240:60"])
+        await contains("get_settings", "{}", "- theme: dark\n- text size: default\n- background noise: on\n- routines (web assistant panel): Morning plan off")
+        await contains("get_settings", "{}", "- usable minutes: weekdays 240m, weekends 60m\n- focus options: new tasks default to 45 min, check in when the timer runs over: never, ask before leaving off, ask why pausing off")
+        XCTAssertEqual(api.prefCalls, ["theme:dark", "focus:45:0:false:-", "focus:-:-:-:false", "ambient:on", "ambient:off", "ambient:on", "usable:240:60"])
         api.settingsSaveOk = false
         await eq("set_theme", #"{"theme":"light"}"#, "error: couldn't switch the theme — it is still dark")
-        await eq("set_ambient_sound", #"{"sound":"pink"}"#, "error: couldn't save — try again")
-        await eq("set_focus_defaults", #"{"pauseReasons":false}"#, "error: couldn't save — try again")
-        await eq("set_ritual", #"{"ritual":"morning"}"#, "error: couldn't save the morning moment — it is still off")
-        for (name, result) in [("set_theme", "ok: theme set to dark"), ("set_focus_defaults", "ok: focus defaults — 45m sessions"), ("set_ambient_sound", "ok: ambient sound set to brown noise")] {
+        await eq("set_ambient_sound", #"{"sound":"off"}"#, "error: couldn't change the background noise — it is still on")
+        await eq("set_focus_defaults", #"{"pauseReasons":true}"#, "error: couldn't save the focus options — nothing changed")
+        await eq("set_ritual", #"{"ritual":"morning"}"#, "error: couldn't save Morning plan — it is still off")
+        for (name, result) in [("set_theme", "ok: theme set to dark"), ("set_focus_defaults", "ok: focus options — new tasks default to 45 min"), ("set_ambient_sound", "ok: background noise on")] {
             XCTAssertEqual(assistantReceipt(name: name, args: ToolArgs(), result: result, tasks: [], facts: [])?.label, String(result.dropFirst(4)), name)
         }
     }

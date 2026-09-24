@@ -7,7 +7,7 @@
 
 import Foundation
 
-/// How proactively the app notifies (Settings → Notifications). Calm =
+/// How proactively the app notifies (Settings → Notifications & calls). Calm =
 /// only what you can't miss; Balanced = the default helpful set; Coach =
 /// maximum prompting. The booleans below are the single source of truth
 /// for which moments each level enables — read by ReminderScheduler,
@@ -17,14 +17,7 @@ public enum NotificationLevel: String, CaseIterable, Sendable {
     case balanced = "Balanced"
     case coach = "Coach"
 
-    /// Verbatim copy from the Android SettingsStore (spec 10 §3.1).
-    public var blurb: String {
-        switch self {
-        case .calm: return "Only the essentials — pre-task reminders and your session recap."
-        case .balanced: return "Reminders, a start-now nudge with Start/Reschedule, paused check-ins, the morning brief, and quiet in-app nudges."
-        case .coach: return "Everything in Balanced, plus a nudge if you haven't started on time and more proactive prompts."
-        }
-    }
+    // The one plain line under each level is `plainLine` (SlimSettings.swift).
 
     /// A "starts now" notification (Start / Reschedule) at the block's start time.
     public var atStart: Bool { self != .calm }

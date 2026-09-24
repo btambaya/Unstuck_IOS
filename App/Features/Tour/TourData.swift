@@ -33,7 +33,7 @@ struct TourState: Codable, Equatable, Sendable {
     var speed: Double?
     var index: Int?
     /// The user ✕-dismissed the floating "Resume tour" chip — it never comes
-    /// back for this run (the Settings → Account path remains). Cleared when a
+    /// back for this run (Settings → Replay the tour remains). Cleared when a
     /// fresh run begins.
     var chipDismissed: Bool?
 }
@@ -145,7 +145,7 @@ struct TourStep: Identifiable, Sendable {
     var surfaceInteractive: Bool { cutoutInteractive || opensAssistant || view == .settings }
 
     /// Round 4: the settings exemption is SCOPED to the section the step
-    /// pushed (Notifications / Interface) — never the whole Settings sheet.
+    /// pushed (Notifications / Appearance) — never the whole Settings sheet.
     /// With the blanket sheet exemption a tester could tap Back to the root
     /// and hit Sign out / Delete account / Export mid-tour (sign-out left the
     /// running lockdown live over AuthView). Only points inside the pushed
@@ -248,7 +248,7 @@ enum TourScript {
             title: "You’re ready to begin",
             body: "That’s the loop: Today narrows things down, the first physical action gets you moving, Focus sustains it, and the Assistant helps when you’re stuck. Pick one real next step.",
             narration: "That’s the core loop. Today narrows things down. The first physical action gets you moving. Focus sustains it. And the Assistant is there when you get stuck. You don’t need to learn everything today — just choose one real next step, and begin.",
-            more: "You can reopen this tour anytime from Settings → Account. Nothing you skip is lost.",
+            more: "You can replay this tour anytime from Settings → Replay the tour. Nothing you skip is lost.",
             primary: "Begin"),
     ]
 
@@ -297,10 +297,10 @@ enum TourScript {
             primary: "Continue"),
         essentialStep("notifications"),
         TourStep(
-            id: "personalization", stage: "Personalize", view: .settings, section: "Interface", target: nil,
+            id: "personalization", stage: "Personalize", view: .settings, section: "Appearance", target: nil,
             title: "Make it yours",
-            body: "Theme, accent, density, and text size; focus defaults; your areas and tags. Adjust what helps, ignore the rest.",
-            narration: "Personalization covers appearance — theme, accent, density, text size — plus your focus defaults and how you manage areas and tags. Change what helps you; leave the rest.",
+            body: "Pick light or dark and your text size here. Areas and tags live on Tasks; focus options live on the Focus screen.",
+            narration: "Here you pick light or dark, and your text size. Your areas and tags live on the Tasks screen, and focus options live on the Focus screen, right where you use them. Change what helps you; leave the rest.",
             primary: "Continue"),
         essentialStep("finish"),
     ]
@@ -337,11 +337,11 @@ let TOUR_QA: [TourQAEntry] = [
     TourQAEntry(pattern: "partner.*assign|difference.*partner",
                 answer: "Partner: either of you can complete it and focus together. Assign: it becomes their task entirely."),
     TourQAEntry(pattern: "notifications off|turn.*off|can i turn",
-                answer: "Yes. Calm mode keeps only essentials, and you can adjust it anytime in Notifications."),
+                answer: "Yes. Calm keeps only the reminders you set, and you can change it anytime in Settings → Notifications & calls."),
     TourQAEntry(pattern: "offline|lose signal",
                 answer: "Unstuck works offline. Your changes sync automatically when you reconnect."),
     TourQAEntry(pattern: "restart|tour again|find the tour",
-                answer: "Reopen it anytime from Settings → Account → Product tour."),
+                answer: "Replay it anytime from Settings → Replay the tour."),
 ]
 
 let TOUR_FALLBACK_ANSWER =
@@ -379,7 +379,7 @@ enum TourResumeDecision: Equatable, Sendable {
     case welcome
 }
 
-/// Explicit open (Settings → Product tour): resume at the saved step if an
+/// Explicit open (Settings → Replay the tour): resume at the saved step if an
 /// UNFINISHED run exists, otherwise show the welcome. A FINISHED tour
 /// (done == true) restarts from the welcome card — web restart semantics —
 /// never "resumes" at its last step.

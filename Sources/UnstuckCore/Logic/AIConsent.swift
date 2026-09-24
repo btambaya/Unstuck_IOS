@@ -124,7 +124,7 @@ public enum AIConsent {
 
     /// App open, "Not now": Calls were on, and now they're off.
     public static let callsTurnedOffTitle = "Calls are off"
-    public static let callsTurnedOffNote = "Calls use the assistant, so they're off for now. You can switch them back on in Settings › Calls."
+    public static let callsTurnedOffNote = "Calls use the assistant, so they're off for now. You can switch them back on in Settings › Notifications & calls."
 
     /// Settings → AI data sharing → off. Calls go off with it.
     public static let revokedNote = "Calls are off too. The assistant will ask again before it's used."

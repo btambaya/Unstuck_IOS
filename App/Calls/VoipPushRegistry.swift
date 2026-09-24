@@ -50,7 +50,7 @@ final class VoipPushRegistry: NSObject, @preconcurrency PKPushRegistryDelegate {
 
     private var registry: PKPushRegistry?
     /// When PushKit registration was (last) requested — `start()` / a retry.
-    /// Settings › Calls shows the one-time "needs VoIP registration — retry"
+    /// Settings › Notifications & calls shows the one-time "needs VoIP registration — retry"
     /// note when no token has arrived `VoipRegistrationNudge.graceSeconds`
     /// after a signed-in launch.
     private(set) var registrationStartedAt: Date?

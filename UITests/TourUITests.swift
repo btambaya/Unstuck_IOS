@@ -259,7 +259,7 @@ final class TourUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Pause the tour? Your progress is saved."]
             .firstMatch.waitForExistence(timeout: 6), "expected the inline pause confirm")
         XCTAssertTrue(app.staticTexts
-            .matching(NSPredicate(format: "label CONTAINS 'Settings → Account → Product tour'"))
+            .matching(NSPredicate(format: "label CONTAINS 'Settings → Replay the tour'"))
             .firstMatch.exists, "the confirm names the Settings path")
         snap("pause-01-confirm")
         app.buttons["Keep going"].firstMatch.tap()

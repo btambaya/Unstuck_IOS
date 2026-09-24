@@ -49,11 +49,15 @@ final class VoiceSessionModel {
     var note: String?
     /// The call this screen is running (fallback B), nil for a plain Talk.
     private(set) var callSession: CallSession?
-    /// Hold-to-talk (Settings "Voice: hold to talk", UserDefaults
-    /// `unstuck.voice.holdToTalk`): turn_detection null, the mic only opens
-    /// while the button is held and the turn commits on release. Read at
-    /// connect time so a mid-session toggle applies to the next session.
+    /// Hold-to-talk (Talk's own "Noisy room? Hold to talk" switch — it moved
+    /// here from Settings, same UserDefaults key `unstuck.voice.holdToTalk`):
+    /// turn_detection null, the mic only opens while the button is held and
+    /// the turn commits on release. Fixed per connection — read at connect
+    /// time; `setHoldToTalk` reconnects in the new mode.
     private(set) var holdToTalk = false
+    /// The switch's position (the stored preference). Equals `holdToTalk`
+    /// except for the moment between a flip and the reconnect.
+    private(set) var holdPreference = VoiceRealtimeClient.holdToTalkPreferred
     /// Hold-to-talk: the button is currently down (drives the state label).
     private(set) var pttPressed = false
     /// Today's voice minutes as the proxy last told them, and when (Ahmad
@@ -239,6 +243,27 @@ final class VoiceSessionModel {
         rc.start()
     }
 
+    /// "Noisy room? Hold to talk" flipped on the Talk screen. Remembered (the
+    /// same key Settings used to write), and a live plain Talk reconnects in
+    /// the new mode right away — the mode is fixed per connection, and the web
+    /// rebuilds its session the same way. A call never offers it (calls always
+    /// listen automatically).
+    func setHoldToTalk(_ on: Bool) {
+        UserDefaults.standard.set(on, forKey: VoiceRealtimeClient.holdToTalkKey)
+        holdPreference = on
+        guard callSession == nil, on != holdToTalk, !ended, !failed, micGranted, isLive,
+              let token = model.voiceAccessToken, !token.isEmpty else { return }
+        // Stop the current conversation; what it changed lands in the thread.
+        client?.stop()
+        client = nil
+        model.assistant.endVoiceSession()
+        captions.reset(); note = nil
+        pttPressed = false
+        state = .connecting
+        reconnects = 0
+        connect(token: token)
+    }
+
     /// Manual Interrupt = a HARD cancel (never ducks). Meaningful only while
     /// the model is responding or playing — `canInterrupt`.
     func interrupt() {
@@ -343,9 +368,14 @@ struct VoiceModeScreen: View {
 
             if let session { center(session) } else { ProgressView() }
 
-            // End
-            VStack {
+            // End, and the noisy-room switch above it (moved here from
+            // Settings — it only ever changed this screen).
+            VStack(spacing: 18) {
                 Spacer()
+                if let session, session.callSession == nil {
+                    HoldToTalkSwitch(isOn: Binding(get: { session.holdPreference },
+                                                   set: { session.setHoldToTalk($0) }))
+                }
                 Button { dismiss() } label: {
                     Text("End")
                         .font(UFont.sans(15, .semibold)).foregroundStyle(.white)
@@ -491,6 +521,32 @@ private struct MinutesLeftLine: View {
                         .replacingOccurrences(of: "a minute left", with: "a minute of voice left"))
             }
         }
+    }
+}
+
+/// "Noisy room? Hold to talk" — the small switch on the Talk screen (same key
+/// as the old Settings row, `unstuck.voice.holdToTalk`). Off: Talk listens by
+/// itself. On: the mic opens only while the Hold to talk button is held.
+private struct HoldToTalkSwitch: View {
+    @Environment(\.uTheme) private var theme
+    let isOn: Binding<Bool>
+
+    var body: some View {
+        Toggle(isOn: isOn) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Noisy room? Hold to talk")
+                    .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+                Text(isOn.wrappedValue ? "Hold the button while you speak, let go to send."
+                                       : "Talk listens by itself.")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            }
+        }
+        .tint(theme.palette.primary)
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .frame(maxWidth: 340)
+        .padding(.horizontal, 24)
+        .accessibilityIdentifier("talk-hold-to-talk")
     }
 }
 

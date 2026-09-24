@@ -182,12 +182,12 @@ final class InterviewThreadDriver {
     /// verbatim, then the small-print disclosure of what happens to the answers.
     static func greeting(firstName: String?) -> String {
         "Hey\(firstName.map { " \($0)" } ?? ""). A few quick questions so I can plan around your actual life — skip any you like.\n\n"
-            + "I’ll remember what you tell me; it stays yours — see What Unstuck knows in Settings to view or delete any of it. "
+            + "I’ll remember what you tell me; it stays yours — see What Unstuck remembers in Settings to view or delete any of it. "
             + "Facts are shared with our AI provider (which doesn’t train on them) so I can help."
     }
 
-    static let pickerQuestion = "Last one — which moments should I run for you? All optional, all changeable in Settings."
-    static let closingLine = "That’s everything — I’ll plan around it. Change any of it in Settings → What Unstuck knows."
+    static let pickerQuestion = "Last one — which moments should I run for you? All optional — ask me anytime to change them."
+    static let closingLine = "That’s everything — I’ll plan around it. Change any of it in Settings → Assistant & privacy."
 }
 
 // MARK: - the chip row
