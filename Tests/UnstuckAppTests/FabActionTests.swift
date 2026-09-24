@@ -349,3 +349,28 @@ private struct BarShot: View {
         .background(theme.palette.bg)
     }
 }
+
+// MARK: - the bar hides while a keyboard is on screen (Ahmad, build 97)
+
+/// `MainTabScaffold` hides the bottom nav while a software keyboard is up (a
+/// bar left under the translucent iOS 26 keyboard ghosts through it). The
+/// on-screen decision is pure: the keyboard's END frame against the screen.
+final class BarKeyboardTests: XCTestCase {
+    private let screen = CGRect(x: 0, y: 0, width: 402, height: 874)
+
+    func testASoftwareKeyboardOnScreenHidesTheBar() {
+        XCTAssertTrue(MainTabScaffold.keyboardCovers(end: CGRect(x: 0, y: 539, width: 402, height: 335), screen: screen))
+    }
+
+    func testAKeyboardEndingOffScreenDoesNot() {
+        // Hidden: the end frame is below the screen's bottom edge.
+        XCTAssertFalse(MainTabScaffold.keyboardCovers(end: CGRect(x: 0, y: 874, width: 402, height: 335), screen: screen))
+        // A hardware keyboard holding the software one just past the edge.
+        XCTAssertFalse(MainTabScaffold.keyboardCovers(end: CGRect(x: 0, y: 873.5, width: 402, height: 335), screen: screen))
+    }
+
+    func testAnEmptyOrNullFrameDoesNot() {
+        XCTAssertFalse(MainTabScaffold.keyboardCovers(end: .zero, screen: screen))
+        XCTAssertFalse(MainTabScaffold.keyboardCovers(end: .null, screen: screen))
+    }
+}

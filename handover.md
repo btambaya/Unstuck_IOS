@@ -195,6 +195,70 @@ in tasks — the reference. Android's DayGrid.kt sheet has the same gap (its own
 - **Seen, not changed (pre-existing, Today too):** the editor opened on a series DAY shows SCHEDULE as the series'
   OLDEST block (`TaskEditor.scheduleText` → `myBlocks.first`), e.g. "09-23 17:00" for today's 09-24 occurrence.
 
+## Keyboard over a long collection: the bottom nav hides while typing (branch listkbd/ios, 2026-09-24) — not shipped yet
+
+Ahmad (build 97, a ~9-item shared list): holding an item near the bottom to edit it — the keyboard covered the row,
+the list wouldn't bring it into view, and the bottom nav rode up and sat ON TOP of the keyboard.
+
+- **Root cause (measured, iPhone 17 Pro sim, real software keyboard).** `MainTabScaffold` drew `BottomNavBar` as the
+  bottom-aligned child of a `ZStack` that respects the keyboard safe area, so SwiftUI's keyboard avoidance lifted the
+  bar to the keyboard's top edge (bar y 479–539, keyboard from 539). The tab's ScrollView parks a focused field
+  flush against the keyboard (edited row's field y 519–539) — the exact band the bar now covered, because the bar is
+  a sibling overlay the ScrollView knows nothing about (the tab roots' `padding(.bottom, 96)` is scroll room, not an
+  inset the scroll-to-focused-field honours). Same for the add field (auto-focused on open, and via the +).
+- **Fix (one place).** The bar is pinned to the bottom of the SCREEN:
+  `.frame(maxHeight: .infinity, alignment: .bottom).ignoresSafeArea(.keyboard, edges: .bottom)` on `BottomNavBar` in
+  `MainTabScaffold`. The keyboard slides up over it like a system tab bar (and off it on dismiss); the tab content
+  keeps its keyboard avoidance, so the focused row / add field sits just above the keyboard and the list scrolls
+  freely. Nothing else moves when there is no keyboard (the flexible frame's empty area takes no touches).
+- **Scope.** The only text fields in tab content (under the bar) are Collections': grid search, the detail's title
+  rename, the add field, the item edit field — all covered by the scaffold fix. Today / Tasks / Calendar tab content
+  has no text field (capture, new task, task editor, assistant, settings, share, palette are all sheets, which never
+  carried the bar).
+- **Test:** `CollectionKeyboardUITests` (appended to `UITests/AppSmokeUITests.swift`) on the demo boot +
+  `UITEST_LONG_LIST=1` (a 12-item "Sync up" list, `DemoSeed.seedLongCollection`): opens it, holds the last row, adds
+  at the bottom via the +, light + dark — asserts the field is wholly above the keyboard, the nav is not above it, the
+  list still scrolls, and the nav is back at the bottom after. RED before (bar y 487–533 over the keyboard at 583,
+  field 518–539 under the bar), GREEN after. Screenshots: `TEST_RUNNER_LISTKBD_SHOTS_DIR` / `…_SHOT_PREFIX`.
+  Simulator gotcha: with a hardware keyboard attached the software keyboard sits off screen until XCUITest types, so
+  the test types a space + delete before measuring.
+- **Also (DEBUG demo boot only):** simulator 7265C136 (iPhone 17 Pro) carries a DEVICE-level
+  `data/Library/Preferences/io.unstucknow.app.plist` with `unstuck.tour.v1 = {"eligible":true}` (a `simctl … defaults
+  write` from July). `TourStore.clear()` only removes the app-domain value, so the fallback armed the tour welcome over
+  Today on every demo boot there and every AppSmoke test failed "never reached Today". `startUITestMode` now WRITES an
+  empty tour state instead of clearing it (UITEST_TOUR boots unchanged).
+- **Not touched:** colours ("Shared with N" indigo — separate pass). Android: separate branch.
+- **Review pass (same branch).** Root cause re-checked against the before tree: tab content 62–539, bar 487–533,
+  edited field 519–539 under it, keyboard (its predictions strip) from 539. Three leftovers fixed:
+  1. *Coral ghost.* Pinned under the keyboard, the bar showed THROUGH the translucent iOS 26 keyboard as a blurred
+     coral smear (the +) along the bottom row — red-minus-blue 45 at the +'s spot in every shot. `MainTabScaffold`
+     now also HIDES the bar while a keyboard is on screen (`keyboardWillChangeFrame` end frame vs the screen —
+     `keyboardCovers(end:screen:)`, unit-tested in `BarKeyboardTests`; a hardware keyboard parking the software one
+     off screen doesn't count): opacity 0, no hit testing, `accessibilityHidden` (XCUITest still lists the buttons,
+     so the UI test checks pixels: red-minus-blue < 24 where the + would be). The slot keeps its place, so nothing
+     jumps; the tour anchor stays registered. A keyboard in a sheet / the tour window hides it too (behind them) —
+     back when that keyboard goes.
+  2. *Row half under the keyboard.* The ScrollView parks the focused TEXT flush on the keyboard, so the edited row's
+     card lost its bottom 10 pt and the add pill half its height. `.safeAreaPadding(.bottom, 20)` on the detail's
+     ScrollView is honoured by that scroll: the card now ends 10 pt (row) / 20 pt (pill) above the keyboard.
+  3. *The + lost its accessibility hit point after a keyboard.* Measured: with the bar pinned (with or without the
+     hiding) the + came back from a keyboard as a Button wrapping a separate "Add" image, and `isHittable` went false
+     (hit point {-1,-1}) — the original, unpinned bar did not do this. The glyph in `CoralFab` is now
+     `accessibilityHidden` (the Button carries the label): the + stays one element and hittable. Finger taps were
+     never affected.
+  - The test measured against the `Keyboard` element (583 = the keys) — 44 pt too low; it now uses the predictions
+    strip (539), checks the whole card, the first row too, scrolling back after a flick down, and no coral where the
+    + would be (under the keyboard, or riding on it). New `testBarComesBackAfterSheetAndSearchKeyboards`: New task
+    sheet closed with its keyboard up → bar back where it was; grid search → bar hidden, back after return, + hittable
+    and opens New collection.
+  - Behaviour to know: opening a collection auto-focuses its add field, so on a phone the nav is hidden there until
+    the keyboard goes (return on the empty field, Back, or finishing an edit). `AppSmokeUITests.testFabCreatesWhat…`
+    now puts the keyboard away before leaving the tab from the nav (it failed on sim 5CD157AA, which shows the
+    software keyboard on focus), and its `tapNav` asserts the button is hittable — XCUITest lists a hidden nav's
+    buttons, and a tap there silently lands on the content.
+  - Tried and dropped: hiding WITHOUT the pin (bar vanishes on will-show, back on did-hide). Same a11y quirk, and the
+    bar would show a beat late; the pinned bar fades out under the keyboard and back in as it leaves.
+
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 
 Ahmad: "Can the plus just be on same line as everything". The coral + was a 56-pt square lifted 28 pt above the bar

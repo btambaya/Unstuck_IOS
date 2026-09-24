@@ -612,6 +612,14 @@ struct CollectionDetailView: View {
                     }
                     .padding(.horizontal, 18).padding(.bottom, 96)
                 }
+                // Breathing room under a focused field. The ScrollView parks a
+                // focused text field flush on the keyboard — the TEXT, not its
+                // card — so the row being edited lost its bottom edge and the
+                // add pill half its height under the keyboard. A bottom safe-area
+                // margin is honoured by that scroll, so the whole card lands
+                // just above the keyboard. (No keyboard: 20 pt more scroll room
+                // under the 96 that clears the nav — nothing visible moves.)
+                .safeAreaPadding(.bottom, 20)
                 // The + on this screen = "put the cursor in the ONE add field".
                 .onChange(of: model.router.collectionFabRequest) { _, req in
                     consumeFabRequest(req, proxy: proxy)
