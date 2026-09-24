@@ -57,9 +57,11 @@ struct InterviewQuestion: Sendable {
 /// question iOS variant once made the two interviews visibly different —
 /// prod tester, 2026-09-05). The one iOS extra is `splitNames` on people.
 /// The two clock chips ("Before 9am" / "After 9pm" on the web) read in the
-/// phone's own 12/24-hour clock — "Before 9 AM" / "Before 09:00" (2026-09-24);
-/// the FACTS they save stay the web's verbatim text, so a fact still reads the
-/// same whichever device wrote it.
+/// phone's own 12/24-hour clock — "Before 9 AM" / "Before 09:00" (2026-09-24),
+/// and the echoed user bubble is the tapped label (InterviewThreadDriver);
+/// the FACTS they save stay the web's verbatim text ("Never schedule anything
+/// before 9am" — shared data every device reads), so a fact still reads the
+/// same whichever device wrote it. Web + Android make the same split.
 var INTERVIEW_QUESTIONS: [InterviewQuestion] { interviewQuestions(clock: .device) }
 
 func interviewQuestions(clock: ClockFormat) -> [InterviewQuestion] { [

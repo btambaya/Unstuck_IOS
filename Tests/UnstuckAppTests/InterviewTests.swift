@@ -71,7 +71,12 @@ final class InterviewTests: XCTestCase {
         let h24 = interviewQuestions(clock: .h24).first { $0.key == "nogo" }!
         XCTAssertEqual(h24.chips.map(\.label), ["Before 09:00", "After 21:00", "Weekends", "No hard limits"])
         let h12 = interviewQuestions(clock: .h12).first { $0.key == "nogo" }!
+        XCTAssertEqual(h12.chips.map(\.label), ["Before 9 AM", "After 9 PM", "Weekends", "No hard limits"])
+        let gb12 = interviewQuestions(clock: ClockFormat(cycle: .h12, amSymbol: "am", pmSymbol: "pm")).first { $0.key == "nogo" }!
+        XCTAssertEqual(gb12.chips.prefix(2).map(\.label), ["Before 9 am", "After 9 pm"], "the locale's own AM/PM markers")
         XCTAssertEqual(h24.chips.map(\.fact), h12.chips.map(\.fact), "the saved fact is the same in both clocks")
+        XCTAssertEqual(h24.chips.prefix(2).map(\.fact), ["Never schedule anything before 9am", "Never schedule anything after 9pm"],
+                       "the fact is shared data every device reads — it stays the web's text on a 24-hour phone")
         XCTAssertEqual(INTERVIEW_QUESTIONS.first { $0.key == "nogo" }!.chips.map(\.label),
                        interviewQuestions(clock: .device).first { $0.key == "nogo" }!.chips.map(\.label))
     }

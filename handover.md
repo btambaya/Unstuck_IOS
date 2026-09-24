@@ -63,6 +63,8 @@ and the test call use `CallSettings.bookingRefusal` ("8:50 AM has already passed
 task"), not the model's "08:50 today is already past (it's 14:00 now). Ask for a later time …"; the "Plan a quiet
 weekend" chip's message (the user's own bubble) says "nothing before 10:00" / "10 AM"; a 12-hour range drops the
 start's marker only when the end follows it in the same half-day (an overnight "1:00 AM–12:30 AM" keeps both).
+Cross-platform decision: the interview's never-schedule chips + their echoed bubble follow the clock ("Before 09:00" /
+"Before 9 AM"), the saved fact stays "Never schedule anything before 9am" (InterviewThreadTests pins both clocks).
 
 ## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
 

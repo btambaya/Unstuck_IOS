@@ -44,10 +44,12 @@ final class InterviewThreadTests: XCTestCase {
         var prompts: [Post] { posts.filter { $0.meta != nil } }
     }
 
-    private func make(_ defaults: UserDefaults? = nil, firstName: String? = "Maya") -> (InterviewThreadDriver, Thread) {
+    private func make(_ defaults: UserDefaults? = nil, firstName: String? = "Maya",
+                      clock: ClockFormat? = nil) -> (InterviewThreadDriver, Thread) {
         let t = Thread()
         let d = defaults ?? freshDefaults()
         let machine = InterviewMachine(
+            questions: clock.map { interviewQuestions(clock: $0) } ?? INTERVIEW_QUESTIONS,
             defaults: d,
             save: { c, f in
                 guard t.saveOK else { return false }
@@ -116,6 +118,34 @@ final class InterviewThreadTests: XCTestCase {
         XCTAssertNotEqual(driver.promptTurnId, first, "the chip row moves to the new question")
         XCTAssertEqual(driver.promptTurnId, t.prompts.last?.id)
         XCTAssertEqual(driver.machine.step, 1)
+    }
+
+    /// The never-schedule chips read in the phone's clock, and the echoed
+    /// bubble is exactly the chip that was tapped ("Before 09:00" on a 24-hour
+    /// phone, "Before 9 AM" on a 12-hour one) — while the SAVED fact stays
+    /// "Never schedule anything before 9am" in both, since the fact is shared
+    /// data every device reads (cross-platform decision, 2026-09-24).
+    func testNoGoChipEchoesTheTappedClockLabelAndSavesTheSharedFact() {
+        let cases: [(ClockFormat, String, String)] = [
+            (.h24, "Before 09:00", "After 21:00"),
+            (.h12, "Before 9 AM", "After 9 PM"),
+            (ClockFormat(cycle: .h12, amSymbol: "am", pmSymbol: "pm"), "Before 9 am", "After 9 pm"),   // en_GB on 12-hour
+        ]
+        for (clock, before, after) in cases {
+            for (label, fact) in [(before, "Never schedule anything before 9am"),
+                                  (after, "Never schedule anything after 9pm")] {
+                let (driver, t) = make(clock: clock)
+                driver.userSent(); driver.turnFinished()
+                for _ in 0..<5 { driver.skip() }
+                XCTAssertEqual(driver.machine.current?.key, "nogo")
+                XCTAssertEqual(driver.machine.current?.chips.prefix(2).map(\.label), [before, after], "\(clock.cycle)")
+                driver.answer(chip: chip(driver, label))
+                XCTAssertEqual(t.echoes.last, label, "the user's bubble is the chip they tapped (\(clock.cycle))")
+                XCTAssertEqual(t.saved.map(\.1), [fact], "the saved fact never follows the clock (\(clock.cycle))")
+                XCTAssertEqual(t.saved.first?.0, .constraint)
+                XCTAssertEqual(driver.machine.current?.key, "nudge")
+            }
+        }
     }
 
     func testNullFactChipSavesNothingButStillAdvances() {
