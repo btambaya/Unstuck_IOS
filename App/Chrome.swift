@@ -1,6 +1,7 @@
 // Custom app chrome matching the Android design: a bottom nav with a pill
-// active-indicator + a floating rounded-square coral FAB, and a shared top
-// AppBar (Orbit/title + search/bell/avatar). Replaces the native TabView bar.
+// active-indicator and the rounded-square coral + as its middle slot, and a
+// shared top AppBar (Orbit/title + search/bell/avatar). Replaces the native
+// TabView bar.
 
 import SwiftUI
 import UnstuckCore
@@ -34,8 +35,10 @@ extension AppRouter.Tab {
     }
 }
 
-/// Bottom nav: 4 cells split around a centered FAB gap, a hairline top divider,
-/// and the floating coral FAB lifted above the bar. 1:1 with BottomNavBar.kt.
+/// Bottom nav: ONE row of five equal slots — Today · Tasks · + · Calendar ·
+/// Collections — under a hairline top divider. The coral + is the middle slot
+/// (not lifted above the bar), vertically centred on the tab cells so it reads
+/// as one line with them. 1:1 with BottomNavBar.kt.
 struct BottomNavBar: View {
     @Environment(\.uTheme) private var theme
     let active: AppRouter.Tab
@@ -46,28 +49,33 @@ struct BottomNavBar: View {
     var fabLabel: String = "New task"
     let onFab: () -> Void
 
+    /// Every tab icon is drawn in this same box. SF Symbols differ in height
+    /// ("square.stack.3d.up" is taller than "clock"/"tray"/"calendar"), and
+    /// with each cell sized by its own symbol the Collections label sat ~3 pt
+    /// below the others. A shared box gives every pill the same height, so all
+    /// four icons share one line and all four labels one baseline.
+    static let iconBox = CGSize(width: 24, height: 22)
+
     private let tabs = AppRouter.Tab.allCases
 
     var body: some View {
-        ZStack(alignment: .top) {
-            HStack(spacing: 0) {
-                let mid = (tabs.count + 1) / 2
-                ForEach(tabs.prefix(mid), id: \.self) { cell($0) }
-                Color.clear.frame(width: 56, height: 1)   // FAB gap (fixed height so it can't expand)
-                ForEach(tabs.suffix(tabs.count - mid), id: \.self) { cell($0) }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.top, 8)
-            .padding(.bottom, 6)
-            .background(theme.palette.bg)
-            .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 0.5) }
-
+        HStack(alignment: .center, spacing: 0) {
+            let mid = (tabs.count + 1) / 2
+            ForEach(tabs.prefix(mid), id: \.self) { cell($0) }
             // Tour anchor: the New-task fallback when an empty account has no
             // task detail to spotlight on the first-action step. That step runs
             // on the Tasks tab, where the + still opens New task — the anchor id
-            // is unchanged on purpose.
-            CoralFab(action: onFab, label: fabLabel).tourTarget(.newTask).offset(y: -28)
+            // is unchanged on purpose. It hugs the 44-pt square, not the slot.
+            CoralFab(action: onFab, label: fabLabel)
+                .tourTarget(.newTask)
+                .frame(maxWidth: .infinity)
+            ForEach(tabs.suffix(tabs.count - mid), id: \.self) { cell($0) }
         }
+        .fixedSize(horizontal: false, vertical: true)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+        .background(theme.palette.bg)
+        .overlay(alignment: .top) { Rectangle().fill(theme.palette.line).frame(height: 0.5) }
     }
 
     private func cell(_ tab: AppRouter.Tab) -> some View {
@@ -77,11 +85,16 @@ struct BottomNavBar: View {
                 Image(systemName: tab.navIcon)
                     .font(.system(size: 19))
                     .foregroundStyle(on ? theme.palette.ink : theme.palette.ink3)
+                    .frame(width: Self.iconBox.width, height: Self.iconBox.height)
                     .padding(.horizontal, 16).padding(.vertical, 4)
                     .background(on ? theme.palette.bg2 : .clear, in: Capsule())
                 Text(tab.navLabel)
                     .font(UFont.sans(11, on ? .semibold : .medium))
                     .foregroundStyle(on ? theme.palette.ink : theme.palette.ink3)
+                    // One line always: a wrapped label would make its cell
+                    // taller and knock the row off its common baseline.
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
             .frame(maxWidth: .infinity)
             .contentShape(Rectangle())
@@ -90,20 +103,27 @@ struct BottomNavBar: View {
     }
 }
 
-/// 56×56, 16pt rounded-square coral FAB (CoralFab.kt).
+/// The bar's + — a 44×44, 13-pt rounded coral square in the middle slot
+/// (CoralFab.kt). Flat, no drop shadow: it is part of the bar, not floating
+/// over the content. Its 44×44 frame is also its tap target.
 struct CoralFab: View {
     @Environment(\.uTheme) private var theme
     let action: () -> Void
     /// Context label only — the drawn button is identical everywhere.
     var label: String = "New task"
+
+    static let side: CGFloat = 44
+    static let cornerRadius: CGFloat = 13
+
     var body: some View {
         Button(action: action) {
             Image(systemName: "plus")
-                .font(.system(size: 24, weight: .semibold))
+                .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(.white)
-                .frame(width: 56, height: 56)
-                .background(theme.palette.coral, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .shadow(color: .black.opacity(0.18), radius: 8, y: 3)
+                .frame(width: Self.side, height: Self.side)
+                .background(theme.palette.coral,
+                            in: RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
