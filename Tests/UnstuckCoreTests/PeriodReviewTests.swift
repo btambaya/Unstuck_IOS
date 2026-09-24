@@ -68,7 +68,7 @@ final class PeriodReviewVectorTests: XCTestCase {
     func testEverySharedVectorByteForByte() throws {
         let file = try loadVectors()
         XCTAssertEqual(file.version, 1)
-        XCTAssertEqual(file.vectors.count, 25)
+        XCTAssertEqual(file.vectors.count, 26)   // V20: a fortnightly series (every-n-weeks spec §8.2)
         for v in file.vectors {
             let d = try XCTUnwrap(file.datasets[v.dataset], v.id)
             let out = withZone(v.tz) {
