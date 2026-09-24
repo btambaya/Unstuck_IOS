@@ -1388,6 +1388,163 @@ final class EveryNWeeksVectorTests: XCTestCase {
     }
 }
 
+/// Adversarial review of the iOS port (2026-09-24): readers stay total for any
+/// stored rule, the direct next-date equals a day-by-day scan, the create
+/// sheet never lets its schedule step move the weeks picked, and the vectors
+/// hold in zones whose DST starts AT midnight.
+final class EveryNWeeksReviewTests: XCTestCase {
+    /// The rule's first date ≥ from by scanning day after day — the reference
+    /// the direct `nextRuleDate` must equal.
+    private func scanNext(_ r: Recurrence, from: String, limit: Int) -> String? {
+        guard let start = strictEpochDay(from) else { return nil }
+        for e in start..<(start + limit) {
+            let iso = civilIso(epochDay: e)
+            if let until = r.untilDate, iso > until { return nil }
+            if isRuleDay(r, iso: iso) { return iso }
+        }
+        return nil
+    }
+
+    func testNextRuleDateEqualsADayByDayScan() {
+        var checked = 0
+        for n in [1, 2, 3, 5, 8] {
+            for mask in 1..<128 {
+                let days = (0..<7).filter { mask & (1 << $0) != 0 }
+                for anchor in ["2026-09-21", "2026-09-24"] {          // a Monday, and V7's Thursday
+                    for until in [nil, "2026-10-14"] as [String?] {
+                        let r = Recurrence.everyNWeeks(interval: n, daysOfWeek: days, anchor: anchor, until: until)
+                        for k in 0..<10 {
+                            let from = civilIso(epochDay: civilEpochDay(2026, 9, 18) + k * 3)
+                            XCTAssertEqual(nextRuleDate(r, fromIso: from), scanNext(r, from: from, limit: 7 * n + 7),
+                                           "N\(n) \(days) \(anchor) until \(until ?? "-") from \(from)")
+                            checked += 1
+                        }
+                    }
+                }
+                let weekly = Recurrence.weekly(daysOfWeek: days + [9, -1], until: nil)
+                XCTAssertEqual(nextRuleDate(weekly, fromIso: "2026-09-25"), scanNext(weekly, from: "2026-09-25", limit: 14))
+            }
+        }
+        XCTAssertEqual(checked, 5 * 127 * 2 * 2 * 10)
+        // No real day, or an invalid rule: nothing.
+        XCTAssertNil(nextRuleDate(.everyNWeeks(interval: 2, daysOfWeek: [9], anchor: "2026-09-21", until: nil), fromIso: "2026-09-24"))
+        XCTAssertNil(nextRuleDate(.everyNWeeks(interval: 0, daysOfWeek: [4], anchor: "2026-09-21", until: nil), fromIso: "2026-09-24"))
+        XCTAssertNil(nextRuleDate(.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "soon", until: nil), fromIso: "2026-09-24"))
+    }
+
+    /// Readers accept ANY integral interval ≥ 1 (spec §2), so a stored rule of
+    /// a million — or Int.max — weeks must neither trap (7 * N overflowed in
+    /// occurrenceReach, which the launch top-up runs) nor hang (a 7N-day scan
+    /// in nextRuleDate froze the editor, and a chip per week in startsChips).
+    func testReadersAreTotalForAHugeStoredInterval() throws {
+        let started = Date()
+        for n in [100, 1_000_000, 1 << 40, Int.max / 7 + 1, Int.max] {
+            let json = #"{"kind":"everyNWeeks","interval":\#(n),"daysOfWeek":[4],"anchor":"2026-09-21"}"#
+            let r = try JSONDecoder().decode(Recurrence.self, from: Data(json.utf8))
+            XCTAssertEqual(r, .everyNWeeks(interval: n, daysOfWeek: [4], anchor: "2026-09-21", until: nil), "\(n)")
+            XCTAssertGreaterThan(occurrenceReach(r), 300, "\(n)")
+            XCTAssertEqual(nextRuleDate(r, fromIso: "2026-09-24"), "2026-09-24", "the anchor week is on")
+            XCTAssertEqual(nextRuleDate(r, fromIso: "2026-09-25"), n == 100 ? scanNext(r, from: "2026-09-25", limit: 707) : nil,
+                           "\(n): the next on week is \(n) weeks out")
+            XCTAssertEqual(startsChips(days: [4], interval: n, baseIso: "2026-09-24").count, 8, "\(n)")
+            XCTAssertEqual(nearestRuleDates(r, date: "2026-10-15", today: "2026-09-24"),
+                           n == 100 ? ["2026-09-24", try XCTUnwrap(scanNext(r, from: "2026-10-16", limit: 707))] : ["2026-09-24"], "\(n)")
+            XCTAssertNotNil(rejectOffSeriesWeek(taskName: "X", recurrence: r, date: "2026-10-15", today: "2026-09-24"))
+            XCTAssertEqual(materializeOccurrences(r, startDate: LocalDate.parse("2026-09-21"), startTime: "10:30").map(\.date),
+                           ["2026-09-24"], "\(n)")
+            XCTAssertEqual(recurrenceLabel(r), "Repeats every \(n) weeks on Thu")
+            var t = mkTask(id: "t", name: "X")
+            t.recurrence = r
+            let past = CalBlock(id: occurrenceId(taskId: "t", date: "2026-09-24"), taskId: "t", taskName: "X",
+                                startTime: "10:30", durationMinutes: 30, date: "2026-09-24", kind: .task)
+            XCTAssertTrue(recurrenceTopUp(task: t, existingBlocks: [past], todayIso: "2026-09-30").isEmpty, "\(n)")
+            let next = nextRuleDate(r, fromIso: "2026-09-30") ?? "2026-09-30"
+            XCTAssertEqual(recurrenceEditAnchor(current: r, newDays: [4], newInterval: 2, todayIso: "2026-09-30"),
+                           seriesAnchor(days: [4], fromIso: max("2026-09-30", LocalDate.mondayOf(next))),
+                           "\(n): the week of the current rule's next date, else today")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5, "no reader scans 7N days")
+    }
+
+    /// A malformed `until` under everyNWeeks is an unreadable rule — the inert
+    /// sentinel — never a throw (the hydrate drops a row that throws).
+    func testAMalformedUntilIsTheSentinelNotAThrow() throws {
+        for until in ["5", "true", "[\"2026-12-31\"]", "{}"] {
+            let json = #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-09-21","until":\#(until)}"#
+            XCTAssertTrue(Recurrence.isUnknown(try JSONDecoder().decode(Recurrence.self, from: Data(json.utf8))), until)
+        }
+        let null = #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-09-21","until":null}"#
+        XCTAssertEqual(try JSONDecoder().decode(Recurrence.self, from: Data(null.utf8)),
+                       .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil))
+        // The other kinds are unchanged: a non-string until still throws there
+        // (build 92's behaviour, which this branch does not widen).
+        XCTAssertThrowsError(try JSONDecoder().decode(Recurrence.self, from: Data(#"{"kind":"weekly","daysOfWeek":[4],"until":5}"#.utf8)))
+    }
+
+    /// The create sheet (spec §5 "Create sheet"): for every day set, picked day
+    /// and "Starts" chip, the rule's weeks are the chip's, the schedule day is
+    /// the picked day for the first chip (weekly's behaviour: an off-pattern
+    /// pick keeps its one-off, as on web and Android) and the chip's own day
+    /// otherwise — and scheduling that day NEVER re-anchors the series away
+    /// from the weeks the user picked.
+    func testCreateSeriesStartNeverMovesThePickedWeeks() throws {
+        XCTAssertNil(createSeriesStart(days: [4], interval: 1, until: nil, pickedIso: "2026-09-24", startsAnchor: nil))
+        XCTAssertNil(createSeriesStart(days: [9], interval: 2, until: nil, pickedIso: "2026-09-24", startsAnchor: nil))
+        // Thursdays every 2 weeks, WHEN = Fri 25 Sep: the first chip is Thu 1 Oct's week, scheduled on Fri 25 Sep
+        // (a one-off, then 1 Oct, 15 Oct …); the second chip starts on Thu 8 Oct.
+        let first = try XCTUnwrap(createSeriesStart(days: [4], interval: 2, until: nil, pickedIso: "2026-09-25", startsAnchor: nil))
+        XCTAssertEqual(first.rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-28", until: nil))
+        XCTAssertEqual(first.scheduleIso, "2026-09-25")
+        let second = try XCTUnwrap(createSeriesStart(days: [4], interval: 2, until: "2026-12-31", pickedIso: "2026-09-25",
+                                                     startsAnchor: "2026-10-05"))
+        XCTAssertEqual(second.rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-10-05", until: "2026-12-31"))
+        XCTAssertEqual(second.scheduleIso, "2026-10-08")
+        // A stale pick (not one of today's chips) is the first chip.
+        XCTAssertEqual(createSeriesStart(days: [4], interval: 2, until: nil, pickedIso: "2026-09-25", startsAnchor: "2026-09-21")?.scheduleIso,
+                       "2026-09-25")
+        for n in 2...4 {
+            for mask in 1..<128 {
+                let days = (0..<7).filter { mask & (1 << $0) != 0 }
+                for k in 0..<7 {
+                    let picked = civilIso(epochDay: civilEpochDay(2026, 9, 21) + k)
+                    for chip in startsChips(days: days, interval: n, baseIso: picked) {
+                        let s = try XCTUnwrap(createSeriesStart(days: days, interval: n, until: nil, pickedIso: picked,
+                                                                startsAnchor: chip.anchor))
+                        guard case .everyNWeeks(_, _, let anchor, _) = s.rule else { return XCTFail("\(n) \(days)") }
+                        XCTAssertEqual(anchor, chip.anchor)
+                        XCTAssertGreaterThanOrEqual(s.scheduleIso, picked)
+                        XCTAssertNil(reanchoredForSchedule(s.rule, chosenIso: s.scheduleIso),
+                                     "N\(n) \(days) picked \(picked) chip \(chip.date): the schedule step moved the weeks")
+                        if s.scheduleIso != picked { XCTAssertTrue(isRuleDay(s.rule, iso: s.scheduleIso)) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// §9.1 again in zones whose spring-forward skips MIDNIGHT itself — V10's
+    /// two occurrences are exactly those Sundays (Havana 2027-03-14, Beirut
+    /// 2027-03-28) — plus Santiago and Chatham; spec §4 "midnight-less zones".
+    func testMaterializeVectorsInMidnightlessZones() throws {
+        let file = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(RecurrenceVectors.json.utf8)) as? [String: Any])
+        let vectors = try XCTUnwrap(file["materialize"] as? [[String: Any]])
+        for zone in ["America/Havana", "Asia/Beirut", "America/Santiago", "Pacific/Chatham"] {
+            try withZone(zone) {
+                for v in vectors {
+                    let id = v["id"] as? String ?? "?"
+                    let data = try JSONSerialization.data(withJSONObject: try XCTUnwrap(v["recurrence"]))
+                    let r = try JSONDecoder().decode(Recurrence.self, from: data)
+                    let got = materializeOccurrences(r, startDate: LocalDate.parse(v["startDate"] as? String ?? ""),
+                                                     startTime: "10:30", horizonDays: v["horizonDays"] as? Int ?? 0).map(\.date)
+                    XCTAssertEqual(got, v["expect"] as? [String], "\(id) in \(zone)")
+                }
+                XCTAssertEqual(nextRuleDate(.everyNWeeks(interval: 2, daysOfWeek: [0], anchor: "2027-03-08", until: nil),
+                                            fromIso: "2027-03-15"), "2027-03-28", zone)
+            }
+        }
+    }
+}
+
 /// iOS build 92's Recurrence codec, verbatim (Supporting.swift at 2075d75) —
 /// the old-codec simulation in §9.4.
 private enum Build92Recurrence: Codable {

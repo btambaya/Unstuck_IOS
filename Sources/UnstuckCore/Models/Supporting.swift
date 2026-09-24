@@ -66,6 +66,21 @@ public enum Recurrence: Codable, Equatable, Sendable {
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let kind = try c.decode(String.self, forKey: .kind)
+        if kind == "everyNWeeks" {
+            // Strict (spec §2): anything that isn't a valid rule is the same
+            // inert sentinel an unknown kind gets — never a throw (the whole
+            // TaskRow would vanish), never a guess (a string "2", a boolean, a
+            // fractional interval, an anchor like "soon" or 2026-02-31). That
+            // covers a malformed `until` (a number, say) too: readers are
+            // total (spec §0 rule 4), so it is decoded here, not thrown below.
+            let until: String?
+            do { until = try c.decodeIfPresent(String.self, forKey: .until) } catch {
+                self = .daily(until: Self.UNKNOWN_UNTIL)
+                return
+            }
+            self = Self.decodeEveryNWeeks(c, until: until) ?? .daily(until: Self.UNKNOWN_UNTIL)
+            return
+        }
         let until = try c.decodeIfPresent(String.self, forKey: .until)
         switch kind {
         case "daily":
@@ -75,12 +90,6 @@ public enum Recurrence: Codable, Equatable, Sendable {
             self = .weekly(daysOfWeek: days, until: until)
         case "monthly":
             self = .monthly(until: until)
-        case "everyNWeeks":
-            // Strict (spec §2): anything that isn't a valid rule is the same
-            // inert sentinel an unknown kind gets — never a throw (the whole
-            // TaskRow would vanish), never a guess (a string "2", a boolean, a
-            // fractional interval, an anchor like "soon" or 2026-02-31).
-            self = Self.decodeEveryNWeeks(c, until: until) ?? .daily(until: Self.UNKNOWN_UNTIL)
         default:
             // Forward-compat: an UNKNOWN kind (a newer web/iOS release added a
             // recurrence type this build can't model). A bare throw would abort

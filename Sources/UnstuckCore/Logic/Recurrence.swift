@@ -115,8 +115,12 @@ public func strictEpochDay(_ iso: String) -> Int? {
     return civilIso(epochDay: e) == iso ? e : nil
 }
 
-/// `a mod n` in 0..<n for any sign of `a` (n > 0).
-@inline(__always) func floorMod(_ a: Int, _ n: Int) -> Int { ((a % n) + n) % n }
+/// `a mod n` in 0..<n for any sign of `a` (n > 0). Never `(a % n + n) % n`:
+/// with a stored interval near Int.max that sum overflows and traps.
+@inline(__always) func floorMod(_ a: Int, _ n: Int) -> Int {
+    let m = a % n
+    return m < 0 ? m + n : m
+}
 
 /// 0=Sun … 6=Sat of an epoch day (1970-01-01 was a Thursday).
 @inline(__always) func epochDayOfWeek(_ e: Int) -> Int { floorMod(e + 4, 7) }
@@ -174,26 +178,46 @@ public func seriesAnchor(days: [Int], fromIso: String) -> String {
     return civilIso(epochDay: epochMonday(from))
 }
 
+/// The last civil day a rule date is ever computed for (9999-12-31): past it
+/// a date no longer has four year digits.
+private let LAST_CIVIL_EPOCH_DAY = 2_932_896
+
 /// The first date on or after `fromIso` that `r` (weekly or every N weeks)
 /// matches, from the RULE alone — never from blocks, which may have been
-/// moved by hand. Bounded by `until`. Scans at most 7N days. Nil when nothing
-/// matches (another kind, no valid days, an ended or invalid rule).
+/// moved by hand. Bounded by `until`. Nil when nothing matches (another kind,
+/// no valid days, an ended or invalid rule).
+///
+/// Computed directly — this week when it is an on week and one of its days
+/// is still ahead, else the first day of the next on week — never by
+/// scanning up to 7N days: readers accept ANY integral interval ≥ 1 (spec
+/// §2), and a stored interval of a million weeks froze the editor (a 7N-day
+/// scan), while one past Int.max / 7 trapped on `7 * N`. Readers are total.
 public func nextRuleDate(_ r: Recurrence, fromIso: String) -> String? {
     guard let from = strictEpochDay(fromIso) else { return nil }
-    let span: Int
+    let found: Int?
     switch r {
-    case .weekly: span = 7
+    case .weekly(let days, _):
+        found = (from..<(from + 7)).first { days.contains(epochDayOfWeek($0)) }
     case .everyNWeeks:
-        guard let p = everyNWeeksParts(r) else { return nil }
-        span = 7 * p.interval
+        guard let p = everyNWeeksParts(r), !p.days.isEmpty else { return nil }
+        let monday = epochMonday(from)
+        let phase = floorMod((monday - p.anchorMonday) / 7, p.interval)
+        if phase == 0, let d = (from...(monday + 6)).first(where: { p.days.contains(epochDayOfWeek($0)) }) {
+            found = d
+        } else {
+            // The next on week: N − phase weeks on (N when this one is on but
+            // its days have passed). Its first series day is the answer.
+            let (offset, overflow) = (phase == 0 ? p.interval : p.interval - phase).multipliedReportingOverflow(by: 7)
+            guard !overflow, offset <= LAST_CIVIL_EPOCH_DAY - monday else { return nil }
+            let week = monday + offset
+            found = (week...(week + 6)).first { p.days.contains(epochDayOfWeek($0)) }
+        }
     default: return nil
     }
-    for i in 0..<span {
-        let iso = civilIso(epochDay: from + i)
-        if let until = r.untilDate, iso > until { return nil }
-        if isRuleDay(r, iso: iso) { return iso }
-    }
-    return nil
+    guard let e = found, e <= LAST_CIVIL_EPOCH_DAY else { return nil }
+    let iso = civilIso(epochDay: e)
+    if let until = r.untilDate, iso > until { return nil }
+    return iso
 }
 
 /// One "Starts" chip (spec §6): the first series day on or after the base in
@@ -212,16 +236,37 @@ public struct StartsChip: Equatable, Sendable {
 /// the first series day ≥ base in its week. Base Thu 24 Sep for Thursdays,
 /// N 2: [Thu 24 Sep, Thu 1 Oct]; base Fri 25 Sep: [Thu 1 Oct, Thu 8 Oct]
 /// (the week of 21 Sep has no Thursday left). Empty with no valid day.
+/// At most 8 chips: writers write 2…8, and a larger interval stored some
+/// other way must not build a chip per week (the editor renders this).
 public func startsChips(days: [Int], interval: Int, baseIso: String) -> [StartsChip] {
     let wanted = Set(validWeekdays(days))
     guard !wanted.isEmpty, interval >= 1, let base = strictEpochDay(baseIso),
           let first = strictEpochDay(seriesAnchor(days: days, fromIso: baseIso)) else { return [] }
-    return (0..<interval).compactMap { k in
+    return (0..<min(interval, 8)).compactMap { k in
         let monday = first + 7 * k
         guard let day = (0..<7).map({ monday + $0 }).first(where: { $0 >= base && wanted.contains(epochDayOfWeek($0)) })
         else { return nil }
         return StartsChip(date: civilIso(epochDay: day), anchor: civilIso(epochDay: monday))
     }
+}
+
+/// The create sheet's every-N-weeks save (spec §5 "Create sheet"): the rule,
+/// with week one the "Starts" chip picked (`startsAnchor`; nil or stale = the
+/// first chip), and the day the first occurrence is scheduled on. The FIRST
+/// chip is the picked day's own series week (seriesAnchor of it), so the
+/// series is scheduled from the picked day itself, exactly as weekly is — an
+/// off-pattern pick keeps its one-off (web and Android do the same). A LATER
+/// chip starts on its own day: scheduling the picked day would re-anchor the
+/// series back to that day's week (scheduleTaskAt, "the series starts here").
+/// Either way the schedule step never moves the weeks the user picked. Nil
+/// for every week (interval < 2) or with no valid day.
+public func createSeriesStart(days: [Int], interval: Int, until: String?, pickedIso: String,
+                              startsAnchor: String?) -> (rule: Recurrence, scheduleIso: String)? {
+    let chips = startsChips(days: days, interval: interval, baseIso: pickedIso)
+    guard interval >= 2, let first = chips.first else { return nil }
+    let pick = chips.first { $0.anchor == startsAnchor } ?? first
+    return (weeklyRule(days: days, interval: interval, anchor: pick.anchor, until: until),
+            pick == first ? pickedIso : pick.date)
 }
 
 /// Do two anchors give the same on-weeks for an N-week rule?
@@ -528,8 +573,13 @@ func occurrenceReach(_ r: Recurrence) -> Int {
         guard isValidEveryNWeeks(r) else { return 0 }
         let sorted = validWeekdays(days).map { ($0 + 6) % 7 }.sorted()
         guard let first = sorted.first, let last = sorted.last else { return 0 }
-        let gaps = zip(sorted, sorted.dropFirst()).map { $1 - $0 } + [7 * n - last + first]
-        return ((gaps.min() ?? 7 * n) - 1) / 2
+        // Readers accept any integral interval: 7N must not trap past Int.max
+        // / 7 (the top-up runs at launch), and the top-up adds ±reach days to
+        // a date. 10 000 weeks (~190 years) already reaches every block a
+        // series can have, so a larger N gives the same answer.
+        let cycle = 7 * min(n, 10_000)
+        let gaps = zip(sorted, sorted.dropFirst()).map { $1 - $0 } + [cycle - last + first]
+        return ((gaps.min() ?? cycle) - 1) / 2
     }
 }
 

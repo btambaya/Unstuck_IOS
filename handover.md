@@ -60,8 +60,10 @@ series re-anchors). Normative spec: every-n-weeks-spec.md (scratchpad of that ru
   `nextRuleDate`, `startsChips`, `recurrenceEditAnchor` (§5), `reanchoredForSchedule`, `weeklyRule` (N 1 → weekly),
   `occurrenceReach` over the 7N cycle, labels ("Repeats every 2 weeks on Thu"). `recurrenceEditStart` returns TODAY
   + 56 days for an N-week rule (E1/E2). Top-up/regenerate/Google/analytics need nothing else (blocks carry no rule).
-- **Writers.** Create sheet: Weekly → weeks chips + "Starts" chips; the first occurrence goes on the picked Starts
-  day. Task editor: same rows; day toggles keep N and the stored weeks; the Schedule seed is a date the rule has.
+- **Writers.** Create sheet: Weekly → weeks chips + "Starts" chips (`createSeriesStart`): the FIRST chip is scheduled
+  from the WHEN day, exactly as weekly (an off-pattern day keeps its one-off — web and Android do the same); a LATER
+  chip is scheduled on its own day, so the schedule step never re-anchors away from the picked week. Task editor:
+  same rows; day toggles keep N and the stored weeks; the Schedule seed is a date the rule has.
   `AppModel.scheduleTaskAt` re-anchors an N-week series on an off-week day (row written first, then blocks).
 - **Assistant.** `set_task_recurrence.intervalWeeks` (1–8, omitted = keep N, 1 = weekly); errors per §7.2; the ok
   line names the rhythm, the next two live on-rule dates ("— next Thu 24 Sep (today), then Thu 8 Oct") and a change
@@ -69,9 +71,17 @@ series re-anchors). Normative spec: every-n-weeks-spec.md (scratchpad of that ru
   7N days away, then a one-off) except on a FIRST placement, which re-anchors. Receipt reads the rhythm from the
   result. Voice REPEATS rule = `prompts.voiceRepeatsRule`. `ToolRegistry.caps` now reports `recurrence_interval`.
 - **Patterns** skip every-N-weeks templates (no "still on for Sunday?" on an off week).
+- **Readers are total for ANY stored rule** (review, same day): readers accept any integral interval ≥ 1, so
+  nothing computes an unclamped 7N or scans 7N days — `nextRuleDate` is computed directly (was a 7N-day scan: a
+  million-week rule froze the editor), `floorMod` is `m < 0 ? m + n : m` (the old `(a % n + n) % n` trapped for N near
+  Int.max, in materialize → the launch top-up), `occurrenceReach`/`nearestRuleDates` clamp the cycle, `startsChips`
+  makes at most 8. A non-string `until` under everyNWeeks decodes to the sentinel instead of throwing (the hydrate
+  drops a row that throws).
 - Tests: `EveryNWeeksVectorTests` (all §9 tables, materialize in UTC + New York + Auckland, the b92 codec as a
-  fixed point), `SeriesOffWeekTests`, receipts, DbRowCodec; app `EveryNWeeksExecutorTests` (X1–X9 + E2/E3 through the
-  executor), voice compaction keeps "every 2–8 weeks".
+  fixed point), `EveryNWeeksReviewTests` (direct next date = a day-by-day scan over 12 700 rules; huge intervals;
+  malformed until; the create sheet never re-anchors the picked week; §9.1 in Havana/Beirut/Santiago/Chatham, where
+  DST starts AT midnight on V10's own Sundays), `SeriesOffWeekTests`, receipts, DbRowCodec; app
+  `EveryNWeeksExecutorTests` (X1–X9 + E2/E3 through the executor), voice compaction keeps "every 2–8 weeks".
 
 ## Zubair's morning call fixes (branch zubair/ios, 2026-09-24) — not shipped yet
 

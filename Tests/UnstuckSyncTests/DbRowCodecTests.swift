@@ -164,7 +164,9 @@ final class DbRowCodecTests: XCTestCase {
         XCTAssertEqual(TaskRow(v1).model(), v1)
         for bad in [#"{"kind":"everyNWeeks","interval":"2","daysOfWeek":[4],"anchor":"2026-09-21"}"#,
                     #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4,"5"],"anchor":"2026-09-21"}"#,
-                    #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-02-31"}"#] {
+                    #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-02-31"}"#,
+                    // A non-string until: the sentinel too, never a throw the hydrate drops the row for.
+                    #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-09-21","until":5}"#] {
             let model = try JSONDecoder().decode(TaskRow.self, from: row(bad)).model()
             XCTAssertEqual(model.name, "Office Focus", bad)
             XCTAssertTrue(Recurrence.isUnknown(model.recurrence), bad)

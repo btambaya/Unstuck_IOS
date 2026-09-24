@@ -65,10 +65,14 @@ private func seriesRhythm(_ recurrence: Recurrence?, _ days: [Int]) -> String {
 /// first one after it. An every-N-weeks rule's nearest dates can be up to 7N
 /// days away, so the ±7-day `nearestSeriesDays` would name none for N ≥ 3.
 public func nearestRuleDates(_ recurrence: Recurrence, date: String, today: String) -> [String] {
-    guard weeklyDays(recurrence) != nil else { return [] }
-    let span = 7 * max(1, recurrence.intervalWeeks ?? 1)
+    guard weeklyDays(recurrence) != nil, isCalendarDate(date), isCalendarDate(today) else { return [] }
+    // Back no further than today (the loop stops there anyway) nor than one
+    // cycle; a stored interval can be any integer, so 7N is never computed
+    // unclamped (it trapped past Int.max / 7) and never scanned whole.
+    let cycle = 7 * min(max(1, recurrence.intervalWeeks ?? 1), 1 << 32)
+    let span = min(cycle, LocalDate.daysUntil(today, date))
     var out: [String] = []
-    for back in 1...span {
+    for back in stride(from: 1, through: span, by: 1) {
         let d = LocalDate.addDays(date, -back)
         if d < today { break }
         if isRuleDay(recurrence, iso: d), recurrence.untilDate.map({ d <= $0 }) ?? true { out.append(d); break }

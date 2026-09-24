@@ -819,18 +819,21 @@ struct NewTaskSheet: View {
     }
 
     /// The rule to save, and — for every N weeks — the day its first
-    /// occurrence goes on: the "Starts" chip's (week one is that chip's week,
-    /// spec §5), resolved against `startDate`, the day picked (fresh clock).
+    /// occurrence is scheduled on (createSeriesStart): the day picked (fresh
+    /// clock) for the first "Starts" chip, as for weekly; a later chip's own
+    /// day, so scheduling keeps the week the user chose.
     private func buildRecurrence(startDate: String?) -> (Recurrence?, firstDate: String?) {
         let untilStr = untilOn ? Self.ymd(until) : nil
         switch repeatKind {
         case .none: return (nil, nil)
         case .daily: return (.daily(until: untilStr), nil)
         case .weekly:
-            guard everyWeeks >= 2, let start = selectedStart(startsCandidates(base: startDate ?? todayIso)) else {
+            guard everyWeeks >= 2,
+                  let s = createSeriesStart(days: Array(days), interval: everyWeeks, until: untilStr,
+                                            pickedIso: startDate ?? todayIso, startsAnchor: startsAnchor) else {
                 return (.weekly(daysOfWeek: days.sorted(), until: untilStr), nil)
             }
-            return (weeklyRule(days: Array(days), interval: everyWeeks, anchor: start.anchor, until: untilStr), start.date)
+            return (s.rule, s.scheduleIso)
         case .monthly: return (.monthly(until: untilStr), nil)
         }
     }
@@ -860,9 +863,9 @@ struct NewTaskSheet: View {
         if !later {
             // Re-resolve Today/Tomorrow against a fresh clock so a sheet left open
             // across midnight doesn't schedule onto yesterday.
-            // Every N weeks starts on its "Starts" day — the day picked when
-            // that is one of the series' days, else the first one after it —
-            // so scheduling keeps the week the user chose.
+            // Every N weeks with a LATER "Starts" chip starts on that chip's
+            // day, so scheduling keeps the week the user chose; otherwise the
+            // picked day, as for weekly (see buildRecurrence).
             if let date = seriesStart ?? effectiveDateNow(), let time = pickedTime {
                 model.scheduleTaskAt(t, date: date, startTime: time)
             }
