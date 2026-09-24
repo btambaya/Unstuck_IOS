@@ -57,6 +57,8 @@ public func calBlockTaskActions(_ block: CalBlock, tasks: [TaskItem],
     // Occurrences are never assigned out; only a real task with an outgoing
     // assign share is gated (the editor's isAssignedOut rule).
     let assignedOut = !isOccurrence && assignedOutIds.contains(task.id)
-    return CalBlockTaskActions(row: row, isOccurrence: isOccurrence, done: row.done,
+    // blockIsDone: the day's block for an occurrence, the task for a one-off —
+    // the rule the grids strike the block by, so the sheet and grid agree.
+    return CalBlockTaskActions(row: row, isOccurrence: isOccurrence, done: blockIsDone(block, task: task),
                                canToggleDone: !assignedOut, canFocus: !assignedOut)
 }

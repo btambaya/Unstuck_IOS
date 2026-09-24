@@ -87,6 +87,49 @@ final class CalBlockActionsTests: XCTestCase {
         XCTAssertEqual(calBlockTaskActions(tomorrow, tasks: [tpl])?.done, true)
     }
 
+    /// A series the old path ENDED (its template done) still has its days: each
+    /// reads its own block, so an untouched day is open, not struck.
+    func testAnEndedSeriesDayReadsItsOwnBlockNotTheTemplate() throws {
+        let a = try XCTUnwrap(calBlockTaskActions(block("occ-24", task: "tpl"), tasks: [series(done: true)]))
+        XCTAssertTrue(a.isOccurrence)
+        XCTAssertFalse(a.done)
+        XCTAssertEqual(a.toggleLabel, "Mark done")
+    }
+
+    // MARK: blockIsDone — the grids' strike rule (web lib/occurrences blockIsDone)
+
+    func testBlockIsDoneOnARepeatingDayIsItsOwnBlock() {
+        XCTAssertTrue(blockIsDone(block("occ", task: "tpl", done: true), task: series()))
+        XCTAssertFalse(blockIsDone(block("occ", task: "tpl"), task: series()))
+        XCTAssertFalse(blockIsDone(block("occ", task: "tpl"), task: series(done: true)),
+                       "an ended series' flag never strikes its days")
+    }
+
+    /// A ticked day whose series was turned off (the block keeps done = true),
+    /// then reopened: the one-off's slot follows the TASK, so reopening it from
+    /// the sheet un-strikes the block on the grid.
+    func testBlockIsDoneOnAOneOffFollowsTheTask() {
+        XCTAssertTrue(blockIsDone(block("b1", task: "t1"), task: mkTask(id: "t1", done: true)))
+        XCTAssertFalse(blockIsDone(block("b1", task: "t1", done: true), task: mkTask(id: "t1")))
+    }
+
+    func testBlockIsDoneWithNoTaskIsFalse() {
+        XCTAssertFalse(blockIsDone(block("b1", task: "gone", done: true), task: nil))
+    }
+
+    /// The sheet's done and the grid's strike are one rule.
+    func testTheSheetAndTheGridAgree() {
+        let tpl = series(done: true), plain = mkTask(id: "t1")
+        let cases: [(CalBlock, TaskItem)] = [
+            (block("occ-a", task: "tpl"), tpl), (block("occ-b", task: "tpl", done: true), tpl),
+            (block("b1", task: "t1", done: true), plain),
+            (block("b2", task: "t2"), mkTask(id: "t2", done: true)),
+        ]
+        for (b, t) in cases {
+            XCTAssertEqual(calBlockTaskActions(b, tasks: [t])?.done, blockIsDone(b, task: t), b.id)
+        }
+    }
+
     // MARK: no actions
 
     func testAnExternalEventHasNoActions() {

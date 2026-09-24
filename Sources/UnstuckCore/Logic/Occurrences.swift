@@ -189,6 +189,19 @@ public func taskLinkRowForId(_ id: String, tasks: [TaskItem], blocks: [CalBlock]
     return taskForBlock(pick, tasks: tasks) ?? task
 }
 
+/// Is this calendar slot done? Port of web `blockIsDone` (lib/occurrences.ts).
+/// A repeating task's day is done on its OWN block — the template's flag never
+/// counts (ticking Tuesday must not strike Wednesday, and a series the old
+/// path ended must not strike every day it still has); a one-off's slot is
+/// done when the TASK is — a stale `done` left on its block (a ticked day
+/// whose series was turned off, then reopened) never strikes it. No task →
+/// not done. The Day / Week grids, the Month peek and the Edit-block sheet
+/// all read this, so the block the sheet just ticked or reopened shows it.
+public func blockIsDone(_ block: CalBlock, task: TaskItem?) -> Bool {
+    guard let task else { return false }
+    return task.recurrence != nil ? block.done : task.done
+}
+
 /// The row to open when a calendar block is tapped: the per-day OCCURRENCE
 /// (id = block id) when the block belongs to a recurring template, else the
 /// normal task. Lets the detail screen treat it as an occurrence.

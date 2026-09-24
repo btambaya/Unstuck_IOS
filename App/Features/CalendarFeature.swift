@@ -611,8 +611,9 @@ private struct WeekView: View {
 
     private func weekBlock(_ b: CalBlock) -> some View {
         let bt = isTaskBlock(b) ? vm.tasks.first(where: { $0.id == b.taskId }) : nil
-        // For a recurring occurrence the completion lives on the block.
-        let done = b.done || bt?.done == true
+        // A repeating day is done on its own block, a one-off when its task
+        // is (blockIsDone — the Edit-block sheet reads the same rule).
+        let done = blockIsDone(b, task: bt)
         let fill = isTaskBlock(b) ? theme.palette.areaColor(bt?.lifeArea) : theme.palette.blueSoft
         return Text(b.taskName)
             .font(UFont.sans(8, .medium))
@@ -1112,8 +1113,10 @@ struct DayGridView: View {
     private func blockCard(_ block: CalBlock, width: CGFloat) -> some View {
         let h = max(24, CGFloat(block.durationMinutes) / 60 * pxPerHour)
         let bt = isTaskBlock(block) ? vm.tasks.first(where: { $0.id == block.taskId }) : nil
-        // For a recurring occurrence the completion lives on the block.
-        let done = block.done || bt?.done == true
+        // A repeating day is done on its own block, a one-off when its task
+        // is (blockIsDone — the Edit-block sheet reads the same rule, so the
+        // block it just ticked or reopened shows it).
+        let done = blockIsDone(block, task: bt)
         let fill: Color = isExternalBlock(block) ? theme.palette.blueSoft
             : (isTaskBlock(block) ? theme.palette.areaColor(bt?.lifeArea).opacity(0.5) : theme.palette.bg2)
         return VStack(alignment: .leading, spacing: 1) {

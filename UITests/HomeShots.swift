@@ -199,4 +199,31 @@ final class CalendarBlockSheetShots: XCTestCase {
         usleep(1_200_000)
         save("08-start-focus")
     }
+
+    /// The two follow-ups on one DAY of a repeating series: Open task lands on
+    /// that day's occurrence (the editor offers "Skip today", which only an
+    /// occurrence has), Start focus runs Focus on it.
+    func testOpenAndFocusOnAnOccurrenceFromTheCalendarBlockSheet() throws {
+        let allow = XCUIApplication(bundleIdentifier: "com.apple.springboard").buttons["Allow"].firstMatch
+        if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(800_000) }
+        XCTAssertTrue(app.buttons["Day"].firstMatch.waitForExistence(timeout: 15), "the demo boot never reached Calendar")
+        usleep(1_000_000)
+
+        openBlock("Take vitamins")
+        app.buttons["cal-block-open"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Skip today"].firstMatch.waitForExistence(timeout: 8),
+                      "Open task on a day of a series opens THAT day (occurrence editor)")
+        usleep(900_000)
+        save("09-occurrence-open-task")
+        app.navigationBars.buttons["Done"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["Skip today"].firstMatch.waitForNonExistence(timeout: 6))
+        usleep(700_000)
+
+        openBlock("Take vitamins")
+        app.buttons["cal-block-focus"].firstMatch.tap()
+        XCTAssertTrue(app.buttons["cal-block-focus"].firstMatch.waitForNonExistence(timeout: 6))
+        XCTAssertTrue(app.buttons["Capture"].firstMatch.waitForExistence(timeout: 8), "Start focus opens Focus")
+        usleep(1_200_000)
+        save("10-occurrence-start-focus")
+    }
 }

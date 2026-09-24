@@ -505,6 +505,27 @@ final class CalBlockSheetActionTests: XCTestCase {
         XCTAssertEqual(try actions("cb-plain-blk")?.toggleLabel, "Mark done")
     }
 
+    /// A day ticked while the task repeated, then the repeat turned off: the
+    /// task carried the tick (done) and its block kept done = true. Mark not
+    /// done from the calendar reopens the TASK — and the grid, which strikes a
+    /// one-off by its task (blockIsDone), shows the block open again. (It read
+    /// `block.done || task.done`, so the block stayed struck after the undo.)
+    func testMarkNotDoneOnAOneOffWithAStaleTickedBlockUnstrikesIt() async throws {
+        try db.save(TaskItem(id: "cb-was-daily", name: "Stretch", estimateMin: 10, done: true,
+                             completedAt: t0, createdAt: t0, updatedAt: t0))
+        try db.save(CalBlock(id: "cb-was-daily-blk", taskId: "cb-was-daily", taskName: "Stretch", startTime: "07:30",
+                             durationMinutes: 10, date: today, kind: .task, done: true, completedAt: t0))
+        let a = try XCTUnwrap(try actions("cb-was-daily-blk"))
+        XCTAssertEqual(a.toggleLabel, "Mark not done")
+        model.toggleCalBlockDone(a)
+        try await settle { try self.storedTask("cb-was-daily")?.done == false }
+        let task = try XCTUnwrap(try storedTask("cb-was-daily"))
+        let blk = try XCTUnwrap(try storedBlock("cb-was-daily-blk"))
+        XCTAssertFalse(task.done)
+        XCTAssertFalse(blockIsDone(blk, task: task), "the grid shows the block open again")
+        XCTAssertEqual(try actions("cb-was-daily-blk")?.toggleLabel, "Mark done")
+    }
+
     // MARK: recurring occurrence
 
     /// Mark done on a day of a series ticks THAT day's block — never the

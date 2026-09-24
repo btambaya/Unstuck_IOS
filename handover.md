@@ -73,8 +73,22 @@ in tasks — the reference. Android's DayGrid.kt sheet has the same gap (its own
   — tomorrow and the template untouched, no template write; undo; Focus/Open route the day's row; assigned-out
   writes nothing; a Google event has no actions). Full suites green: core 1075, app 1166.
 - **Screenshots:** `UITests/HomeShots.swift` → `CalendarBlockSheetShots` (demo boot + new `UITEST_CALENDAR=1`, which
-  seeds a daily "Take vitamins" at the current hour and lands on Calendar — `DemoSeed.seedCalendarExtras`). Run with
-  `TEST_RUNNER_CALBLOCK_SHOTS_DIR=<dir>` in the environment; writes 01-plain-open … 08-start-focus.
+  seeds a daily "Take vitamins" at the current hour and lands on Calendar — `DemoSeed.seedCalendarExtras`). Two
+  tests: 01-plain-open … 08-start-focus, and 09-occurrence-open-task / 10-occurrence-start-focus (Open / Focus on
+  a series DAY — the editor opens as that day, with "Skip today"). The runner does not see
+  `TEST_RUNNER_CALBLOCK_SHOTS_DIR` here; the shots land in the default `/tmp/unstuck-calblock-shots`.
+- **Review fix — the grid strikes by the sheet's rule** (`blockIsDone(block, task:)`, UnstuckCore Occurrences.swift,
+  port of web lib/occurrences `blockIsDone`, which the web Week grid already uses): a series DAY is done on its own
+  block, a one-off when its TASK is. The Day `blockCard`, Week `weekBlock` and Month peek read
+  `block.done || task.done`, so (a) a day ticked while the task repeated, then the repeat turned off (task carries
+  the tick, the block keeps done = true), then reopened — Mark not done reopened the task but the block STAYED
+  struck; (b) a series the old path ended (template done) struck every day, while the sheet said "Mark done" for
+  them and its toggle changed nothing visible. `calBlockTaskActions.done` reads the same function, so sheet and
+  grid are one rule. Android's DayGrid.kt:280 has the same `b.done || bt?.done` — port there too.
+  Tests: core +5 (`blockIsDone` cases, ended-series day, sheet == grid), app +1 (stale ticked block un-strikes after
+  Mark not done). Core 1080, app 1167 green.
+- **Seen, not changed (pre-existing, Today too):** the editor opened on a series DAY shows SCHEDULE as the series'
+  OLDEST block (`TaskEditor.scheduleText` → `myBlocks.first`), e.g. "09-23 17:00" for today's 09-24 occurrence.
 
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 
