@@ -56,7 +56,15 @@ struct InterviewQuestion: Sendable {
 /// verbatim, so a fact reads the same whichever device wrote it (a five-
 /// question iOS variant once made the two interviews visibly different —
 /// prod tester, 2026-09-05). The one iOS extra is `splitNames` on people.
-let INTERVIEW_QUESTIONS: [InterviewQuestion] = [
+/// The two clock chips ("Before 9am" / "After 9pm" on the web) read in the
+/// phone's own 12/24-hour clock — "Before 9 AM" / "Before 09:00" (2026-09-24),
+/// and the echoed user bubble is the tapped label (InterviewThreadDriver);
+/// the FACTS they save stay the web's verbatim text ("Never schedule anything
+/// before 9am" — shared data every device reads), so a fact still reads the
+/// same whichever device wrote it. Web + Android make the same split.
+var INTERVIEW_QUESTIONS: [InterviewQuestion] { interviewQuestions(clock: .device) }
+
+func interviewQuestions(clock: ClockFormat) -> [InterviewQuestion] { [
     InterviewQuestion(
         key: "rhythm", category: .rhythm,
         question: "When’s your head clearest?",
@@ -95,8 +103,8 @@ let INTERVIEW_QUESTIONS: [InterviewQuestion] = [
         key: "nogo", category: .constraint,
         question: "When should I never schedule anything?",
         chips: [
-            InterviewChip(label: "Before 9am", fact: "Never schedule anything before 9am"),
-            InterviewChip(label: "After 9pm", fact: "Never schedule anything after 9pm"),
+            InterviewChip(label: "Before \(clock.shortTime(minutes: 9 * 60))", fact: "Never schedule anything before 9am"),
+            InterviewChip(label: "After \(clock.shortTime(minutes: 21 * 60))", fact: "Never schedule anything after 9pm"),
             InterviewChip(label: "Weekends", fact: "Keep weekends free — never schedule work there"),
             InterviewChip(label: "No hard limits", fact: nil),
         ],
@@ -109,7 +117,7 @@ let INTERVIEW_QUESTIONS: [InterviewQuestion] = [
             InterviewChip(label: "Keep me honest", fact: "Wants to be kept honest — direct nudges are welcome"),
             InterviewChip(label: "Barely at all", fact: "Minimal nudging — only speak up when it really matters"),
         ]),
-]
+] }
 
 // MARK: - state machine
 

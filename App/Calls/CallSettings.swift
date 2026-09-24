@@ -14,6 +14,7 @@
 // hydrate instead of pulled over (the NotificationPrefs pattern).
 
 import Foundation
+import UnstuckCore
 import UnstuckSync
 
 enum CallSettings {
@@ -132,10 +133,15 @@ enum CallSettings {
     /// "23:00 is outside this iPhone's call hours (06:00–23:00)" on untouched
     /// defaults, where the server and the web take 23:00 — so that one case
     /// also says the last minute that rings (audit 2026-09-22, C12).
-    static func hoursLabel(start: String, end: String, refusing t: Int) -> String {
-        guard let e = minutesOfDay(end), t == e else { return "\(start)–\(end)" }
+    /// `clock`: the user's 12/24-hour clock for a line they READ (Settings,
+    /// the task editor — "8:00 AM–9:00 PM"); nil keeps the machine HH:MM the
+    /// model's `error:` strings carry.
+    static func hoursLabel(start: String, end: String, refusing t: Int, clock: ClockFormat? = nil) -> String {
+        let span = clock.map { $0.range(start, end) } ?? "\(start)–\(end)"
+        guard let e = minutesOfDay(end), t == e else { return span }
         let last = (e + 24 * 60 - 1) % (24 * 60)
-        return "\(start)–\(end); the latest it rings is \(String(format: "%02d:%02d", last / 60, last % 60))"
+        let lastText = clock?.time(minutes: last) ?? String(format: "%02d:%02d", last / 60, last % 60)
+        return "\(span); the latest it rings is \(lastText)"
     }
 
     // MARK: will it ring here? (audit 2026-09-22, C12)
@@ -159,16 +165,18 @@ enum CallSettings {
     /// will ring here. Judged at the minute the dispatcher really books it
     /// (proactiveRingMinute) and the minute after — call-dispatch runs every
     /// minute — against this phone's switch and hours.
-    static func proactiveTimeWarning(_ hhmm: String, enabled: Bool, start: String, end: String) -> String? {
+    /// Times read in the phone's own clock (`clock`; tests pin one).
+    static func proactiveTimeWarning(_ hhmm: String, enabled: Bool, start: String, end: String,
+                                     clock: ClockFormat = .device) -> String? {
         guard let t = minutesOfDay(hhmm) else { return nil }
         guard let ring = proactiveRingMinute(t) else {
-            return "Unstuck only calls between \(serverWindowStart) and \(serverWindowEnd), so a call at \(hhmm) never rings."
+            return "Unstuck only calls between \(clock.time(serverWindowStart)) and \(clock.time(serverWindowEnd)), so a call at \(clock.time(hhmm)) never rings."
         }
         if !enabled {
             return "Calls are off on this iPhone, so this call is declined here — switch them on above."
         }
         if let outside = [ring, ring + 1].first(where: { !isWithinWindow(minuteOfDay: $0, start: start, end: end) }) {
-            return "Unstuck rings this call at about \(String(format: "%02d:%02d", outside / 60, outside % 60)), outside this iPhone's allowed hours (\(hoursLabel(start: start, end: end, refusing: outside))), so it's declined here — widen the hours above or pick another time."
+            return "Unstuck rings this call at about \(clock.time(minutes: outside)), outside this iPhone's allowed hours (\(hoursLabel(start: start, end: end, refusing: outside, clock: clock))), so it's declined here — widen the hours above or pick another time."
         }
         return nil
     }
@@ -178,13 +186,33 @@ enum CallSettings {
     /// call rings here. The 23:00 minute itself is left out: the default
     /// hours end there (exclusive), and one edge minute is not worth a
     /// warning on every untouched phone.
-    static func afterBlockWarning(enabled: Bool, start: String, end: String) -> String? {
+    static func afterBlockWarning(enabled: Bool, start: String, end: String, clock: ClockFormat = .device) -> String? {
         if !enabled {
             return "Calls are off on this iPhone, so these check-ins are declined here — switch them on above."
         }
         guard let s = minutesOfDay(serverWindowStart), let e = minutesOfDay(serverWindowEnd) else { return nil }
         if (s..<e).allSatisfy({ isWithinWindow(minuteOfDay: $0, start: start, end: end) }) { return nil }
-        return "This iPhone only takes calls \(start)–\(end), so a check-in after a block that ends outside those hours is declined here."
+        return "This iPhone only takes calls \(clock.range(start, end)), so a check-in after a block that ends outside those hours is declined here."
+    }
+
+    /// `CallToolLogic.timeGuard`'s refusal as the USER reads it, or nil when
+    /// the time passes. The guard's own `error:` string is written for the
+    /// model — machine HH:MM, "ask for a later time", the free windows — and
+    /// the task editor showed it raw: "08:50 today is already past (it's
+    /// 14:00 now). Ask for a later time …" on a 12-hour phone (2026-09-24).
+    /// `fix` is the screen's own next step ("pick a shorter lead or move the
+    /// task"). Times in the phone's 12/24-hour clock.
+    static func bookingRefusal(_ callAt: Date, now: Date, fix: String, clock: ClockFormat = .device,
+                               calendar: Calendar = .current) -> String? {
+        guard CallToolLogic.timeGuard(callAt, now: now, calendar: calendar) != nil else { return nil }
+        let callDay = CallToolLogic.ymd(callAt, calendar: calendar), today = CallToolLogic.ymd(now, calendar: calendar)
+        if callDay < today || (callDay == today && minuteOfDay(callAt, calendar: calendar) <= minuteOfDay(now, calendar: calendar)) {
+            return "\(clock.time(callAt, calendar: calendar)) has already passed — \(fix)."
+        }
+        if !isWithinServerWindow(callAt, calendar: calendar) {
+            return "Calls can only be booked between \(clock.time(serverWindowStart)) and \(clock.time(serverWindowEnd)) — \(fix)."
+        }
+        return "That time can't be booked — \(fix)."
     }
 
     /// Can a call actually ring on this phone? Calls on here, and a

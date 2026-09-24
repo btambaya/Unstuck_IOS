@@ -473,7 +473,7 @@ extension AppModel {
     static func postRescheduleConfirmation(taskName: String, newTime: String, taskId: String) async {
         let c = UNMutableNotificationContent()
         c.title = "Rescheduled"
-        c.body = "\u{201C}\(taskName)\u{201D} moved to \(formatTime(newTime))."
+        c.body = "\u{201C}\(taskName)\u{201D} moved to \(ClockFormat.device.time(newTime))."
         c.threadIdentifier = NotificationCategories.Thread.reminders
         c.interruptionLevel = .timeSensitive
         c.userInfo = ["kind": "reminder", "deepLink": "unstuck://task/\(taskId)"]

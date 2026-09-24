@@ -107,6 +107,29 @@ final class ReplyPolishTests: XCTestCase {
         XCTAssertEqual(spokenTime(hour: 23, minute: 59), "11:59pm")
     }
 
+    /// With the device clock (what the app passes), a raw 14:30 from a tool
+    /// result reads in the user's own 12/24-hour clock — a 24-hour phone keeps
+    /// "14:30", a 12-hour one gets the app's "2:30 PM" (2026-09-24).
+    func testTimesFollowTheDeviceClockWhenGiven() {
+        func polished(_ s: String, _ clock: ClockFormat) -> String {
+            var o = Self.opts
+            o.clock = clock
+            return polishReply(s, o)
+        }
+        let before = "Done — scheduled Dentist on 2026-09-04 at 14:00. Slots: 14:30, 00:30 and 09:05."
+        XCTAssertEqual(polished(before, .h24), "Scheduled Dentist on Fri 4 Sep at 14:00. Slots: 14:30, 00:30 and 09:05.")
+        XCTAssertEqual(polished(before, .h12), "Scheduled Dentist on Fri 4 Sep at 2 PM. Slots: 2:30 PM, 12:30 AM and 9:05 AM.")
+        XCTAssertEqual(polished("Blocked 14:00-15:00 tomorrow.", .h12), "Blocked 2 PM-3 PM tomorrow.")
+        // Idempotent in both modes; protected spans still untouched.
+        for clock in [ClockFormat.h12, .h24] {
+            let once = polished(before, clock)
+            XCTAssertEqual(polished(once, clock), once)
+            XCTAssertEqual(polished("Renamed `14:00` to \"14:00\".", clock), "Renamed `14:00` to \"14:00\".")
+        }
+        // No clock → the web's spoken vectors, unchanged.
+        XCTAssertEqual(polish("Moved it to 14:30."), "Moved it to 2:30pm.")
+    }
+
     func testVectorCountCoversTheContract() {
         XCTAssertGreaterThanOrEqual(Self.vectors.count, 25)
     }

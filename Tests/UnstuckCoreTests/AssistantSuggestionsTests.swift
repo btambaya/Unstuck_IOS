@@ -135,6 +135,19 @@ final class AssistantSuggestionsTests: XCTestCase {
         XCTAssertTrue(msg.contains("2026-08-08 and 2026-08-09"), msg)
     }
 
+    /// The tapped message becomes the user's own bubble, so its "not before"
+    /// time reads in the phone's 12/24-hour clock (2026-09-24).
+    func testQuietWeekendMessageFollowsThePhonesClock() {
+        let light = [task(estimateMin: 30, lifeArea: "Home"), task(estimateMin: 20, lifeArea: "Personal")]
+        func msg(_ clock: ClockFormat) -> String {
+            buildSuggestions(tasks: light, blocks: [], collections: [], todayIso: TODAY, clock: clock)
+                .planAndSchedule.first { $0.label == "Plan a quiet weekend" }!.message
+        }
+        XCTAssertTrue(msg(.h24).contains("nothing before 10:00,"), msg(.h24))
+        XCTAssertTrue(msg(.h12).contains("nothing before 10 AM,"), msg(.h12))
+        XCTAssertFalse(msg(.h24).contains("10am"))
+    }
+
     func testAWeekendChipOnASaturdayPlansTodayAndTomorrow() {
         // 2026-08-08 IS a Saturday: `(6 - day + 7) % 7 == 0` keeps it today.
         let light = [task(estimateMin: 30, lifeArea: "Home"), task(estimateMin: 20, lifeArea: "Health")]

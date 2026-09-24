@@ -16,14 +16,21 @@ import UnstuckData
 import UnstuckDesign
 import UnstuckShared
 
-/// Shared, configured-once DateFormatter for the Today date eyebrow — hoisted to
-/// file scope so the header doesn't allocate a fresh DateFormatter on every
-/// render. Read-only after the fixed config; `nonisolated(unsafe)` documents
-/// that to the Swift 6 concurrency checker.
-private enum TodayFmt {
-    nonisolated(unsafe) static let eyebrow: DateFormatter = {
-        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEEE · h:mm a"; return f
+/// Shared, configured-once DateFormatter for the Today date eyebrow's weekday —
+/// hoisted to file scope so the header doesn't allocate a fresh DateFormatter
+/// on every render. Read-only after the fixed config; `nonisolated(unsafe)`
+/// documents that to the Swift 6 concurrency checker. The time is NOT in it:
+/// it follows the phone's 12/24-hour clock through `ClockFormat` (a fixed
+/// "h:mm a" said "THURSDAY · 2:02 PM" on a 24-hour phone; Ahmad, 2026-09-24).
+enum TodayFmt {
+    nonisolated(unsafe) static let weekday: DateFormatter = {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "EEEE"; return f
     }()
+
+    /// "Thursday · 14:02" / "Thursday · 2:02 PM".
+    static func eyebrow(_ now: Date, clock: ClockFormat = .device) -> String {
+        "\(weekday.string(from: now)) · \(clock.time(now))"
+    }
 }
 
 /// Pure first-name derivation for the Today greeting — mirrors the web
@@ -837,7 +844,7 @@ struct TodayView: View {
         }
     }
     private var dateEyebrow: String {
-        TodayFmt.eyebrow.string(from: Date())
+        TodayFmt.eyebrow(Date())
     }
 }
 

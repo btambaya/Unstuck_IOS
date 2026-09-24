@@ -5,7 +5,7 @@ import Foundation
 
 public struct Slot: Equatable, Sendable {
     public let date: String       // YYYY-MM-DD
-    public let label: String      // 'Today · 9:30 AM'
+    public let label: String      // 'Today · 9:30 AM' / 'Today · 09:30' (the device clock)
     public let startTime: String  // HH:MM
     public init(date: String, label: String, startTime: String) {
         self.date = date
@@ -27,12 +27,12 @@ public struct Conflict: Equatable, Sendable {
 // below (Swift forbids referencing non-public symbols in a public
 // function's default-argument expression).
 
-/// 12-hour time with AM/PM, e.g. "9:00 AM", "2:30 PM", "12:15 AM".
-public func formatTime(_ hhmm: String) -> String {
-    let (h, m) = parseHM(hhmm)
-    let period = h >= 12 ? "PM" : "AM"
-    let h12 = ((h + 11) % 12) + 1
-    return "\(h12):\(pad2(m)) \(period)"
+/// A stored "HH:MM" as the user reads it — the device's 12/24-hour clock
+/// ("14:30" / "2:30 PM"); tests pass `clock` to pin a mode. Was a hard-coded
+/// 12-hour format, which put "2:30 PM" next to 24-hour times elsewhere
+/// (Ahmad, 2026-09-24). Everything goes through `ClockFormat`.
+public func formatTime(_ hhmm: String, clock: ClockFormat = .device) -> String {
+    clock.time(hhmm)
 }
 
 private func parseHM(_ hhmm: String) -> (Int, Int) {
@@ -75,7 +75,8 @@ public func findFreeSlots(
     daysToScan: Int = 4,
     dayStartMin: Int = 8 * 60,
     dayEndMin: Int = 18 * 60,
-    limit: Int = 9
+    limit: Int = 9,
+    clock: ClockFormat = .device
 ) -> [Slot] {
     let start = startDate ?? now
     var out: [Slot] = []
@@ -107,7 +108,7 @@ public func findFreeSlots(
             let gapEnd = min(block.start, dayEndMin)
             while cursor + durationMin <= gapEnd {
                 let hhmm = hhmmFromMin(cursor)
-                out.append(Slot(date: dayIso, label: "\(dayLabelFor(day, today: now)) · \(formatTime(hhmm))", startTime: hhmm))
+                out.append(Slot(date: dayIso, label: "\(dayLabelFor(day, today: now)) · \(clock.time(hhmm))", startTime: hhmm))
                 if out.count >= limit { return out }
                 cursor += step
             }
@@ -125,13 +126,15 @@ public func findFreeSlotsForDate(
     now: Date = Date(),
     limit: Int = 6,
     dayStartMin: Int = 8 * 60,
-    dayEndMin: Int = 18 * 60
+    dayEndMin: Int = 18 * 60,
+    clock: ClockFormat = .device
 ) -> [Slot] {
     let parts = isoDate.split(separator: "-").map { Int($0) }
     guard parts.count == 3, let y = parts[0], let m = parts[1], let d = parts[2] else { return [] }
     let day = Time.civil(y, m, d)
     return findFreeSlots(blocks, durationMin: durationMin, now: now, startDate: day,
-                         daysToScan: 1, dayStartMin: dayStartMin, dayEndMin: dayEndMin, limit: limit)
+                         daysToScan: 1, dayStartMin: dayStartMin, dayEndMin: dayEndMin, limit: limit,
+                         clock: clock)
 }
 
 /// Every block on `date` overlapping the proposed slot, sorted by start.
@@ -157,9 +160,9 @@ public func findConflicts(
     return out.sorted { parseHhmm($0.block.startTime) < parseHhmm($1.block.startTime) }
 }
 
-/// A block's time range for conflict pills, e.g. "9:00 AM–10:00 AM".
-public func blockTimeRange(_ b: CalBlock) -> String {
+/// A block's time range for conflict pills, in the user's clock:
+/// "09:00–10:00" / "9:00–10:00 AM".
+public func blockTimeRange(_ b: CalBlock, clock: ClockFormat = .device) -> String {
     let startMin = parseHhmm(b.startTime)
-    let endMin = startMin + b.durationMinutes
-    return "\(formatTime(hhmmFromMin(startMin)))–\(formatTime(hhmmFromMin(endMin)))"
+    return clock.range(startMinutes: startMin, endMinutes: startMin + b.durationMinutes)
 }

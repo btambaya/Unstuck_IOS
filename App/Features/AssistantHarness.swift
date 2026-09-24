@@ -246,7 +246,8 @@ enum AssistantHarness {
                     // raw 2026-09-05 / 14:00) on the model's FINAL text only —
                     // AFTER the fabrication guard saw the raw claim, never on
                     // the hidden bounce, never on voice (naturalness, 2026-09-06).
-                    if !closing.isEmpty { closing = polishReply(closing) }
+                    // Times read in the phone's own 12/24-hour clock (2026-09-24).
+                    if !closing.isEmpty { closing = polishReply(closing, PolishOptions(clock: .device)) }
                     // The web's five-branch ladder (use-assistant.ts): a
                     // receipt-less write is still a success — never assert
                     // "nothing changed" over one, and never promise a card
