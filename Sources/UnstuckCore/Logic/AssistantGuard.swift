@@ -197,16 +197,50 @@ private func sentenceClaimsAction(_ c: String) -> Bool {
     CLAIM_PATTERNS.contains { $0.test(c) }
 }
 
+// MARK: - the period-review recap (week-review-spec.md §5.4)
+
+// "You finished …" / "you've also completed …": the USER did it — a review of
+// their period, not the assistant claiming an action. Identical on every
+// platform (web receipts.ts, Android AssistantGuard.kt).
+private let USER_SUBJECT = "\\b(?:you|you['’]ve|you have|you['’]d|you had)\\s+(?:(?:also|just|then|only|still|already|even|finally)\\s+)?"
+private let USER_DID = re("\(USER_SUBJECT)(?:\(CLAIM_VERBS))\\b")
+// A verb coordinated with one already neutralised, in the same clause:
+// "you did "Draft" and skipped "Stretch"", "…, then moved on to …".
+private let AND_DID = re("(\\byou did\\b[^.!?;—]*?(?:,|\\band\\b|\\bthen\\b)\\s+(?:(?:also|then)\\s+)?)(?:\(CLAIM_VERBS))\\b")
+
+/// Rewrites user-subject verb phrases to "you did" so the claim patterns see
+/// no verb. Only ever applied on a turn where `get_period_review` returned
+/// `ok:` (the `recap` flag): globally it would wave through a fabricated
+/// write phrased at the user ("you've moved "Dentist" to Friday").
+public func neutraliseUserRecap(_ c: String) -> String {
+    func replaceAll(_ r: NSRegularExpression, _ s: String, _ template: String) -> String {
+        r.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..<s.endIndex, in: s), withTemplate: template)
+    }
+    var s = replaceAll(USER_DID, c, "you did")
+    var prev = ""
+    while prev != s {   // terminates: "did" is not a claim verb
+        prev = s
+        s = replaceAll(AND_DID, s, "$1did")
+    }
+    return s
+}
+
 /// Does a no-tool-call reply read like a claimed COMPLETED action or a
 /// memory promise? ("Done — added 'X'", "the task has been created",
 /// "I'll make a note of that"). Used by BOTH the text loop and the voice
 /// session guard. Deliberately careful: honest answers ABOUT existing state
 /// ("your dentist slot is on Friday") must not trip it, and neither must a
 /// truthful reference to a PREVIOUS turn's action ("I moved it earlier").
-public func looksLikeActionClaim(_ content: String?) -> Bool {
+///
+/// `recap`: this turn's `get_period_review` returned `ok:` — a sentence about
+/// what the USER did ("You finished "Draft chapter 3"") is a review, not a
+/// claim (spec §5.4). Every other turn keeps the guard exactly as before.
+public func looksLikeActionClaim(_ content: String?, recap: Bool = false) -> Bool {
     let whole = (content ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if whole.isEmpty { return false }
     // Only a sentence about THIS turn counts; an earlier-turn recap in the
     // same sentence disqualifies that sentence, not the others.
-    return sentences(whole).contains { !refersToEarlierTurn($0) && sentenceClaimsAction($0) }
+    return sentences(whole).contains {
+        !refersToEarlierTurn($0) && sentenceClaimsAction(recap ? neutraliseUserRecap($0) : $0)
+    }
 }

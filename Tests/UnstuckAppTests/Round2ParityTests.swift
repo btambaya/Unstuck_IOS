@@ -574,6 +574,34 @@ final class FocusAccuracyTests: XCTestCase {
         XCTAssertEqual(row.actualSec, 25 * 60 + AppModel.sharedFocusCapGraceSec, "not 16 hours into Insights")
         XCTAssertEqual(AppModel.displacedClockSession(id: "old", task: t, rawSec: 20 * 60, estimateMin: 25).actualSec,
                        20 * 60, "a real one logs as it is")
+        // The row carries the SESSION's plan (an extended 45), not the task's
+        // default 25 — Insights' D1 cap and calibration read it (P1-13).
+        XCTAssertEqual(AppModel.displacedClockSession(id: "old", task: t, rawSec: 50 * 60, estimateMin: 45).estimateMin, 45)
+    }
+
+    // MARK: analytics — the displaced session's pause length and plan
+
+    /// Starting Focus on B while A is PAUSED ends A's pause: A's reason log is
+    /// re-saved with how long the pause lasted ("What pauses you", "How fast
+    /// you come back" — cross-check P0-3), and A's Session row carries A's
+    /// own plan (estimate + extends), not the task default (P1-13).
+    func testDisplacingAPausedSessionLogsThePauseLengthAndTheSessionsOwnPlan() async throws {
+        let (model, db, store) = try boot()
+        let a = task(newUUID(), estimate: 25)
+        try db.save(a)
+        // Extended to 40 min, 28 min in, paused two minutes ago with a reason.
+        var paused = FocusTimer.pause(running(a.id, sinceMin: 30, estimate: 40), now: nowMs - 120_000)
+        let log = ReasonLog(id: newUUID(), taskId: a.id, reason: "Phone", action: .pause, at: stamp)
+        paused.pendingPauseLog = log
+        try store.set(paused)
+        let sid = try XCTUnwrap(paused.id)
+        model.finalizeDisplacedFocus(forNewTaskId: newUUID())
+        let timed = try await eventually { (try db.fetchById(ReasonLog.self, id: log.id)?.durationSec ?? 0) > 0 }
+        XCTAssertTrue(timed, "the pause's reason log never got its length")
+        XCTAssertEqual(Double(try XCTUnwrap(db.fetchById(ReasonLog.self, id: log.id)?.durationSec)), 120, accuracy: 3)
+        let row = try await eventually { try db.fetchById(UnstuckCore.Session.self, id: sid) != nil }
+        XCTAssertTrue(row)
+        XCTAssertEqual(try db.fetchById(UnstuckCore.Session.self, id: sid)?.estimateMin, 40, "the session's plan, not the task's 25")
     }
 
     /// The assistant's finish_focus caps a session left running — and says

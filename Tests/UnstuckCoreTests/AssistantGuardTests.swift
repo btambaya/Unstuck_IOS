@@ -179,3 +179,57 @@ final class AssistantGuardTests: XCTestCase {
         XCTAssertFalse(looksLikeActionClaim("I can't book that outside your call hours — want 9am tomorrow?"))
     }
 }
+
+/// week-review-spec.md §5.4: the user-subject neutraliser runs ONLY on a turn
+/// where get_period_review returned `ok:` (`recap: true`). The 16 cases, each
+/// checked with and without `recap`, verified against the web receipts.ts.
+final class AssistantGuardRecapTests: XCTestCase {
+    /// A review of what the USER did — a claim today, not one on a review turn.
+    private let reviewSentences = [
+        "You finished \"Draft chapter 3\" and the bank call.",
+        "You skipped \"Stretch\" once on purpose.",
+        "You've also completed \"Tax return\".",
+        "You finished \"Draft chapter 3\" and skipped \"Stretch\" once.",
+        "You finished \"Draft chapter 3\", then moved on to \"Tax return\".",
+    ]
+    /// Real claims by the assistant — claims with or without `recap`.
+    private let claims = [
+        "Completed three tasks last week.",
+        "Added \"Milk\" to Groceries.",
+        "I've added \"Milk\" to your list.",
+        "Moved \"Dentist\" to Friday.",
+        "Done — added it.",
+        "Created \"Email Sarah\" for 2pm.",
+        "The task has been created.",
+        "Scheduled \"Gym\" for Thursday at 6.",
+        "I added \"Milk\".",
+        "You finished \"Draft chapter 3\". I moved \"Tax return\" to Friday.",
+    ]
+
+    func testReviewSentencesPassOnlyOnAReviewTurn() {
+        for s in reviewSentences {
+            XCTAssertFalse(looksLikeActionClaim(s, recap: true), s)
+            XCTAssertTrue(looksLikeActionClaim(s), "without recap the guard is unchanged: \(s)")
+            XCTAssertTrue(looksLikeActionClaim(s, recap: false), s)
+        }
+    }
+
+    func testRealClaimsStillTripWithOrWithoutRecap() {
+        for s in claims {
+            XCTAssertTrue(looksLikeActionClaim(s, recap: true), s)
+            XCTAssertTrue(looksLikeActionClaim(s), s)
+        }
+    }
+
+    func testAFabricatedWritePhrasedAtTheUserStillTripsOffAReviewTurn() {
+        XCTAssertTrue(looksLikeActionClaim("You're all set — you've moved \"Dentist\" to Friday."))
+    }
+
+    func testNeutraliserRewritesCoordinatedVerbsToAFixpoint() {
+        XCTAssertEqual(neutraliseUserRecap("You finished \"Draft chapter 3\" and skipped \"Stretch\" once."),
+                       "you did \"Draft chapter 3\" and did \"Stretch\" once.")
+        XCTAssertEqual(neutraliseUserRecap("You finished \"Draft chapter 3\", then moved on to \"Tax return\"."),
+                       "you did \"Draft chapter 3\", then did on to \"Tax return\".")
+        XCTAssertEqual(neutraliseUserRecap("I added \"Milk\"."), "I added \"Milk\".")
+    }
+}

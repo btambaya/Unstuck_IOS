@@ -982,6 +982,14 @@ final class AppModel {
            let t = (try? taskRepo?.fetch(id: "t-proposal")) ?? nil {
             router.beginFocus(t)
         }
+        // Debug hook: open Insights on launch (screenshots of the analytics
+        // cards); UITEST_INSIGHTS_RICH adds a repeating series, a planned
+        // week and a long-waiting task done this week so every card shows.
+        if ProcessInfo.processInfo.environment["UITEST_INSIGHTS"] == "1" {
+            if ProcessInfo.processInfo.environment["UITEST_INSIGHTS_RICH"] == "1" { DemoSeed.seedInsightsExtras(database) }
+            UserDefaults.standard.set(ProcessInfo.processInfo.environment["UITEST_INSIGHTS_DEEP"] == "1", forKey: "insights.deepDive")
+            router.present(.insights)
+        }
         // Debug hook: replay the tester-reported BULK calendar turn through the
         // real assistant (scripted transport, no network) — crash isolation.
         // Debug hook: a canned one-line reply (no network, no LLM) so a UI walk
@@ -3134,14 +3142,17 @@ final class AppModel {
         return ok
     }
 
+    // `write` (the coordinator's, else the UI-test write-through) like every
+    // other writer, so the in-memory UI-test store records sessions and pause
+    // lengths too — Insights reads both.
     func saveSession(_ session: Session) {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         let now = Self.isoNow()
         Task { try? await write.upsertSession(session, nowISO: now) }
     }
 
     func saveReasonLog(_ log: ReasonLog) {
-        guard let write = coordinator?.write else { return }
+        guard let write else { return }
         let now = Self.isoNow()
         Task { try? await write.upsertReasonLog(log, nowISO: now) }
     }

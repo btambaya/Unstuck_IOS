@@ -107,6 +107,15 @@ struct VoiceIntegrityGuard: Sendable {
     /// (`correctiveResponse`) out of a reply that had nothing to do.
     var nextResponseExempt = false
     private var exempt = false
+    /// get_period_review returned ok: since the user last spoke — the spoken
+    /// review ("you finished the chapter draft…") is a later response than
+    /// the one that carried the call, so a per-response flag isn't enough.
+    /// Cleared when the app answers the user's NEXT turn (week-review-spec.md
+    /// §5.4) — not on a raw `speech_started`, which on the loudspeaker also
+    /// fires for the echo of the review itself and would re-arm the guard
+    /// against the very reply it was cleared for (a corrective there forces
+    /// a tool call, `tool_choice: required`).
+    var periodReviewed = false
 
     /// The corrective injected as a hidden user item (verbatim from the web).
     static let correctiveText = "(integrity check from the app, not the user: you said you did or would do something, but no tool ran — nothing happened. Call the right tool NOW, with sensible defaults for anything you were not told (a call label can be a few words, a call time is context.now plus what they said); do not ask again what you already asked. Then say in a few words what the result was — no apology, no explanation.)"
@@ -134,7 +143,12 @@ struct VoiceIntegrityGuard: Sendable {
     mutating func toolDispatched(_ name: String) { if Self.counts(name) { toolCalled = true } }
     mutating func toolFinished(_ name: String, result: String) {
         nextResponseToolBacked = result.hasPrefix("ok:") && Self.counts(name)
+        if name == "get_period_review" && result.hasPrefix("ok:") { periodReviewed = true }
     }
+    /// The app is answering a new USER turn (the barge-in controller's
+    /// `.createResponse` after a real turn, or push-to-talk's release): an
+    /// earlier review no longer vouches. Echo and coughs never get here.
+    mutating func userTurnAnswered() { periodReviewed = false }
     /// A cancelled/incomplete response (barge-in) is not a claim.
     mutating func responseCancelled() { wasCorrection = false }
 
@@ -143,7 +157,7 @@ struct VoiceIntegrityGuard: Sendable {
         if exempt { exempt = false; return false }
         if wasCorrection { wasCorrection = false; return false }
         if toolCalled || correctionsLeft <= 0 { return false }
-        if !looksLikeActionClaim(transcript) { return false }
+        if !looksLikeActionClaim(transcript, recap: periodReviewed) { return false }
         correctionsLeft -= 1
         wasCorrection = true
         return true
@@ -929,8 +943,13 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 voiceLog.notice("voice truncate at \(cut.audioEndMs, privacy: .public) ms of \((heard?.receivedFrames ?? 0) * 1000 / AudioTruncation.sampleRate, privacy: .public) ms")
                 send(cut.event(id: Self.truncateEventPrefix + String(n)))
             case .deleteItem(let id): send(["type": "conversation.item.delete", "item_id": id])
-            case .createResponse: send(["type": "response.create"])
+            case .createResponse:
+                // Only ever a user turn's answer (tryAsk): tool continuations,
+                // correctives and the opening go out as `.clientCreate`.
+                withLock { _guard.userTurnAnswered() }
+                send(["type": "response.create"])
             case .commitAndRespond:
+                withLock { _guard.userTurnAnswered() }
                 send(["type": "input_audio_buffer.commit"])
                 send(["type": "response.create"])
             case .startConfirmTimer(let ms):

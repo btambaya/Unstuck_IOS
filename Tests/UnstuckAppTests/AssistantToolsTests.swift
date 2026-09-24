@@ -87,6 +87,9 @@ final class FakeAssistantState: AssistantAppState {
     }
 
     func getTasks() -> [TaskItem] { tasks }
+    /// The last cal_blocks read hit the row cap (get_period_review's note).
+    var blocksTruncated = false
+    func calBlocksMayBeTruncated() async -> Bool { blocksTruncated }
     func getBlocks() -> [CalBlock] { blocks }
     func getCollections() -> [ItemCollection] { collections }
     func getAreas() -> [String] { areas.map(\.name) }
@@ -794,6 +797,73 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertFalse(wed.contains("note: this is the CURRENT week"), wed)
         let month = await run("get_insights", #"{"window":"month"}"#)
         XCTAssertFalse(month.contains("note: this is the CURRENT week"), month)
+    }
+
+    /// week-review-spec.md §5.3: the early-week note now points at
+    /// get_period_review — with the fallback for a server that doesn't offer it.
+    func testGetInsightsEarlyWeekNotePointsAtThePeriodReviewWithAFallback() async {
+        api.today = "2026-09-22"                                   // a Tuesday
+        let r = await run("get_insights", #"{"window":"week"}"#)
+        XCTAssertTrue(r.hasSuffix("note: this is the CURRENT week, two days so far — it says nothing about last week. If they asked about last week, call get_period_review with period=last_week — or, if you don't have that tool, say this window can't show last week and offer the month (window: month)."), r)
+        XCTAssertFalse(r.contains("no last-week window"))
+    }
+
+    // MARK: get_period_review (week-review-spec.md) — the shared vectors run in UnstuckCoreTests
+
+    func testPeriodReviewReadsTheStoreAndCountsWhatWasDone() async {
+        var report = task("t_rep", "Quarterly report")
+        report.done = true
+        report.completedAt = "\(YESTERDAY)T11:00:00"              // zone-less = local wall clock
+        report.lifeArea = "Work"
+        var open = task("t_open", "Tax return")
+        open.createdAt = "\(YESTERDAY)T09:00:00"
+        api.tasks = [report, open]
+        api.sessions = [UnstuckCore.Session(id: "s1", taskId: "t_rep", taskName: "Quarterly report", estimateMin: 30,
+                                            actualSec: 1500, completedAt: "\(YESTERDAY)T10:55:00"),
+                        // an accidental 20-second start never counts (D1)
+                        UnstuckCore.Session(id: "s2", taskId: "t_rep", taskName: "Quarterly report", estimateMin: 30,
+                                            actualSec: 20, completedAt: "\(YESTERDAY)T10:56:00")]
+        let r = await run("get_period_review", #"{"period":"dates","from":"\#(YESTERDAY)"}"#)
+        XCTAssertTrue(r.hasPrefix("ok: review of "), r)
+        XCTAssertTrue(r.contains("\nDone: 1 task — \"Quarterly report\".\n"), r)
+        XCTAssertTrue(r.contains("\nFocus: 1 session, 25m on \"Quarterly report\".\n"), r)
+        XCTAssertTrue(r.contains("\nAlso: added 1 task.\n"), r)
+        XCTAssertTrue(r.contains("\nBy area: Work 1.\n"), r)
+        XCTAssertFalse(r.contains("note:"), r)
+        XCTAssertEqual(READ_ONLY_TOOLS.contains("get_period_review"), true, "a review never disarms the write guard")
+    }
+
+    func testPeriodReviewErrorsAndTheCalendarSlotNote() async {
+        await eq("get_period_review", "{}", "error: period required — today, yesterday, this_week, last_week, this_month, last_month, week_of (with date), month_of (with date), or dates (with from and to)")
+        await eq("get_period_review", #"{"period":"week_of"}"#, "error: period=week_of needs date (YYYY-MM-DD)")
+        // A non-string argument counts as absent (spec §3.2).
+        await eq("get_period_review", #"{"period":7}"#, "error: period required — today, yesterday, this_week, last_week, this_month, last_month, week_of (with date), month_of (with date), or dates (with from and to)")
+        api.blocksTruncated = true
+        let r = await run("get_period_review", #"{"period":"last_week"}"#)
+        XCTAssertTrue(r.hasPrefix("ok: review of last week ("), r)
+        XCTAssertTrue(r.hasSuffix("note: this device may be missing some calendar slots (over the 1,000-slot sync limit) — repeating check-offs and plan numbers may be low."), r)
+    }
+
+    /// §6 (f): toolCaps rides on the TEXT request only — never in the context
+    /// the voice instructions serialise (or the tour's).
+    func testToolCapsGoOnTheTextRequestOnly() {
+        XCTAssertEqual(ToolRegistry.caps, ["period_review"])
+        let text = textRequestContext(api)
+        XCTAssertEqual(text["toolCaps"], .array([.string("period_review")]))
+        XCTAssertNil(buildAssistantContext(api)["toolCaps"])
+        XCTAssertFalse(buildVoiceInstructions(api).contains("toolCaps"))
+        XCTAssertFalse(buildVoiceInstructions(api).contains("period_review\""))
+    }
+
+    /// §5.2: the voice rule, verbatim, right after the read-before-answer line
+    /// (whose "the week" now says "what is planned for the week", §5.1c).
+    func testVoiceInstructionsCarryThePeriodReviewRule() {
+        let v = buildVoiceInstructions(api)
+        for s in ["call get_period_review first", "Follow any note in the result", "never that the week was empty",
+                  "Before answering what is in a list / the inbox / what is planned for the week, or acting on an item, call get_lists / get_captures / get_schedule / get_tasks / find_tasks. HOW DID IT GO: \"how has my week been\""] {
+            XCTAssertTrue(v.contains(s), s)
+        }
+        XCTAssertTrue(v.contains("Numbers and names only from the result; if nothing was logged, say so — never that the week was empty. "))
     }
 
     func testGetTasksViewsAreDistinctAndFiltersNarrow() async {

@@ -389,6 +389,13 @@ extension AppModel {
         next.sessionStart = sessionStart
         next.paused = inc.paused
         next.pausedAt = inc.pausedAtMs
+        if wasPaused != inc.paused {
+            // The partner resumed (or re-paused) the shared clock: my pause
+            // ended with it — its reason log gets how long it lasted (P0-3),
+            // and a stale one never rides into the next pause.
+            if wasPaused, let closed = FocusTimer.closedPauseLog(cur, now: now) { saveReasonLog(closed) }
+            next.pendingPauseLog = nil
+        }
         next.sessionEstimateMin = inc.estimateMin
         next.lastAppliedRev = inc.rev
         next.lastAppliedAtMs = inc.atMs
@@ -550,7 +557,7 @@ extension AppModel {
         var taskName = "your shared task"
         if !isRecipient, let task = (try? taskRepo?.fetch(id: taskId)) ?? nil {
             saveSession(Session(id: sessionId, taskId: task.id, taskName: task.name,
-                                estimateMin: task.estimateMin, actualSec: elapsed,
+                                estimateMin: estimate, actualSec: elapsed,   // the session's plan (P1-13)
                                 completedAt: Self.isoNow()))
             taskName = task.name
         } else if let title = _shareState?.sharedWithMe.first(where: { $0.taskId == taskId })?.title {
@@ -638,7 +645,7 @@ extension AppModel {
     /// CAPPED elapsed like its ledger write: a clock left running overnight
     /// logged its whole night into Insights (audit 2026-09-22, C43).
     static func displacedClockSession(id: String, task: TaskItem, rawSec: Int, estimateMin: Int) -> Session {
-        Session(id: id, taskId: task.id, taskName: task.name, estimateMin: task.estimateMin,
+        Session(id: id, taskId: task.id, taskName: task.name, estimateMin: estimateMin,   // the session's plan (P1-13)
                 actualSec: cappedSharedElapsedSec(rawSec: rawSec, estimateMin: estimateMin),
                 completedAt: isoNow())
     }

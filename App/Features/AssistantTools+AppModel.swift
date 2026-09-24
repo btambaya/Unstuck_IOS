@@ -24,6 +24,9 @@ final class AppModelAssistantState: AssistantAppState {
     // MARK: reads
 
     func getTasks() -> [TaskItem] { (try? model.taskRepo?.all()) ?? [] }
+    func calBlocksMayBeTruncated() async -> Bool {
+        await model.coordinator?.lastCalBlocksPull()?.mayBeTruncated == true
+    }
     func getBlocks() -> [CalBlock] { (try? model.db?.fetchAllCalBlocks()) ?? [] }
     func getCollections() -> [ItemCollection] { (try? model.db?.fetchAllCollections()) ?? [] }
     func getAreaRows() -> [LifeArea] { ((try? model.db?.fetchAllLifeAreas()) ?? []).sorted { $0.sortOrder < $1.sortOrder } }
@@ -308,8 +311,9 @@ final class AppModelAssistantState: AssistantAppState {
         let task = (try? model.taskRepo?.fetch(id: cur.taskId)) ?? nil
         let name = task?.name ?? "Focus session"
         let session = Session(id: cur.id ?? newUUID(), taskId: cur.taskId, taskName: name,
-                              estimateMin: task?.estimateMin ?? cur.sessionEstimateMin, actualSec: elapsed,
+                              estimateMin: cur.sessionEstimateMin, actualSec: elapsed,
                               completedAt: AppModel.isoNow())
+        if let closed = FocusTimer.closedPauseLog(cur, now: now) { model.saveReasonLog(closed) }   // a pause ends here too
         do { try store.set(FocusTimer.done(cur)) } catch { return nil }
         model.refreshLiveSession()
         LiveActivityController.shared.end()

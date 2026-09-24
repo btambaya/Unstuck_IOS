@@ -102,6 +102,32 @@ enum DemoSeed {
     }
 }
 
+extension DemoSeed {
+    /// UITEST_INSIGHTS_RICH: a daily "Stretch" series across this week and
+    /// last (done / skipped / open), a planned-but-open task from last week,
+    /// and a task that waited three weeks done this week — so Plan vs followed
+    /// through, the repeating rhythm and Got unstuck all have something to show.
+    static func seedInsightsExtras(_ db: AppDatabase) {
+        let now = iso(0)
+        let today = Clock.todayISO()
+        try? db.save(TaskItem(id: "t-stretch", name: "Stretch", estimateMin: 10, lifeArea: "Health",
+                              recurrence: .daily(until: nil), createdAt: iso(-30 * 86_400), updatedAt: now))
+        for k in 0..<10 {
+            let date = LocalDate.addDays(today, -k)
+            let done = k != 3 && k != 6 && k > 0
+            try? db.save(CalBlock(id: "occ-\(k)", taskId: "t-stretch", taskName: "Stretch", startTime: "07:30",
+                                  durationMinutes: 10, date: date, kind: .task, done: done, skipped: k == 6,
+                                  completedAt: done ? iso(-Double(k) * 86_400) : nil))
+        }
+        try? db.save(TaskItem(id: "t-tax", name: "File the tax return", estimateMin: 60, lifeArea: "Personal",
+                              moveCount: 2, createdAt: iso(-40 * 86_400), updatedAt: now))
+        try? db.save(CalBlock(id: "blk-tax", taskId: "t-tax", taskName: "File the tax return", startTime: "10:00",
+                              durationMinutes: 60, date: LocalDate.addDays(today, -2), kind: .task))
+        try? db.save(TaskItem(id: "t-garage", name: "Clear out the garage", estimateMin: 90, done: true, lifeArea: "Personal",
+                              moveCount: 3, completedAt: iso(-3_000), createdAt: iso(-21 * 86_400), updatedAt: now))
+    }
+}
+
 // MARK: - bulk-turn repro (UITEST_ASSISTANT_BULK)
 //
 // Testers report the app dying "after being asked to add a lot of items to the

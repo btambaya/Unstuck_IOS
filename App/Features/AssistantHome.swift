@@ -56,7 +56,8 @@ func buildAssistantContext(_ model: AppModel, now: Date = Date()) -> AssistantCo
         : nil
 
     // The same usable-time math the web's right-rail TimeRemaining panel shows.
-    let usable = usableToday(blocks: blocks, todayIso: todayIso)
+    let usable = usableToday(blocks: blocks, todayIso: todayIso,
+                             doneTaskIds: Set(tasks.filter(\.done).map(\.id)))
     let usableLabel = usable.usableMins > 0 ? fmtHrs(usable.usableMins) : nil
     let openTodayCount = blocks.filter { $0.date == todayIso && !$0.done && !$0.skipped }.count
 

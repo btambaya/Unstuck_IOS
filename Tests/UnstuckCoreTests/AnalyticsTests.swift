@@ -30,6 +30,19 @@ final class WeekdayAreaHoursTests: XCTestCase {
         XCTAssertEqual(out[1].data[0], 1)     // Tue, Work
         XCTAssertEqual(out[2].data[1], 0.5)   // Wed, Personal
     }
+
+    func testTasklessNoAreaAndUnknownAreaSessionsLandInTheTrailingNoAreaSlot() {
+        let tasks = [mkTask(id: "t1", lifeArea: "Errands"), mkTask(id: "t2"), mkTask(id: "t3", lifeArea: "Gone")]
+        let sessions = [
+            sess("s1", taskId: "t1", actualSec: 3600, completedAt: "2026-05-19T10:00:00.000Z"),   // Tue, Errands
+            sess("s2", taskId: "t2", actualSec: 1800, completedAt: "2026-05-19T11:00:00.000Z"),   // no area
+            sess("s3", taskId: nil, actualSec: 1800, completedAt: "2026-05-19T12:00:00.000Z"),    // no task
+            sess("s4", taskId: "t3", actualSec: 3600, completedAt: "2026-05-19T13:00:00.000Z"),   // area not the user's
+        ]
+        let out = weekdayAreaHours(sessions, tasks, areas: ["Errands", "Work"])
+        XCTAssertEqual(out[1].data, [1, 0, 2])
+        XCTAssertEqual(out.map { $0.data.count }, Array(repeating: 3, count: 7))
+    }
 }
 
 final class CalibrationTests: XCTestCase {
@@ -141,7 +154,31 @@ final class HistogramDegenerateBinTests: XCTestCase {
     }
 }
 
+final class PauseLengthBinsTests: XCTestCase {
+    func testBinsTimedPausesAndCollectsLongOnesInTheLastBin() {
+        let logs = [
+            ReasonLog(id: "1", reason: "Phone", action: .pause, at: "2026-05-21T10:00:00.000Z", durationSec: 90),
+            ReasonLog(id: "2", reason: "Phone", action: .pause, at: "2026-05-21T10:00:00.000Z", durationSec: 299),
+            ReasonLog(id: "3", reason: "Snack", action: .pause, at: "2026-05-21T10:00:00.000Z", durationSec: 300),
+            ReasonLog(id: "4", reason: "Tired", action: .pause, at: "2026-05-21T10:00:00.000Z", durationSec: 3 * 3600),
+            ReasonLog(id: "5", reason: "Other", action: .pause, at: "2026-05-21T10:00:00.000Z"),   // untimed
+        ]
+        XCTAssertEqual(pauseLengthBins(logs), [2, 1, 0, 0, 0, 0, 1])
+        XCTAssertEqual(pauseLengthBins([], binCount: 0), [])
+    }
+}
+
 final class SlippingTests: XCTestCase {
+    func testSkipsRepeatingTemplatesAndLaterTasksAndDoesNotCap() {
+        var template = mkTask(id: "r", name: "Stretch", moveCount: 9)
+        template.recurrence = .daily(until: nil)
+        let parked = mkTask(id: "l", name: "Someday", moveCount: 9, later: true)
+        let real = (0..<8).map { mkTask(id: "t\($0)", name: "Chore \($0)", moveCount: 3) }
+        let out = slipping([template, parked] + real)
+        XCTAssertEqual(out.count, 8)
+        XCTAssertEqual(out.map(\.name), (0..<8).map { "Chore \($0)" })   // ties → name order
+    }
+
     func testFlagsOlderThan21Days() {
         let now = Date().timeIntervalSince1970 * 1000
         let old = iso(now - 30 * DAY_MS)
@@ -169,10 +206,8 @@ final class CaptureBreakdownTests: XCTestCase {
     }
 }
 
-final class TimeOfDayHeatmapTests: XCTestCase {
-    // timeOfDayHeatmap buckets sessions by LOCAL hour-of-day, so the UTC fixture
-    // timestamps below only land in the expected hour bucket when local == UTC.
-    // Pin the process default to UTC rather than relying on an external `TZ=UTC`.
+final class FocusHourGridTests: XCTestCase {
+    // Buckets by LOCAL weekday + hour; pin the zone so the UTC fixtures line up.
     private var savedTimeZone: TimeZone!
 
     override func setUp() {
@@ -186,14 +221,25 @@ final class TimeOfDayHeatmapTests: XCTestCase {
         super.tearDown()
     }
 
-    func testSkipsWeekendsAndClamps() {
+    func testSpreadsEachSessionOverTheHoursItRanIncludingWeekendsAndNights() {
         let sessions = [
-            sess("s1", taskId: "t", actualSec: 3600, completedAt: "2026-05-23T10:00:00.000Z"), // Sat — skipped
-            sess("s2", taskId: "t", actualSec: 1800, completedAt: "2026-05-19T08:00:00.000Z"), // Tue 8am bucket 0
+            sess("sat", taskId: "t", actualSec: 3600, completedAt: "2026-05-23T10:00:00.000Z"),          // Sat 09–10
+            sess("eve", taskId: "t", actualSec: 100 * 60, completedAt: "2026-05-19T23:10:00.000Z"),     // Tue 21:30–23:10
+            sess("mid", taskId: "t", actualSec: 30 * 60, completedAt: "2026-05-20T00:15:00.000Z"),      // Tue 23:45 → Wed 00:15
         ]
-        let grid = timeOfDayHeatmap(sessions)
-        XCTAssertEqual(grid[1][0], 0.5)
-        XCTAssertEqual(grid.count, 5)
+        let grid = focusHourGrid(sessions)
+        XCTAssertEqual(grid.count, 7)
+        XCTAssertEqual(grid[0].count, 24)
+        XCTAssertEqual(grid[5][9], 60)       // Saturday counts
+        XCTAssertEqual(grid[1][21], 30)
+        XCTAssertEqual(grid[1][22], 60)
+        XCTAssertEqual(grid[1][23], 10 + 15)
+        XCTAssertEqual(grid[2][0], 15)       // crosses midnight into Wednesday
+        XCTAssertEqual(grid.flatMap { $0 }.reduce(0, +), 190)
+        let peak = peakFocusHour(grid)
+        XCTAssertEqual(peak?.day, 1)
+        XCTAssertEqual(peak?.hour, 22)
+        XCTAssertNil(peakFocusHour(focusHourGrid([])))
     }
 }
 

@@ -29,8 +29,15 @@ public func fmtHrs(_ mins: Int) -> String {
     return "\(h)h \(m)m"
 }
 
-public func usableToday(blocks: [CalBlock], todayIso: String = Clock.todayISO()) -> UsableToday {
-    let today = blocks.filter { $0.date == todayIso }
+/// Today's usable time. A block that is already done or skipped isn't time
+/// still to use (a skipped 30-min slot read "30m usable"; cross-check P0-10):
+/// occurrence blocks carry their own `done`/`skipped`, and a plain task's
+/// done-ness lives on the task, so the caller passes `doneTaskIds`.
+public func usableToday(blocks: [CalBlock], todayIso: String = Clock.todayISO(),
+                        doneTaskIds: Set<String> = []) -> UsableToday {
+    let today = blocks.filter {
+        $0.date == todayIso && !$0.done && !$0.skipped && !doneTaskIds.contains($0.taskId ?? "")
+    }
     func total(_ predicate: (CalBlock) -> Bool) -> Int {
         today.filter(predicate).reduce(0) { $0 + $1.durationMinutes }
     }

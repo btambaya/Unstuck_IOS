@@ -171,6 +171,10 @@ enum AssistantHarness {
         var stagedShare = false
         // The last screen a navigation opened — its own kind of empty reply.
         var navigatedTo: String?
+        // get_period_review returned ok: this user turn — a reply recapping
+        // what the USER did ("You finished …") is a review, not a claim
+        // (week-review-spec.md §5.4). Every other turn keeps the guard as is.
+        var periodReviewed = false
 
         for i in 0..<maxIterations {
             if deps.isCancelled() { return .cancelled }
@@ -198,7 +202,8 @@ enum AssistantHarness {
             case .ok(let reply):
                 let content = reply.content ?? ""
                 // FABRICATION GUARD (a stable qwen failure mode, 2026-08-29).
-                if reply.toolCalls.isEmpty && !corrected && !writeToolSucceeded && looksLikeActionClaim(content) {
+                if reply.toolCalls.isEmpty && !corrected && !writeToolSucceeded
+                    && looksLikeActionClaim(content, recap: periodReviewed) {
                     corrected = true
                     working.append(AssistantTurn(ChatMessage(role: "assistant", content: content), hidden: true))
                     working.append(AssistantTurn(ChatMessage(role: "user", content: correctiveText), hidden: true))
@@ -270,6 +275,7 @@ enum AssistantHarness {
                     var result = await runAssistantTool(name: call.function.name, args: args, api: deps.api, scratch: deps.scratch)
                     CrashBreadcrumbs.drop("tool.done \(call.function.name) \(result.hasPrefix("error") ? "err" : "ok")")
                     if result.hasPrefix("ok:") {
+                        if call.function.name == "get_period_review" { periodReviewed = true }
                         if NAVIGATION_TOOLS.contains(call.function.name) {
                             let screen = result.dropFirst("ok:".count).trimmingCharacters(in: .whitespaces)
                                 .replacingOccurrences(of: "opened ", with: "", options: .anchored)

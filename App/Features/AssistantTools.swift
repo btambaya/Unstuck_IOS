@@ -44,6 +44,9 @@ struct TaskShareInfo: Equatable, Sendable {
 protocol AssistantAppState: AnyObject {
     // ── reads ──
     func getTasks() -> [TaskItem]
+    /// A requirement (not only an extension method) so the AppModel state's
+    /// answer is dispatched dynamically; the extension supplies `false`.
+    func calBlocksMayBeTruncated() async -> Bool
     func getBlocks() -> [CalBlock]
     func getCollections() -> [ItemCollection]
     func getAreas() -> [String]
@@ -187,6 +190,10 @@ protocol AssistantAppState: AnyObject {
 extension AssistantAppState {
     func interviewPending() -> Bool { !InterviewMachine.isDone() }
     func markInterviewDone() { InterviewMachine.markDone() }
+    /// The last cal_blocks read hit PostgREST's 1,000-row cap, so the store
+    /// may be missing slots (get_period_review adds a note). Default false so
+    /// every fake keeps compiling; the AppModel state asks the coordinator.
+    func calBlocksMayBeTruncated() async -> Bool { false }
 }
 
 /// What `finish_focus` landed — enough for the result line.
@@ -258,6 +265,14 @@ struct ToolArgs {
     var isEmpty: Bool { raw.isEmpty }
     func has(_ k: String) -> Bool { raw[k] != nil }
     func isNull(_ k: String) -> Bool { if case .null? = raw[k] { return true }; return false }
+
+    /// The argument exactly as sent when it is a string (untrimmed, blank
+    /// kept); nil for anything else. `get_period_review` trims with the
+    /// spec's own whitespace set (week-review-spec.md §3.2).
+    func rawString(_ k: String) -> String? {
+        if case .string(let v)? = raw[k] { return v }
+        return nil
+    }
 
     func str(_ k: String) -> String? {
         if case .string(let v)? = raw[k] {

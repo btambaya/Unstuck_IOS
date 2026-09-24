@@ -2,6 +2,10 @@
 // collections. Port of lib/analytics.ts. Swift Charts views (the iOS
 // Report + DeepDive) consume these; each chart decides whether it has
 // enough data to show real numbers vs. an empty state.
+//
+// Callers pass sessions through `countableSessions` (PeriodFacts.swift, the
+// D1 filter) first, so a forgotten timer or an accidental 5-second start
+// never reaches a chart.
 
 import Foundation
 
@@ -15,7 +19,6 @@ private let HOUR: Double = 3600
 private func parseDate(_ iso: String) -> Date? {
     Time.parseMillis(iso).map { Date(timeIntervalSince1970: $0 / 1000) }
 }
-private func hourOf(_ d: Date) -> Int { Time.calendar.component(.hour, from: d) }
 
 /// Monday-anchored weekday index: Mon=0 … Sun=6.
 public func dayOfWeekIdx(_ d: Date) -> Int {
@@ -31,15 +34,21 @@ public struct StackedBar: Equatable, Sendable {
 private let DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 public let DEFAULT_AREAS = ["Work", "Personal", "Home", "Health", "Volunteering"]
 
+/// Label of the trailing "unassigned" series in `weekdayAreaHours`.
+public let NO_AREA_LABEL = "No area"
+
+/// Focus hours per weekday (Mon…Sun) × area. `data` holds one slot per name
+/// in `areas` (the user's OWN life areas, in their order) PLUS one trailing
+/// "No area" slot for sessions with no task, a task with no area, or an area
+/// that no longer exists — those were silently dropped before (≈42% of prod
+/// focus time; analytics cross-check P0-5).
 public func weekdayAreaHours(_ sessions: [Session], _ tasks: [TaskItem], areas: [String] = DEFAULT_AREAS) -> [StackedBar] {
-    // Unassigned tasks (lifeArea == nil) drop out entirely — never
-    // coerced to 'Work'.
     var taskArea: [String: String] = [:]
     for t in tasks where t.lifeArea != nil { taskArea[t.id] = t.lifeArea }
-    var out = DAY_LABELS.map { StackedBar(d: $0, data: areas.map { _ in 0 }) }
+    var out = DAY_LABELS.map { StackedBar(d: $0, data: Array(repeating: 0, count: areas.count + 1)) }
     for s in sessions {
-        guard let taskId = s.taskId, let area = taskArea[taskId],
-              let ai = areas.firstIndex(of: area), let d = parseDate(s.completedAt) else { continue }
+        guard let d = parseDate(s.completedAt) else { continue }
+        let ai = s.taskId.flatMap { taskArea[$0] }.flatMap { areas.firstIndex(of: $0) } ?? areas.count
         out[dayOfWeekIdx(d)].data[ai] += Double(s.actualSec) / HOUR
     }
     return out
@@ -94,21 +103,45 @@ public func interruptionBins(_ captures: [Capture], _ sessions: [Session], binMi
     return bins
 }
 
-// MARK: H4 — time-of-day heatmap (5 weekdays × 6 two-hour buckets from 7am)
+// MARK: H4 — hour × day heatmap (7 days × 24 hours, by the hours a session spanned)
 
 public typealias Heatmap = [[Double]]
 
-public func timeOfDayHeatmap(_ sessions: [Session]) -> Heatmap {
-    var grid: Heatmap = Array(repeating: Array(repeating: 0, count: 6), count: 5)
-    for s in sessions {
-        guard let d = parseDate(s.completedAt) else { continue }
-        let dow = dayOfWeekIdx(d)
-        if dow > 4 { continue }
-        let bucket = Int((Double(hourOf(d) - 7) / 2).rounded(.down))
-        if bucket < 0 || bucket > 5 { continue }
-        grid[dow][bucket] += Double(s.actualSec) / HOUR
+/// Focus MINUTES per local weekday (rows Mon…Sun) × hour of day (0…23),
+/// spread over the hours each session actually ran: it ended at
+/// `completedAt` and started `actualSec` earlier, so 21:30–23:10 puts 30 min
+/// in 21h, 60 in 22h and 10 in 23h. Every day and every hour counts —
+/// weekends, evenings and night owls included (the old Mon–Fri 07–19 grid by
+/// END hour showed 20% of prod focus; cross-check P0-2).
+public func focusHourGrid(_ sessions: [Session]) -> Heatmap {
+    var grid: Heatmap = Array(repeating: Array(repeating: 0, count: 24), count: 7)
+    let cal = Time.calendar
+    for s in sessions where s.actualSec > 0 {
+        guard let endMs = Time.parseMillis(s.completedAt) else { continue }
+        let end = Date(timeIntervalSince1970: endMs / 1000)
+        var t = end.addingTimeInterval(-Double(s.actualSec))
+        var guardSteps = 0
+        while t < end, guardSteps < 48 {
+            guardSteps += 1
+            let hourEnd = cal.dateInterval(of: .hour, for: t)?.end ?? end
+            let segEnd = min(hourEnd, end)
+            let c = cal.dateComponents([.weekday, .hour], from: t)
+            let row = ((c.weekday ?? 1) + 5) % 7          // 1=Sun…7=Sat → Mon=0…Sun=6
+            grid[row][min(max(c.hour ?? 0, 0), 23)] += segEnd.timeIntervalSince(t) / 60
+            if segEnd <= t { break }
+            t = segEnd
+        }
     }
     return grid
+}
+
+/// The busiest (weekday, hour) cell of `focusHourGrid`, or nil when empty.
+public func peakFocusHour(_ grid: Heatmap) -> (day: Int, hour: Int, minutes: Double)? {
+    var best: (day: Int, hour: Int, minutes: Double)? = nil
+    for (d, row) in grid.enumerated() {
+        for (h, m) in row.enumerated() where m > (best?.minutes ?? 0) { best = (d, h, m) }
+    }
+    return best
 }
 
 // MARK: H5 — pause anatomy
@@ -138,7 +171,24 @@ public func pauseAnatomy(_ reasonLogs: [ReasonLog]) -> [PauseBar] {
         .map { $0 }
 }
 
-// MARK: H6 — re-entry distribution
+// MARK: H6 — how fast you come back (pause → resume)
+
+/// Pause lengths (reason logs with a `durationSec`, written on resume) in
+/// `binMin`-minute bins; the last bin collects everything longer. Replaces
+/// the old re-entry chart, which measured the DAYS between two sessions on
+/// the same task (cross-check P0-6, decision D5).
+public func pauseLengthBins(_ reasonLogs: [ReasonLog], binMin: Int = 5, binCount: Int = 7) -> [Int] {
+    let binMin = max(1, binMin)
+    guard binCount >= 1 else { return [] }
+    var bins = Array(repeating: 0, count: binCount)
+    for r in reasonLogs {
+        guard let sec = r.durationSec, sec > 0 else { continue }
+        bins[min(binCount - 1, sec / (binMin * 60))] += 1
+    }
+    return bins
+}
+
+// MARK: re-entry distribution (days-between-sessions; no longer shown)
 
 public func reEntryDistribution(_ sessions: [Session], binMin: Int = 5, binCount: Int = 12) -> [Int] {
     // Degenerate-arg guards (see interruptionBins): avoid divide-by-zero on a
@@ -173,20 +223,25 @@ public struct SlipRow: Equatable, Sendable {
     public let moveCount: Int
 }
 
+/// Open one-off tasks that have waited 21+ days or been moved 3+ times.
+/// Repeating templates (their age is the series', and moving one day bumps
+/// the template's count) and Later tasks (parked on purpose) are not slips.
+/// Returns the FULL list — the card shows the true count, lists cap at display.
 public func slipping(_ tasks: [TaskItem], now: EpochMillis = Date().timeIntervalSince1970 * 1000) -> [SlipRow] {
     var out: [SlipRow] = []
     for t in tasks {
-        if t.done { continue }
+        if t.done || t.recurrence != nil || t.later == true { continue }
         let ageDays: Double = Time.parseMillis(t.createdAt).map { (now - $0) / (24 * 60 * 60 * 1000) } ?? 0
         let moves = t.moveCount ?? 0
         if ageDays >= 21 || moves >= 3 {
             out.append(SlipRow(name: t.name, weeks: max(0, Int((ageDays / 7).rounded(.down))), moveCount: moves))
         }
     }
-    return out
-        .sorted { ($0.moveCount, $0.weeks) > ($1.moveCount, $1.weeks) }
-        .prefix(6)
-        .map { $0 }
+    return out.sorted {
+        ($0.moveCount, $0.weeks) != ($1.moveCount, $1.weeks)
+            ? ($0.moveCount, $0.weeks) > ($1.moveCount, $1.weeks)
+            : utf16Less($0.name, $1.name)
+    }
 }
 
 // MARK: capture flow breakdown
@@ -202,6 +257,10 @@ public func captureBreakdown(_ captures: [Capture]) -> [CaptureTag: Int] {
 public struct Insight: Equatable, Sendable {
     public let title: String
     public let sub: String
+    public init(title: String, sub: String) {
+        self.title = title
+        self.sub = sub
+    }
 }
 
 private let WEEKDAY_NAMES = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"]

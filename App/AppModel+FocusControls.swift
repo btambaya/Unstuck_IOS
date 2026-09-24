@@ -118,7 +118,7 @@ extension AppModel {
             return nil
         }
         saveSession(Session(id: sessionId, taskId: task.id, taskName: task.name,
-                            estimateMin: task.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+                            estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
         if accruesViaSharedLedger(cur, taskId: task.id) {
             // Partner-shared own task: the exactly-once ledger (same session id
             // as the partner's finalize) — capped like every resurrected path.
@@ -279,7 +279,10 @@ extension AppModel {
     /// un-freezes the Live Activity, and cancels the pending paused check-in.
     func resumeFocus() {
         guard let liveStore, let cur = (try? liveStore.get()) ?? nil, cur.paused else { return }
-        let resumed = FocusTimer.resume(cur, now: Date().timeIntervalSince1970 * 1000)
+        let now = Date().timeIntervalSince1970 * 1000
+        // The pause's reason log gets how long the pause lasted (Insights P0-3).
+        if let closed = FocusTimer.closedPauseLog(cur, now: now) { saveReasonLog(closed) }
+        let resumed = FocusTimer.resume(cur, now: now)
         try? liveStore.set(resumed)
         refreshLiveSession()
         LiveActivityController.shared.update(
