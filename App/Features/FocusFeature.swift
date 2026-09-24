@@ -230,7 +230,9 @@ final class FocusModel {
         let sTaskId = occurrence?.templateId ?? task.id
         let sName = occurrence?.templateName ?? task.name
         let session = Session(id: live.id ?? newUUID(), taskId: sTaskId, taskName: sName,
-                              estimateMin: task.estimateMin, actualSec: elapsed, completedAt: AppModel.isoNow())
+                              // The session's own plan (estimate + any extends), as web
+                              // logs it — not the task default (analytics P1-13).
+                              estimateMin: live.sessionEstimateMin, actualSec: elapsed, completedAt: AppModel.isoNow())
         live = FocusTimer.done(live)
         persist()
         LiveActivityController.shared.end()

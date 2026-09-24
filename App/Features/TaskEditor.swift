@@ -509,14 +509,24 @@ struct TaskEditor: View {
 
     // MARK: sessions + captures
 
-    private var taskSessions: [Session] { sessions.filter { $0.taskId == editTarget.id } }
+    /// This task's counted sessions (D1: no accidental < 1 min starts, runaway
+    /// timers clamped — the Insights numbers), NEWEST first.
+    private var taskSessions: [Session] {
+        countableSessions(sessions.filter { $0.taskId == editTarget.id })
+            .sorted { (PeriodTime.ms($0.completedAt) ?? 0) > (PeriodTime.ms($1.completedAt) ?? 0) }
+    }
     private var taskCaptures: [Capture] { captures.filter { $0.taskId == editTarget.id } }
 
     private var sessionsSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             SectionLabel("Sessions")
             ForEach(taskSessions.prefix(6)) { s in
-                Text("• \(s.actualSec / 60)m focused").font(UFont.sans(13)).foregroundStyle(theme.palette.ink2).padding(.vertical, 2)
+                let when = sessionDayLabel(s.completedAt, now: Date()).map { "\($0) · " } ?? ""
+                Text("• \(when)\(fmtFocusDur(roundedMinutes(s.actualSec))) focused")
+                    .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2).padding(.vertical, 2)
+            }
+            if taskSessions.count > 6 {
+                Text("+\(taskSessions.count - 6) earlier").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

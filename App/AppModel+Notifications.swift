@@ -550,7 +550,7 @@ extension AppModel {
         }
         if let task = (try? taskRepo?.fetch(id: cur.taskId)) ?? nil {
             let session = Session(id: cur.id ?? newUUID(), taskId: task.id, taskName: task.name,
-                                  estimateMin: task.estimateMin, actualSec: capped, completedAt: Self.isoNow())
+                                  estimateMin: cur.sessionEstimateMin, actualSec: capped, completedAt: Self.isoNow())
             // One true shared session: an OWNER session on a partner-shared task
             // accrues via the ledger only (same session id as the partner's
             // finalize — exactly once), with the same capped amount.

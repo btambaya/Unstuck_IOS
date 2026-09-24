@@ -118,7 +118,7 @@ extension AppModel {
             return nil
         }
         saveSession(Session(id: sessionId, taskId: task.id, taskName: task.name,
-                            estimateMin: task.estimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
+                            estimateMin: cur.sessionEstimateMin, actualSec: elapsed, completedAt: Self.isoNow()))
         if accruesViaSharedLedger(cur, taskId: task.id) {
             // Partner-shared own task: the exactly-once ledger (same session id
             // as the partner's finalize) — capped like every resurrected path.

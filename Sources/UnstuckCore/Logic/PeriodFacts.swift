@@ -797,6 +797,22 @@ public func resolveInsightsPeriod(_ kind: InsightsPeriodKind, offset: Int, now: 
     }
 }
 
+/// Whole local days from `a` to `b` ('YYYY-MM-DD'; 0 when either isn't a real date).
+public func civilDaysBetween(_ a: String, _ b: String) -> Int {
+    guard let x = CivilDay.parse(a), let y = CivilDay.parse(b) else { return 0 }
+    return y - x
+}
+
+/// "Today" / "Yesterday" / "Wed 16 Sep" (+ year when not this year) for a
+/// stamp's local day; nil when unparseable. For session lists.
+public func sessionDayLabel(_ stamp: String?, now: Date) -> String? {
+    guard let day = PeriodTime.dayOf(stamp) else { return nil }
+    let today = PeriodTime.at(Int64((now.timeIntervalSince1970 * 1000).rounded(.down))).day
+    if day == today { return "Today" }
+    if day == CivilDay.add(today, -1) { return "Yesterday" }
+    return dayLabel(day, year: CivilDay.ymd(CivilDay.num(today)).0)
+}
+
 /// Whether stepping further back would still land on or after `earliest`
 /// (the first activity); true when nothing bounds it yet.
 public func canStepBack(_ p: InsightsPeriod, earliest: String?) -> Bool {

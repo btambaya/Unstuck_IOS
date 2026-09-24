@@ -257,6 +257,10 @@ public func captureBreakdown(_ captures: [Capture]) -> [CaptureTag: Int] {
 public struct Insight: Equatable, Sendable {
     public let title: String
     public let sub: String
+    public init(title: String, sub: String) {
+        self.title = title
+        self.sub = sub
+    }
 }
 
 private let WEEKDAY_NAMES = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"]
