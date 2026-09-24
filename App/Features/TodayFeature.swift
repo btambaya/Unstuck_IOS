@@ -102,6 +102,7 @@ final class TodayModel {
             for try await snap in repo.observeTasksAndBlocks() {
                 areas = snap.areas
                 sessions = snap.sessions
+                weekFocus = UnstuckCore.weekFocusMin(sessions: snap.sessions, now: Date())
                 // all/blocks assignment triggers recomputeSnapshot via didSet;
                 // set blocks last so the final recompute sees both.
                 all = snap.tasks
@@ -202,7 +203,8 @@ final class TodayModel {
     /// (D1-filtered sessions, periodFacts, rounded minutes): the old rolling
     /// 7 days showed "This week · 1h 35m" over a Week tab reading nothing
     /// (cross-check P0-8).
-    var weekFocus: (thisWeek: Int, lastWeek: Int) { UnstuckCore.weekFocusMin(sessions: sessions, now: Date()) }
+    /// Computed once per store snapshot (not per render — Today redraws often).
+    private(set) var weekFocus: (thisWeek: Int, lastWeek: Int) = (0, 0)
 
     // MARK: nudges (quiet, in-app — Android AppViewModel.nudges parity)
 
