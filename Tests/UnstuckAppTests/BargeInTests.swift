@@ -2467,7 +2467,8 @@ final class BargeInTests: XCTestCase {
         XCTAssertFalse(c.pendingCreate, "turn 2 rode on the continuation: its words were already in the conversation")
         for t in [50.53, 50.8, 51.0, 53.0] { XCTAssertEqual(creates(on(.tick, t)), 0, "nothing more at \(t)") }
         XCTAssertEqual(creates(all), 2, "turn 1's create and the continuation — nothing else")
-        XCTAssertFalse(all.contains(.createResponse) && all.lastIndex(of: .createResponse)! > all.firstIndex(of: .continueAfterTools)!)
+        XCTAssertLessThan(all.lastIndex(of: .createResponse) ?? .max, all.firstIndex(of: .continueAfterTools) ?? -1,
+                          "no turn ask after the continuation, and a continuation there was")
     }
 
     func test31b_anOutputBackBeforeItsRepliesDone_theDoneSendsTheContinuation() {

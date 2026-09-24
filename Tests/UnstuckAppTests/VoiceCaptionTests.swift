@@ -1522,7 +1522,7 @@ final class VoiceToolHoldTests: XCTestCase {
         return cond()
     }
 
-    func testZubairsMorningCall_theOutputIsOnTheWireBeforeTheOneCreate() async {
+    func testZubairsMorningCall_theOutputIsOnTheWireBeforeTheOneCreate() async throws {
         let c = client()
         at(43, c, speechStarted("u1"))
         at(44.5, c, speechStopped)
@@ -1545,16 +1545,18 @@ final class VoiceToolHoldTests: XCTestCase {
         tool.release("ok: \"Office Focus\" no longer repeats (future occurrences removed)")
         let sent = await eventually { self.creates == 2 }
         XCTAssertTrue(sent, "the continuation goes once the output is back")
-        let output = outputIndex("call_RF"), lastCreate = wire.types.lastIndex(of: "response.create")
-        XCTAssertNotNil(output)
-        XCTAssertLessThan(output!, lastCreate!, "the output is on the wire before the one create")
+        // Unwrapped, not forced: with the hold removed the create goes at the
+        // done, before any output — that must FAIL here, not crash the run.
+        let output = try XCTUnwrap(outputIndex("call_RF"), "the tool's output never went back")
+        let lastCreate = try XCTUnwrap(wire.types.lastIndex(of: "response.create"))
+        XCTAssertLessThan(output, lastCreate, "the output is on the wire before the one create")
         at(50.448, c, created("r7"))
         for t in [50.53, 51.0, 53.0] { clock.t = t; c.timerFired() }
         XCTAssertEqual(creates, 2, "one create answered the output and turn 2 — no refused second create")
         XCTAssertTrue(wire.errors.isEmpty, "\(wire.errors)")
     }
 
-    func testAFailingToolStillSendsItsErrorOutputAndReleasesTheHold() async {
+    func testAFailingToolStillSendsItsErrorOutputAndReleasesTheHold() async throws {
         let c = client()
         at(1, c, created("r1"), words("r1", "One moment."), audio("r1"))
         at(1.5, c, call("r1", "call_A", "schedule_task", #"{"taskId":"x","date":"2026-09-24"}"#))
@@ -1564,10 +1566,10 @@ final class VoiceToolHoldTests: XCTestCase {
         let sent = await eventually { self.creates == 1 }
         XCTAssertTrue(sent)
         XCTAssertEqual(outputs("call_A"), ["error: couldn't save that change to \"Office Focus\" — nothing changed; try again"])
-        XCTAssertLessThan(outputIndex("call_A")!, wire.types.lastIndex(of: "response.create")!)
+        XCTAssertLessThan(try XCTUnwrap(outputIndex("call_A")), try XCTUnwrap(wire.types.lastIndex(of: "response.create")))
     }
 
-    func testAStuckToolIsAnsweredWithAnErrorAfterTenSeconds_andItsLateResultIsDropped() async {
+    func testAStuckToolIsAnsweredWithAnErrorAfterTenSeconds_andItsLateResultIsDropped() async throws {
         let c = client()
         at(100, c, created("r1"), words("r1", "One moment."), audio("r1"))
         at(100.2, c, call("r1", "call_S", "request_call", #"{"when":"2026-09-24 12:00"}"#))
@@ -1578,7 +1580,8 @@ final class VoiceToolHoldTests: XCTestCase {
         clock.t = 110.2; c.timerFired()
         XCTAssertEqual(outputs("call_S"), [VoiceRealtimeClient.toolTimeoutOutput])
         XCTAssertEqual(creates, 1)
-        XCTAssertLessThan(outputIndex("call_S")!, wire.types.lastIndex(of: "response.create")!, "its error output, then the create")
+        XCTAssertLessThan(try XCTUnwrap(outputIndex("call_S"), "no timeout output"), try XCTUnwrap(wire.types.lastIndex(of: "response.create")),
+                          "its error output, then the create")
         XCTAssertTrue(VoiceRealtimeClient.toolTimeoutOutput.hasPrefix("error: "))
         // It returns at last: dropped — one output per call, no second create.
         tool.release("ok: call booked")

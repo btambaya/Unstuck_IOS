@@ -70,6 +70,15 @@ From prod assistant_turns, session 1cbfac75 (07:01–07:03 UTC). Web did its hal
   `ok: "X" is already on <date> at <HH:MM> — nothing to change`, no write, still anchors a set_task_recurrence after it.
   Receipts: an ok ending `NOTHING_TO_CHANGE` gets no card; kind none reads "Repeat removed". Voice prompt carries web's
   REPEATS_RULE verbatim (unsupported repeats said first, offered as a question).
+- **Open (review, same day) — the no-tool variant still asks twice.** The 50.333 create was also a second ask for
+  "I'll just leave it in only for today.": that segment's speech had ended before the 48.106 create (so the reply
+  heard it), but its transcript landed just after the create and re-opened the turn (`since > sent` at
+  response.created). With a tool call it now rides on the one continuation; with NO tool the same timing still sends
+  a second `response.create` at the reply's done (probed against this branch: `creates(done) == 1`,
+  `pendingCreate == true`). It fires whenever the last segment of a multi-segment turn is transcribed more than
+  `turnHoldMs` after its speech_stopped — 2 of the 3 multi-segment turns in this call were. Fix idea: a final
+  transcript for a segment whose `stoppedAt` precedes an in-flight / answering turn ask is already answered (caption
+  it, don't re-open the turn, don't cancel that reply); keep notice creates out of it. Needs its own review.
 
 ## James's assistant reports + analytics alignment (branch polish/ios, 2026-09-24) — not shipped yet
 
