@@ -34,24 +34,77 @@ public struct StackedBar: Equatable, Sendable {
 private let DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 public let DEFAULT_AREAS = ["Work", "Personal", "Home", "Health", "Volunteering"]
 
-/// Label of the trailing "unassigned" series in `weekdayAreaHours`.
+/// Label of the "unassigned" series in `weekdayAreaBars`.
 public let NO_AREA_LABEL = "No area"
 
-/// Focus hours per weekday (Mon…Sun) × area. `data` holds one slot per name
-/// in `areas` (the user's OWN life areas, in their order) PLUS one trailing
-/// "No area" slot for sessions with no task, a task with no area, or an area
-/// that no longer exists — those were silently dropped before (≈42% of prod
-/// focus time; analytics cross-check P0-5).
-public func weekdayAreaHours(_ sessions: [Session], _ tasks: [TaskItem], areas: [String] = DEFAULT_AREAS) -> [StackedBar] {
-    var taskArea: [String: String] = [:]
-    for t in tasks where t.lifeArea != nil { taskArea[t.id] = t.lifeArea }
-    var out = DAY_LABELS.map { StackedBar(d: $0, data: Array(repeating: 0, count: areas.count + 1)) }
+/// One column of the "When focus happens" bars (and get_insights' By area):
+/// one of the user's areas, another area a task carries, or "No area"
+/// (`area == nil`).
+public struct AreaSeries: Equatable, Sendable {
+    public let name: String
+    public let area: String?
+    public init(name: String, area: String?) {
+        self.name = name
+        self.area = area
+    }
+}
+
+/// The bars: `days` (Mon…Sun) hold one hours slot per entry of `series`.
+public struct AreaBars: Equatable, Sendable {
+    public let series: [AreaSeries]
+    public let days: [StackedBar]
+}
+
+/// The area a session counts under: its task's area when that has any text,
+/// else nil (no task, a task with no area, a task not in `tasks`).
+private func sessionArea(_ s: Session, _ byId: [String: TaskItem]) -> String? {
+    guard let t = s.taskId.flatMap({ byId[$0] }), let a = t.lifeArea, hasReviewText(a) else { return nil }
+    return a
+}
+
+/// The series, web's rule (lib/period-facts.ts `areaSeries`) on all three
+/// apps: the user's own areas in their order, then any OTHER area a task
+/// carries (an area since renamed or deleted, one typed by the assistant)
+/// under its own name, sorted, then "No area" when some session has none.
+/// An area outside the list used to fold into "No area" here and on Android
+/// while web drew it by name (tonight's analytics review).
+public func areaSeries(_ sessions: [Session], _ tasks: [TaskItem], areas: [String]) -> [AreaSeries] {
+    let byId = Dictionary(tasks.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+    let known = Set(areas)
+    var extra = Set<String>()
+    var noArea = false
+    for s in sessions {
+        if let a = sessionArea(s, byId) {
+            if !known.contains(a) { extra.insert(a) }
+        } else {
+            noArea = true
+        }
+    }
+    return areas.map { AreaSeries(name: $0, area: $0) }
+        + extra.sorted(by: utf16Less).map { AreaSeries(name: $0, area: $0) }
+        + (noArea ? [AreaSeries(name: NO_AREA_LABEL, area: nil)] : [])
+}
+
+/// Focus hours per weekday (Mon…Sun) × area series (`areaSeries`). Every
+/// session lands somewhere — no task, no area and an area outside the user's
+/// list were silently dropped once (≈42% of prod focus time; analytics
+/// cross-check P0-5). Callers pass COUNTED sessions.
+public func weekdayAreaBars(_ sessions: [Session], _ tasks: [TaskItem], areas: [String] = DEFAULT_AREAS) -> AreaBars {
+    let series = areaSeries(sessions, tasks, areas: areas)
+    let byId = Dictionary(tasks.map { ($0.id, $0) }, uniquingKeysWith: { _, b in b })
+    var out = DAY_LABELS.map { StackedBar(d: $0, data: Array(repeating: 0, count: series.count)) }
     for s in sessions {
         guard let d = parseDate(s.completedAt) else { continue }
-        let ai = s.taskId.flatMap { taskArea[$0] }.flatMap { areas.firstIndex(of: $0) } ?? areas.count
+        let a = sessionArea(s, byId)
+        guard let ai = series.firstIndex(where: { $0.area == a }) else { continue }
         out[dayOfWeekIdx(d)].data[ai] += Double(s.actualSec) / HOUR
     }
-    return out
+    return AreaBars(series: series, days: out)
+}
+
+/// `weekdayAreaBars`' days alone (slots in `areaSeries` order).
+public func weekdayAreaHours(_ sessions: [Session], _ tasks: [TaskItem], areas: [String] = DEFAULT_AREAS) -> [StackedBar] {
+    weekdayAreaBars(sessions, tasks, areas: areas).days
 }
 
 // MARK: H2 — estimate-vs-actual scatter
@@ -81,6 +134,21 @@ public func calibrationHitRate(_ dots: [CalibrationDot], slackMin: Int = 5) -> D
 
 // MARK: H3 — interruption histogram (captures as the proxy)
 
+/// When a session really started: `completedAt` minus the time it REALLY ran
+/// (its stored `actualSec`, not the D1-clamped length). A timer forgotten for
+/// 34 h "started" 4 h before it was stopped when read from its clamped length
+/// (Android's rule, 1c616da, now on all three).
+public func realSessionStartMs(_ s: Session) -> Double? {
+    Time.parseMillis(s.completedAt).map { $0 - Double(max(0, s.actualSec)) * 1000 }
+}
+
+/// Captures linked to a COUNTED session, by minutes into it. Pass the RAW
+/// sessions: the start is the session's real start (`realSessionStartMs`),
+/// so a forgotten timer's captures land where they were taken. That start
+/// ignores paused time, so a capture taken before a pause can read as before
+/// the start: it goes in the first bin rather than being dropped (web and
+/// Android do the same). The screen hides the chart below
+/// `INTERRUPTIONS_MIN_LINKED` linked captures.
 public func interruptionBins(_ captures: [Capture], _ sessions: [Session], binMin: Int = 3, binCount: Int = 10) -> [Int] {
     // Degenerate-arg guards: a 0-wide bin divides-by-zero in the index math, and
     // a 0-count bin array would index bins[-1]. Coerce to safe minimums.
@@ -88,15 +156,12 @@ public func interruptionBins(_ captures: [Capture], _ sessions: [Session], binMi
     guard binCount >= 1 else { return [] }
     var bins = Array(repeating: 0, count: binCount)
     var sessionStart: [String: Double] = [:]
-    for s in sessions {
-        if let end = Time.parseMillis(s.completedAt) {
-            sessionStart[s.id] = end - Double(s.actualSec) * 1000
-        }
+    for s in sessions where countedSec(s) != nil {
+        if let start = realSessionStartMs(s) { sessionStart[s.id] = start }
     }
     for c in captures {
         guard let sid = c.sessionId, let start = sessionStart[sid], let at = Time.parseMillis(c.at) else { continue }
-        let intoMin = (at - start) / 60_000
-        if intoMin < 0 { continue }
+        let intoMin = max(0, (at - start) / 60_000)
         let idx = min(binCount - 1, Int((intoMin / Double(binMin)).rounded(.down)))
         bins[idx] += 1
     }

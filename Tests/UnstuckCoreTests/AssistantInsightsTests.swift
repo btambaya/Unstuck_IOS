@@ -84,6 +84,20 @@ final class GoldenHoursTests: XCTestCase {
         XCTAssertEqual(g.share, 1, accuracy: 1e-5)
     }
 
+    /// Forgotten timers that really began at 9:00 (estimate 25 → they count 85
+    /// min each) sit in the 9am band, weighted by their counted length — from
+    /// the clamped length they "started" at 13:35 (Android's rule, now on all
+    /// three). Raw rows go in: the D1 filter runs inside, so a 30-second start
+    /// counts for nothing.
+    func testARunawayTimerIsPlacedAtItsRealStartAndWeighedByItsCountedLength() {
+        let runaways = repeatN(10) { sess(10 + $0, 9, 0, 6 * 3600, estimateMin: 25) }
+        let accidental = repeatN(10) { sess(10 + $0, 20, 0, 30) }
+        let g = goldenHours(runaways + accidental, now: FIXED_NOW)
+        XCTAssertEqual(g?.hours, [9, 10])
+        XCTAssertEqual(g?.factText, "Deep focus lands best around 9–11am (from 10 real sessions)")
+        XCTAssertEqual(g?.share ?? 0, 1, accuracy: 1e-9)
+    }
+
     func testSessionsWithNoEstimateMinStillCount() {
         let sessions = repeatN(7) { sess(10 + $0, 9, 0, 1800) } + repeatN(7) { sess(10 + $0, 10, 0, 1800, estimateMin: 30) }
         let g = goldenHours(sessions, now: FIXED_NOW)

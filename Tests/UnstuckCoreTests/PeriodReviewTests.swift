@@ -457,3 +457,59 @@ final class PageAndReviewAgreeTests: XCTestCase {
         }
     }
 }
+
+// MARK: - cross-platform rules (analytics review, 2026-09-24)
+
+final class InsightsCrossPlatformRulesTests: XCTestCase {
+    private func occ(_ id: String, _ taskId: String, _ date: String, done: Bool = false, skipped: Bool = false) -> CalBlock {
+        var b = mkBlock(id: id, taskId: taskId, taskName: taskId, date: date)
+        b.done = done
+        b.skipped = skipped
+        return b
+    }
+
+    /// Repeating series: kept, then due so far, then name (web's order on all
+    /// three). Two series with the same kept count: the one with more days
+    /// due comes first even though its name sorts later.
+    func testRepeatingSeriesSortByKeptThenDueThenName() {
+        var a = mkTask(id: "a", name: "Alpha")
+        a.recurrence = .daily(until: nil)
+        var z = mkTask(id: "z", name: "Zulu")
+        z.recurrence = .daily(until: nil)
+        var m = mkTask(id: "m", name: "Mike")
+        m.recurrence = .daily(until: nil)
+        let blocks = [
+            occ("a1", "a", "2026-09-21", done: true), occ("a2", "a", "2026-09-22", skipped: true),
+            occ("z1", "z", "2026-09-21", done: true), occ("z2", "z", "2026-09-22"),
+            occ("m1", "m", "2026-09-21", done: true), occ("m2", "m", "2026-09-22", done: true),
+        ]
+        let data = PeriodData(tasks: [a, z, m], blocks: blocks, sessions: [])
+        let series = seriesRhythm(data, from: "2026-09-21", to: "2026-09-27", today: "2026-09-24")
+        XCTAssertEqual(series.map(\.name), ["Mike", "Zulu", "Alpha"])
+        XCTAssertEqual(series.map(\.kept), [2, 1, 1])
+        XCTAssertEqual(series.map(\.dueSoFar), [2, 2, 1])
+    }
+
+    /// "All time" starts at the earliest task created, task DONE (its
+    /// completion) or counted session end — web's rule. A reopened task's old
+    /// completion stamp and an accidental 20-second start don't move it.
+    func testAllTimeStartsAtTheFirstRealActivity() {
+        let made = mkTask(id: "m", createdAt: "2026-09-10T09:00:00.000Z", updatedAt: "2026-09-10T09:00:00.000Z")
+        let reopened = mkTask(id: "r", done: false, createdAt: "2026-09-12T09:00:00.000Z",
+                              updatedAt: "2026-09-12T09:00:00.000Z", completedAt: "2026-09-01T09:00:00.000Z")
+        let tiny = Session(id: "tiny", taskName: "x", actualSec: 20, completedAt: "2026-09-02T09:00:00.000Z")
+        XCTAssertEqual(PeriodData(tasks: [made, reopened], blocks: [], sessions: [tiny]).earliestDay, "2026-09-10")
+        // A done task's completion counts, even before any creation stamp.
+        let done = mkTask(id: "d", done: true, createdAt: "2026-09-11T09:00:00.000Z",
+                          updatedAt: "2026-09-11T09:00:00.000Z", completedAt: "2026-09-05T09:00:00.000Z")
+        XCTAssertEqual(PeriodData(tasks: [made, done], blocks: [], sessions: []).earliestDay, "2026-09-05")
+        // So does a counted session's end.
+        let real = Session(id: "real", taskName: "x", actualSec: 1500, completedAt: "2026-09-03T09:00:00.000Z")
+        XCTAssertEqual(PeriodData(tasks: [made], blocks: [], sessions: [real]).earliestDay, "2026-09-03")
+        withZone("UTC") {
+            let all = resolveInsightsPeriod(.all, offset: 0, now: prNow("2026-09-24T15:30:00.000Z"),
+                                            earliest: PeriodData(tasks: [made, reopened], blocks: [], sessions: [tiny]).earliestDay)
+            XCTAssertEqual(all.from, "2026-09-10")
+        }
+    }
+}

@@ -31,17 +31,56 @@ final class WeekdayAreaHoursTests: XCTestCase {
         XCTAssertEqual(out[2].data[1], 0.5)   // Wed, Personal
     }
 
-    func testTasklessNoAreaAndUnknownAreaSessionsLandInTheTrailingNoAreaSlot() {
-        let tasks = [mkTask(id: "t1", lifeArea: "Errands"), mkTask(id: "t2"), mkTask(id: "t3", lifeArea: "Gone")]
+    /// Web's rule on all three (analytics review, 2026-09-24): the user's
+    /// areas, then an area outside their list under its OWN name (sorted),
+    /// then "No area" for no task / no area — it used to fold "Gone" into
+    /// "No area" here and on Android while web drew it by name.
+    func testAnAreaOutsideTheUsersListIsItsOwnSeriesAndNoAreaComesLast() {
+        let tasks = [mkTask(id: "t1", lifeArea: "Errands"), mkTask(id: "t2"), mkTask(id: "t3", lifeArea: "Gone"),
+                     mkTask(id: "t4", lifeArea: "Garden"), mkTask(id: "t5", lifeArea: "  ")]
         let sessions = [
             sess("s1", taskId: "t1", actualSec: 3600, completedAt: "2026-05-19T10:00:00.000Z"),   // Tue, Errands
             sess("s2", taskId: "t2", actualSec: 1800, completedAt: "2026-05-19T11:00:00.000Z"),   // no area
             sess("s3", taskId: nil, actualSec: 1800, completedAt: "2026-05-19T12:00:00.000Z"),    // no task
             sess("s4", taskId: "t3", actualSec: 3600, completedAt: "2026-05-19T13:00:00.000Z"),   // area not the user's
+            sess("s5", taskId: "t4", actualSec: 1800, completedAt: "2026-05-19T14:00:00.000Z"),   // another one
+            sess("s6", taskId: "t5", actualSec: 1800, completedAt: "2026-05-19T15:00:00.000Z"),   // blank area = none
         ]
-        let out = weekdayAreaHours(sessions, tasks, areas: ["Errands", "Work"])
-        XCTAssertEqual(out[1].data, [1, 0, 2])
-        XCTAssertEqual(out.map { $0.data.count }, Array(repeating: 3, count: 7))
+        let bars = weekdayAreaBars(sessions, tasks, areas: ["Errands", "Work"])
+        XCTAssertEqual(bars.series, [AreaSeries(name: "Errands", area: "Errands"), AreaSeries(name: "Work", area: "Work"),
+                                     AreaSeries(name: "Garden", area: "Garden"), AreaSeries(name: "Gone", area: "Gone"),
+                                     AreaSeries(name: NO_AREA_LABEL, area: nil)])
+        XCTAssertEqual(bars.days[1].data, [1, 0, 0.5, 1, 1.5])
+        XCTAssertEqual(bars.days.map { $0.data.count }, Array(repeating: 5, count: 7))
+        XCTAssertEqual(weekdayAreaHours(sessions, tasks, areas: ["Errands", "Work"]), bars.days)
+    }
+
+    func testNoAreaIsOnlyASeriesWhenSomeSessionHasNoArea() {
+        let tasks = [mkTask(id: "t1", lifeArea: "Work")]
+        let sessions = [sess("s1", taskId: "t1", actualSec: 3600, completedAt: "2026-05-19T10:00:00.000Z")]
+        XCTAssertEqual(areaSeries(sessions, tasks, areas: ["Work", "Home"]).map(\.name), ["Work", "Home"])
+    }
+}
+
+final class RunawayStartTests: XCTestCase {
+    /// A timer forgotten for hours (estimate 25 → counts 85 min) that really
+    /// began at 09:00: its captures are measured from 09:00, not from 85 min
+    /// before it was stopped — they used to read as "before the start" and
+    /// vanish (Android's rule, now on all three). A capture that still reads
+    /// before the start (paused time) lands in the first bin; a session that
+    /// doesn't count (under a minute) places nothing.
+    func testInterruptionBinsMeasureFromTheRealStart() {
+        let s = Session(id: "run", taskId: "t", taskName: "task", estimateMin: 25, actualSec: 6 * 3600,
+                        completedAt: "2026-01-01T15:00:00.000Z")
+        let tiny = Session(id: "tiny", taskId: "t", taskName: "task", actualSec: 30, completedAt: "2026-01-01T15:00:00.000Z")
+        let caps = [cap("a", sessionId: "run", tag: .idea, at: "2026-01-01T09:10:00.000Z"),   // 10 min in → bin 3
+                    cap("b", sessionId: "run", tag: .idea, at: "2026-01-01T08:59:00.000Z"),   // "before" → bin 0
+                    cap("c", sessionId: "tiny", tag: .idea, at: "2026-01-01T14:59:45.000Z")]  // not a counted session
+        let bins = interruptionBins(caps, [s, tiny])
+        XCTAssertEqual(bins[3], 1)
+        XCTAssertEqual(bins[0], 1)
+        XCTAssertEqual(bins.reduce(0, +), 2)
+        XCTAssertEqual(realSessionStartMs(s), Time.parseMillis("2026-01-01T09:00:00.000Z"))
     }
 }
 

@@ -316,10 +316,14 @@ public struct PeriodData: Sendable {
         return t
     }
 
-    /// The earliest local day anything was created, focused or completed —
-    /// where stepping back through past periods stops.
+    /// The earliest local day with any recorded activity — a task created, a
+    /// task done (its completion; a reopened task's old stamp doesn't count),
+    /// a counted session ended — where "All time" starts and stepping back
+    /// through past periods stops. Web's rule (lib/period-facts.ts
+    /// `firstActivityDay`), the same on all three apps.
     public var earliestDay: String? {
-        let days = (taskCreated + taskDone + sessionEnd).compactMap { $0?.day }
+        let done = tasks.indices.map { tasks[$0].done ? taskDone[$0] : nil }
+        let days = (taskCreated + done + sessionEnd).compactMap { $0?.day }
         return days.min(by: utf16Less)
     }
 }
@@ -609,7 +613,8 @@ public struct SeriesRhythm: Equatable, Sendable {
 }
 
 /// Every repeating series with at least one occurrence dated in `[from, to]`,
-/// dots by block date. Sorted by kept (desc), then name, then id.
+/// dots by block date. Sorted by kept (desc), then due so far (desc), then
+/// name, then id — web's order (lib/period-facts.ts), the same on all three.
 public func seriesRhythm(_ data: PeriodData, from: String, to: String, today: String) -> [SeriesRhythm] {
     var dots: [String: [SeriesDot]] = [:]
     var order: [String] = []
@@ -628,6 +633,7 @@ public func seriesRhythm(_ data: PeriodData, from: String, to: String, today: St
                             dots: ds.sorted { utf16Less($0.date, $1.date) })
     }.sorted {
         if $0.kept != $1.kept { return $0.kept > $1.kept }
+        if $0.dueSoFar != $1.dueSoFar { return $0.dueSoFar > $1.dueSoFar }
         if $0.name != $1.name { return utf16Less($0.name, $1.name) }
         return utf16Less($0.taskId, $1.taskId)
     }
