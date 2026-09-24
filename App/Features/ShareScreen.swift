@@ -1001,7 +1001,10 @@ struct ShareScreen: View {
         return VStack(alignment: .leading, spacing: 10) {
             SectionLabel("Someone new")
             HStack(spacing: 8) {
-                TextField("name@example.com", text: $vm.email)
+                // `verbatim`: a LocalizedStringKey placeholder is parsed as
+                // Markdown, which autolinks the bare address — it rendered in
+                // the system link blue and read like a filled-in value.
+                TextField(text: $vm.email, prompt: Text(verbatim: "name@example.com")) { Text("Email address") }
                     .textFieldStyle(.roundedBorder)
                     .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
                     .submitLabel(.send)

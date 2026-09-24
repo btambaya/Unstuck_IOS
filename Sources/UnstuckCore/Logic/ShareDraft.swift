@@ -94,13 +94,18 @@ public struct ShareDraft: Equatable, Sendable {
     }
 
     /// Pick a connection at a grade, or change the grade of one already
-    /// picked (their place in the order is kept). A blank id is ignored.
+    /// picked (their place in the order is kept). A blank id is ignored. A
+    /// connection with no display name is "Someone" — what the Share screen's
+    /// row calls them — never a blank (the row would read "them · can edit"
+    /// beside an empty monogram).
     public mutating func pick(userId: String, name: String, access: ShareAccess) {
         guard !userId.isEmpty else { return }
-        let pick = ShareDraftPick(recipient: .user(id: userId), name: name, access: access)
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pick = ShareDraftPick(recipient: .user(id: userId), name: trimmed.isEmpty ? shareDraftUnnamed : trimmed,
+                                  access: access)
         if let i = picks.firstIndex(where: { $0.id == pick.id }) {
             picks[i].access = access
-            if !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { picks[i].name = name }
+            if !trimmed.isEmpty { picks[i].name = trimmed }
         } else {
             picks.append(pick)
         }
@@ -221,10 +226,16 @@ public func shareDraftSummary(_ picks: [ShareDraftPick],
     return ShareDraftSummary(text: text, spoken: spoken)
 }
 
+/// The name of a pick that has none (the Share screen's own fallback).
+public let shareDraftUnnamed = "Someone"
+
 /// First names, except where two picks would read the same — those keep
-/// their full name so "Maya, Maya" never happens.
+/// their full name so "Maya, Maya" never happens. A blank name reads
+/// "Someone", never `shareShortName`'s "them".
 private func shareDraftNames(_ picks: [ShareDraftPick]) -> [String] {
-    let short = picks.map { shareShortName($0.name) }
+    let short = picks.map { p in
+        p.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? shareDraftUnnamed : shareShortName(p.name)
+    }
     var counts: [String: Int] = [:]
     for s in short { counts[s.lowercased(), default: 0] += 1 }
     return zip(picks, short).map { p, s in

@@ -75,12 +75,19 @@ Ahmad, on the New task sheet's Share section (a big card per connected person, e
   to the name field on close and scrolls the sheet to the top).
 - **Removed from NewTaskSheet:** the per-member cards, `shareLevels`, the sheet's own `CircleModel` (+ its
   `.task`/`.onDisappear`), the inline invite panel and explainer. Nothing else in the sheet changed.
-- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 22) — summary 0/1/2/many, mixed grades, long names, addresses,
-  collisions, budget sweep; selection → submit mapping; pre-create lines. `ShareScreenPreCreateTests`
+- **Review fixes (same branch):** a connection with no display name is picked as "Someone" (the Share screen row's
+  own fallback) — it used to read "them · can edit" beside an empty monogram; and the Share screen's "Someone new"
+  placeholder is `Text(verbatim:)` — the LocalizedStringKey placeholder was parsed as Markdown, autolinking the
+  address into the system link blue so it read like a filled-in value (both modes; Connections' invite field still
+  has the old form).
+- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 23) — summary 0/1/2/many, mixed grades, long names, addresses,
+  collisions, blank names, budget sweep; selection → submit mapping; pre-create lines. `ShareScreenPreCreateTests`
   (UnifiedSharingScreenTests.swift, 11) — the model over a DraftShareTransport: nothing reaches the server, picks /
   grade changes / removals / queued addresses land in the draft, re-open pins the picks, the invite link is a
   connect invite, the mapping submit hands `applyCreateShares`. Screenshots: `SharePeopleCardShots.testNewTaskShareRowShots`
-  (light + dark; writes to SHARE_ROW_SHOTS_DIR, default /tmp/unstuck-share-row-shots).
+  (light + dark; writes to SHARE_ROW_SHOTS_DIR, default /tmp/unstuck-share-row-shots) — nothing picked, the picker +
+  its Choose someone list, then 1 / 2 / 3 picks (mixed grades → "Maya + 2 more") with the picker CLOSED and
+  REOPENED between picks, asserting the picks come back first with their grade and the switch resets to Can edit.
 - **Merge note:** another branch edits NewTaskSheet for the remembered estimate; this branch touches only the share
   state block, the removed circle `.task`/`.onDisappear` lines around `.onAppear(perform: seedPrefill)`, the share
   section functions and the share block at the end of `submit()`.

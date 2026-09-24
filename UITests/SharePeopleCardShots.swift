@@ -208,13 +208,14 @@ final class SharePeopleCardShots: XCTestCase {
 
     // MARK: New task → "Share with…" (the one row + the pre-create picker)
 
-    /// New task → More options: the ONE "Share with…" row with nothing picked,
-    /// the pre-create Share screen it opens, two people picked at different
-    /// grades (Maya · Can edit, Zubair · Can view) with Someone new + Invite
-    /// with a link below, and the row's summary afterwards —
-    /// light + dark. PNGs go to SHARE_ROW_SHOTS_DIR (TEST_RUNNER_-prefixed for
-    /// xcodebuild; default /tmp/unstuck-share-row-shots). Each step asserts the
-    /// screen it shoots actually rendered.
+    /// New task → More options: the ONE "Share with…" row with nothing
+    /// picked, the pre-create Share screen it opens and its "Choose someone"
+    /// list, then the row after 1 / 2 / 3 picks — the picker is CLOSED and
+    /// REOPENED between picks, so this also proves the picks survive a
+    /// reopen (they come back first, with their grade) — light + dark. PNGs go
+    /// to SHARE_ROW_SHOTS_DIR (TEST_RUNNER_-prefixed for xcodebuild; default
+    /// /tmp/unstuck-share-row-shots). Each step asserts the screen it shoots
+    /// actually rendered.
     func testNewTaskShareRowShots() throws {
         let env = ProcessInfo.processInfo.environment
         let dir = URL(fileURLWithPath: env["SHARE_ROW_SHOTS_DIR"] ?? "/tmp/unstuck-share-row-shots")
@@ -256,45 +257,72 @@ final class SharePeopleCardShots: XCTestCase {
             XCTAssertEqual(row.value as? String, "Only you", "[\(theme)] nothing picked reads Only you")
             shot("01-row-nothing-picked-\(theme)")
 
-            row.tap()
             let bar = app.navigationBars["Share"].firstMatch
-            expect(bar, "[\(theme)] the row did not open the Share screen")
-            guard bar.exists else { shot("\(theme)-FAILED-share"); app.terminate(); continue }
-            usleep(900_000)
-            shot("02-picker-open-\(theme)")
-
-            // Maya at the default Can edit …
             let choose = app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Choose someone'")).firstMatch
-            expect(choose, "[\(theme)] no 'Choose someone' row in the pre-create Share screen")
-            if choose.exists {
-                choose.tap(); usleep(800_000)
-                let maya = app.buttons["Share with Maya Chen"].firstMatch
-                expect(maya, "[\(theme)] Maya is not in the picker")
-                if maya.exists { maya.tap(); usleep(900_000) }
+            let editGrade = app.segmentedControls.buttons["Can edit"].firstMatch
+            let viewGrade = app.segmentedControls.buttons["Can view"].firstMatch
+            /// Open the picker from the row; false (after asserting) if it didn't.
+            func openPicker(_ step: String) -> Bool {
+                row.tap()
+                expect(bar, "[\(theme)] \(step): the row did not open the Share screen")
+                guard bar.exists else { shot("\(theme)-FAILED-\(step)"); return false }
+                usleep(900_000)
+                return true
             }
-            // … Zubair at Can view.
-            let view = app.segmentedControls.buttons["Can view"].firstMatch
-            expect(view, "[\(theme)] the Can edit / Can view switch is missing")
-            if view.exists { view.tap(); usleep(400_000) }
-            if choose.waitForExistence(timeout: 4) {
+            /// "Choose someone" → the searchable list → one person.
+            func pick(_ name: String, shootList: String? = nil) {
+                expect(choose, "[\(theme)] no 'Choose someone' row in the pre-create Share screen")
+                guard choose.exists else { return }
                 choose.tap(); usleep(800_000)
-                let zubair = app.buttons["Share with Zubair Kazaure"].firstMatch
-                expect(zubair, "[\(theme)] Zubair is not in the picker")
-                if zubair.exists { zubair.tap(); usleep(900_000) }
+                let person = app.buttons["Share with \(name)"].firstMatch
+                expect(person, "[\(theme)] \(name) is not in the Choose someone list")
+                if let shootList { shot(shootList) }
+                if person.exists { person.tap(); usleep(900_000) }
             }
-            expect(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Maya Chen, Can edit'")).firstMatch,
-                   "[\(theme)] Maya is not shown as picked at Can edit")
-            expect(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Zubair Kazaure, Can view'")).firstMatch,
-                   "[\(theme)] Zubair is not shown as picked at Can view")
-            shot("03-picker-two-picked-\(theme)")
+            func closePicker() {
+                app.navigationBars["Share"].buttons["Done"].firstMatch.tap(); usleep(900_000)
+                expect(row, "[\(theme)] back on the New task sheet")
+            }
+            func picked(_ who: String) -> XCUIElement {
+                app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", who)).firstMatch
+            }
+
+            // 1 · Maya at the default Can edit.
+            guard openPicker("open-1") else { app.terminate(); continue }
+            XCTAssertTrue(editGrade.isSelected, "[\(theme)] the grade switch defaults to Can edit")
+            shot("02-picker-open-\(theme)")
+            pick("Maya Chen", shootList: "03-choose-someone-list-\(theme)")
+            expect(picked("Maya Chen, Can edit"), "[\(theme)] Maya is not shown as picked at Can edit")
+            closePicker()
+            XCTAssertEqual(row.value as? String, "Maya can edit", "[\(theme)] one pick")
+            shot("04-row-one-picked-\(theme)")
+
+            // 2 · REOPEN: Maya is still picked (first, at Can edit); Zubair at Can view.
+            guard openPicker("reopen-2") else { app.terminate(); continue }
+            expect(picked("Maya Chen, Can edit"), "[\(theme)] Maya's pick did not survive closing the picker")
+            expect(viewGrade, "[\(theme)] the Can edit / Can view switch is missing")
+            if viewGrade.exists { viewGrade.tap(); usleep(400_000) }
+            pick("Zubair Kazaure")
+            expect(picked("Zubair Kazaure, Can view"), "[\(theme)] Zubair is not shown as picked at Can view")
+            shot("05-picker-two-picked-\(theme)")
             expect(app.buttons["Invite with a link"].firstMatch, "[\(theme)] pre-create's connect-invite link is missing")
             XCTAssertFalse(app.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Share a link'")).firstMatch.exists,
                            "[\(theme)] a task link can't exist before the task")
-
-            app.navigationBars["Share"].buttons["Done"].firstMatch.tap(); usleep(900_000)
-            expect(row, "[\(theme)] back on the New task sheet")
+            closePicker()
             XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view", "[\(theme)] the row's spoken summary")
-            shot("04-row-two-picked-\(theme)")
+            shot("06-row-two-picked-\(theme)")
+
+            // 3 · REOPEN again: the switch is back on Can edit; Zoë at Can edit.
+            guard openPicker("reopen-3") else { app.terminate(); continue }
+            expect(picked("Zubair Kazaure, Can view"), "[\(theme)] Zubair's grade did not survive closing the picker")
+            XCTAssertTrue(editGrade.isSelected, "[\(theme)] a reopened picker starts on Can edit again")
+            pick("Zoë Müller")
+            expect(picked("Zoë Müller, Can edit"), "[\(theme)] Zoë is not shown as picked at Can edit")
+            shot("07-picker-three-picked-\(theme)")
+            closePicker()
+            XCTAssertEqual(row.value as? String, "Maya can edit, Zubair can view, Zoë can edit",
+                           "[\(theme)] three picks, mixed grades — spoken in full")
+            shot("08-row-three-mixed-\(theme)")
             app.terminate()
         }
     }

@@ -123,6 +123,20 @@ final class ShareDraftTests: XCTestCase {
         XCTAssertEqual(d.pick(forUser: "u1")?.name, "James Wilson")
     }
 
+    func testAConnectionWithNoNameIsSomeoneNeverBlank() {
+        var d = ShareDraft()
+        d.pick(userId: "u1", name: "", access: .edit)
+        XCTAssertEqual(d.pick(forUser: "u1")?.name, "Someone", "the Share screen's row name for them")
+        XCTAssertEqual(shareDraftSummary(d.picks).text, "Someone · can edit")
+        d.pick(userId: "u2", name: " Anna Berg ", access: .view)
+        XCTAssertEqual(d.pick(forUser: "u2")?.name, "Anna Berg", "names are trimmed")
+        XCTAssertEqual(shareDraftSummary(d.picks).text, "Someone · edit, Anna · view")
+        // A pick built directly with no name still never reads "them".
+        XCTAssertEqual(shareDraftSummary([person("u9", "  ", .view)]).text, "Someone · can view")
+        d.pick(userId: "u1", name: "Maya Chen", access: .edit)
+        XCTAssertEqual(d.pick(forUser: "u1")?.name, "Maya Chen", "a later known name replaces the fallback")
+    }
+
     func testSetAccessAndRemoveById() {
         var d = ShareDraft()
         d.pick(userId: "u1", name: "James", access: .edit)
