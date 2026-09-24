@@ -44,11 +44,14 @@ struct SettingsView: View {
 
                     hubCard
 
-                    Text("Your data is yours — export a complete copy any time.")
-                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                        .padding(.top, 14)
-
-                    aboutCard.padding(.top, 18)
+                    // The build, for bug reports — one faint line, not a card
+                    // (the old About card's Theme duplicated Interface and
+                    // "Backend: Supabase" meant nothing to anyone; Ahmad 2026-09-24).
+                    Text("Unstuck \(Self.appVersion)")
+                        .font(UFont.mono(11)).foregroundStyle(theme.palette.ink3)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 18)
+                        .accessibilityLabel("Version \(Self.appVersion)")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 18)
@@ -142,34 +145,12 @@ struct SettingsView: View {
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
     }
 
-    // MARK: about card
-
-    private var aboutCard: some View {
-        VStack(spacing: 0) {
-            aboutLine("Theme", themeLabel(model.settings.theme))
-            divider
-            aboutLine("Version", Self.appVersion)
-            divider
-            aboutLine("Backend", "Supabase")
-        }
-        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(theme.palette.line, lineWidth: 1))
-    }
-
     /// "1.0 (5)" from the bundle — never hardcode (it drifted to 0.1.0 once).
     private static var appVersion: String {
         let info = Bundle.main.infoDictionary
         let version = info?["CFBundleShortVersionString"] as? String ?? "?"
         let build = info?["CFBundleVersion"] as? String ?? "?"
         return "\(version) (\(build))"
-    }
-
-    private func themeLabel(_ t: ThemePref) -> String {
-        switch t {
-        case .system: return "Follows system"
-        case .light: return "Light"
-        case .dark: return "Dark"
-        }
     }
 
     // MARK: row builders
@@ -218,16 +199,6 @@ struct SettingsView: View {
     private var chevron: some View {
         Image(systemName: "chevron.right")
             .font(.system(size: 13, weight: .semibold)).foregroundStyle(theme.palette.ink3)
-    }
-
-    /// Static About row.
-    private func aboutLine(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(label).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-            Spacer()
-            Text(value).font(UFont.mono(12)).foregroundStyle(theme.palette.ink3).lineLimit(1)
-        }
-        .padding(.horizontal, 16).padding(.vertical, 14)
     }
 }
 
