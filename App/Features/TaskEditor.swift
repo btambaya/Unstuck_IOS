@@ -396,11 +396,16 @@ struct TaskEditor: View {
         let mode = kindOf(rec)
         let days = weeklyDays(rec)
         let until = rec?.untilDate
+        let weeks = rec?.intervalWeeks ?? 1
         return VStack(alignment: .leading, spacing: 8) {
             chipScroll {
                 chip("Never", selected: mode == .none) { applyRecurrence(nil) }
                 chip("Daily", selected: mode == .daily) { applyRecurrence(.daily(until: until)) }
-                chip("Weekly", selected: mode == .weekly) { applyRecurrence(.weekly(daysOfWeek: days.isEmpty ? [1] : days, until: until)) }
+                // Already weekly (every week or every N weeks): re-tapping keeps
+                // the rule as it is, never drops an every-N-weeks to every week.
+                chip("Weekly", selected: mode == .weekly) {
+                    if mode != .weekly { applyWeekly(days: days.isEmpty ? [1] : days, interval: 1) }
+                }
                 chip("Monthly", selected: mode == .monthly) { applyRecurrence(.monthly(until: until)) }
             }
             if mode == .weekly {
@@ -409,7 +414,8 @@ struct TaskEditor: View {
                         let on = days.contains(idx)
                         Button {
                             let next = on ? days.filter { $0 != idx } : (days + [idx]).sorted()
-                            applyRecurrence(.weekly(daysOfWeek: next.isEmpty ? [idx] : next, until: until))
+                            // Moving days KEEPS the rhythm (and the weeks).
+                            applyWeekly(days: next.isEmpty ? [idx] : next, interval: weeks)
                         } label: {
                             Text(label).font(.system(size: 13, weight: .medium))
                                 .frame(width: 30, height: 30)
@@ -420,6 +426,8 @@ struct TaskEditor: View {
                         .buttonStyle(.plain)
                     }
                 }
+                weeksRow(days: days, weeks: weeks)
+                if weeks >= 2, case .everyNWeeks(_, _, let anchor, _)? = rec { startsRow(days: days, weeks: weeks, anchor: anchor) }
             }
             if mode != .none {
                 HStack(spacing: 8) {
@@ -435,6 +443,54 @@ struct TaskEditor: View {
                 }
             }
         }
+    }
+
+    /// Every week · 2 weeks · 3 weeks · 4 weeks (every-n-weeks spec §6); a
+    /// rhythm set elsewhere past 4 (the assistant goes up to 8) shows as a
+    /// fifth, selected chip.
+    private func weeksRow(days: [Int], weeks: Int) -> some View {
+        chipScroll {
+            ForEach([1, 2, 3, 4], id: \.self) { n in
+                chip(n == 1 ? "Every week" : "\(n) weeks", selected: weeks == n) {
+                    if weeks != n { applyWeekly(days: days.isEmpty ? [1] : days, interval: n) }
+                }
+            }
+            if weeks > 4 { chip("Every \(weeks) weeks", selected: true) {} }
+        }
+    }
+
+    /// "Starts": one chip per week of the cycle, from the series' next date,
+    /// so the stored weeks are the first (selected) chip. Tapping another
+    /// moves week one there (the off weeks' open days go, the new ones come).
+    private func startsRow(days: [Int], weeks: Int, anchor: String) -> some View {
+        let today = Clock.todayISO()
+        let base = editTarget.recurrence.flatMap { nextRuleDate($0, fromIso: today) } ?? today
+        let chips = startsChips(days: days, interval: weeks, baseIso: base)
+        return HStack(spacing: 8) {
+            Text("Starts").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            chipScroll {
+                ForEach(chips, id: \.anchor) { c in
+                    let on = sameWeeks(c.anchor, anchor, interval: weeks)
+                    chip(shortDayName(c.date), selected: on) {
+                        if !on { applyWeekly(days: days, interval: weeks, anchor: c.anchor) }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Save a weekly-days rule with `interval` weeks (1 = plain weekly). Week
+    /// one (spec §5): `anchor` when the user picked it in "Starts"; else the
+    /// stored one when N is unchanged; else the week of the current rule's
+    /// next date (or, from daily / monthly / no repeat, of the series' next
+    /// block, else today).
+    private func applyWeekly(days: [Int], interval: Int, anchor: String? = nil) {
+        let rec = editTarget.recurrence
+        let today = Clock.todayISO()
+        let week1 = anchor ?? recurrenceEditAnchor(
+            current: rec, newDays: days, newInterval: interval, todayIso: today,
+            startIso: recurrenceAnchor(taskId: editTarget.id, blocks: myBlocks, todayIso: today)?.date)
+        applyRecurrence(weeklyRule(days: days, interval: interval, anchor: week1, until: rec?.untilDate))
     }
 
     // MARK: tags
@@ -764,14 +820,30 @@ struct TaskEditor: View {
         var seedTime = seed?.startTime
         var parsed = seed.flatMap { Self.parseIso($0.date) } ?? Date()
         if let pending = pendingRecurrence {
-            parsed = materializeOccurrences(pending, startDate: today, startTime: "00:00", horizonDays: 35)
-                .first.flatMap { Self.parseIso($0.date) } ?? today
-        } else if editTarget.recurrence != nil {
+            // Every N weeks: the rule's own next date (a 35-day scan finds
+            // none from N = 6 when this week's days have passed).
+            if case .everyNWeeks = pending {
+                parsed = nextRuleDate(pending, fromIso: Clock.todayISO()).flatMap(Self.parseIso) ?? today
+            } else {
+                parsed = materializeOccurrences(pending, startDate: today, startTime: "00:00", horizonDays: 35)
+                    .first.flatMap { Self.parseIso($0.date) } ?? today
+            }
+        } else if let rec = editTarget.recurrence {
             let todayIso = Clock.todayISO()
             seed = recurrenceAnchor(taskId: editTarget.id, blocks: myBlocks, todayIso: todayIso) ?? myBlocks.first
             seedTime = recurrenceEditStart(taskId: editTarget.id, recurrence: editTarget.recurrence,
                                            blocks: myBlocks, todayIso: todayIso)?.startTime ?? seed?.startTime
             parsed = seed.flatMap { Self.parseIso($0.date) } ?? Date()
+            // Every N weeks seeds a date the RULE has: the first live block on
+            // one, else the rule's next date — never an occurrence moved into
+            // an off week, or "OK" without changes would re-anchor the series
+            // there (every-n-weeks spec §6).
+            if case .everyNWeeks = rec {
+                let onRule = myBlocks.filter { !$0.done && !$0.skipped && $0.date >= todayIso && isRuleDay(rec, iso: $0.date) }
+                if let first = onRule.first.flatMap({ Self.parseIso($0.date) }) ?? nextRuleDate(rec, fromIso: todayIso).flatMap(Self.parseIso) {
+                    parsed = first
+                }
+            }
         }
         datePick = max(parsed, today)
         timePick = seedTime.flatMap { Self.parseHHmm($0) } ?? Date()
@@ -813,6 +885,25 @@ struct TaskEditor: View {
         // move-count bump is the last write — a trailing setLater built from
         // the pre-schedule row used to land after it and undo the bump.
         var target = editTarget
+        // Scheduling an every-N-weeks series re-anchors it on the chosen day
+        // (spec §5). With a Later un-park in play, both whole-row writes carry
+        // the new weeks, the row awaited before the series is planned —
+        // setLater's un-awaited write could otherwise land after it and put
+        // the old weeks back.
+        if let re = reanchoredForSchedule(target.recurrence, chosenIso: dateIso), target.later == true {
+            target.recurrence = re
+            target.later = false
+            target.updatedAt = AppModel.isoNow()
+            let row = target
+            Task {
+                guard await model.saveTaskAwaiting(row) else { return }
+                model.scheduleTaskAt(row, date: dateIso, startTime: timeIso)
+                ReminderScheduler.shared.resync()
+            }
+            scheduledLabel = "\(dateIso.suffix(5)) \(formatTime(timeIso))"
+            showSchedule = false
+            return
+        }
         if target.later == true {
             model.setLater(target, false)
             target.later = false
@@ -841,21 +932,16 @@ struct TaskEditor: View {
         switch r {
         case .none: return .none
         case .daily: return .daily
-        case .weekly: return .weekly
+        // Every N weeks is the Weekly mode with its weeks row set past 1.
+        case .weekly, .everyNWeeks: return .weekly
         case .monthly: return .monthly
         }
     }
     private func weeklyDays(_ r: Recurrence?) -> [Int] {
-        if case .weekly(let d, _) = r { return d }
-        return []
+        r?.weekDays ?? []
     }
     private func withUntil(_ r: Recurrence?, _ until: String?) -> Recurrence? {
-        switch r {
-        case .none: return nil
-        case .daily: return .daily(until: until)
-        case .weekly(let d, _): return .weekly(daysOfWeek: d, until: until)
-        case .monthly: return .monthly(until: until)
-        }
+        r?.withUntil(until)
     }
 
     private static func ymd(_ date: Date) -> String {

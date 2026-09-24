@@ -54,6 +54,53 @@ final class SeriesWeekdayTests: XCTestCase {
     }
 }
 
+/// Every-n-weeks spec §7.3: the off-week guard and its wording.
+final class SeriesOffWeekTests: XCTestCase {
+    private let fortnightly: Recurrence = .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil)
+
+    func testAnOffWeekThursdayIsRefusedWithTheNearestOnWeekThursdays() throws {
+        XCTAssertTrue(isOffSeriesWeek(fortnightly, date: "2026-10-15"))
+        XCTAssertFalse(isOffSeriesWeek(fortnightly, date: "2026-10-22"))
+        XCTAssertFalse(isOffSeriesWeek(fortnightly, date: "2026-10-16"), "an off WEEKDAY is isOffSeriesDay's")
+        XCTAssertFalse(isOffSeriesWeek(.weekly(daysOfWeek: [4], until: nil), date: "2026-10-15"))
+        XCTAssertTrue(isOffSeriesDay(fortnightly, date: "2026-10-16"))
+        XCTAssertFalse(isOffSeriesDay(fortnightly, date: "2026-10-15"))
+        let r = try XCTUnwrap(rejectOffSeriesWeek(taskName: "Office Focus", recurrence: fortnightly, date: "2026-10-15", today: "2026-09-30"))
+        XCTAssertEqual(r, "error: \"Office Focus\" repeats every 2 weeks on Thursday, and Thu 15 Oct is an off week — nothing was scheduled."
+            + " The nearest Thursdays it repeats on are Thu 8 Oct (2026-10-08) and Thu 22 Oct (2026-10-22)."
+            + " Call schedule_task again with the day the user meant."
+            + " Only if they asked for Thu 15 Oct on purpose, as a one-off, call schedule_task again with exactly 2026-10-15."
+            + " To change the weeks or days it repeats on, call set_task_recurrence first.")
+        XCTAssertNil(rejectOffSeriesWeek(taskName: "Office Focus", recurrence: fortnightly, date: "2026-10-22", today: "2026-09-30"))
+    }
+
+    func testNearestRuleDatesReachAcrossTheWholeCycle() {
+        let every4: Recurrence = .everyNWeeks(interval: 4, daysOfWeek: [4], anchor: "2026-09-21", until: nil)
+        XCTAssertEqual(nearestRuleDates(every4, date: "2026-10-08", today: "2026-09-24"), ["2026-09-24", "2026-10-22"])
+        // Never before today.
+        XCTAssertEqual(nearestRuleDates(every4, date: "2026-10-08", today: "2026-09-25"), ["2026-10-22"])
+        // Two days a week, one weekday named: "days".
+        let two: Recurrence = .everyNWeeks(interval: 2, daysOfWeek: [1, 4], anchor: "2026-09-21", until: nil)
+        XCTAssertEqual(nearestRuleDates(two, date: "2026-10-15", today: "2026-09-30"), ["2026-10-08", "2026-10-19"])
+        XCTAssertTrue(rejectOffSeriesWeek(taskName: "X", recurrence: two, date: "2026-10-15", today: "2026-09-30")?
+            .contains(" The nearest days it repeats on are Thu 8 Oct (2026-10-08) and Mon 19 Oct (2026-10-19).") ?? false)
+        // An ended series names what is left.
+        let ended: Recurrence = .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: "2026-10-10")
+        XCTAssertEqual(nearestRuleDates(ended, date: "2026-10-15", today: "2026-09-30"), ["2026-10-08"])
+    }
+
+    func testTheWeekdayRefusalAndTheOneOffNoteNameTheRhythm() throws {
+        let r = try XCTUnwrap(rejectOffSeriesDay(taskName: "Office Focus", recurrence: fortnightly, date: "2026-10-16", today: "2026-09-30"))
+        XCTAssertTrue(r.hasPrefix("error: \"Office Focus\" repeats every 2 weeks on Thursday, but 2026-10-16 is a Friday — nothing was scheduled."
+            + " Its nearest days are Thursday 8 October (2026-10-08) or Thursday 22 October (2026-10-22)."), r)
+        XCTAssertEqual(offSeriesDayNote(recurrence: fortnightly, date: "2026-10-15"),
+                       " — a one-off on Thursday 15 October; the series stays every 2 weeks on Thursday")
+        XCTAssertEqual(shortDayName("2026-10-08"), "Thu 8 Oct")
+        XCTAssertEqual(weeklyDays(fortnightly), [4])
+        XCTAssertNil(weeklyDays(.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "soon", until: nil)), "an invalid rule is no series")
+    }
+}
+
 final class ConfirmFirstTests: XCTestCase {
     private func allows(_ target: String?, _ user: String, prev: String? = nil) -> Bool {
         ConfirmFirst.allows(tool: "delete_task", target: target, userText: user, previousAssistant: prev)

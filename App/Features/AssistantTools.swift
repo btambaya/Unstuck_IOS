@@ -441,6 +441,23 @@ private func liveBlockAt(_ api: AssistantAppState, _ task: TaskItem, date: Strin
 @MainActor
 private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?,
                           scratch: TurnScratch) async -> String? {
+    var task = task
+    // A FIRST placement of an every-N-weeks series (nothing live after today)
+    // starts the series here (every-n-weeks spec §5): week one becomes the
+    // week of the first series day on or after the date. The row is written
+    // BEFORE the fill below reads the rule, or the tail would be minted on the
+    // old weeks. Moving one occurrence of a live series never re-anchors.
+    if task.recurrence != nil,
+       !api.getBlocks().contains(where: { $0.taskId == task.id && !$0.done && !$0.skipped && $0.date > api.todayIso() }),
+       let re = reanchoredForSchedule(task.recurrence, chosenIso: date) {
+        let fresh = api.getTasks().first { $0.id == task.id } ?? task
+        var next = fresh
+        next.recurrence = re
+        next.updatedAt = AppModel.isoNow()
+        await api.upsertTask(next)
+        scratch.newTasks[next.id] = next
+        task = next
+    }
     let blocks = api.getBlocks()
     // The anchor to move is the task's NEXT LIVE block — first-in-array grabbed
     // an old done/skipped occurrence on real accounts (tester round, 2026-09-01).
@@ -615,6 +632,20 @@ func refreshScratchList(_ id: String, api: AssistantAppState, scratch: TurnScrat
 /// The registry's list-colour vocabulary (create_list / recolor_list).
 let LIST_COLORS = ["indigo", "coral", "green", "amber", "blue", "violet"]
 
+/// set_task_recurrence's `intervalWeeks`, read as sent (spec §7.2): absent
+/// (or null), a whole number (2 and 2.0 alike), or anything else — "2", true,
+/// 2.5 — which is refused, never rounded or coerced.
+enum IntervalWeeksArg: Equatable { case absent, value(Int), notWhole }
+
+func intervalWeeksArg(_ args: ToolArgs) -> IntervalWeeksArg {
+    switch args.raw["intervalWeeks"] {
+    case nil, .null?: return .absent
+    case .integer(let i)?: return .value(i)
+    case .double(let d)?: return Int(exactly: d).map { .value($0) } ?? .notWhole
+    default: return .notWhole
+    }
+}
+
 /// A recurrence's day list, spelled ("Mon, Wed") for a result line.
 func weekdayNames(_ days: [Int]) -> String {
     days.sorted().map { WEEKDAY_NAMES_CAP[max(0, min(6, $0))].prefix(3) }.map(String.init).joined(separator: ", ")
@@ -725,11 +756,20 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // there earlier) is that one-off being retimed, not a new day — as
         // on web and Android.
         var oneOff = ""
-        if isOffSeriesDay(t.recurrence, date: date),
+        // An every-N-weeks series on one of its weekdays in an OFF week is
+        // refused the same way (spec §7.3) — except on the series' FIRST
+        // placement (nothing live after today), which re-anchors the series
+        // on that day, so every week is valid then.
+        let placesSeries = t.recurrence != nil
+            && !api.getBlocks().contains { $0.taskId == t.id && !$0.done && !$0.skipped && $0.date > api.todayIso() }
+        let offWeek = !placesSeries && isOffSeriesWeek(t.recurrence, date: date)
+        if isOffSeriesDay(t.recurrence, date: date) || offWeek,
            !api.getBlocks().contains(where: { $0.taskId == t.id && isTaskBlock($0) && $0.date == date }) {
             let key = "schedule|\(t.id)|\(date)"
             if !scratch.offDayRefused.contains(key),
-               let refusal = rejectOffSeriesDay(taskName: t.name, recurrence: t.recurrence, date: date, today: api.todayIso()) {
+               let refusal = offWeek
+                ? rejectOffSeriesWeek(taskName: t.name, recurrence: t.recurrence, date: date, today: api.todayIso())
+                : rejectOffSeriesDay(taskName: t.name, recurrence: t.recurrence, date: date, today: api.todayIso()) {
                 scratch.offDayRefused.insert(key)
                 return refusal
             }
@@ -824,12 +864,30 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // Weekly with no days used to save an EMPTY weekly series (never
         // materialised a single day) and report ok — refuse and ask instead.
         if kind == "weekly" && days.isEmpty { return "error: weekly needs daysOfWeek (0=Sunday … 6=Saturday) — ask which days" }
+        // Every N weeks (spec §7.2). A stop ignores it, like any stray weekly
+        // param: Zubair's own cancel carried daysOfWeek [4] (2026-09-24
+        // 07:02:50), and refusing a cancel over an intervalWeeks would be
+        // absurd. Checked as a whole number, never rounded (2.5 is not 3).
+        let stopping = kind == nil || kind == "none"
+        var interval: Int?
+        if !stopping {
+            switch intervalWeeksArg(args) {
+            case .absent:
+                break
+            case .notWhole:
+                return "error: intervalWeeks must be a whole number of weeks (2 = every other week) — nothing changed"
+            case .value(let n):
+                if kind != "weekly" && n >= 2 { return "error: every N weeks only goes with kind weekly and its days — nothing changed" }
+                if n < 1 || n > 8 { return "error: every N weeks goes up to every 8 weeks — nothing changed; tell the user this rhythm isn't available" }
+                interval = n
+            }
+        }
         // Stopping a repeat that isn't there: what the user asked for is
         // already true, so it is a success that changed nothing. As an error
         // the model told Zubair "It didn't change anything… doesn't actually
         // have recurrence" right after he'd asked it to stop (iOS call,
         // 2026-09-24 07:03:25). No receipt (NOTHING_TO_CHANGE). As on web.
-        if kind == nil || kind == "none", t.recurrence == nil { return "ok: \"\(t.name)\" already doesn't repeat\(NOTHING_TO_CHANGE)" }
+        if stopping, t.recurrence == nil { return "ok: \"\(t.name)\" already doesn't repeat\(NOTHING_TO_CHANGE)" }
         // The slot placed for it earlier THIS turn (create_task / schedule_task
         // with a date) on a day the new weekly days don't include: the park-run
         // variant — create_task on Sunday 20 Sep, then weekly on Saturday,
@@ -845,23 +903,6 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
                 return refusal
             }
         }
-        let rec: Recurrence?
-        switch kind {
-        case "daily": rec = .daily(until: until)
-        case "weekly": rec = .weekly(daysOfWeek: days, until: until)
-        case "monthly": rec = .monthly(until: until)
-        default: rec = nil
-        }
-        // The editor's rule (audit 2026-09-22, C3): "stop repeating" carries a
-        // ticked today onto the task, and a repeat turned on never leaves a
-        // DONE template (an ended series).
-        let before = t
-        t = taskAfterSettingRecurrence(t, recurrence: rec, blocks: api.getBlocks(), todayIso: api.todayIso(), nowISO: now())
-        t.updatedAt = now()
-        await api.upsertTask(t)
-        scratch.newTasks[t.id] = t
-        // Regenerate future blocks off the existing anchor, if scheduled.
-        let blocks = api.getBlocks()
         let today = api.todayIso()
         // An occurrence schedule_task placed earlier in this turn sets the
         // series' day and time: "make Office every Monday at 11" on a series
@@ -869,13 +910,65 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // below kept 09:15 and put the new 11:00 back while replying ok —
         // leaving no tool that could re-time a series (audit 2026-09-22, C1).
         let placed = scratch.placedBlocks[t.id].flatMap { id in
-            blocks.first { $0.id == id && !$0.done && !$0.skipped && !$0.startTime.isEmpty && $0.date >= today }
+            api.getBlocks().first { $0.id == id && !$0.done && !$0.skipped && !$0.startTime.isEmpty && $0.date >= today }
         }
+        // The rhythm (spec §7.2): an omitted intervalWeeks KEEPS the task's —
+        // "move it to Fridays" on a fortnightly series stays fortnightly, and
+        // the model needn't know N. 1 is plain weekly.
+        let oldWeeks = t.recurrence?.intervalWeeks
+        var keepsWeeks = false
+        let rec: Recurrence?
+        switch kind {
+        case "daily": rec = .daily(until: until)
+        case "monthly": rec = .monthly(until: until)
+        case "weekly":
+            let n = interval ?? (t.recurrence.flatMap { r -> Int? in
+                if case .everyNWeeks(let n, _, _, _) = r, isValidEveryNWeeks(r) { return n }
+                return nil
+            } ?? 1)
+            if n >= 2 {
+                // Week one (spec §5): the stored anchor when N is unchanged —
+                // such an edit never moves the weeks, even over a block placed
+                // this turn; else the week of the day placed this turn (the
+                // Zubair case: create_task put Thu 24 Sep → week of 21 Sep);
+                // else the week of the current rule's next date.
+                if case .everyNWeeks(let old, _, let anchor, _)? = t.recurrence, old == n, strictEpochDay(anchor) != nil {
+                    keepsWeeks = true
+                    rec = weeklyRule(days: days, interval: n, anchor: anchor, until: until)
+                } else if let placed {
+                    rec = weeklyRule(days: days, interval: n, anchor: seriesAnchor(days: days, fromIso: placed.date), until: until)
+                } else {
+                    let from = recurrenceAnchor(taskId: t.id, blocks: api.getBlocks(), todayIso: today)?.date
+                    rec = weeklyRule(days: days, interval: n,
+                                     anchor: recurrenceEditAnchor(current: t.recurrence, newDays: days, newInterval: n,
+                                                                  todayIso: today, startIso: from),
+                                     until: until)
+                }
+            } else {
+                rec = .weekly(daysOfWeek: days, until: until)
+            }
+        default: rec = nil
+        }
+        // The editor's rule (audit 2026-09-22, C3): "stop repeating" carries a
+        // ticked today onto the task, and a repeat turned on never leaves a
+        // DONE template (an ended series).
+        let before = t
+        t = taskAfterSettingRecurrence(t, recurrence: rec, blocks: api.getBlocks(), todayIso: today, nowISO: now())
+        t.updatedAt = now()
+        await api.upsertTask(t)
+        scratch.newTasks[t.id] = t
+        // Regenerate future blocks off the existing anchor, if scheduled.
+        let blocks = api.getBlocks()
         // Otherwise the earliest LIVE block, never an arbitrary one — see
         // recurrenceAnchor — at the series' own time and day, never a one-off
         // moved occurrence's (recurrenceEditStart, audit 2026-09-22, C1).
-        let start = placed.map { RecurrenceStart(date: $0.date, startTime: $0.startTime, horizonDays: RECURRENCE_HORIZON_DAYS) }
-            ?? recurrenceEditStart(taskId: t.id, recurrence: rec, blocks: blocks, todayIso: today)
+        // An every-N-weeks edit that keeps N runs from TODAY at the placed
+        // time (spec §5): the weeks come from the rule, and the placed block
+        // may be a one-off moved into an off week earlier in the session.
+        let start = placed.map {
+            keepsWeeks ? RecurrenceStart(date: today, startTime: $0.startTime, horizonDays: RECURRENCE_HORIZON_DAYS)
+                : RecurrenceStart(date: $0.date, startTime: $0.startTime, horizonDays: RECURRENCE_HORIZON_DAYS)
+        } ?? recurrenceEditStart(taskId: t.id, recurrence: rec, blocks: blocks, todayIso: today)
         if let start {
             // This month's moved occurrence (see RecurrenceStart) goes INTO the
             // plan as kept. The lists are disjoint (stage 2): rewrites are plain
@@ -912,12 +1005,34 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // materialised nothing yet said a plain "ok" (audit 2026-09-22, C7).
         let anchored = start != nil
         guard let kind, kind != "none" else { return "ok: \"\(t.name)\" no longer repeats\(anchored ? " (future occurrences removed)" : "")\(doneNote)" }
-        let how = kind == "weekly" ? "weekly on \(weekdayNames(days))" : kind
+        // The line always names the rhythm it saved (spec §7.2) — "weekly" or
+        // "every N weeks" — so a model that meant every week sees a kept N.
+        let how: String
+        switch rec {
+        case .everyNWeeks(let n, let d, _, _)?: how = "every \(n) weeks on \(weekdayNames(d))"
+        case .weekly?: how = "weekly on \(weekdayNames(days))"
+        default: how = kind
+        }
         // The time the series now runs at, so the reply can't claim a re-time
         // that didn't happen (audit 2026-09-22, C1).
         let at = start.map { " at \($0.startTime)" } ?? ""
         let till = until.map { " until \($0)" } ?? ""
-        return "ok: \"\(t.name)\" now repeats \(how)\(at)\(till)\(doneNote)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
+        // Every N weeks: the next two dates it runs on, from the store AFTER
+        // the writes — dates the rule has AND a live occurrence holds, today's
+        // own while it is open (Zubair asked at 07:02 with today's 10:30 still
+        // ahead) — so the reply can't misstate which weeks count.
+        var next = ""
+        if let rec, case .everyNWeeks = rec, anchored {
+            let dates = Set(api.getBlocks().filter {
+                $0.taskId == t.id && isTaskBlock($0) && !$0.done && !$0.skipped && $0.date >= today && isRuleDay(rec, iso: $0.date)
+            }.map(\.date)).sorted().prefix(2).map { "\(shortDayName($0))\($0 == today ? " (today)" : "")" }
+            if let first = dates.first { next = " — next \(first)" + (dates.count > 1 ? ", then \(dates[1])" : "") }
+        }
+        // A call that CHANGED the rhythm says so: "every week now; it was every 2 weeks".
+        func weeks(_ n: Int) -> String { n == 1 ? "every week" : "every \(n) weeks" }
+        let newWeeks = rec?.intervalWeeks
+        let changed = oldWeeks.flatMap { o in newWeeks.flatMap { n in n != o ? " — \(weeks(n)) now; it was \(weeks(o))" : nil } } ?? ""
+        return "ok: \"\(t.name)\" now repeats \(how)\(at)\(till)\(doneNote)\(next)\(changed)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
 
     case "complete_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }

@@ -43,6 +43,36 @@ phases land. Newest status at the top.
 
 
 
+## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
+
+Zubair asked for "every two weeks on Thursdays"; Ahmad approved it the same morning (week = ISO Monday; UI chips
+Every week · 2 · 3 · 4 weeks, the assistant up to 8; "Starts" chips shown; moving days keeps the rhythm; Schedule on a
+series re-anchors). Normative spec: every-n-weeks-spec.md (scratchpad of that run); shared vectors
+`unstuck/lib/recurrence-vectors.json` → `Tests/UnstuckCoreTests/RecurrenceVectors.generated.swift`.
+
+- **Model + codec.** `Recurrence.everyNWeeks(interval:daysOfWeek:anchor:until:)` =
+  `{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-09-21"}`. Strict decode (§2): integral interval
+  ≥ 1 (2.0 ok; "2", true, 2.5 no), anchor a real strict YYYY-MM-DD (`strictEpochDay`, never `LocalDate.parse`), days
+  all integral numbers; anything else → the unknown sentinel (never a throw). Old builds (≤ b92) read it as the
+  sentinel and write that back whole — migration 081 (web/backend) keeps the stored rule.
+- **The rule (Recurrence.swift).** Week index = whole weeks between Mondays in EPOCH DAYS from civil fields
+  (`civilEpochDay`, pure integer math) — never instants, never the ISO week number. `isRuleDay`, `seriesAnchor`,
+  `nextRuleDate`, `startsChips`, `recurrenceEditAnchor` (§5), `reanchoredForSchedule`, `weeklyRule` (N 1 → weekly),
+  `occurrenceReach` over the 7N cycle, labels ("Repeats every 2 weeks on Thu"). `recurrenceEditStart` returns TODAY
+  + 56 days for an N-week rule (E1/E2). Top-up/regenerate/Google/analytics need nothing else (blocks carry no rule).
+- **Writers.** Create sheet: Weekly → weeks chips + "Starts" chips; the first occurrence goes on the picked Starts
+  day. Task editor: same rows; day toggles keep N and the stored weeks; the Schedule seed is a date the rule has.
+  `AppModel.scheduleTaskAt` re-anchors an N-week series on an off-week day (row written first, then blocks).
+- **Assistant.** `set_task_recurrence.intervalWeeks` (1–8, omitted = keep N, 1 = weekly); errors per §7.2; the ok
+  line names the rhythm, the next two live on-rule dates ("— next Thu 24 Sep (today), then Thu 8 Oct") and a change
+  ("— every week now; it was every 2 weeks"). `schedule_task`: off-week guard (refused once, nearest rule dates up to
+  7N days away, then a one-off) except on a FIRST placement, which re-anchors. Receipt reads the rhythm from the
+  result. Voice REPEATS rule = `prompts.voiceRepeatsRule`. `ToolRegistry.caps` now reports `recurrence_interval`.
+- **Patterns** skip every-N-weeks templates (no "still on for Sunday?" on an off week).
+- Tests: `EveryNWeeksVectorTests` (all §9 tables, materialize in UTC + New York + Auckland, the b92 codec as a
+  fixed point), `SeriesOffWeekTests`, receipts, DbRowCodec; app `EveryNWeeksExecutorTests` (X1–X9 + E2/E3 through the
+  executor), voice compaction keeps "every 2–8 weeks".
+
 ## Zubair's morning call fixes (branch zubair/ios, 2026-09-24) — not shipped yet
 
 From prod assistant_turns, session 1cbfac75 (07:01–07:03 UTC). Web did its half in the same run (commits cbad570, d7441b7).

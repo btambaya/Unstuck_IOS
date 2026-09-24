@@ -118,4 +118,18 @@ final class VoiceToolCompactionTests: XCTestCase {
         let area = props["area"] as? [String: Any] ?? [:]
         XCTAssertNil(area["description"], "prose that only restates the parameter name goes too")
     }
+
+    /// Every-n-weeks spec §7.1: voice keeps only first sentences, so the tool's
+    /// must name every N weeks within the 90-character cap, and the
+    /// parameter's survives whole.
+    func testSetTaskRecurrenceStillSaysEveryNWeeksOnVoice() throws {
+        let tool = try XCTUnwrap(VoiceToolCompaction.compact(ToolRegistry.voice).first { $0["name"] as? String == "set_task_recurrence" })
+        XCTAssertEqual(tool["description"] as? String,
+                       "Repeat a task daily, weekly or every 2–8 weeks on given days, or monthly; kind=none stops…")
+        let props = (tool["parameters"] as? [String: Any])?["properties"] as? [String: Any]
+        let p = try XCTUnwrap(props?["intervalWeeks"] as? [String: Any])
+        XCTAssertEqual(p["type"] as? String, "integer")
+        XCTAssertEqual(p["description"] as? String, "Every N weeks, 1–8 (2 = every other week / fortnightly).")
+        XCTAssertNil(p["cap"], "a registry cap never reaches the realtime session")
+    }
 }

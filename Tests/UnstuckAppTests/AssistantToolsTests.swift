@@ -854,9 +854,11 @@ final class AssistantToolsTests: XCTestCase {
     /// §6 (f): toolCaps rides on the TEXT request only — never in the context
     /// the voice instructions serialise (or the tour's).
     func testToolCapsGoOnTheTextRequestOnly() {
-        XCTAssertEqual(ToolRegistry.caps, ["period_review"])
+        // recurrence_interval: this build executes set_task_recurrence's
+        // intervalWeeks (every-n-weeks spec §7.1), so the server offers it.
+        XCTAssertEqual(ToolRegistry.caps, ["period_review", "recurrence_interval"])
         let text = textRequestContext(api)
-        XCTAssertEqual(text["toolCaps"], .array([.string("period_review")]))
+        XCTAssertEqual(text["toolCaps"], .array([.string("period_review"), .string("recurrence_interval")]))
         XCTAssertNil(buildAssistantContext(api)["toolCaps"])
         XCTAssertFalse(buildVoiceInstructions(api).contains("toolCaps"))
         XCTAssertFalse(buildVoiceInstructions(api).contains("period_review\""))
@@ -874,15 +876,19 @@ final class AssistantToolsTests: XCTestCase {
     }
 
     /// Zubair's iOS call, 2026-09-24: "every two weeks on Thursdays" got
-    /// weekly first and "I can't set it to every two weeks" after. The spoken
-    /// prompt carries web's REPEATS_RULE verbatim, with the rules of conduct
-    /// (before HOW YOU SPEAK, after the calls rule — web's order).
+    /// weekly first and "I can't set it to every two weeks" after. This build
+    /// executes intervalWeeks, so the spoken prompt carries the every-N-weeks
+    /// REPEATS rule — verbatim the shared vectors' prompts.voiceRepeatsRule
+    /// (lib/recurrence-vectors.json) — with the rules of conduct (before HOW
+    /// YOU SPEAK, after the calls rule — web's order).
     func testVoiceInstructionsSayAnUnsupportedRepeatBeforeSettingAnything() throws {
         let v = buildVoiceInstructions(api)
-        let rule = "REPEATS: a task can repeat daily, weekly on chosen days, or monthly, optionally until a last date — nothing else. "
-            + "If they ask for a repeat those can't express (every two weeks, every other month, the third Tuesday), say so FIRST and offer the closest options "
-            + "as a question (\"Every other week isn't an option — weekly on Thursdays, or just this one?\"), never as \"I'll set it weekly…\"; "
+        let rule = "REPEATS: a task can repeat daily, weekly or every 2–8 weeks on chosen days, or monthly, optionally until a last date — nothing else. "
+            + "Every two weeks (every other week, fortnightly) is weekly with intervalWeeks 2; the result names the rhythm it saved and the next dates — say what it says. "
+            + "If they ask for a repeat those can't express (every other month, the third Tuesday, every ten days), say so FIRST and offer the closest options "
+            + "as a question (\"Every other month isn't an option — monthly, or just this one?\"), never as \"I'll set it monthly…\"; "
             + "never set a different pattern before they agree to it. "
+        XCTAssertFalse(v.contains("every two weeks, every other month"), "the old 'every two weeks isn't an option' wording is gone")
         let at = try XCTUnwrap(v.range(of: rule))
         XCTAssertLessThan(at.lowerBound, try XCTUnwrap(v.range(of: "HOW YOU SPEAK")).lowerBound)
         XCTAssertGreaterThan(at.lowerBound, try XCTUnwrap(v.range(of: "CALLS: Unstuck can phone them.")).lowerBound)
@@ -4330,5 +4336,208 @@ final class GoogleWriteBackAppTests: XCTestCase {
         XCTAssertEqual(google.calls, ["patch primary evtOld", "insert primary Dentist"])
         XCTAssertEqual(try db.fetchById(CalBlock.self, id: stale.id)?.externalEventId, "evt1")
         XCTAssertTrue(try XCTUnwrap(model.googleBacklog).unconfirmedEventIds().isEmpty)
+    }
+}
+
+// MARK: - every N weeks (every-n-weeks spec §7.2, §7.3; shared executor cases X1–X9)
+
+/// The executor cases of lib/recurrence-vectors.json (`executor.cases`),
+/// with the vector task, so every mint's deterministic id is pinned too.
+@MainActor
+final class EveryNWeeksExecutorTests: XCTestCase {
+    private var api = FakeAssistantState()
+    private var scratch = TurnScratch()
+    private let TID = "3f1c2a9e-5b7d-4c21-9a0e-7d2b1c4e8f60"
+    private let V1 = Recurrence.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil)
+
+    override func setUp() async throws {
+        try await super.setUp()
+        api = FakeAssistantState()
+        scratch = TurnScratch()
+    }
+
+    private func run(_ name: String, _ json: String) async -> String {
+        await runAssistantTool(name: name, args: ToolArgs(json: json), api: api, scratch: scratch)
+    }
+    private func occ(_ date: String, _ time: String = "10:30", done: Bool = false) -> CalBlock {
+        CalBlock(id: occurrenceId(taskId: TID, date: date), taskId: TID, taskName: "Office Focus", startTime: time,
+                 durationMinutes: 60, date: date, kind: .task, done: done)
+    }
+    private func receipt(_ args: ReceiptArgs, _ result: String) -> String? {
+        deriveReceipt(name: "set_task_recurrence", args: args, result: result, tasks: api.tasks)?.label
+    }
+    private func snapshot<T: Encodable>(_ v: T) -> String {
+        let e = JSONEncoder()
+        e.outputFormatting = [.sortedKeys]
+        return (try? e.encode(v)).flatMap { String(data: $0, encoding: .utf8) } ?? ""
+    }
+    private var rule: Recurrence? { api.tasks.first { $0.id == TID }?.recurrence }
+    private var live: [String] {
+        api.blocks.filter { $0.taskId == TID && !$0.done && !$0.skipped }.map(\.date).sorted()
+    }
+    /// The common live series of X3–X7: V1's rule, 24 Sep … 5 Nov at 10:30.
+    private func seedSeries() {
+        api.today = "2026-09-24"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+        api.blocks = ["2026-09-24", "2026-10-08", "2026-10-22", "2026-11-05"].map { occ($0) }
+    }
+
+    /// X1 + X2: Zubair's turn replayed — create_task put today's 10:30 (still
+    /// ahead at 07:02), then every 2 weeks on Thursdays; then his stop,
+    /// carrying the stray daysOfWeek plus an intervalWeeks.
+    func testX1X2_ZubairsTurn_everyTwoWeeksOnThursdays_thenStop() async {
+        api.today = "2026-09-24"
+        api.now = "07:02"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60)]
+        api.blocks = [CalBlock(id: "placed", taskId: TID, taskName: "Office Focus", startTime: "10:30", durationMinutes: 60,
+                               date: "2026-09-24", kind: .task)]
+        scratch.placedBlocks[TID] = "placed"
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — next Thu 24 Sep (today), then Thu 8 Oct")
+        XCTAssertEqual(rule, V1)
+        XCTAssertTrue(api.blocks.contains { $0.id == "placed" && $0.date == "2026-09-24" }, "today's block is kept")
+        XCTAssertEqual(api.insertedBlocks, ["57241982-da03-5433-a2c1-f930c4040a2b", "3b773424-5396-5b9e-965c-bf8280df86e4",
+                                            "7cc40ec5-7729-5d13-aebf-2edabf4b65b8"].map { "\($0)|insert_or_retime" })
+        XCTAssertEqual(live, ["2026-09-24", "2026-10-08", "2026-10-22", "2026-11-05"])
+        XCTAssertEqual(receipt(ReceiptArgs(taskId: TID, kind: "weekly"), r), "Repeats every 2 weeks — “Office Focus”")
+
+        let stop = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"none","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertTrue(stop.hasPrefix("ok: \"Office Focus\" no longer repeats"), stop)
+        XCTAssertNil(rule)
+        XCTAssertEqual(live, ["2026-09-24"], "today stays, nothing after it")
+        XCTAssertEqual(receipt(ReceiptArgs(taskId: TID, kind: "none"), stop), "Repeat removed — “Office Focus”")
+        // A stop with a nonsense intervalWeeks is still just a stop (nothing to stop now).
+        let again = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"none","intervalWeeks":"2"}"#)
+        XCTAssertEqual(again, "ok: \"Office Focus\" already doesn't repeat — nothing to change")
+    }
+
+    /// X3: new days with intervalWeeks omitted KEEP every 2 weeks and the
+    /// stored anchor ("move it to Fridays" never silently doubles it).
+    func testX3_omittedIntervalKeepsTheRhythmAndTheWeeks() async {
+        seedSeries()
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[5]}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Fri at 10:30 — next Fri 25 Sep, then Fri 9 Oct")
+        XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [5], anchor: "2026-09-21", until: nil))
+        XCTAssertEqual(live, ["2026-09-24", "2026-09-25", "2026-10-09", "2026-10-23", "2026-11-06"],
+                       "today's Thursday is kept (an edit never touches today); the Fridays are the on-week ones")
+        XCTAssertEqual(receipt(ReceiptArgs(taskId: TID, kind: "weekly"), r), "Repeats every 2 weeks — “Office Focus”")
+    }
+
+    /// X4: intervalWeeks 1 goes back to plain weekly, and the line says the rhythm changed.
+    func testX4_intervalOneIsPlainWeeklyAndSaysSo() async {
+        seedSeries()
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":1}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats weekly on Thu at 10:30 — every week now; it was every 2 weeks")
+        XCTAssertEqual(rule, .weekly(daysOfWeek: [4], until: nil))
+        XCTAssertTrue(live.contains("2026-10-01") && live.contains("2026-10-15"), "\(live)")
+        XCTAssertEqual(receipt(ReceiptArgs(taskId: TID, kind: "weekly"), r), "Repeats weekly — “Office Focus”",
+                       "the receipt reads the saved rhythm, not the old one the line names")
+        // …and back to every 2 weeks, from weekly: the week of the next Thursday is week one.
+        let back = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(back, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — next Thu 24 Sep (today), then Thu 8 Oct — every 2 weeks now; it was every week")
+        XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil))
+        XCTAssertFalse(live.contains("2026-10-01") || live.contains("2026-10-15"), "the off-week Thursdays went: \(live)")
+    }
+
+    /// X5–X7: every refusal changes nothing.
+    func testX5X6X7_refusalsChangeNothing() async {
+        seedSeries()
+        let before = snapshot(api.tasks) + snapshot(api.blocks)
+        let range = "error: every N weeks goes up to every 8 weeks — nothing changed; tell the user this rhythm isn't available"
+        let whole = "error: intervalWeeks must be a whole number of weeks (2 = every other week) — nothing changed"
+        let kind = "error: every N weeks only goes with kind weekly and its days — nothing changed"
+        for (args, expect) in [(#""intervalWeeks":9"#, range), (#""intervalWeeks":0"#, range), (#""intervalWeeks":-2"#, range),
+                               (#""intervalWeeks":2.5"#, whole), (#""intervalWeeks":"2""#, whole), (#""intervalWeeks":true"#, whole)] {
+            let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],\#(args)}"#)
+            XCTAssertEqual(r, expect, args)
+        }
+        let daily = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"daily","intervalWeeks":2}"#)
+        XCTAssertEqual(daily, kind)
+        let monthly = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"monthly","intervalWeeks":3}"#)
+        XCTAssertEqual(monthly, kind)
+        XCTAssertEqual(snapshot(api.tasks) + snapshot(api.blocks), before)
+        XCTAssertEqual(rule, V1)
+        // 2.0 is 2 (a whole number sent as a double), and 8 is the most.
+        let eight = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":8.0}"#)
+        XCTAssertTrue(eight.hasPrefix("ok: \"Office Focus\" now repeats every 8 weeks on Thu at 10:30"), eight)
+        XCTAssertTrue(eight.hasSuffix(" — every 8 weeks now; it was every 2 weeks"), eight)
+    }
+
+    /// X8: a FIRST placement (nothing live after today) onto an off-week
+    /// Thursday is not refused; the series re-anchors there, and the fill runs
+    /// on the new weeks.
+    func testX8_firstPlacementOnAnOffWeekReanchors() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+        api.blocks = [occ("2026-09-24", done: true)]
+        let r = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-15","startTime":"10:30"}"#)
+        XCTAssertTrue(r.hasPrefix("ok:"), r)
+        XCTAssertFalse(r.contains("one-off"), r)
+        XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-10-12", until: nil))
+        for d in ["2026-10-15", "2026-10-29", "2026-11-12"] { XCTAssertTrue(live.contains(d), "\(d) in \(live)") }
+        for d in ["2026-10-08", "2026-10-22", "2026-11-05"] { XCTAssertFalse(live.contains(d), "\(d) in \(live)") }
+    }
+
+    /// X9: the same date on a LIVE series is an off week — refused once,
+    /// naming the nearest on-week Thursdays; the same call again is a one-off.
+    func testX9_offWeekOnALiveSeriesIsRefusedOnceThenAOneOff() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+        api.blocks = [occ("2026-09-24", done: true), occ("2026-10-08"), occ("2026-10-22"), occ("2026-11-05")]
+        let before = snapshot(api.tasks) + snapshot(api.blocks)
+        let refused = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-15","startTime":"10:30"}"#)
+        XCTAssertTrue(refused.hasPrefix("error: \"Office Focus\" repeats every 2 weeks on Thursday, and Thu 15 Oct is an off week — nothing was scheduled. The nearest Thursdays it repeats on are Thu 8 Oct (2026-10-08) and Thu 22 Oct (2026-10-22)"), refused)
+        XCTAssertEqual(snapshot(api.tasks) + snapshot(api.blocks), before, "an error writes nothing")
+        let again = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-15","startTime":"10:30"}"#)
+        XCTAssertTrue(again.hasPrefix("ok:"), again)
+        XCTAssertTrue(again.hasSuffix(" — a one-off on Thursday 15 October; the series stays every 2 weeks on Thursday"), again)
+        XCTAssertEqual(rule, V1, "moving one occurrence never re-anchors")
+        XCTAssertTrue(live.contains("2026-10-15"))
+        // An off WEEKDAY on the series names its real (on-week) dates.
+        let friday = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-16","startTime":"10:30"}"#)
+        XCTAssertTrue(friday.hasPrefix("error: \"Office Focus\" repeats every 2 weeks on Thursday, but 2026-10-16 is a Friday — nothing was scheduled. Its nearest days are Thursday 8 October (2026-10-08) or Thursday 22 October (2026-10-22)."), friday)
+    }
+
+    /// Every 4 weeks: the nearest dates are up to 28 days away, and are still named.
+    func testAnEveryFourWeeksRefusalStillNamesItsDates() async {
+        api.today = "2026-09-24"
+        api.now = "12:00"
+        let r4 = Recurrence.everyNWeeks(interval: 4, daysOfWeek: [4], anchor: "2026-09-21", until: nil)
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: r4)]
+        api.blocks = [occ("2026-09-24"), occ("2026-10-22"), occ("2026-11-19")]
+        let r = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-08","startTime":"10:30"}"#)
+        XCTAssertTrue(r.hasPrefix("error: \"Office Focus\" repeats every 4 weeks on Thursday, and Thu 8 Oct is an off week — nothing was scheduled. The nearest Thursdays it repeats on are Thu 24 Sep (2026-09-24) and Thu 22 Oct (2026-10-22)."), r)
+    }
+
+    /// Changing N with nothing placed: week one is the week of the current
+    /// rule's next date, so the next occurrence never jumps (E3).
+    func testChangingNKeepsTheNextOccurrence() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+        api.blocks = [occ("2026-09-24", done: true), occ("2026-10-08"), occ("2026-10-22"), occ("2026-11-05"), occ("2026-11-19")]
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":3}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 3 weeks on Thu at 10:30 — next Thu 8 Oct, then Thu 29 Oct — every 3 weeks now; it was every 2 weeks")
+        XCTAssertEqual(rule, .everyNWeeks(interval: 3, daysOfWeek: [4], anchor: "2026-10-05", until: nil))
+        XCTAssertEqual(live, ["2026-10-08", "2026-10-29", "2026-11-19"])
+    }
+
+    /// An until-only change on a series whose next block was moved into an
+    /// off week keeps the stored weeks (E2): the moved one goes back to its day.
+    func testAnUntilOnlyChangeKeepsTheWeeks() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+        var moved = occ("2026-10-08")
+        moved.date = "2026-10-15"
+        api.blocks = [occ("2026-09-24", done: true), moved, occ("2026-10-22"), occ("2026-11-05"), occ("2026-11-19")]
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"until":"2026-12-31"}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 until 2026-12-31 — next Thu 8 Oct, then Thu 22 Oct")
+        XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: "2026-12-31"))
+        XCTAssertEqual(live, ["2026-10-08", "2026-10-22", "2026-11-05", "2026-11-19"])
+        XCTAssertTrue(api.deletedBlockIds.isEmpty, "nothing deleted: \(api.deletedBlockIds)")
     }
 }

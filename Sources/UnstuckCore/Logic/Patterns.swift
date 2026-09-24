@@ -92,6 +92,11 @@ public func derivePatterns(_ tasks: [TaskItem], _ blocks: [CalBlock], todayIso: 
 
     for b in blocks {
         guard let tid = b.taskId, !tid.isEmpty, let task = taskById[tid] else { continue }
+        // An every-N-weeks series is not a weekly habit by definition: a
+        // fortnightly Sunday showed 3 distinct weeks in the 5-week window, so
+        // its off-week Sunday raised "still on for Sunday?" (every-n-weeks
+        // spec §8.2).
+        if case .everyNWeeks? = task.recurrence { continue }
         let d = LocalDate.parse(b.date)
         if d >= historyEnd || d < historyStart { continue }   // history only
         let dow = Time.dayOfWeekJS(d)

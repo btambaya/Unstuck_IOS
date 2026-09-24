@@ -55,6 +55,10 @@ struct NewTaskSheet: View {
     enum RepeatKind: String, CaseIterable { case none = "None", daily = "Daily", weekly = "Weekly", monthly = "Monthly" }
     @State private var repeatKind: RepeatKind = .none
     @State private var days: Set<Int> = []
+    /// Weekly's rhythm: 1 = every week, 2…4 = every N weeks (spec §6).
+    @State private var everyWeeks = 1
+    /// The week picked in "Starts" (its Monday); nil = the first chip.
+    @State private var startsAnchor: String?
     @State private var untilOn = false
     @State private var until = Date()
 
@@ -534,7 +538,11 @@ struct NewTaskSheet: View {
                 ForEach(RepeatKind.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
-            if repeatKind == .weekly { weekdayToggles }
+            if repeatKind == .weekly {
+                weekdayToggles
+                weeksRow
+                if everyWeeks >= 2 { startsRow }
+            }
             if repeatKind != .none {
                 Toggle("Ends on a date", isOn: $untilOn).font(UFont.sans(14))
                 if untilOn { DatePicker("Until", selection: $until, in: Date()..., displayedComponents: .date).font(UFont.sans(14)) }
@@ -641,6 +649,39 @@ struct NewTaskSheet: View {
                         .clipShape(Circle())
                 }
                 .buttonStyle(.plain)
+            }
+        }
+    }
+
+    /// Every week · 2 weeks · 3 weeks · 4 weeks (every-n-weeks spec §6).
+    private var weeksRow: some View {
+        chipScroll {
+            ForEach([1, 2, 3, 4], id: \.self) { n in
+                chip(n == 1 ? "Every week" : "\(n) weeks", selected: everyWeeks == n) { everyWeeks = n }
+            }
+        }
+    }
+
+    /// The "Starts" chips: one per week of the cycle, each the first chosen
+    /// weekday on or after the day picked above (else today) in its week, so
+    /// "which Thursdays?" is explicit. The first is the default.
+    private func startsCandidates(base: String) -> [StartsChip] {
+        startsChips(days: Array(days), interval: everyWeeks, baseIso: base)
+    }
+
+    private func selectedStart(_ chips: [StartsChip]) -> StartsChip? {
+        chips.first { $0.anchor == startsAnchor } ?? chips.first
+    }
+
+    private var startsRow: some View {
+        let chips = startsCandidates(base: effectiveDate ?? todayIso)
+        let picked = selectedStart(chips)
+        return HStack(spacing: 8) {
+            Text("Starts").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            chipScroll {
+                ForEach(chips, id: \.anchor) { c in
+                    chip(shortDayName(c.date), selected: c == picked) { startsAnchor = c.anchor }
+                }
             }
         }
     }
@@ -777,13 +818,20 @@ struct NewTaskSheet: View {
         return trimmed
     }
 
-    private func buildRecurrence() -> Recurrence? {
+    /// The rule to save, and — for every N weeks — the day its first
+    /// occurrence goes on: the "Starts" chip's (week one is that chip's week,
+    /// spec §5), resolved against `startDate`, the day picked (fresh clock).
+    private func buildRecurrence(startDate: String?) -> (Recurrence?, firstDate: String?) {
         let untilStr = untilOn ? Self.ymd(until) : nil
         switch repeatKind {
-        case .none: return nil
-        case .daily: return .daily(until: untilStr)
-        case .weekly: return .weekly(daysOfWeek: days.sorted(), until: untilStr)
-        case .monthly: return .monthly(until: untilStr)
+        case .none: return (nil, nil)
+        case .daily: return (.daily(until: untilStr), nil)
+        case .weekly:
+            guard everyWeeks >= 2, let start = selectedStart(startsCandidates(base: startDate ?? todayIso)) else {
+                return (.weekly(daysOfWeek: days.sorted(), until: untilStr), nil)
+            }
+            return (weeklyRule(days: Array(days), interval: everyWeeks, anchor: start.anchor, until: untilStr), start.date)
+        case .monthly: return (.monthly(until: untilStr), nil)
         }
     }
 
@@ -791,7 +839,7 @@ struct NewTaskSheet: View {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, canSubmit else { return }
         let now = AppModel.isoNow()
-        let recurrence = buildRecurrence()
+        let (recurrence, seriesStart) = buildRecurrence(startDate: effectiveDateNow())
         let later = whenSel == "Later"
 
         var t = model.addTask(
@@ -812,7 +860,10 @@ struct NewTaskSheet: View {
         if !later {
             // Re-resolve Today/Tomorrow against a fresh clock so a sheet left open
             // across midnight doesn't schedule onto yesterday.
-            if let date = effectiveDateNow(), let time = pickedTime {
+            // Every N weeks starts on its "Starts" day — the day picked when
+            // that is one of the series' days, else the first one after it —
+            // so scheduling keeps the week the user chose.
+            if let date = seriesStart ?? effectiveDateNow(), let time = pickedTime {
                 model.scheduleTaskAt(t, date: date, startTime: time)
             }
             ReminderScheduler.shared.resync()

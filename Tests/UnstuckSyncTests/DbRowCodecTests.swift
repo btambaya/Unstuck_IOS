@@ -138,6 +138,39 @@ final class DbRowCodecTests: XCTestCase {
         XCTAssertTrue(Recurrence.isUnknown(model.recurrence))   // recurrence is inert
     }
 
+    // Every N weeks (every-n-weeks spec §2): the server row decodes to the
+    // new case with its anchor, the wire shape keeps camelCase jsonb keys, and
+    // a MALFORMED one (a string interval, a non-number day) keeps the task —
+    // its rule is the inert sentinel, never a throw that drops the row.
+    func testEveryNWeeksTaskRowDecodesEncodesAndDegrades() throws {
+        func row(_ recurrence: String) -> Data {
+            """
+            {"id":"t1","name":"Office Focus","estimate_min":60,"total_focused":0,"done":false,
+             "priority":null,"tags":[],"objectives":[],"comments":[],
+             "intent_when":null,"intent_then":null,"life_area":null,
+             "first_physical_action":null,"move_count":0,"completed_at":null,"later":false,
+             "recurrence":\(recurrence),
+             "created_at":"2026-05-21T10:00:00.000Z","updated_at":"2026-05-21T10:00:00.000Z"}
+            """.data(using: .utf8)!
+        }
+        let v1 = try JSONDecoder().decode(TaskRow.self, from: row(#"{"kind":"everyNWeeks","interval":2.0,"daysOfWeek":[4],"anchor":"2026-09-21","until":null}"#)).model()
+        XCTAssertEqual(v1.recurrence, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil))
+        let rec = try jsonObject(TaskRow(v1))["recurrence"] as! [String: Any]
+        XCTAssertEqual(rec["kind"] as? String, "everyNWeeks")
+        XCTAssertEqual(rec["interval"] as? Int, 2)
+        XCTAssertEqual(rec["daysOfWeek"] as? [Int], [4])
+        XCTAssertEqual(rec["anchor"] as? String, "2026-09-21")
+        XCTAssertNil(rec["until"], "until only when set")
+        XCTAssertEqual(TaskRow(v1).model(), v1)
+        for bad in [#"{"kind":"everyNWeeks","interval":"2","daysOfWeek":[4],"anchor":"2026-09-21"}"#,
+                    #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4,"5"],"anchor":"2026-09-21"}"#,
+                    #"{"kind":"everyNWeeks","interval":2,"daysOfWeek":[4],"anchor":"2026-02-31"}"#] {
+            let model = try JSONDecoder().decode(TaskRow.self, from: row(bad)).model()
+            XCTAssertEqual(model.name, "Office Focus", bad)
+            XCTAssertTrue(Recurrence.isUnknown(model.recurrence), bad)
+        }
+    }
+
     func testForeignKeysDroppedWhenNotUUID() throws {
         let valid = "22222222-2222-4222-8222-222222222222"
         let bad = CalBlock(id: "b", taskId: "not-a-uuid", taskName: "B", startTime: "09:00",

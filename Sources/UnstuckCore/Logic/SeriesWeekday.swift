@@ -33,11 +33,74 @@ public func weekdayList(_ days: [Int]) -> String {
     return names.dropLast().joined(separator: ", ") + " and " + names.last!
 }
 
-/// The weekly days of `recurrence`, or nil when it isn't a weekly series with days.
+/// "Thu 8 Oct" for a 'YYYY-MM-DD' — the every-N-weeks lines' short date.
+public func shortDayName(_ iso: String) -> String {
+    let parts = iso.split(separator: "-").compactMap { Int($0) }
+    guard parts.count == 3, (1...12).contains(parts[1]) else { return iso }
+    return "\(WEEKDAY_NAMES_CAP[LocalDate.dayOfWeek(iso)].prefix(3)) \(parts[2]) \(MONTH_NAMES[parts[1] - 1].prefix(3))"
+}
+
+/// The weekly days of `recurrence` — a weekly series, or a valid every-N-weeks
+/// one — or nil when it isn't one with days.
 public func weeklyDays(_ recurrence: Recurrence?) -> [Int]? {
-    guard case .weekly(let days, _)? = recurrence else { return nil }
+    let days: [Int]
+    switch recurrence {
+    case .weekly(let d, _)?: days = d
+    case .everyNWeeks(_, let d, _, _)? where isValidEveryNWeeks(recurrence): days = d
+    default: return nil
+    }
     let valid = days.filter { (0...6).contains($0) }
     return valid.isEmpty ? nil : valid
+}
+
+/// "every 2 weeks on Thursday" / "every Monday and Thursday" — the rhythm and
+/// days a refusal names.
+private func seriesRhythm(_ recurrence: Recurrence?, _ days: [Int]) -> String {
+    if case .everyNWeeks(let n, _, _, _)? = recurrence, n >= 2 { return "every \(n) weeks on \(weekdayList(days))" }
+    return "every \(weekdayList(days))"
+}
+
+/// The rule dates nearest `date` that are not before `today` (spec §7.3): the
+/// latest one before `date` (when there is one on or after today), then the
+/// first one after it. An every-N-weeks rule's nearest dates can be up to 7N
+/// days away, so the ±7-day `nearestSeriesDays` would name none for N ≥ 3.
+public func nearestRuleDates(_ recurrence: Recurrence, date: String, today: String) -> [String] {
+    guard weeklyDays(recurrence) != nil else { return [] }
+    let span = 7 * max(1, recurrence.intervalWeeks ?? 1)
+    var out: [String] = []
+    for back in 1...span {
+        let d = LocalDate.addDays(date, -back)
+        if d < today { break }
+        if isRuleDay(recurrence, iso: d), recurrence.untilDate.map({ d <= $0 }) ?? true { out.append(d); break }
+    }
+    if let next = nextRuleDate(recurrence, fromIso: LocalDate.addDays(date, 1)) { out.append(next) }
+    return out
+}
+
+/// True when `date` is one of an every-N-weeks series' weekdays in a week it
+/// doesn't repeat in (Thu 15 Oct for a fortnightly Thursday on 8 and 22 Oct).
+public func isOffSeriesWeek(_ recurrence: Recurrence?, date: String) -> Bool {
+    guard let recurrence, case .everyNWeeks = recurrence, let days = weeklyDays(recurrence), isCalendarDate(date),
+          days.contains(LocalDate.dayOfWeek(date)) else { return false }
+    return !isRuleDay(recurrence, iso: date)
+}
+
+/// schedule_task's refusal for an every-N-weeks series on one of its weekdays
+/// in an off week (spec §7.3), with the nearest dates it repeats on; nil when
+/// the date is fine. Not for a series' FIRST placement: that re-anchors the
+/// series on the day (every week is valid then), so the caller skips it.
+public func rejectOffSeriesWeek(taskName: String, recurrence: Recurrence?, date: String, today: String) -> String? {
+    guard let recurrence, isOffSeriesWeek(recurrence, date: date), let days = weeklyDays(recurrence),
+          let n = recurrence.intervalWeeks else { return nil }
+    let near = nearestRuleDates(recurrence, date: date, today: today)
+    let names = Set(near.map { LocalDate.dayOfWeek($0) })
+    let noun = names.count == 1 ? WEEKDAY_NAMES_CAP[names.first!] : "day"
+    let listed = near.map { "\(shortDayName($0)) (\($0))" }.joined(separator: " and ")
+    return "error: \"\(taskName)\" repeats every \(n) weeks on \(weekdayList(days)), and \(shortDayName(date)) is an off week — nothing was scheduled."
+        + (near.isEmpty ? "" : " The nearest \(noun)\(near.count == 1 ? " it repeats on is" : "s it repeats on are") \(listed).")
+        + " Call schedule_task again with the day the user meant."
+        + " Only if they asked for \(shortDayName(date)) on purpose, as a one-off, call schedule_task again with exactly \(date)."
+        + " To change the weeks or days it repeats on, call set_task_recurrence first."
 }
 
 /// The series' days nearest `date` that are not before `today`: the latest one
@@ -65,8 +128,9 @@ private func namedDates(_ dates: [String]) -> String {
     dates.map { "\(plainDayName($0)) (\($0))" }.joined(separator: " or ")
 }
 
-/// True when `date` falls on a day a weekly `recurrence` doesn't repeat on
-/// (false for any other recurrence, or none).
+/// True when `date` falls on a WEEKDAY a weekly (or every-N-weeks)
+/// `recurrence` doesn't repeat on (false for any other recurrence, or none).
+/// An N-week series' off weeks are `isOffSeriesWeek`.
 public func isOffSeriesDay(_ recurrence: Recurrence?, date: String) -> Bool {
     guard let days = weeklyDays(recurrence), isCalendarDate(date) else { return false }
     return !days.contains(LocalDate.dayOfWeek(date))
@@ -75,11 +139,18 @@ public func isOffSeriesDay(_ recurrence: Recurrence?, date: String) -> Bool {
 /// schedule_task's refusal for a weekly series on a day it doesn't repeat on;
 /// nil when the date is one of its days (or the task isn't a weekly series).
 /// `date` must already be a valid, not-past date (rejectPastDate ran first).
+/// An every-N-weeks series names its rhythm and its nearest REAL dates, which
+/// can be weeks away.
 public func rejectOffSeriesDay(taskName: String, recurrence: Recurrence?, date: String, today: String) -> String? {
-    guard isOffSeriesDay(recurrence, date: date), let days = weeklyDays(recurrence) else { return nil }
+    guard isOffSeriesDay(recurrence, date: date), let recurrence, let days = weeklyDays(recurrence) else { return nil }
     let dayName = WEEKDAY_NAMES_CAP[LocalDate.dayOfWeek(date)]
-    let near = nearestSeriesDays(daysOfWeek: days, date: date, today: today)
-    return "error: \"\(taskName)\" repeats every \(weekdayList(days)), but \(date) is a \(dayName) — nothing was scheduled."
+    let near: [String]
+    if case .everyNWeeks = recurrence {
+        near = nearestRuleDates(recurrence, date: date, today: today)
+    } else {
+        near = nearestSeriesDays(daysOfWeek: days, date: date, today: today)
+    }
+    return "error: \"\(taskName)\" repeats \(seriesRhythm(recurrence, days)), but \(date) is a \(dayName) — nothing was scheduled."
         + (near.isEmpty ? "" : " Its nearest \(near.count == 1 ? "day is" : "days are") \(namedDates(near)).")
         + " Call schedule_task again with the day the user meant (a weekday name means the coming one — copy it from context.upcoming)."
         + " Only if they asked for \(plainDayName(date)) on purpose, as a one-off, call schedule_task again with exactly \(date)."
@@ -90,6 +161,9 @@ public func rejectOffSeriesDay(taskName: String, recurrence: Recurrence?, date: 
 /// reply says it plainly instead of calling it the series' day.
 public func offSeriesDayNote(recurrence: Recurrence?, date: String) -> String {
     guard let days = weeklyDays(recurrence) else { return "" }
+    if case .everyNWeeks(let n, _, _, _)? = recurrence, n >= 2 {
+        return " — a one-off on \(plainDayName(date)); the series stays every \(n) weeks on \(weekdayList(days))"
+    }
     return " — a one-off on \(plainDayName(date)); the series stays on \(weekdayList(days))"
 }
 

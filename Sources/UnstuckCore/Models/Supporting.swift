@@ -32,13 +32,22 @@ public struct Comment: Codable, Equatable, Sendable {
 ///   { "kind": "daily", "until": null }
 ///   { "kind": "weekly", "daysOfWeek": [1,3,5], "until": "2026-09-01" }
 ///   { "kind": "monthly" }
+///   { "kind": "everyNWeeks", "interval": 2, "daysOfWeek": [4], "anchor": "2026-09-21" }
+///
+/// `everyNWeeks` (every-n-weeks spec, owner-approved 2026-09-24, Zubair's
+/// "every two weeks on Thursdays"): week one is the ISO (Monday) week holding
+/// `anchor`, then every `interval`-th week before and after it. Writers store
+/// the anchor as a Monday, `interval` 2…8 (1 is written as plain weekly) and
+/// distinct, sorted days in 0…6; readers accept any integral interval ≥ 1 and
+/// ignore out-of-range days. A malformed one decodes to the unknown sentinel.
 public enum Recurrence: Codable, Equatable, Sendable {
     case daily(until: String?)
     case weekly(daysOfWeek: [Int], until: String?)
     case monthly(until: String?)
+    case everyNWeeks(interval: Int, daysOfWeek: [Int], anchor: String, until: String?)
 
     private enum CodingKeys: String, CodingKey {
-        case kind, daysOfWeek, until
+        case kind, interval, daysOfWeek, anchor, until
     }
 
     /// `until` sentinel for an unrecognised recurrence kind (see `init(from:)`).
@@ -66,6 +75,12 @@ public enum Recurrence: Codable, Equatable, Sendable {
             self = .weekly(daysOfWeek: days, until: until)
         case "monthly":
             self = .monthly(until: until)
+        case "everyNWeeks":
+            // Strict (spec §2): anything that isn't a valid rule is the same
+            // inert sentinel an unknown kind gets — never a throw (the whole
+            // TaskRow would vanish), never a guess (a string "2", a boolean, a
+            // fractional interval, an anchor like "soon" or 2026-02-31).
+            self = Self.decodeEveryNWeeks(c, until: until) ?? .daily(until: Self.UNKNOWN_UNTIL)
         default:
             // Forward-compat: an UNKNOWN kind (a newer web/iOS release added a
             // recurrence type this build can't model). A bare throw would abort
@@ -91,7 +106,54 @@ public enum Recurrence: Codable, Equatable, Sendable {
         case .monthly(let until):
             try c.encode("monthly", forKey: .kind)
             try c.encodeIfPresent(until, forKey: .until)
+        case .everyNWeeks(let interval, let days, let anchor, let until):
+            try c.encode("everyNWeeks", forKey: .kind)
+            try c.encode(interval, forKey: .interval)
+            try c.encode(days, forKey: .daysOfWeek)
+            try c.encode(anchor, forKey: .anchor)
+            try c.encodeIfPresent(until, forKey: .until)
         }
+    }
+
+    /// A JSON number with an integral value (`2` and `2.0` alike — jsonb keeps
+    /// `2.0` as written); anything else (a string, a boolean, null, `2.5`, a
+    /// number past Int's range) is `.other`. Decoded through Codable, never
+    /// JSONSerialization, where `1` and `true` are the same NSNumber.
+    private enum IntegralNumber: Decodable {
+        case integral(Int)
+        case other
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if let i = try? c.decode(Int.self) {
+                self = .integral(i)
+            } else if let d = try? c.decode(Double.self), let i = Int(exactly: d) {
+                self = .integral(i)
+            } else {
+                self = .other
+            }
+        }
+
+        var value: Int? {
+            if case .integral(let i) = self { return i }
+            return nil
+        }
+    }
+
+    /// A valid `everyNWeeks` (spec §2), or nil: `interval` an integral number
+    /// ≥ 1, `anchor` exactly YYYY-MM-DD and a real date (it must round-trip),
+    /// `daysOfWeek` an array of integral numbers only (out-of-range values are
+    /// kept as stored and ignored by readers).
+    private static func decodeEveryNWeeks(_ c: KeyedDecodingContainer<CodingKeys>, until: String?) -> Recurrence? {
+        guard let interval = (try? c.decode(IntegralNumber.self, forKey: .interval))?.value, interval >= 1,
+              let anchor = try? c.decode(String.self, forKey: .anchor), strictEpochDay(anchor) != nil,
+              let raw = try? c.decode([IntegralNumber].self, forKey: .daysOfWeek) else { return nil }
+        var days: [Int] = []
+        for d in raw {
+            guard let v = d.value else { return nil }
+            days.append(v)
+        }
+        return .everyNWeeks(interval: interval, daysOfWeek: days, anchor: anchor, until: until)
     }
 }
 

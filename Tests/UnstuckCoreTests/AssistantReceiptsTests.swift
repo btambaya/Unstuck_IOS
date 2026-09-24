@@ -96,6 +96,19 @@ final class AssistantReceiptsTests: XCTestCase {
         let stopped = deriveReceipt(name: "set_task_recurrence", args: ReceiptArgs(taskId: "t7", kind: "none"),
                                     result: "ok: \"Taxes\" no longer repeats", tasks: [t])
         XCTAssertEqual(stopped?.label, "Repeat removed — “Taxes”")
+        // Every N weeks reads the rhythm from the RESULT (every-n-weeks spec
+        // §7.3): an omitted intervalWeeks can still keep N, and a change back
+        // to every week names the old N after "now".
+        let fortnightly = deriveReceipt(name: "set_task_recurrence", args: ReceiptArgs(taskId: "t7", kind: "weekly"),
+                                        result: "ok: \"Taxes\" now repeats every 2 weeks on Thu at 10:30 — next Thu 24 Sep (today), then Thu 8 Oct",
+                                        tasks: [t])
+        XCTAssertEqual(fortnightly?.label, "Repeats every 2 weeks — “Taxes”")
+        let backToWeekly = deriveReceipt(name: "set_task_recurrence", args: ReceiptArgs(taskId: "t7", kind: "weekly"),
+                                         result: "ok: \"Taxes\" now repeats weekly on Thu at 10:30 — every week now; it was every 2 weeks",
+                                         tasks: [t])
+        XCTAssertEqual(backToWeekly?.label, "Repeats weekly — “Taxes”")
+        XCTAssertEqual(repeatsEveryNWeeks("ok: \"Every 3 weeks club\" now repeats every 8 weeks on Mon"), 8)
+        XCTAssertNil(repeatsEveryNWeeks("ok: \"X\" now repeats every day"))
     }
 
     /// An ok whose wish was already true changed nothing — no card claiming a

@@ -1108,3 +1108,317 @@ final class DeterministicOccurrenceTests: XCTestCase {
                        "and never covers the day it is leaving")
     }
 }
+
+// MARK: - every N weeks (every-n-weeks spec, owner-approved 2026-09-24)
+//
+// THE shared vectors: lib/recurrence-vectors.json, minified by
+// scripts/gen-tool-registry.mjs into RecurrenceVectors.generated.swift. Every
+// table is asserted as written, and the materialize list runs again under each
+// of its time zones (a floor of millisecond differences fails V10 in New York).
+
+private enum RV {
+    nonisolated(unsafe) static let file: [String: Any] = {
+        let obj = try? JSONSerialization.jsonObject(with: Data(RecurrenceVectors.json.utf8))
+        return obj as? [String: Any] ?? [:]
+    }()
+    static var taskId: String { file["taskId"] as? String ?? "" }
+    static func list(_ key: String) -> [[String: Any]] { file[key] as? [[String: Any]] ?? [] }
+
+    /// A vector's recurrence object through the real codec (nil for JSON null).
+    static func rec(_ v: Any?) throws -> Recurrence? {
+        guard let v, !(v is NSNull) else { return nil }
+        let data = try JSONSerialization.data(withJSONObject: v)
+        return try JSONDecoder().decode(Recurrence.self, from: data)
+    }
+
+    static func decode(_ json: String) throws -> Recurrence {
+        try JSONDecoder().decode(Recurrence.self, from: Data(json.utf8))
+    }
+
+    /// The vector task's blocks: `occurrenceOf` → its deterministic id.
+    static func blocks(_ v: Any?) -> [CalBlock] {
+        (v as? [[String: Any]] ?? []).enumerated().map { i, b in
+            let date = b["date"] as? String ?? ""
+            let id = (b["occurrenceOf"] as? String).map { occurrenceId(taskId: taskId, date: $0) } ?? "plain-\(i)"
+            var blk = CalBlock(id: id, taskId: taskId, taskName: "Office Focus", startTime: b["startTime"] as? String ?? "",
+                               durationMinutes: 60, date: date, kind: .task)
+            blk.done = b["done"] as? Bool ?? false
+            return blk
+        }
+    }
+
+    static func task(_ r: Recurrence?) -> TaskItem {
+        var t = mkTask(id: taskId, name: "Office Focus", estimateMin: 60)
+        t.recurrence = r
+        return t
+    }
+}
+
+final class EveryNWeeksVectorTests: XCTestCase {
+    func testTheVectorsLoaded() {
+        XCTAssertEqual(RV.file["version"] as? Int, 1)
+        XCTAssertEqual(RV.list("materialize").count, 18)
+        XCTAssertEqual(RV.list("topUp").count, 4)
+        XCTAssertEqual(RV.list("regenerate").count, 3)
+    }
+
+    private func materializeAll(_ zone: String) throws {
+        for v in RV.list("materialize") {
+            let id = v["id"] as? String ?? "?"
+            let r = try XCTUnwrap(try RV.rec(v["recurrence"]), id)
+            let start = LocalDate.parse(v["startDate"] as? String ?? "")
+            let got = materializeOccurrences(r, startDate: start, startTime: "10:30", horizonDays: v["horizonDays"] as? Int ?? 0)
+                .map(\.date)
+            XCTAssertEqual(got, v["expect"] as? [String], "\(id) in \(zone)")
+            if let wrong = v["wrong"] as? [String] { XCTAssertNotEqual(got, wrong, "\(id) in \(zone)") }
+        }
+    }
+
+    /// §9.1 in the process zone and in every zone the file names.
+    func testMaterializeInEveryZone() throws {
+        try materializeAll("default")
+        for zone in RV.file["timeZones"] as? [String] ?? [] {
+            try withZone(zone) { try materializeAll(zone) }
+        }
+        XCTAssertEqual((RV.file["timeZones"] as? [String])?.sorted(), ["America/New_York", "Pacific/Auckland"])
+    }
+
+    /// §9.2, plus the property: N = 1 is today's weekly reach for all 127 day sets.
+    func testReach() throws {
+        for v in RV.list("reach") {
+            let r = try XCTUnwrap(try RV.rec(v["recurrence"]))
+            XCTAssertEqual(occurrenceReach(r), v["expect"] as? Int, "\(r)")
+        }
+        for mask in 1..<128 {
+            let days = (0..<7).filter { mask & (1 << $0) != 0 }
+            XCTAssertEqual(occurrenceReach(.everyNWeeks(interval: 1, daysOfWeek: days, anchor: "2026-09-21", until: nil)),
+                           occurrenceReach(.weekly(daysOfWeek: days, until: nil)), "\(days)")
+        }
+        XCTAssertEqual(occurrenceReach(.everyNWeeks(interval: 0, daysOfWeek: [4], anchor: "2026-09-21", until: nil)), 0)
+    }
+
+    /// §9.3: the top-up keeps the tail on the stored anchor's weeks, whatever
+    /// the frontier (moved to a Friday, or into an off week).
+    func testTopUp() throws {
+        for v in RV.list("topUp") {
+            let id = v["id"] as? String ?? "?"
+            let task = RV.task(try RV.rec(v["recurrence"]))
+            let got = recurrenceTopUp(task: task, existingBlocks: RV.blocks(v["blocks"]), todayIso: v["today"] as? String ?? "",
+                                      horizonDays: v["horizonDays"] as? Int ?? 56)
+            let expect = (v["expect"] as? [[String: Any]] ?? []).map { "\($0["date"] as? String ?? "")→\($0["id"] as? String ?? "")" }
+            XCTAssertEqual(got.map { "\($0.date)→\($0.id)" }, expect, id)
+            XCTAssertTrue(got.allSatisfy { $0.startTime == v["startTime"] as? String }, id)
+        }
+        // The UUIDv5 cross-check: id(09-24) is stage 2's vector #1.
+        XCTAssertEqual(occurrenceId(taskId: RV.taskId, date: "2026-09-24"), "f8f5c8e7-0bb2-58d7-bc30-2701a2c9e1be")
+    }
+
+    private func planDates(_ p: RegenPlan) -> (up: [String], del: [String], retime: [String]) {
+        let byId = Dictionary(uniqueKeysWithValues: (0..<120).map { i -> (String, String) in
+            let d = LocalDate.addDays("2026-09-01", i)
+            return (occurrenceId(taskId: RV.taskId, date: d), d)
+        })
+        return (p.toUpsert.map(\.date), p.toDelete.map { byId[$0] ?? $0 }, p.toRetime.map { "\(byId[$0.id] ?? $0.id)→\($0.date)" })
+    }
+
+    /// §9.3b: repeat edits regenerate from TODAY over 56 days with the §5
+    /// anchor; the draft's plan is asserted too, as the regression it prevents.
+    func testRegenerateEdits() throws {
+        for v in RV.list("regenerate") {
+            let id = v["id"] as? String ?? "?"
+            let after = try XCTUnwrap(try RV.rec(v["after"]), id)
+            let today = v["today"] as? String ?? ""
+            let blocks = RV.blocks(v["blocks"])
+            // The real start helper gives exactly the vector's start.
+            let start = try XCTUnwrap(recurrenceEditStart(taskId: RV.taskId, recurrence: after, blocks: blocks, todayIso: today), id)
+            XCTAssertEqual(start, RecurrenceStart(date: v["startDate"] as? String ?? "", startTime: v["startTime"] as? String ?? "",
+                                                  horizonDays: v["horizonDays"] as? Int ?? 0), id)
+            // …and the edit anchor gives the vector's after-anchor.
+            let before = try RV.rec(v["before"])
+            if case .everyNWeeks(let n, let days, let anchor, _) = after {
+                XCTAssertEqual(recurrenceEditAnchor(current: before, newDays: days, newInterval: n, todayIso: today), anchor, id)
+            }
+            let plan = regenerateForTask(task: RV.task(after), recurrence: after, existingBlocks: blocks, todayIso: today,
+                                         startTime: start.startTime, startDate: LocalDate.parse(start.date),
+                                         horizonDays: start.horizonDays)
+            let got = planDates(plan)
+            let e = v["expect"] as? [String: Any] ?? [:]
+            XCTAssertEqual(got.up, e["toUpsert"] as? [String], id)
+            XCTAssertEqual(got.del, e["toDelete"] as? [String], id)
+            let retime = (e["toRetime"] as? [[String: Any]] ?? []).map { "\($0["occurrenceOf"] as? String ?? "")→\($0["to"] as? String ?? "")" }
+            XCTAssertEqual(got.retime, retime, id)
+            XCTAssertTrue(plan.toUpsert.allSatisfy { $0.id == occurrenceId(taskId: RV.taskId, date: $0.date) }, id)
+
+            if let draft = v["draft"] as? [String: Any] {
+                let dAfter = try XCTUnwrap(try RV.rec(draft["after"]), id)
+                let dPlan = regenerateForTask(task: RV.task(dAfter), recurrence: dAfter, existingBlocks: blocks, todayIso: today,
+                                              startTime: start.startTime, startDate: LocalDate.parse(draft["startDate"] as? String ?? ""),
+                                              horizonDays: 56)
+                let d = planDates(dPlan), dp = draft["plan"] as? [String: Any] ?? [:]
+                XCTAssertEqual(d.up, dp["toUpsert"] as? [String], "\(id) draft")
+                XCTAssertEqual(d.del, dp["toDelete"] as? [String], "\(id) draft")
+                XCTAssertNotEqual(d.up + d.del, got.up + got.del, "\(id): the draft's plan is the regression")
+            }
+        }
+    }
+
+    func testAnchorHelpers() throws {
+        for v in RV.list("seriesAnchor") {
+            XCTAssertEqual(seriesAnchor(days: v["daysOfWeek"] as? [Int] ?? [], fromIso: v["from"] as? String ?? ""),
+                           v["expect"] as? String, "\(v)")
+        }
+        for v in RV.list("nextRuleDate") {
+            let r = try XCTUnwrap(try RV.rec(v["recurrence"]))
+            XCTAssertEqual(nextRuleDate(r, fromIso: v["from"] as? String ?? ""), v["expect"] as? String, "\(v)")
+        }
+        for v in RV.list("editAnchor") {
+            XCTAssertEqual(recurrenceEditAnchor(current: try RV.rec(v["current"]), newDays: v["newDaysOfWeek"] as? [Int] ?? [],
+                                                newInterval: v["newInterval"] as? Int ?? 0, todayIso: v["today"] as? String ?? "",
+                                                startIso: v["startDate"] as? String),
+                           v["expect"] as? String, v["about"] as? String ?? "")
+        }
+        for v in RV.list("scheduleAnchor") {
+            let r = try XCTUnwrap(try RV.rec(v["recurrence"]))
+            guard case .everyNWeeks(let n, let days, let anchor, _) = r else { return XCTFail("not every N weeks") }
+            let chosen = v["chosenDate"] as? String ?? ""
+            let expect = v["expect"] as? String ?? ""
+            XCTAssertEqual(seriesAnchor(days: days, fromIso: chosen), expect, v["about"] as? String ?? "")
+            let changes = v["changesWeeks"] as? Bool ?? false
+            XCTAssertEqual(!sameWeeks(expect, anchor, interval: n), changes, v["about"] as? String ?? "")
+            // Re-anchored only when the weeks change; the row keeps its value otherwise.
+            XCTAssertEqual(reanchoredForSchedule(r, chosenIso: chosen),
+                           changes ? .everyNWeeks(interval: n, daysOfWeek: days, anchor: expect, until: nil) : nil)
+        }
+        for v in RV.list("startsChips") {
+            let chips = startsChips(days: v["daysOfWeek"] as? [Int] ?? [], interval: v["interval"] as? Int ?? 0,
+                                    baseIso: v["base"] as? String ?? "")
+            XCTAssertEqual(chips.map(\.date), v["expect"] as? [String], "\(v)")
+            XCTAssertEqual(chips.map(\.anchor), v["expectAnchors"] as? [String], "\(v)")
+        }
+    }
+
+    func testLabels() throws {
+        for v in RV.list("labels") {
+            let r = try XCTUnwrap(try RV.rec(v["recurrence"]))
+            XCTAssertEqual(recurrenceLabel(r), v["expect"] as? String, "\(v)")
+        }
+        // A rule built in code (not decoded) that is invalid still reads as nothing.
+        XCTAssertEqual(recurrenceLabel(.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "soon", until: nil)), "")
+        XCTAssertEqual(recurrenceLabel(.everyNWeeks(interval: 2, daysOfWeek: [9], anchor: "2026-09-21", until: nil)), "")
+    }
+
+    /// §9.4 codec: canonical round-trips, the unreadable cases decode to the
+    /// sentinel (inert, no label), and the old codec (iOS ≤ b92) turns V1 into
+    /// the sentinel, a fixed point of its encoder — 081's input.
+    func testCodec() throws {
+        let codec = try XCTUnwrap(RV.file["codec"] as? [String: Any])
+        for c in codec["canonical"] as? [[String: Any]] ?? [] {
+            let about = c["about"] as? String ?? ""
+            let r = try RV.decode(c["json"] as? String ?? "")
+            guard case .everyNWeeks = r else { XCTFail(about); continue }
+            let out = String(decoding: try JSONEncoder().encode(r), as: UTF8.self)
+            let expect = c["expect"] as? String ?? ""
+            // JSONEncoder doesn't keep key order, so compare values — plus the
+            // exact integral spelling, and until only when set.
+            let a = try JSONSerialization.jsonObject(with: Data(out.utf8)) as? NSDictionary
+            let b = try JSONSerialization.jsonObject(with: Data(expect.utf8)) as? NSDictionary
+            XCTAssertEqual(a, b, about)
+            XCTAssertEqual(a?.allKeys.count, b?.allKeys.count, about)
+            XCTAssertFalse(out.contains(".0"), about)
+            XCTAssertEqual(try RV.decode(out), r, about)
+        }
+        for c in codec["unreadable"] as? [[String: Any]] ?? [] {
+            let about = c["about"] as? String ?? ""
+            let r = try RV.decode(c["json"] as? String ?? "")
+            XCTAssertTrue(Recurrence.isUnknown(r), about)
+            XCTAssertEqual(try JSONSerialization.jsonObject(with: try JSONEncoder().encode(r)) as? NSDictionary,
+                           try JSONSerialization.jsonObject(with: Data((codec["sentinel"] as? String ?? "").utf8)) as? NSDictionary, about)
+            XCTAssertEqual(recurrenceLabel(r), "", about)
+            XCTAssertTrue(materializeOccurrences(r, startDate: LocalDate.parse("2026-09-24"), startTime: "10:30").isEmpty, about)
+        }
+        let old = try XCTUnwrap(codec["oldCodec"] as? [String: Any])
+        let oldDecoded = try JSONDecoder().decode(Build92Recurrence.self, from: Data((old["input"] as? String ?? "").utf8))
+        let oldOut = try JSONEncoder().encode(oldDecoded)
+        let expect = try JSONSerialization.jsonObject(with: Data((old["expect"] as? String ?? "").utf8)) as? NSDictionary
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: oldOut) as? NSDictionary, expect)
+        let again = try JSONEncoder().encode(try JSONDecoder().decode(Build92Recurrence.self, from: oldOut))
+        XCTAssertEqual(try JSONSerialization.jsonObject(with: again) as? NSDictionary, expect, "a fixed point")
+        // …and THIS build reads that value as the sentinel too (it never
+        // repeats), which is why migration 081 keeps the stored rule.
+        XCTAssertTrue(Recurrence.isUnknown(try RV.decode(old["expect"] as? String ?? "")))
+    }
+
+    func testStrictDates() {
+        XCTAssertEqual(strictEpochDay("1970-01-01"), 0)
+        XCTAssertEqual(strictEpochDay("2026-09-21"), civilEpochDay(2026, 9, 21))
+        XCTAssertEqual(civilIso(epochDay: civilEpochDay(2028, 2, 29)), "2028-02-29")
+        for bad in ["soon", "2026-02-31", "2026-9-21", "2026-09-21T00:00:00Z", "2026-13-01", "2026-00-10", "2026-09-00",
+                    "２０２６-09-21", "2026/09/21", "", "2027-02-29"] {
+            XCTAssertNil(strictEpochDay(bad), bad)
+        }
+        // Every day 1900…2100 round-trips and agrees with the calendar.
+        var e = civilEpochDay(1900, 1, 1)
+        var d = Time.civil(1900, 1, 1)
+        while e < civilEpochDay(2100, 12, 31) {
+            XCTAssertEqual(civilIso(epochDay: e), Clock.dateISO(d))
+            e += 97
+            d = Time.addDays(d, 97)
+        }
+    }
+
+    func testWeeklyRuleWritersNormalise() {
+        XCTAssertEqual(weeklyRule(days: [4], interval: 1, anchor: "2026-09-21", until: nil), .weekly(daysOfWeek: [4], until: nil))
+        XCTAssertEqual(weeklyRule(days: [5, 1, 5, 9], interval: 2, anchor: "2026-09-21", until: "2026-12-31"),
+                       .everyNWeeks(interval: 2, daysOfWeek: [1, 5], anchor: "2026-09-21", until: "2026-12-31"))
+        XCTAssertEqual(Recurrence.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil).withUntil("2026-12-31"),
+                       .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: "2026-12-31"))
+    }
+
+    /// §8.2: a fortnightly Sunday is not a weekly habit — no "still on for
+    /// Sunday?" on its off week.
+    func testPatternsSkipEveryNWeeksSeries() {
+        var t = mkTask(id: "s", name: "Swim")
+        t.recurrence = .everyNWeeks(interval: 2, daysOfWeek: [0], anchor: "2026-09-28", until: nil)
+        let blocks = ["2026-10-04", "2026-10-18", "2026-11-01"].map {
+            CalBlock(id: "b\($0)", taskId: "s", taskName: "Swim", startTime: "09:00", durationMinutes: 60, date: $0, kind: .task)
+        }
+        XCTAssertTrue(derivePatterns([t], blocks, todayIso: "2026-11-08").isEmpty)
+        t.recurrence = nil
+        XCTAssertEqual(derivePatterns([t], blocks, todayIso: "2026-11-08").count, 1, "the same blocks on a plain task are a pattern")
+    }
+}
+
+/// iOS build 92's Recurrence codec, verbatim (Supporting.swift at 2075d75) —
+/// the old-codec simulation in §9.4.
+private enum Build92Recurrence: Codable {
+    case daily(until: String?)
+    case weekly(daysOfWeek: [Int], until: String?)
+    case monthly(until: String?)
+    private enum CodingKeys: String, CodingKey { case kind, daysOfWeek, until }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(String.self, forKey: .kind)
+        let until = try c.decodeIfPresent(String.self, forKey: .until)
+        switch kind {
+        case "daily": self = .daily(until: until)
+        case "weekly": self = .weekly(daysOfWeek: try c.decodeIfPresent([Int].self, forKey: .daysOfWeek) ?? [], until: until)
+        case "monthly": self = .monthly(until: until)
+        default: self = .daily(until: "0001-01-01")
+        }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .daily(let until):
+            try c.encode("daily", forKey: .kind)
+            try c.encodeIfPresent(until, forKey: .until)
+        case .weekly(let days, let until):
+            try c.encode("weekly", forKey: .kind)
+            try c.encode(days, forKey: .daysOfWeek)
+            try c.encodeIfPresent(until, forKey: .until)
+        case .monthly(let until):
+            try c.encode("monthly", forKey: .kind)
+            try c.encodeIfPresent(until, forKey: .until)
+        }
+    }
+}

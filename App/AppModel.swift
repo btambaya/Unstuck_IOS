@@ -3072,6 +3072,21 @@ final class AppModel {
             blocks.min { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
         }
 
+        // Scheduling an every-N-weeks series means "the series starts here"
+        // (every-n-weeks spec §5): week one becomes the week of the first
+        // series day on or after the chosen day. Only an off-week choice
+        // changes anything (an on-week one keeps the same weeks, and the row
+        // is left alone). The row carrying the new anchor is written BEFORE
+        // the plan's blocks, so the top-up never reads the old weeks, and it
+        // is the row every whole-row write below builds on.
+        var task = task
+        var reanchored = false
+        if let re = reanchoredForSchedule(task.recurrence, chosenIso: iso) {
+            task.recurrence = re
+            task.updatedAt = now
+            reanchored = true
+        }
+
         if let recurrence = task.recurrence {
             let today = Clock.todayISO()
             let parts = iso.split(separator: "-").compactMap { Int($0) }
@@ -3088,17 +3103,18 @@ final class AppModel {
             // are disjoint, so one Task writes them all.
             let (plan, chosen) = recurrenceChosenDateWrite(task: task, existing: existing, plan: regen,
                                                            iso: iso, startTime: startTime)
-            Task {
-                await self.applyRegenPlan(plan, unpark: false)
-                await self.writeChosenDay(chosen, task: task, iso: iso, startTime: startTime)
-            }
             // Compared with the series' next occurrence: a template's earliest
             // block is weeks-old history, so every re-schedule — even a no-op —
             // bumped moveCount (audit 2026-09-22, C7).
-            if let anchor = recurrenceAnchor(taskId: task.id, blocks: existing, todayIso: today),
-               anchor.date != iso || anchor.startTime != startTime {
-                let bumped = bumpMoveCount(task, nowISO: now)
-                Task { try? await write.upsertTask(bumped, nowISO: now) }
+            let moved = recurrenceAnchor(taskId: task.id, blocks: existing, todayIso: today)
+                .map { $0.date != iso || $0.startTime != startTime } ?? false
+            let row: TaskItem? = moved ? bumpMoveCount(task, nowISO: now) : (reanchored ? task : nil)
+            let committed = task
+            Task {
+                // The re-anchored row lands first (awaited), then the blocks.
+                if let row { try? await write.upsertTask(row, nowISO: now) }
+                await self.applyRegenPlan(plan, unpark: false)
+                await self.writeChosenDay(chosen, task: committed, iso: iso, startTime: startTime)
             }
         } else if let cur = earliest(existing) {
             if cur.date != iso || cur.startTime != startTime {

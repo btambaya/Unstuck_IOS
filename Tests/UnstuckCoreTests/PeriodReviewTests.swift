@@ -427,11 +427,12 @@ final class PageAndReviewAgreeTests: XCTestCase {
                 checked.append(v.id)
             }
         }
-        // Weeks and months in UTC, New York, across DST and another year.
+        // Weeks and months in UTC, New York, across DST and another year —
+        // and a fortnightly series (V20, every-n-weeks spec §8.2).
         XCTAssertEqual(checked.sorted(), ["V1-last-week", "V10-history-floor", "V11-this-month", "V12-monday-note",
                                           "V13-length-cap", "V15-stamp-grammar", "V16-hard-cut-keeps-tail", "V17-dst-week",
-                                          "V18-other-year", "V19-padded-args", "V2-this-week-so-far", "V4-week-of",
-                                          "V6-empty-month", "V8-timezone"])
+                                          "V18-other-year", "V19-padded-args", "V2-this-week-so-far", "V20-fortnightly-series",
+                                          "V4-week-of", "V6-empty-month", "V8-timezone"])
     }
 
     /// A forgotten timer and an accidental start: the review, the page and

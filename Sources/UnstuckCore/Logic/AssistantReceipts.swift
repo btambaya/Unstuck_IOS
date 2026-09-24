@@ -183,6 +183,10 @@ public func deriveReceipt(
         let suffix = nm.map { " — “\($0)”" } ?? ""
         // kind "none" is the stop: it read "Repeats none" on the card.
         if let kind = args.kind, kind != "none" {
+            // The rhythm from the RESULT, not the args: an omitted
+            // intervalWeeks keeps a series' every N weeks (every-n-weeks spec
+            // §7.3), and "every week now; it was every 2 weeks" names the old one.
+            if let n = repeatsEveryNWeeks(result) { return Receipt(icon: .calendar, label: "Repeats every \(n) weeks\(suffix)") }
             return Receipt(icon: .calendar, label: "Repeats \(kind)\(suffix)")
         }
         return Receipt(icon: .calendar, label: "Repeat removed\(suffix)")
@@ -432,4 +436,12 @@ public func planReceiptUndo(_ undo: ReceiptUndo, tasks: [TaskItem], nowISO: Stri
     case .cancelCall(let id):
         return .cancelCall(id: id)
     }
+}
+
+/// N from a set_task_recurrence ok line's "now repeats every N weeks", or nil.
+func repeatsEveryNWeeks(_ result: String) -> Int? {
+    guard let r = result.range(of: "now repeats every ") else { return nil }
+    let digits = result[r.upperBound...].prefix { $0.isASCII && $0.isNumber }
+    guard !digits.isEmpty, result[r.upperBound...].dropFirst(digits.count).hasPrefix(" weeks") else { return nil }
+    return Int(digits)
 }

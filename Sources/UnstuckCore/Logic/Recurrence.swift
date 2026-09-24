@@ -27,11 +27,259 @@ public extension Recurrence {
         switch self {
         case .daily(let u), .monthly(let u): return u
         case .weekly(_, let u): return u
+        case .everyNWeeks(_, _, _, let u): return u
+        }
+    }
+
+    /// Weeks between on-weeks for a rule the weekly pickers show: 1 for
+    /// weekly, N for every N weeks, nil for any other kind.
+    var intervalWeeks: Int? {
+        switch self {
+        case .weekly: return 1
+        case .everyNWeeks(let n, _, _, _): return n
+        default: return nil
+        }
+    }
+
+    /// The day list of a weekly or every-N-weeks rule, as stored (nil for any
+    /// other kind).
+    var weekDays: [Int]? {
+        switch self {
+        case .weekly(let d, _), .everyNWeeks(_, let d, _, _): return d
+        default: return nil
+        }
+    }
+
+    /// The same rule with `until` replaced (nil clears it).
+    func withUntil(_ until: String?) -> Recurrence {
+        switch self {
+        case .daily: return .daily(until: until)
+        case .weekly(let d, _): return .weekly(daysOfWeek: d, until: until)
+        case .monthly: return .monthly(until: until)
+        case .everyNWeeks(let n, let d, let a, _): return .everyNWeeks(interval: n, daysOfWeek: d, anchor: a, until: until)
         }
     }
 }
 
-private func matchesRecurrence(_ r: Recurrence, startDate: Date, candidate: Date) -> Bool {
+// MARK: - every N weeks: civil-date arithmetic (spec §4)
+//
+// The week index is whole weeks between Mondays, counted in EPOCH DAYS built
+// from the civil Y/M/D fields — never from instants (a floor of millisecond
+// differences loses a day after a spring-forward: 2027-03-28 became an off
+// week in New York), and never the ISO week-of-year number (2026 has 53
+// weeks, so a fortnightly Thursday would fire on 31 Dec AND 7 Jan).
+
+/// Days from 1970-01-01 to the proleptic-Gregorian civil date y-m-d (pure
+/// integer arithmetic, no calendar or time zone).
+public func civilEpochDay(_ y: Int, _ m: Int, _ d: Int) -> Int {
+    let yy = m <= 2 ? y - 1 : y
+    let era = (yy >= 0 ? yy : yy - 399) / 400
+    let yoe = yy - era * 400
+    let mp = (m + 9) % 12
+    let doy = (153 * mp + 2) / 5 + d - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146_097 + doe - 719_468
+}
+
+/// The civil 'YYYY-MM-DD' of an epoch day (inverse of `civilEpochDay`).
+public func civilIso(epochDay e: Int) -> String {
+    let z = e + 719_468
+    let era = (z >= 0 ? z : z - 146_096) / 146_097
+    let doe = z - era * 146_097
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)
+    let mp = (5 * doy + 2) / 153
+    let d = doy - (153 * mp + 2) / 5 + 1
+    let m = mp < 10 ? mp + 3 : mp - 9
+    let y = yoe + era * 400 + (m <= 2 ? 1 : 0)
+    return String(format: "%04d-%02d-%02d", y, m, d)
+}
+
+/// The epoch day of a STRICT 'YYYY-MM-DD' — exactly ten ASCII characters in
+/// that shape, and a real date (it must round-trip: 2026-02-31 is nil, never
+/// 3 Mar). The validator every everyNWeeks reader uses; `LocalDate.parse` is
+/// not one (it reads "soon" as 1970-01-01).
+public func strictEpochDay(_ iso: String) -> Int? {
+    let u = Array(iso.utf8)
+    guard u.count == 10, u[4] == 45, u[7] == 45 else { return nil }
+    func num(_ r: Range<Int>) -> Int? {
+        var v = 0
+        for i in r {
+            guard (48...57).contains(u[i]) else { return nil }
+            v = v * 10 + Int(u[i] - 48)
+        }
+        return v
+    }
+    guard let y = num(0..<4), let m = num(5..<7), let d = num(8..<10), (1...12).contains(m), d >= 1 else { return nil }
+    let e = civilEpochDay(y, m, d)
+    return civilIso(epochDay: e) == iso ? e : nil
+}
+
+/// `a mod n` in 0..<n for any sign of `a` (n > 0).
+@inline(__always) func floorMod(_ a: Int, _ n: Int) -> Int { ((a % n) + n) % n }
+
+/// 0=Sun … 6=Sat of an epoch day (1970-01-01 was a Thursday).
+@inline(__always) func epochDayOfWeek(_ e: Int) -> Int { floorMod(e + 4, 7) }
+
+/// The epoch day of the Monday of `e`'s ISO week.
+@inline(__always) func epochMonday(_ e: Int) -> Int { e - floorMod(epochDayOfWeek(e) + 6, 7) }
+
+/// The distinct days of `days` that are real weekdays (0…6), sorted.
+/// Out-of-range values are ignored, never folded into 0…6.
+public func validWeekdays(_ days: [Int]) -> [Int] {
+    Array(Set(days.filter { (0...6).contains($0) })).sorted()
+}
+
+/// The parts of an every-N-weeks rule readers need, or nil when it isn't a
+/// valid one (interval < 1 or an anchor that isn't a strict real date).
+/// Readers are total: an invalid rule matches no day and never traps.
+private func everyNWeeksParts(_ r: Recurrence) -> (interval: Int, days: Set<Int>, anchorMonday: Int)? {
+    guard case .everyNWeeks(let n, let days, let anchor, _) = r, n >= 1, let a = strictEpochDay(anchor) else { return nil }
+    return (n, Set(days.filter { (0...6).contains($0) }), epochMonday(a))
+}
+
+/// True when `r` is an every-N-weeks rule a reader can use (spec §2).
+public func isValidEveryNWeeks(_ r: Recurrence?) -> Bool {
+    guard let r else { return false }
+    return everyNWeeksParts(r) != nil
+}
+
+/// Does `iso` fall on the rule's days and weeks — the §4 test without the
+/// start / until bounds? Weekly: its weekday; every N weeks: its weekday AND
+/// `floorMod(weekIndex, N) == 0`. False for any other kind, or a bad date.
+public func isRuleDay(_ r: Recurrence, iso: String) -> Bool {
+    guard let e = strictEpochDay(iso) else { return false }
+    switch r {
+    case .weekly(let days, _):
+        return days.contains(epochDayOfWeek(e))
+    case .everyNWeeks:
+        guard let p = everyNWeeksParts(r), p.days.contains(epochDayOfWeek(e)) else { return false }
+        return floorMod((epochMonday(e) - p.anchorMonday) / 7, p.interval) == 0
+    default:
+        return false
+    }
+}
+
+/// Week one of a series that starts at `fromIso` (spec §4, §5): the Monday of
+/// the first date on or after `fromIso` whose weekday is in `days`. A start
+/// on an off weekday (a Friday for a Thursday rule) therefore does not push
+/// the first Thursday back by N weeks. Only called with a non-empty valid day
+/// set; with none it is `fromIso`'s own Monday.
+public func seriesAnchor(days: [Int], fromIso: String) -> String {
+    guard let from = strictEpochDay(fromIso) else { return fromIso }
+    let wanted = Set(validWeekdays(days))
+    for i in 0..<7 where wanted.contains(epochDayOfWeek(from + i)) {
+        return civilIso(epochDay: epochMonday(from + i))
+    }
+    return civilIso(epochDay: epochMonday(from))
+}
+
+/// The first date on or after `fromIso` that `r` (weekly or every N weeks)
+/// matches, from the RULE alone — never from blocks, which may have been
+/// moved by hand. Bounded by `until`. Scans at most 7N days. Nil when nothing
+/// matches (another kind, no valid days, an ended or invalid rule).
+public func nextRuleDate(_ r: Recurrence, fromIso: String) -> String? {
+    guard let from = strictEpochDay(fromIso) else { return nil }
+    let span: Int
+    switch r {
+    case .weekly: span = 7
+    case .everyNWeeks:
+        guard let p = everyNWeeksParts(r) else { return nil }
+        span = 7 * p.interval
+    default: return nil
+    }
+    for i in 0..<span {
+        let iso = civilIso(epochDay: from + i)
+        if let until = r.untilDate, iso > until { return nil }
+        if isRuleDay(r, iso: iso) { return iso }
+    }
+    return nil
+}
+
+/// One "Starts" chip (spec §6): the first series day on or after the base in
+/// one week, and the Monday that week one would be if it is picked.
+public struct StartsChip: Equatable, Sendable {
+    public let date: String
+    public let anchor: String
+    public init(date: String, anchor: String) {
+        self.date = date
+        self.anchor = anchor
+    }
+}
+
+/// The "Starts" row for an every-N-weeks pick: N chips, one per consecutive
+/// week, beginning with the week of `seriesAnchor(days, base)`. Each chip is
+/// the first series day ≥ base in its week. Base Thu 24 Sep for Thursdays,
+/// N 2: [Thu 24 Sep, Thu 1 Oct]; base Fri 25 Sep: [Thu 1 Oct, Thu 8 Oct]
+/// (the week of 21 Sep has no Thursday left). Empty with no valid day.
+public func startsChips(days: [Int], interval: Int, baseIso: String) -> [StartsChip] {
+    let wanted = Set(validWeekdays(days))
+    guard !wanted.isEmpty, interval >= 1, let base = strictEpochDay(baseIso),
+          let first = strictEpochDay(seriesAnchor(days: days, fromIso: baseIso)) else { return [] }
+    return (0..<interval).compactMap { k in
+        let monday = first + 7 * k
+        guard let day = (0..<7).map({ monday + $0 }).first(where: { $0 >= base && wanted.contains(epochDayOfWeek($0)) })
+        else { return nil }
+        return StartsChip(date: civilIso(epochDay: day), anchor: civilIso(epochDay: monday))
+    }
+}
+
+/// Do two anchors give the same on-weeks for an N-week rule?
+public func sameWeeks(_ a: String, _ b: String, interval: Int) -> Bool {
+    guard interval >= 1, let x = strictEpochDay(a), let y = strictEpochDay(b) else { return a == b }
+    return floorMod((epochMonday(x) - epochMonday(y)) / 7, interval) == 0
+}
+
+/// Week one for a repeat EDIT that writes every N weeks (spec §5), when the
+/// user picked no week in "Starts":
+///  • the task is already every N weeks with the SAME N (days, time or until
+///    changed) → the stored anchor: such an edit never moves the weeks;
+///  • it is weekly, or every N weeks with another N → the week of the CURRENT
+///    rule's next date (from the rule, not from blocks), so the next
+///    occurrence never jumps — or, when the new days in that week have passed,
+///    the next week that has one: `seriesAnchor(newDays, max(today,
+///    monday(nextRuleDate(current, today))))`;
+///  • from daily, monthly or no repeat → `seriesAnchor(newDays, startIso ??
+///    today)`, `startIso` being the edit's start day (the series' next block).
+public func recurrenceEditAnchor(current: Recurrence?, newDays: [Int], newInterval: Int,
+                                 todayIso: String, startIso: String? = nil) -> String {
+    if case .everyNWeeks(let n, _, let anchor, _)? = current, n == newInterval, strictEpochDay(anchor) != nil {
+        return anchor
+    }
+    switch current {
+    case .weekly?, .everyNWeeks?:
+        var from = todayIso
+        if let current, let next = nextRuleDate(current, fromIso: todayIso), let e = strictEpochDay(next) {
+            from = max(todayIso, civilIso(epochDay: epochMonday(e)))
+        }
+        return seriesAnchor(days: newDays, fromIso: from)
+    default:
+        return seriesAnchor(days: newDays, fromIso: startIso ?? todayIso)
+    }
+}
+
+/// The rule a weekly-days pick writes (the pickers, set_task_recurrence):
+/// 1 week is plain weekly; 2 and up is every N weeks. Days are written
+/// distinct, sorted and in 0…6 (spec §0 rule 3).
+public func weeklyRule(days: [Int], interval: Int, anchor: String, until: String?) -> Recurrence {
+    let d = validWeekdays(days)
+    return interval <= 1 ? .weekly(daysOfWeek: d, until: until)
+        : .everyNWeeks(interval: interval, daysOfWeek: d, anchor: anchor, until: until)
+}
+
+/// Scheduling a series on a chosen day means "the series starts here" (spec
+/// §5): an every-N-weeks rule re-anchors to `seriesAnchor(days, chosen)`. Nil
+/// when nothing changes — another kind, or a chosen day whose week is already
+/// an on week (the same weeks, so the task row need not be written).
+public func reanchoredForSchedule(_ r: Recurrence?, chosenIso: String) -> Recurrence? {
+    guard case .everyNWeeks(let n, let days, let anchor, let until)? = r, isValidEveryNWeeks(r),
+          !validWeekdays(days).isEmpty else { return nil }
+    let next = seriesAnchor(days: days, fromIso: chosenIso)
+    guard !sameWeeks(next, anchor, interval: n) else { return nil }
+    return .everyNWeeks(interval: n, daysOfWeek: days, anchor: next, until: until)
+}
+
+private func matchesRecurrence(_ r: Recurrence, startDate: Date, candidate: Date, candidateIso: String) -> Bool {
     if Time.startOfDay(candidate) < Time.startOfDay(startDate) { return false }
     switch r {
     case .daily:
@@ -42,6 +290,9 @@ private func matchesRecurrence(_ r: Recurrence, startDate: Date, candidate: Date
         // Clamp a day-31 start to each month's last day (Feb 28/29, Apr 30, …),
         // recovering to 31 in long months — matches current Android (the v0.4.23 fix).
         return Time.dayOfMonth(candidate) == min(Time.dayOfMonth(startDate), Time.daysInMonth(candidate))
+    case .everyNWeeks:
+        // From the civil date string, never the instant (spec §4).
+        return isRuleDay(r, iso: candidateIso)
     }
 }
 
@@ -67,7 +318,7 @@ public func materializeOccurrences(
         let day = Time.startOfDay(Time.addDays(base, i))
         let iso = Clock.dateISO(day)
         if let untilIso, iso > untilIso { break }
-        if matchesRecurrence(recurrence, startDate: startDate, candidate: day) {
+        if matchesRecurrence(recurrence, startDate: startDate, candidate: day, candidateIso: iso) {
             out.append(MaterializedOccurrence(date: iso, startTime: startTime))
         }
     }
@@ -258,8 +509,11 @@ private func recurrenceSeriesDay(_ blocks: [CalBlock]) -> (day: Int, votes: Int)
 /// How many days either side of one of the series' dates a block still counts
 /// as that date's occurrence, moved: under half the gap to the neighbouring
 /// dates, so it is nearer that date than any other. A monthly date is at
-/// least 28 days from the next; a daily one has no room.
-private func occurrenceReach(_ r: Recurrence) -> Int {
+/// least 28 days from the next; a daily one has no room. Every N weeks is
+/// measured over its 7N-day cycle with ISO positions (Mon=0 … Sun=6) of the
+/// days in week one (spec §4): 6 for fortnightly on one day, 27 for every 8
+/// weeks; with N = 1 it equals the weekly value for every day set.
+func occurrenceReach(_ r: Recurrence) -> Int {
     switch r {
     case .daily:
         return 0
@@ -270,6 +524,12 @@ private func occurrenceReach(_ r: Recurrence) -> Int {
         return ((gaps.min() ?? 7) - 1) / 2
     case .monthly:
         return 14
+    case .everyNWeeks(let n, let days, _, _):
+        guard isValidEveryNWeeks(r) else { return 0 }
+        let sorted = validWeekdays(days).map { ($0 + 6) % 7 }.sorted()
+        guard let first = sorted.first, let last = sorted.last else { return 0 }
+        let gaps = zip(sorted, sorted.dropFirst()).map { $1 - $0 } + [7 * n - last + first]
+        return ((gaps.min() ?? 7 * n) - 1) / 2
     }
 }
 
@@ -318,6 +578,15 @@ public func recurrenceEditStart(taskId: String, recurrence: Recurrence?, blocks:
     let timed = blocks.filter { $0.taskId == taskId && isTaskBlock($0) && !$0.startTime.isEmpty }
     let live = timed.filter { !$0.done && !$0.skipped && $0.date >= todayIso }
     let time = live.count >= 2 ? (mostCommonStartTime(live, tieBreak: timed) ?? anchor.startTime) : anchor.startTime
+    // Every N weeks regenerates from TODAY over the full horizon (spec §5):
+    // the rule's anchor decides the weeks, so the start needs no day of its
+    // own, and a window starting at the next block (up to N weeks out) or on
+    // a Monday ended before the top-up's today + 55 — every on-week block in
+    // that gap was deleted, then minted again by the next top-up (vector E1),
+    // re-arming reminders and churning Google events.
+    if case .everyNWeeks? = recurrence {
+        return RecurrenceStart(date: todayIso, startTime: time, horizonDays: horizonDays)
+    }
     // Two of the last three must agree before the day moves off the anchor's:
     // switching a weekly series to monthly keeps the next occurrence's day.
     guard case .monthly = recurrence, let series = recurrenceSeriesDay(timed), series.votes >= 2 else {
@@ -544,6 +813,16 @@ public func recurrenceLabel(_ r: Recurrence?) -> String {
         base = days.count == 7 ? "Repeats daily" : "Repeats \(formatDays(days))"
     case .monthly:
         base = "Repeats monthly"
+    case .everyNWeeks(let n, let days, _, _):
+        // Out-of-range days are dropped before formatting; an invalid rule (or
+        // one with no real day) repeats zero times and reads as nothing.
+        let valid = validWeekdays(days)
+        guard isValidEveryNWeeks(r), !valid.isEmpty else { return "" }
+        if n == 1 {
+            base = valid.count == 7 ? "Repeats daily" : "Repeats \(formatDays(valid))"
+        } else {
+            base = valid.count == 7 ? "Repeats every day, every \(n) weeks" : "Repeats every \(n) weeks on \(formatDays(valid))"
+        }
     }
     if let until = r.untilDate {
         let parts = until.split(separator: "-").map { Int($0) }
