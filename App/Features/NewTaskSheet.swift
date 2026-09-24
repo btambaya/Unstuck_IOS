@@ -464,7 +464,7 @@ struct NewTaskSheet: View {
                 }
             } else {
                 Text("Their email (optional)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                TextField("name@example.com", text: $inviteEmail)
+                TextField(String("name@example.com"), text: $inviteEmail)   // String: a key would autolink the address blue
                     .textFieldStyle(.roundedBorder)
                     .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
                     .submitLabel(.done)

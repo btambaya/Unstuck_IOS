@@ -47,28 +47,36 @@ public enum SettingsDestination: String, CaseIterable, Sendable {
     /// the hub (a link never dead-ends).
     public static func from(section raw: String?) -> SettingsDestination {
         guard let raw else { return .hub }
+        // Same folding as the web's normalizeSection (lib/settings-sections.ts):
+        // trimmed, lower-cased, runs of spaces collapsed.
         let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             .replacingOccurrences(of: "_", with: "-")
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
         guard !key.isEmpty else { return .hub }
+        // Every web alias is here too (so a link means the same everywhere),
+        // except `sound`, which the plan sends to the Focus screen on iOS.
         switch key {
-        case "notifications", "notification", "calls", "call", "reminders",
-             "notifications & calls", "notifications-and-calls", "notifications-calls":
+        case "notifications", "notification", "calls", "call", "reminders", "reminder",
+             "calls from unstuck", "notifications & calls", "notifications and calls",
+             "notifications-and-calls", "notifications-calls":
             return .notifications
-        case "assistant", "ai", "memory", "knows", "remembers", "privacy",
-             "assistant & privacy", "assistant-and-privacy", "assistant-privacy",
-             "what unstuck knows", "what-unstuck-knows":
+        case "assistant", "ai", "ai assistant", "ai data sharing", "memory", "knows", "remembers", "privacy",
+             "assistant & privacy", "assistant and privacy", "assistant-and-privacy", "assistant-privacy",
+             "what unstuck knows", "what-unstuck-knows", "what unstuck remembers":
             return .assistant
-        case "interface", "appearance", "accessibility", "theme", "text size", "text-size", "display":
+        case "interface", "appearance", "accessibility", "a11y", "theme", "text size", "text-size", "display":
             return .appearance
-        case "people", "connections", "circle", "trusted circle", "trusted-circle":
+        case "people", "connections", "circle", "sharing", "people you share with",
+             "trusted circle", "trusted-circle":
             return .people
-        case "account", "backup", "export":
+        case "account", "backup", "export", "sync", "profile", "password", "delete":
             return .account
-        case "feedback":
+        case "feedback", "send feedback":
             return .feedback
         case "focus", "sound", "sounds":
             return .focus
-        case "areas", "tags", "areas & tags", "areas and tags", "areas-and-tags", "areas-tags", "area", "tag":
+        case "areas", "tags", "areas & tags", "areas and tags", "areas-and-tags", "areas-tags", "areas+tags",
+             "area", "tag":
             return .areas
         default:
             return .hub

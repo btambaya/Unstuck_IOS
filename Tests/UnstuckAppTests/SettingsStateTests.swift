@@ -229,3 +229,81 @@ final class SignOutWarningTests: XCTestCase {
         XCTAssertTrue(mixed.contains("2 changes the server couldn’t accept stay on this iPhone only"), mixed)
     }
 }
+
+// MARK: - where a Settings link lands (slim settings, 2026-09-24)
+
+/// Every entry point that names a Settings section — `unstuck://settings`
+/// links (server, old builds), the assistant's open_screen, the web's
+/// capitalised `?section=` ids — lands on the slim structure: old names are
+/// aliases, the bare link stays the hub, areas/tags open the Tasks sheet.
+@MainActor
+final class SettingsLinkRoutingTests: XCTestCase {
+    private var model: AppModel!
+
+    override func setUp() {
+        super.setUp()
+        model = AppModel()
+        model.startUITestMode()
+    }
+
+    private func land(_ link: String) -> AppRouter.Sheet? {
+        model.router.dismissAllPresentations()
+        model.router.pendingDeepLink = nil
+        model.routeDeepLink(link)
+        return model.router.activeSheet
+    }
+
+    func testTheBareLinkStaysTheHub() {
+        // The server sends it on purpose (invites, shares): People is one tap.
+        XCTAssertEqual(land("unstuck://settings"), .settings(section: nil))
+    }
+
+    func testOldAndNewSectionNamesLandOnTheSlimScreens() {
+        let table: [(String, String?)] = [
+            ("Notifications", "Notifications"), ("calls", "Notifications"), ("Calls", "Notifications"),
+            ("Interface", "Appearance"), ("accessibility", "Appearance"), ("Appearance", "Appearance"),
+            ("memory", "Assistant"), ("AI", "Assistant"), ("Assistant", "Assistant"),
+            ("People", "People"), ("circle", "People"),
+            ("Backup", "Account"), ("export", "Account"), ("Account", "Account"),
+            ("feedback", "Feedback"),
+            ("focus", nil), ("Sound", nil),   // nothing running → the hub
+            ("insights", nil), ("nonsense", nil),
+        ]
+        for (section, want) in table {
+            XCTAssertEqual(land("unstuck://settings?section=\(section)"), .settings(section: want), section)
+        }
+    }
+
+    func testAreasAndTagsOpenTheTasksSheet() {
+        for section in ["areas", "Areas", "tags", "Areas%20%26%20tags"] {
+            model.router.select(.today)
+            XCTAssertEqual(land("unstuck://settings?section=\(section)"), .areasTags, section)
+            XCTAssertEqual(model.router.tab, .tasks, section)
+        }
+    }
+
+    func testTheAssistantsOpenScreenTargets() {
+        model.router.dismissAllPresentations()
+        XCTAssertTrue(model.openScreen("settings"))
+        XCTAssertEqual(model.router.activeSheet, .settings(section: nil))
+        model.router.dismissAllPresentations(); model.router.pendingDeepLink = nil
+        XCTAssertTrue(model.openScreen("notifications"))
+        XCTAssertEqual(model.router.activeSheet, .settings(section: "Notifications"))
+        model.router.dismissAllPresentations(); model.router.pendingDeepLink = nil
+        XCTAssertTrue(model.openScreen("people"))
+        XCTAssertEqual(model.router.activeSheet, .settings(section: "People"))
+        model.router.dismissAllPresentations(); model.router.pendingDeepLink = nil
+        XCTAssertTrue(model.openScreen("areas"))
+        XCTAssertEqual(model.router.activeSheet, .areasTags)
+        XCTAssertEqual(model.router.tab, .tasks)
+    }
+
+    func testALinkArrivingOverAnOpenSheetIsDeferredThenLands() {
+        model.router.present(.inbox)
+        model.routeDeepLink("unstuck://settings?section=Interface")
+        XCTAssertEqual(model.router.pendingDeepLink, "unstuck://settings?section=Interface",
+                       "dismiss first, then present — two sheets on one host no-op")
+        model.flushPendingDeepLink()
+        XCTAssertEqual(model.router.activeSheet, .settings(section: "Appearance"))
+    }
+}

@@ -593,7 +593,7 @@ private struct AddSomeoneSection: View {
     private var formBody: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Their email (optional)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-            TextField("name@example.com", text: $email)
+            TextField(String("name@example.com"), text: $email)   // String: a key would autolink the address blue
                 .textFieldStyle(.roundedBorder)
                 .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
                 .submitLabel(.done)
@@ -606,7 +606,7 @@ private struct AddSomeoneSection: View {
             HStack(spacing: 8) {
                 Button(action: submit) {
                     Text(busy ? "Working…" : (email.trimmingCharacters(in: .whitespaces).isEmpty ? "Generate link" : "Send invite"))
-                        .font(UFont.sans(14, .semibold)).foregroundStyle(.white)
+                        .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.bg)
                         .padding(.horizontal, 16).padding(.vertical, 9)
                         .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                 }.buttonStyle(.plain).disabled(busy)
@@ -644,7 +644,7 @@ private struct AddSomeoneSection: View {
                         copied = true
                         Task { try? await Task.sleep(nanoseconds: 1_800_000_000); copied = false }
                     } label: {
-                        Text("Copy link").font(UFont.sans(14, .semibold)).foregroundStyle(.white)
+                        Text("Copy link").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.bg)
                             .padding(.horizontal, 16).padding(.vertical, 9)
                             .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                     }.buttonStyle(.plain)
@@ -732,7 +732,7 @@ private struct RedeemSection: View {
                             .onSubmit(submit)
                         Button(action: submit) {
                             Text(busy ? "Joining…" : "Join")
-                                .font(UFont.sans(14, .semibold)).foregroundStyle(.white)
+                                .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.bg)
                                 .padding(.horizontal, 16).padding(.vertical, 9)
                                 .background(theme.palette.ink).clipShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
                         }.buttonStyle(.plain)

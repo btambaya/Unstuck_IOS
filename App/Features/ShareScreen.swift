@@ -878,7 +878,7 @@ struct ShareScreen: View {
         return VStack(alignment: .leading, spacing: 10) {
             SectionLabel("Someone new")
             HStack(spacing: 8) {
-                TextField("name@example.com", text: $vm.email)
+                TextField(String("name@example.com"), text: $vm.email)   // String: a key would autolink the address blue
                     .textFieldStyle(.roundedBorder)
                     .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
                     .submitLabel(.send)

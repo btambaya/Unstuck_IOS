@@ -35,6 +35,27 @@ final class SlimSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsDestination.from(section: "Assistant & privacy"), .assistant)
     }
 
+    /// The web's alias table (lib/settings-sections.ts) lands in the same place
+    /// here — only `sound` differs on purpose (the Focus screen on iOS).
+    func testTheWebsAliasesMeanTheSameHere() {
+        let web: [(String, SettingsDestination)] = [
+            ("sync", .account), ("profile", .account), ("password", .account), ("delete", .account),
+            ("calls from unstuck", .notifications), ("reminder", .notifications),
+            ("notifications and calls", .notifications),
+            ("ai assistant", .assistant), ("ai data sharing", .assistant), ("what unstuck remembers", .assistant),
+            ("assistant and privacy", .assistant),
+            ("sharing", .people), ("people you share with", .people),
+            ("a11y", .appearance), ("text size", .appearance),
+            ("send feedback", .feedback),
+            ("areas+tags", .areas), ("area", .areas), ("tag", .areas),
+        ]
+        for (raw, want) in web {
+            XCTAssertEqual(SettingsDestination.from(section: raw), want, raw)
+        }
+        XCTAssertEqual(SettingsDestination.from(section: "Notifications   &  calls"), .notifications,
+                       "runs of spaces fold like the web's")
+    }
+
     func testNothingOrUnknownIsTheHubNeverADeadEnd() {
         XCTAssertEqual(SettingsDestination.from(section: nil), .hub)
         XCTAssertEqual(SettingsDestination.from(section: ""), .hub)

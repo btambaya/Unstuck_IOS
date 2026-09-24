@@ -311,6 +311,7 @@ struct CallSettingsView: View {
                     .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.bg)
                     .padding(.horizontal, 14).padding(.vertical, 7)
                     .background(theme.palette.ink, in: Capsule())
+                    .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -7)
             }
             .buttonStyle(.plain)
             .disabled(nudgeRetried)

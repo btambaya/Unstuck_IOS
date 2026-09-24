@@ -242,8 +242,9 @@ struct TasksView: View {
                 }
                 editAreasPill
             }
+            .padding(.vertical, 1)
         }
-        .padding(.bottom, 12)
+        .padding(.bottom, 11)
     }
 
     /// The end of the area row: add, rename, recolour or delete areas and
@@ -257,8 +258,11 @@ struct TasksView: View {
             }
             .foregroundStyle(theme.palette.ink2)
             .padding(.horizontal, 12).padding(.vertical, 6)
-            .overlay(Capsule().stroke(theme.palette.line2))
-            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
+            // An INSET ring, and one point less of the negative padding than
+            // the filled pills: the horizontal ScrollView clips to the row, and
+            // a centred stroke on the capsule's edge lost its top and bottom.
+            .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
+            .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -8)
         }
         .buttonStyle(.plain)
         .accessibilityLabel("Edit areas and tags")

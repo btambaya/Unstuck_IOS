@@ -198,13 +198,14 @@ struct SettingsView: View {
     /// hub — real buttons with a 44-pt hit area and labels. The build, for
     /// bug reports.
     private var footer: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 0) {
             footerLink("Terms", url: "https://unstucknow.io/terms", label: "Terms of Use", id: "settings-terms")
             Text("·").accessibilityHidden(true)
             footerLink("Privacy", url: "https://unstucknow.io/privacy", label: "Privacy Policy", id: "settings-privacy")
             Text("·").accessibilityHidden(true)
             Text("Unstuck \(Self.appVersion)")
                 .font(UFont.mono(11))
+                .padding(.leading, 7)
                 .accessibilityLabel("Version \(Self.appVersion)")
         }
         .font(UFont.sans(12))
@@ -216,9 +217,12 @@ struct SettingsView: View {
         Button {
             if let u = URL(string: url) { UIApplication.shared.open(u) }
         } label: {
+            // Even padding (not a min width) keeps the "·" gaps equal; with it
+            // "Terms" still clears 44 pt wide.
             Text(title).underline()
                 .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink2)
-                .frame(minWidth: 44, minHeight: 44)
+                .padding(.horizontal, 7)
+                .frame(minHeight: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

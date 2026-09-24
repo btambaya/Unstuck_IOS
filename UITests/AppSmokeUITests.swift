@@ -129,6 +129,19 @@ final class AppSmokeUITests: XCTestCase {
                       "the row's Focus action did not start a session")
         usleep(700_000)
         snap("11-focus")
+
+        // Slim settings: the focus options live on the Focus screen's ⋯ now
+        // (they left Settings) — the sheet opens and closes on its own Done.
+        let options = app.buttons["focus-options"].firstMatch
+        expect(options, "the Focus screen has no ⋯ Options button")
+        options.tap()
+        expect(app.staticTexts["Check in when I run over"].firstMatch, "Focus ⋯ Options did not open")
+        XCTAssertTrue(app.staticTexts["Ask before I leave a session"].firstMatch.exists, "the leave option is missing")
+        XCTAssertTrue(app.staticTexts["Talk me through the session"].firstMatch.exists, "the coach option is missing")
+        snap("11b-focus-options")
+        app.navigationBars["Focus options"].buttons["Done"].firstMatch.tap()
+        usleep(700_000)
+        XCTAssertTrue(app.staticTexts["FOCUSING"].firstMatch.exists, "closing the options must leave the session running")
     }
 
     /// Tapping "Talk" must actually PRESENT the voice screen. Ahmad, 2026-09-09:
@@ -181,10 +194,16 @@ final class AppSmokeUITests: XCTestCase {
         }
         XCTAssertTrue(app.buttons["settings-terms"].firstMatch.exists, "Terms must stay one tap from the hub")
         XCTAssertTrue(app.buttons["settings-privacy"].firstMatch.exists, "Privacy must stay one tap from the hub")
-        // Gone from the hub: Focus, Sound, Accessibility, Interface, Insights,
-        // Backup, Areas & tags, Calls from Unstuck.
-        for gone in ["Focus", "Sound", "Accessibility", "Interface", "Insights", "Backup", "Areas & tags"] {
-            XCTAssertFalse(app.buttons["settings-row-\(gone)"].exists, "\(gone) must not be a hub row any more")
+        // Exactly the seven rows — nothing else carries a hub-row handle, and
+        // the old rows (Focus, Sound, Accessibility, Interface, Insights,
+        // Backup, Areas & tags, Calls from Unstuck, What Unstuck knows) are gone.
+        let rowIds = Set(app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH 'settings-row-'"))
+            .allElementsBoundByIndex.map { $0.identifier })
+        XCTAssertEqual(rowIds, Set(["account", "notifications", "assistant", "people", "appearance", "feedback", "tour"]
+            .map { "settings-row-\($0)" }), "the hub must hold exactly the seven slim rows")
+        for gone in ["Sound", "Accessibility", "Interface", "Backup", "Areas & tags", "Calls from Unstuck", "What Unstuck knows"] {
+            XCTAssertFalse(app.staticTexts[gone].exists, "\(gone) must not be on the hub any more")
         }
         snap("08-settings")
 
@@ -207,6 +226,12 @@ final class AppSmokeUITests: XCTestCase {
         expect(app.staticTexts["What the AI can see."].firstMatch, "Settings → Assistant & privacy did not open")
         XCTAssertTrue(app.switches["settings-ai-data-sharing"].firstMatch.exists, "the AI data sharing consent row must stay")
         snap("17-settings-assistant")
+        app.navigationBars.buttons.firstMatch.tap(); usleep(600_000)
+
+        app.buttons["settings-row-people"].firstMatch.tap()
+        expect(app.staticTexts["People you share with."].firstMatch, "Settings → People did not open")
+        XCTAssertTrue(app.buttons["people-invite-code"].firstMatch.exists, "the invite code sits behind its link")
+        snap("18-settings-people")
         app.navigationBars.buttons.firstMatch.tap(); usleep(600_000)
 
         let accountRow = app.descendants(matching: .any)["settings-row-account"].firstMatch

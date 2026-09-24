@@ -116,6 +116,23 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   fallback tap), AssistantToolsTests (new tool wording), TourDataTests, UI: AppSmoke `testSettingsSubScreens` (the
   seven rows, footer, Appearance/N&C/A&P/Account), `testSettingsAndInsights` (week pill), CrashReportAttach (hub
   Send feedback), TourUITests (pause copy).
+- **Verifier pass (same day)** — went through PLAN.md's control table row by row on the simulator; everything lands
+  where the plan says. Fixed: People's ink buttons (Generate link / Send invite, Copy link, Join) were white text on
+  the ink fill — invisible in dark mode — now the ink/bg pair; the three `name@example.com` placeholders
+  (People, Share, New Task) were LocalizedStringKeys, so markdown autolinked them system-blue — now plain Strings;
+  the Tasks "Edit" pill's ring lost its top/bottom to the ScrollView clip (inset ring + 1 pt row slack); the footer's
+  "·" gaps were uneven (min-width → even padding); the VoIP "Try again" got a 44-pt hit area;
+  `SettingsDestination` now takes every alias the web's `normalizeSection` does (sync/profile/password/delete,
+  a11y, sharing, "calls from unstuck", "send feedback"… — only `sound` differs, by the plan) and folds spaces the
+  same way. Tests added:
+  `SettingsLinkRoutingTests` (in SettingsStateTests.swift — every old/new `?section=`, bare link = hub, areas → Tasks
+  sheet, open_screen targets, deferred-over-a-sheet), AppSmoke `testFocus` opens Focus ⋯ Options, the hub row-ID set
+  must be exactly the seven, People opens; TourUITests `testFullTourAppearanceStepIsScopedToAppearance` (the full
+  tour's Appearance step: Text size works under the panel, Back to the hub is swallowed); `SettingsShots` (in
+  HomeShots.swift) writes the hub + every screen light/dark + the moved controls to /tmp/unstuck-settings-shots.
+  Still open (not code): the two tour m4a clips above; switches keep the indigo `primary` tint (ask Ahmad with a
+  screenshot before changing); Talk's new switch sits above End, so a very long caption on a small phone can run
+  under it (captions already could run under End).
 
 ## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
 
