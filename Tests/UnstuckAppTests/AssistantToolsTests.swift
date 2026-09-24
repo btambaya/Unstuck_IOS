@@ -2561,6 +2561,13 @@ final class AssistantToolsTests: XCTestCase {
         // A later turn is a fresh scratch: it is refused again.
         scratch = TurnScratch()
         await prefix("schedule_task", #"{"taskId":"p","date":"2026-09-27"}"#, "error: \"Park run\" repeats every Saturday")
+        // Retiming the Sunday one-off in a later turn is not a new off day:
+        // the day already holds its occurrence, so it goes straight through
+        // (web and Android alike).
+        scratch = TurnScratch()
+        await eq("schedule_task", #"{"taskId":"p","date":"2026-09-20","startTime":"09:00"}"#, "ok: scheduled \"Park run\" 2026-09-20 09:00")
+        XCTAssertEqual(api.blocks.first { $0.id == "s19" }?.startTime, "09:00")
+        XCTAssertEqual(api.blocks.first { $0.id == "s19" }?.date, "2026-09-20")
     }
 
     /// The variant: create_task on the wrong day, then weekly on Saturday. The

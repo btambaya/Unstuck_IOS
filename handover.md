@@ -51,7 +51,9 @@ Same behaviour is being built on web and Android the same night; keep the wordin
   landed on Sunday 20 Sep): `rejectOffSeriesDay` (UnstuckCore/Logic/SeriesWeekday.swift) names the nearest real days in
   plain words ("Saturday 19 September (2026-09-19) or Saturday 26 September …"); nothing is written. The SAME call made
   again in the turn/voice session (`TurnScratch.offDayRefused`) is the model confirming a one-off the user asked for —
-  it goes through and the ok-result says "— a one-off on Sunday 20 September; the series stays on Saturday".
+  it goes through and the ok-result says "— a one-off on Sunday 20 September; the series stays on Saturday". A day
+  that already holds one of the task's occurrences (a one-off moved there earlier) is not checked — retiming it goes
+  straight through, as on web and Android.
   `set_task_recurrence` weekly refuses when the slot placed EARLIER THIS TURN (create_task/schedule_task with a date,
   `scratch.placedBlocks`) is on a day the new days don't include (`rejectOffSeriesPlacement`) — the create-on-Sunday-then-
   weekly-Saturday variant that started the series a week late. create_task itself never makes a series, so it has no check.
@@ -62,8 +64,10 @@ Same behaviour is being built on web and Android the same night; keep the wordin
   `AssistantHarness.confirmFirstRefusal` runs before any registry `confirmFirst` tool (delete_task, delete_list,
   leave_list, delete_area, delete_tag, cancel_focus) and refuses unless the user's latest message asks for it by name,
   points at what the assistant just named ("delete it"), asks sweepingly ("delete all my done tasks"), or is a yes to the
-  assistant's previous delete question (`ConfirmFirst.allows`, UnstuckCore/Logic/ConfirmFirst.swift). TEXT harness only —
-  the voice path is not gated yet.
+  assistant's previous delete question (`ConfirmFirst.allows`, UnstuckCore/Logic/ConfirmFirst.swift). A yes is a short
+  answer that starts with one ("I'll do it on Friday" / "please add milk" are not), it answers the thing the QUESTION
+  named (not another name earlier in the reply), and a message that opens with a no ("No, leave it") asks only for
+  what it names. TEXT harness only — the voice path (Talk + calls, `runVoiceTool`) is not gated yet.
 - **Analytics (B), picked rules, all three apps:** an area outside the user's list is its own series by name
   (`areaSeries`/`weekdayAreaBars`, web's rule; "No area" only when some session has none); repeating series sort kept →
   due → name; the voice review flag clears only on `.createResponse`/`.commitAndRespond` (already so since 5316fe2, now

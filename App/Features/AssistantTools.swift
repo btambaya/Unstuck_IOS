@@ -687,9 +687,13 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // A weekly series on a day it doesn't repeat on is almost always the
         // model's date maths ("Saturday" → 2026-09-20, a Sunday: James's park
         // run, 2026-09-13) — refused with the series' nearest days, nothing
-        // written. The same call repeated is a one-off the user asked for.
+        // written. The same call repeated is a one-off the user asked for. A
+        // day that already holds one of its occurrences (a one-off moved
+        // there earlier) is that one-off being retimed, not a new day — as
+        // on web and Android.
         var oneOff = ""
-        if isOffSeriesDay(t.recurrence, date: date) {
+        if isOffSeriesDay(t.recurrence, date: date),
+           !api.getBlocks().contains(where: { $0.taskId == t.id && isTaskBlock($0) && $0.date == date }) {
             let key = "schedule|\(t.id)|\(date)"
             if !scratch.offDayRefused.contains(key),
                let refusal = rejectOffSeriesDay(taskName: t.name, recurrence: t.recurrence, date: date, today: api.todayIso()) {

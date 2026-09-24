@@ -141,6 +141,53 @@ final class ConfirmFirstTests: XCTestCase {
         XCTAssertFalse(allows(tool: "delete_tag", "urgent", "tag it urgent"))
     }
 
+    /// A no is never a request: "leave it" keeps a list, and a message that
+    /// opens with no/wait/keep only counts when it names the thing itself.
+    func testANoIsNeverTakenAsTheAsk() {
+        let leave = "Want me to leave the list “Book club”?"
+        XCTAssertFalse(allows(tool: "leave_list", "Book club", "No, leave it", prev: leave))
+        XCTAssertFalse(allows(tool: "leave_list", "Book club", "leave it for now", prev: leave))
+        XCTAssertFalse(allows(tool: "leave_list", "Book club", "no, leave them all", prev: "Should I leave Book club and Family?"))
+        XCTAssertTrue(allows(tool: "leave_list", "Book club", "yes", prev: leave))
+        XCTAssertTrue(allows(tool: "leave_list", "Book club", "leave that list", prev: "Book club is shared by Sam."))
+        XCTAssertFalse(allows(tool: "cancel_focus", "Write report", "No, stop asking", prev: "Want me to cancel this session?"))
+        XCTAssertFalse(allows("Gym", "no, clear it off today", prev: "Delete “Gym”?"))
+        // Naming it is still an ask, whatever came first.
+        XCTAssertTrue(allows("Gym", "No, delete Gym", prev: "Want me to move “Gym” to Friday?"))
+    }
+
+    /// A yes is a short answer that STARTS with one — not "do it" or
+    /// "please" somewhere in another request.
+    func testAYesIsAnAnswerNotAWordInsideAnotherRequest() {
+        let asked = "Gym has no slots left — want me to delete it?"
+        XCTAssertFalse(allows("Gym", "I'll do it on Friday", prev: asked))
+        XCTAssertFalse(allows("Gym", "can you do it tomorrow instead?", prev: asked))
+        XCTAssertFalse(allows("Gym", "please add milk to groceries", prev: asked))
+        XCTAssertTrue(allows("Gym", "please do", prev: asked))
+        XCTAssertTrue(allows("Gym", "please", prev: asked))
+        XCTAssertTrue(allows("Gym", "yes please", prev: asked))
+        XCTAssertTrue(allows("Gym", "oh yes please", prev: asked))
+        XCTAssertTrue(allows("Gym", "ok do it", prev: asked))
+        XCTAssertTrue(allows("Gym", "just do it", prev: asked))
+        XCTAssertTrue(allows("Gym", "please go ahead", prev: asked))
+        XCTAssertTrue(allows("Gym", "Absolutely, bin it", prev: asked))
+        XCTAssertFalse(allows("Gym", "well I'll do it later", prev: asked))
+        XCTAssertTrue(allows("Gym", "go ahead", prev: asked))
+    }
+
+    /// The yes answers the thing the question named — not another task
+    /// mentioned earlier in the same reply.
+    func testAYesDeletesOnlyWhatTheQuestionNamed() {
+        XCTAssertFalse(allows("Gym", "yes", prev: "Gym is done for today. Want me to delete “Old plan”?"))
+        XCTAssertTrue(allows("Old plan", "yes", prev: "Gym is done for today. Want me to delete “Old plan”?"))
+        // A question that points back ("delete it?") covers what came just before.
+        XCTAssertTrue(allows("Gym", "yes", prev: "Gym has no slots left. Want me to delete it?"))
+        // A full stop inside a quoted name doesn't end the question.
+        XCTAssertEqual(ConfirmFirst.lastAsk("Want me to delete “Dr. Patel follow-up”? It's done."),
+                       "Want me to delete “Dr. Patel follow-up”?")
+        XCTAssertTrue(allows("Dr. Patel follow-up", "yes", prev: "Want me to delete “Dr. Patel follow-up”? It's done."))
+    }
+
     func testRefusalsSayNothingChangedAndToAskFirst() {
         XCTAssertEqual(ConfirmFirst.refusal(tool: "delete_task", target: "Gym"),
                        "error: not deleted — the user hasn't asked to delete \"Gym\" in this conversation. Nothing was changed. Ask them first (\"Delete “Gym”?\") and call delete_task only once they say yes.")
