@@ -160,7 +160,7 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
         guard let token = deps.accessToken(), !token.isEmpty else { onEnded(.failed("not signed in")); return }
         // The receipt rule already declined a call without the OK; this
         // catches one turned off between the ring and the answer.
-        guard deps.hasAIConsent() else { onEnded(.failed("no AI consent")); return }
+        guard deps.hasAIConsent() else { onEnded(.noAIConsent); return }
         generation += 1
         let gen = generation
         let config = makeConfig(session, deps: deps, generation: gen)

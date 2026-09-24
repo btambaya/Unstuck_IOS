@@ -58,13 +58,20 @@ Until now only small print in the memory screens said "our AI provider". Shared 
   (≤1.5 s), then the sheet (`AIConsentSheet`, AssistantSheet.swift) from the surface that asked (`.aiConsentSheet(host)` on
   AssistantSheet / TodayView / CallSettingsView / CallMeSection / Settings › Interface / MainTabScaffold). Agree runs the action
   once the sheet is gone; "Not now" (or swipe) skips it and the surface shows `AIConsent.decline(action).note`.
+  An ask whose sheet never comes up (the panel closed during the read, or its surface was busy presenting) is dropped after
+  2 s (`presentAIConsentAsk`) — otherwise it would silence every later gate until relaunch; a sheet torn down under its
+  surface (deep link / tour closing the panel) counts as "Not now" (`aiConsentSheetGone`). A fresh read that started before
+  a change made here never overwrites it (`aiConsentPushGen`).
 - **Gated:** assistant send + chips + dictation auto-send, Talk (sheet button + Today's mic), Siri "Ask Unstuck" (prompt waits in
   the composer), Calls master switch on, proactive calls on, test call, a task's "Call me about this". Backstops: `AssistantModel.send`
   (error `consent`, nothing sent), `tourAsk` (canned answers), `VoiceSessionModel.start`, the call launcher.
 - **Calls:** app open with Calls on for the account (this phone's switch AND a proactive call or a live booked call) and no OK
   → asked once per launch; "Not now" turns Calls off (switch + proactive, account-wide) and an alert says so. An incoming call
   without the OK is declined on receipt (`CallEnvironment.hasAIConsent`, after the calls-off rule) with a quiet notification
-  carrying the notes; a fallback-B tap is declined the same way.
+  carrying the notes; a fallback-B tap is declined the same way. A call that passes the receipt rules re-reads the OK while it
+  rings (`CallEnvironment.callWillRing`), so one turned off on the web / another phone is caught at the answer: the launcher
+  refuses (`CallEndReason.noAIConsent` → outcome done, note "no AI consent", a normal alert with the way back on).
+  Messages queued behind a running turn are dropped unsent if sharing is turned off meanwhile (`AssistantModel.drainQueue`).
 - **Settings › Interface › "AI data sharing":** shows On/Off; off = clear + Calls off; on = the sheet.
 - **Not done:** no server-side enforcement (older builds must keep working) — follow-up. Android needs the same gate.
   UI tests boot with the OK granted (`UITEST_AI_CONSENT=0` boots without it).

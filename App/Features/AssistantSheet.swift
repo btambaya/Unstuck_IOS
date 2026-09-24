@@ -609,6 +609,8 @@ private struct AIConsentSheetHost: ViewModifier {
 struct AIConsentSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
+    /// The ask this sheet came up for (AppModel.aiConsentSheetShown / Gone).
+    @State private var askId: UUID?
 
     var body: some View {
         ScrollView {
@@ -658,6 +660,11 @@ struct AIConsentSheet: View {
         .background(theme.palette.bg.ignoresSafeArea())
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        .onAppear {
+            askId = model.aiConsentAsk?.id
+            model.aiConsentSheetShown(askId)
+        }
+        .onDisappear { model.aiConsentSheetGone(askId) }
     }
 }
 

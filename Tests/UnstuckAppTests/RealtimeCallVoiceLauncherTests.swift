@@ -424,7 +424,7 @@ final class RealtimeCallVoiceLauncherTests: XCTestCase {
         d.hasAIConsent = { false }
         launcher.bind(d)
         startDegraded()
-        XCTAssertEqual(ended, [.failed("no AI consent")])
+        XCTAssertEqual(ended, [.noAIConsent])
         XCTAssertTrue(sessions.isEmpty)
         XCTAssertEqual(sessionStarts, 0)
     }

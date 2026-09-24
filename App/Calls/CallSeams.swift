@@ -30,6 +30,10 @@ enum CallEndReason: Equatable, Sendable {
     /// the same way) — a normal end, not a failure; the post-call notice
     /// carries this plain line.
     case outOfMinutes(String)
+    /// The account's AI-consent OK was gone at the answer (turned off on the
+    /// web or another phone while it rang): nothing connected to the
+    /// assistant, and the notes land with the way to turn it back on.
+    case noAIConsent
 }
 
 /// How the coordinator tells CallKit a call ended (maps 1:1 onto
@@ -105,13 +109,19 @@ protocol CallEnvironment: AnyObject {
     /// The account has agreed to AI data sharing (AIConsent). A call is a
     /// conversation with the assistant — without the OK it never connects:
     /// it ends as `declined` quietly and the notes land as a notification.
+    /// No default: every environment has to answer it (fail closed).
     var hasAIConsent: Bool { get }
+    /// A call passed the receipt rules and is ringing: re-read the account's
+    /// OK, so one turned off on the web or another phone since this device
+    /// last looked is known before the answer connects (the launcher checks
+    /// it again then).
+    func callWillRing()
 }
 
 extension CallEnvironment {
     var isSessionKnown: Bool { true }
     var isCallsEnabled: Bool { true }
-    var hasAIConsent: Bool { true }
+    func callWillRing() {}
 }
 
 /// A local notification the coordinator wants posted. Codable so the outcome

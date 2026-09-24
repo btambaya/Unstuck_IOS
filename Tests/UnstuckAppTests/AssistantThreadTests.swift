@@ -399,6 +399,65 @@ final class AIConsentGateTests: XCTestCase {
         XCTAssertEqual(app.aiConsentAsk?.host, .assistant)
     }
 
+    func testAnAskItsSurfaceNeverShowedIsDroppedSoTheNextGateCanAsk() async throws {
+        // The panel closed while the account was read (or its surface was
+        // busy presenting): left in place, the ask would silence every gate.
+        app.aiConsentShowGrace = .milliseconds(50)
+        var ran = 0
+        await app.askForAIConsent(.talk, from: .today) { ran += 1 }
+        XCTAssertNotNil(app.aiConsentAsk)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(app.aiConsentAsk)
+        XCTAssertEqual(ran, 0)
+        XCTAssertNil(app.aiConsentNote, "nobody saw it — nothing to explain")
+        await app.askForAIConsent(.chat, from: .assistant) {}
+        XCTAssertEqual(app.aiConsentAsk?.host, .assistant)
+    }
+
+    func testAnAskOnScreenIsLeftAlone() async throws {
+        app.aiConsentShowGrace = .milliseconds(50)
+        await app.askForAIConsent(.chat, from: .assistant) {}
+        app.aiConsentSheetShown(app.aiConsentAsk?.id)
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(app.aiConsentAsk?.host, .assistant)
+    }
+
+    func testAppOpensAskThatNeverShowedIsTriedAgainLater() async throws {
+        app.aiConsentShowGrace = .milliseconds(50)
+        app.aiConsentAskedOnOpen = true
+        app.presentAIConsentAsk(AIConsentAsk(action: .callsOnOpen, host: .root, onAgree: {}, onDecline: {}))
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(app.aiConsentAsk)
+        XCTAssertFalse(app.aiConsentAskedOnOpen)
+    }
+
+    func testTheSheetTornDownUnderItCountsAsNotNow() async {
+        // A deep link or the tour closed the panel with the sheet up: no
+        // answer, no swipe — still "Not now", and the gate is free again.
+        var ran = 0, declined = 0
+        await app.askForAIConsent(.chat, from: .assistant, onDecline: { declined += 1 }) { ran += 1 }
+        let id = app.aiConsentAsk?.id
+        app.aiConsentSheetShown(id)
+        app.aiConsentSheetGone(id)
+        XCTAssertNil(app.aiConsentAsk)
+        XCTAssertEqual(ran, 0)
+        XCTAssertEqual(declined, 1)
+        XCTAssertEqual(app.aiConsentNote?.host, .assistant)
+    }
+
+    func testTheSheetGoingAfterAnAnswerChangesNothing() async {
+        var ran = 0
+        await app.askForAIConsent(.talk, from: .assistant) { ran += 1 }
+        let id = app.aiConsentAsk?.id
+        app.aiConsentSheetShown(id)
+        app.agreeAIConsent()
+        app.aiConsentSheetGone(id)
+        XCTAssertEqual(ran, 0, "Talk still opens only once the sheet has finished going")
+        app.aiConsentSheetDismissed(from: .assistant)
+        XCTAssertEqual(ran, 1)
+        XCTAssertTrue(app.aiConsentGranted)
+    }
+
     func testCallsCountAsOnOnlyWhenSomethingCanRing() {
         CallSettings.enabled = true
         XCTAssertFalse(app.callsAreOnForAIConsent, "the switch is on by default — alone it rings nothing")
@@ -476,6 +535,26 @@ final class AIConsentGateTests: XCTestCase {
         guard case .err("consent") = await assistant.tourAsk(messages: [], stepId: "s", stepTitle: "t") else {
             return XCTFail("the tour answers from its script instead")
         }
+        assistant.clear()
+    }
+
+    func testTurningSharingOffMidTurnDropsWhatWasQueuedBehindIt() async throws {
+        AssistantModel.scrubPersisted()
+        app.aiConsentCache = AIConsent.Cache(userId: "u1", record: granted, pending: false)
+        let assistant = AssistantModel(model: app, client: AssistantClient(Self.offlineClient()))
+        assistant.send("first")
+        XCTAssertTrue(assistant.sending)
+        assistant.send("second")
+        XCTAssertEqual(assistant.queued.map(\.text), ["second"])
+        app.revokeAIConsent()
+        for _ in 0..<500 {
+            if !assistant.sending { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(assistant.sending)
+        XCTAssertTrue(assistant.queued.isEmpty)
+        XCTAssertEqual(assistant.turns.filter { $0.role == "user" }.map(\.text), ["first"], "the queued one never went")
+        XCTAssertEqual(assistant.error, "consent")
         assistant.clear()
     }
 

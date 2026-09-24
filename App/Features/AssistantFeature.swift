@@ -243,6 +243,9 @@ final class AssistantModel {
     /// Drain the queue one message per idle moment.
     private func drainQueue() {
         guard !sending, !queued.isEmpty else { return }
+        // AI data sharing turned off while a turn ran: what was queued behind
+        // it is dropped unsent, like `send` (AIConsent).
+        if client != nil, !model.aiConsentGranted { queued.removeAll(); error = "consent"; return }
         let next = queued.removeFirst()
         startTurn(next.text)
     }

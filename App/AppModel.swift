@@ -392,6 +392,11 @@ final class AppModel {
     @ObservationIgnored var aiConsentResolved = false
     @ObservationIgnored var aiConsentLastFetch: Date?
     @ObservationIgnored var aiConsentPushGen = 0
+    /// The ask whose sheet actually came up (AIConsentSheet reports in).
+    @ObservationIgnored var aiConsentShownAskId: UUID?
+    /// How long an ask may wait for its surface to show it before it's
+    /// dropped (`presentAIConsentAsk`). Shortened by the tests.
+    @ObservationIgnored var aiConsentShowGrace: Duration = .seconds(2)
 
     /// The ONE way to open the Assistant panel (launcher, Siri deep link, the
     /// guided tour, Today's input pill). No-ops while the kill-switch is off,
@@ -3254,7 +3259,35 @@ extension AppModel {
         aiConsentChecking = false
         if aiConsentGranted { proceed(); return }
         guard aiConsentAsk == nil else { return }
-        aiConsentAsk = AIConsentAsk(action: action, host: host, onAgree: proceed, onDecline: onDecline)
+        presentAIConsentAsk(AIConsentAsk(action: action, host: host, onAgree: proceed, onDecline: onDecline))
+    }
+
+    /// Put `ask` up for its surface. If the sheet never comes up — the panel
+    /// was closed while the account was read, or its surface was already
+    /// presenting something — the ask is dropped after a moment. Left in
+    /// place it would silence every later gate (one sheet at a time) until
+    /// the next launch.
+    func presentAIConsentAsk(_ ask: AIConsentAsk) {
+        aiConsentAsk = ask
+        let grace = aiConsentShowGrace
+        Task { [weak self] in
+            try? await Task.sleep(for: grace)
+            guard let self, self.aiConsentAsk?.id == ask.id, self.aiConsentShownAskId != ask.id else { return }
+            self.aiConsentAsk = nil
+            // App open's one look didn't happen: a later foreground tries again.
+            if ask.action == .callsOnOpen { self.aiConsentAskedOnOpen = false }
+        }
+    }
+
+    /// The consent sheet came up for ask `id` (AIConsentSheet.onAppear).
+    func aiConsentSheetShown(_ id: UUID?) { aiConsentShownAskId = id }
+
+    /// The consent sheet for ask `id` has gone. An answer or a swipe has
+    /// normally settled it already; if its surface was torn down under it
+    /// (the panel closed by a deep link or the tour) it counts as "Not now".
+    func aiConsentSheetGone(_ id: UUID?) {
+        guard let id, aiConsentAsk?.id == id else { return }
+        aiConsentSheetDismissed()
     }
 
     /// "Agree and continue": recorded here at once (so it holds offline) and
@@ -3341,10 +3374,13 @@ extension AppModel {
             aiConsentResolved = true
         } else if force || aiConsentLastFetch.map({ Date().timeIntervalSince($0) >= 60 }) ?? true {
             aiConsentLastFetch = Date()
+            // A change made here while the read was out (Agree tapped) beats
+            // an answer the server gave before it landed.
+            let changeGen = aiConsentPushGen
             let fetch: @Sendable () async -> AIConsentSnapshot? = { await auth.fetchAIConsent() }
             let snapshot: AIConsentSnapshot?
             if let timeout { snapshot = await AuthService.firstWithin(timeout, fetch) } else { snapshot = await fetch() }
-            if let snapshot, snapshot.userId == (cachedUserId ?? snapshot.userId) {
+            if let snapshot, changeGen == aiConsentPushGen, snapshot.userId == (cachedUserId ?? snapshot.userId) {
                 adoptAIConsent(snapshot.record, userId: snapshot.userId, source: .fresh)
             }
             aiConsentResolved = true
@@ -3364,7 +3400,7 @@ extension AppModel {
                                    askedThisLaunch: aiConsentAskedOnOpen),
               !router.hasActivePresentation, !Self.anythingPresented() else { return }
         aiConsentAskedOnOpen = true
-        aiConsentAsk = AIConsentAsk(action: .callsOnOpen, host: .root, onAgree: {}, onDecline: {})
+        presentAIConsentAsk(AIConsentAsk(action: .callsOnOpen, host: .root, onAgree: {}, onDecline: {}))
     }
 
     /// Something is presented over the tab scaffold that the router doesn't

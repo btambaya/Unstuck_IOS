@@ -131,6 +131,9 @@ final class FakeEnvironment: CallEnvironment {
     /// The account's AI-consent OK (AIConsent).
     var aiConsent = true
     var hasAIConsent: Bool { aiConsent }
+    /// Times a ringing call asked for the OK to be re-read.
+    var ringRereads = 0
+    func callWillRing() { ringRereads += 1 }
 }
 
 @MainActor
@@ -389,6 +392,37 @@ final class CallCoordinatorTests: XCTestCase {
         answerAndActivate()
         XCTAssertEqual(launcher.started.count, 1)
         XCTAssertEqual(reporter.outcomes, [.answered])
+    }
+
+    func testARingingCallRereadsTheOKButADeclinedOneDoesnt() {
+        // An OK turned off on the web or another phone must be known before
+        // the answer connects: the ring asks for a fresh read.
+        sut.reportIncoming(payload())
+        XCTAssertEqual(env.ringRereads, 1)
+        sut.reportIncoming(payload())   // the duplicate push touches nothing
+        XCTAssertEqual(env.ringRereads, 1)
+    }
+
+    func testNoRereadForACallDeclinedOnReceipt() {
+        env.aiConsent = false
+        sut.reportIncoming(payload())
+        XCTAssertEqual(env.ringRereads, 0)
+    }
+
+    func testTheOKGoneByTheAnswerHangsUpWithTheWayBackOn() {
+        // Turned off while it rang: the launcher refuses (nothing reaches the
+        // assistant) and the notice says why — a normal alert, they just
+        // picked up.
+        answerAndActivate()
+        launcher.end(.noAIConsent)
+        controller.flush()
+        XCTAssertEqual(reporter.outcomes, [.answered, .done])
+        XCTAssertEqual(reporter.reports.last?.notes, [CallNotifications.noAIConsentOutcome])
+        XCTAssertEqual(notifier.posted.map(\.id), ["unstuck.call.consent.\(Self.callId)"])
+        XCTAssertTrue(notifier.posted[0].body.contains("turn on AI data sharing"))
+        XCTAssertFalse(notifier.posted[0].quiet)
+        XCTAssertFalse(notifier.posted[0].timeSensitive, "nothing is ringing")
+        XCTAssertNil(sut.active)
     }
 
     func testSignedOutBeatsTheCallsSwitch() {

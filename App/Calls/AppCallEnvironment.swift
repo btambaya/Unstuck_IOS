@@ -85,6 +85,14 @@ final class AppCallEnvironment: CallEnvironment {
         if let m = model { return m.aiConsentGranted }
         return AIConsent.isGranted(AIConsentStore.load(), userId: nil)
     }
+
+    /// Ringing: read the account's OK fresh while the user reaches for the
+    /// phone. Before AppModel is up there's nothing to do here — its boot
+    /// reads the account anyway.
+    func callWillRing() {
+        guard let m = model else { return }
+        Task { await m.refreshAIConsent(force: true) }
+    }
 }
 
 /// Posts the coordinator's notifications through UNUserNotificationCenter.

@@ -11,7 +11,9 @@
 //                     ├─ focus session live   → end .answeredElsewhere, outcome busy, notify
 //                     ├─ anchor known over    → end .remoteEnded, outcome stale (silent);
 //                     │                         one not synced here yet rings (web/Android audit 2026-09-23, A6)
-//                     └─ else ring; 30 s unanswered → .unanswered, outcome missed —
+//                     └─ else ring (the AI-consent OK is re-read meanwhile — the
+//                        launcher refuses at the answer if it went: outcome done, notify);
+//                        30 s unanswered → .unanswered, outcome missed —
 //                        the "I called about X" notification is handed to the
 //                        REPORTER and posted only once call-outcome answers
 //                        `retry: false` (a first miss is re-rung by the server
@@ -264,6 +266,7 @@ final class CallCoordinator {
             endSilently(session, reason: .remoteEnded, outcome: .stale, notification: nil)
             return
         }
+        environment.callWillRing()
         ringTimer = clock.after(Self.ringTimeout) { [weak self] in self?.ringTimedOut(uuid: session.uuid) }
     }
 
@@ -381,6 +384,11 @@ final class CallCoordinator {
                 // skips for the minutes (077), so the row reads alike.
                 report(session, .done, outcomeNotes: [CallNotifications.minutesUsedOutcome])
                 notifier.post(CallNotifications.minutesUsed(session, line: line))
+            case .noAIConsent:
+                // Answered, but the OK was gone: nothing reached the
+                // assistant. The notes land with the way back on.
+                report(session, .done, outcomeNotes: [CallNotifications.noAIConsentOutcome])
+                notifier.post(CallNotifications.noAIConsent(session, answered: true))
             }
         }
         return true
@@ -598,11 +606,15 @@ enum CallNotifications {
     }
     /// The account hasn't agreed to AI data sharing: the call never connected
     /// to the assistant. Declined quietly; the notes land with the way on.
-    static func noAIConsent(_ s: CallSession) -> CallNotification {
+    /// `answered`: they picked up and it hung up at once (the OK was turned
+    /// off while it rang) — a normal alert, like minutesUsed, so they see why.
+    static func noAIConsent(_ s: CallSession, answered: Bool = false) -> CallNotification {
         make(s, id: "unstuck.call.consent.\(s.callId)", title: "I called about \(s.label)",
              body: body(s.notes) + "\n(calls use the assistant — turn on AI data sharing in Settings › Interface to take them)",
-             quiet: true)
+             quiet: !answered, timeSensitive: false)
     }
+    /// call_requests.outcome_notes for a call answered after the OK was turned off.
+    static let noAIConsentOutcome = "no AI consent"
     static func voiceFailed(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.failed.\(s.callId)", title: "Couldn't start the call — here's what it was about", body: body(s.notes))
     }
