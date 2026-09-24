@@ -4,8 +4,8 @@
 //   • a status line only when something is wrong: notifications are off for
 //     Unstuck → Turn on;
 //   • Reminders: "How much Unstuck checks in" Calm / Balanced / Coach (one
-//     plain line each; the level also paces the spoken focus coach) and
-//     "Remind me before a task" Off / 5 / 10 / 15. Changing either re-syncs
+//     plain line each; the level also paces "Talk me through the session")
+//     and "Remind me before a task" Off / 5 / 10 / 15. Changing either re-syncs
 //     the reminder alarms; the level also mirrors its derived booleans to
 //     notification_preferences (best-effort) so the server-driven morning
 //     summary + paused-checkin cap honour it;
@@ -45,7 +45,10 @@ struct NotificationSettingsView: View {
 
                 if let line = permissionLine { statusLine(line) .padding(.bottom, 14) }
 
-                SectionLabel("How much Unstuck checks in").padding(.bottom, 8)
+                // Copy canon §1: "Reminders" heads the level and the lead;
+                // those two are row titles under it (Android's layout).
+                SectionLabel("Reminders").padding(.bottom, 10)
+                rowTitle("How much Unstuck checks in").padding(.bottom, 8)
                 VStack(spacing: 0) {
                     ForEach(NotificationLevel.allCases, id: \.self) { l in
                         if l != NotificationLevel.allCases.first {
@@ -60,14 +63,14 @@ struct NotificationSettingsView: View {
                 .tourTarget(.notifBody)
                 SettingsNote(text: NotificationLevel.coachPaceNote).padding(.top, 8)
 
-                SectionLabel("Remind me before a task")
-                    .padding(.top, 22).padding(.bottom, 8)
+                rowTitle("Remind me before a task")
+                    .padding(.top, 20).padding(.bottom, 8)
                 HStack(spacing: 6) {
                     ForEach(leadOptions, id: \.self) { min in
                         leadChip(min)
                     }
                 }
-                SettingsNote(text: "Reminders ring on this iPhone, even offline. A task can have its own.")
+                SettingsNote(text: "Reminders work even offline. Any task can have its own time.")
                     .padding(.top, 10)
 
                 SectionLabel("Calls").padding(.top, 26).padding(.bottom, 8)
@@ -146,6 +149,12 @@ struct NotificationSettingsView: View {
     }
 
     // MARK: level + lead
+
+    /// A row title under the Reminders heading (the settings rows' label style).
+    private func rowTitle(_ text: String) -> some View {
+        Text(text).font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
+            .accessibilityAddTraits(.isHeader)
+    }
 
     private func levelRow(_ l: NotificationLevel) -> some View {
         Button {

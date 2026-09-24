@@ -56,6 +56,50 @@ final class SlimSettingsTests: XCTestCase {
                        "runs of spaces fold like the web's")
     }
 
+    /// Copy canon §5: one matching rule on all three platforms (Android's) —
+    /// lower-case, "&" → "and", drop everything that isn't a letter or digit.
+    /// Dashes, underscores, "+" and spaces all fold away.
+    func testDashesUnderscoresAndPlusFoldAway() {
+        let table: [(String, SettingsDestination)] = [
+            ("ai-assistant", .assistant), ("calls_from_unstuck", .notifications),
+            ("notifications-calls", .notifications), ("notifications_and_calls", .notifications),
+            ("assistant-privacy", .assistant), ("Assistant+Privacy", .assistant),
+            ("trusted-circle", .people), ("TrustedCircle", .people), ("people_you_share_with", .people),
+            ("text-size", .appearance), ("TEXT_SIZE", .appearance), ("display", .appearance),
+            ("what-unstuck-knows", .assistant), ("whatUnstuckRemembers", .assistant),
+            ("send_feedback", .feedback), ("areas+tags", .areas), ("AreasTags", .areas), ("areas_and_tags", .areas),
+        ]
+        for (raw, want) in table {
+            XCTAssertEqual(SettingsDestination.from(section: raw), want, raw)
+        }
+        XCTAssertEqual(SettingsDestination.sectionKey("Notifications & Calls"), "notificationsandcalls")
+        XCTAssertEqual(SettingsDestination.sectionKey(" a11y "), "a11y", "digits are kept")
+        XCTAssertEqual(SettingsDestination.from(section: " - _ "), .hub, "nothing left → the hub")
+    }
+
+    /// Every canonical name (copy canon §5, already reduced) lands where the
+    /// table says; `sound`/`sounds` open Focus on the phones.
+    func testTheCanonicalNameTable() {
+        let canon: [(SettingsDestination, [String])] = [
+            (.account, ["account", "backup", "export", "sync", "profile", "password", "delete"]),
+            (.notifications, ["notifications", "notification", "notificationsandcalls", "notificationscalls",
+                              "calls", "call", "callsfromunstuck", "reminders", "reminder"]),
+            (.assistant, ["assistant", "assistantandprivacy", "assistantprivacy", "ai", "aiassistant", "aidatasharing",
+                          "privacy", "memory", "knows", "whatunstuckknows", "remembers", "whatunstuckremembers", "facts"]),
+            (.people, ["people", "peopleyousharewith", "connections", "circle", "trustedcircle", "sharing"]),
+            (.appearance, ["appearance", "interface", "accessibility", "a11y", "theme", "textsize", "display"]),
+            (.feedback, ["feedback", "sendfeedback"]),
+            (.areas, ["areas", "area", "tags", "tag", "areasandtags", "areastags"]),
+            (.focus, ["focus", "sound", "sounds"]),
+        ]
+        for (want, names) in canon {
+            for n in names { XCTAssertEqual(SettingsDestination.from(section: n), want, n) }
+        }
+        for n in ["settings", "hub", "tour", "producttour", "insights"] {
+            XCTAssertEqual(SettingsDestination.from(section: n), .hub, n)
+        }
+    }
+
     func testNothingOrUnknownIsTheHubNeverADeadEnd() {
         XCTAssertEqual(SettingsDestination.from(section: nil), .hub)
         XCTAssertEqual(SettingsDestination.from(section: ""), .hub)
@@ -108,7 +152,10 @@ final class SlimSettingsTests: XCTestCase {
         XCTAssertEqual(NotificationLevel.balanced.plainLine,
                        "Also a nudge when a task should start, a check-in if you've paused a while, and a morning summary.")
         XCTAssertEqual(NotificationLevel.coach.plainLine, "Also a second nudge if you haven't started 10 minutes in.")
-        XCTAssertTrue(NotificationLevel.coachPaceNote.contains("focus coach"))
+        // Names what the person turns on in Focus ⋯ ("Talk me through the
+        // session"), not a "focus coach" that reads as the Coach level only.
+        XCTAssertEqual(NotificationLevel.coachPaceNote,
+                       "This also sets how often Unstuck talks you through a focus session.")
     }
 
     func testFactCategoriesHavePlainNames() {
@@ -139,7 +186,9 @@ final class SlimSettingsTests: XCTestCase {
         XCTAssertEqual(CallsBlockState.resolve(assistantOn: true, aiSharingOn: true, phoneSwitchOn: true), .on)
         XCTAssertEqual(CallsBlockState.needsLine(assistantOn: false, aiSharingOn: false),
                        "Calls need the Assistant and AI data sharing.")
-        XCTAssertTrue(CallsBlockState.needsLine(assistantOn: false, aiSharingOn: true).contains("the Assistant"))
-        XCTAssertTrue(CallsBlockState.needsLine(assistantOn: true, aiSharingOn: false).contains("AI data sharing"))
+        XCTAssertEqual(CallsBlockState.needsLine(assistantOn: false, aiSharingOn: true),
+                       "Calls need the Assistant, which is off.")
+        XCTAssertEqual(CallsBlockState.needsLine(assistantOn: true, aiSharingOn: false),
+                       "Calls need AI data sharing, which is off.")
     }
 }

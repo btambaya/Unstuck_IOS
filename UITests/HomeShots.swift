@@ -249,7 +249,7 @@ final class SettingsShots: XCTestCase {
 
         // "Ask before I leave" offers "don't ask again" on the question itself.
         app.buttons["← Out"].firstMatch.tap(); usleep(900_000)
-        expect(app.buttons["Leave, and don't ask again"].firstMatch, "the leave question has no don't-ask-again")
+        expect(app.buttons["Leave and don't ask again"].firstMatch, "the leave question has no don't-ask-again")
         save("moved-03-leave-confirm")
         cancelDialog("Stay")
         app.buttons["Pause"].firstMatch.tap(); usleep(900_000)

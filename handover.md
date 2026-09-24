@@ -78,7 +78,7 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   `accessibilityReduceMotion`.
 - **Moved onto their screens**: Focus `⋯` (id `focus-options`) → `FocusOptionsSheet` (Check in when I run over
   Never/5/10 · Ask before I leave · Ask why I'm pausing · Talk me through the session · Voice replies); the leave and
-  pause questions carry "Leave, and don't ask again" / "Don't ask again"; flipping the coach mid-session starts/stops
+  pause questions carry "Leave and don't ask again" / "Don't ask again"; flipping the coach mid-session starts/stops
   it. **The speaker button is the background-noise setting** — `updateAudio` no longer needs `ambient != .off` (the
   silent-button bug), a tap stores `.brown`/`.off`, a stored `pink` reads as on. Talk: "Noisy room? Hold to talk"
   switch (`HoldToTalkSwitch`, same key `unstuck.voice.holdToTalk`; a live plain Talk reconnects in the new mode,
@@ -91,8 +91,9 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   switch** → AI consent → hours → focus → anchor; outcome `declined` (never `missed`, so no re-ring), quiet notice
   `unstuck.call.assistant.<id>` "(the Assistant is off on this iPhone — Settings › Assistant & privacy)". The
   fallback-B alert tap declines the same way. CallMeSection says so where a call is booked.
-- **Links** (`SettingsDestination.from`, case-insensitive): notifications/notification/calls → N&C; assistant/ai/
-  memory/knows → A&P; interface/appearance/accessibility/theme → Appearance; people/connections/circle → People;
+- **Links** (`SettingsDestination.from`; since the copy canon: lower-case, "&" → "and", keep only letters and digits —
+  Android's rule — so dashes/underscores/"+"/spaces all fold; names written reduced): notifications/notification/calls → N&C; assistant/ai/
+  memory/knows/facts → A&P; interface/appearance/accessibility/theme → Appearance; people/connections/circle → People;
   backup/export/account → Account; feedback → the feedback sheet; focus/sound → the live Focus screen, else the hub;
   areas/tags/"areas & tags" → Tasks tab + Areas & tags sheet (so `open_screen areas` too); unknown/bare → the hub
   (the server's bare `unstuck://settings` stays hub → People).
@@ -137,6 +138,15 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   re-record them; switches keep the indigo `primary` tint (ask Ahmad with a
   screenshot before changing); Talk's new switch sits above End, so a very long caption on a small phone can run
   under it (captions already could run under End).
+- **Copy canon (scratchpad swt/COPY-CANON.md, same day)** — one wording on all three platforms: N&C gets a
+  "Reminders" heading with "How much Unstuck checks in" / "Remind me before a task" as row titles; pace note "This
+  also sets how often Unstuck talks you through a focus session."; lead note "Reminders work even offline. Any task
+  can have its own time."; Calls: intro line above the switch (`CallSettingsView.introLine`), no sub-line while on,
+  "Off: this phone won't ring…", hours "Outside these hours it won't ring…", the three "Rings …" call lines, the test
+  call keeps its label and shows "Booking…" underneath. Focus ⋯ Options: the four canon sub-lines (pausing gained
+  one), Voice replies says "add five" (what the coach asks) and, greyed out while the coach is off, "Turn on “Talk me
+  through the session” first." Leave question: "Leave this session?" / "Your timer keeps running. You can pick it
+  back up from Today." / Leave · Leave and don't ask again · Stay. Aliases: the reduced-form matcher + `facts`.
 
 ## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
 

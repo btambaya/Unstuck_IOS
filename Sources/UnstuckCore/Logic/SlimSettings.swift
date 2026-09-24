@@ -42,45 +42,49 @@ public enum SettingsDestination: String, CaseIterable, Sendable {
         }
     }
 
-    /// Resolve a `section=` value (or a tour step's section) — case-
-    /// insensitive, with every old name as an alias. nil / empty / unknown →
-    /// the hub (a link never dead-ends).
+    /// Resolve a `section=` value (or a tour step's section) — every old name
+    /// is an alias. nil / empty / unknown → the hub (a link never dead-ends).
     public static func from(section raw: String?) -> SettingsDestination {
         guard let raw else { return .hub }
-        // Same folding as the web's normalizeSection (lib/settings-sections.ts):
-        // trimmed, lower-cased, runs of spaces collapsed.
-        let key = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            .replacingOccurrences(of: "_", with: "-")
-            .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        // One matching rule on all three platforms (copy canon §5; Android's
+        // settingsSectionAlias, the web's normalizeSection): lower-case, "&" →
+        // "and", then drop everything that isn't a letter or a digit — so
+        // spaces, dashes, underscores and "+" all fold away and
+        // "Areas & tags", "areas-and-tags", "areas_tags" and "AreasTags" are
+        // one key. The names below are written in that reduced form.
+        let key = sectionKey(raw)
         guard !key.isEmpty else { return .hub }
-        // Every web alias is here too (so a link means the same everywhere),
-        // except `sound`, which the plan sends to the Focus screen on iOS.
         switch key {
-        case "notifications", "notification", "calls", "call", "reminders", "reminder",
-             "calls from unstuck", "notifications & calls", "notifications and calls",
-             "notifications-and-calls", "notifications-calls":
+        case "notifications", "notification", "notificationsandcalls", "notificationscalls",
+             "calls", "call", "callsfromunstuck", "reminders", "reminder":
             return .notifications
-        case "assistant", "ai", "ai assistant", "ai data sharing", "memory", "knows", "remembers", "privacy",
-             "assistant & privacy", "assistant and privacy", "assistant-and-privacy", "assistant-privacy",
-             "what unstuck knows", "what-unstuck-knows", "what unstuck remembers":
+        case "assistant", "assistantandprivacy", "assistantprivacy", "ai", "aiassistant", "aidatasharing",
+             "privacy", "memory", "knows", "whatunstuckknows", "remembers", "whatunstuckremembers", "facts":
             return .assistant
-        case "interface", "appearance", "accessibility", "a11y", "theme", "text size", "text-size", "display":
-            return .appearance
-        case "people", "connections", "circle", "sharing", "people you share with",
-             "trusted circle", "trusted-circle":
+        case "people", "peopleyousharewith", "connections", "circle", "trustedcircle", "sharing":
             return .people
+        case "appearance", "interface", "accessibility", "a11y", "theme", "textsize", "display":
+            return .appearance
         case "account", "backup", "export", "sync", "profile", "password", "delete":
             return .account
-        case "feedback", "send feedback":
+        case "feedback", "sendfeedback":
             return .feedback
+        // `sound` / `sounds` open the Focus screen on the phones (the web
+        // sends them to Appearance — a sanctioned difference).
         case "focus", "sound", "sounds":
             return .focus
-        case "areas", "tags", "areas & tags", "areas and tags", "areas-and-tags", "areas-tags", "areas+tags",
-             "area", "tag":
+        case "areas", "area", "tags", "tag", "areasandtags", "areastags":
             return .areas
         default:
             return .hub
         }
+    }
+
+    /// The reduced key a section name is matched on: lower-cased, "&" →
+    /// "and", only letters and digits kept.
+    static func sectionKey(_ raw: String) -> String {
+        String(raw.lowercased().replacingOccurrences(of: "&", with: "and")
+            .filter { $0.isLetter || $0.isNumber })
     }
 
     /// The `section=` of an `unstuck://settings?section=…` link.
@@ -141,8 +145,10 @@ public extension NotificationLevel {
         }
     }
 
-    /// The line under the picker: the level also paces the spoken focus coach.
-    static let coachPaceNote = "This also sets how often the focus coach talks during a session."
+    /// The line under the picker: the level also paces "Talk me through the
+    /// session" (Focus ⋯ Options) — named the way that option is, not as a
+    /// "focus coach" that reads as if it only applied to the Coach level.
+    static let coachPaceNote = "This also sets how often Unstuck talks you through a focus session."
 }
 
 public extension ProfileFactCategory {

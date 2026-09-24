@@ -318,7 +318,7 @@ struct FocusView: View {
     @State private var soundSeeded = false
     /// Focus ⋯ Options (the focus settings that used to live in Settings).
     @State private var showOptions = false
-    /// Soft-exit confirm ("Leave focus?") — Android parity: the timer keeps
+    /// Soft-exit confirm ("Leave this session?") — Android parity: the timer keeps
     /// running and stays resumable from Today; we just stop showing it.
     @State private var showLeaveConfirm = false
     // End-of-session reflection (Android ReflectSheet) — shown after Done /
@@ -451,16 +451,17 @@ struct FocusView: View {
                 if exitAfterReason { exitAfterReason = false; dismiss() }
             }
         }
-        .confirmationDialog("Leave focus?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
+        // Titled with the option's own words ("Ask before I leave a session").
+        .confirmationDialog("Leave this session?", isPresented: $showLeaveConfirm, titleVisibility: .visible) {
             Button("Leave") { dismiss() }
             // Focus ⋯ Options → "Ask before I leave a session" turns it back on.
-            Button("Leave, and don't ask again") {
+            Button("Leave and don't ask again") {
                 model.settings.focusSoftExit = false
                 dismiss()
             }
             Button("Stay", role: .cancel) {}
         } message: {
-            Text("Your timer keeps running — you can pick it back up from Today.")
+            Text("Your timer keeps running. You can pick it back up from Today.")
         }
         .sheet(isPresented: $showOptions) { FocusOptionsSheet() }
         // "Talk me through the session" switched in ⋯ Options mid-session:
@@ -1214,24 +1215,31 @@ struct FocusOptionsSheet: View {
                 VStack(alignment: .leading, spacing: 0) {
                     SettingsCard {
                         SettingsChoiceRow(label: "Check in when I run over",
-                                          sub: "How long past the estimate before Unstuck asks how it's going.",
+                                          sub: "How long after time's up before Unstuck asks how it's going.",
                                           options: [("0", "Never"), ("5", "5 min"), ("10", "10 min")],
                                           selected: String(settings.focusOverrunMin)) { v in
                             settings.focusOverrunMin = Int(v) ?? 5
                         }
                         CardDivider()
                         SettingsToggleRow(label: "Ask before I leave a session",
-                                          sub: "Leaving never stops the timer; you can pick it up from Today.",
+                                          sub: "A quick check before you leave. Your timer keeps running either way.",
                                           isOn: $settings.focusSoftExit)
                         CardDivider()
-                        SettingsToggleRow(label: "Ask why I'm pausing", isOn: $settings.focusPauseReasons)
+                        SettingsToggleRow(label: "Ask why I'm pausing",
+                                          sub: "One tap on a reason. It helps you spot patterns later.",
+                                          isOn: $settings.focusPauseReasons)
                         CardDivider()
                         SettingsToggleRow(label: "Talk me through the session",
-                                          sub: "Short spoken updates. How often follows Notifications & calls.",
+                                          sub: "Short spoken updates: halfway, five minutes left, time's up. How often is set in Settings → Notifications & calls.",
                                           isOn: $settings.focusSpokenCoach)
                         CardDivider()
+                        // Greyed out (never hidden) while the coach is off, and
+                        // then it says what to turn on first. "add five" is what
+                        // the coach asks at time's up (FocusCopilot).
                         SettingsToggleRow(label: "Voice replies",
-                                          sub: "After it speaks, say “add ten”, “stop” or “keep going”. Heard on this iPhone only; nothing is recorded.",
+                                          sub: settings.focusSpokenCoach
+                                              ? "After a question, answer out loud: “add five”, “stop” or “keep going”. It listens on this phone for a few seconds; nothing is recorded."
+                                              : "Turn on “Talk me through the session” first.",
                                           isOn: $settings.focusVoiceReplies)
                             .opacity(settings.focusSpokenCoach ? 1 : 0.4)
                             .disabled(!settings.focusSpokenCoach)

@@ -76,6 +76,10 @@ struct CallSettingsView: View {
     static let testCallLabel = "Test call"
     static let testCallNote = "This is what a call from Unstuck sounds like"
 
+    /// The Calls block's intro, above the switch whenever the block isn't
+    /// collapsed to its one line.
+    static let introLine = "Unstuck can ring your phone to plan, check in or go over your notes. It only rings when you ask, or for the calls you turn on below."
+
     var body: some View {
         let assistantOn = model.settings.assistantEnabled
         let aiOn = model.aiConsentGranted
@@ -84,6 +88,12 @@ struct CallSettingsView: View {
             case .needsAssistant:
                 needsAssistantLine(assistantOn: assistantOn, aiOn: aiOn)
             case .off, .on:
+                // The intro (copy canon §2 #6): what a call is for and when it
+                // rings, so the switch itself needs no line while it's on.
+                Text(Self.introLine)
+                    .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, 10)
                 SettingsCard {
                     masterSwitch
                     if enabled {
@@ -153,10 +163,12 @@ struct CallSettingsView: View {
         HStack(alignment: .top, spacing: 12) {
             VStack(alignment: .leading, spacing: 3) {
                 Text("Let Unstuck call this phone").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-                Text(enabled ? "It rings when you ask for a call, or at the times you pick below."
-                             : "Off. A call booked for this iPhone is declined, and its notes arrive as a notification.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                    .fixedSize(horizontal: false, vertical: true)
+                // On: no line — the intro above says when it rings.
+                if !enabled {
+                    Text("Off: this phone won't ring. You'll get a notification with the notes instead.")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 0)
             Toggle("", isOn: Binding(get: { enabled }, set: { on in
@@ -201,7 +213,7 @@ struct CallSettingsView: View {
                     .accessibilityLabel("Calls until")
                 Spacer(minLength: 0)
             }
-            Text("Outside these hours a call is declined quietly and its notes arrive as a notification.")
+            Text("Outside these hours it won't ring. You'll get a notification with the notes instead.")
                 .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -211,17 +223,17 @@ struct CallSettingsView: View {
     @ViewBuilder
     private var proactiveRows: some View {
         let prefs = model.callProactivePrefs
-        proactiveRow("Morning call", sub: "Plan the day together.",
+        proactiveRow("Morning call", sub: "Rings to plan the day with you.",
                      isOn: prefs.morningEnabled, time: prefs.morningTime,
                      setOn: { var p = model.callProactivePrefs; p.morningEnabled = $0; model.setCallProactivePrefs(p) },
                      setTime: { var p = model.callProactivePrefs; p.morningTime = $0; model.setCallProactivePrefs(p) })
         CardDivider()
-        proactiveRow("Evening call", sub: "Go over what got done and what moves to tomorrow.",
+        proactiveRow("Evening call", sub: "Rings to go over what got done and what moves to tomorrow.",
                      isOn: prefs.eveningEnabled, time: prefs.eveningTime,
                      setOn: { var p = model.callProactivePrefs; p.eveningEnabled = $0; model.setCallProactivePrefs(p) },
                      setTime: { var p = model.callProactivePrefs; p.eveningTime = $0; model.setCallProactivePrefs(p) })
         CardDivider()
-        proactiveRow("Call me after a focus block", sub: "When a block ends and its task isn't done yet.",
+        proactiveRow("Call me after a focus block", sub: "Rings when a block ends and its task isn't done yet.",
                      isOn: prefs.afterBlockEnabled, time: nil,
                      setOn: { var p = model.callProactivePrefs; p.afterBlockEnabled = $0; model.setCallProactivePrefs(p) },
                      setTime: { _ in })
@@ -330,7 +342,8 @@ struct CallSettingsView: View {
                     if testState == .booking { ProgressView().controlSize(.small) }
                     Image(systemName: "phone").font(.system(size: 12, weight: .semibold))
                         .accessibilityHidden(true)
-                    Text(testState == .booking ? "Booking a test call…" : "Try a test call")
+                    // The label stays put while booking; the line below says so.
+                    Text("Try a test call")
                         .font(UFont.sans(13, .semibold)).underline()
                 }
                 .foregroundStyle(theme.palette.ink)
@@ -346,7 +359,10 @@ struct CallSettingsView: View {
             case .failed(let why):
                 Text(why).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                     .fixedSize(horizontal: false, vertical: true)
-            default:
+            case .booking:
+                Text("Booking…")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            case .idle:
                 Text("We'll ring you in about a minute.")
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }
