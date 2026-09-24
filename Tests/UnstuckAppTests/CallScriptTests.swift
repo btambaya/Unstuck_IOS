@@ -1078,3 +1078,20 @@ final class CallToolsTests: XCTestCase {
         await expect("get_calls", [:], "ok: no calls booked")
     }
 }
+
+/// Zubair's after-block calls, 2026-09-24 10:31 + 11:43: "It went well." and a
+/// misheard "I always do that." were each ticked off at once — the rule said
+/// "settle it in one move". A vague answer now gets one question first.
+final class CallCompletionRuleTests: XCTestCase {
+    func testAfterBlockTicksOffOnlyAClearDoneAndAsksOnAVagueAnswer() {
+        let r = CallScript.conversationRule(.afterBlock)
+        XCTAssertTrue(r.contains("ONLY when they clearly say they finished it"), r)
+        XCTAssertTrue(r.contains("Want me to mark it done?"), r)
+        XCTAssertTrue(r.contains("Never change anything they didn't ask for"), r)
+        XCTAssertFalse(r.contains("settle it in one move"), r)
+    }
+
+    func testEveningTicksOffOnlyWhatTheyClearlySayTheyFinished() {
+        XCTAssertTrue(CallScript.conversationRule(.evening).contains("complete_task only for something they clearly say they finished"))
+    }
+}

@@ -243,9 +243,9 @@ enum CallScript {
         case .morning:
             return "If they say yes, read today's plan from the call context below, briefly (times the way people say them) — call get_schedule only if the context has no plan — then plan with them: move things with schedule_task / block_time, add what's missing with create_task, drop what won't happen with set_task_later or carry_to_tomorrow. Act ONLY through tools."
         case .evening:
-            return "If they say yes, say from the call context below what got done today and what is still open, in one sentence — NEVER ask them what got done, and call get_tasks(view: completed) only if the context has no such line — then ask what moves to tomorrow: carry_to_tomorrow ONLY when they ask for it, complete_task for anything they finished, add_capture for a loose thought. Act ONLY through tools."
+            return "If they say yes, say from the call context below what got done today and what is still open, in one sentence — NEVER ask them what got done, and call get_tasks(view: completed) only if the context has no such line — then ask what moves to tomorrow: carry_to_tomorrow ONLY when they ask for it, complete_task only for something they clearly say they finished, add_capture for a loose thought. Act ONLY through tools."
         case .afterBlock:
-            return "Listen, then settle it in one move: done → complete_task (or complete_occurrence for a recurring one); not now → skip_occurrence / set_task_later; needs another go → schedule_task or block_time for a new slot. Act ONLY through tools."
+            return "Listen. Tick it off (complete_task, or complete_occurrence for a recurring one) ONLY when they clearly say they finished it — \"done\", \"finished it\", \"all done\". If they only say how it went (\"it went well\", \"sort of\") or you didn't catch it, ask one short question first — \"Want me to mark it done?\" — and act only on a yes. Not now → skip_occurrence / set_task_later, and needs another go → schedule_task or block_time, only when they say so. Never change anything they didn't ask for. Act ONLY through tools."
         }
     }
 }
