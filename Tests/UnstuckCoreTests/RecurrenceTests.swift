@@ -926,13 +926,20 @@ final class DeterministicOccurrenceTests: XCTestCase {
     func testRegenerateTimeChangeRewritesInPlace() {
         let t = series(.daily(until: nil))
         var blocks = (1...55).map { occ(day($0), event: $0 % 2 == 0 ? "evt\($0)" : nil) }
-        blocks[4].done = true   // a future day ticked early comes back open, as delete + mint did
+        blocks[4].done = true   // a future day ticked early keeps its tick (the history rule, as on web and Android)
         blocks.append(occ(day(-1), done: true))   // history is never touched
         let plan = regenerateForTask(task: t, recurrence: t.recurrence, existingBlocks: blocks, todayIso: today,
                                      startTime: "09:00", startDate: LocalDate.parse(day(1)))
         let retimed = Dictionary(uniqueKeysWithValues: plan.toRetime.map { ($0.id, $0) })
         for o in 1...55 {
             let id = occurrenceId(taskId: t.id, date: day(o))
+            if o == 5 {
+                // Kept as it is: not rewritten back to open, not deleted, not twinned.
+                XCTAssertNil(retimed[id], "a day ticked early is not re-opened")
+                XCTAssertFalse(plan.toDelete.contains(id))
+                XCTAssertFalse(plan.toUpsert.contains { $0.date == day(o) })
+                continue
+            }
             XCTAssertEqual(retimed[id]?.date, day(o))
             XCTAssertEqual(retimed[id]?.startTime, "09:00")
             XCTAssertEqual(retimed[id]?.done, false)
@@ -1143,6 +1150,7 @@ private enum RV {
             var blk = CalBlock(id: id, taskId: taskId, taskName: "Office Focus", startTime: b["startTime"] as? String ?? "",
                                durationMinutes: 60, date: date, kind: .task)
             blk.done = b["done"] as? Bool ?? false
+            blk.skipped = b["skipped"] as? Bool ?? false
             return blk
         }
     }
@@ -1160,7 +1168,7 @@ final class EveryNWeeksVectorTests: XCTestCase {
         XCTAssertEqual(RV.list("materialize").count, 20)
         XCTAssertEqual(RV.list("startsBase").count, 7)
         XCTAssertEqual(RV.list("topUp").count, 4)
-        XCTAssertEqual(RV.list("regenerate").count, 3)
+        XCTAssertEqual(RV.list("regenerate").count, 4)
     }
 
     private func materializeAll(_ zone: String) throws {
@@ -1500,26 +1508,32 @@ final class EveryNWeeksReviewTests: XCTestCase {
     }
 
     /// The create sheet (spec §5 "Create sheet"): for every day set, picked day
-    /// and "Starts" chip, the rule's weeks are the chip's, the schedule day is
-    /// the picked day for the first chip (weekly's behaviour: an off-pattern
-    /// pick keeps its one-off, as on web and Android) and the chip's own day
-    /// otherwise — and scheduling that day NEVER re-anchors the series away
-    /// from the weeks the user picked.
+    /// and "Starts" chip, the rule's weeks are the chip's and the schedule day
+    /// is ALWAYS the picked day — web's create modal (canonical where the spec
+    /// is silent): the first block goes on the WHEN day, and a later chip only
+    /// moves week one, so that day stays as a one-off before the chip's weeks.
+    /// The create sheet schedules it with re-anchoring off, and the series'
+    /// first date on or after the picked day is then exactly the chip's.
     func testCreateSeriesStartNeverMovesThePickedWeeks() throws {
         XCTAssertNil(createSeriesStart(days: [4], interval: 1, until: nil, pickedIso: "2026-09-24", startsAnchor: nil))
         XCTAssertNil(createSeriesStart(days: [9], interval: 2, until: nil, pickedIso: "2026-09-24", startsAnchor: nil))
         // Thursdays every 2 weeks, WHEN = Fri 25 Sep: the first chip is Thu 1 Oct's week, scheduled on Fri 25 Sep
-        // (a one-off, then 1 Oct, 15 Oct …); the second chip starts on Thu 8 Oct.
+        // (a one-off, then 1 Oct, 15 Oct …); the second chip keeps the Friday too, then 8 Oct, 22 Oct ….
         let first = try XCTUnwrap(createSeriesStart(days: [4], interval: 2, until: nil, pickedIso: "2026-09-25", startsAnchor: nil))
         XCTAssertEqual(first.rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-28", until: nil))
         XCTAssertEqual(first.scheduleIso, "2026-09-25")
         let second = try XCTUnwrap(createSeriesStart(days: [4], interval: 2, until: "2026-12-31", pickedIso: "2026-09-25",
                                                      startsAnchor: "2026-10-05"))
         XCTAssertEqual(second.rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-10-05", until: "2026-12-31"))
-        XCTAssertEqual(second.scheduleIso, "2026-10-08")
+        XCTAssertEqual(second.scheduleIso, "2026-09-25")
+        // Today (Thu 24 Sep) + the second chip: today's slot, then Thu 1 Oct's weeks (web: 24 Sep, 1 Oct, 15 Oct …).
+        let today = try XCTUnwrap(createSeriesStart(days: [4], interval: 2, until: nil, pickedIso: "2026-09-24", startsAnchor: "2026-09-28"))
+        XCTAssertEqual(today.scheduleIso, "2026-09-24")
+        XCTAssertEqual(materializeOccurrences(today.rule, startDate: LocalDate.parse("2026-09-24"), startTime: "10:30", horizonDays: 28).map(\.date),
+                       ["2026-10-01", "2026-10-15"])
         // A stale pick (not one of today's chips) is the first chip.
-        XCTAssertEqual(createSeriesStart(days: [4], interval: 2, until: nil, pickedIso: "2026-09-25", startsAnchor: "2026-09-21")?.scheduleIso,
-                       "2026-09-25")
+        XCTAssertEqual(createSeriesStart(days: [4], interval: 2, until: nil, pickedIso: "2026-09-25", startsAnchor: "2026-09-21")?.rule,
+                       .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-28", until: nil))
         for n in 2...4 {
             for mask in 1..<128 {
                 let days = (0..<7).filter { mask & (1 << $0) != 0 }
@@ -1530,10 +1544,9 @@ final class EveryNWeeksReviewTests: XCTestCase {
                                                                 startsAnchor: chip.anchor))
                         guard case .everyNWeeks(_, _, let anchor, _) = s.rule else { return XCTFail("\(n) \(days)") }
                         XCTAssertEqual(anchor, chip.anchor)
-                        XCTAssertGreaterThanOrEqual(s.scheduleIso, picked)
-                        XCTAssertNil(reanchoredForSchedule(s.rule, chosenIso: s.scheduleIso),
-                                     "N\(n) \(days) picked \(picked) chip \(chip.date): the schedule step moved the weeks")
-                        if s.scheduleIso != picked { XCTAssertTrue(isRuleDay(s.rule, iso: s.scheduleIso)) }
+                        XCTAssertEqual(s.scheduleIso, picked)
+                        XCTAssertEqual(nextRuleDate(s.rule, fromIso: picked), chip.date,
+                                       "N\(n) \(days) picked \(picked): the series' first date is the chip's")
                     }
                 }
             }

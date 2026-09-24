@@ -93,6 +93,15 @@ series re-anchors). Normative spec: every-n-weeks-spec.md (scratchpad of that ru
   Android's order). Vectors: the new `startsBase` list, editAnchor past-block/Monday cases and X10–X16 (hand-ported
   into `EveryNWeeksExecutorTests`; the app target can't read the SwiftPM vector file).
 
+- **Cross-platform verification (same day).** A random differential harness (390 rules, 150 anchors/chips, 250 edits,
+  220 top-ups, 350 repeat edits, UTC and New York) ran the same inputs through web, iOS and Android. Fixed on iOS to
+  match web (canonical) and the spec: `regenerateForTask` keeps the HISTORY RULE (spec §5 — a future occurrence done or
+  skipped is never deleted or rewritten open; a day settled that way gets no second open one; iOS used to delete them,
+  and a time change re-opened a day done early); the create sheet always places the WHEN day (a later "Starts" chip
+  only moves week one — `createSeriesStart` → picked day, `scheduleTaskAt(reanchor: false)`); `startsChips` is empty
+  below N = 2; the context and task lines say `repeatsEveryWeeks` / " · repeats every N weeks" (web and Android did).
+  Vectors: E4 (the history rule) and a startsChips N = 1 case.
+
 ## Today week pill: always shown (2026-09-24) — not shipped yet
 
 Ahmad's iPhone Today had no pill ("Where is the insight button??"): it hid at 0 focused, and it is Today's only way

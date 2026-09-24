@@ -237,10 +237,11 @@ public struct StartsChip: Equatable, Sendable {
 /// N 2: [Thu 24 Sep, Thu 1 Oct]; base Fri 25 Sep: [Thu 1 Oct, Thu 8 Oct]
 /// (the week of 21 Sep has no Thursday left). Empty with no valid day.
 /// At most 8 chips: writers write 2…8, and a larger interval stored some
-/// other way must not build a chip per week (the editor renders this).
+/// other way must not build a chip per week (the editor renders this). None
+/// below N = 2 — every week has no Starts row (web's rule, a shared vector).
 public func startsChips(days: [Int], interval: Int, baseIso: String) -> [StartsChip] {
     let wanted = Set(validWeekdays(days))
-    guard !wanted.isEmpty, interval >= 1, let base = strictEpochDay(baseIso),
+    guard !wanted.isEmpty, interval >= 2, let base = strictEpochDay(baseIso),
           let first = strictEpochDay(seriesAnchor(days: days, fromIso: baseIso)) else { return [] }
     return (0..<min(interval, 8)).compactMap { k in
         let monday = first + 7 * k
@@ -252,21 +253,21 @@ public func startsChips(days: [Int], interval: Int, baseIso: String) -> [StartsC
 
 /// The create sheet's every-N-weeks save (spec §5 "Create sheet"): the rule,
 /// with week one the "Starts" chip picked (`startsAnchor`; nil or stale = the
-/// first chip), and the day the first occurrence is scheduled on. The FIRST
-/// chip is the picked day's own series week (seriesAnchor of it), so the
-/// series is scheduled from the picked day itself, exactly as weekly is — an
-/// off-pattern pick keeps its one-off (web and Android do the same). A LATER
-/// chip starts on its own day: scheduling the picked day would re-anchor the
-/// series back to that day's week (scheduleTaskAt, "the series starts here").
-/// Either way the schedule step never moves the weeks the user picked. Nil
-/// for every week (interval < 2) or with no valid day.
+/// first chip), and the day the first occurrence is scheduled on — ALWAYS the
+/// day picked under WHEN, as for weekly and as web's create modal does (web is
+/// canonical where the spec is silent; cross-platform verification
+/// 2026-09-24). A LATER chip only moves week one: the picked day keeps its
+/// slot as a one-off before it (Today + "Starts Thu 1 Oct" → today, then 1
+/// Oct, 15 Oct …), and the series runs on the chip's weeks. The caller
+/// schedules with `reanchor: false` (AppModel.scheduleTaskAt), or placing the
+/// picked day would move week one back to that day's week. Nil for every week
+/// (interval < 2) or with no valid day.
 public func createSeriesStart(days: [Int], interval: Int, until: String?, pickedIso: String,
                               startsAnchor: String?) -> (rule: Recurrence, scheduleIso: String)? {
     let chips = startsChips(days: days, interval: interval, baseIso: pickedIso)
     guard interval >= 2, let first = chips.first else { return nil }
     let pick = chips.first { $0.anchor == startsAnchor } ?? first
-    return (weeklyRule(days: days, interval: interval, anchor: pick.anchor, until: until),
-            pick == first ? pickedIso : pick.date)
+    return (weeklyRule(days: days, interval: interval, anchor: pick.anchor, until: until), pickedIso)
 }
 
 /// Do two anchors give the same on-weeks for an N-week rule?
@@ -480,8 +481,9 @@ public func regenerateForTask(
     let futureExisting = existing.filter { $0.date > todayIso }
 
     guard let recurrence else {
-        // Clearing recurrence — delete every future occurrence, keep history.
-        return RegenPlan(toUpsert: [], toDelete: futureExisting.map(\.id).filter { !keepIds.contains($0) })
+        // Clearing recurrence — delete future occurrences but keep any the user
+        // already completed or skipped (history), and any the edit keeps.
+        return RegenPlan(toUpsert: [], toDelete: futureExisting.filter { !$0.done && !$0.skipped && !keepIds.contains($0.id) }.map(\.id))
     }
 
     let desired = materializeOccurrences(recurrence, startDate: startDate, startTime: startTime, horizonDays: horizonDays)
@@ -489,17 +491,27 @@ public func regenerateForTask(
     let desiredKeys = Set(desired.map { "\($0.date)|\($0.startTime)" })
     let existingFutureKeys = Set(futureExisting.map { "\($0.date)|\($0.startTime)" })
 
+    // The history rule (every-n-weeks spec §5 — web and Android): a future
+    // occurrence already done or skipped is never deleted, and never rewritten
+    // back to open. Deleting it erased the tick of a day done early (weekly →
+    // every 2 weeks dropped a done off-week Thursday), and a time change
+    // brought it back open ("do it again"). Only untouched future rows go.
     var toDelete: [String] = []
-    for b in futureExisting where !desiredKeys.contains("\(b.date)|\(b.startTime)") {
+    for b in futureExisting where !b.done && !b.skipped && !desiredKeys.contains("\(b.date)|\(b.startTime)") {
         toDelete.append(b.id)
     }
     // A kept row is HELD: never deleted, never rewritten.
     var deleteSet = Set(toDelete).subtracting(keepIds)
     let existingById = Dictionary(existing.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+    // A day that keeps its done or skipped occurrence is settled: a new open
+    // one there (at the new time, or when that row carries another id — a
+    // legacy random one) would twin it. One block per task per day (web's
+    // settledDates; cross-platform verification 2026-09-24).
+    let settledDates = Set(futureExisting.filter { $0.done || $0.skipped }.map(\.date))
 
     var toUpsert: [CalBlock] = []
     var toRetime: [CalBlock] = []
-    for o in desired where !existingFutureKeys.contains("\(o.date)|\(o.startTime)") {
+    for o in desired where !existingFutureKeys.contains("\(o.date)|\(o.startTime)") && !settledDates.contains(o.date) {
         let id = occurrenceId(taskId: task.id, date: o.date)
         if deleteSet.contains(id), let row = existingById[id] {
             // Rule B: the same id deleted + minted → rewrite it in place, from

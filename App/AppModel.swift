@@ -3063,7 +3063,13 @@ final class AppModel {
     /// scheduled task doesn't create duplicate blocks or falsely trip the slip
     /// detector. Brand-new tasks (e.g. move-to-task promote) fall through to a
     /// single insert.
-    func scheduleTaskAt(_ task: TaskItem, date iso: String, startTime: String) {
+    ///
+    /// `reanchor: false` is the create sheet's: its rule already carries the
+    /// week one the user picked in "Starts", and the day picked under WHEN is
+    /// placed as it is — a later chip keeps that day as a one-off before its
+    /// weeks (web's create modal, canonical; createSeriesStart). Every other
+    /// caller schedules a series "from here" and re-anchors (spec §5).
+    func scheduleTaskAt(_ task: TaskItem, date iso: String, startTime: String, reanchor: Bool = true) {
         guard let write = coordinator?.write else { return }
         let existing = ((try? db?.blocks(forTask: task.id)) ?? []).filter { isTaskBlock($0) }
         let now = Self.isoNow()
@@ -3081,7 +3087,7 @@ final class AppModel {
         // is the row every whole-row write below builds on.
         var task = task
         var reanchored = false
-        if let re = reanchoredForSchedule(task.recurrence, chosenIso: iso) {
+        if reanchor, let re = reanchoredForSchedule(task.recurrence, chosenIso: iso) {
             task.recurrence = re
             task.updatedAt = now
             reanchored = true

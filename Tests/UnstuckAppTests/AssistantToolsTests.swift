@@ -4721,6 +4721,29 @@ final class EveryNWeeksExecutorTests: XCTestCase {
         XCTAssertEqual(live, ["2026-10-08", "2026-10-29", "2026-11-19"])
     }
 
+    /// The context and the task lines say how often (every-n-weeks spec §7.3;
+    /// web `repeatsEveryWeeks` / `repeatsTag`, Android the same), so a later
+    /// turn can answer "how often?"; plain weekly says only "repeats".
+    /// (get_tasks tags its occurrence rows with the same `repeatsTag`.)
+    /// Cross-platform verification 2026-09-24: iOS was the one without it.
+    func testTheContextAndTaskLinesSayEveryNWeeks() async {
+        seedSeries()
+        func ctxTask() -> [String: AnyJSON]? {
+            guard case .array(let rows)? = buildAssistantContext(api)["tasks"] else { return nil }
+            for case .object(let o) in rows where o["id"] == .string(TID) { return o }
+            return nil
+        }
+        XCTAssertEqual(ctxTask()?["repeats"], .bool(true))
+        XCTAssertEqual(ctxTask()?["repeatsEveryWeeks"], .integer(2))
+        let found = await run("find_tasks", #"{"query":"office"}"#)
+        XCTAssertTrue(found.contains(" · repeats every 2 weeks"), found)
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: .weekly(daysOfWeek: [4], until: nil))]
+        XCTAssertEqual(ctxTask()?["repeats"], .bool(true))
+        XCTAssertNil(ctxTask()?["repeatsEveryWeeks"])
+        let weekly = await run("find_tasks", #"{"query":"office"}"#)
+        XCTAssertTrue(weekly.contains(" · repeats") && !weekly.contains("every"), weekly)
+    }
+
     /// An until-only change on a series whose next block was moved into an
     /// off week keeps the stored weeks (E2): the moved one goes back to its day.
     func testAnUntilOnlyChangeKeepsTheWeeks() async {

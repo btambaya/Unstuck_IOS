@@ -107,7 +107,7 @@ func runSurfaceTool(name: String, args: ToolArgs, api: AssistantAppState, scratc
             var line = "- \(t.name) [id=\(taskId)] \(t.estimateMin)m"
             if let area = t.lifeArea, !area.isEmpty { line += " · \(area)" }
             if let b { line += " · \(b.date) \(b.startTime)" }
-            if occ != nil { line += " · repeats" }
+            if let occ { line += repeatsTag(tasks.first { $0.id == occ.taskId }?.recurrence) }
             if t.later == true { line += " · Later" }
             if (t.moveCount ?? 0) >= 3 { line += " · slipped \(t.moveCount ?? 0)×" }
             // When it was created — "the ones I created last week" (Ahmad,

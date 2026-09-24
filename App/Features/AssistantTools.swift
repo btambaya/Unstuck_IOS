@@ -650,6 +650,14 @@ func intervalWeeksArg(_ args: ToolArgs) -> IntervalWeeksArg {
     }
 }
 
+/// " · repeats", or " · repeats every 2 weeks" — a task line's rhythm, so a
+/// later turn can answer "how often?" (every-n-weeks spec §7.3; web
+/// `repeatsTag`, Android `taskLine`).
+func repeatsTag(_ r: Recurrence?) -> String {
+    if case .everyNWeeks(let n, _, _, _)? = r, isValidEveryNWeeks(r), n >= 2 { return " · repeats every \(n) weeks" }
+    return " · repeats"
+}
+
 /// A recurrence's day list, spelled ("Mon, Wed") for a result line.
 func weekdayNames(_ days: [Int]) -> String {
     days.sorted().map { WEEKDAY_NAMES_CAP[max(0, min(6, $0))].prefix(3) }.map(String.init).joined(separator: ", ")
@@ -1173,7 +1181,7 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
             var line = "- \(t.name) [id=\(t.id)] \(t.estimateMin)m"
             if let area = t.lifeArea, !area.isEmpty { line += " · \(area)" }
             if let b = nextLiveBlock(api, taskId: t.id) { line += " · \(b.date) \(b.startTime)" }
-            if t.recurrence != nil { line += " · repeats" }
+            if t.recurrence != nil { line += repeatsTag(t.recurrence) }
             if t.later == true { line += " · Later" }
             if t.done { line += " · done" }
             return line

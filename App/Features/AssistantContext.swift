@@ -154,6 +154,11 @@ func buildAssistantContext(_ api: AssistantAppState, now: Date = Date()) -> [Str
         if let area = t.lifeArea, !area.isEmpty { o["lifeArea"] = .string(area) }
         if t.later == true { o["later"] = .bool(true) }
         if t.recurrence != nil { o["repeats"] = .bool(true) }
+        // How often, for a series every N ≥ 2 weeks (every-n-weeks spec §7.3;
+        // web and Android send the same key), so a later turn can answer it.
+        if case .everyNWeeks(let n, _, _, _)? = t.recurrence, isValidEveryNWeeks(t.recurrence), n >= 2 {
+            o["repeatsEveryWeeks"] = .integer(n)
+        }
         if let b = blocksByTask[t.id] {
             o["scheduledDate"] = .string(b.date)
             o["scheduledTime"] = .string(b.startTime)

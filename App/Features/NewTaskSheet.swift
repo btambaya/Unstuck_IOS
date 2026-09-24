@@ -819,9 +819,9 @@ struct NewTaskSheet: View {
     }
 
     /// The rule to save, and — for every N weeks — the day its first
-    /// occurrence is scheduled on (createSeriesStart): the day picked (fresh
-    /// clock) for the first "Starts" chip, as for weekly; a later chip's own
-    /// day, so scheduling keeps the week the user chose.
+    /// occurrence is scheduled on (createSeriesStart): always the day picked
+    /// (fresh clock), as for weekly and as on web; a later "Starts" chip only
+    /// moves week one, and the picked day keeps its slot before it.
     private func buildRecurrence(startDate: String?) -> (Recurrence?, firstDate: String?) {
         let untilStr = untilOn ? Self.ymd(until) : nil
         switch repeatKind {
@@ -863,11 +863,12 @@ struct NewTaskSheet: View {
         if !later {
             // Re-resolve Today/Tomorrow against a fresh clock so a sheet left open
             // across midnight doesn't schedule onto yesterday.
-            // Every N weeks with a LATER "Starts" chip starts on that chip's
-            // day, so scheduling keeps the week the user chose; otherwise the
-            // picked day, as for weekly (see buildRecurrence).
+            // The picked day, as for weekly (see buildRecurrence) — never
+            // re-anchored: the rule already carries the week one picked in
+            // "Starts", and a later chip keeps the picked day as a one-off
+            // before its weeks, as web's create modal does.
             if let date = seriesStart ?? effectiveDateNow(), let time = pickedTime {
-                model.scheduleTaskAt(t, date: date, startTime: time)
+                model.scheduleTaskAt(t, date: date, startTime: time, reanchor: false)
             }
             ReminderScheduler.shared.resync()
         }
