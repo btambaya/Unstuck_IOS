@@ -194,17 +194,19 @@ struct TasksView: View {
         .padding(.bottom, 10)
     }
 
-    /// Per-tab accent (web parity: Backlog=amber, Today=coral, Upcoming=blue,
-    /// Later=primary, Completed=green; All has no accent). Selected = tinted
-    /// soft fill + ink; inactive = bg2 with a leading accent dot.
+    /// Selected = the app's ink fill + bg text (the one selection look —
+    /// Ahmad, 2026-09-24: no tinted/indigo selected pills); inactive = bg2 +
+    /// ink2 with the tab's small leading dot (Backlog amber, Today ink,
+    /// Upcoming/Recurring blue, Later grey — it was indigo —, Completed green;
+    /// All none).
     private func bucketPill(_ v: TaskListView, selected: Bool, action: @escaping () -> Void) -> some View {
-        let accent = accentPair(v)
-        let bg = selected ? (accent?.soft ?? theme.palette.ink) : theme.palette.bg2
-        let fg = selected ? (accent?.ink ?? theme.palette.bg) : theme.palette.ink2
+        let dot = bucketDot(v)
+        let bg = selected ? theme.palette.ink : theme.palette.bg2
+        let fg = selected ? theme.palette.bg : theme.palette.ink2
         return Button(action: action) {
             HStack(spacing: 5) {
-                if let accent, !selected {
-                    Circle().fill(accent.ink).frame(width: 6, height: 6)
+                if let dot, !selected {
+                    Circle().fill(dot).frame(width: 6, height: 6)
                 }
                 Text(v.rawValue)
                     .font(UFont.sans(12, .medium))
@@ -215,14 +217,14 @@ struct TasksView: View {
         }.buttonStyle(.plain)
     }
 
-    private func accentPair(_ v: TaskListView) -> (soft: Color, ink: Color)? {
+    private func bucketDot(_ v: TaskListView) -> Color? {
         switch v {
-        case .backlog:   return (theme.palette.amberSoft, theme.palette.amberInk)
-        case .today:     return (theme.palette.coralSoft, theme.palette.ink)
-        case .upcoming:  return (theme.palette.blueSoft, theme.palette.blueInk)
-        case .later:     return (theme.palette.primarySoft, theme.palette.primaryDeep)
-        case .recurring: return (theme.palette.blueSoft, theme.palette.blueInk)
-        case .completed: return (theme.palette.greenSoft, theme.palette.greenInk)
+        case .backlog:   return theme.palette.amberInk
+        case .today:     return theme.palette.ink
+        case .upcoming:  return theme.palette.blueInk
+        case .later:     return theme.palette.ink3
+        case .recurring: return theme.palette.blueInk
+        case .completed: return theme.palette.greenInk
         case .all:       return nil
         }
     }
@@ -299,13 +301,14 @@ struct TasksView: View {
             Button { vm.activeTag = nil } label: {
                 HStack(spacing: 6) {
                     Text("Filtering by tag ")
-                        .font(UFont.sans(12)).foregroundStyle(theme.palette.primaryDeep)
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
                         + Text("#\(tag)")
                         .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
-                    Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.primaryDeep)
+                    Text("✕").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
                 }
                 .padding(.horizontal, 11).padding(.vertical, 6)
-                .background(theme.palette.primarySoft, in: Capsule())
+                .background(theme.palette.bg2, in: Capsule())
+                .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
                 // 44pt hit area on the pill without growing the drawn capsule —
                 // negative padding cancels the extra height so layout is unchanged.
                 .frame(minHeight: 44).contentShape(Capsule()).padding(.vertical, -9)
@@ -515,9 +518,10 @@ struct TaskRowView: View {
                             Button { onTagTap(tag) } label: {
                                 Text("#\(tag)")
                                     .font(UFont.sans(10, .medium))
-                                    .foregroundStyle(theme.palette.primaryDeep)
+                                    .foregroundStyle(theme.palette.ink2)
                                     .padding(.horizontal, 7).padding(.vertical, 2)
-                                    .background(theme.palette.primarySoft, in: Capsule())
+                                    .background(theme.palette.bg2, in: Capsule())
+                                    .overlay(Capsule().strokeBorder(theme.palette.line2, lineWidth: 1))
                             }.buttonStyle(.plain)
                         }
                         ShareWithPill(names: shareWith)

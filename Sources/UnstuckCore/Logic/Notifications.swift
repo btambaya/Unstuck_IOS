@@ -249,15 +249,18 @@ public func relPast(_ deltaMs: EpochMillis) -> String {
 
 // MARK: - accent-by-kind (Android accentFor; colors resolved by the UI)
 
+/// `.ink` is the neutral dot (the morning brief, evening preview and daily
+/// nudge) — it was indigo `primaryDeep` until the colour sweep (2026-09-24:
+/// no indigo accents).
 public enum NotificationAccent: Sendable {
-    case amber, green, primaryDeep, coral
+    case amber, green, ink, coral
 }
 
 public func notificationAccent(kind: String) -> NotificationAccent {
     switch kind {
     case "paused_checkin", "atstart", "drifted": return .amber
     case "session_recap": return .green
-    case "morning_brief", "evening_preview", "daily_nudge": return .primaryDeep
+    case "morning_brief", "evening_preview", "daily_nudge": return .ink
     default: return .coral
     }
 }

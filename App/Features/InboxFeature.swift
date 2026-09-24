@@ -181,7 +181,7 @@ struct InboxView: View {
     private func actions(_ cap: Capture, canOpen: Bool) -> some View {
         HStack(spacing: 0) {
             if !showArchived {
-                action("Promote →", color: theme.palette.primaryDeep, weight: .bold) {
+                action("Promote →", color: theme.palette.ink, weight: .bold) {
                     // Android: promoteCapture THEN archiveCapture (capture preserved).
                     model.promoteCapture(cap)
                     model.archiveCapture(cap.id)
@@ -223,7 +223,7 @@ struct InboxView: View {
 
     private func tagColor(_ tag: CaptureTag) -> Color {
         switch tag {
-        case .followUp: return theme.palette.primaryDeep
+        case .followUp: return theme.palette.ink2
         case .idea: return theme.palette.amber
         case .edit: return theme.palette.blue
         case .question: return theme.palette.green

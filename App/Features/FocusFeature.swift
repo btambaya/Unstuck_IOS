@@ -1052,7 +1052,7 @@ struct FocusView: View {
         ]
         return VStack(alignment: .leading, spacing: 12) {
             Text("SESSION COMPLETE · \(reflectMin)M").font(UFont.mono(11, .medium)).tracking(0.8)
-                .foregroundStyle(theme.palette.primaryDeep)
+                .foregroundStyle(theme.palette.ink3)
             Text("How did that land?").font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
             ForEach(opts, id: \.key) { o in
                 Button { reflectSel = o.key } label: {

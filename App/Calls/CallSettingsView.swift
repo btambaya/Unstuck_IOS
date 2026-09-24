@@ -189,7 +189,7 @@ struct CallSettingsView: View {
                 }
             }))
             .labelsHidden()
-            .tint(theme.palette.primary)
+            .unstuckSwitch()
             .accessibilityLabel("Let Unstuck call this phone")
             .accessibilityIdentifier("settings-calls-switch")
         }
@@ -262,7 +262,7 @@ struct CallSettingsView: View {
                     }
                 }))
                     .labelsHidden()
-                    .tint(theme.palette.primary)
+                    .unstuckSwitch()
                     .accessibilityLabel(title)
             }
             if isOn, let time {

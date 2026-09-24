@@ -178,7 +178,7 @@ struct AssistantHomeBlock: View {
                     }
                     .padding(.horizontal, 16).padding(.vertical, 14)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(theme.palette.primarySoft,
+                    .background(theme.palette.bg2,
                                 in: RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
                 .buttonStyle(.plain)

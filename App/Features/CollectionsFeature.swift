@@ -260,7 +260,7 @@ struct ListsView: View {
                 Spacer()
                 HStack(spacing: 6) {
                     if shared {
-                        Text("SHARED").font(UFont.sans(8, .bold)).foregroundStyle(theme.palette.primaryDeep)
+                        Text("SHARED").font(UFont.sans(8, .bold)).foregroundStyle(theme.palette.ink2)
                     }
                     Text("\(col.items.count)").font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
                 }
@@ -539,7 +539,7 @@ struct CollectionDetailView: View {
                 if shared {
                     Text(owner ? "Shared with \(col.members?.count ?? 0)"
                          : (canEdit ? "Shared with you · you can edit" : "Shared with you · view only"))
-                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink2)
                         .padding(.top, 8).padding(.leading, 2)
                 }
             }
@@ -894,7 +894,7 @@ private struct CollItemRow: View {
         let overdue = !promotedDone && (dueDate.map { $0 < Date() } ?? false)
         if overdue { return theme.palette.red }
         if promotedDone { return theme.palette.greenInk }
-        return theme.palette.primaryDeep
+        return theme.palette.ink2
     }
 }
 

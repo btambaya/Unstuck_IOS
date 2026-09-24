@@ -236,7 +236,7 @@ struct TourPanel: View {
     private func header(_ step: TourStep) -> some View {
         HStack(spacing: 10) {
             ZStack {
-                Circle().fill(theme.palette.primarySoft).frame(width: 26, height: 26)
+                Circle().fill(theme.palette.bg2).frame(width: 26, height: 26)
                 Mark(size: 16)
             }
             VStack(alignment: .leading, spacing: 5) {
@@ -249,8 +249,8 @@ struct TourPanel: View {
                 HStack(spacing: 4) {
                     ForEach(Array(tour.steps.enumerated()), id: \.element.id) { i, _ in
                         Capsule()
-                            .fill(i == tour.index ? theme.palette.primary
-                                  : i < tour.index ? theme.palette.primarySoft : theme.palette.line2)
+                            .fill(i == tour.index ? theme.palette.ink
+                                  : i < tour.index ? theme.palette.ink3 : theme.palette.line2)
                             .frame(width: i == tour.index ? 16 : 6, height: 6)
                             .animation(.easeOut(duration: 0.16), value: tour.index)
                     }
@@ -297,7 +297,7 @@ struct TourPanel: View {
                     .frame(height: 4)
                     .overlay(alignment: .leading) {
                         GeometryReader { geo in
-                            Capsule().fill(theme.palette.primary)
+                            Capsule().fill(theme.palette.ink)
                                 .frame(width: max(0, geo.size.width * tour.audio.progress))
                         }
                     }

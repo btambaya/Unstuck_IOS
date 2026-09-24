@@ -37,7 +37,7 @@ struct AuthView: View {
 
                 Text(signUp ? "BEGIN AGAIN" : "WELCOME BACK")
                     .font(UFont.mono(11, .medium)).tracking(0.8)
-                    .foregroundStyle(theme.palette.primaryDeep)
+                    .foregroundStyle(theme.palette.ink3)
                     .padding(.top, 16)
 
                 Text(signUp ? "You don't need more discipline." : "Pick up where\nyou left off.")
@@ -80,7 +80,7 @@ struct AuthView: View {
                 Button(signUp ? "Already have an account? Sign in" : "New here? Create an account") {
                     mode = signUp ? .signIn : .signUp; status = nil
                 }
-                .font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                .font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink)
                 .buttonStyle(.plain).padding(.top, 16).padding(.vertical, 10)
 
                 Button("Email me a magic link instead") { Task { await magicLink() } }
@@ -101,7 +101,7 @@ struct AuthView: View {
                 // links open in Safari.
                 Text("By continuing you agree to our [Terms of Use](https://unstucknow.io/terms) and [Privacy Policy](https://unstucknow.io/privacy).")
                     .font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                    .tint(theme.palette.primaryDeep)
+                    .tint(theme.palette.ink)
                     .multilineTextAlignment(.center).padding(.top, 14)
             }
             .frame(maxWidth: .infinity)
@@ -174,7 +174,7 @@ struct AuthView: View {
                 // Keep the email + password they typed: often it IS their password.
                 mode = .signIn; status = nil; focus = .password
             }
-            .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+            .font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
             Button("Forgot password?") { Task { await forgotPassword() } }
                 .font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
         }
@@ -371,7 +371,7 @@ struct SetNewPasswordView: View {
                 Mark(size: 36).padding(.top, 30)
                 Text("SET A NEW PASSWORD")
                     .font(UFont.mono(11, .medium)).tracking(0.8)
-                    .foregroundStyle(theme.palette.primaryDeep).padding(.top, 16)
+                    .foregroundStyle(theme.palette.ink3).padding(.top, 16)
                 Text("Choose a new password.")
                     .font(UFont.serifItalic(34)).foregroundStyle(theme.palette.ink)
                     .multilineTextAlignment(.center).padding(.top, 8)

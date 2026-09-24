@@ -339,7 +339,7 @@ private struct CalendarSyncBar: View {
                 Button { sync() } label: {
                     Text("Sync now")
                         .font(UFont.sans(12, .medium))
-                        .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.primaryDeep)
+                        .foregroundStyle(busy ? theme.palette.ink3 : theme.palette.ink)
                         .padding(.horizontal, 8).padding(.vertical, 4)
                 }.buttonStyle(.plain).disabled(busy)
                 // Destructive — confirm first (it drops all synced events).
@@ -443,7 +443,7 @@ private struct WeekView: View {
                 // Header: This week / range + ‹ Today ›
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 4) {
-                        SectionLabel(weekOffset == 0 ? "This week" : "Week").foregroundStyle(theme.palette.primaryDeep)
+                        SectionLabel(weekOffset == 0 ? "This week" : "Week")
                         Text(weekRangeLabel(days.first!, days.last!))
                             .font(UFont.serifItalic(24)).foregroundStyle(theme.palette.ink)
                     }
@@ -456,7 +456,7 @@ private struct WeekView: View {
                         .accessibilityLabel("Previous week")
                     if weekOffset != 0 {
                         Button { weekOffset = 0 } label: {
-                            Text("Today").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                            Text("Today").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
                                 .padding(.horizontal, 8).padding(.vertical, 4)
                                 .frame(minHeight: 44).contentShape(Rectangle()).padding(.vertical, -10)
                         }.buttonStyle(.plain)
@@ -474,7 +474,7 @@ private struct WeekView: View {
                 // Rollup stats
                 HStack(spacing: 8) {
                     rollup("Focus planned", total >= 60 ? "\(total / 60)h \(total % 60)m" : "\(total)m",
-                           theme.palette.primarySoft, theme.palette.primaryDeep)
+                           theme.palette.bg2, theme.palette.ink)
                     rollup("Busiest", busiest, theme.palette.amberSoft, theme.palette.amberInk)
                     rollup("Lightest", lightest, theme.palette.greenSoft, theme.palette.greenInk)
                 }
@@ -708,7 +708,7 @@ private struct MonthView: View {
                     }.buttonStyle(.plain)
                         .accessibilityLabel("Previous month")
                     Button { ym = Date() } label: {
-                        Text("Today").font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                        Text("Today").font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink)
                             .padding(.horizontal, 8).padding(.vertical, 4)
                             .frame(minHeight: 44).contentShape(Rectangle()).padding(.vertical, -10)
                     }.buttonStyle(.plain)
@@ -731,7 +731,7 @@ private struct MonthView: View {
                         Text("planned").font(UFont.mono(10, .medium))
                     }
                     HStack(spacing: 3) {
-                        Circle().strokeBorder(theme.palette.primaryDeep, style: StrokeStyle(lineWidth: 1, dash: [1.5, 1]))
+                        Circle().strokeBorder(theme.palette.ink2, style: StrokeStyle(lineWidth: 1, dash: [1.5, 1]))
                             .frame(width: 5, height: 5)
                         Text("shared").font(UFont.mono(10, .medium))
                     }
@@ -814,9 +814,11 @@ private struct MonthView: View {
         let t = min(1, max(0, Double(v) / Double(maxV)))
         let isToday = iso == todayISO
         let day = Time.calendar.component(.day, from: d)
-        // Heat fill: today = coral, empty = bg2, else lerp bg2→primary.
+        // Heat fill: today = coral, empty = bg2, else lerp bg2→ink3 (neutral;
+        // ink3 sits at the old indigo's lightness, so the text flip below
+        // keeps its contrast).
         let fill: Color = isToday ? theme.palette.coral
-            : (v == 0 ? theme.palette.bg2 : lerpColor(theme.palette.bg2, theme.palette.primary, 0.2 + 0.6 * t))
+            : (v == 0 ? theme.palette.bg2 : lerpColor(theme.palette.bg2, theme.palette.ink3, 0.2 + 0.6 * t))
         let textColor: Color = (isToday || t > 0.5) ? theme.palette.bg : theme.palette.ink2
         // Planned marks — MY task blocks that day (from the cached
         // blocksByDate) + shared ones — separate from the focus-density fill.

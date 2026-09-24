@@ -860,7 +860,7 @@ struct TourWelcomeCard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     ZStack {
-                        Circle().fill(theme.palette.primarySoft).frame(width: 44, height: 44)
+                        Circle().fill(theme.palette.bg2).frame(width: 44, height: 44)
                         Mark(size: 26)
                     }
                     Text("Welcome to Unstuck")
@@ -933,7 +933,7 @@ struct TourResumeCard: View {
                 .onTapGesture {}
             VStack(alignment: .leading, spacing: 0) {
                 ZStack {
-                    Circle().fill(theme.palette.primarySoft).frame(width: 40, height: 40)
+                    Circle().fill(theme.palette.bg2).frame(width: 40, height: 40)
                     Mark(size: 22)
                 }
                 Text("Continue your tour?")
@@ -1068,9 +1068,9 @@ private struct TourModeRow: View {
                             Text("SUGGESTED")
                                 .font(UFont.mono(9.5, .medium))
                                 .tracking(0.6)
-                                .foregroundStyle(theme.palette.primaryDeep)
+                                .foregroundStyle(theme.palette.ink2)
                                 .padding(.horizontal, 7).padding(.vertical, 2)
-                                .background(theme.palette.primarySoft, in: Capsule())
+                                .background(theme.palette.bg2, in: Capsule())
                         }
                     }
                     Text(sub)
@@ -1090,7 +1090,7 @@ private struct TourModeRow: View {
             .padding(.horizontal, 16).padding(.vertical, 15)
             .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(recommended ? theme.palette.primary : theme.palette.line,
+                .stroke(recommended ? theme.palette.ink : theme.palette.line,
                         lineWidth: recommended ? 1.5 : 1))
             .contentShape(Rectangle())
         }

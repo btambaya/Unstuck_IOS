@@ -438,7 +438,7 @@ struct TaskEditor: View {
                     }
                     if until != nil {
                         Button("Clear") { applyRecurrence(withUntil(rec, nil)) }
-                            .font(UFont.sans(12)).foregroundStyle(theme.palette.primaryDeep).buttonStyle(.plain)
+                            .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2).buttonStyle(.plain)
                     }
                 }
             }
@@ -509,9 +509,9 @@ struct TaskEditor: View {
                             HStack(spacing: 4) {
                                 Text("#\(name)").font(UFont.sans(12, .medium)); Text("✕").font(UFont.sans(11))
                             }
-                            .foregroundStyle(theme.palette.primaryDeep)
+                            .foregroundStyle(theme.palette.bg)
                             .padding(.horizontal, 10).padding(.vertical, 5)
-                            .background(theme.palette.primarySoft, in: Capsule())
+                            .background(theme.palette.ink, in: Capsule())
                         }
                         .buttonStyle(.plain)
                     }
@@ -548,7 +548,7 @@ struct TaskEditor: View {
                 let on = selected.contains(tag.name)
                 Button { setTags(on ? selected.filter { $0 != tag.name } : selected + [tag.name]) } label: {
                     HStack(spacing: 8) {
-                        Text(on ? "✓" : " ").font(UFont.sans(13)).foregroundStyle(theme.palette.primaryDeep).frame(width: 12)
+                        Text(on ? "✓" : " ").font(UFont.sans(13)).foregroundStyle(theme.palette.ink).frame(width: 12)
                         Text("#\(tag.name)").font(UFont.sans(13)).foregroundStyle(theme.palette.ink); Spacer()
                     }
                     .padding(.horizontal, 14).padding(.vertical, 10)
@@ -557,7 +557,7 @@ struct TaskEditor: View {
             }
             if showCreate {
                 Button { setTags(selected + [ensureTag(q)]); tagQuery = "" } label: {
-                    Text("Create \"\(q)\"").font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                    Text("Create \"\(q)\"").font(UFont.sans(13, .medium)).foregroundStyle(theme.palette.ink)
                         .padding(.horizontal, 14).padding(.vertical, 10).frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .buttonStyle(.plain)
@@ -617,7 +617,7 @@ struct TaskEditor: View {
             Text(cap.body).font(UFont.sans(14)).foregroundStyle(theme.palette.ink)
             HStack(spacing: 14) {
                 Button("Promote to task →") { model.promoteCapture(cap) }
-                    .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.primaryDeep)
+                    .font(UFont.sans(12, .medium)).foregroundStyle(theme.palette.ink)
                 Button("Discard") { model.discardCapture(cap.id) }
                     .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
             }

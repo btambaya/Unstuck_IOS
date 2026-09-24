@@ -41,7 +41,6 @@ struct OnboardingView: View {
             // above it) — mirrors Android's RoundedCornerShape(24) surface card.
             VStack(alignment: .leading, spacing: 0) {
                 SectionLabel("STEP \(step + 1) OF \(Self.steps)")
-                    .foregroundStyle(theme.palette.primaryDeep)
 
                 ScrollView { stepBody.padding(.top, 14) }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -130,7 +129,7 @@ struct OnboardingView: View {
             field("Reply to landlord about parking", text: $firstTask, field: .firstTask, submit: .next) {
                 focus = .firstAction
             }
-            SectionLabel("FIRST STEP").foregroundStyle(theme.palette.primaryDeep).padding(.top, 10)
+            SectionLabel("FIRST STEP").padding(.top, 10)
             // Last field: Done = the step's Continue (both fields are optional).
             field("The smallest first move (optional)", text: $firstAction, field: .firstAction, submit: .done) {
                 withAnimation(.easeInOut(duration: 0.2)) { step += 1 }

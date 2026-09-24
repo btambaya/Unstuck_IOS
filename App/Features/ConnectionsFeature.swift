@@ -381,7 +381,7 @@ private struct RosterSection: View {
                     Task { try? await Task.sleep(nanoseconds: 1_800_000_000); if copiedId == m.id { copiedId = nil } }
                 } label: {
                     Text(copiedId == m.id ? "Copied!" : "Copy link")
-                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(copyInviteLinkLabel(email: m.inviteeEmail, copied: copiedId == m.id))
@@ -491,7 +491,7 @@ private struct WaitingSection: View {
                     Task { try? await Task.sleep(nanoseconds: 1_800_000_000); if copiedId == p.id { copiedId = nil } }
                 } label: {
                     Text(copiedId == p.id ? "Copied!" : "Copy link")
-                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(copyInviteLinkLabel(email: p.email, copied: copiedId == p.id))
@@ -545,7 +545,7 @@ private struct BlockedSection: View {
                                     .lineLimit(1)
                                 Spacer()
                                 Button { Task { await vm.unblock(b) } } label: {
-                                    Text("Unblock").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.primaryDeep)
+                                    Text("Unblock").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
                                         .frame(minHeight: 32).contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)

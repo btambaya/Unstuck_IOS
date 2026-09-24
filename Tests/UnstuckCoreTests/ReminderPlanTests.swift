@@ -325,9 +325,9 @@ final class NotificationAccentTests: XCTestCase {
         XCTAssertEqual(notificationAccent(kind: "atstart"), .amber)
         XCTAssertEqual(notificationAccent(kind: "drifted"), .amber)
         XCTAssertEqual(notificationAccent(kind: "session_recap"), .green)
-        XCTAssertEqual(notificationAccent(kind: "morning_brief"), .primaryDeep)
-        XCTAssertEqual(notificationAccent(kind: "evening_preview"), .primaryDeep)
-        XCTAssertEqual(notificationAccent(kind: "daily_nudge"), .primaryDeep)
+        XCTAssertEqual(notificationAccent(kind: "morning_brief"), .ink)
+        XCTAssertEqual(notificationAccent(kind: "evening_preview"), .ink)
+        XCTAssertEqual(notificationAccent(kind: "daily_nudge"), .ink)
         XCTAssertEqual(notificationAccent(kind: "collection_share"), .coral)
         XCTAssertEqual(notificationAccent(kind: "anything"), .coral)
     }
