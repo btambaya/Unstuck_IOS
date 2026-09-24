@@ -301,6 +301,8 @@ final class SettingsShots: XCTestCase {
         row("assistant").tap()
         expect(app.staticTexts["What the AI can see."].firstMatch, "Assistant & privacy did not open")
         save("moved-11-assistant-sharing-off")
+    }
+}
 
 // Calendar → Day → tap a task block: the Edit-block sheet's Mark done / Start
 // focus / Open task (Ahmad, 2026-09-24: "Can't complete a task from
