@@ -2186,10 +2186,10 @@ final class BargeInTests: XCTestCase {
         _ = c.handle(.audioDelta(id: "r0"), now: 1)
         _ = c.handle(.toolStarted, now: 1.5)   // the reply calls a tool
         _ = c.handle(.responseDone(id: "r0", status: "completed"), now: 2)
-        XCTAssertEqual(core(c.handle(.playbackDrained, now: 3)), [.uiState(.listening)], "a tool is out: its reply comes first")
-        XCTAssertEqual(core(c.handle(.tick, now: 10)), [], "however long it runs")
-        XCTAssertEqual(core(c.handle(.toolFinished, now: 11)), [.startConfirmTimer(ms: 3001)], "its continuation is created next")
-        _ = c.handle(.clientCreate, now: 11.12)
+        XCTAssertEqual(core(c.handle(.playbackDrained, now: 3)), [.uiState(.thinking)], "a tool is out: its reply comes first")
+        XCTAssertEqual(core(c.handle(.tick, now: 10)), [], "while it runs")
+        XCTAssertEqual(core(c.handle(.toolFinished, now: 11)), [.continueAfterTools, .uiState(.thinking), .startConfirmTimer(ms: 3001)],
+                       "its continuation is created next — the controller's own create (header §7)")
         _ = c.handle(.responseCreated(id: "r1"), now: 11.5)
         _ = c.handle(.audioDelta(id: "r1"), now: 12)
         _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 13)
@@ -2413,5 +2413,173 @@ final class BargeInTests: XCTestCase {
         apply(c.handle(.transcription(text: "what have I got left today", itemId: "q", final: true), now: 6.3))
         apply(c.handle(.tick, now: 6.8))
         XCTAssertFalse(g.periodReviewed)
+    }
+
+    // MARK: 31 — tool calls hold every create (Zubair's morning call,
+    // 2026-09-24 07:02:44–50, assistant_turns). Two turns ("No, just cancel
+    // the recurring." / "I'll just leave it in only for today."); the reply
+    // said "One moment." and called set_task_recurrence; its done asked for
+    // the second turn at 50.333, BEFORE the output went back at 50.402. The
+    // model answered without the result — "I tried to cancel the repeat,
+    // but it didn't go through" over an ok — and the continuation's own
+    // create was refused ("already has an active response", 50.706).
+
+    /// Every create the controller asks for — a turn's or the continuation.
+    private func creates(_ cmds: [BargeInCommand]) -> Int {
+        cmds.filter { $0 == .createResponse || $0 == .continueAfterTools }.count
+    }
+
+    func test31a_zubairsTwoTurns_theReplysToolOutputGoesBackBeforeTheOneCreate() {
+        var c = BargeInController(profile: .lowEcho)   // a CallKit call, on the receiver
+        var all: [BargeInCommand] = []
+        func on(_ e: BargeInEvent, _ t: TimeInterval) -> [BargeInCommand] {
+            let out = c.handle(e, now: t)
+            all += out
+            return out
+        }
+        // The reply before ("It's set to repeat every Thursday…") has played out.
+        _ = on(.responseCreated(id: "r5"), 25.66)
+        _ = on(.audioDelta(id: "r5"), 26)
+        _ = on(.responseDone(id: "r5", status: "completed"), 28.13)
+        _ = on(.playbackDrained, 42)
+        // Turn 1, and turn 2 begun before turn 1 was asked for.
+        _ = on(.speechStarted(itemId: "u1"), 43)
+        _ = on(.speechStopped, 44.5)
+        _ = on(.transcription(text: "No, just cancel the recurring.", itemId: "u1", final: true), 44.8)
+        _ = on(.speechStarted(itemId: "u2"), 45.2)
+        XCTAssertEqual(creates(on(.tick, 45.3)), 0, "they're still talking")
+        _ = on(.speechStopped, 47.4)
+        XCTAssertEqual(creates(on(.tick, 47.9)), 1, "the turn is asked for once they're quiet")
+        XCTAssertEqual(creates(on(.transcription(text: "I'll just leave it in only for today.", itemId: "u2", final: true), 48.03)), 0)
+        _ = on(.responseCreated(id: "r6"), 48.16)
+        XCTAssertTrue(c.pendingCreate, "turn 2's words came after the create: still owed")
+        XCTAssertEqual(creates(on(.tick, 48.53)), 0)
+        _ = on(.audioDelta(id: "r6"), 49)                 // "Okay, we'll stop it from repeating going forward. One moment."
+        _ = on(.toolStarted, 50.246)                        // set_task_recurrence {kind: none}
+        let done = on(.responseDone(id: "r6", status: "completed"), 50.252)
+        XCTAssertEqual(creates(done), 0, "THE BUG: this asked for turn 2 before the tool's output was back")
+        XCTAssertTrue(c.continuationOwed)
+        XCTAssertEqual(creates(on(.tick, 50.3)), 0, "no fallback either")
+        let back = on(.toolFinished, 50.402)                // the output is on the wire
+        XCTAssertEqual(core(back), [.continueAfterTools, .uiState(.thinking)], "ONE create, after the output")
+        XCTAssertFalse(c.continuationOwed)
+        _ = on(.responseCreated(id: "r7"), 50.448)
+        XCTAssertFalse(c.pendingCreate, "turn 2 rode on the continuation: its words were already in the conversation")
+        for t in [50.53, 50.8, 51.0, 53.0] { XCTAssertEqual(creates(on(.tick, t)), 0, "nothing more at \(t)") }
+        XCTAssertEqual(creates(all), 2, "turn 1's create and the continuation — nothing else")
+        XCTAssertFalse(all.contains(.createResponse) && all.lastIndex(of: .createResponse)! > all.firstIndex(of: .continueAfterTools)!)
+    }
+
+    func test31b_anOutputBackBeforeItsRepliesDone_theDoneSendsTheContinuation() {
+        var c = speaking(.lowEcho)
+        _ = c.handle(.toolStarted, now: 1)
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 1.1)), 0, "the reply that called it is still generating")
+        XCTAssertTrue(c.continuationOwed)
+        XCTAssertEqual(core(c.handle(.responseDone(id: "r1", status: "completed"), now: 1.2)), [.continueAfterTools, .uiState(.thinking)])
+        XCTAssertEqual(creates(c.handle(.tick, now: 4)), 0)
+    }
+
+    func test31c_parallelCalls_oneCreateAfterTheLastOutput() {
+        var c = speaking(.lowEcho)
+        _ = c.handle(.toolStarted, now: 1)
+        _ = c.handle(.toolStarted, now: 1.01)
+        XCTAssertEqual(c.toolsRunning, 2)
+        XCTAssertEqual(creates(c.handle(.responseDone(id: "r1", status: "completed"), now: 1.05)), 0)
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 1.2)), 0, "one output still out")
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 1.4)), 1)
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 1.5)), 0, "a stray finish releases nothing twice")
+    }
+
+    func test31d_aTurnWhoseHoldIsntUpWhenTheOutputLands_rideOnTheSameCreate() {
+        var c = speaking(.lowEcho)
+        _ = c.handle(.toolStarted, now: 1)
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1.1)
+        _ = c.handle(.playbackDrained, now: 2)
+        _ = c.handle(.speechStarted(itemId: "u"), now: 3)
+        _ = c.handle(.speechStopped, now: 3.6)
+        _ = c.handle(.transcription(text: "and tomorrow too", itemId: "u", final: true), now: 3.8)
+        XCTAssertEqual(core(c.handle(.toolFinished, now: 4.0)), [.startConfirmTimer(ms: 500)], "their hold first — they may go on")
+        XCTAssertEqual(creates(c.handle(.tick, now: 4.1)), 0)
+        let out = c.handle(.tick, now: 4.3)
+        XCTAssertEqual(core(out), [.continueAfterTools, .uiState(.thinking)], "one create: the output and their turn")
+        XCTAssertFalse(out.contains(.createResponse))
+        _ = c.handle(.responseCreated(id: "r2"), now: 4.5)
+        XCTAssertFalse(c.pendingCreate)
+    }
+
+    func test31e_aStuckToolTimesOut_itsErrorOutputThenTheCreate_andItsLateFinishReleasesNothing() {
+        var c = speaking(.lowEcho)
+        XCTAssertEqual(core(c.handle(.toolStarted, now: 1)), [.startConfirmTimer(ms: 10_000)], "the stuck-tool clock")
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1.1)
+        _ = c.handle(.playbackDrained, now: 2)
+        // They speak meanwhile: held too.
+        _ = c.handle(.speechStarted(itemId: "u"), now: 3)
+        _ = c.handle(.speechStopped, now: 3.5)
+        _ = c.handle(.transcription(text: "hello are you there", itemId: "u", final: true), now: 3.7)
+        XCTAssertEqual(creates(c.handle(.tick, now: 4.2)), 0)
+        XCTAssertEqual(creates(c.handle(.tick, now: 6.2)), 0, "not the 2.5 s fallback either")
+        XCTAssertEqual(creates(c.handle(.tick, now: 10.9)), 0)
+        XCTAssertEqual(core(c.handle(.tick, now: 11)), [.expireTools, .continueAfterTools, .uiState(.thinking)],
+                       "10 s: its error output, then one create — never a deadlock")
+        XCTAssertEqual(c.toolsRunning, 0)
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 12)), 0, "its late result was dropped by the client")
+        _ = c.handle(.responseCreated(id: "r2"), now: 12.1)
+        XCTAssertFalse(c.pendingCreate)
+    }
+
+    func test31f_aDoneThatNeverComes_theClockReleasesIt() {
+        var c = speaking(.lowEcho)
+        _ = c.handle(.toolStarted, now: 1)
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 1.2)), 0)
+        XCTAssertEqual(creates(c.handle(.tick, now: 8)), 0)
+        let out = core(c.handle(.tick, now: 11))
+        XCTAssertEqual(out, [.continueAfterTools, .uiState(.thinking)], "no tool to expire; the lost done no longer holds it")
+        XCTAssertFalse(c.responseActive)
+    }
+
+    func test31g_aRefusedContinuationIsHeldAgainAndSentWhenTheReplyInTheWayIsDone() {
+        var c = speaking(.lowEcho)
+        _ = c.handle(.toolStarted, now: 1)
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 1.1)
+        XCTAssertEqual(creates(c.handle(.toolFinished, now: 1.3)), 1)
+        let refused = core(c.handle(.responseAlreadyActive, now: 1.4))
+        XCTAssertTrue(refused.contains(.startConfirmTimer(ms: 10_000)), "the hold is back on, with its clock")
+        XCTAssertTrue(c.continuationOwed)
+        XCTAssertEqual(creates(c.handle(.tick, now: 3)), 0)
+        XCTAssertEqual(core(c.handle(.responseDone(id: nil, status: "completed"), now: 3.5)), [.continueAfterTools, .uiState(.thinking)])
+    }
+
+    func test31h_theNoticeAndAClientCreateNeverGoInBetween() {
+        var c = BargeInController(profile: .lowEcho)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.toolStarted, now: 0.5)
+        _ = c.handle(.responseDone(id: "r1", status: "completed"), now: 0.6)
+        XCTAssertEqual(notices(c.handle(.minutesWarning, now: 1)), 0)
+        XCTAssertEqual(notices(c.handle(.tick, now: 5)), 0, "a tool is out")
+        XCTAssertEqual(c.uiStateNow, .thinking, "its reply is on its way")
+        let back = c.handle(.toolFinished, now: 6)
+        XCTAssertEqual(creates(back), 1)
+        XCTAssertEqual(notices(back), 0, "the continuation first")
+    }
+
+    func test31i_holdToTalk_aReleaseWhileAToolRunsCommitsOnly_theContinuationAnswersIt() {
+        var c = BargeInController(profile: .speaker, holdToTalk: true)
+        _ = c.handle(.responseCreated(id: "r1"), now: 0)
+        _ = c.handle(.audioDelta(id: "r1"), now: 0.2)
+        _ = c.handle(.toolStarted, now: 0.5)
+        _ = c.handle(.pttDown, now: 1)                     // cuts "One moment."
+        _ = c.handle(.responseDone(id: "r1", status: "cancelled"), now: 1.1)
+        let up = core(c.handle(.pttUp, now: 2))
+        XCTAssertEqual(up, [.commitInput, .uiState(.thinking)], "their words are committed; no create of their own")
+        XCTAssertFalse(up.contains(.commitAndRespond))
+        XCTAssertEqual(core(c.handle(.toolFinished, now: 2.5)), [.continueAfterTools, .uiState(.thinking)])
+        // Released with the outputs already in: the continuation goes with the commit.
+        var d = BargeInController(profile: .speaker, holdToTalk: true)
+        _ = d.handle(.responseCreated(id: "r1"), now: 0)
+        _ = d.handle(.toolStarted, now: 0.5)
+        _ = d.handle(.pttDown, now: 1)
+        _ = d.handle(.responseDone(id: "r1", status: "cancelled"), now: 1.1)
+        XCTAssertEqual(creates(d.handle(.toolFinished, now: 1.5)), 0, "the button is held")
+        XCTAssertEqual(core(d.handle(.pttUp, now: 2)), [.commitInput, .uiState(.thinking), .continueAfterTools, .uiState(.thinking)])
     }
 }

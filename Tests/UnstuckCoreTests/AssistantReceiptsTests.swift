@@ -92,6 +92,21 @@ final class AssistantReceiptsTests: XCTestCase {
         let cleared = deriveReceipt(name: "set_task_recurrence", args: ReceiptArgs(taskId: "t7"),
                                     result: "ok", tasks: [t])
         XCTAssertEqual(cleared?.label, "Repeat removed — “Taxes”")
+        // kind "none" is the stop, never "Repeats none" (web parity, 2026-09-24).
+        let stopped = deriveReceipt(name: "set_task_recurrence", args: ReceiptArgs(taskId: "t7", kind: "none"),
+                                    result: "ok: \"Taxes\" no longer repeats", tasks: [t])
+        XCTAssertEqual(stopped?.label, "Repeat removed — “Taxes”")
+    }
+
+    /// An ok whose wish was already true changed nothing — no card claiming a
+    /// change (Zubair's call, 2026-09-24; web receipts.ts NOTHING_TO_CHANGE).
+    func testAnOkThatChangedNothingGetsNoReceipt() {
+        let t = task(id: "t7", name: "Office Focus")
+        XCTAssertNil(deriveReceipt(name: "set_task_recurrence", args: ReceiptArgs(taskId: "t7", kind: "none"),
+                                   result: "ok: \"Office Focus\" already doesn't repeat" + NOTHING_TO_CHANGE, tasks: [t]))
+        XCTAssertNil(deriveReceipt(name: "schedule_task", args: ReceiptArgs(taskId: "t7", date: "2026-09-24", startTime: "10:30"),
+                                   result: "ok: \"Office Focus\" is already on 2026-09-24 at 10:30" + NOTHING_TO_CHANGE, tasks: [t]))
+        XCTAssertEqual(NOTHING_TO_CHANGE, " — nothing to change")
     }
 
     func testTheRemainingWriteToolsEachGetTheirOwnGlyph() {

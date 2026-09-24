@@ -54,12 +54,26 @@
 //   6. THE MINUTES NOTICE: at about a minute of today's voice minutes left
 //      (the proxy's `unstuck.voice_budget` with warn:true) the assistant says
 //      so once, in its own voice (Ahmad 2026-09-23). It is a reply like any
-//      other, so it waits its turn: nothing on air or being created (ours,
-//      or the client's own opening / corrective / tool continuation), no
-//      tool running, no turn of theirs waiting or still being transcribed,
-//      the user not speaking (nor the mic's gate just opened, nor Interrupt
-//      just pressed), and a moment of quiet after the last sound — never
-//      over the user. The held echo deletes go before it, as before any ask.
+//      other, so it waits its turn: nothing on air or being created (ours —
+//      a turn's ask, the tools' continuation — or the client's own opening /
+//      corrective), no tool running, no turn of theirs waiting or still being
+//      transcribed, the user not speaking (nor the mic's gate just opened, nor
+//      Interrupt just pressed), and a moment of quiet after the last sound —
+//      never over the user. The held echo deletes go before it, as before any ask.
+//   7. TOOL CALLS HOLD EVERY CREATE: from a reply's first function call
+//      until every output has gone back AND that reply is done, nothing asks
+//      for a reply — not a turn of theirs, not the fallback, not the notice
+//      (and the client sends no corrective). Then ONE `response.create`
+//      (`.continueAfterTools`) answers the outputs and any turn that waited
+//      on them — its words are in the conversation already. Zubair's
+//      morning call (2026-09-24 07:02:48–50): two turns, the reply called
+//      set_task_recurrence, its done asked for the second turn BEFORE the
+//      output went back, the model answered without it — "I tried to
+//      cancel the repeat, but it didn't go through" over an ok — and the
+//      continuation's own create was refused. A tool that fails still
+//      sends its error output (and releases); one still running after
+//      `toolTimeoutMs` is answered with an error output (`.expireTools`)
+//      so the conversation never waits for ever.
 //
 // Hold-to-talk (turn_detection null) is unchanged: the client commits and
 // creates on release. Two guards since 2026-09-23 (review): a reply created
@@ -253,6 +267,19 @@ enum BargeInCommand: Equatable, Sendable {
     /// voice. Only ever emitted with nothing on air or being created, no
     /// tool running and the user quiet.
     case speakMinutesNotice
+    /// `response.create` after a reply's tool calls (header §7): every output
+    /// has gone back and that reply is done. It also answers any turn of
+    /// theirs that waited on the outputs. Not a user-turn ask for the
+    /// integrity guard: a review a tool just returned still vouches for the
+    /// recap this reply is.
+    case continueAfterTools
+    /// Tool calls still running `toolTimeoutMs` after the first began: the
+    /// client answers each with an error output (and drops its late result)
+    /// — always BEFORE the `.continueAfterTools` that follows it.
+    case expireTools
+    /// Hold-to-talk release while tool outputs are owed: commit what they
+    /// said, and let the continuation's one create answer it with the rest.
+    case commitInput
 }
 
 enum BargeInEvent: Equatable, Sendable {
@@ -302,11 +329,13 @@ enum BargeInEvent: Equatable, Sendable {
     /// 2026-09-23).
     case minutesWarning
     /// The client sent a `response.create` of its own, outside the
-    /// controller — the opening and its retry, the integrity corrective, a
-    /// tool continuation: a reply is being created that nothing here asked for.
+    /// controller — the opening and its retry, the integrity corrective: a
+    /// reply is being created that nothing here asked for.
     case clientCreate
-    /// A tool call started running / its output went back (the
-    /// continuation's create follows a moment later).
+    /// A reply's function call started running (its arguments are done) /
+    /// its output went back — a failed call's error output included. Every
+    /// create is held in between (header §7); the continuation is asked for
+    /// here once the last output is in and the reply is done.
     case toolStarted
     case toolFinished
 }
@@ -447,8 +476,25 @@ struct BargeInController: Sendable {
     /// A `response.create` the client sent itself (`.clientCreate`), until a
     /// response.created answers it or the grace runs out.
     private var clientCreateSentAt: TimeInterval?
-    /// Tool calls running: their continuation's create is still to come.
+    /// Tool calls whose outputs haven't gone back yet (`.toolStarted` …
+    /// `.toolFinished`).
     private(set) var toolsRunning = 0
+    /// THE HOLD (header §7): a reply called tools, and the one
+    /// `response.create` that follows their outputs hasn't gone out. While
+    /// it is on, nothing else is asked for; it goes off when that create is
+    /// sent (`sendContinuation`).
+    private(set) var continuationOwed = false
+    /// When the hold began (the batch's first call) — the stuck-tool timeout
+    /// counts from here.
+    private var toolHoldSince: TimeInterval?
+    /// A tool call gets this long before it is answered with an error
+    /// output (`.expireTools`), and the calling reply this long to finish:
+    /// the conversation never waits on a tool for ever.
+    static let toolTimeoutMs = 10_000
+    /// The continuation's create, until response.created answers it —
+    /// refused ("already has an active response"), the hold is back on and
+    /// the reply that refused it sends it again when done.
+    private var continuationSentAt: TimeInterval?
     /// The last sound either side made — speech start / stop, a reply
     /// finishing or its audio draining, a cut. The notice waits
     /// `noticeQuietMs` after it: that pause is where the user answers, and a
@@ -520,7 +566,7 @@ struct BargeInController: Sendable {
     var uiStateNow: VoiceState {
         if state == .hold { return .listening }
         if playbackQueued { return .speaking }
-        if responseActive { return .thinking }
+        if responseActive || continuationOwed { return .thinking }   // a tool's reply is on its way
         return .listening
     }
 
@@ -541,6 +587,7 @@ struct BargeInController: Sendable {
             createSentAt = nil
             clientCreateSentAt = nil
             releaseCreateAt = nil
+            continuationSentAt = nil
             // A new reply: the one before it is now the "previous" reference.
             spokenPrevious = spokenCurrent
             spokenCurrent = []
@@ -576,7 +623,19 @@ struct BargeInController: Sendable {
             // (the server never queues one): re-ask below if a turn is pending —
             // also when the server ignored our cancel and the reply completed.
             createSentAt = nil
-            if pendingCreate {
+            if continuationOwed {
+                // The reply called tools (header §7): no ask of its own — the
+                // turn they took meanwhile rides on the ONE create that goes
+                // once every output is back, now if they already are. Asking
+                // here, before the output, is what had the model say "it
+                // didn't go through" over an ok (Zubair, 2026-09-24 07:02:50).
+                if !playbackQueued {
+                    if state == .speaking { state = .idle }
+                    lastSoundAt = now
+                }
+                let ask = releaseToolsOrArm(now: now)
+                out += ask.isEmpty ? [.uiState(uiStateNow)] : ask
+            } else if pendingCreate {
                 // The reply we cancelled is finished server-side: the user's
                 // turn can be asked for once its hold is up and they are quiet.
                 let ask = tryAsk(now: now)
@@ -613,7 +672,9 @@ struct BargeInController: Sendable {
             playingResponseId = nil
             if !responseActive {
                 if state == .speaking { state = .idle }
-                out.append(.uiState(.listening))
+                // "One moment." played out while its tool runs: the reply
+                // with the result is on its way.
+                out.append(.uiState(continuationOwed ? .thinking : .listening))
             }
 
         case .gateOpen:
@@ -835,7 +896,25 @@ struct BargeInController: Sendable {
                     out += restoreToSpeaking()
                 }
             }
-            out += tryAsk(now: now)
+            if continuationOwed {
+                // A tool still out — or the reply that called it still not
+                // done — `toolTimeoutMs` after the call began: its error
+                // output goes back and the conversation moves on. Never a
+                // deadlock over a tool that hangs or a done that never came.
+                if let since = toolHoldSince, Int(((now - since) * 1000).rounded()) >= Self.toolTimeoutMs {
+                    if toolsRunning > 0 {
+                        toolsRunning = 0
+                        out.append(.expireTools)
+                    }
+                    if responseActive {
+                        responseActive = false
+                        if state == .speaking, !playbackQueued { state = .idle }
+                    }
+                }
+                out += releaseTools(now: now)
+            } else {
+                out += tryAsk(now: now)
+            }
 
         case .interruptPressed:
             if state == .hold { break }
@@ -866,7 +945,12 @@ struct BargeInController: Sendable {
             default:
                 break
             }
-            if pendingCreate {
+            if continuationOwed {
+                // Nothing is generating: the tools' continuation (with any
+                // turn that waited on it) once their outputs are in.
+                let ask = releaseToolsOrArm(now: now)
+                out += ask.isEmpty ? [.uiState(uiStateNow)] : ask
+            } else if pendingCreate {
                 // Our cancel found nothing to cancel — the reply had already
                 // finished. Its done is not coming; ask once the hold is up.
                 let ask = tryAsk(now: now)
@@ -877,15 +961,25 @@ struct BargeInController: Sendable {
 
         case .responseAlreadyActive:
             // Our create collided with a reply the server is still generating
-            // (the tool continuation, the corrective and the opening create
-            // outside the controller). Something IS generating: clearing
-            // responseActive here showed "Listening…" over it, left a barge-in
-            // with no response.cancel to send, and re-created at network speed
-            // into the same refusal until it ended (audit 2026-09-22, C46).
+            // (the corrective and the opening create outside the controller;
+            // the tools' continuation is re-held below). Something IS
+            // generating: clearing responseActive here showed "Listening…"
+            // over it, left a barge-in with no response.cancel to send, and
+            // re-created at network speed into the same refusal until it
+            // ended (audit 2026-09-22, C46).
             // Its done re-asks a pending turn; a done that never comes is the
             // grace timer's.
             responseActive = true
             if state == .idle { state = .speaking }
+            if continuationSentAt != nil {
+                // The refused create was the tools' continuation: the hold is
+                // back on, and the reply that refused it sends it again when
+                // done (or the stuck-tool clock does).
+                continuationSentAt = nil
+                continuationOwed = true
+                toolHoldSince = now
+                out.append(.startConfirmTimer(ms: Self.toolTimeoutMs))
+            }
             if holdToTalk, releaseCreateAt != nil {
                 // The refused create is the release's (nothing answered it
                 // yet): their committed words are a pending turn, its hold
@@ -918,11 +1012,20 @@ struct BargeInController: Sendable {
             // The press already cancelled + flushed whatever was playing; the
             // reply to this turn arrives as a fresh response.created.
             state = .idle
+            lastSoundAt = now
+            if continuationOwed {
+                // Tool outputs are owed (header §7): commit their words now;
+                // the continuation's one create answers them with the
+                // results — a create of its own would be answered without.
+                out.append(.commitInput)
+                out.append(.uiState(.thinking))
+                out += releaseTools(now: now)   // held only by the button: goes now
+                break
+            }
             // That create is the release's own, not a pending turn's: the
             // minutes notice must not be created into it.
             clientCreateSentAt = now
             releaseCreateAt = now
-            lastSoundAt = now
             out.append(.commitAndRespond)
             out.append(.uiState(.thinking))
 
@@ -935,12 +1038,20 @@ struct BargeInController: Sendable {
 
         case .toolStarted:
             toolsRunning += 1
+            if !continuationOwed {
+                // The hold begins (header §7), and the stuck-tool clock with it.
+                continuationOwed = true
+                toolHoldSince = now
+                out.append(.startConfirmTimer(ms: Self.toolTimeoutMs))
+            }
 
         case .toolFinished:
-            toolsRunning = max(0, toolsRunning - 1)
-            // Its output went back; the coalesced continuation create goes
-            // out ~120 ms later (VoiceRealtimeClient.scheduleContinue).
-            clientCreateSentAt = now
+            // A call the timeout already answered finishing late: its output
+            // was never sent (the client drops it) — nothing to release.
+            guard toolsRunning > 0 else { break }
+            toolsRunning -= 1
+            // The last output is in: the continuation, if its reply is done.
+            if toolsRunning == 0 { out += releaseToolsOrArm(now: now) }
         }
 
         // The minutes notice, once whatever was holding it has let go.
@@ -1034,6 +1145,12 @@ struct BargeInController: Sendable {
     /// generating — or the cancelled reply's done never came (the fallback).
     private mutating func tryAsk(now: TimeInterval) -> [BargeInCommand] {
         guard let since = pendingTurnSince else { return [] }
+        // Tool outputs owed (header §7): nothing is asked for — not the turn,
+        // not the fallback — until they are all back and the reply that
+        // called them is done; the continuation then answers the turn too
+        // (`releaseTools`). A done that never comes is the stuck-tool
+        // clock's (`.tick`).
+        if continuationOwed && (toolsRunning > 0 || responseActive) { return [] }
         if let wait = waitForDisplacingWords(since: since, now: now) {
             return [.startConfirmTimer(ms: Int((wait * 1000).rounded()) + 1)]
         }
@@ -1056,8 +1173,42 @@ struct BargeInController: Sendable {
             let left = Int(((Self.createGraceSec - (now - sent)) * 1000).rounded()) + 1
             return [.startConfirmTimer(ms: left)]
         }
+        // The outputs are in: the one create answers them and this turn.
+        if continuationOwed { return sendContinuation(now: now) }
         createSentAt = now
         return [.createResponse, .uiState(.thinking)]
+    }
+
+    /// The continuation after tool calls (header §7), when it is due: every
+    /// output back, the reply that called them done, the button not held.
+    /// A turn of theirs waiting too is asked for through `tryAsk` — its hold
+    /// since they last spoke and a silent VAD still apply — and rides on the
+    /// same create.
+    private mutating func releaseTools(now: TimeInterval) -> [BargeInCommand] {
+        guard continuationOwed, toolsRunning == 0, !responseActive, state != .hold else { return [] }
+        if pendingCreate { return tryAsk(now: now) }
+        return sendContinuation(now: now)
+    }
+
+    /// `releaseTools`, with the tick armed when all it waits for is a turn
+    /// of theirs whose hold isn't up yet.
+    private mutating func releaseToolsOrArm(now: TimeInterval) -> [BargeInCommand] {
+        let ask = releaseTools(now: now)
+        if ask.isEmpty, continuationOwed, toolsRunning == 0, !responseActive, state != .hold, pendingCreate {
+            return [.startConfirmTimer(ms: Self.turnHoldMs)]
+        }
+        return ask
+    }
+
+    /// THE one create after tool calls. Tracked like our own ask: a turn
+    /// they take while it is in flight stays pending (`since > sent` at
+    /// response.created) and is asked for when this reply is done.
+    private mutating func sendContinuation(now: TimeInterval) -> [BargeInCommand] {
+        continuationOwed = false
+        toolHoldSince = nil
+        continuationSentAt = now
+        createSentAt = now
+        return [.continueAfterTools, .uiState(.thinking)]
     }
 
     /// The held deletes, as commands — all of them, or all but one item's.
@@ -1283,7 +1434,7 @@ struct BargeInController: Sendable {
     /// playing, a tool running) is re-checked by the event that ends it.
     private mutating func tryNotice(now: TimeInterval) -> [BargeInCommand] {
         guard let owed = noticeOwedSince else { return [] }
-        guard !modelBusy, !pendingCreate, !serverSpeaking, state != .hold, toolsRunning == 0 else { return [] }
+        guard !modelBusy, !pendingCreate, !serverSpeaking, state != .hold, toolsRunning == 0, !continuationOwed else { return [] }
         // Whole milliseconds, as the tick's confirm: `now - since` is
         // floating point, and 15.2 − 14 is a hair under 1.2.
         func ms(since t: TimeInterval) -> Int { Int(((now - t) * 1000).rounded()) }
