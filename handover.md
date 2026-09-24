@@ -43,6 +43,43 @@ phases land. Newest status at the top.
 
 
 
+## Zubair's morning call fixes (branch zubair/ios, 2026-09-24) — not shipped yet
+
+From prod assistant_turns, session 1cbfac75 (07:01–07:03 UTC). Web did its half in the same run (commits cbad570, d7441b7).
+
+- **Tool calls hold every create (BargeIn header §7).** The reply said "One moment." and called set_task_recurrence;
+  its done asked for his second turn BEFORE the tool's output went back, the model answered without it ("I tried to
+  cancel the repeat, but it didn't go through" over an ok) and the continuation's own create was refused. Now
+  `.toolStarted` puts a hold on (`continuationOwed`): no turn ask, no 2.5 s fallback, no minutes notice, no
+  integrity corrective (`shouldCorrect(toolsPending:)`) until every output is back AND the calling reply is done;
+  then ONE `.continueAfterTools` create answers the outputs and any turn that waited (its hold since they spoke still
+  applies). A failing tool sends its error output and releases the same way; a tool still out after 10 s
+  (`toolTimeoutMs`) gets `VoiceRealtimeClient.toolTimeoutOutput` (`.expireTools`, sent under the lock the tool Task
+  claims its call with — the output is always on the wire before the create) and its late result is dropped; a done
+  that never comes is released by the same clock. Hold-to-talk: a release while a tool runs commits only
+  (`.commitInput`). The old 120 ms `scheduleContinue` timer is gone. Talk and calls share the client, so both get it.
+  Tests: BargeInTests 31a–i (31a replays 07:02:44–50), VoiceToolHoldTests (the real client, real frames).
+- **The opening said twice.** Not a logging bug: the model spoke "Morning. Want to walk through today?" as two message
+  items in one response (two transcript rows, same response id; 96 output audio tokens where the line takes ~48 at
+  that session's rate) — the build-77 primer fix made it rarer, not impossible. `RepeatedSpeechFilter` holds a later
+  item's audio/caption while its words are still an earlier item's word for word; the first new word plays everything
+  held; a whole repeat is dropped and `conversation.item.delete`d at the done (event id `evt_repeat_delete_N`, its
+  refusal swallowed). The proxy still logs what the model generated (two rows + a "client discarded item" row).
+- **Tools (as web).** `set_task_recurrence` kind none on a task that doesn't repeat → `ok: "X" already doesn't repeat —
+  nothing to change`; `schedule_task` into the task's exact live slot (strict H:MM[:SS], never for a Later task) →
+  `ok: "X" is already on <date> at <HH:MM> — nothing to change`, no write, still anchors a set_task_recurrence after it.
+  Receipts: an ok ending `NOTHING_TO_CHANGE` gets no card; kind none reads "Repeat removed". Voice prompt carries web's
+  REPEATS_RULE verbatim (unsupported repeats said first, offered as a question).
+- **Open (review, same day) — the no-tool variant still asks twice.** The 50.333 create was also a second ask for
+  "I'll just leave it in only for today.": that segment's speech had ended before the 48.106 create (so the reply
+  heard it), but its transcript landed just after the create and re-opened the turn (`since > sent` at
+  response.created). With a tool call it now rides on the one continuation; with NO tool the same timing still sends
+  a second `response.create` at the reply's done (probed against this branch: `creates(done) == 1`,
+  `pendingCreate == true`). It fires whenever the last segment of a multi-segment turn is transcribed more than
+  `turnHoldMs` after its speech_stopped — 2 of the 3 multi-segment turns in this call were. Fix idea: a final
+  transcript for a segment whose `stoppedAt` precedes an in-flight / answering turn ask is already answered (caption
+  it, don't re-open the turn, don't cancel that reply); keep notice creates out of it. Needs its own review.
+
 ## James's assistant reports + analytics alignment (branch polish/ios, 2026-09-24) — not shipped yet
 
 Same behaviour is being built on web and Android the same night; keep the wording in step.

@@ -727,7 +727,14 @@ final class AssistantToolsTests: XCTestCase {
                  "ok: \"Alpha\" now repeats daily until \(NEXT_WEEK) — it has no calendar slot yet; schedule_task it to place the first one")
         await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "ok: \"Alpha\" no longer repeats")
         XCTAssertNil(api.tasks[0].recurrence)
-        await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "error: \"Alpha\" doesn't repeat — nothing changed")
+        // Stopping a repeat that isn't there is what they asked for, already
+        // true: an ok that changed nothing (Zubair's call, 2026-09-24 — as an
+        // error the model said "It didn't change anything… doesn't actually
+        // have recurrence"). Web's wording.
+        let before = api.tasks[0]
+        await eq("set_task_recurrence", #"{"taskId":"a","kind":"none"}"#, "ok: \"Alpha\" already doesn't repeat — nothing to change")
+        await eq("set_task_recurrence", #"{"taskId":"a"}"#, "ok: \"Alpha\" already doesn't repeat — nothing to change")
+        XCTAssertEqual(api.tasks[0], before, "nothing written")
     }
 
     // MARK: get_tasks
@@ -866,6 +873,21 @@ final class AssistantToolsTests: XCTestCase {
         XCTAssertTrue(v.contains("Numbers and names only from the result; if nothing was logged, say so — never that the week was empty. "))
     }
 
+    /// Zubair's iOS call, 2026-09-24: "every two weeks on Thursdays" got
+    /// weekly first and "I can't set it to every two weeks" after. The spoken
+    /// prompt carries web's REPEATS_RULE verbatim, with the rules of conduct
+    /// (before HOW YOU SPEAK, after the calls rule — web's order).
+    func testVoiceInstructionsSayAnUnsupportedRepeatBeforeSettingAnything() throws {
+        let v = buildVoiceInstructions(api)
+        let rule = "REPEATS: a task can repeat daily, weekly on chosen days, or monthly, optionally until a last date — nothing else. "
+            + "If they ask for a repeat those can't express (every two weeks, every other month, the third Tuesday), say so FIRST and offer the closest options "
+            + "as a question (\"Every other week isn't an option — weekly on Thursdays, or just this one?\"), never as \"I'll set it weekly…\"; "
+            + "never set a different pattern before they agree to it. "
+        let at = try XCTUnwrap(v.range(of: rule))
+        XCTAssertLessThan(at.lowerBound, try XCTUnwrap(v.range(of: "HOW YOU SPEAK")).lowerBound)
+        XCTAssertGreaterThan(at.lowerBound, try XCTUnwrap(v.range(of: "CALLS: Unstuck can phone them.")).lowerBound)
+    }
+
     func testGetTasksViewsAreDistinctAndFiltersNarrow() async {
         seedViews()
         let later = await run("get_tasks", #"{"view":"later"}"#)
@@ -905,6 +927,88 @@ final class AssistantToolsTests: XCTestCase {
         await eq("schedule_task", #"{"taskId":"a","date":"\#(TOMORROW)","startTime":"11:00"}"#, "ok: scheduled \"Alpha\" \(TOMORROW) 11:00")
         XCTAssertEqual(api.blocks[0].startTime, "11:00")
         XCTAssertEqual(api.tasks[0].moveCount, 1)
+    }
+
+    /// Zubair's call, 2026-09-24 07:02:02–03: create_task with a date and a
+    /// time, then schedule_task for the same day and time. The second is an
+    /// ok that changed nothing — no second block, no move — in web's words,
+    /// and it still anchors the set_task_recurrence that follows.
+    func testScheduleTaskIntoTheSlotCreateTaskJustMadeIsAnOkThatChangesNothing() async throws {
+        let made = await run("create_task", #"{"name":"Office Focus","date":"\#(TOMORROW)","startTime":"10:30","estimateMin":60}"#)
+        XCTAssertTrue(made.hasPrefix("ok: created task id="), made)
+        XCTAssertTrue(made.contains("(scheduled \(TOMORROW) 10:30)"), made)
+        let id = try XCTUnwrap(api.tasks.first { $0.name == "Office Focus" }?.id)
+        let before = snapshot(api.tasks) + snapshot(api.blocks)
+        await eq("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"10:30"}"#,
+                 "ok: \"Office Focus\" is already on \(TOMORROW) at 10:30 — nothing to change")
+        await eq("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"10:30:00"}"#,
+                 "error: startTime must be 24-hour HH:MM (got \"10:30:00\"). Nothing was scheduled.")
+        XCTAssertEqual(snapshot(api.tasks) + snapshot(api.blocks), before, "nothing written: one block, no move counted")
+        XCTAssertEqual(api.blocks.filter { $0.taskId == id }.count, 1)
+        XCTAssertNotNil(scratch.placedBlocks[id], "it still anchors a repeat set next")
+        // Another time is a real move.
+        await eq("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"11:00"}"#,
+                 "ok: scheduled \"Office Focus\" \(TOMORROW) 11:00")
+        // A block stored with seconds is the same slot.
+        api.blocks[0].startTime = "11:00:00"
+        await eq("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"11:00"}"#,
+                 "ok: \"Office Focus\" is already on \(TOMORROW) at 11:00 — nothing to change")
+        // A task parked in Later keeps its slot, but putting it back there is
+        // a real change (every block write un-parks it) — web parity.
+        api.tasks[0].later = true
+        api.blocks[0].startTime = "11:00"
+        await prefix("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"11:00"}"#,
+                     "ok: scheduled \"Office Focus\" \(TOMORROW) 11:00")
+        api.tasks[0].later = false
+        // A done or skipped slot there is no slot: placed again as before.
+        api.blocks[0].startTime = "11:00"
+        api.blocks[0].skipped = true
+        await prefix("schedule_task", #"{"taskId":"\#(id)","date":"\#(TOMORROW)","startTime":"11:00"}"#,
+                     "ok: scheduled \"Office Focus\" \(TOMORROW)")
+    }
+
+    /// Zubair's morning call itself (prod assistant_turns, session 1cbfac75,
+    /// 2026-09-24 07:02–07:03), replayed call by call through the iOS
+    /// executor with its arguments — one voice session, one scratch — as web
+    /// recurring-tools.test.ts does: create 10:30 → the same slot scheduled
+    /// again → weekly on the day → stop → stop again. On the phone the second
+    /// stop was an error the model read as a failure ("It didn't change
+    /// anything"), and the re-schedule a fresh "scheduled".
+    func testZubairsMorningCallReplayed_everyLineTrue_todayKept_noPhantomReceipts() async throws {
+        api.now = "07:02"
+        let dow = LocalDate.dayOfWeek(TODAY)
+        func receipt(_ name: String, _ args: ReceiptArgs, _ result: String) -> String? {
+            deriveReceipt(name: name, args: args, result: result, tasks: api.tasks)?.label
+        }
+        let made = await run("create_task", #"{"date":"\#(TODAY)","name":"Office Focus","startTime":"10:30","estimateMin":60}"#)
+        let id = try XCTUnwrap(api.tasks.first { $0.name == "Office Focus" }?.id)
+        XCTAssertEqual(made, "ok: created task id=\(id) name=\"Office Focus\" (scheduled \(TODAY) 10:30)")
+        XCTAssertEqual(receipt("create_task", ReceiptArgs(), made), "Created “Office Focus”")
+
+        let sched = await run("schedule_task", #"{"date":"\#(TODAY)","taskId":"\#(id)","startTime":"10:30"}"#)
+        XCTAssertEqual(sched, "ok: \"Office Focus\" is already on \(TODAY) at 10:30 — nothing to change")
+        XCTAssertNil(receipt("schedule_task", ReceiptArgs(taskId: id, date: TODAY, startTime: "10:30"), sched))
+        XCTAssertEqual(api.blocks.filter { $0.taskId == id }.count, 1)
+
+        let weekly = await run("set_task_recurrence", #"{"kind":"weekly","taskId":"\#(id)","daysOfWeek":[\#(dow)]}"#)
+        XCTAssertEqual(weekly, "ok: \"Office Focus\" now repeats weekly on \(weekdayNames([dow])) at 10:30")
+        XCTAssertEqual(receipt("set_task_recurrence", ReceiptArgs(taskId: id, kind: "weekly"), weekly), "Repeats weekly — “Office Focus”")
+        XCTAssertTrue(api.blocks.contains { $0.taskId == id && $0.date > TODAY })
+
+        // "No, just cancel the recurring. I'll just leave it in only for today."
+        let stop = await run("set_task_recurrence", #"{"kind":"none","taskId":"\#(id)","daysOfWeek":[\#(dow)]}"#)
+        XCTAssertEqual(stop, "ok: \"Office Focus\" no longer repeats (future occurrences removed)")
+        XCTAssertEqual(receipt("set_task_recurrence", ReceiptArgs(taskId: id, kind: "none"), stop), "Repeat removed — “Office Focus”")
+        XCTAssertNil(api.tasks.first { $0.id == id }?.recurrence)
+        let live = api.blocks.filter { $0.taskId == id && !$0.done && !$0.skipped }.map { "\($0.date) \($0.startTime)" }
+        XCTAssertEqual(live, ["\(TODAY) 10:30"], "today stays, nothing after it")
+
+        // "Were you able to cancel the recurring tasks?" — asked again.
+        let before = snapshot(api.tasks) + snapshot(api.blocks)
+        let again = await run("set_task_recurrence", #"{"kind":"none","taskId":"\#(id)"}"#)
+        XCTAssertEqual(again, "ok: \"Office Focus\" already doesn't repeat — nothing to change")
+        XCTAssertNil(receipt("set_task_recurrence", ReceiptArgs(taskId: id, kind: "none"), again))
+        XCTAssertEqual(snapshot(api.tasks) + snapshot(api.blocks), before)
     }
 
     func testScheduleTaskRefusesPastDatesPastTimesAndNeverInventsATime() async {

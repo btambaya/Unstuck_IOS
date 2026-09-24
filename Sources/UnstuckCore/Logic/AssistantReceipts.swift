@@ -130,6 +130,13 @@ private func stripAfterDash(_ s: String) -> String {
     return String(s[..<r.lowerBound])
 }
 
+/// The tail of an `ok:` line whose wish was ALREADY true, so nothing was
+/// written: stopping a repeat on a task that doesn't repeat, scheduling a task
+/// into the very slot it already has (AssistantTools, 2026-09-24; web
+/// receipts.ts `NOTHING_TO_CHANGE`). A success for the model to say plainly —
+/// and no receipt, which would claim a change.
+public let NOTHING_TO_CHANGE = " — nothing to change"
+
 /// Build the receipt for one SUCCESSFUL tool call (result starts "ok").
 /// `tasks` resolves live entities for undo targets; `tone` (from
 /// `toneFromFacts`) phrases the quiet-win line. Returns nil for read-only
@@ -142,6 +149,7 @@ public func deriveReceipt(
     tone: Tone = .gentle
 ) -> Receipt? {
     guard result.hasPrefix("ok") else { return nil }
+    if result.hasSuffix(NOTHING_TO_CHANGE) { return nil }
     switch name {
     case "create_task":
         let nm = quotedFragment(result) ?? "task"
@@ -173,7 +181,8 @@ public func deriveReceipt(
     case "set_task_recurrence":
         let nm = args.taskId.flatMap { id in tasks.first { $0.id == id }?.name }
         let suffix = nm.map { " — “\($0)”" } ?? ""
-        if let kind = args.kind {
+        // kind "none" is the stop: it read "Repeats none" on the card.
+        if let kind = args.kind, kind != "none" {
             return Receipt(icon: .calendar, label: "Repeats \(kind)\(suffix)")
         }
         return Receipt(icon: .calendar, label: "Repeat removed\(suffix)")

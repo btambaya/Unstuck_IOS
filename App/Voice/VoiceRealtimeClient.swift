@@ -21,7 +21,9 @@
 //          → response.function_call_arguments.done {name, call_id, arguments}
 //          → response.output_item.done {item: function_call}  (same, other shape)
 //   client → conversation.item.create {function_call_output, call_id, output}
-//          → response.create (coalesced)
+//          → response.create — ONE, once every output of the reply's calls
+//            is back and that reply is done (BargeIn header §7); nothing
+//            else is created in between
 //   client → conversation.item.delete {PRIMER}  on the first response.done
 //
 // Plus the voice integrity guard: a spoken "I've added it" with no tool call
@@ -153,10 +155,14 @@ struct VoiceIntegrityGuard: Sendable {
     mutating func responseCancelled() { wasCorrection = false }
 
     /// Called on a COMPLETED response: true when a corrective must be sent.
-    mutating func shouldCorrect() -> Bool {
+    /// `toolsPending`: the response called tools whose outputs haven't all
+    /// gone back — its continuation is the next reply, and a corrective's
+    /// create now would race the outputs (BargeIn header §7); that reply is
+    /// scored on its own.
+    mutating func shouldCorrect(toolsPending: Bool = false) -> Bool {
         if exempt { exempt = false; return false }
         if wasCorrection { wasCorrection = false; return false }
-        if toolCalled || correctionsLeft <= 0 { return false }
+        if toolsPending || toolCalled || correctionsLeft <= 0 { return false }
         if !looksLikeActionClaim(transcript, recap: periodReviewed) { return false }
         correctionsLeft -= 1
         wasCorrection = true
@@ -259,6 +265,153 @@ struct VoiceMinutes: Equatable, Sendable {
     static let noticeText = "(note from the app, not the user: about one minute of today's voice time is left. Say so now, once, in one short natural line in your own words — like \"We've got about a minute left today.\" — then stop and listen. No question, no tool, and never say it again.)"
 }
 
+/// A reply can speak in several message items — a lead-in, then the answer
+/// ("Okay, let me think…" + "Focus — nice. I can add…", Zubair's call,
+/// 2026-09-24 07:01:53). One that REPEATS an item the same reply already
+/// spoke is never played: Zubair's morning call opened with "Morning. Want
+/// to walk through today?" twice in one response (assistant_turns 07:01:13,
+/// two rows, same response; 96 output audio tokens where the line takes
+/// ~48 at that session's ~21 a second) — the build-77 primer fix
+/// (RealtimeCallVoiceLauncher.primer) made it rarer, not impossible. The
+/// model's output is not ours to stop, so the phone drops it: a later item's
+/// audio and caption are held while its words are still an earlier item's
+/// word for word. The first word it says that the earlier one didn't (or
+/// one word more) and everything held plays at once — the transcript runs
+/// ahead of the audio, so a lead-in's answer is rarely held at all. Ended
+/// as a whole repeat, it is dropped, and deleted from the conversation when
+/// the reply is done, so the model doesn't hear itself say it twice either.
+/// Pure; fed by item id. No item id (a backend that sends none) → nothing
+/// is held.
+struct RepeatedSpeechFilter: Sendable {
+    enum Fate: Equatable, Sendable { case undecided, play, drop }
+    /// What to hand on now: caption text, and audio chunks of `audioItem`.
+    struct Release: Equatable, Sendable {
+        var caption = ""
+        var audio: [Data] = []
+        var audioItem: String?
+    }
+    private struct Item: Sendable {
+        /// Everything its transcript said so far (deltas split words).
+        var said = ""
+        /// Caption text withheld while undecided.
+        var withheld = ""
+        var complete = false
+        var fate: Fate
+        var held: [Data] = []
+    }
+    /// The reply being judged, and its items in the order they began
+    /// speaking. Another reply's deltas (the last one's tail, still on air)
+    /// pass straight through.
+    private var responseId: String?
+    private var order: [String] = []
+    private var items: [String: Item] = [:]
+
+    /// A new reply: the last one's items are forgotten.
+    mutating func begin(responseId: String?) {
+        self.responseId = responseId
+        order.removeAll()
+        items.removeAll()
+    }
+
+    private func judged(_ itemId: String?, _ response: String?) -> String? {
+        guard let itemId else { return nil }
+        if let response, let current = responseId, response != current { return nil }
+        return itemId
+    }
+
+    func fate(of itemId: String) -> Fate? { items[itemId]?.fate }
+
+    /// An audio delta: the chunks to play now.
+    mutating func audio(_ pcm: Data, itemId: String?, responseId: String?) -> Release {
+        guard let itemId = judged(itemId, responseId) else { return Release(audio: [pcm], audioItem: itemId) }
+        touch(itemId)
+        switch items[itemId]!.fate {
+        case .play: return Release(audio: [pcm], audioItem: itemId)
+        case .drop: return Release()
+        case .undecided:
+            items[itemId]!.held.append(pcm)
+            return Release()
+        }
+    }
+
+    /// A transcript delta: the caption (and any held audio) to hand on now.
+    mutating func transcript(_ delta: String, itemId: String?, responseId: String?) -> Release {
+        guard let itemId = judged(itemId, responseId) else { return Release(caption: delta) }
+        touch(itemId)
+        items[itemId]!.said += delta
+        switch items[itemId]!.fate {
+        case .play: return Release(caption: delta)
+        case .drop: return Release()
+        case .undecided:
+            items[itemId]!.withheld += delta
+            return judge(itemId)
+        }
+    }
+
+    /// The item's transcript is complete: judged on all it said.
+    mutating func transcriptDone(itemId: String?, responseId: String?) -> Release {
+        guard let itemId = judged(itemId, responseId), items[itemId] != nil else { return Release() }
+        items[itemId]!.complete = true
+        return items[itemId]!.fate == .undecided ? judge(itemId) : Release()
+    }
+
+    /// The reply is done: an item still undecided plays what it has (never
+    /// drop what can't be shown to repeat); and the items dropped as
+    /// repeats, to delete from the conversation. Another reply's late done
+    /// finishes nothing.
+    mutating func finish(responseId: String?) -> (releases: [Release], dropped: [String]) {
+        if let responseId, let current = self.responseId, responseId != current { return ([], []) }
+        var releases: [Release] = []
+        for id in order where items[id]?.fate == .undecided {
+            releases.append(play(id))
+        }
+        let dropped = order.filter { items[$0]?.fate == .drop }
+        begin(responseId: nil)
+        return (releases, dropped)
+    }
+
+    private mutating func touch(_ itemId: String) {
+        guard items[itemId] == nil else { return }
+        // The reply's first spoken item always plays; a later one waits for
+        // its words.
+        items[itemId] = Item(fate: order.isEmpty ? .play : .undecided)
+        order.append(itemId)
+    }
+
+    private mutating func judge(_ id: String) -> Release {
+        let item = items[id]!
+        let words = BargeInController.tokens(item.said)
+        guard !words.isEmpty else { return item.complete ? play(id) : Release() }
+        let earlier = order.prefix { $0 != id }.compactMap { items[$0].map { BargeInController.tokens($0.said) } }
+        // Mid-stream the last word may be cut ("wa" of "walk"): the words
+        // before it must match, and it must start the earlier one's.
+        let settled = item.complete ? words : Array(words.dropLast())
+        let tail = item.complete ? nil : words.last
+        let stillRepeating = earlier.contains { e in
+            guard settled.count <= e.count, Array(e.prefix(settled.count)) == settled else { return false }
+            guard let tail else { return true }
+            return settled.count < e.count && e[settled.count].hasPrefix(tail)
+        }
+        // Anything it says that an earlier item didn't — a different word,
+        // or more words — and all of it plays: only a whole repeat is cut.
+        guard stillRepeating else { return play(id) }
+        if item.complete {
+            items[id]!.fate = .drop
+            items[id]!.held.removeAll()
+            items[id]!.withheld = ""
+        }
+        return Release()
+    }
+
+    private mutating func play(_ id: String) -> Release {
+        let item = items[id]!
+        items[id]!.fate = .play
+        items[id]!.held.removeAll()
+        items[id]!.withheld = ""
+        return Release(caption: item.withheld, audio: item.held, audioItem: id)
+    }
+}
+
 /// The largest figure of today's minutes this phone has seen, per account
 /// and local day — how a team member with under 10 minutes left is still
 /// told their allowance is 60 (VoiceMinutes.allowanceMinutes). A new day or
@@ -296,6 +449,9 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     static let primerDeleteEvent = "evt_primer_delete_0001"
     /// Client event ids on truncates, so their rejections are recognised.
     static let truncateEventPrefix = "evt_truncate_"
+    /// Client event ids on the deletes of a reply's dropped repeats
+    /// (`RepeatedSpeechFilter`) — best effort, their rejection is no error.
+    static let repeatDeleteEventPrefix = "evt_repeat_delete_"
     /// The minutes notice's hidden note (VoiceMinutes.noticeText), by a known
     /// id so it is deleted once its reply is done — like the primer, a note
     /// left in the conversation is a standing instruction the model re-runs
@@ -512,9 +668,19 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     private var _guard = VoiceIntegrityGuard()
     /// Both event shapes can carry the same call — dispatch once.
     private var _handledCalls = Set<String>()
-    /// One coalesced response.create after tool outputs — a response.create per
-    /// parallel call races "already has an active response" errors.
-    private var _continueTask: Task<Void, Never>?
+    /// Tool calls whose output hasn't gone back (call_id → tool name). The
+    /// barge-in controller holds every response.create until this is empty
+    /// and then asks for ONE (`.continueAfterTools`, BargeIn header §7); a
+    /// call still here when the stuck-tool clock runs out is answered with
+    /// `toolTimeoutOutput` (`.expireTools`) and its late result dropped.
+    private var _runningCalls: [String: String] = [:]
+    /// The current reply's spoken items: a whole repeat of one it already
+    /// spoke is never played (`RepeatedSpeechFilter`).
+    private var _speech = RepeatedSpeechFilter()
+    /// Deletes of dropped repeats sent this session (their event ids).
+    private var _repeatDeletes = 0
+    /// The output a call gets when it has not returned in time.
+    static let toolTimeoutOutput = "error: no result in time — the app could not confirm this happened. Say you couldn't confirm it and offer to check; never say it worked."
 
     /// Synchronous scoped locking — the ONLY way the flags are touched.
     /// Callable from async contexts (NSLock's bare lock()/unlock() are not).
@@ -782,17 +948,15 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
     }
 
     func stop() {
-        let first: (socket: URLSessionWebSocketTask?, cont: Task<Void, Never>?)? = withLock {
-            if _stopped { return nil }
+        let (first, socket): (Bool, URLSessionWebSocketTask?) = withLock {
+            if _stopped { return (false, nil) }
             _stopped = true; _open = false
-            let pair = (task, _continueTask)
+            let s = task
             task = nil
-            _continueTask = nil
-            return pair
+            return (true, s)
         }
-        guard let first else { return }
-        first.cont?.cancel()
-        first.socket?.cancel(with: .goingAway, reason: nil)
+        guard first else { return }
+        socket?.cancel(with: .goingAway, reason: nil)
         session.invalidateAndCancel()   // release the session + its op queue + the delegate retain
         stopObservingRoute()
         audio.shutdown()
@@ -840,7 +1004,11 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         // Ducks/restores/cancels are a handful per session; routine events
         // (audio deltas, ticks that decided nothing) stay out of the log.
         let decisive = cmds.contains { c in
-            switch c { case .duck, .restore, .sendCancel, .flushPlayback, .createResponse, .deleteItem, .speakMinutesNotice: return true; default: return false }
+            switch c {
+            case .duck, .restore, .sendCancel, .flushPlayback, .createResponse, .deleteItem, .speakMinutesNotice,
+                 .continueAfterTools, .expireTools, .commitInput: return true
+            default: return false
+            }
         }
         // NEVER the event's own description: `.transcription` carries the
         // user's words, and a .public log line travels in any sysdiagnose a
@@ -853,6 +1021,10 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         }
         execute(cmds)
     }
+
+    /// A barge-in timer went off (`.startConfirmTimer`). Internal so the
+    /// tests can fire one at a chosen moment of their injected clock.
+    func timerFired() { dispatch(.tick) }
 
     /// Command kinds only (no payloads) for the log line above.
     private static func describe(_ cmds: [BargeInCommand]) -> String {
@@ -869,6 +1041,9 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             case .startConfirmTimer(let ms): return "timer\(ms)"
             case .uiState(let s): return "ui:\(s)"
             case .speakMinutesNotice: return "minutes-notice"
+            case .continueAfterTools: return "continue-after-tools"
+            case .expireTools: return "expire-tools"
+            case .commitInput: return "commit"
             default: return nil
             }
         }
@@ -944,10 +1119,38 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 send(cut.event(id: Self.truncateEventPrefix + String(n)))
             case .deleteItem(let id): send(["type": "conversation.item.delete", "item_id": id])
             case .createResponse:
-                // Only ever a user turn's answer (tryAsk): tool continuations,
-                // correctives and the opening go out as `.clientCreate`.
+                // Only ever a user turn's answer (tryAsk): correctives and the
+                // opening go out as `.clientCreate`, the tools' continuation
+                // as `.continueAfterTools`.
                 withLock { _guard.userTurnAnswered() }
                 send(["type": "response.create"])
+            case .continueAfterTools:
+                // THE one create after a reply's tool calls (BargeIn header
+                // §7): every output is already on the wire ahead of it. Not
+                // a user-turn answer for the guard — a review a tool just
+                // returned still vouches for the recap this reply is.
+                send(["type": "response.create"])
+            case .expireTools:
+                // Calls the stuck-tool clock gave up on: each gets an error
+                // output now, and its late result is dropped (handleToolCall
+                // claims the call under this same lock). Sent under the lock,
+                // so every output is on the wire before the continuation's
+                // create that follows this command.
+                let expired: [String] = withLock {
+                    let calls = _runningCalls
+                    _runningCalls.removeAll()
+                    for (callId, name) in calls {
+                        send(Self.toolOutputFrame(callId: callId, output: Self.toolTimeoutOutput))
+                        _guard.toolFinished(name, result: Self.toolTimeoutOutput)
+                    }
+                    return calls.values.sorted()
+                }
+                voiceLog.notice("voice tools timed out: \(expired.joined(separator: ","), privacy: .public)")
+            case .commitInput:
+                // Hold-to-talk release while tool outputs are owed: the
+                // continuation's create answers these words with the results.
+                withLock { _guard.userTurnAnswered() }
+                send(["type": "input_audio_buffer.commit"])
             case .commitAndRespond:
                 withLock { _guard.userTurnAnswered() }
                 send(["type": "input_audio_buffer.commit"])
@@ -959,7 +1162,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 Task { [weak self] in
                     try? await Task.sleep(nanoseconds: UInt64(ms) * 1_000_000)
                     guard let self, self.withLock({ self._open }) else { return }
-                    self.dispatch(.tick)
+                    self.timerFired()
                 }
             case .updateTurnDetection(let td):
                 // ONLY the field that changed. Re-sending the whole session
@@ -1192,6 +1395,7 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         case "response.created":
             withLock {
                 _guard.responseCreated(); _anyResponse = true
+                _speech.begin(responseId: responseId)
                 // The reply that answers the minutes notice's note (header
                 // §6 in BargeIn) — its done deletes the note.
                 if _noticeNoteLive, _noticeResponseId == nil { _noticeResponseId = responseId ?? "" }
@@ -1208,9 +1412,12 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             if let b64 = ev["delta"] as? String, let pcm = Data(base64Encoded: b64) {
                 // The item id travels with the audio: a cut reply is truncated
                 // by the item the user was HEARING (the proxy keeps GA's
-                // item_id when it renames response.output_audio.delta).
-                audio.enqueue(pcm, itemId: ev["item_id"] as? String)
-                dispatch(.audioDelta(id: responseId))
+                // item_id when it renames response.output_audio.delta). A
+                // later item of the reply waits for its words (a repeat is
+                // never played — RepeatedSpeechFilter).
+                let itemId = ev["item_id"] as? String
+                let release = withLock { _speech.audio(pcm, itemId: itemId, responseId: responseId) }
+                play(release, responseId: responseId)
             }
         case "response.audio_transcript.delta":
             // The echo reference sees EVERY word the model produced, before
@@ -1222,13 +1429,16 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // Captions for a cancelled reply never leak through (same id rule).
             guard withLock({ _bargeIn.acceptsTranscript(id: responseId) }) else { return }
             if let d = ev["delta"] as? String {
-                withLock { _guard.transcriptDelta(d) }
-                onCaption("assistant", d, false)
+                let release = withLock { _speech.transcript(d, itemId: ev["item_id"] as? String, responseId: responseId) }
+                play(release, responseId: responseId)
             }
         case "response.audio_transcript.done":
             // Belt and braces for the echo reference: the whole reply at once,
             // in case the deltas lagged the audio (device log 2026-09-19).
             if let t = ev["transcript"] as? String, !t.isEmpty { dispatch(.assistantTranscript(delta: t)) }
+            // A held item is judged on all it said: a whole repeat is dropped.
+            let release = withLock { _speech.transcriptDone(itemId: ev["item_id"] as? String, responseId: responseId) }
+            play(release, responseId: responseId)
             onCaption("assistant", "", true)
         case "conversation.item.input_audio_transcription.delta":
             // Energy profiles: a confirm accelerator that may never arrive.
@@ -1263,7 +1473,19 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
             // response.audio_transcript.done would otherwise let the next
             // segment's deltas run straight into this one's last word. The
             // reducer treats a second segment-end as a no-op.
-            if type == "response.done" { onCaption("assistant", "", true) }
+            if type == "response.done" {
+                // An item still held plays what it has; a whole repeat that
+                // was dropped leaves the conversation too, so the model never
+                // hears itself say it twice (RepeatedSpeechFilter).
+                let (releases, dropped) = withLock { _speech.finish(responseId: responseId) }
+                for r in releases { play(r, responseId: responseId) }
+                for item in dropped {
+                    let n: Int = withLock { _repeatDeletes += 1; return _repeatDeletes }
+                    voiceLog.notice("voice reply repeated one of its own items — dropped, deleting it")
+                    send(["type": "conversation.item.delete", "item_id": item, "event_id": Self.repeatDeleteEventPrefix + String(n)])
+                }
+                onCaption("assistant", "", true)
+            }
             // First response finished → the opening primer has served its
             // purpose; remove it so it can never be re-executed after an
             // interruption. Best effort: a backend without item.delete just
@@ -1380,6 +1602,12 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
                 voiceLog.notice("voice truncate refused: \(String((m ?? "-").prefix(200)), privacy: .public)")
                 return
             }
+            // The delete of a dropped repeat, likewise best effort: it was
+            // never played either way.
+            if [ev["event_id"], errObj?["event_id"]].contains(where: { ($0 as? String)?.hasPrefix(Self.repeatDeleteEventPrefix) == true }) {
+                voiceLog.notice("voice repeat delete refused: \(String((m ?? "-").prefix(200)), privacy: .public)")
+                return
+            }
             // A server error before ANY reply started: the session is dead on
             // arrival (the socket closes right after). Not surfaced — the
             // screen reconnects once or twice; only if that fails does the
@@ -1415,12 +1643,30 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         }
     }
 
+    /// Hand on what the repeat filter released: its caption (the guard's
+    /// transcript too), then its audio as the reply's — unless that reply
+    /// was cut meanwhile (a held item released at a cancelled reply's done).
+    private func play(_ r: RepeatedSpeechFilter.Release, responseId: String?) {
+        guard !r.caption.isEmpty || !r.audio.isEmpty, withLock({ _bargeIn.shouldEnqueueAudio(id: responseId) }) else { return }
+        if !r.caption.isEmpty {
+            withLock { _guard.transcriptDelta(r.caption) }
+            onCaption("assistant", r.caption, false)
+        }
+        for pcm in r.audio {
+            audio.enqueue(pcm, itemId: r.audioItem)
+            dispatch(.audioDelta(id: responseId))
+        }
+    }
+
     /// Spoken claim of a completed action with NO tool call in that response →
     /// bounce one hidden corrective so the model acts for real and corrects
     /// itself out loud. Capped per session; never bounces a correction's own
     /// follow-up, so it cannot loop.
     private func checkFabrication() {
-        let correct: Bool = withLock { _guard.shouldCorrect() }
+        // Never while the reply's tool outputs are owed: their continuation
+        // is the next create, and a corrective's would race them (BargeIn
+        // header §7).
+        let correct: Bool = withLock { _guard.shouldCorrect(toolsPending: _bargeIn.continuationOwed) }
         guard correct else { return }
         send(["type": "conversation.item.create",
               "item": ["type": "message", "role": "user",
@@ -1434,39 +1680,49 @@ final class VoiceRealtimeClient: NSObject, URLSessionWebSocketDelegate, @uncheck
         let fresh: Bool = withLock {
             if _handledCalls.contains(callId) { return false }   // both event shapes fired
             _handledCalls.insert(callId)
+            _runningCalls[callId] = name
             _guard.toolDispatched(name)
             return true
         }
         guard fresh else { return }
         let argsJSON = arguments ?? "{}"
-        // The turn-taking knows a tool is out: nothing of its own (the
-        // minutes notice) may be created before the continuation's reply.
+        // The turn-taking holds every response.create — a turn's ask, the
+        // fallback, the minutes notice — until this call's output is back
+        // (BargeIn header §7).
         dispatch(.toolStarted)
         Task { [weak self] in
             guard let self else { return }
+            // A failing tool returns its "error: …" line like any result: it
+            // goes back the same way and releases the hold the same way.
             let result = await self.runTool(name, argsJSON)
-            // Feed the tool result back; the reply after it is tool-backed only
-            // when the tool really changed something.
-            self.send(["type": "conversation.item.create",
-                       "item": ["type": "function_call_output", "call_id": callId, "output": result]])
-            self.withLock { self._guard.toolFinished(name, result: result) }
+            // Feed the result back; the reply after it is tool-backed only
+            // when the tool really changed something. Claimed and sent under
+            // the lock `.expireTools` takes: the call is either still ours —
+            // its output goes on the wire now, ahead of any continuation — or
+            // the clock already answered it, and this late result is dropped
+            // (a second output for one call_id is an error).
+            // A session already over (stopped, or its transport gone) takes
+            // no output and no continuation — and shows no "Thinking…".
+            let sent: Bool = self.withLock {
+                guard !self._stopped, !self._reportedError,
+                      self._runningCalls.removeValue(forKey: callId) != nil else { return false }
+                self.send(Self.toolOutputFrame(callId: callId, output: result))
+                self._guard.toolFinished(name, result: result)
+                return true
+            }
+            guard sent else {
+                voiceLog.notice("voice tool \(name, privacy: .public) returned after its timeout or the session's end — result dropped")
+                return
+            }
+            // The last output in and its reply done → ONE response.create
+            // (`.continueAfterTools`), from the controller.
             self.dispatch(.toolFinished)
-            self.scheduleContinue()
         }
     }
 
-    /// One coalesced response.create ~120ms after the last tool output.
-    private func scheduleContinue() {
-        withLock {
-            _continueTask?.cancel()
-            _continueTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 120_000_000)
-                guard !Task.isCancelled, let self else { return }
-                self.withLock { self._continueTask = nil }
-                self.send(["type": "response.create"])
-                self.dispatch(.clientCreate)
-            }
-        }
+    static func toolOutputFrame(callId: String, output: String) -> [String: Any] {
+        ["type": "conversation.item.create",
+         "item": ["type": "function_call_output", "call_id": callId, "output": output]]
     }
 
     /// The opening reply went missing once on the device (2026-09-20 00:04:

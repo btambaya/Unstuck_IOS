@@ -410,6 +410,29 @@ private func rejectPastTime(_ api: AssistantAppState, _ date: String, _ startTim
     rejectPastTime(blocks: api.getBlocks(), today: api.todayIso(), date: date, startTime: startTime, nowHM: api.nowHM())
 }
 
+/// 'H:MM' / 'HH:MM[:SS]' → 'HH:MM'; anything else (e.g. "10:30pm") → nil:
+/// never read as a time it might not be (web `hhmm`).
+private func hhmm(_ s: String) -> String? {
+    let parts = s.trimmingCharacters(in: .whitespaces).split(separator: ":", omittingEmptySubsequences: false)
+    guard parts.count == 2 || parts.count == 3 else { return nil }
+    if parts.count == 3, parts[2].count != 2 || !parts[2].allSatisfy(\.isASCII) || !parts[2].allSatisfy(\.isNumber) { return nil }
+    return normalizeClockTime("\(parts[0]):\(parts[1])")
+}
+
+/// The task's open (not done, not skipped) calendar slot at exactly this day
+/// and time, if it has one — the slot a schedule_task there would not change
+/// (web `liveBlockAt`). Never for a task parked in Later: every block write
+/// un-parks it, so "put it back on Thursday at 10:30" over the slot it kept
+/// in Later is a real change, not "already there".
+@MainActor
+private func liveBlockAt(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String) -> CalBlock? {
+    guard let at = hhmm(startTime), task.later != true else { return nil }
+    return api.getBlocks().first {
+        $0.taskId == task.id && isTaskBlock($0) && !$0.done && !$0.skipped
+            && $0.date == date && !$0.startTime.isEmpty && hhmm($0.startTime) == at
+    }
+}
+
 /// Place (or move) the anchor block for a task at date+time, materialising the
 /// recurrence horizon when the task repeats. Returns the time the block landed
 /// on (callers report it honestly), or nil when a repeating task's occurrence
@@ -684,6 +707,16 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         if let bad = rejectBadStartTime(args.str("startTime")) { return bad + " Nothing was scheduled." }
         let startTime = args.str("startTime").flatMap(normalizeClockTime)
         if let past = rejectPastDate(api, date) { return past }
+        // Already in that exact slot: nothing to move. create_task with a
+        // date and time, then schedule_task for the same day and time, is the
+        // model re-placing what create_task already placed (Zubair's call,
+        // 2026-09-24 07:02:03) — an ok that says nothing changed, with no
+        // second receipt, never a second block. It still anchors a
+        // set_task_recurrence after it, the way a placement would. As on web.
+        if let startTime, let same = liveBlockAt(api, t, date: date, startTime: startTime) {
+            scratch.placedBlocks[t.id] = same.id
+            return "ok: \"\(t.name)\" is already on \(date) at \(startTime)\(NOTHING_TO_CHANGE)"
+        }
         // A weekly series on a day it doesn't repeat on is almost always the
         // model's date maths ("Saturday" → 2026-09-20, a Sunday: James's park
         // run, 2026-09-13) — refused with the series' nearest days, nothing
@@ -791,7 +824,12 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // Weekly with no days used to save an EMPTY weekly series (never
         // materialised a single day) and report ok — refuse and ask instead.
         if kind == "weekly" && days.isEmpty { return "error: weekly needs daysOfWeek (0=Sunday … 6=Saturday) — ask which days" }
-        if kind == nil || kind == "none", t.recurrence == nil { return "error: \"\(t.name)\" doesn't repeat — nothing changed" }
+        // Stopping a repeat that isn't there: what the user asked for is
+        // already true, so it is a success that changed nothing. As an error
+        // the model told Zubair "It didn't change anything… doesn't actually
+        // have recurrence" right after he'd asked it to stop (iOS call,
+        // 2026-09-24 07:03:25). No receipt (NOTHING_TO_CHANGE). As on web.
+        if kind == nil || kind == "none", t.recurrence == nil { return "ok: \"\(t.name)\" already doesn't repeat\(NOTHING_TO_CHANGE)" }
         // The slot placed for it earlier THIS turn (create_task / schedule_task
         // with a date) on a day the new weekly days don't include: the park-run
         // variant — create_task on Sunday 20 Sep, then weekly on Saturday,

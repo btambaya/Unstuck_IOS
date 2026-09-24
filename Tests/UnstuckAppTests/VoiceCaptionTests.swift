@@ -1402,3 +1402,365 @@ final class VoiceMinutesTests: XCTestCase {
         XCTAssertFalse(VoiceMinutes.endedByMinutes(last: VoiceMinutes(remainingMs: 30_000, warn: true), elapsed: 19, anyReply: true))
     }
 }
+
+// MARK: - Tool calls hold every create (Zubair's morning call, 2026-09-24)
+//
+// assistant_turns, session 1cbfac75: 07:02:44.799 "No, just cancel the
+// recurring." / 48.034 "I'll just leave it in only for today." / 50.246
+// "…One moment." + set_task_recurrence {kind: none} / 50.252 its done /
+// 50.333 client response.create — BEFORE / 50.402 the tool's ok / 50.530 the
+// continuation's create, refused / "I tried to cancel the repeat, but it
+// didn't go through." Driven through the real client, the real frames.
+
+/// Every chunk the client enqueued for playback, by item id.
+private final class RecordingAudioIO: VoiceAudioIO, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _items: [String?] = []
+    var onGateChange: (@Sendable (_ open: Bool) -> Void)?
+    var onPlaybackDrained: (@Sendable () -> Void)?
+    var enqueued: [String?] { lock.withLock { _items } }
+    func startPlayback() {}
+    func startCapture(_ onFrame: @escaping @Sendable (Data) -> Void) {}
+    func enqueue(_ pcm: Data, itemId: String?) { lock.withLock { _items.append(itemId) } }
+    func playbackPosition() -> PlaybackPosition? { nil }
+    func flushPlayback() {}
+    func setPlaybackGain(_ gain: Float) {}
+    func setGateContext(_ ctx: GateContext) {}
+    func recalibrateGate() {}
+    func shutdown() {}
+}
+
+/// A tool that returns only when the test says so (or never).
+private final class HeldTool: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _result: String?
+    private var _calls: [String] = []
+    func release(_ result: String) { lock.withLock { _result = result } }
+    var calls: [String] { lock.withLock { _calls } }
+    func run(_ name: String) async -> String {
+        lock.withLock { _calls.append(name) }
+        while true {
+            if let r = lock.withLock({ _result }) { return r }
+            try? await Task.sleep(nanoseconds: 2_000_000)
+        }
+    }
+}
+
+private final class TestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _t: TimeInterval = 0
+    var t: TimeInterval {
+        get { lock.withLock { _t } }
+        set { lock.withLock { _t = newValue } }
+    }
+}
+
+private func frameJSON(_ obj: [String: Any]) -> String {
+    String(data: try! JSONSerialization.data(withJSONObject: obj), encoding: .utf8)!
+}
+
+final class VoiceToolHoldTests: XCTestCase {
+    private let wire = Wire(), clock = TestClock(), tool = HeldTool()
+
+    private func client() -> VoiceRealtimeClient {
+        let tool = self.tool, wire = self.wire, clock = self.clock
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: SilentAudioIO(),
+            runTool: { name, _ in await tool.run(name) },
+            onState: { wire.state($0) },
+            onCaption: { _, _, _ in },
+            onError: { wire.error($0) },
+            initialRoute: .lowEcho,   // a CallKit call on the receiver
+            routeProvider: { .lowEcho },
+            now: { clock.t })
+        c.sendOverride = { wire.sent($0) }
+        return c
+    }
+
+    private func at(_ t: TimeInterval, _ c: VoiceRealtimeClient, _ frames: String...) {
+        clock.t = t
+        for f in frames { c.handle(f) }
+    }
+    private func speechStarted(_ item: String) -> String { frameJSON(["type": "input_audio_buffer.speech_started", "item_id": item]) }
+    private var speechStopped: String { frameJSON(["type": "input_audio_buffer.speech_stopped"]) }
+    private func heard(_ item: String, _ t: String) -> String {
+        frameJSON(["type": "conversation.item.input_audio_transcription.completed", "item_id": item, "transcript": t])
+    }
+    private func created(_ id: String) -> String { frameJSON(["type": "response.created", "response": ["id": id]]) }
+    private func audio(_ r: String) -> String {
+        frameJSON(["type": "response.audio.delta", "response_id": r, "item_id": "msg_" + r, "delta": Data(count: 480).base64EncodedString()])
+    }
+    private func words(_ r: String, _ t: String) -> String {
+        frameJSON(["type": "response.audio_transcript.delta", "response_id": r, "item_id": "msg_" + r, "delta": t])
+    }
+    private func call(_ r: String, _ id: String, _ name: String, _ args: String) -> String {
+        frameJSON(["type": "response.function_call_arguments.done", "response_id": r, "call_id": id, "name": name, "arguments": args])
+    }
+    private func done(_ r: String) -> String { frameJSON(["type": "response.done", "response": ["id": r, "status": "completed"]]) }
+
+    private var creates: Int { wire.types.filter { $0 == "response.create" }.count }
+    /// Index of the function_call_output for `callId` among all frames sent.
+    private func outputIndex(_ callId: String) -> Int? {
+        wire.frames.firstIndex { f in
+            guard f["type"] as? String == "conversation.item.create", let item = f["item"] as? [String: Any] else { return false }
+            return item["type"] as? String == "function_call_output" && item["call_id"] as? String == callId
+        }
+    }
+    private func outputs(_ callId: String) -> [String] {
+        wire.frames.compactMap { f in
+            guard f["type"] as? String == "conversation.item.create", let item = f["item"] as? [String: Any],
+                  item["type"] as? String == "function_call_output", item["call_id"] as? String == callId else { return nil }
+            return item["output"] as? String
+        }
+    }
+    private func eventually(_ cond: () -> Bool) async -> Bool {
+        for _ in 0..<500 {
+            if cond() { return true }
+            try? await Task.sleep(nanoseconds: 4_000_000)
+        }
+        return cond()
+    }
+
+    func testZubairsMorningCall_theOutputIsOnTheWireBeforeTheOneCreate() async throws {
+        let c = client()
+        at(43, c, speechStarted("u1"))
+        at(44.5, c, speechStopped)
+        at(44.8, c, heard("u1", "No, just cancel the recurring."))
+        at(45.2, c, speechStarted("u2"))
+        at(47.4, c, speechStopped)
+        clock.t = 47.9; c.timerFired()
+        XCTAssertEqual(creates, 1, "turn 1 is asked for")
+        at(48.03, c, heard("u2", "I'll just leave it in only for today."))
+        at(48.16, c, created("r6"))
+        at(49, c, words("r6", "Okay, we'll stop it from repeating going forward. One moment."), audio("r6"))
+        at(50.246, c, call("r6", "call_RF", "set_task_recurrence", #"{"kind":"none","taskId":"68fa7c0b"}"#))
+        at(50.252, c, done("r6"))
+        XCTAssertEqual(creates, 1, "THE BUG: turn 2 was asked for here, before the tool's output")
+        clock.t = 50.3; c.timerFired()
+        clock.t = 50.53; c.timerFired()
+        XCTAssertEqual(creates, 1, "nor by a timer")
+        XCTAssertFalse(wire.frames.contains { ($0["item"] as? [String: Any])?["role"] as? String == "user" }, "nor a corrective")
+        clock.t = 50.402
+        tool.release("ok: \"Office Focus\" no longer repeats (future occurrences removed)")
+        let sent = await eventually { self.creates == 2 }
+        XCTAssertTrue(sent, "the continuation goes once the output is back")
+        // Unwrapped, not forced: with the hold removed the create goes at the
+        // done, before any output — that must FAIL here, not crash the run.
+        let output = try XCTUnwrap(outputIndex("call_RF"), "the tool's output never went back")
+        let lastCreate = try XCTUnwrap(wire.types.lastIndex(of: "response.create"))
+        XCTAssertLessThan(output, lastCreate, "the output is on the wire before the one create")
+        at(50.448, c, created("r7"))
+        for t in [50.53, 51.0, 53.0] { clock.t = t; c.timerFired() }
+        XCTAssertEqual(creates, 2, "one create answered the output and turn 2 — no refused second create")
+        XCTAssertTrue(wire.errors.isEmpty, "\(wire.errors)")
+    }
+
+    func testAFailingToolStillSendsItsErrorOutputAndReleasesTheHold() async throws {
+        let c = client()
+        at(1, c, created("r1"), words("r1", "One moment."), audio("r1"))
+        at(1.5, c, call("r1", "call_A", "schedule_task", #"{"taskId":"x","date":"2026-09-24"}"#))
+        at(1.6, c, done("r1"))
+        XCTAssertEqual(creates, 0)
+        tool.release("error: couldn't save that change to \"Office Focus\" — nothing changed; try again")
+        let sent = await eventually { self.creates == 1 }
+        XCTAssertTrue(sent)
+        XCTAssertEqual(outputs("call_A"), ["error: couldn't save that change to \"Office Focus\" — nothing changed; try again"])
+        XCTAssertLessThan(try XCTUnwrap(outputIndex("call_A")), try XCTUnwrap(wire.types.lastIndex(of: "response.create")))
+    }
+
+    func testAStuckToolIsAnsweredWithAnErrorAfterTenSeconds_andItsLateResultIsDropped() async throws {
+        let c = client()
+        at(100, c, created("r1"), words("r1", "One moment."), audio("r1"))
+        at(100.2, c, call("r1", "call_S", "request_call", #"{"when":"2026-09-24 12:00"}"#))
+        at(100.3, c, done("r1"))
+        clock.t = 105; c.timerFired()
+        clock.t = 110.1; c.timerFired()
+        XCTAssertEqual(creates, 0, "not before the clock runs out")
+        clock.t = 110.2; c.timerFired()
+        XCTAssertEqual(outputs("call_S"), [VoiceRealtimeClient.toolTimeoutOutput])
+        XCTAssertEqual(creates, 1)
+        XCTAssertLessThan(try XCTUnwrap(outputIndex("call_S"), "no timeout output"), try XCTUnwrap(wire.types.lastIndex(of: "response.create")),
+                          "its error output, then the create")
+        XCTAssertTrue(VoiceRealtimeClient.toolTimeoutOutput.hasPrefix("error: "))
+        // It returns at last: dropped — one output per call, no second create.
+        tool.release("ok: call booked")
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(outputs("call_S"), [VoiceRealtimeClient.toolTimeoutOutput])
+        XCTAssertEqual(creates, 1)
+    }
+
+    func testAToolThatReturnsAfterTheSessionEndedSendsNothing() async {
+        let c = client()
+        at(1, c, created("r1"), words("r1", "One moment."), audio("r1"))
+        at(1.5, c, call("r1", "call_L", "create_task", #"{"name":"x"}"#))
+        at(1.6, c, done("r1"))
+        c.stop()
+        let statesAtStop = wire.states.count
+        tool.release("ok: created task id=1 name=\"x\"")
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(outputs("call_L"), [], "no output on a closed session")
+        XCTAssertEqual(creates, 0)
+        XCTAssertEqual(wire.states.count, statesAtStop, "nor a \"Thinking…\" over the closed screen")
+        XCTAssertEqual(wire.states.last, .closed)
+    }
+
+    func testNoCorrectiveWhileTheRepliesOutputsAreOwed() async {
+        // The claim alone gets its corrective (so the words below ARE a claim)…
+        let claim = "I've added it to your list."
+        let plain = client()
+        at(1, plain, created("r0"), words("r0", claim))
+        at(2, plain, done("r0"))
+        let correctives = { self.wire.frames.filter { (($0["item"] as? [String: Any])?["content"] as? [[String: Any]])?.first?["text"] as? String == VoiceIntegrityGuard.correctiveText }.count }
+        XCTAssertEqual(correctives(), 1)
+        XCTAssertEqual(creates, 1)
+        // …but not while the tool the reply called (a read) is still out:
+        // its create would race the output.
+        let c = client()
+        at(3, c, created("r1"), words("r1", claim))
+        at(3.2, c, call("r1", "call_R", "get_tasks", #"{"view":"today"}"#))
+        at(3.3, c, done("r1"))
+        XCTAssertEqual(correctives(), 1, "no second corrective")
+        XCTAssertEqual(creates, 1)
+        tool.release("ok: Today (1): Office Focus")
+        let sent = await eventually { self.creates == 2 }
+        XCTAssertTrue(sent, "the continuation, once")
+        XCTAssertEqual(correctives(), 1)
+    }
+}
+
+// MARK: - A reply that repeats one of its own items is played once
+//
+// Zubair's morning call, 2026-09-24 07:01:12–13: "Morning. Want to walk
+// through today?" logged twice for ONE response (resp_ERXk8Xi1GBuwigPa4eTkk,
+// 96 output audio tokens where the line takes ~48) — the model said it as
+// two message items. The phone plays the first, drops the repeat, and takes
+// it out of the conversation.
+
+final class VoiceRepeatedSpeechTests: XCTestCase {
+    private func client(_ io: RecordingAudioIO, _ wire: Wire, _ sink: CaptionSink) -> VoiceRealtimeClient {
+        let c = VoiceRealtimeClient(
+            proxyURL: "wss://example.invalid/v", token: "t", model: "m",
+            instructions: "i", opening: "o", tools: [], audio: io,
+            runTool: { _, _ in "ok" },
+            onState: { _ in },
+            onCaption: { role, text, done in sink.apply(role, text, done) },
+            onError: { wire.error($0) },
+            initialRoute: .lowEcho,
+            routeProvider: { .lowEcho },
+            now: { 0 })
+        c.sendOverride = { wire.sent($0) }
+        return c
+    }
+    private func audio(_ r: String, _ item: String) -> String {
+        frameJSON(["type": "response.audio.delta", "response_id": r, "item_id": item, "delta": Data(count: 480).base64EncodedString()])
+    }
+    private func words(_ r: String, _ item: String, _ t: String) -> String {
+        frameJSON(["type": "response.audio_transcript.delta", "response_id": r, "item_id": item, "delta": t])
+    }
+    private func said(_ r: String, _ item: String, _ t: String) -> String {
+        frameJSON(["type": "response.audio_transcript.done", "response_id": r, "item_id": item, "transcript": t])
+    }
+    private func assistantText(_ sink: CaptionSink) -> String {
+        sink.calls.filter { $0.role == "assistant" }.map(\.text).joined()
+    }
+    private func deletes(_ wire: Wire) -> [[String: Any]] {
+        wire.frames.filter { $0["type"] as? String == "conversation.item.delete" && $0["item_id"] as? String != VoiceRealtimeClient.primerItemId }
+    }
+
+    func testZubairsOpeningSaidTwiceInOneReplyIsHeardOnce_andTheRepeatLeavesTheConversation() {
+        let io = RecordingAudioIO(), wire = Wire(), sink = CaptionSink()
+        let c = client(io, wire, sink)
+        let line = "Morning. Want to walk through today?"
+        c.handle(frameJSON(["type": "response.created", "response": ["id": "r0"]]))
+        c.handle(words("r0", "A", line))
+        c.handle(audio("r0", "A")); c.handle(audio("r0", "A"))
+        c.handle(said("r0", "A", line))
+        c.handle(audio("r0", "B"))                       // the repeat's audio before its words
+        c.handle(words("r0", "B", "Morning. Want to wa"))
+        c.handle(audio("r0", "B"))
+        c.handle(words("r0", "B", "lk through today?"))
+        c.handle(audio("r0", "B"))
+        c.handle(said("r0", "B", line))
+        c.handle(frameJSON(["type": "response.done", "response": ["id": "r0", "status": "completed"]]))
+        XCTAssertEqual(io.enqueued, ["A", "A"], "the repeat is never played")
+        XCTAssertEqual(assistantText(sink), line, "nor captioned")
+        let d = deletes(wire)
+        XCTAssertEqual(d.count, 1)
+        XCTAssertEqual(d.first?["item_id"] as? String, "B")
+        XCTAssertEqual((d.first?["event_id"] as? String)?.hasPrefix(VoiceRealtimeClient.repeatDeleteEventPrefix), true)
+        // Its refusal is best effort, never a broken session.
+        c.handle(frameJSON(["type": "error", "error": ["message": "Item not found", "event_id": d.first?["event_id"] as? String ?? ""]]))
+        XCTAssertTrue(wire.errors.isEmpty, "\(wire.errors)")
+        XCTAssertFalse(wire.states.contains(.error))
+    }
+
+    func testALeadInThenTheAnswerBothPlay_theAnswerHeldOnlyUntilItsFirstWord() {
+        let io = RecordingAudioIO(), wire = Wire(), sink = CaptionSink()
+        let c = client(io, wire, sink)
+        c.handle(frameJSON(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(words("r1", "A", "Okay, let me think through where that focus fits."))
+        c.handle(audio("r1", "A"))
+        c.handle(audio("r1", "B"))                       // held: no words yet
+        XCTAssertEqual(io.enqueued, ["A"])
+        c.handle(words("r1", "B", "Focus — nice. I can add an Office Focus event."))
+        XCTAssertEqual(io.enqueued, ["A", "B"], "its first word is new: what was held plays at once")
+        c.handle(audio("r1", "B"))
+        c.handle(frameJSON(["type": "response.done", "response": ["id": "r1", "status": "completed"]]))
+        XCTAssertEqual(io.enqueued, ["A", "B", "B"])
+        XCTAssertTrue(assistantText(sink).contains("Focus — nice."))
+        XCTAssertTrue(deletes(wire).isEmpty)
+    }
+
+    func testAnItemThatStartsLikeAnEarlierOneButSaysMoreIsPlayedWhole() {
+        let io = RecordingAudioIO(), wire = Wire(), sink = CaptionSink()
+        let c = client(io, wire, sink)
+        c.handle(frameJSON(["type": "response.created", "response": ["id": "r1"]]))
+        c.handle(words("r1", "A", "Okay."))
+        c.handle(audio("r1", "A"))
+        c.handle(said("r1", "A", "Okay."))
+        c.handle(words("r1", "B", "Okay."))
+        c.handle(audio("r1", "B"))
+        XCTAssertEqual(io.enqueued, ["A"], "so far a repeat")
+        c.handle(words("r1", "B", " Office Focus is at half ten."))
+        XCTAssertEqual(io.enqueued, ["A", "B"], "then more than the earlier one said: all of it plays")
+        c.handle(frameJSON(["type": "response.done", "response": ["id": "r1", "status": "completed"]]))
+        XCTAssertTrue(deletes(wire).isEmpty)
+        XCTAssertTrue(assistantText(sink).hasSuffix("Okay. Office Focus is at half ten."))
+    }
+
+    // The filter itself.
+
+    func testTheFilterWaitsOnACutWordAndPlaysWhatDiverges() {
+        var f = RepeatedSpeechFilter()
+        f.begin(responseId: "r")
+        XCTAssertEqual(f.transcript("Morning. Want to walk through today?", itemId: "A", responseId: "r").caption, "Morning. Want to walk through today?")
+        XCTAssertEqual(f.audio(Data([1]), itemId: "B", responseId: "r"), .init())
+        XCTAssertEqual(f.transcript("Morning. Want to wa", itemId: "B", responseId: "r"), .init(), "\"wa\" may be \"walk\"")
+        let out = f.transcript("nder", itemId: "B", responseId: "r")
+        XCTAssertEqual(out.caption, "Morning. Want to wander")
+        XCTAssertEqual(out.audio, [Data([1])])
+        XCTAssertEqual(f.fate(of: "B"), .play)
+        // Another reply's tail, and a backend with no item ids, pass straight through.
+        XCTAssertEqual(f.audio(Data([2]), itemId: "Z", responseId: "older").audio, [Data([2])])
+        XCTAssertEqual(f.audio(Data([3]), itemId: nil, responseId: "r").audio, [Data([3])])
+        XCTAssertNil(f.fate(of: "Z"))
+    }
+
+    func testTheFilterPlaysAnUndecidedItemAtTheDone_andDropsOnlyWholeRepeats() {
+        var f = RepeatedSpeechFilter()
+        f.begin(responseId: "r")
+        _ = f.transcript("Got it.", itemId: "A", responseId: "r")
+        _ = f.audio(Data([1]), itemId: "B", responseId: "r")   // never any words
+        let (releases, dropped) = f.finish(responseId: "r")
+        XCTAssertEqual(releases.flatMap(\.audio), [Data([1])], "never drop what can't be shown to repeat")
+        XCTAssertEqual(dropped, [])
+        f.begin(responseId: "s")
+        _ = f.transcript("One moment.", itemId: "A", responseId: "s")
+        _ = f.transcript("One moment.", itemId: "B", responseId: "s")
+        _ = f.transcriptDone(itemId: "B", responseId: "s")
+        XCTAssertEqual(f.fate(of: "B"), .drop)
+        XCTAssertEqual(f.finish(responseId: "other").dropped, [], "another reply's late done finishes nothing")
+        XCTAssertEqual(f.finish(responseId: "s").dropped, ["B"])
+    }
+}
