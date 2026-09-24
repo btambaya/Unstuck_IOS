@@ -86,8 +86,18 @@ struct TaskEditor: View {
             .sorted { ($0.date, $0.startTime) < ($1.date, $1.startTime) }
     }
     private var scheduleText: String {
-        if editTarget.later == true { return "Later" }
-        if let b = myBlocks.first { return "\(b.date.suffix(5)) \(ClockFormat.device.time(b.startTime))" }
+        Self.scheduleLabel(later: editTarget.later == true, occurrence: occBlock,
+                           blocks: myBlocks, clock: .device)
+    }
+    /// The Schedule cell. On ONE DAY of a repeating task (an occurrence row,
+    /// opened from Today or the calendar) it reads that day's own block: the
+    /// series' blocks are sorted oldest first, so `blocks.first` showed
+    /// yesterday's "09-23 17:00" on today's 09-24 occurrence. A plain task, or
+    /// the series itself, keeps reading its first block.
+    nonisolated static func scheduleLabel(later: Bool, occurrence: CalBlock?,
+                                          blocks: [CalBlock], clock: ClockFormat) -> String {
+        if later { return "Later" }
+        if let b = occurrence ?? blocks.first { return "\(b.date.suffix(5)) \(clock.time(b.startTime))" }
         return "Unscheduled"
     }
     private var statusText: String {

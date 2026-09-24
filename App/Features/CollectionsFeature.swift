@@ -248,7 +248,7 @@ struct ListsView: View {
                 }
             }
             .padding(.horizontal, 18)
-            .padding(.bottom, 96)   // clear the floating bottom nav
+            .padding(.bottom, BottomNavBar.clearance)   // clear the bottom nav
         }
     }
 
@@ -610,7 +610,7 @@ struct CollectionDetailView: View {
                             .onAppear { addFocused = true }
                         }
                     }
-                    .padding(.horizontal, 18).padding(.bottom, 96)
+                    .padding(.horizontal, 18).padding(.bottom, BottomNavBar.clearance)
                 }
                 // Breathing room under a focused field. The ScrollView parks a
                 // focused text field flush on the keyboard — the TEXT, not its
@@ -618,7 +618,7 @@ struct CollectionDetailView: View {
                 // add pill half its height under the keyboard. A bottom safe-area
                 // margin is honoured by that scroll, so the whole card lands
                 // just above the keyboard. (No keyboard: 20 pt more scroll room
-                // under the 96 that clears the nav — nothing visible moves.)
+                // under the clearance that clears the nav — nothing visible moves.)
                 .safeAreaPadding(.bottom, 20)
                 // The + on this screen = "put the cursor in the ONE add field".
                 .onChange(of: model.router.collectionFabRequest) { _, req in

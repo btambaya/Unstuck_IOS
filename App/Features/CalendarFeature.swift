@@ -187,8 +187,9 @@ struct CalendarView: View {
                          prefillDate: at.date, prefillTime: at.time)
         }
         // The assistant ✦ launcher, like every other tab. The grids pad their
-        // content 96pt at the bottom (and the Day tray's chip row scrolls past
-        // it) so it never covers the last hour rows or a drop target.
+        // content BottomNavBar.clearance at the bottom (the launcher's own
+        // offset), and the Day tray's chip row scrolls past it, so it never
+        // covers the last hour rows or a drop target.
         .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
@@ -524,7 +525,7 @@ private struct WeekView: View {
                 Color.clear.frame(height: 16)
                 }
                 .padding(.horizontal, 18)
-                .padding(.bottom, 96)
+                .padding(.bottom, BottomNavBar.clearance)
             }
         }
         // Tap a task block → mark done / focus / open, reschedule / resize /
@@ -779,13 +780,13 @@ private struct MonthView: View {
                         }
                     }
 
-                    // Clear the floating bottom nav (96pt, like every tab) AND the
-                    // assistant launcher docked above it (46pt + a gap), so the last
+                    // Clear the bottom nav (BottomNavBar.clearance, like every tab)
+                    // AND the assistant launcher docked above it (46pt + a gap), so the last
                     // week's Sat/Sun cells scroll fully out from under both.
                     Color.clear.frame(height: 56)
                 }
                 .padding(.horizontal, 18)
-                .padding(.bottom, 96)
+                .padding(.bottom, BottomNavBar.clearance)
             }
         }
         // Tap a day → everything on it; a row then opens the task (mine) or
@@ -1027,7 +1028,7 @@ struct DayGridView: View {
                 .padding(.leading, 12).padding(.trailing, 76).padding(.bottom, 12)
             }
         }
-        .padding(.bottom, 84)   // clear the floating bottom nav
+        .padding(.bottom, BottomNavBar.clearance)   // clear the bottom nav
     }
 
     private func grid(width: CGFloat) -> some View {

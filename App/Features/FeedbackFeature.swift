@@ -49,10 +49,11 @@ struct AssistantLauncherModifier: ViewModifier {
                     // Tour anchor: the assistant/re-entry steps ring this launcher.
                     .tourTarget(.assistantLaunch)
                     .padding(.trailing, 16)
-                    // Clear the floating bottom nav (~84pt incl. the safe area) so
-                    // the launcher isn't occluded by / mis-tapped into the
-                    // Collections tab beneath it. Content already pads 96pt here.
-                    .padding(.bottom, 96)
+                    // Clear the bottom nav so the launcher isn't occluded by /
+                    // mis-tapped into the Collections tab beneath it. The SAME
+                    // clearance every tab root pads its content by, so the two
+                    // move together.
+                    .padding(.bottom, BottomNavBar.clearance)
             }
         }
     }

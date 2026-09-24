@@ -314,7 +314,7 @@ struct TodayView: View {
                     ProgressView().frame(maxWidth: .infinity).padding(.top, 60)
                 }
             }
-            .padding(.bottom, 96)   // clear the floating bottom nav
+            .padding(.bottom, BottomNavBar.clearance)   // clear the bottom nav
             }
         }
         .background(theme.palette.bg.ignoresSafeArea())

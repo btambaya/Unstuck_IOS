@@ -268,6 +268,41 @@ final class RepeatingFocusPriorTests: XCTestCase {
         XCTAssertEqual(TaskEditor.statusLabel(done: false, isOccurrence: false, focusedSec: 0), "Not started")
         XCTAssertEqual(TaskEditor.statusLabel(done: true, isOccurrence: false, focusedSec: 600), "Completed")
     }
+
+    /// The task sheet's Schedule on a day of a repeating task: the series'
+    /// blocks sort oldest first, so it read yesterday's block ("09-23 17:00")
+    /// on today's 09-24 occurrence. It reads the occurrence's own day/time.
+    func testTheTaskSheetShowsARepeatingDaysOwnScheduleNotTheSeriesOldest() {
+        let tpl = series()
+        func block(_ id: String, _ date: String, _ time: String) -> CalBlock {
+            CalBlock(id: id, taskId: tpl.id, taskName: tpl.name, startTime: time,
+                     durationMinutes: 25, date: date, kind: .task)
+        }
+        let past = block("occ-0923", "2026-09-23", "17:00")
+        let today = block("occ-0924", "2026-09-24", "09:30")
+        let tomorrow = block("occ-0925", "2026-09-25", "09:30")
+        let all = [past, today, tomorrow]
+        XCTAssertEqual(TaskEditor.scheduleLabel(later: false, occurrence: today, blocks: all, clock: .h24),
+                       "09-24 09:30", "the day opened, not the series' oldest block")
+        XCTAssertEqual(TaskEditor.scheduleLabel(later: false, occurrence: tomorrow, blocks: all, clock: .h12),
+                       "09-25 9:30 AM")
+        // A plain task (no occurrence) keeps its first block; Later and no
+        // block read as before.
+        XCTAssertEqual(TaskEditor.scheduleLabel(later: false, occurrence: nil, blocks: all, clock: .h24),
+                       "09-23 17:00")
+        XCTAssertEqual(TaskEditor.scheduleLabel(later: true, occurrence: nil, blocks: all, clock: .h24), "Later")
+        XCTAssertEqual(TaskEditor.scheduleLabel(later: false, occurrence: nil, blocks: [], clock: .h24), "Unscheduled")
+    }
+
+    /// VoiceOver on the notification centre: a `collection_share` is also a
+    /// shared list's update / "finished" / late-item nudge, so it must not be
+    /// announced as a new share — the card reads "Shared list: <title>".
+    func testASharedListNotificationIsNotAnnouncedAsANewShare() {
+        XCTAssertEqual(notificationKindLabel("collection_share"), "Shared list")
+        XCTAssertFalse(notificationKindLabel("collection_share").localizedCaseInsensitiveContains("shared with you"))
+        XCTAssertEqual(notificationKindLabel("task_share"), "Shared with you")
+        XCTAssertEqual(notificationKindLabel("something_new"), "Notification")
+    }
 }
 
 final class SharedFocusLedgerParkingTests: XCTestCase {
