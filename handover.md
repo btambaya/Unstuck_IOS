@@ -86,14 +86,21 @@ ink3, the voice orb coral). The palette tokens themselves are untouched — only
 - **Left as they are (not accents)**: the life-area / collection colour token "indigo" (a user-picked category colour,
   shared with web + Android, still the default for a new area/collection — the Work area dot, Insights "When focus
   happens" bars); the Focus room's deep-indigo radial background (FocusFeature + TourDemoFocus bgTop OKLCH 0.30/0.10/280 —
-  a designed surface); the tour Ask answer bubble (fixed OKLCH 0.93/0.04/280, web parity); the tour scrim (20,18,40).
+  a designed surface); the tour scrim (20,18,40). (The tour Ask answer bubble WAS on this list — a fixed OKLCH
+  0.93/0.04/280, i.e. `primarySoft` by value; the review moved it to the neutral 0.93/0.005/280, same lightness, still
+  fixed-light in both schemes. The web's tour-panel.tsx still has the lavender — port with the web sweep.)
   The widget has no switches and no palette colours; its Done/Start buttons use the system accent (blue — the widget
   target has no AccentColor). Change any of these only with a screenshot to Ahmad first.
 - **Evidence**: `ColourShots` (in UITests/HomeShots.swift — no new files) walks Today, Tasks (+ tag filter, Later), the
   editor, Calendar week/month, Insights (+ deep dive), Captures, Settings (N&C, A&P, People), Talk (+ hold on), Focus
   options, the tour (welcome + a spotlit step) and the signed-out auth screen, light AND dark, and ASSERTS each ON switch
   it meets is coral by sampling the track's pixels (AI data sharing, the Calls switch, hold-to-talk, Focus options).
-  Output: `COLOUR_SHOTS_DIR` env, else /tmp/unstuck-colour-shots.
+  Output: `COLOUR_SHOTS_DIR` env, else /tmp/unstuck-colour-shots. Review pass added `testColourListsNewTaskAppearance`
+  (shared lists via the new `UITEST_SHARED_LIST=1` demo seed — "SHARED" card label + "Shared with 2" / "Shared with
+  you · you can edit"; New task's "Ends on a date" switch, ASSERTED coral; Appearance) and `testColourTourAsk` (dark
+  welcome + the Ask answer bubble, ASSERTED neutral not lavender). `launchToToday` declines a tour welcome another run
+  left armed on a shared sim, and `dismissSheet` drags from the sheet's own header (the fixed 6% point missed on
+  iPhone 17). Also fixed in review: New task's toggle had `.unstuckSwitch()` twice.
 
 ## Slim Settings (branch settings/ios, 2026-09-24) — not shipped yet
 

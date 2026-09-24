@@ -50,8 +50,11 @@ struct TourPanel: View {
     @State private var askHeight: CGFloat = 0
     @FocusState private var askFocused: Bool
 
-    /// FIXED answer-bubble colors (web: oklch(0.93 0.04 280) / oklch(0.25 0.02 280)).
-    private static let answerBg = OKLCH(0.93, 0.04, 280).color
+    /// FIXED answer-bubble colors (light in both schemes, as on the web). The
+    /// fill was the pale indigo oklch(0.93 0.04 280) — the `primarySoft` tint
+    /// by value — until the colour sweep (Ahmad, 2026-09-24: no indigo
+    /// accents); it keeps its lightness with the neutral `line` chroma.
+    private static let answerBg = OKLCH(0.93, 0.005, 280).color
     private static let answerInk = OKLCH(0.25, 0.02, 280).color
     private static let thinkingInk = OKLCH(0.42, 0.02, 280).color
 

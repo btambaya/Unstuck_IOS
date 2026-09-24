@@ -544,7 +544,7 @@ struct NewTaskSheet: View {
                 if everyWeeks >= 2 { startsRow }
             }
             if repeatKind != .none {
-                Toggle("Ends on a date", isOn: $untilOn).font(UFont.sans(14)).unstuckSwitch().unstuckSwitch()
+                Toggle("Ends on a date", isOn: $untilOn).font(UFont.sans(14)).unstuckSwitch()
                 if untilOn { DatePicker("Until", selection: $until, in: Date()..., displayedComponents: .date).font(UFont.sans(14)) }
             }
         }

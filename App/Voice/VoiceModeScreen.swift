@@ -423,12 +423,10 @@ struct VoiceModeScreen: View {
         // is a no-op while we're merely listening, so it is disabled then.
         let live = session.isLive && session.state != .connecting
         let canInterrupt = session.canInterrupt
-        let orbColor: Color
-        switch session.state {
-        case .speaking: orbColor = theme.palette.coral
-        case .thinking: orbColor = theme.palette.amber
-        default: orbColor = theme.palette.coral
-        }
+        // Coral in every state (listening, speaking, connecting, error) —
+        // Ahmad, 2026-09-24: the voice orb is coral, never the old indigo —
+        // except thinking, which keeps its amber.
+        let orbColor: Color = session.state == .thinking ? theme.palette.amber : theme.palette.coral
         return VStack(spacing: 24) {
             PulsingOrb(active: live,
                        color: orbColor,

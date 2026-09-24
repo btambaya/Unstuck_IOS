@@ -99,6 +99,18 @@ enum DemoSeed {
                                         CollectionItem(id: "b1", body: "Four Thousand Weeks", pinned: true, at: now),
                                         CollectionItem(id: "b2", body: "Deep Work", at: now),
                                     ], sortOrder: 1, archived: false))
+        // UITEST_SHARED_LIST: one list of mine shared with two people and one
+        // someone shared with me, so the card's "SHARED" label and the detail's
+        // "Shared with …" line render (colour-sweep screenshots, 2026-09-24).
+        if ProcessInfo.processInfo.environment["UITEST_SHARED_LIST"] == "1" {
+            try? db.save(ItemCollection(id: "col-trip", name: "Trip plans", color: "green", subtitle: nil,
+                                        items: [CollectionItem(id: "tr1", body: "Book the train", at: now)],
+                                        sortOrder: 2, members: ["u-sam", "u-lee"], archived: false))
+            try? db.save(ItemCollection(id: "col-team", name: "Team reading", color: "amber", subtitle: nil,
+                                        items: [CollectionItem(id: "tm1", body: "Shape Up", at: now)],
+                                        sortOrder: 3, ownerId: "u-sam", members: ["ui-test"], myRole: "editor",
+                                        archived: false))
+        }
     }
 }
 

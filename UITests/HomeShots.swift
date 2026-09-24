@@ -353,6 +353,12 @@ final class ColourShots: XCTestCase {
 
     private func launchToToday() {
         app.launch()
+        // A tour welcome an earlier run left armed on this simulator sits over
+        // Today (seen on a shared slot, 2026-09-24); decline it — declined, it
+        // stays hidden on every later boot.
+        if app.staticTexts["Welcome to Unstuck"].firstMatch.waitForExistence(timeout: 5) {
+            app.buttons["Not now"].firstMatch.tap(); usleep(900_000)
+        }
         XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 15),
                       "the demo boot never reached Today")
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
@@ -384,8 +390,12 @@ final class ColourShots: XCTestCase {
     /// Pull a sheet (no Done button) down by its grabber area.
     private func dismissSheet(_ title: String) {
         for _ in 0..<3 where app.navigationBars[title].exists {
-            let top = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.06))
-            top.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.98)))
+            // Grab the sheet by its own header (a fixed 6% point sits in the
+            // status bar on some phones and the drag never reached the sheet).
+            let bar = app.navigationBars[title].firstMatch
+            let from = bar.isHittable ? bar.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+                                      : app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.06))
+            from.press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.98)))
             usleep(1_000_000)
         }
         XCTAssertFalse(app.navigationBars[title].exists, "the \(title) sheet did not close")
@@ -608,6 +618,91 @@ final class ColourShots: XCTestCase {
         for mode in ["light", "dark"] {
             setMode(mode)
             save("\(mode)-23-auth")
+        }
+    }
+
+    // Reviewer pass (2026-09-24): the screens the first pass never reached.
+
+    /// Shared lists (UITEST_SHARED_LIST seeds one of mine shared with two
+    /// people and one shared with me), New task's "Ends on a date" switch (it
+    /// had no tint — the system green) and Appearance, in light and dark.
+    func testColourListsNewTaskAppearance() throws {
+        app.launchEnvironment["UITEST_SHARED_LIST"] = "1"
+        launchToToday()
+        for mode in ["light", "dark"] {
+            setMode(mode)
+            tapNav("Collections")
+            expect(app.staticTexts["Trip plans"].firstMatch, "the seeded shared list is missing")
+            save("\(mode)-24-collections-shared")
+            for (name, shot) in [("Trip plans", "25-collection-shared-mine"),
+                                 ("Team reading", "26-collection-shared-with-me")] {
+                guard let card = hittable(app.buttons.matching(NSPredicate(format: "label CONTAINS %@", name)))
+                        ?? hittable(app.staticTexts.matching(NSPredicate(format: "label == %@", name))) else {
+                    XCTFail("\(mode): no card for \(name)"); continue
+                }
+                card.tap()
+                expect(app.staticTexts.matching(NSPredicate(format: "label BEGINSWITH 'Shared with'")).firstMatch,
+                       "\(mode) \(name): no 'Shared with' line")
+                save("\(mode)-\(shot)")
+                back()
+            }
+
+            tapNav("Today")
+            app.buttons["New task"].firstMatch.tap()
+            expect(app.staticTexts["What's on your mind?"].firstMatch, "New task did not open")
+            let more = app.buttons.matching(NSPredicate(format: "label CONTAINS 'More options'")).firstMatch
+            expect(more, "New task has no More options")
+            more.tap(); usleep(700_000)
+            app.swipeUp(); usleep(600_000)
+            let daily = app.segmentedControls.buttons["Daily"].firstMatch
+            expect(daily, "New task has no Repeat · Daily segment")
+            daily.tap(); usleep(700_000)
+            app.swipeUp(); usleep(600_000)
+            let ends = app.switches["Ends on a date"].firstMatch
+            expect(ends, "no 'Ends on a date' switch after picking Daily")
+            ends.coordinate(withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)).tap(); usleep(900_000)
+            save("\(mode)-27-new-task-ends-on")
+            assertCoralSwitch(ends, "\(mode) New task · Ends on a date")
+            app.navigationBars.buttons["Close"].firstMatch.tap(); usleep(900_000)
+
+            app.buttons["Account and settings"].firstMatch.tap()
+            expect(row("appearance"), "Settings did not open")
+            row("appearance").tap()
+            expect(app.staticTexts["How it looks."].firstMatch, "Appearance did not open")
+            save("\(mode)-28-settings-appearance")
+            back()
+            app.buttons["Done"].firstMatch.tap(); usleep(900_000)
+        }
+    }
+
+    /// The tour's Ask answer bubble — it was a fixed pale indigo (the
+    /// `primarySoft` value) — plus the welcome card in dark.
+    func testColourTourAsk() throws {
+        app.launchEnvironment["UITEST_TOUR"] = "1"
+        setMode("dark")
+        app.launch()
+        expect(app.staticTexts["Welcome to Unstuck"].firstMatch, "the tour welcome never showed", timeout: 20)
+        save("dark-21-tour-welcome")
+        app.staticTexts["Essential tour"].firstMatch.tap()
+        expect(app.staticTexts["This is Unstuck"].firstMatch, "the first tour step never showed", timeout: 12)
+        usleep(900_000)
+        app.buttons["Ask a question"].firstMatch.tap()
+        let askField = app.textFields.firstMatch
+        expect(askField, "expected the tour's ask input", timeout: 6)
+        askField.tap()
+        askField.typeText("usable time")
+        app.buttons["Send question"].firstMatch.tap()
+        let answer = app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'focus time you realistically have'")).firstMatch
+        expect(answer, "the canned tour answer never landed", timeout: 10)
+        for mode in ["dark", "light"] {
+            setMode(mode)
+            save("\(mode)-29-tour-ask-answer")
+            // The bubble behind the answer text: the neutral fill, never the
+            // old lavender (226,230,255).
+            let neutral = share(of: answer, near: (231, 231, 235), tol: 6)
+            let lavender = share(of: answer, near: (226, 230, 255), tol: 6)
+            XCTAssertGreaterThan(neutral, 0.3, "\(mode): the answer bubble is not the neutral fill (\(neutral))")
+            XCTAssertLessThan(lavender, 0.02, "\(mode): the answer bubble is still indigo-tinted (\(lavender))")
         }
     }
 }
