@@ -910,3 +910,81 @@ public func weekFocusMin(sessions: [Session], now: Date) -> (thisWeek: Int, last
     let last = resolveInsightsPeriod(.week, offset: 1, now: now, earliest: nil)
     return (periodFacts(data, p.window).focusMin, periodFacts(data, last.window).focusMin)
 }
+
+// MARK: - The Today week pill: ALWAYS shown, the way into Insights from home
+
+/// One run of the pill's text; `strong` runs are the emphasised value (ink,
+/// semibold), the rest the quiet lead (ink2).
+public struct WeekPillRun: Equatable, Sendable {
+    public let text: String
+    public let strong: Bool
+    public init(_ text: String, strong: Bool = false) {
+        self.text = text
+        self.strong = strong
+    }
+}
+
+/// What the Today header's week pill says and which Insights week it opens.
+/// It is ALWAYS there — hidden at 0 focused, a week with no focus left
+/// Insights unreachable from home (Ahmad's iPhone Today, 2026-09-24):
+///  • focus this week → "This week · 2h 5m focused →";
+///  • Mon/Tue with NOTHING yet this week (no focus, nothing done) and a last
+///    week that had focus → "Last week · 3h focused →", opening Insights on
+///    last week (the pill's earlier early-week behaviour, kept);
+///  • tasks done this week but no focus → "3 done this week →" ("1 done …");
+///  • nothing this week → "Your week →".
+/// Every number is the Insights page's own — periodFacts over the same
+/// window, from the same rows — so the pill and the page never disagree.
+public struct WeekPill: Equatable, Sendable {
+    public enum Kind: Equatable, Sendable {
+        case focused(minutes: Int)
+        case lastWeekFocused(minutes: Int)
+        case done(count: Int)
+        case empty
+    }
+    public let kind: Kind
+
+    public init(_ kind: Kind) { self.kind = kind }
+
+    /// The Insights week a tap opens: 1 = last week, 0 = this week.
+    public var insightsWeekOffset: Int {
+        if case .lastWeekFocused = kind { return 1 }
+        return 0
+    }
+
+    /// The text before the arrow, in runs.
+    public var runs: [WeekPillRun] {
+        switch kind {
+        case .focused(let m): return [WeekPillRun("This week · "), WeekPillRun("\(fmtFocusDur(m)) focused", strong: true)]
+        case .lastWeekFocused(let m): return [WeekPillRun("Last week · "), WeekPillRun("\(fmtFocusDur(m)) focused", strong: true)]
+        case .done(let n): return [WeekPillRun("\(n) done", strong: true), WeekPillRun(" this week")]
+        case .empty: return [WeekPillRun("Your week", strong: true)]
+        }
+    }
+
+    /// The pill's words without the arrow: "3 done this week" (web
+    /// `weekPillText`; the shared weekPill vectors' `text`).
+    public var label: String { runs.map(\.text).joined() }
+
+    /// The whole pill as shown: "3 done this week →".
+    public var text: String { label + " →" }
+}
+
+/// The Today week pill from the user's rows (see `WeekPill`). `now` is the
+/// device's clock; the week is the Insights "This week" (Monday → now).
+public func weekPill(tasks: [TaskItem], blocks: [CalBlock], sessions: [Session], now: Date) -> WeekPill {
+    let data = PeriodData(tasks: tasks, blocks: blocks, sessions: sessions)
+    let this = periodFacts(data, resolveInsightsPeriod(.week, offset: 0, now: now, earliest: nil).window)
+    if this.focusMin > 0 { return WeekPill(.focused(minutes: this.focusMin)) }
+    if this.doneCount == 0 {
+        // Early in the week (Mon/Tue) with nothing yet: last week's focus, if any.
+        let today = PeriodTime.at(Int64((now.timeIntervalSince1970 * 1000).rounded(.down))).day
+        let dow = CivilDay.weekday(today)   // 0 = Sunday, 1 = Monday
+        if dow == 1 || dow == 2 {
+            let last = periodFacts(data, resolveInsightsPeriod(.week, offset: 1, now: now, earliest: nil).window).focusMin
+            if last > 0 { return WeekPill(.lastWeekFocused(minutes: last)) }
+        }
+        return WeekPill(.empty)
+    }
+    return WeekPill(.done(count: this.doneCount))
+}

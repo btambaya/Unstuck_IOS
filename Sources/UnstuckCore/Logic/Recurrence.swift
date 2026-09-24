@@ -275,41 +275,78 @@ public func sameWeeks(_ a: String, _ b: String, interval: Int) -> Bool {
     return floorMod((epochMonday(x) - epochMonday(y)) / 7, interval) == 0
 }
 
+/// The Monday of the week holding a strict 'YYYY-MM-DD' (the string itself
+/// when it isn't one). Writers store an every-N-weeks anchor as its Monday
+/// (spec §0 rule 3; web `mondayIso`).
+public func mondayIso(_ iso: String) -> String {
+    guard let e = strictEpochDay(iso) else { return iso }
+    return civilIso(epochDay: epochMonday(e))
+}
+
+/// The day the "Starts" chips (and a repeat edit's default week one) count
+/// from (spec §5, §6; web `startsBase`), for an edit of `current` into every
+/// `interval` weeks on `newDays`:
+///  • already every N weeks with the SAME N → the stored rule's next date ON
+///    THE NEW DAYS (the edit keeps the stored anchor, so that is the series'
+///    real first date — counted on the old days, a Thu → Mon change on a
+///    Wednesday labelled the stored weeks' chip "Mon 19 Oct" over a series
+///    that starts Mon 5 Oct; web review 17181ed). With the days unchanged it
+///    is exactly `nextRuleDate(stored, today)`;
+///  • weekly, or every N weeks with another N → the week of the CURRENT
+///    rule's next date (from the rule, not the blocks: E3), or today when
+///    that week has begun — the next occurrence never jumps;
+///  • anything else (no repeat, daily, monthly) → the series' next block day
+///    (`blockIso`, recurrenceAnchor's) when it is AHEAD of today, else today:
+///    a task whose only blocks are history never starts its weeks in the past
+///    (web's rule, canonical — the spec's literal `recurrenceEditStart(...)
+///    .date` could be a past week).
+public func startsBase(current: Recurrence?, interval: Int, todayIso: String, blockIso: String? = nil,
+                       newDays: [Int]? = nil) -> String {
+    if case .everyNWeeks(let n, let days, let anchor, let until)? = current, n == interval, isValidEveryNWeeks(current) {
+        let edited = validWeekdays(newDays ?? [])
+        let kept = Recurrence.everyNWeeks(interval: n, daysOfWeek: edited.isEmpty ? days : edited, anchor: anchor, until: until)
+        return nextRuleDate(kept, fromIso: todayIso) ?? todayIso
+    }
+    switch current {
+    case .weekly?, .everyNWeeks?:
+        guard let current, let next = nextRuleDate(current, fromIso: todayIso) else { return todayIso }
+        return max(todayIso, mondayIso(next))
+    default:
+        guard let blockIso, blockIso > todayIso else { return todayIso }
+        return blockIso
+    }
+}
+
 /// Week one for a repeat EDIT that writes every N weeks (spec §5), when the
 /// user picked no week in "Starts":
 ///  • the task is already every N weeks with the SAME N (days, time or until
-///    changed) → the stored anchor: such an edit never moves the weeks;
+///    changed) → the stored anchor, written as its Monday: such an edit never
+///    moves the weeks;
 ///  • it is weekly, or every N weeks with another N → the week of the CURRENT
 ///    rule's next date (from the rule, not from blocks), so the next
 ///    occurrence never jumps — or, when the new days in that week have passed,
 ///    the next week that has one: `seriesAnchor(newDays, max(today,
 ///    monday(nextRuleDate(current, today))))`;
-///  • from daily, monthly or no repeat → `seriesAnchor(newDays, startIso ??
-///    today)`, `startIso` being the edit's start day (the series' next block).
+///  • from daily, monthly or no repeat → `seriesAnchor(newDays, startIso)`
+///    when `startIso` (the series' next block) is ahead of today, else from
+///    TODAY — a task whose only blocks are in the past starts its weeks now,
+///    never in a past week (web's rule, canonical; see `startsBase`).
 public func recurrenceEditAnchor(current: Recurrence?, newDays: [Int], newInterval: Int,
                                  todayIso: String, startIso: String? = nil) -> String {
     if case .everyNWeeks(let n, _, let anchor, _)? = current, n == newInterval, strictEpochDay(anchor) != nil {
-        return anchor
+        return mondayIso(anchor)
     }
-    switch current {
-    case .weekly?, .everyNWeeks?:
-        var from = todayIso
-        if let current, let next = nextRuleDate(current, fromIso: todayIso), let e = strictEpochDay(next) {
-            from = max(todayIso, civilIso(epochDay: epochMonday(e)))
-        }
-        return seriesAnchor(days: newDays, fromIso: from)
-    default:
-        return seriesAnchor(days: newDays, fromIso: startIso ?? todayIso)
-    }
+    return seriesAnchor(days: newDays, fromIso: startsBase(current: current, interval: newInterval, todayIso: todayIso,
+                                                           blockIso: startIso))
 }
 
 /// The rule a weekly-days pick writes (the pickers, set_task_recurrence):
 /// 1 week is plain weekly; 2 and up is every N weeks. Days are written
-/// distinct, sorted and in 0…6 (spec §0 rule 3).
+/// distinct, sorted and in 0…6, and the anchor as its Monday (spec §0 rule 3).
 public func weeklyRule(days: [Int], interval: Int, anchor: String, until: String?) -> Recurrence {
     let d = validWeekdays(days)
     return interval <= 1 ? .weekly(daysOfWeek: d, until: until)
-        : .everyNWeeks(interval: interval, daysOfWeek: d, anchor: anchor, until: until)
+        : .everyNWeeks(interval: interval, daysOfWeek: d, anchor: mondayIso(anchor), until: until)
 }
 
 /// Scheduling a series on a chosen day means "the series starts here" (spec

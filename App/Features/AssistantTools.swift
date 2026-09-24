@@ -442,22 +442,6 @@ private func liveBlockAt(_ api: AssistantAppState, _ task: TaskItem, date: Strin
 private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: String, startTime: String?,
                           scratch: TurnScratch) async -> String? {
     var task = task
-    // A FIRST placement of an every-N-weeks series (nothing live after today)
-    // starts the series here (every-n-weeks spec §5): week one becomes the
-    // week of the first series day on or after the date. The row is written
-    // BEFORE the fill below reads the rule, or the tail would be minted on the
-    // old weeks. Moving one occurrence of a live series never re-anchors.
-    if task.recurrence != nil,
-       !api.getBlocks().contains(where: { $0.taskId == task.id && !$0.done && !$0.skipped && $0.date > api.todayIso() }),
-       let re = reanchoredForSchedule(task.recurrence, chosenIso: date) {
-        let fresh = api.getTasks().first { $0.id == task.id } ?? task
-        var next = fresh
-        next.recurrence = re
-        next.updatedAt = AppModel.isoNow()
-        await api.upsertTask(next)
-        scratch.newTasks[next.id] = next
-        task = next
-    }
     let blocks = api.getBlocks()
     // The anchor to move is the task's NEXT LIVE block — first-in-array grabbed
     // an old done/skipped occurrence on real accounts (tester round, 2026-09-01).
@@ -482,11 +466,31 @@ private func scheduleTask(_ api: AssistantAppState, _ task: TaskItem, date: Stri
     let action: ChosenDateAction = task.recurrence == nil ? .mint
         : recurrenceChosenDateAction(existing: blocks.filter { $0.taskId == task.id },
                                      plan: RegenPlan(toUpsert: [], toDelete: []), iso: date, startTime: time)
+    let openOnDay = blocks.first { $0.taskId == task.id && isTaskBlock($0) && $0.date == date && !$0.done && !$0.skipped }
+    // A FIRST placement of an every-N-weeks series starts the series here
+    // (every-n-weeks spec §5): week one becomes the week of the first series
+    // day on or after the date. The task row is written BEFORE ANY block —
+    // the placement's and the fill's — so no reader (the fill below, another
+    // device's top-up on the placed block's echo) runs the old weeks from it:
+    // writes reach the server in the order they are made. An on-week day
+    // keeps the rule as it is (nothing to write); a day whose occurrence is
+    // already done places nothing and changes nothing. Moving one occurrence
+    // of a live series never re-anchors. As on web (review 17181ed).
+    var coveredDone = false
+    if case .covered = action, openOnDay == nil { coveredDone = true }
+    if task.recurrence != nil, placesSeries, !coveredDone,
+       let re = reanchoredForSchedule(task.recurrence, chosenIso: date) {
+        var next = api.getTasks().first { $0.id == task.id } ?? task
+        next.recurrence = re
+        next.updatedAt = AppModel.isoNow()
+        await api.upsertTask(next)
+        scratch.newTasks[next.id] = next
+        task = next
+    }
     switch action {
     case .covered:
-        let open = blocks.first { $0.taskId == task.id && isTaskBlock($0) && $0.date == date && !$0.done && !$0.skipped }
-        guard let open else { return nil }
-        scratch.placedBlocks[task.id] = open.id
+        guard let openOnDay else { return nil }
+        scratch.placedBlocks[task.id] = openOnDay.id
     case .retime(let b):
         var moved = b
         moved.startTime = time
@@ -1021,10 +1025,13 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         // the writes — dates the rule has AND a live occurrence holds, today's
         // own while it is open (Zubair asked at 07:02 with today's 10:30 still
         // ahead) — so the reply can't misstate which weeks count.
+        // A date counts only when the saved rule has it, `until` included
+        // (nextRuleDate of the day is the day itself — web's test).
         var next = ""
         if let rec, case .everyNWeeks = rec, anchored {
             let dates = Set(api.getBlocks().filter {
-                $0.taskId == t.id && isTaskBlock($0) && !$0.done && !$0.skipped && $0.date >= today && isRuleDay(rec, iso: $0.date)
+                $0.taskId == t.id && isTaskBlock($0) && !$0.done && !$0.skipped && $0.date >= today
+                    && nextRuleDate(rec, fromIso: $0.date) == $0.date
             }.map(\.date)).sorted().prefix(2).map { "\(shortDayName($0))\($0 == today ? " (today)" : "")" }
             if let first = dates.first { next = " — next \(first)" + (dates.count > 1 ? ", then \(dates[1])" : "") }
         }
@@ -1032,7 +1039,9 @@ private func runCoreTool(name: String, args: ToolArgs, api: AssistantAppState, s
         func weeks(_ n: Int) -> String { n == 1 ? "every week" : "every \(n) weeks" }
         let newWeeks = rec?.intervalWeeks
         let changed = oldWeeks.flatMap { o in newWeeks.flatMap { n in n != o ? " — \(weeks(n)) now; it was \(weeks(o))" : nil } } ?? ""
-        return "ok: \"\(t.name)\" now repeats \(how)\(at)\(till)\(doneNote)\(next)\(changed)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
+        // The parts in web's and Android's exact order: the rhythm change,
+        // then the next dates, then the done note, then "no slot yet".
+        return "ok: \"\(t.name)\" now repeats \(how)\(at)\(till)\(changed)\(next)\(doneNote)\(anchored ? "" : " — it has no calendar slot yet; schedule_task it to place the first one")"
 
     case "complete_task":
         guard let t = findTask(args.str("taskId"), api: api, scratch: scratch) else { return "error: task not found" }

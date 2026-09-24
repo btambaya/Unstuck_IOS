@@ -98,8 +98,14 @@ final class FakeAssistantState: AssistantAppState {
     func todayIso() -> String { today }
     func nowHM() -> String { now }
 
+    /// Every task / block write, in the order the executor made it: "task"
+    /// (an every-N-weeks row adds its anchor: "task 2026-10-12"), "block
+    /// <date>", "insert <date>", "delete <id>" — writes reach the server in
+    /// this order, so the order is behaviour (every-n-weeks spec §5).
+    var writeLog: [String] = []
     func upsertTask(_ t: TaskItem) async {
         await commit()
+        if case .everyNWeeks(_, _, let anchor, _)? = t.recurrence { writeLog.append("task \(anchor)") } else { writeLog.append("task") }
         if let i = tasks.firstIndex(where: { $0.id == t.id }) { tasks[i] = t } else { tasks.append(t) }
     }
     func removeTask(_ id: String) async { await commit(); tasks.removeAll { $0.id == id } }
@@ -118,6 +124,7 @@ final class FakeAssistantState: AssistantAppState {
     }
     func upsertBlock(_ b: CalBlock) async {
         await commit()
+        writeLog.append("block \(b.date)")
         if let i = blocks.firstIndex(where: { $0.id == b.id }) { blocks[i] = b } else { blocks.append(b) }
     }
     /// Every mint the executor asked for: "<id>|<retime or insert>" (stage 2).
@@ -135,6 +142,7 @@ final class FakeAssistantState: AssistantAppState {
         await commit()
         beforeInsert?(b)
         insertedBlocks.append("\(b.id)|\(retimeIfTaken ? "insert_or_retime" : "insert")")
+        writeLog.append("insert \(b.date)")
         if let i = blocks.firstIndex(where: { $0.id == b.id }) {
             let held = blocks[i]
             guard retimeIfTaken, held.date == b.date, !held.done, !held.skipped else { return false }
@@ -145,7 +153,9 @@ final class FakeAssistantState: AssistantAppState {
         blocks.append(b)
         return true
     }
-    func deleteBlock(_ id: String) async { await commit(); deletedBlockIds.append(id); blocks.removeAll { $0.id == id } }
+    func deleteBlock(_ id: String) async {
+        await commit(); deletedBlockIds.append(id); writeLog.append("delete \(id)"); blocks.removeAll { $0.id == id }
+    }
 
     private func patch(_ id: String, _ fn: (inout ItemCollection) -> Void) {
         guard let i = collections.firstIndex(where: { $0.id == id }) else { return }
@@ -4435,7 +4445,8 @@ final class EveryNWeeksExecutorTests: XCTestCase {
                        "the receipt reads the saved rhythm, not the old one the line names")
         // …and back to every 2 weeks, from weekly: the week of the next Thursday is week one.
         let back = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
-        XCTAssertEqual(back, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — next Thu 24 Sep (today), then Thu 8 Oct — every 2 weeks now; it was every week")
+        // Web's and Android's order: the rhythm change, THEN the next dates.
+        XCTAssertEqual(back, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — every 2 weeks now; it was every week — next Thu 24 Sep (today), then Thu 8 Oct")
         XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil))
         XCTAssertFalse(live.contains("2026-10-01") || live.contains("2026-10-15"), "the off-week Thursdays went: \(live)")
     }
@@ -4461,7 +4472,7 @@ final class EveryNWeeksExecutorTests: XCTestCase {
         // 2.0 is 2 (a whole number sent as a double), and 8 is the most.
         let eight = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":8.0}"#)
         XCTAssertTrue(eight.hasPrefix("ok: \"Office Focus\" now repeats every 8 weeks on Thu at 10:30"), eight)
-        XCTAssertTrue(eight.hasSuffix(" — every 8 weeks now; it was every 2 weeks"), eight)
+        XCTAssertTrue(eight.contains(" at 10:30 — every 8 weeks now; it was every 2 weeks — next "), eight)
     }
 
     /// X8: a FIRST placement (nothing live after today) onto an off-week
@@ -4478,6 +4489,191 @@ final class EveryNWeeksExecutorTests: XCTestCase {
         XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-10-12", until: nil))
         for d in ["2026-10-15", "2026-10-29", "2026-11-12"] { XCTAssertTrue(live.contains(d), "\(d) in \(live)") }
         for d in ["2026-10-08", "2026-10-22", "2026-11-05"] { XCTAssertFalse(live.contains(d), "\(d) in \(live)") }
+    }
+
+    /// Web review 17181ed, fix 1: a first placement that re-anchors writes
+    /// the task row BEFORE ANY block — the placement's and the fill's. Writes
+    /// reach the server in the order they are made, so another device's
+    /// top-up reading the placed block's echo never sees it with the OLD
+    /// weeks (and mints their tail, 22 Oct, 5 Nov …, beside the new one).
+    /// With an open block left today (the one moved), the move-count bump
+    /// carries the new rule too.
+    func testX8_theReanchoredTaskRowIsWrittenBeforeAnyBlock() async {
+        for withLive in [false, true] {
+            api = FakeAssistantState()
+            scratch = TurnScratch()
+            api.today = "2026-09-30"
+            api.now = "12:00"
+            api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+            api.blocks = [occ("2026-09-24", done: true)] + (withLive ? [occ("2026-09-30")] : [])
+            let r = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-15","startTime":"10:30"}"#)
+            XCTAssertTrue(r.hasPrefix("ok:"), r)
+            let log = api.writeLog.joined(separator: " | ")
+            XCTAssertEqual(api.writeLog.first, "task 2026-10-12", log)
+            XCTAssertTrue(api.writeLog.filter { $0.hasPrefix("task") }.allSatisfy { $0 == "task 2026-10-12" }, log)
+            XCTAssertTrue(api.writeLog.contains { $0.hasSuffix("2026-10-15") && !$0.hasPrefix("task") }, log)
+            XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-10-12", until: nil))
+            if withLive { XCTAssertEqual(api.tasks.first?.moveCount, 1, log) }
+        }
+    }
+
+    /// …and a first placement onto a day whose occurrence is already DONE
+    /// places nothing and leaves the weeks alone (no row write at all).
+    func testAFirstPlacementOntoADoneDayChangesNothing() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
+        api.blocks = [occ("2026-09-24", done: true), occ("2026-10-15", done: true)]
+        let r = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-15","startTime":"10:30"}"#)
+        XCTAssertTrue(r.hasPrefix("error: \"Office Focus\" is already done on 2026-10-15"), r)
+        XCTAssertEqual(rule, V1)
+        XCTAssertEqual(api.writeLog, [])
+    }
+
+    /// Week one when a task with no repeat (or daily / monthly) becomes every
+    /// N weeks and its only blocks are HISTORY: counted from today, never from
+    /// the past block's week (web's rule, canonical). Thu 24 Sep's week would
+    /// be 8 Oct, 22 Oct …; from Wed 30 Sep it is Thu 1 Oct, 15 Oct ….
+    func testNoRepeatWithOnlyPastBlocksStartsItsWeeksFromToday() async {
+        for current in [nil, Recurrence.daily(until: nil), .monthly(until: nil)] {
+            api = FakeAssistantState()
+            scratch = TurnScratch()
+            api.today = "2026-09-30"
+            api.now = "12:00"
+            api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: current)]
+            api.blocks = [CalBlock(id: "past", taskId: TID, taskName: "Office Focus", startTime: "10:30", durationMinutes: 60,
+                                   date: "2026-09-24", kind: .task)]
+            let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+            XCTAssertTrue(r.hasPrefix("ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30"), r)
+            XCTAssertTrue(r.contains(" — next Thu 1 Oct, then Thu 15 Oct"), r)
+            XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-28", until: nil), "\(String(describing: current))")
+            XCTAssertEqual(live.filter { $0 >= "2026-09-30" }, ["2026-10-01", "2026-10-15", "2026-10-29", "2026-11-12"])
+        }
+    }
+
+    /// The ok line's parts in web's and Android's exact order: the saved
+    /// rhythm and time, the rhythm change, the next dates, THEN the done note
+    /// (a done plain task made every 2 weeks; a rhythm change is X4 / E3 —
+    /// the two never meet, changing one repeat for another keeps done).
+    func testTheOkLineOrderMatchesWebAndAndroid() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, done: true, completedAt: "2026-09-29T09:00:00.000Z")]
+        api.blocks = [CalBlock(id: "slot", taskId: TID, taskName: "Office Focus", startTime: "10:30", durationMinutes: 60,
+                               date: "2026-09-29", kind: .task)]
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — next Thu 1 Oct, then Thu 15 Oct (it was done — now open again)")
+    }
+
+    /// X14: an edit that keeps N writes the stored anchor as its MONDAY
+    /// (spec §0 rule 3), even over a row some other writer stored mid-week.
+    func testX14_aKeptAnchorIsWrittenAsItsMonday() async {
+        seedSeries()
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60,
+                          recurrence: .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-24", until: nil))]
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[5]}"#)
+        XCTAssertTrue(r.hasPrefix("ok: \"Office Focus\" now repeats every 2 weeks on Fri at 10:30"), r)
+        XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [5], anchor: "2026-09-21", until: nil))
+    }
+
+    // MARK: the shared executor cases X10–X16 (lib/recurrence-vectors.json,
+    // web canonical; hand-ported — the app test target can't read the
+    // SwiftPM vector file)
+
+    /// X10: the off-week guard judges the WEEK without until — an on-week
+    /// Thursday past until is not called an off week; its off-week neighbour
+    /// still is, naming only dates the rule has.
+    func testX10_theOffWeekGuardIgnoresUntil() async {
+        let r = Recurrence.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: "2026-10-22")
+        let seed: () -> Void = { [self] in
+            api = FakeAssistantState()
+            scratch = TurnScratch()
+            api.today = "2026-09-30"
+            api.now = "12:00"
+            api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: r)]
+            api.blocks = [occ("2026-09-24", done: true), occ("2026-10-08"), occ("2026-10-22")]
+        }
+        seed()
+        let onWeek = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-11-05","startTime":"10:30"}"#)
+        XCTAssertTrue(onWeek.hasPrefix("ok:"), onWeek)
+        seed()
+        let offWeek = await run("schedule_task", #"{"taskId":"\#(TID)","date":"2026-10-29","startTime":"10:30"}"#)
+        XCTAssertTrue(offWeek.hasPrefix("error: \"Office Focus\" repeats every 2 weeks on Thursday, and Thu 29 Oct is an off week — nothing was scheduled. The nearest Thursday it repeats on is Thu 22 Oct (2026-10-22)"), offWeek)
+        XCTAssertEqual(rule, r)
+    }
+
+    /// X11: weekly → every 2 weeks, the ok line in full — the rhythm change
+    /// BEFORE the next dates (how, at, until, rhythm note, next, done note).
+    func testX11_theFullOkLineOrder() async {
+        api.today = "2026-09-30"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: .weekly(daysOfWeek: [4], until: nil))]
+        api.blocks = ["2026-10-01", "2026-10-08", "2026-10-15", "2026-10-22"].map { occ($0) }
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — every 2 weeks now; it was every week — next Thu 1 Oct, then Thu 15 Oct")
+        XCTAssertEqual(rule, .everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-28", until: nil))
+        for d in ["2026-10-01", "2026-10-15"] { XCTAssertTrue(live.contains(d), "\(d) in \(live)") }
+        for d in ["2026-10-08", "2026-10-22"] { XCTAssertFalse(live.contains(d), "\(d) in \(live)") }
+    }
+
+    /// X12: a DONE plain task made every 2 weeks — the next dates come BEFORE
+    /// the done note; today's slot keeps the tick, so they start 8 Oct.
+    func testX12_theNextDatesComeBeforeTheDoneNote() async {
+        api.today = "2026-09-24"
+        api.now = "07:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60, done: true)]
+        api.blocks = [CalBlock(id: "plain-0", taskId: TID, taskName: "Office Focus", startTime: "10:30", durationMinutes: 60,
+                               date: "2026-09-24", kind: .task)]
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — next Thu 8 Oct, then Thu 22 Oct (it was done — today's occurrence stays done)")
+        XCTAssertEqual(rule, V1)
+    }
+
+    /// X13: intervalWeeks is checked in ONE order — a whole number first, then
+    /// weekly only (2 and up), then 1…8 — and a huge whole number is out of
+    /// range, never "not a whole number". Nothing changes.
+    func testX13_theCheckOrderAndHugeWholeNumbers() async {
+        seedSeries()
+        let range = "error: every N weeks goes up to every 8 weeks — nothing changed; tell the user this rhythm isn't available"
+        for (args, expect) in [
+            (#""kind":"daily","intervalWeeks":9"#, "error: every N weeks only goes with kind weekly and its days — nothing changed"),
+            (#""kind":"monthly","intervalWeeks":2.5"#, "error: intervalWeeks must be a whole number of weeks (2 = every other week) — nothing changed"),
+            (#""kind":"daily","intervalWeeks":0"#, range),
+            (#""kind":"weekly","daysOfWeek":[4],"intervalWeeks":10000000000"#, range),
+            (#""kind":"weekly","daysOfWeek":[4],"intervalWeeks":12345678901"#, range),
+        ] {
+            let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)",\#(args)}"#)
+            XCTAssertEqual(r, expect, args)
+        }
+        XCTAssertEqual(rule, V1)
+    }
+
+    /// X15: a plain task whose only block is in the PAST (Thu 17 Sep) made
+    /// every 2 weeks on a Wednesday: week one counts from today, so
+    /// tomorrow's Thursday is in it (the past block's week would skip 24 Sep).
+    func testX15_aPastOnlyTaskStartsItsWeeksFromToday() async {
+        api.today = "2026-09-23"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60)]
+        api.blocks = [CalBlock(id: "plain-0", taskId: TID, taskName: "Office Focus", startTime: "10:30", durationMinutes: 60,
+                               date: "2026-09-17", kind: .task)]
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu at 10:30 — next Thu 24 Sep, then Thu 8 Oct")
+        XCTAssertEqual(rule, V1)
+        for d in ["2026-09-24", "2026-10-08"] { XCTAssertTrue(live.contains(d), "\(d) in \(live)") }
+        XCTAssertFalse(live.contains("2026-10-01"), "\(live)")
+    }
+
+    /// X16: a plain task with no calendar slot made every 2 weeks asks for a
+    /// first slot and names NO next dates.
+    func testX16_noSlotNamesNoNextDates() async {
+        api.today = "2026-09-24"
+        api.now = "12:00"
+        api.tasks = [task(TID, "Office Focus", estimateMin: 60)]
+        api.blocks = []
+        let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":2}"#)
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 2 weeks on Thu — it has no calendar slot yet; schedule_task it to place the first one")
+        XCTAssertEqual(rule, V1)
     }
 
     /// X9: the same date on a LIVE series is an off week — refused once,
@@ -4520,7 +4716,7 @@ final class EveryNWeeksExecutorTests: XCTestCase {
         api.tasks = [task(TID, "Office Focus", estimateMin: 60, recurrence: V1)]
         api.blocks = [occ("2026-09-24", done: true), occ("2026-10-08"), occ("2026-10-22"), occ("2026-11-05"), occ("2026-11-19")]
         let r = await run("set_task_recurrence", #"{"taskId":"\#(TID)","kind":"weekly","daysOfWeek":[4],"intervalWeeks":3}"#)
-        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 3 weeks on Thu at 10:30 — next Thu 8 Oct, then Thu 29 Oct — every 3 weeks now; it was every 2 weeks")
+        XCTAssertEqual(r, "ok: \"Office Focus\" now repeats every 3 weeks on Thu at 10:30 — every 3 weeks now; it was every 2 weeks — next Thu 8 Oct, then Thu 29 Oct")
         XCTAssertEqual(rule, .everyNWeeks(interval: 3, daysOfWeek: [4], anchor: "2026-10-05", until: nil))
         XCTAssertEqual(live, ["2026-10-08", "2026-10-29", "2026-11-19"])
     }

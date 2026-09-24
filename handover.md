@@ -83,6 +83,26 @@ series re-anchors). Normative spec: every-n-weeks-spec.md (scratchpad of that ru
   DST starts AT midnight on V10's own Sundays), `SeriesOffWeekTests`, receipts, DbRowCodec; app
   `EveryNWeeksExecutorTests` (X1–X9 + E2/E3 through the executor), voice compaction keeps "every 2–8 weeks".
 
+- **Cross-platform agreement (same day; web 17181ed is canonical where the spec is silent).** Mirrored the web
+  review's three fixes: an assistant FIRST placement writes the re-anchored task row before ANY block (and not at all
+  when that day's occurrence is already done); a same-N edit counts the "Starts" chips on the EDITED days
+  (`startsBase`, web's helper); the off-week guard judges the week without `until` (iOS already did — now pinned).
+  Plus: a no-repeat/daily/monthly task whose only blocks are past starts its weeks from TODAY (`startsBase` → a block
+  counts only when it is ahead); every writer stores a Monday anchor (`weeklyRule`/`mondayIso`, the editor's until
+  path too); the `set_task_recurrence` ok line is how · at · until · rhythm change · next dates · done note (web and
+  Android's order). Vectors: the new `startsBase` list, editAnchor past-block/Monday cases and X10–X16 (hand-ported
+  into `EveryNWeeksExecutorTests`; the app target can't read the SwiftPM vector file).
+
+## Today week pill: always shown (2026-09-24) — not shipped yet
+
+Ahmad's iPhone Today had no pill ("Where is the insight button??"): it hid at 0 focused, and it is Today's only way
+into Insights. `UnstuckCore.weekPill(tasks:blocks:sessions:now:)` (PeriodFacts.swift) → `WeekPill`: focus this week
+→ "This week · 2h 5m focused →"; else Mon/Tue with this week EMPTY (no focus, nothing done) and focus last week →
+"Last week · … focused →" (opens Insights on last week); else done this week → "3 done this week →"; else "Your week
+→". Numbers are periodFacts over the Insights "This week" window (same cut), so the pill and the page agree. The view
+(TodayFeature `weekPill`) keeps the capsule, ink2/ink runs and the coral dot. Tests: `WeekPillTests` (the shared
+`weekPill` vectors P1–P10 from web's period-review-vectors.json, plus the three states, early week, local zone).
+
 ## Zubair's morning call fixes (branch zubair/ios, 2026-09-24) — not shipped yet
 
 From prod assistant_turns, session 1cbfac75 (07:01–07:03 UTC). Web did its half in the same run (commits cbad570, d7441b7).

@@ -459,12 +459,16 @@ struct TaskEditor: View {
         }
     }
 
-    /// "Starts": one chip per week of the cycle, from the series' next date,
-    /// so the stored weeks are the first (selected) chip. Tapping another
-    /// moves week one there (the off weeks' open days go, the new ones come).
+    /// "Starts": one chip per week of the cycle, from the series' next date
+    /// counted on the days shown (startsBase — web's rule), so the stored
+    /// weeks are the first (selected) chip and it names the series' real
+    /// first date. Tapping another moves week one there (the off weeks' open
+    /// days go, the new ones come).
     private func startsRow(days: [Int], weeks: Int, anchor: String) -> some View {
         let today = Clock.todayISO()
-        let base = editTarget.recurrence.flatMap { nextRuleDate($0, fromIso: today) } ?? today
+        let base = startsBase(current: editTarget.recurrence, interval: weeks, todayIso: today,
+                              blockIso: recurrenceAnchor(taskId: editTarget.id, blocks: myBlocks, todayIso: today)?.date,
+                              newDays: days)
         let chips = startsChips(days: days, interval: weeks, baseIso: base)
         return HStack(spacing: 8) {
             Text("Starts").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
@@ -941,7 +945,12 @@ struct TaskEditor: View {
         r?.weekDays ?? []
     }
     private func withUntil(_ r: Recurrence?, _ until: String?) -> Recurrence? {
-        r?.withUntil(until)
+        // An every-N-weeks rule is written through weeklyRule, so its anchor
+        // goes back as its Monday (spec §0 rule 3) — the weeks never change.
+        if case .everyNWeeks(let n, let days, let anchor, _)? = r {
+            return weeklyRule(days: days, interval: n, anchor: anchor, until: until)
+        }
+        return r?.withUntil(until)
     }
 
     private static func ymd(_ date: Date) -> String {

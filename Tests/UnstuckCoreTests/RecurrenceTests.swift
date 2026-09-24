@@ -1157,7 +1157,8 @@ private enum RV {
 final class EveryNWeeksVectorTests: XCTestCase {
     func testTheVectorsLoaded() {
         XCTAssertEqual(RV.file["version"] as? Int, 1)
-        XCTAssertEqual(RV.list("materialize").count, 18)
+        XCTAssertEqual(RV.list("materialize").count, 20)
+        XCTAssertEqual(RV.list("startsBase").count, 7)
         XCTAssertEqual(RV.list("topUp").count, 4)
         XCTAssertEqual(RV.list("regenerate").count, 3)
     }
@@ -1276,6 +1277,23 @@ final class EveryNWeeksVectorTests: XCTestCase {
                                                 newInterval: v["newInterval"] as? Int ?? 0, todayIso: v["today"] as? String ?? "",
                                                 startIso: v["startDate"] as? String),
                            v["expect"] as? String, v["about"] as? String ?? "")
+        }
+        // The Starts row of an edit (web's startsBase, canonical where the
+        // spec is silent): its base, its chips, and the chip pre-selected —
+        // the weeks the edit saves with no pick (recurrenceEditAnchor).
+        for v in RV.list("startsBase") {
+            let about = v["about"] as? String ?? ""
+            let current = try RV.rec(v["current"])
+            let days = v["newDaysOfWeek"] as? [Int] ?? []
+            let n = v["newInterval"] as? Int ?? 0
+            let today = v["today"] as? String ?? ""
+            let block = v["startDate"] as? String
+            let base = startsBase(current: current, interval: n, todayIso: today, blockIso: block, newDays: days)
+            XCTAssertEqual(base, v["expect"] as? String, about)
+            let chips = startsChips(days: days, interval: n, baseIso: base)
+            XCTAssertEqual(chips.map(\.date), v["expectChips"] as? [String], about)
+            let week1 = recurrenceEditAnchor(current: current, newDays: days, newInterval: n, todayIso: today, startIso: block)
+            XCTAssertEqual(chips.first { sameWeeks($0.anchor, week1, interval: n) }?.date, v["expectSelected"] as? String, about)
         }
         for v in RV.list("scheduleAnchor") {
             let r = try XCTUnwrap(try RV.rec(v["recurrence"]))
@@ -1577,5 +1595,76 @@ private enum Build92Recurrence: Codable {
             try c.encode("monthly", forKey: .kind)
             try c.encodeIfPresent(until, forKey: .until)
         }
+    }
+}
+
+// MARK: - web parity (web review 17181ed; web's behaviour is canonical where the spec is silent)
+
+final class EveryNWeeksWebParityTests: XCTestCase {
+    private let V1 = Recurrence.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: nil)
+
+    /// Fix 2: a same-N edit with new days counts the "Starts" chips on the
+    /// EDITED days. A fortnightly Thursday moved to Mondays on Wed 30 Sep:
+    /// the stored weeks are the first chip and it names the series' real
+    /// first Monday, 5 Oct — counted on the old days it read "Mon 19 Oct",
+    /// a whole cycle late, over a saved rule that starts on 5 Oct.
+    func testStartsChipsCountOnTheEditedDays() throws {
+        let base = startsBase(current: V1, interval: 2, todayIso: "2026-09-30", newDays: [1])
+        XCTAssertEqual(base, "2026-10-05")
+        let chips = startsChips(days: [1], interval: 2, baseIso: base)
+        XCTAssertEqual(chips.map(\.date), ["2026-10-05", "2026-10-12"])
+        XCTAssertEqual(chips.filter { sameWeeks($0.anchor, "2026-09-21", interval: 2) }.map(\.date), ["2026-10-05"])
+        let kept = weeklyRule(days: [1], interval: 2,
+                              anchor: recurrenceEditAnchor(current: V1, newDays: [1], newInterval: 2, todayIso: "2026-09-30"),
+                              until: nil)
+        XCTAssertEqual(nextRuleDate(kept, fromIso: "2026-10-01"), "2026-10-05", "what the chip says is what the edit saves")
+        // The old count (the stored rule's next date on its OLD days).
+        let old = startsChips(days: [1], interval: 2, baseIso: try XCTUnwrap(nextRuleDate(V1, fromIso: "2026-09-30")))
+        XCTAssertEqual(old.filter { sameWeeks($0.anchor, "2026-09-21", interval: 2) }.map(\.date), ["2026-10-19"])
+        // The same days: exactly the stored rule's next date, as before.
+        XCTAssertEqual(startsBase(current: V1, interval: 2, todayIso: "2026-09-30", newDays: [4]), "2026-10-08")
+        XCTAssertEqual(startsBase(current: V1, interval: 2, todayIso: "2026-09-30"), "2026-10-08")
+    }
+
+    /// Fix 3: the off-week check judges the WEEK without `until` (weekly
+    /// never checks until there either): an on-week Thursday past the end is
+    /// not "an off week"; its off-week neighbour still is, and names only the
+    /// dates the rule has.
+    func testAnOnWeekDayPastUntilIsNotAnOffWeek() throws {
+        let r = Recurrence.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-21", until: "2026-10-22")
+        XCTAssertFalse(isOffSeriesWeek(r, date: "2026-11-05"))
+        XCTAssertNil(rejectOffSeriesWeek(taskName: "Office Focus", recurrence: r, date: "2026-11-05", today: "2026-09-30"))
+        XCTAssertTrue(isOffSeriesWeek(r, date: "2026-10-29"))
+        let line = try XCTUnwrap(rejectOffSeriesWeek(taskName: "Office Focus", recurrence: r, date: "2026-10-29", today: "2026-09-30"))
+        XCTAssertTrue(line.contains("Thu 29 Oct is an off week"), line)
+        XCTAssertTrue(line.contains("The nearest Thursday it repeats on is Thu 22 Oct (2026-10-22)."), line)
+    }
+
+    /// No repeat, daily or monthly → every N weeks when the task's only
+    /// blocks are HISTORY: week one counts from today (web's rule), never from
+    /// the past block's week. A block ahead of today still sets it.
+    func testWeekOneFromAPastOnlyTaskCountsFromToday() {
+        for current in [nil, Recurrence.daily(until: nil), .monthly(until: nil)] {
+            let about = String(describing: current)
+            XCTAssertEqual(recurrenceEditAnchor(current: current, newDays: [4], newInterval: 2, todayIso: "2026-09-30",
+                                                startIso: "2026-09-24"), "2026-09-28", about)
+            XCTAssertEqual(recurrenceEditAnchor(current: current, newDays: [4], newInterval: 2, todayIso: "2026-09-30",
+                                                startIso: "2026-10-06"), "2026-10-05", about)
+            XCTAssertEqual(recurrenceEditAnchor(current: current, newDays: [4], newInterval: 2, todayIso: "2026-09-30"),
+                           "2026-09-28", about)
+            XCTAssertEqual(startsBase(current: current, interval: 2, todayIso: "2026-09-30", blockIso: "2026-09-24"), "2026-09-30", about)
+            XCTAssertEqual(startsBase(current: current, interval: 2, todayIso: "2026-09-30", blockIso: "2026-10-06"), "2026-10-06", about)
+        }
+    }
+
+    /// Writers store the anchor as its Monday (spec §0 rule 3): a same-N edit
+    /// over a row some other writer stored mid-week, and every weeklyRule.
+    func testWritersStoreMondayAnchors() {
+        let midWeek = Recurrence.everyNWeeks(interval: 2, daysOfWeek: [4], anchor: "2026-09-24", until: nil)
+        XCTAssertEqual(recurrenceEditAnchor(current: midWeek, newDays: [5], newInterval: 2, todayIso: "2026-09-30"), "2026-09-21")
+        XCTAssertEqual(weeklyRule(days: [4], interval: 2, anchor: "2026-09-24", until: nil), V1)
+        XCTAssertEqual(weeklyRule(days: [4], interval: 2, anchor: "2026-09-27", until: nil), V1, "Sunday closes the ISO week")
+        XCTAssertEqual(mondayIso("2026-09-21"), "2026-09-21")
+        XCTAssertEqual(mondayIso("soon"), "soon")
     }
 }

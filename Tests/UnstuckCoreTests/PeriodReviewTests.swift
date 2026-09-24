@@ -514,3 +514,152 @@ final class InsightsCrossPlatformRulesTests: XCTestCase {
         }
     }
 }
+
+// MARK: - the Today week pill: always shown, the way into Insights from home
+
+final class WeekPillTests: XCTestCase {
+    /// The SHARED pill vectors (period-review-vectors.json `weekPill`, web
+    /// canonical): every state over the review datasets, in UTC and New York.
+    func testTheSharedWeekPillVectors() throws {
+        let file = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(PeriodReviewVectors.json.utf8)) as? [String: Any])
+        let list = try XCTUnwrap((file["weekPill"] as? [String: Any])?["vectors"] as? [[String: Any]])
+        XCTAssertEqual(list.count, 10)
+        for v in list {
+            let id = v["id"] as? String ?? "?"
+            let d = try prDataset(v["dataset"] as? String ?? "")
+            let now = prNow(v["now"] as? String ?? "")
+            let expect = v["expect"] as? [String: Any] ?? [:]
+            withZone(v["tz"] as? String ?? "UTC") {
+                let p = weekPill(tasks: d.tasks, blocks: d.blocks, sessions: d.sessions, now: now)
+                let kind: String
+                switch p.kind {
+                case .focused, .lastWeekFocused: kind = "focus"
+                case .done: kind = "done"
+                case .empty: kind = "empty"
+                }
+                XCTAssertEqual(kind, expect["kind"] as? String, id)
+                XCTAssertEqual(p.label, expect["text"] as? String, id)
+                // `at`: the Monday of the week the tap opens (null = this week).
+                let today = PeriodTime.at(Int64((now.timeIntervalSince1970 * 1000).rounded(.down))).day
+                let at = p.insightsWeekOffset == 1 ? CivilDay.add(CivilDay.monday(today), -7) : nil
+                XCTAssertEqual(at, expect["at"] as? String, id)
+                let opened = resolveInsightsPeriod(.week, offset: p.insightsWeekOffset, now: now, earliest: nil)
+                XCTAssertEqual(opened.from, at ?? CivilDay.monday(today), id)
+            }
+        }
+    }
+
+    private func session(_ id: String, min: Int, at: String) -> Session {
+        Session(id: id, taskId: "f", taskName: "Deep work", estimateMin: 60, actualSec: min * 60, completedAt: at)
+    }
+    private func doneTask(_ id: String, at: String) -> TaskItem {
+        mkTask(id: id, name: id, done: true, createdAt: "2026-09-01T09:00:00.000Z", completedAt: at)
+    }
+    private let thu = prNow("2026-09-24T15:30:00.000Z")   // Thursday
+    private let mon = prNow("2026-09-28T08:00:00.000Z")   // Monday
+    private let tue = prNow("2026-09-29T08:00:00.000Z")   // Tuesday
+
+    /// Focus this week → today's format, opening Insights on this week — even
+    /// with tasks done too.
+    func testFocusThisWeek() {
+        withZone("UTC") {
+            let p = weekPill(tasks: [doneTask("a", at: "2026-09-22T10:00:00.000Z")], blocks: [],
+                             sessions: [session("s1", min: 60, at: "2026-09-22T11:00:00.000Z"),
+                                        session("s2", min: 65, at: "2026-09-24T09:00:00.000Z"),
+                                        session("old", min: 90, at: "2026-09-18T09:00:00.000Z")], now: thu)
+            XCTAssertEqual(p.kind, .focused(minutes: 125))
+            XCTAssertEqual(p.text, "This week · 2h 5m focused →")
+            XCTAssertEqual(p.runs, [WeekPillRun("This week · "), WeekPillRun("2h 5m focused", strong: true)])
+            XCTAssertEqual(p.insightsWeekOffset, 0)
+        }
+    }
+
+    /// No focus but tasks done this week → "3 done this week" ("1 done …"),
+    /// the SAME count the Insights page's This week shows (plain tasks and
+    /// repeating occurrences, periodFacts): last week's and a later-today
+    /// stamp past "now" don't count.
+    func testDoneThisWeekMatchesTheInsightsPage() throws {
+        try withZone("UTC") {
+            var tpl = mkTask(id: "gym", name: "Gym", createdAt: "2026-09-01T09:00:00.000Z")
+            tpl.recurrence = .weekly(daysOfWeek: [2], until: nil)
+            var occ = mkBlock(id: "g1", taskId: "gym", taskName: "Gym", date: "2026-09-22")
+            occ.done = true
+            occ.completedAt = "2026-09-22T18:00:00.000Z"
+            let tasks = [tpl,
+                         doneTask("a", at: "2026-09-21T10:00:00.000Z"),
+                         doneTask("b", at: "2026-09-23T10:00:00.000Z"),
+                         doneTask("lastweek", at: "2026-09-20T10:00:00.000Z"),
+                         doneTask("later", at: "2026-09-24T18:00:00.000Z"),
+                         mkTask(id: "open", name: "open", createdAt: "2026-09-22T10:00:00.000Z")]
+            let sessions = [session("lastweek", min: 50, at: "2026-09-18T09:00:00.000Z"),
+                            session("blip", min: 0, at: "2026-09-23T09:00:00.000Z")]   // an accidental start: no focus
+            let p = weekPill(tasks: tasks, blocks: [occ], sessions: sessions, now: thu)
+            XCTAssertEqual(p.kind, .done(count: 3))
+            XCTAssertEqual(p.text, "3 done this week →")
+            XCTAssertEqual(p.runs, [WeekPillRun("3 done", strong: true), WeekPillRun(" this week")])
+            XCTAssertEqual(p.insightsWeekOffset, 0)
+            let page = periodHeadline(PeriodData(tasks: tasks, blocks: [occ], sessions: sessions),
+                                      resolveInsightsPeriod(.week, offset: 0, now: thu, earliest: nil))
+            XCTAssertEqual(page.done, 3, "the pill's number is the Insights page's")
+            XCTAssertEqual(page.focusMin, 0)
+            let one = weekPill(tasks: [doneTask("b", at: "2026-09-23T10:00:00.000Z")], blocks: [], sessions: [], now: thu)
+            XCTAssertEqual(one.text, "1 done this week →")
+        }
+    }
+
+    /// Nothing this week → "Your week", still there and still opening
+    /// Insights (on this week) — mid-week even when last week had focus.
+    func testNothingThisWeekStillShowsYourWeek() {
+        withZone("UTC") {
+            let empty = weekPill(tasks: [], blocks: [], sessions: [], now: thu)
+            XCTAssertEqual(empty.kind, .empty)
+            XCTAssertEqual(empty.text, "Your week →")
+            XCTAssertEqual(empty.insightsWeekOffset, 0)
+            let lastOnly = weekPill(tasks: [doneTask("lastweek", at: "2026-09-20T10:00:00.000Z")], blocks: [],
+                                    sessions: [session("s", min: 85, at: "2026-09-18T09:00:00.000Z")], now: thu)
+            XCTAssertEqual(lastOnly.text, "Your week →", "Thursday: last week's focus is not this week's pill")
+            // Monday with no last-week focus either.
+            XCTAssertEqual(weekPill(tasks: [], blocks: [], sessions: [], now: mon).text, "Your week →")
+        }
+    }
+
+    /// Mon/Tue with NOTHING yet this week and a last week that had focus:
+    /// "Last week · …", opening Insights on last week (kept). Something done
+    /// this week already is this week's pill.
+    func testEarlyWeekShowsLastWeekWhenThisWeekIsEmpty() {
+        withZone("UTC") {
+            let last = [session("s", min: 85, at: "2026-09-24T09:00:00.000Z")]
+            for now in [mon, tue] {
+                let p = weekPill(tasks: [], blocks: [], sessions: last, now: now)
+                XCTAssertEqual(p.kind, .lastWeekFocused(minutes: 85))
+                XCTAssertEqual(p.text, "Last week · 1h 25m focused →")
+                XCTAssertEqual(p.insightsWeekOffset, 1)
+            }
+            let doneMonday = weekPill(tasks: [doneTask("a", at: "2026-09-28T07:30:00.000Z"),
+                                              doneTask("b", at: "2026-09-28T07:45:00.000Z")],
+                                      blocks: [], sessions: last, now: mon)
+            XCTAssertEqual(doneMonday.text, "2 done this week →")
+            XCTAssertEqual(doneMonday.insightsWeekOffset, 0)
+            let focusMonday = weekPill(tasks: [], blocks: [], sessions: last + [session("m", min: 30, at: "2026-09-28T07:00:00.000Z")],
+                                       now: mon)
+            XCTAssertEqual(focusMonday.text, "This week · 30m focused →")
+        }
+    }
+
+    /// The week follows the device's zone (Time.calendar), like the page: a
+    /// Sunday-night stamp in New York is still this week there.
+    func testTheWeekIsTheLocalWeek() {
+        withZone("America/New_York") {
+            // Now = Mon 28 Sep 03:00 UTC = Sun 27 Sep 23:00 in New York, so the
+            // week is 21–27 Sep there and a Sunday-evening tick is in it.
+            let tick = [doneTask("a", at: "2026-09-27T23:30:00.000Z")]
+            let now = prNow("2026-09-28T03:00:00.000Z")
+            XCTAssertEqual(weekPill(tasks: tick, blocks: [], sessions: [], now: now).text, "1 done this week →")
+        }
+        withZone("UTC") {
+            // …while in UTC it is already Monday: that tick was last week.
+            let tick = [doneTask("a", at: "2026-09-27T23:30:00.000Z")]
+            XCTAssertEqual(weekPill(tasks: tick, blocks: [], sessions: [], now: prNow("2026-09-28T03:00:00.000Z")).text, "Your week →")
+        }
+    }
+}

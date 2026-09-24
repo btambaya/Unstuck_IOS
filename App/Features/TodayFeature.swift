@@ -102,7 +102,7 @@ final class TodayModel {
             for try await snap in repo.observeTasksAndBlocks() {
                 areas = snap.areas
                 sessions = snap.sessions
-                weekFocusCache = nil   // new sessions → recount on the next read
+                weekPillCache = nil   // new sessions / ticks → recount on the next read
                 // all/blocks assignment triggers recomputeSnapshot via didSet;
                 // set blocks last so the final recompute sees both.
                 all = snap.tasks
@@ -198,25 +198,27 @@ final class TodayModel {
         }
     }
 
-    /// Focus minutes this calendar week (Monday 00:00 → now) and last week —
-    /// the header pill. The SAME count the Insights page shows for "This week"
+    /// The header's week pill (UnstuckCore.weekPill): this week's focus, else
+    /// what got done this week, else "Your week" — always there, the way into
+    /// Insights. The SAME counts the Insights page shows for "This week"
     /// (D1-filtered sessions, periodFacts, rounded minutes): the old rolling
     /// 7 days showed "This week · 1h 35m" over a Week tab reading nothing
     /// (cross-check P0-8).
     /// Counted once per store snapshot AND local day (not per render — Today
     /// redraws often): keyed on the day too, so a Today left open over Sunday
     /// night doesn't carry last week's total into Monday as "This week".
-    func weekFocus(now: Date = Date()) -> (thisWeek: Int, lastWeek: Int) {
-        // Read `sessions` on every call, cache hit or not, so the view that
-        // shows the pill stays subscribed to new sessions (Observation).
-        let current = sessions
+    func weekPill(now: Date = Date()) -> WeekPill {
+        // Read the rows on every call, cache hit or not, so the view that
+        // shows the pill stays subscribed to new sessions and ticks
+        // (Observation).
+        let (tasks, blocks, sessions) = (all, blocks, sessions)
         let day = Clock.dateISO(now)
-        if let c = weekFocusCache, c.day == day { return c.value }
-        let value = UnstuckCore.weekFocusMin(sessions: current, now: now)
-        weekFocusCache = (day, value)
+        if let c = weekPillCache, c.day == day { return c.value }
+        let value = UnstuckCore.weekPill(tasks: tasks, blocks: blocks, sessions: sessions, now: now)
+        weekPillCache = (day, value)
         return value
     }
-    @ObservationIgnored private var weekFocusCache: (day: String, value: (thisWeek: Int, lastWeek: Int))?
+    @ObservationIgnored private var weekPillCache: (day: String, value: WeekPill)?
 
     // MARK: nudges (quiet, in-app — Android AppViewModel.nudges parity)
 
@@ -408,30 +410,30 @@ struct TodayView: View {
         .padding(.horizontal, 18).padding(.bottom, 4)
     }
 
-    /// "This week · 1h 35m focused" → Insights. Hidden at 0 (web parity). Early
-    /// in the week (Mon/Tue) with nothing yet but a last week that had focus,
-    /// it reads "Last week · …" and opens Insights on last week.
-    @ViewBuilder
+    /// The week pill → Insights, ALWAYS shown (it is the way into Insights
+    /// from home): "This week · 1h 35m focused", else "3 done this week", else
+    /// "Your week". Early in the week (Mon/Tue) with nothing yet this week but
+    /// a last week that had focus, it reads "Last week · …" and opens Insights
+    /// on last week. The words and counts are UnstuckCore.weekPill's.
     private var weekPill: some View {
-        let f = vm?.weekFocus() ?? (thisWeek: 0, lastWeek: 0)
-        let dow = LocalDate.dayOfWeek(Clock.todayISO())   // 0 = Sunday, 1 = Monday
-        let early = dow == 1 || dow == 2
-        let showLast = f.thisWeek == 0 && f.lastWeek > 0 && early
-        let min = showLast ? f.lastWeek : f.thisWeek
-        if min > 0 {
-            // Opens INSIGHTS, not Settings — Android parity (TodayScreen pill → Route.Insights).
-            Button { insightsWeekOffset = showLast ? 1 : 0; showInsights = true } label: {
-                HStack(spacing: 8) {
-                    Circle().fill(theme.palette.coral).frame(width: 6, height: 6)
-                    Text(showLast ? "Last week · " : "This week · ").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                        + Text("\(fmtFocusDur(min)) focused").font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink)
-                    Text("→").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                }
-                .padding(.horizontal, 12).padding(.vertical, 7)
-                .background(theme.palette.bg2, in: Capsule())
-            }.buttonStyle(.plain).padding(.top, 2)
-                .accessibilityIdentifier("week-pill")
+        let pill = vm?.weekPill() ?? WeekPill(.empty)
+        let label = pill.runs.reduce(Text("")) { text, run in
+            text + Text(run.text).font(UFont.sans(12, run.strong ? .semibold : .regular))
+                .foregroundStyle(run.strong ? theme.palette.ink : theme.palette.ink2)
         }
+        // Opens INSIGHTS, not Settings — Android parity (TodayScreen pill → Route.Insights).
+        return Button { insightsWeekOffset = pill.insightsWeekOffset; showInsights = true } label: {
+            HStack(spacing: 8) {
+                Circle().fill(theme.palette.coral).frame(width: 6, height: 6)
+                label
+                Text("→").font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            }
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(theme.palette.bg2, in: Capsule())
+        }.buttonStyle(.plain).padding(.top, 2)
+            .accessibilityIdentifier("week-pill")
+            .accessibilityLabel(pill.label)
+            .accessibilityHint("Opens Insights")
     }
 
     // MARK: filter pills
