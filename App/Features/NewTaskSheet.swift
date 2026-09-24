@@ -2,10 +2,10 @@
 // NewTaskSheet + web task-create-modal). Four serif questions instead of ten
 // stacked sections:
 //   What's on your mind? → When? (+ Time sub-row) → How long? → Which area?
-// then a collapsed "More options" disclosure holding Share/assign (per-task
-// circle sharing, applied on submit), Tags and Repeat. WHEN is mandatory; the
-// time auto-picks the first free slot for the date unless the user chooses
-// one. First step / reminder / capture drafts moved to TaskEditor — new tasks
+// then a collapsed "More options" disclosure holding Share (one "Share with…"
+// row → the pre-create Share screen, applied on submit), Tags and Repeat.
+// WHEN is mandatory; the time auto-picks the first free slot for the date
+// unless the user chooses one. First step / reminder / capture drafts moved to TaskEditor — new tasks
 // use the global default reminder. No priority picker (the web + DB don't
 // surface one). Editing an existing task still goes through TaskEditor.
 
@@ -20,8 +20,18 @@ struct NewTaskSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     @Environment(\.uTheme) private var theme
-    /// The share picker's monogram disc (same as the Share screen's).
+    /// The "Share with…" row's monogram disc (same as the Share screen's).
     @ScaledMetric(relativeTo: .body) private var monogramSize: CGFloat = 22
+    /// How far each disc tucks under the next, and the row-coloured ring
+    /// around each — 4 + 1.5 (web and Android's numbers) covers at most 5.5pt
+    /// of the disc beneath, clear of its centred letter.
+    private static let monogramOverlap: CGFloat = 4
+    private static let monogramRing: CGFloat = 1.5
+    /// The row's summary budgets, widest first: 28 is the one rule's
+    /// (`shareDraftSummaryMaxLength`, same on web and Android); the tighter
+    /// ones only cut NAMES, so the grade still shows on a narrow row.
+    private static let summaryBudgets = [shareDraftSummaryMaxLength, 24, 20, 16, 12]   // five: see shareRow
+    @Environment(\.dynamicTypeSize) private var typeSize
 
     let defaultEstimate: Int
     /// Optional prefill (e.g. tapping an empty calendar slot): a date and/or
@@ -66,26 +76,13 @@ struct NewTaskSheet: View {
     // four questions; Share · Tags · Repeat live behind it.
     @State private var moreOpen = false
 
-    // Per-task sharing (picked levels are LOCAL create-state — the share RPCs
-    // fire on submit, after the task row exists). userId → level; absent = Off.
-    @State private var shareLevels: [String: ShareLevel] = [:]
-    @State private var circle: CircleModel?
-
-    // Inline invite-a-new-person state (same flow as ShareSheet).
-    @State private var inviting = false
-    @State private var inviteEmail = ""
-    @State private var inviteResult: InviteOutcome?
-    @State private var inviteErr: String?
-    @State private var copied = false
-
-    private struct InviteOutcome { let added: Bool; let emailed: Bool; let link: String?; let email: String }
-
-    /// nil == "Off"; else the granted level — the unified vocabulary (Can edit
-    /// = partner, Can view = view). "Assign" is no longer a share level here:
-    /// hand a task over from its editor ("Hand over to…") once it exists.
-    private let shareOptions: [(value: ShareLevel?, label: String)] = [
-        (nil, "Off"), (.partner, ShareAccess.edit.label), (.view, ShareAccess.view.label),
-    ]
+    // Per-task sharing: ONE "Share with…" row that opens the Share screen in
+    // pre-create mode. The picks (Can edit / Can view / Hand over per person,
+    // typed addresses held until the task is added) are LOCAL create-state in
+    // the draft — the share RPCs fire on submit, after the task row exists.
+    // Nothing is sent if the sheet is closed without adding the task.
+    @State private var shareDraft: DraftShareTransport?
+    @State private var showSharePicker = false
 
     // Live data.
     @State private var blocks: [CalBlock] = []
@@ -145,10 +142,6 @@ struct NewTaskSheet: View {
 
     private var canSubmit: Bool { !name.trimmingCharacters(in: .whitespaces).isEmpty && !needsTime }
 
-    private var activeMembers: [CircleMember] {
-        (circle?.members ?? []).filter { $0.status == "active" && $0.memberUserId != nil }
-    }
-
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -182,13 +175,7 @@ struct NewTaskSheet: View {
                 }
             }
             .task { await observe() }
-            .task {
-                let c = circle ?? model.makeCircleModel()
-                circle = c
-                c.start()
-            }
             .onAppear(perform: seedPrefill)
-            .onDisappear { circle?.stop() }
             .onChange(of: effectiveDate) { _, _ in autoPick() }
             .onChange(of: estimate) { _, _ in autoPick() }
             // Re-pick the first free slot once blocks arrive (and on every
@@ -344,184 +331,125 @@ struct NewTaskSheet: View {
         }
     }
 
+    /// ONE row — "Share with…" · who (monograms + a one-line summary) · ›.
+    /// It opens the Share screen in pre-create mode (the grade switch, the
+    /// people picker, "Someone new", the connect-invite link); the picks stay
+    /// LOCAL and the share RPCs fire on submit, after the task exists — a
+    /// failed share never blocks creation. Ahmad 2026-09-24: a card per person
+    /// with a full-width Off / Can edit / Can view switch was "terrible".
+    /// Labelled "SHARE" like the sections around it (Tags, Repeat) — the
+    /// same label web and Android put above the row.
     private var shareSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        // Connections first, then held addresses — the summary's order, so
+        // the first monogram is the first name it reads.
+        let picks = shareDraftSummaryOrder(shareDraft?.draft.picks ?? [])
+        let summary = shareDraftSummary(picks)
+        return VStack(alignment: .leading, spacing: 7) {
             SectionLabel("Share")
-            if !activeMembers.isEmpty {
-                VStack(spacing: 10) {
-                    ForEach(activeMembers) { m in shareMemberRow(m) }
-                }
-            }
-            if inviting { invitePanel } else { addSomeoneButton }
-            if activeMembers.isEmpty && !inviting {
-                Text("Share this task with someone you're connected to. You can also share by email or link from the task once it's created.")
-                    .font(UFont.sans(13)).foregroundStyle(theme.palette.ink2)
-                    .fixedSize(horizontal: false, vertical: true)
-            } else if !activeMembers.isEmpty {
-                shareExplainer
+            Button(action: openSharePicker) { shareRow(picks: picks, summary: summary) }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Share with")
+                .accessibilityValue(summary.spoken)
+                .accessibilityHint("Pick who gets this task")
+                .accessibilityIdentifier("new-task-share-row")
+        }
+        .sheet(isPresented: $showSharePicker) {
+            if let shareDraft {
+                ShareScreen(target: .task(id: "", name: name.trimmingCharacters(in: .whitespacesAndNewlines)),
+                            draft: shareDraft)
             }
         }
     }
 
-    /// One circle member: initial avatar + name/relationship, and a full-width
-    /// Off/View/Partner/Assign segmented row. Selection is LOCAL — the share
-    /// RPCs fire on submit (a failed share must never block creation).
-    private func shareMemberRow(_ m: CircleMember) -> some View {
-        let userId = m.memberUserId ?? ""
-        let current = shareLevels[userId]
-        return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 10) {
-                // The Share screen's monogram: the selected / unselected chip
-                // pair on a circle — filled once a level is picked, never the
-                // accent (the app spends accent on eyebrows + text links only).
-                Text(String((m.memberName ?? "?").prefix(1)).uppercased())
-                    .font(UFont.sans(10, .semibold))
-                    .foregroundStyle(current != nil ? theme.palette.bg : theme.palette.ink2)
-                    .frame(width: monogramSize, height: monogramSize)
-                    .background(current != nil ? theme.palette.ink : theme.palette.bg2, in: Circle())
-                    .overlay(Circle().stroke(current != nil ? Color.clear : theme.palette.line2))
-                    .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(m.memberName ?? "Member").font(UFont.sans(14, .semibold))
-                        .foregroundStyle(theme.palette.ink).lineLimit(1)
-                    if let label = m.relationshipLabel {
-                        Text(label).font(UFont.sans(11)).foregroundStyle(theme.palette.ink3)
-                    }
-                }
-                Spacer(minLength: 0)
-            }
-            HStack(spacing: 2) {
-                ForEach(shareOptions, id: \.label) { opt in
-                    let selected = current == opt.value
-                    Button {
-                        if let level = opt.value { shareLevels[userId] = level }
-                        else { shareLevels.removeValue(forKey: userId) }
-                    } label: {
-                        Text(opt.label)
-                            .font(UFont.sans(11, .semibold))
-                            .foregroundStyle(selected ? theme.palette.bg : theme.palette.ink2)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 5)
-                            .background(selected ? theme.palette.ink : Color.clear, in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(2)
-            .background(theme.palette.bg, in: Capsule())
-            .overlay(Capsule().stroke(theme.palette.line2))
+    /// The row's face. One line at normal sizes, never wrapped: when space is
+    /// short the monograms drop out first, then the summary is re-cut to a
+    /// tighter budget by the SAME rule (names give way, the grade stays), and
+    /// only past the last budget does the text itself truncate. At
+    /// accessibility sizes "Share with…" and the summary stack.
+    private func shareRow(picks: [ShareDraftPick], summary: ShareDraftSummary) -> some View {
+        func line(_ text: String) -> some View {
+            Text(text).font(UFont.sans(13))
+                .foregroundStyle(picks.isEmpty ? theme.palette.ink3 : theme.palette.ink2)
+                .lineLimit(1)
         }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    // MARK: inline invite (same flow as ShareSheet)
-
-    private var addSomeoneButton: some View {
-        Button { inviting = true; inviteResult = nil; inviteErr = nil } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "plus").font(.system(size: 12, weight: .semibold))
-                Text("Add someone").font(UFont.sans(13, .semibold))
-            }.foregroundStyle(theme.palette.primaryDeep)
-        }.buttonStyle(.plain)
-    }
-
-    @ViewBuilder
-    private var invitePanel: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let r = inviteResult {
-                if r.added {
-                    Text("✓ Added — pick their level above.")
-                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.greenInk)
-                } else if r.emailed {
-                    Text("✓ Invite sent to \(r.email). Pick their level once they accept.")
-                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.greenInk)
-                } else if let link = r.link {
-                    Text("Invite link ready\(copied ? " · copied!" : "")")
-                        .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink)
-                    Text(link).font(UFont.mono(12)).foregroundStyle(theme.palette.ink2)
-                        .padding(10).frame(maxWidth: .infinity, alignment: .leading)
-                        .background(theme.palette.bg, in: RoundedRectangle(cornerRadius: Radius.sm, style: .continuous))
-                        .textSelection(.enabled)
-                    Text(r.email.isEmpty ? "Send it to them — it's the only way in."
-                         : "We couldn't email them — send this link instead.")
-                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                }
-                HStack(spacing: 8) {
-                    if let link = r.link {
-                        Button { copy(link) } label: {
-                            Text("Copy link").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
-                                .padding(.horizontal, 14).padding(.vertical, 8)
-                                .background(theme.palette.ink, in: Capsule())
-                        }.buttonStyle(.plain)
-                    }
-                    Button { inviting = false; inviteResult = nil } label: {
-                        Text("Done").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink2)
-                            .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(theme.palette.bg, in: Capsule())
-                    }.buttonStyle(.plain)
-                }
-            } else {
-                Text("Their email (optional)").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
-                TextField(String("name@example.com"), text: $inviteEmail)   // String: a key would autolink the address blue
-                    .textFieldStyle(.roundedBorder)
-                    .keyboardType(.emailAddress).textInputAutocapitalization(.never).autocorrectionDisabled()
-                    .submitLabel(.done)
-                    .onSubmit { generateInvite() }
-                Text("We'll email them the invite. Or leave it blank for a link you send yourself.")
-                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
-                if let inviteErr {
-                    Text(inviteErr).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
-                }
-                HStack(spacing: 8) {
-                    Button { generateInvite() } label: {
-                        Text(inviteEmail.trimmingCharacters(in: .whitespaces).isEmpty ? "Generate link" : "Send invite")
-                            .font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.bg)
-                            .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(theme.palette.ink, in: Capsule())
-                    }.buttonStyle(.plain)
-                    Button { inviting = false; inviteErr = nil } label: {
-                        Text("Cancel").font(UFont.sans(13, .semibold)).foregroundStyle(theme.palette.ink2)
-                            .padding(.horizontal, 14).padding(.vertical, 8)
-                            .background(theme.palette.bg, in: Capsule())
-                    }.buttonStyle(.plain)
-                }
-            }
-        }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(theme.palette.bg2, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
-    }
-
-    private func generateInvite() {
-        let email = inviteEmail.trimmingCharacters(in: .whitespacesAndNewlines)
-        inviteErr = nil
-        Task {
-            guard let circle else { inviteErr = "Sign in to invite people."; return }
-            let r = await circle.invite(email: email.isEmpty ? nil : email)
-            if r.ok == false, r.added != true, r.emailed != true, r.link == nil {
-                inviteErr = r.error == "circle_full" ? "Your circle is full." : "Could not create invite."
-                return
-            }
-            inviteResult = InviteOutcome(added: r.added == true, emailed: r.emailed == true, link: r.link, email: email)
-            inviteEmail = ""
-            if let link = r.link { copy(link) }
-        }
-    }
-
-    private func copy(_ s: String) {
-        UIPasteboard.general.string = s
-        copied = true
-        Task { try? await Task.sleep(nanoseconds: 1_800_000_000); copied = false }
-    }
-
-    private var shareExplainer: some View {
-        (Text(ShareAccess.edit.label).font(UFont.sans(12, .semibold)) + Text(" — \(ShareAccess.edit.blurb) ").font(UFont.sans(12))
-         + Text(ShareAccess.view.label).font(UFont.sans(12, .semibold)) + Text(" — \(ShareAccess.view.blurb) ").font(UFont.sans(12))
-         + Text("To hand it over entirely, use “Hand over to…” in the task once it's created.").font(UFont.sans(12)))
+        let summaryText = line(summary.text)
+        // The same rule at each tighter budget (`summaryBudgets[0]` is
+        // `summary` itself).
+        let cut = Self.summaryBudgets.map { shareDraftSummary(picks, maxLength: $0).text }
+        let title = Text("Share with…").font(UFont.sans(14, .semibold)).foregroundStyle(theme.palette.ink)
+        let chevron = Image(systemName: "chevron.right").font(.system(size: 11, weight: .semibold))
             .foregroundStyle(theme.palette.ink3)
-            .fixedSize(horizontal: false, vertical: true)
+        return Group {
+            if typeSize.isAccessibilitySize {
+                HStack(spacing: 10) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        title.fixedSize(horizontal: false, vertical: true)
+                        Text(summary.text).font(UFont.sans(13))
+                            .foregroundStyle(picks.isEmpty ? theme.palette.ink3 : theme.palette.ink2)
+                            .lineLimit(2)
+                    }
+                    Spacer(minLength: 8)
+                    chevron
+                }
+                .padding(.vertical, 12)
+            } else {
+                HStack(spacing: 10) {
+                    title.lineLimit(1).layoutPriority(1)
+                    Spacer(minLength: 8)
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            if !picks.isEmpty { shareMonograms(picks) }
+                            summaryText
+                        }
+                        // Explicit candidates (not a ForEach): ViewThatFits
+                        // tries its direct children in order.
+                        summaryText
+                        line(cut[1])
+                        line(cut[2])
+                        line(cut[3])
+                        line(cut[4]).truncationMode(.tail)
+                    }
+                    chevron
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+        .background(theme.palette.surface, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(theme.palette.line2))
+        .contentShape(Rectangle())
+    }
+
+    /// Up to three picked people, overlapping — the Share screen's "has it"
+    /// monogram (ink disc, bg letter; selection is the black-and-white pair),
+    /// each ringed OUTSIDE its disc in the row's surface so the overlap reads.
+    /// The ring used to be a stroke centred on the disc edge with a 20 %
+    /// overlap, and the next disc bit into the letter beneath; now each disc
+    /// tucks 4pt under the next plus the 1.5pt ring — 5.5pt, clear of the
+    /// centred letter at every size. Decorative: the summary says who.
+    private func shareMonograms(_ picks: [ShareDraftPick]) -> some View {
+        let ring = Self.monogramRing
+        return HStack(spacing: -(Self.monogramOverlap + ring * 2)) {
+            ForEach(picks.prefix(3)) { p in
+                Text(String(p.name.trimmingCharacters(in: .whitespaces).prefix(1)).uppercased())
+                    .font(UFont.sans(10, .semibold))
+                    .foregroundStyle(theme.palette.bg)
+                    .frame(width: monogramSize, height: monogramSize)
+                    .background(theme.palette.ink, in: Circle())
+                    .padding(ring)
+                    .background(theme.palette.surface, in: Circle())
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func openSharePicker() {
+        // Put the keyboard away first: UIKit hands focus back to the name
+        // field when the Share screen closes, which scrolled the sheet to the
+        // top — away from the row that just changed — with the keyboard up.
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        if shareDraft == nil { shareDraft = model.makeShareDraftTransport() }
+        showSharePicker = true
     }
 
     private var tagsSection: some View {
@@ -888,10 +816,14 @@ struct NewTaskSheet: View {
         // failed share (e.g. offline) is INTENTIONALLY non-blocking here — the
         // returned failures are discarded rather than surfaced, matching the web's
         // create flow. A dropped share is re-addable from the task's Share sheet.
-        let shares = shareLevels.map { (user: $0.key, level: $0.value) }
-        if !shares.isEmpty {
+        // The picks come from the pre-create Share screen's draft: connections
+        // → task_share, typed addresses → share-task add (same grade mapping).
+        let draft = shareDraft?.draft ?? ShareDraft()
+        let shares = draft.userShares.map { (user: $0.userId, level: $0.level) }
+        let emails = draft.emailShares.map { (email: $0.email, level: $0.level) }
+        if !shares.isEmpty || !emails.isEmpty {
             let task = t
-            Task { await model.applyCreateShares(task: task, shares: shares) }
+            Task { await model.applyCreateShares(task: task, shares: shares, emails: emails) }
         }
         dismiss()
     }

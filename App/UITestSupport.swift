@@ -485,6 +485,9 @@ final class DemoShareTransport: ShareScreenTransport {
     func collectionLink(collectionId: String, role: String) async -> ShareLinkOutcome {
         .ok(url: "https://unstucknow.io/circle/join?code=demo")
     }
+    func inviteToConnect() async -> ShareLinkOutcome {
+        .ok(url: "https://unstucknow.io/circle/join?code=demo")
+    }
     func block(userId: String) async -> Bool {
         await delay()
         members.removeAll { $0.userId == userId }
