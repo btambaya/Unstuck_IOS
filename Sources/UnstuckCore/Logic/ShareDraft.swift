@@ -10,10 +10,12 @@
 //                            each at a level, in pick order.
 //   • shareDraftSummary    — the row's trailing text ("Only you",
 //                            "James · can edit", "James · edit, Anna · view",
-//                            "James + 3 more · can edit") + its spoken form.
-//   • shareDraftResultLine — the Share screen's honest line in pre-create
-//                            mode ("Maya will get it when you add the task…"),
-//                            never "Shared with…" for a task that isn't there.
+//                            "James + 3 more · can edit") + its spoken form;
+//                            connections first, then held addresses.
+//   • shareDraftResultLine — the Share screen's confirmation line in
+//                            pre-create mode ("Maya can edit once you add the
+//                            task."), never "Shared with…" for a task that
+//                            isn't there.
 //
 // ONE behaviour on iOS, Android and web (decided 2026-09-24 after the three
 // were compared side by side): the grades are Can edit / Can view / Hand over
@@ -211,7 +213,8 @@ public struct ShareDraftSummary: Equatable, Sendable {
 public let shareDraftSummaryMaxLength = 28
 
 /// THE SUMMARY RULE (one rule on all three apps; the FORM is decided by the
-/// number of picks, never by the length):
+/// number of picks, never by the length). ORDER: connections first, in pick
+/// order, then held addresses, in pick order (`shareDraftSummaryOrder`):
 ///  • 0         → "Only you"
 ///  • 1         → "James · can edit" | "· can view" | "· handed over"
 ///  • 2, same   → "James, Anna · can edit"
@@ -222,9 +225,12 @@ public let shareDraftSummaryMaxLength = 28
 ///    each name is capped at the largest length that fits, so a short name
 ///    stays whole and a long one gives way; never below one letter + "…".
 /// Names are first names ("James" from "James Wilson"; the part of an address
-/// before the @); a blank name is "Someone".
-public func shareDraftSummary(_ picks: [ShareDraftPick],
+/// before the @); a blank name is "Someone". Two or more names that must be
+/// cut share ONE common cap (not a half split each). The spoken form follows
+/// the same order.
+public func shareDraftSummary(_ picked: [ShareDraftPick],
                               maxLength: Int = shareDraftSummaryMaxLength) -> ShareDraftSummary {
+    let picks = shareDraftSummaryOrder(picked)
     guard let first = picks.first else { return ShareDraftSummary(text: "Only you", spoken: "Only you") }
     let names = picks.map { shareDraftName($0.name) }
     let uniform = picks.allSatisfy { $0.level == first.level }
@@ -254,6 +260,14 @@ public func shareDraftSummary(_ picks: [ShareDraftPick],
         }.joined(separator: ", ")
     }
     return ShareDraftSummary(text: text, spoken: spoken)
+}
+
+/// The order the summary (and the row's monograms) name picks in:
+/// connections first, in pick order, then held addresses, in pick order — on
+/// iOS, Android and web alike. Stable: already-ordered input is unchanged.
+public func shareDraftSummaryOrder(_ picks: [ShareDraftPick]) -> [ShareDraftPick] {
+    func isAddress(_ p: ShareDraftPick) -> Bool { if case .email = p.recipient { return true } else { return false } }
+    return picks.filter { !isAddress($0) } + picks.filter(isAddress)
 }
 
 /// "can edit" / "can view" / "handed over" — the one grade everyone has.
@@ -312,24 +326,29 @@ private func shareDraftTruncate(_ s: String, to limit: Int) -> String {
 
 // MARK: - the Share screen's line in pre-create mode
 
-/// The honest line under the Share screen's controls when the task does not
-/// exist yet: nothing has been shared, so it says what WILL happen on "Add
-/// task". Outcomes that don't arise before creation fall back to
+/// The confirmation line under the Share screen's controls when the task does
+/// not exist yet: nothing has been shared, so it says what WILL happen on
+/// "Add task". The SAME strings on iOS, Android and web (decided 2026-09-24):
+///  • pick / grade change → "<Name> can edit once you add the task."
+///                          "<Name> can view once you add the task."
+///  • hand over           → "<Name> gets it as their task once you add it — you keep view."
+///  • add an address      → "<address> gets it once you add the task."
+///  • remove              → "<Name> won't get this task."
+/// <Name> is the short name (the first name; for an address, the part before
+/// the @). Outcomes that don't arise before creation fall back to
 /// `shareResultLine`.
 public func shareDraftResultLine(_ r: ShareResult) -> String {
     switch r {
-    case .shared(let name, let access):
-        return "\(shareShortName(name)) will get it when you add the task — they can \(access.verb)."
+    case .shared(let name, let access), .accessChanged(let name, let access):
+        return "\(shareShortName(name)) can \(access.verb) once you add the task."
     case .invited(let email), .accepted(let email):
-        return "\(email) will get it when you add the task."
-    case .accessChanged(let name, let access):
-        return "\(shareShortName(name)) will be able to \(access.verb)."
+        return "\(email) gets it once you add the task."
     case .handedOver(let name):
-        return "\(shareShortName(name)) will get it as their task when you add it — you keep view."
+        return "\(shareShortName(name)) gets it as their task once you add it — you keep view."
     case .removed(let name):
-        return "\(shareShortName(name)) won't get it."
+        return "\(shareShortName(name)) won't get this task."
     case .inviteCancelled(let email):
-        return "\(email) won't get it."
+        return "\(shareShortName(email)) won't get this task."
     case .linkCopied:
         return "Invite link copied — whoever opens it is connected to you, then you can pick them here."
     case .blocked:

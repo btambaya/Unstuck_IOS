@@ -33,7 +33,9 @@
 // sheet reads back and shares on submit. What needs the task to exist is
 // hidden: "Share a link" (replaced by the connect-invite link the old inline
 // "Add someone" panel made), the pending-invite list (queued addresses show
-// in its place), and Report / Block on a picked row. A picked row's menu is
+// in its place), Report / Block on a picked row, and "Manage people" (a push
+// to Settings › People would leave the unsaved task behind — web and Android
+// hide it too). A picked row's menu is
 // Can edit / Can view / Hand over / Remove — the same four as web and
 // Android (Hand over = level `assign`, held like the rest until submit).
 //
@@ -283,7 +285,8 @@ final class ShareScreenModel {
     let mode: Mode
     /// The task doesn't exist yet (New task → "Share with…"): the transport
     /// is a DraftShareTransport, and every line says what WILL happen on
-    /// "Add task" (`shareDraftResultLine`), never "Shared with…".
+    /// "Add task" (`shareDraftResultLine` — "Maya can edit once you add the
+    /// task."), never "Shared with…".
     let preCreate: Bool
     @ObservationIgnored private let transport: any ShareScreenTransport
 
@@ -634,7 +637,8 @@ struct ShareScreen: View {
     var mode: ShareScreenModel.Mode = .share
     /// Pre-create mode (New task → "Share with…"): picks land in this draft,
     /// not on the server — the New task sheet shares on submit. Hides what
-    /// needs the task to exist (Share a link, Report / Block on a row).
+    /// needs the task to exist (Share a link, Report / Block on a row) and
+    /// "Manage people" (it would push away from the unsaved task).
     var draft: DraftShareTransport? = nil
 
     private var preCreate: Bool { draft != nil }
@@ -770,15 +774,20 @@ struct ShareScreen: View {
                 Spacer(minLength: 8)
                 // Everyone you share with, in one place (Settings → People) —
                 // one push away from any share sheet (slim settings, 2026-09-24).
-                NavigationLink { ConnectionsView() } label: {
-                    Text("Manage people")
-                        .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink2)
-                        .underline()
-                        .frame(minHeight: 44).contentShape(Rectangle())
-                        .padding(.vertical, -12)
+                // Not in pre-create: the task isn't saved yet, and leaving for
+                // People would lose it (web did; decided 2026-09-24 — hidden
+                // on iOS, Android and web).
+                if !preCreate {
+                    NavigationLink { ConnectionsView() } label: {
+                        Text("Manage people")
+                            .font(UFont.sans(12, .semibold)).foregroundStyle(theme.palette.ink2)
+                            .underline()
+                            .frame(minHeight: 44).contentShape(Rectangle())
+                            .padding(.vertical, -12)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityIdentifier("share-manage-people")
                 }
-                .buttonStyle(.plain)
-                .accessibilityIdentifier("share-manage-people")
             }
             if vm.loading && vm.people.isEmpty {
                 Text("Loading…").font(UFont.sans(13)).foregroundStyle(theme.palette.ink3)

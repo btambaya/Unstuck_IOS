@@ -929,7 +929,7 @@ final class ShareScreenPreCreateTests: XCTestCase {
         XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u1", level: .partner)])
         XCTAssertEqual(draft.draft.picks.first?.name, "Maya Chen", "the name comes from the roster")
         XCTAssertEqual(vm.people[0].access, .edit, "the row shows the pick (reloaded from the draft)")
-        XCTAssertEqual(vm.result, "Maya will get it when you add the task — they can edit.")
+        XCTAssertEqual(vm.result, "Maya can edit once you add the task.")
         XCTAssertNil(vm.error)
 
         vm.access = .view
@@ -946,11 +946,11 @@ final class ShareScreenPreCreateTests: XCTestCase {
         await vm.tap(vm.people[1])
         await vm.setAccess(vm.people[1], .view)
         XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u2", level: .view)])
-        XCTAssertEqual(vm.result, "Zubair will be able to view.")
+        XCTAssertEqual(vm.result, "Zubair can view once you add the task.")
         await vm.setAccess(vm.people[1], nil)
         XCTAssertTrue(draft.draft.isEmpty)
         XCTAssertNil(vm.people[1].access)
-        XCTAssertEqual(vm.result, "Zubair won't get it.")
+        XCTAssertEqual(vm.result, "Zubair won't get this task.")
         assertNothingReachedTheServer()
     }
 
@@ -962,13 +962,32 @@ final class ShareScreenPreCreateTests: XCTestCase {
         assertNothingReachedTheServer()
         XCTAssertEqual(draft.draft.emailShares, [ShareDraftEmailShare(email: "sam@example.com", level: .partner)])
         XCTAssertEqual(vm.pending, [SharePendingRow(id: "email:sam@example.com", email: "sam@example.com", access: .edit)])
-        XCTAssertEqual(vm.result, "sam@example.com will get it when you add the task.")
+        XCTAssertEqual(vm.result, "sam@example.com gets it once you add the task.")
         XCTAssertEqual(vm.email, "", "the field clears after a queued address")
 
         await vm.cancelPending(vm.pending[0])
         XCTAssertTrue(draft.draft.isEmpty)
         XCTAssertTrue(vm.pending.isEmpty)
-        XCTAssertEqual(vm.result, "sam@example.com won't get it.")
+        XCTAssertEqual(vm.result, "sam won't get this task.")
+        assertNothingReachedTheServer()
+    }
+
+    func testAHeldAddressIsNamedAfterThePeopleEvenWhenAddedFirst() async {
+        let vm = preCreateModel()
+        await vm.load()
+        vm.access = .view
+        vm.email = "sam@example.com"
+        await vm.shareWithEmail()                      // sam · Can view (added first)
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "sam · can view")
+        vm.access = .edit
+        await vm.tap(vm.people[0])                     // Maya · Can edit
+        XCTAssertEqual(vm.result, "Maya can edit once you add the task.")
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Maya · edit, sam · view",
+                       "connections first, then held addresses")
+        XCTAssertEqual(shareDraftSummary(draft.draft.picks).spoken, "Maya can edit, sam can view")
+        // Submit is unchanged by the summary's order.
+        XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u1", level: .partner)])
+        XCTAssertEqual(draft.draft.emailShares, [ShareDraftEmailShare(email: "sam@example.com", level: .view)])
         assertNothingReachedTheServer()
     }
 
@@ -1023,7 +1042,7 @@ final class ShareScreenPreCreateTests: XCTestCase {
         await vm.handOver(vm.people[1])                // → Hand over
         assertNothingReachedTheServer()
         XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u2", level: .assign)])
-        XCTAssertEqual(vm.result, "Zubair will get it as their task when you add it — you keep view.")
+        XCTAssertEqual(vm.result, "Zubair gets it as their task once you add it — you keep view.")
         XCTAssertTrue(vm.people[1].handedOver, "the row reads Handed over (reloaded from the draft)")
         XCTAssertEqual(vm.people[1].statusLabel, "Handed over")
         XCTAssertEqual(shareDraftSummary(draft.draft.picks).text, "Zubair · handed over")
@@ -1031,11 +1050,11 @@ final class ShareScreenPreCreateTests: XCTestCase {
         // Back to a grade from the same menu, then Remove.
         await vm.setAccess(vm.people[1], .view)
         XCTAssertEqual(draft.draft.userShares, [ShareDraftUserShare(userId: "u2", level: .view)])
-        XCTAssertEqual(vm.result, "Zubair will be able to view.")
+        XCTAssertEqual(vm.result, "Zubair can view once you add the task.")
         await vm.handOver(vm.people[1])
         await vm.setAccess(vm.people[1], nil)
         XCTAssertTrue(draft.draft.isEmpty)
-        XCTAssertEqual(vm.result, "Zubair won't get it.")
+        XCTAssertEqual(vm.result, "Zubair won't get this task.")
 
         // Reopening pins a handed-over pick first, like any other.
         await vm.tap(vm.people[0])

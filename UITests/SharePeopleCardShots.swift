@@ -231,6 +231,10 @@ final class SharePeopleCardShots: XCTestCase {
             let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
             let allow = springboard.buttons["Allow"].firstMatch
             if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(600_000) }
+            // A shared simulator can carry an offered tour (its state lives in
+            // the app's defaults) — the welcome card covers the +; decline it.
+            let notNow = app.buttons["Not now"].firstMatch
+            if notNow.waitForExistence(timeout: 3) { notNow.tap(); usleep(600_000) }
 
             let newTask = app.buttons["New task"].firstMatch
             expect(newTask, "[\(theme)] the demo boot never showed the + (New task)", timeout: 40)
@@ -311,9 +315,12 @@ final class SharePeopleCardShots: XCTestCase {
             // 1 · Maya at the default Can edit → "Maya · can edit".
             guard openPicker("open-1") else { app.terminate(); continue }
             XCTAssertTrue(editGrade.isSelected, "[\(theme)] the grade switch defaults to Can edit")
+            XCTAssertFalse(app.buttons["share-manage-people"].exists,
+                           "[\(theme)] Manage people would leave the unsaved task — hidden before it exists")
             shot("02-picker-open-\(theme)")
             pick("Maya Chen", shootList: "03-choose-someone-list-\(theme)")
             expect(picked("Maya Chen, Can edit"), "[\(theme)] Maya is not shown as picked at Can edit")
+            expect(app.staticTexts["✓ Maya can edit once you add the task."].firstMatch, "[\(theme)] no pick confirmation")
             closePicker()
             XCTAssertEqual(row.value as? String, "Maya can edit", "[\(theme)] one pick")
             shot("04-row-one-picked-\(theme)")
@@ -376,7 +383,7 @@ final class SharePeopleCardShots: XCTestCase {
             guard openPicker("reopen-6") else { app.terminate(); continue }
             if openMenu("Maya Chen, Can edit") { app.buttons["Hand over"].firstMatch.tap(); usleep(900_000) }
             expect(picked("Maya Chen, Handed over"), "[\(theme)] Maya is not shown as handed over")
-            expect(app.staticTexts.matching(NSPredicate(format: "label CONTAINS 'as their task when you add it'")).firstMatch,
+            expect(app.staticTexts["✓ Maya gets it as their task once you add it — you keep view."].firstMatch,
                    "[\(theme)] no pre-create hand-over line")
             shot("11-picker-handed-over-\(theme)")
             closePicker()

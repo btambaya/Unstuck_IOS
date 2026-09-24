@@ -12,33 +12,37 @@ final class ShareDraftTests: XCTestCase {
 
     // MARK: THE SHARED CASES — the summary rule, verbatim on iOS / Android / web
 
-    /// One row per case: the picks as (name, level) — "e" Can edit (partner),
-    /// "v" Can view (view), "h" Hand over (assign) — and the row's text at the
-    /// default budget of 28 characters. Android (ShareWithSummaryTest) and web
-    /// (pre-create-share.test) carry the same table.
+    /// One row per case: the picks IN PICK ORDER as (name, level) — "e" Can
+    /// edit (partner), "v" Can view (view), "h" Hand over (assign); a name with
+    /// an "@" is a held address, anything else a connection — and the row's
+    /// text at the default budget of 28 characters. The summary names
+    /// connections first (pick order), then held addresses (pick order).
+    /// Android (ShareWithSummaryTest) and web (pre-create-share.test) carry the
+    /// same table.
     static let sharedCases: [(picks: [(String, String)], text: String)] = [
         ([], "Only you"),
         // 1 → "<Name> · can edit|can view|handed over"
         ([("James Wilson", "e")], "James · can edit"),
         ([("James Wilson", "v")], "James · can view"),
         ([("James Wilson", "h")], "James · handed over"),
-        // 2, same grade → "<A>, <B> · <grade>"
+        // 2, same grade → "<A>, <B> · <grade>" (an address picked first still comes second)
         ([("James Wilson", "e"), ("Anna Berg", "e")], "James, Anna · can edit"),
-        ([("James Wilson", "v"), ("Anna Berg", "v")], "James, Anna · can view"),
+        ([("anna@example.com", "v"), ("James Wilson", "v")], "James, anna · can view"),
         ([("James Wilson", "h"), ("Anna Berg", "h")], "James, Anna · handed over"),
         // 2, mixed → "<A> · edit, <B> · view"
         ([("James Wilson", "e"), ("Anna Berg", "v")], "James · edit, Anna · view"),
         ([("Anna Berg", "v"), ("James Wilson", "e")], "Anna · view, James · edit"),
-        // 3+ → "<First> + N more", " · <grade>" ONLY when everyone has the same one
+        // 3+ → "<First> + N more", " · <grade>" ONLY when everyone has the same one;
+        // <First> is the first CONNECTION picked when there is one
         ([("James Wilson", "e"), ("Anna Berg", "e"), ("Sam O'Brien", "e")], "James + 2 more · can edit"),
-        ([("James Wilson", "v"), ("Anna Berg", "v"), ("Sam", "v"), ("Maya Chen", "v"), ("Kai", "v")],
-         "James + 4 more · can view"),
+        ([("sam@example.com", "v"), ("kai@example.com", "v"), ("James Wilson", "v"), ("Anna Berg", "v"),
+          ("Maya Chen", "v")], "James + 4 more · can view"),
         ([("James Wilson", "h"), ("Anna Berg", "h"), ("Sam", "h")], "James + 2 more · handed over"),
         ([("James Wilson", "e"), ("Anna Berg", "v"), ("Sam O'Brien", "e")], "James + 2 more"),
         ([("Ivy Park", "e"), ("Sam O'Brien", "e"), ("Kai Lee", "e")], "Ivy + 2 more · can edit"),
-        // addresses: the part before the @
+        // addresses: the part before the @, named AFTER the connections
         ([("maya@example.com", "v")], "maya · can view"),
-        ([("James Wilson", "e"), ("maya@example.com", "v")], "James · edit, maya · view"),
+        ([("maya@example.com", "v"), ("James Wilson", "e")], "James · edit, maya · view"),
         // blank → "Someone"
         ([("", "e")], "Someone · can edit"),
         // long names are cut with "…" BEFORE the grade — the grade always shows
@@ -137,6 +141,30 @@ final class ShareDraftTests: XCTestCase {
         // No special case (web and Android have none): first names, as written.
         XCTAssertEqual(shareDraftSummary([person("u1", "Maya Chen"), person("u2", "Maya Lopez")]).text,
                        "Maya, Maya · can edit")
+    }
+
+    func testConnectionsComeFirstThenAddressesEachInPickOrder() {
+        var d = ShareDraft()
+        d.addEmail("zoe@example.com", access: .edit)
+        d.pick(userId: "u1", name: "James Wilson", access: .edit)
+        d.addEmail("amy@example.com", access: .view)
+        d.pick(userId: "u2", name: "Anna Berg", access: .view)
+        XCTAssertEqual(shareDraftSummaryOrder(d.picks).map(\.id),
+                       ["user:u1", "user:u2", "email:zoe@example.com", "email:amy@example.com"])
+        XCTAssertEqual(shareDraftSummary(d.picks).text, "James + 3 more")
+        XCTAssertEqual(shareDraftSummary(d.picks).spoken, "James can edit, Anna can view, zoe can edit, amy can view",
+                       "the spoken form reads in the same order")
+        // Addresses among themselves keep pick order (never alphabetical).
+        var two = ShareDraft()
+        two.addEmail("zoe@example.com", access: .edit)
+        two.addEmail("amy@example.com", access: .edit)
+        XCTAssertEqual(shareDraftSummary(two.picks).text, "zoe, amy · can edit")
+        // Only the summary is ordered: the draft (and so submit) keeps pick order.
+        XCTAssertEqual(d.picks.map(\.id), ["email:zoe@example.com", "user:u1", "email:amy@example.com", "user:u2"])
+        // Already ordered → unchanged.
+        let ordered = shareDraftSummaryOrder(d.picks)
+        XCTAssertEqual(shareDraftSummaryOrder(ordered), ordered)
+        XCTAssertEqual(shareDraftSummaryOrder([]), [])
     }
 
     // MARK: the local selection
@@ -268,15 +296,25 @@ final class ShareDraftTests: XCTestCase {
 
     // MARK: pre-create lines
 
-    func testPreCreateLinesSayWhatWillHappen() {
-        XCTAssertEqual(shareDraftResultLine(.shared(name: "Maya Chen", access: .edit)),
-                       "Maya will get it when you add the task — they can edit.")
-        XCTAssertEqual(shareDraftResultLine(.invited(email: "x@y.com")), "x@y.com will get it when you add the task.")
-        XCTAssertEqual(shareDraftResultLine(.accessChanged(name: "Maya Chen", access: .view)), "Maya will be able to view.")
+    /// The confirmation line after each pre-create action — the SAME strings
+    /// on iOS, Android and web (decided 2026-09-24).
+    func testPreCreateLinesAreTheDecidedStrings() {
+        // pick / grade change
+        XCTAssertEqual(shareDraftResultLine(.shared(name: "Maya Chen", access: .edit)), "Maya can edit once you add the task.")
+        XCTAssertEqual(shareDraftResultLine(.shared(name: "Maya Chen", access: .view)), "Maya can view once you add the task.")
+        XCTAssertEqual(shareDraftResultLine(.accessChanged(name: "Maya Chen", access: .view)),
+                       "Maya can view once you add the task.")
+        XCTAssertEqual(shareDraftResultLine(.accessChanged(name: "Maya Chen", access: .edit)),
+                       "Maya can edit once you add the task.")
+        // hand over
         XCTAssertEqual(shareDraftResultLine(.handedOver(name: "Maya Chen")),
-                       "Maya will get it as their task when you add it — you keep view.")
-        XCTAssertEqual(shareDraftResultLine(.removed(name: "Maya Chen")), "Maya won't get it.")
-        XCTAssertEqual(shareDraftResultLine(.inviteCancelled(email: "x@y.com")), "x@y.com won't get it.")
+                       "Maya gets it as their task once you add it — you keep view.")
+        // add an address (the address as typed, normalised)
+        XCTAssertEqual(shareDraftResultLine(.invited(email: "maya@example.com")), "maya@example.com gets it once you add the task.")
+        // remove — a person by first name, an address by the part before the @
+        XCTAssertEqual(shareDraftResultLine(.removed(name: "Maya Chen")), "Maya won't get this task.")
+        XCTAssertEqual(shareDraftResultLine(.inviteCancelled(email: "maya@example.com")), "maya won't get this task.")
+        XCTAssertEqual(shareDraftResultLine(.removed(name: "Someone")), "Someone won't get this task.")
         XCTAssertTrue(shareDraftResultLine(.linkCopied(kind: .task)).hasPrefix("Invite link copied"))
         for r: ShareResult in [.shared(name: "Maya", access: .edit), .invited(email: "x@y.com"),
                                .accessChanged(name: "Maya", access: .edit), .handedOver(name: "Maya")] {

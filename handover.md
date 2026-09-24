@@ -63,6 +63,10 @@ a side-by-side cross-check found differences and ONE behaviour was decided for i
   NAMES are cut with "…" (water-filling: each name capped at the largest length that fits, a short name stays whole;
   never below one letter + "…") so the grade always shows. First names; an address shows the part before the @;
   blank = "Someone". No same-first-name special case (web / Android have none) — "Maya, Maya · can edit".
+  ORDER (final decision, 2026-09-24): connections first (pick order), then held addresses (pick order) —
+  `shareDraftSummaryOrder`, used by the summary, its spoken form and the row's monograms; the draft itself (and so
+  submit) keeps pick order. Cut names share ONE common cap (not a half split). Web keeps pixel-fitting on wide rows
+  but must give exactly these strings at budget 28.
   `ShareDraftTests.sharedCases` is the shared table (26 cases) the Android and web tests mirror.
 - **The picker is the Share screen**, in PRE-CREATE mode: `ShareScreen(target: .task(id: "", name:), draft:)`. Its
   transport is `DraftShareTransport` (ShareScreen.swift): the roster comes from the live transport (or the
@@ -70,9 +74,11 @@ a side-by-side cross-check found differences and ONE behaviour was decided for i
   switch (Can edit / Can view, default Can edit), the who-has-it card, the searchable "Choose someone" picker and
   "Someone new" work unchanged. A picked person's menu is **Can edit / Can view / Hand over / Remove**
   (`ShareScreenModel.handOver`, pre-create only → level `assign`, the level web and Android send; no one-hand-over
-  limit — the server, web and Android have none). Result lines: `shareDraftResultLine` ("Maya will get it when you
-  add the task — they can edit.", "Maya will get it as their task when you add it — you keep view.", never
-  "Shared with…").
+  limit — the server, web and Android have none). Confirmation lines (`shareDraftResultLine`, the SAME strings on
+  all three, final 2026-09-24): pick / grade change "Maya can edit|view once you add the task." · hand over "Maya
+  gets it as their task once you add it — you keep view." · add an address "maya@example.com gets it once you add
+  the task." · remove "Maya won't get this task." (an address by the part before the @: "maya won't get this
+  task."). Never "Shared with…".
 - **Someone new (pre-create)** = HELD: the button says "Add"; a typed address is listed as "Gets it when you add
   the task · can edit" (✕ removes), counted in the row summary by its local part, and shared with THIS task on
   save via `share-task add` (existing account → shared at once; no account → an invite claimed on sign-up).
@@ -80,8 +86,9 @@ a side-by-side cross-check found differences and ONE behaviour was decided for i
 - **Hidden in pre-create:** "Share a link" (a task link needs the task) → replaced by the ONE **"Invite with a
   link"** row, the connect-only `circle-invite {}` link (transport method `inviteToConnect`, default
   `.failed("not_configured")` for fakes) — web and Android now have the same row; Report… and Block… on a picked
-  row (both still exist on the task's own Share screen / Settings › People). "Manage people" (from main's slim
-  Settings) stays — it pushes Settings › People inside the Share screen's own stack.
+  row (both still exist on the task's own Share screen / Settings › People), and "Manage people" (final decision
+  2026-09-24: pushing Settings › People would leave the unsaved task — web lost it; hidden on all three). It stays
+  on an existing task's / list's Share screen.
 - **Submit** is the same path, fed from the draft: `draft.userShares` (partner / view / assign) →
   `applyCreateShares(task:shares:emails:)` (flush the insert, then task_share + share-notify per person, then
   `share-task add` per held address). Fire-and-forget: a failed share never blocks creation. The keyboard is put
@@ -93,18 +100,18 @@ a side-by-side cross-check found differences and ONE behaviour was decided for i
   `.task`/`.onDisappear`), the inline invite panel and explainer.
 - **Review fixes:** a connection with no display name is picked as "Someone" (not "them"); the "Someone new"
   placeholder can't be autolinked blue (main's `String(...)` form kept at the merge).
-- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 19 incl. the shared table, every-budget grade check, hand-over
+- **Tests:** `ShareDraftTests` (UnstuckCoreTests, 20 incl. the shared table, connections-before-addresses, every-budget grade check, hand-over
   as a level, addresses never handed over, spoken forms, pre-create lines). `ShareScreenPreCreateTests`
-  (UnifiedSharingScreenTests.swift, 14) — nothing reaches the server, picks / grade changes / hand-over / removals /
+  (UnifiedSharingScreenTests.swift, 15, incl. an address added before a person) — nothing reaches the server, picks / grade changes / hand-over / removals /
   held addresses land in the draft, re-open pins the picks (a hand-over too), `handOver` is a no-op outside
   pre-create, the invite link is a connect invite, the levels submit hands `applyCreateShares`. Screenshots:
   `SharePeopleCardShots.testNewTaskShareRowShots` (light + dark; SHARE_ROW_SHOTS_DIR, default
-  /tmp/unstuck-share-row-shots) walks 01 nothing picked · 02/03 picker + Choose someone · 04 one · 05 two same ·
+  /tmp/unstuck-share-row-shots; declines an offered tour; asserts no Manage people in pre-create) walks 01 nothing picked · 02/03 picker + Choose someone · 04 one · 05 two same ·
   06 the person menu · 07 two mixed · 08 held address + Invite with a link · 09 three mixed · 10 three same ·
   11 hand-over in the picker · 12 the row with a hand-over, closing and reopening the picker between steps.
 - **Merged main** (build 98, Settings slim-down) into this branch on 2026-09-24: NewTaskSheet keeps main's
   "remembers the last estimate" (`model.settings.focusDefaultMin = estimate` in `submit()`) and this branch's share
-  row; ShareScreen keeps main's "Manage people" link and placeholder form.
+  row; ShareScreen keeps main's "Manage people" link (hidden in pre-create since the final pass) and placeholder form.
 
 ## Slim Settings (branch settings/ios, 2026-09-24) — not shipped yet
 

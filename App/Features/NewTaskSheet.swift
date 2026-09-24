@@ -340,7 +340,9 @@ struct NewTaskSheet: View {
     /// Labelled "SHARE" like the sections around it (Tags, Repeat) — the
     /// same label web and Android put above the row.
     private var shareSection: some View {
-        let picks = shareDraft?.draft.picks ?? []
+        // Connections first, then held addresses — the summary's order, so
+        // the first monogram is the first name it reads.
+        let picks = shareDraftSummaryOrder(shareDraft?.draft.picks ?? [])
         let summary = shareDraftSummary(picks)
         return VStack(alignment: .leading, spacing: 7) {
             SectionLabel("Share")
