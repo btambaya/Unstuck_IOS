@@ -106,7 +106,31 @@ extension View {
     /// Mark this view as a tour spotlight anchor (the iOS `data-tour="…"`).
     /// Invisible; adds no layout or interaction.
     func tourTarget(_ id: TourTargetID) -> some View {
-        background(TourAnchorReader(id: id).allowsHitTesting(false))
+        background(TourAnchorSlot(id: id))
+    }
+}
+
+/// The anchor, unless the environment switched anchors off (snapshots only).
+private struct TourAnchorSlot: View {
+    @Environment(\.tourAnchorsEnabled) private var enabled
+    let id: TourTargetID
+    var body: some View {
+        if enabled { TourAnchorReader(id: id).allowsHitTesting(false) }
+    }
+}
+
+private struct TourAnchorsEnabledKey: EnvironmentKey {
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    /// False ONLY for off-screen snapshots (ImageRenderer): it can't flatten
+    /// the UIKit anchor view and paints a yellow placeholder where it sits —
+    /// e.g. behind the bar's +. A snapshot has no window, so nothing could
+    /// have registered anyway. The app never sets this.
+    var tourAnchorsEnabled: Bool {
+        get { self[TourAnchorsEnabledKey.self] }
+        set { self[TourAnchorsEnabledKey.self] = newValue }
     }
 }
 

@@ -1,7 +1,8 @@
-// Root scaffold matching the Android design: a custom bottom nav
-// (Today · Tasks · [coral FAB] · Calendar · Collections) with a pill active
-// indicator + a floating rounded-square coral FAB. The selected tab's screen
-// fills the area above the bar; each screen keeps its own NavigationStack.
+// Root scaffold matching the Android design: a custom bottom nav — one row of
+// five equal slots, Today · Tasks · [coral +] · Calendar · Collections — with a
+// pill active indicator; the rounded-square coral + sits IN the row (not lifted
+// above it). The selected tab's screen fills the area above the bar; each
+// screen keeps its own NavigationStack.
 
 import SwiftUI
 import UnstuckCore

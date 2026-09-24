@@ -394,14 +394,23 @@ struct CallSettingsView: View {
         // "Booked — ringing at …" line would be a lie.
         let now = Date()
         let at = now.addingTimeInterval(60)
-        if let e = CallToolLogic.timeGuard(at, now: now) {
-            testState = .failed(e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst + ".")
+        // The lines below are READ by the user: times in the phone's clock.
+        let clock = ClockFormat.device
+        if !CallSettings.isWithinServerWindow(at) {
+            // The model's timeGuard string carries machine HH:MM — say it here.
+            testState = .failed("Calls can only be booked between \(clock.time(CallSettings.serverWindowStart)) and \(clock.time(CallSettings.serverWindowEnd)) — try the test call inside that window.")
+            return
+        }
+        // Any other refusal, in the user's words and clock (the guard's own
+        // `error:` string carries the model's machine HH:MM).
+        if let refusal = CallSettings.bookingRefusal(at, now: now, fix: "try the test call again in a minute", clock: clock) {
+            testState = .failed(refusal)
             return
         }
         if !CallSettings.isWithinWindow(at) {
             let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
-                                                refusing: CallSettings.minuteOfDay(at))
-            testState = .failed("\(CallSettings.hhmm(at)) is outside your call hours (\(hours)), so this iPhone would decline it. Widen the hours above to try it now.")
+                                                refusing: CallSettings.minuteOfDay(at), clock: clock)
+            testState = .failed("\(clock.time(at, calendar: .current)) is outside your call hours (\(hours)), so this iPhone would decline it. Widen the hours above to try it now.")
             return
         }
         testState = .booking
@@ -418,7 +427,7 @@ struct CallSettingsView: View {
                 let row = try await store.client.create(userId: uid, callAt: at, label: Self.testCallLabel,
                                                         notes: [Self.testCallNote], kind: "test")
                 try? store.mirror.upsert(row)
-                testState = .booked(CallSettings.hhmm(at))
+                testState = .booked(clock.time(at, calendar: .current))
             } catch {
                 testState = .failed("Couldn't book the test call. Check your connection and try again.")
             }
@@ -439,9 +448,3 @@ struct CallSettingsView: View {
     }
 }
 
-private extension String {
-    var capitalizedFirst: String {
-        guard let f = first else { return self }
-        return f.uppercased() + dropFirst()
-    }
-}

@@ -15,8 +15,10 @@ final class AssistantReceiptsTests: XCTestCase {
                  createdAt: "2026-08-01T10:00:00Z", updatedAt: "2026-08-01T10:00:00Z")
     }
 
-    private func r(_ name: String, _ result: String, args: ReceiptArgs = ReceiptArgs(), tasks: [TaskItem] = [], tone: Tone = .gentle) -> Receipt? {
-        deriveReceipt(name: name, args: args, result: result, tasks: tasks, tone: tone)
+    // The web vectors are 24-hour; the 12-hour cards are pinned separately.
+    private func r(_ name: String, _ result: String, args: ReceiptArgs = ReceiptArgs(), tasks: [TaskItem] = [],
+                   tone: Tone = .gentle, clock: ClockFormat = .h24) -> Receipt? {
+        deriveReceipt(name: name, args: args, result: result, tasks: tasks, tone: tone, clock: clock)
     }
 
     // MARK: deriveReceipt
@@ -30,9 +32,24 @@ final class AssistantReceiptsTests: XCTestCase {
     func testScheduleTaskCarriesDateAndTimeFromArgs() {
         let r = deriveReceipt(name: "schedule_task",
                               args: ReceiptArgs(date: "2026-08-04", startTime: "15:00"),
-                              result: "ok: scheduled \"Dentist\" 2026-08-04 15:00", tasks: [])
+                              result: "ok: scheduled \"Dentist\" 2026-08-04 15:00", tasks: [], clock: .h24)
         XCTAssertEqual(r?.label, "Scheduled “Dentist” · 2026-08-04 15:00")
         XCTAssertNil(r?.undo)
+    }
+
+    /// The card shows the time in the user's clock; the tool's "15:00" is
+    /// machine format (2026-09-24).
+    func testReceiptTimesFollowTheClock() {
+        let args = ReceiptArgs(date: "2026-08-04", startTime: "15:00")
+        let result = "ok: scheduled \"Dentist\" 2026-08-04 15:00"
+        XCTAssertEqual(deriveReceipt(name: "schedule_task", args: args, result: result, tasks: [], clock: .h12)?.label,
+                       "Scheduled “Dentist” · 2026-08-04 3:00 PM")
+        XCTAssertEqual(deriveReceipt(name: "schedule_task", args: args, result: result, tasks: [], clock: .h24)?.label,
+                       "Scheduled “Dentist” · 2026-08-04 15:00")
+        XCTAssertEqual(r("request_call", "ok: call booked 2026-09-03 14:45 \"speak to James\" (1 note) id=cr1", clock: .h12)?.label,
+                       "Call booked Thu 2:45 PM — speak to James · 1 note")
+        XCTAssertEqual(r("update_call", "ok: updated call \"speak to James\" — 2026-09-04 09:00, 2 notes", clock: .h12)?.label,
+                       "Call updated Fri 9:00 AM — speak to James · 2 notes")
     }
 
     func testCompleteTaskFindsTheCompletedTaskForTheUncompleteUndo() {

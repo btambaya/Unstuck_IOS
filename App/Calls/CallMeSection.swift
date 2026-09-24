@@ -58,9 +58,11 @@ struct CallMeSection: View {
         guard CallSettings.enabled else {
             return "Calls are off on this iPhone, so it would decline this call. Switch them on in Settings › Notifications & calls."
         }
+        // Times in the phone's own 12/24-hour clock (2026-09-24).
+        let clock = ClockFormat.device
         let hours = CallSettings.hoursLabel(start: CallSettings.windowStart, end: CallSettings.windowEnd,
-                                            refusing: CallSettings.minuteOfDay(callAt))
-        return "\(CallSettings.hhmm(callAt)) is outside this iPhone's call hours (\(hours)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Notifications & calls."
+                                            refusing: CallSettings.minuteOfDay(callAt), clock: clock)
+        return "\(clock.time(callAt, calendar: .current)) is outside this iPhone's call hours (\(hours)), so it would decline this call. Pick another lead, move the task, or widen the hours in Settings › Notifications & calls."
     }
     /// Booking, or changing the ring time (lead / slot), meets the hint;
     /// a notes-only edit of an existing row doesn't — update_call's rule.
@@ -135,7 +137,10 @@ struct CallMeSection: View {
             }
             HStack(spacing: 10) {
                 if let callAt {
-                    Text("Rings \(CallToolLogic.fmt(callAt))").font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
+                    // The day as before; the time in the phone's clock (the
+                    // tools' "YYYY-MM-DD HH:MM" is machine format).
+                    Text("Rings \(CallToolLogic.ymd(callAt)) \(ClockFormat.device.time(callAt, calendar: .current))")
+                        .font(UFont.sans(12)).foregroundStyle(theme.palette.ink2)
                 }
                 Spacer()
                 Button { save() } label: {
@@ -243,8 +248,10 @@ struct CallMeSection: View {
     private func save() {
         guard let store, let callAt, let block = nextBlock,
               let uid = model.coordinator?.auth.currentUserId else { return }
-        if let e = CallToolLogic.timeGuard(callAt, now: Date()) {
-            error = e.replacingOccurrences(of: "error: ", with: "").capitalizedFirst
+        // In the user's words and clock — timeGuard's `error:` string is the
+        // model's (machine HH:MM + "ask for a later time"; 2026-09-24).
+        if let refusal = CallSettings.bookingRefusal(callAt, now: Date(), fix: "pick a shorter lead or move the task") {
+            error = refusal
             return
         }
         // The button is disabled while the hint applies to a booking or a
@@ -297,9 +304,3 @@ struct CallMeSection: View {
     }
 }
 
-private extension String {
-    var capitalizedFirst: String {
-        guard let f = first else { return self }
-        return f.uppercased() + dropFirst()
-    }
-}

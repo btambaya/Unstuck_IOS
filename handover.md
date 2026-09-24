@@ -148,6 +148,52 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   through the session” first." Leave question: "Leave this session?" / "Your timer keeps running. You can pick it
   back up from Today." / Leave · Leave and don't ask again · Stay. Aliases: the reduced-form matcher + `facts`.
 
+## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
+
+Ahmad: "Can the plus just be on same line as everything". The coral + was a 56-pt square lifted 28 pt above the bar
+(it covered the last row scrolled under it); it is now the middle one of FIVE equal slots — Today · Tasks · + ·
+Calendar · Collections — a flat 44×44, 13-pt rounded coral square (white SF "plus" 20 pt semibold, no shadow),
+centred on the tab cells (icon pill + label) so it reads as one line. Same as Android's BottomNavBar.kt.
+
+- **One baseline.** Every tab icon draws in the same 24×22 box (`BottomNavBar.iconBox`): the taller
+  `square.stack.3d.up` used to make the Collections cell taller, so its label sat ~3 pt below the others. Labels are
+  held to one line (`minimumScaleFactor(0.8)`), so a wrapped label can't knock a cell off the row.
+- **Unchanged:** `onFab` / `fabAction`, the VoiceOver label (`fabLabel`), the tour's `new-task` anchor (now hugging
+  the 44-pt square), the hairline, bar colour, safe area, the active pill, theme coral. Only the 44×44 square takes
+  taps (the rest of its slot is dead, as the old gap was).
+- **Left alone on purpose:** every tab root still pads 96 pt at the bottom ("clear the floating bottom nav"), and the
+  assistant launcher's 96 pt is matched to it. The bar is now 60.3 pt (was 63.7 + the 28-pt lift), so a list scrolled
+  to its end shows ~36 pt of empty space above the bar. Trimming it (to ~68–72) moves the launcher — Ahmad's call.
+- `tourTarget` reads a new `\.tourAnchorsEnabled` environment switch (default on, never set by the app): only
+  off-screen snapshots turn it off, because ImageRenderer paints a yellow placeholder for the UIKit anchor view.
+- Test: `FabActionTests.testThePlusSitsInTheTabRow` renders the bar (ImageRenderer, 3x, 430 pt, light + dark, Today
+  + Collections active) and checks from the pixels: + is 44 pt, horizontally centred, centred on the cells, no coral
+  above the hairline, the four label tops within 1 pt. It fails on the old bar. PNGs only when `UNSTUCK_RENDER_DIR`
+  is set (`TEST_RUNNER_UNSTUCK_RENDER_DIR=…` on xcodebuild).
+
+## One clock: the phone's 12/24-hour setting everywhere (branch clock/ios, 2026-09-24) — not shipped yet
+
+Ahmad: "On the calendar we need to be consistent — either 12 hour or 24h, not both." His 24-hour iPhone showed
+"THURSDAY · 2:02 PM" on Today next to 14:02 elsewhere; every screen hard-coded its own format. RULE: every clock time
+the user SEES goes through `UnstuckCore.ClockFormat` (Sources/UnstuckCore/Support/ClockFormat.swift) —
+`ClockFormat.device` (cached; dropped on NSLocale.currentLocaleDidChange and on every .active via `refreshDevice()`)
+follows Settings › 24-Hour Time (template "j" → 12h when it has a/b/B/h/K outside quotes). 24h "14:30", whole hours
+in tight spots "14:00" (never "14"); 12h "2:30 PM" / "2 PM" with the locale's AM/PM; ranges "14:00–15:30" /
+"2:00–3:30 PM". Routed: Today eyebrow, Day + Week grid hour labels, block chips, block-edit + New-task time chips,
+task-editor schedule line, shared blocks / month peek / shared rows + detail, collection "by" times, Insights heatmap
+axis + VoiceOver summary, receipts (schedule + call cards), the chat polish time rule, the Calls settings / task
+editor lines, the "Rescheduled" notification, the interview's Before/After chips. NOT routed (machine / model text):
+tool args + results, AssistantContext, call instructions + day context, `hoursLabel` with no clock (the model's
+`error:` strings), storage/API/Google HH:MM, logs, the web-port `hourSpanLabel` in read_insights. Pure Core display
+helpers take `clock: ClockFormat = .device`; tests pin `.h12` / `.h24` (ClockFormatTests + the touched suites).
+Review pass (same day): a `timeGuard` refusal is never shown raw any more — the task editor's "Call me" Book/Update
+and the test call use `CallSettings.bookingRefusal` ("8:50 AM has already passed — pick a shorter lead or move the
+task"), not the model's "08:50 today is already past (it's 14:00 now). Ask for a later time …"; the "Plan a quiet
+weekend" chip's message (the user's own bubble) says "nothing before 10:00" / "10 AM"; a 12-hour range drops the
+start's marker only when the end follows it in the same half-day (an overnight "1:00 AM–12:30 AM" keeps both).
+Cross-platform decision: the interview's never-schedule chips + their echoed bubble follow the clock ("Before 09:00" /
+"Before 9 AM"), the saved fact stays "Never schedule anything before 9am" (InterviewThreadTests pins both clocks).
+
 ## Every N weeks (branch nweeks/ios, 2026-09-24) — not shipped yet
 
 Zubair asked for "every two weeks on Thursdays"; Ahmad approved it the same morning (week = ISO Monday; UI chips

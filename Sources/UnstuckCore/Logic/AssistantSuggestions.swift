@@ -77,11 +77,15 @@ private func openTasks(_ tasks: [TaskItem]) -> [TaskItem] {
     tasks.filter { !$0.done && $0.recurrence == nil }
 }
 
+/// `clock`: the user's 12/24-hour clock for a time inside a chip's message —
+/// the tapped message is the user's own bubble in the thread, so "nothing
+/// before 10am" read 12-hour on a 24-hour phone (2026-09-24). Tests pin it.
 public func buildSuggestions(
     tasks: [TaskItem],
     blocks: [CalBlock],
     collections: [ItemCollection],
-    todayIso: String
+    todayIso: String,
+    clock: ClockFormat = .device
 ) -> SuggestionGroups {
     let open = openTasks(tasks)
     var gettingStarted: [AssistantSuggestion] = []
@@ -135,7 +139,7 @@ public func buildSuggestions(
         let (sat, sun) = nextWeekend(todayIso)
         planAndSchedule.append(.init(
             label: "Plan a quiet weekend",
-            message: "Schedule my lighter personal and home tasks across \(sat) and \(sun), spaced out with breathing room — nothing before 10am, and leave the rest of the weekend free."))
+            message: "Schedule my lighter personal and home tasks across \(sat) and \(sun), spaced out with breathing room — nothing before \(clock.shortTime(minutes: 10 * 60)), and leave the rest of the weekend free."))
     }
     if todayBlocks.isEmpty && !open.isEmpty {
         planAndSchedule.append(.init(

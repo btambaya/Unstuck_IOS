@@ -263,10 +263,10 @@ struct NewTaskSheet: View {
             chipScroll {
                 chip("Custom…", selected: false) { openTimePicker() }
                 if let pt = pickedTime, !slots.contains(where: { $0.startTime == pt }) {
-                    chip(formatTime(pt), selected: true) { openTimePicker() }
+                    chip(ClockFormat.device.time(pt), selected: true) { openTimePicker() }
                 }
                 ForEach(slots, id: \.startTime) { s in
-                    chip(formatTime(s.startTime), selected: pickedTime == s.startTime) {
+                    chip(ClockFormat.device.time(s.startTime), selected: pickedTime == s.startTime) {
                         pickedTime = s.startTime; autoTime = false
                     }
                 }

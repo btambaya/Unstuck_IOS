@@ -176,16 +176,16 @@ final class ShareVisibleInTests: XCTestCase {
         XCTAssertEqual(shareBucket(row, todayISO: TODAY, timeZone: tokyo), .upcoming)
         // The slot + planned labels read in the recipient's zone too.
         XCTAssertEqual(sharedSlotLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
-                                       nextStartAt: row.nextStartAt, todayISO: TODAY, timeZone: london),
+                                       nextStartAt: row.nextStartAt, todayISO: TODAY, timeZone: london, clock: .h24),
                        "Today 16:30 · 45m")
         XCTAssertEqual(sharedSlotLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
-                                       nextStartAt: row.nextStartAt, todayISO: TODAY, timeZone: tokyo),
+                                       nextStartAt: row.nextStartAt, todayISO: TODAY, timeZone: tokyo, clock: .h24),
                        "Tomorrow 00:30 · 45m")
         XCTAssertEqual(sharedPlannedLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
-                                          nextDone: false, nextStartAt: row.nextStartAt, timeZone: london),
+                                          nextDone: false, nextStartAt: row.nextStartAt, timeZone: london, clock: .h24),
                        "Planned Thu, May 21 · 16:30 · 45m")
         XCTAssertEqual(sharedPlannedLabel(nextDate: row.nextDate, nextStartTime: row.nextStartTime, nextDurationMinutes: 45,
-                                          nextDone: true, nextStartAt: row.nextStartAt, timeZone: london),
+                                          nextDone: true, nextStartAt: row.nextStartAt, timeZone: london, clock: .h24),
                        "Done Thu, May 21 · 16:30 · 45m")
     }
 
@@ -358,11 +358,11 @@ final class SharedSlotLabelTests: XCTestCase {
     }
 
     func testSlotLabelFromTheNextBlock() {
-        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-23", nextStartTime: "04:30", nextDurationMinutes: 45, todayISO: TODAY),
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-23", nextStartTime: "04:30", nextDurationMinutes: 45, todayISO: TODAY, clock: .h24),
                        "Sat 04:30 · 45m")
-        XCTAssertEqual(sharedSlotLabel(nextDate: TODAY, nextStartTime: "09:00", nextDurationMinutes: 25, todayISO: TODAY),
+        XCTAssertEqual(sharedSlotLabel(nextDate: TODAY, nextStartTime: "09:00", nextDurationMinutes: 25, todayISO: TODAY, clock: .h24),
                        "Today 09:00 · 25m")
-        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-15", nextStartTime: "09:00", nextDurationMinutes: 45, todayISO: TODAY),
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-15", nextStartTime: "09:00", nextDurationMinutes: 45, todayISO: TODAY, clock: .h24),
                        "Overdue · Fri 09:00 · 45m")
         // Missing pieces are simply omitted.
         XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-23", nextStartTime: nil, nextDurationMinutes: nil, todayISO: TODAY), "Sat")
@@ -374,15 +374,34 @@ final class SharedSlotLabelTests: XCTestCase {
     }
 
     func testPlannedLabelForTheDetail() {
-        XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-23", nextStartTime: "04:30", nextDurationMinutes: 45, nextDone: false),
+        XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-23", nextStartTime: "04:30", nextDurationMinutes: 45, nextDone: false, clock: .h24),
                        "Planned Sat, May 23 · 04:30 · 45m")
         // A finished past block still says when the task WAS.
-        XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-15", nextStartTime: "09:00", nextDurationMinutes: 45, nextDone: true),
+        XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-15", nextStartTime: "09:00", nextDurationMinutes: 45, nextDone: true, clock: .h24),
                        "Done Fri, May 15 · 09:00 · 45m")
         XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-23", nextStartTime: nil, nextDurationMinutes: nil, nextDone: nil),
                        "Planned Sat, May 23")
         XCTAssertNil(sharedPlannedLabel(nextDate: nil, nextStartTime: "09:00", nextDurationMinutes: 45, nextDone: nil))
         XCTAssertNil(sharedPlannedLabel(nextDate: "nope", nextStartTime: nil, nextDurationMinutes: nil, nextDone: nil))
+    }
+
+    /// The slot reads in the RECIPIENT's clock — a 12-hour phone never sees a
+    /// 24-hour "04:30" here while the rest of the app says "4:30 AM".
+    func testSlotAndPlannedLabelsFollowTheClock() {
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-23", nextStartTime: "16:30", nextDurationMinutes: 45,
+                                       todayISO: TODAY, clock: .h12),
+                       "Sat 4:30 PM · 45m")
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-23", nextStartTime: "16:30", nextDurationMinutes: 45,
+                                       todayISO: TODAY, clock: .h24),
+                       "Sat 16:30 · 45m")
+        XCTAssertEqual(sharedPlannedLabel(nextDate: "2026-05-23", nextStartTime: "04:30", nextDurationMinutes: 45,
+                                          nextDone: false, clock: .h12),
+                       "Planned Sat, May 23 · 4:30 AM · 45m")
+        // The zone shift happens first, then the clock: London 16:30 → "4:30 PM".
+        XCTAssertEqual(sharedSlotLabel(nextDate: "2026-05-22", nextStartTime: "00:30", nextDurationMinutes: 45,
+                                       nextStartAt: "2026-05-21T15:30:00+00:00", todayISO: TODAY,
+                                       timeZone: london, clock: .h12),
+                       "Today 4:30 PM · 45m")
     }
 }
 
@@ -461,6 +480,6 @@ final class SharedWithMeVisibilityTests: XCTestCase {
         XCTAssertEqual(shareBucket(parked, todayISO: TODAY), .parked)
         XCTAssertEqual(sharedSlotLabel(nextDate: future.nextDate, nextStartTime: future.nextStartTime,
                                        nextDurationMinutes: future.nextDurationMinutes, nextDone: future.nextDone,
-                                       todayISO: TODAY), "Sat 04:30 · 45m")
+                                       todayISO: TODAY, clock: .h24), "Sat 04:30 · 45m")
     }
 }

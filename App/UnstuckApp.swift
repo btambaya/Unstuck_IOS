@@ -1,5 +1,6 @@
 import BackgroundTasks
 import SwiftUI
+import UnstuckCore
 import UnstuckDesign
 
 // BackgroundSync — BGAppRefreshTask registration + scheduling (spec
@@ -146,6 +147,9 @@ struct UnstuckApp: App {
                     // offline edits + hydrate whenever the app returns to the
                     // foreground; queue the next BG refresh on exit.
                     if phase == .active {
+                        // A 12/24-hour switch made in iOS Settings while we were
+                        // away shows on the next render (2026-09-24).
+                        ClockFormat.refreshDevice()
                         // Merge any Siri-queued hands-free writes into the outbox
                         // BEFORE syncNow so they flush on this same foreground.
                         model.drainSiriWriteQueue()

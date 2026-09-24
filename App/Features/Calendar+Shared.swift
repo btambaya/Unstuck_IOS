@@ -253,10 +253,11 @@ func monthDayMarks(own: [CalBlock], shared: [SharedBlock]) -> MonthDayMarks {
 /// block — what the detail sheet shows when it was opened from a calendar
 /// tap (that block, not the projection's next one). Rendered in the
 /// recipient's zone when the row carries `startAt` (migration 053); a pre-053
-/// row reads the owner's date/time text.
-func sharedBlockPlannedLabel(_ b: SharedBlock, timeZone: TimeZone = .current) -> String? {
+/// row reads the owner's date/time text. The time is in the phone's clock.
+func sharedBlockPlannedLabel(_ b: SharedBlock, timeZone: TimeZone = .current,
+                             clock: ClockFormat = .device) -> String? {
     sharedPlannedLabel(nextDate: b.date, nextStartTime: b.startTime, nextDurationMinutes: b.durationMinutes,
-                       nextDone: b.done, nextStartAt: b.startAt, timeZone: timeZone)
+                       nextDone: b.done, nextStartAt: b.startAt, timeZone: timeZone, clock: clock)
 }
 
 // MARK: - Shared block views (read-only)
@@ -281,7 +282,7 @@ struct SharedBlockCard: View {
                     .foregroundStyle(block.done ? theme.palette.ink3 : theme.palette.ink)
             }
             if height > 34 {
-                Text("\(formatTime(block.startTime)) · \(shortName(block.ownerName))")
+                Text("\(ClockFormat.device.time(block.startTime)) · \(shortName(block.ownerName))")
                     .font(UFont.mono(9)).foregroundStyle(theme.palette.ink3).lineLimit(1)
             }
         }
@@ -293,7 +294,7 @@ struct SharedBlockCard: View {
             .strokeBorder(theme.palette.primary, style: StrokeStyle(lineWidth: 1, dash: [4, 3])))
         .contentShape(Rectangle())
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(block.title), shared by \(shortName(block.ownerName)), \(formatTime(block.startTime)), \(block.durationMinutes) minutes")
+        .accessibilityLabel("\(block.title), shared by \(shortName(block.ownerName)), \(ClockFormat.device.time(block.startTime)), \(block.durationMinutes) minutes")
         .accessibilityHint("Opens the shared task")
     }
 }
@@ -487,8 +488,10 @@ struct MonthDayPeekSheet: View {
         return CalFmt.weekdayMonthDay.string(from: d)
     }
 
+    /// "14:30 · 45m" / "2:30 PM · 1h 15m" — the start in the phone's clock.
     private func slotText(_ start: String, _ minutes: Int) -> String {
-        minutes >= 60 ? "\(start) · \(minutes / 60)h\(minutes % 60 == 0 ? "" : " \(minutes % 60)m")" : "\(start) · \(minutes)m"
+        let at = ClockFormat.device.time(start)
+        return minutes >= 60 ? "\(at) · \(minutes / 60)h\(minutes % 60 == 0 ? "" : " \(minutes % 60)m")" : "\(at) · \(minutes)m"
     }
 
     struct PeekRow: Identifiable {

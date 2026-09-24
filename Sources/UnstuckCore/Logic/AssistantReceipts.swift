@@ -139,14 +139,17 @@ public let NOTHING_TO_CHANGE = " — nothing to change"
 
 /// Build the receipt for one SUCCESSFUL tool call (result starts "ok").
 /// `tasks` resolves live entities for undo targets; `tone` (from
-/// `toneFromFacts`) phrases the quiet-win line. Returns nil for read-only
+/// `toneFromFacts`) phrases the quiet-win line; `clock` is the user's
+/// 12/24-hour clock for the times a card shows (the tool's HH:MM is machine
+/// format — the card is what the user reads). Returns nil for read-only
 /// tools and unrecognized results — no receipt beats a wrong receipt.
 public func deriveReceipt(
     name: String,
     args: ReceiptArgs,
     result: String,
     tasks: [TaskItem],
-    tone: Tone = .gentle
+    tone: Tone = .gentle,
+    clock: ClockFormat = .device
 ) -> Receipt? {
     guard result.hasPrefix("ok") else { return nil }
     if result.hasSuffix(NOTHING_TO_CHANGE) { return nil }
@@ -164,7 +167,7 @@ public func deriveReceipt(
         return Receipt(icon: .calendar,
                        label: "Scheduled “\(nm)”"
                            + (date.isEmpty ? "" : " · \(date)")
-                           + (time.isEmpty ? "" : " \(time)"))
+                           + (time.isEmpty ? "" : " \(clock.time(time))"))
 
     case "update_task":
         return Receipt(icon: .pencil, label: "Updated “\(quotedFragment(result) ?? "task")”")
@@ -334,13 +337,13 @@ public func deriveReceipt(
     case "request_call":
         guard let m = callBooked(result) else { return nil }
         return Receipt(icon: .calendar,
-                       label: "Call booked \(shortWeekday(m.date)) \(m.hm) — \(m.label) · \(m.n) note\(m.n == "1" ? "" : "s")",
+                       label: "Call booked \(shortWeekday(m.date)) \(clock.time(m.hm)) — \(m.label) · \(m.n) note\(m.n == "1" ? "" : "s")",
                        undo: .cancelCall(id: m.id))
 
     case "update_call":
         guard let m = callUpdated(result) else { return nil }
         return Receipt(icon: .pencil,
-                       label: "Call updated \(shortWeekday(m.date)) \(m.hm) — \(m.label) · \(m.n) note\(m.n == "1" ? "" : "s")")
+                       label: "Call updated \(shortWeekday(m.date)) \(clock.time(m.hm)) — \(m.label) · \(m.n) note\(m.n == "1" ? "" : "s")")
 
     case "cancel_call":
         return Receipt(icon: .trash, label: "Call cancelled — \(quotedFragment(result) ?? "call")")

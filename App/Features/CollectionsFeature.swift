@@ -939,7 +939,7 @@ private struct ByTimePicker: View {
 // MARK: - ISO helpers
 
 /// Shared, configured-once formatters — hoisted to static so the per-row due-time
-/// rendering (parseISO + fmtTime) doesn't allocate three formatters per call.
+/// rendering (parseISO + fmtTime) doesn't allocate two formatters per call.
 /// Read-only after the fixed config; `nonisolated(unsafe)` documents that to the
 /// Swift 6 concurrency checker.
 private enum ColFmt {
@@ -949,9 +949,6 @@ private enum ColFmt {
     nonisolated(unsafe) static let isoPlain: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime]; return f
     }()
-    nonisolated(unsafe) static let time: DateFormatter = {
-        let f = DateFormatter(); f.locale = Locale(identifier: "en_US"); f.dateFormat = "h:mm a"; return f
-    }()
 }
 
 private func parseISO(_ iso: String) -> Date? {
@@ -959,7 +956,8 @@ private func parseISO(_ iso: String) -> Date? {
     return ColFmt.isoPlain.date(from: iso)
 }
 
+/// A "by" time in the phone's 12/24-hour clock (was a fixed "h:mm a").
 private func fmtTime(_ iso: String?) -> String {
     guard let iso, let date = parseISO(iso) else { return "" }
-    return ColFmt.time.string(from: date)
+    return ClockFormat.device.time(date)
 }
