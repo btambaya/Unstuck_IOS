@@ -14,6 +14,13 @@ import UnstuckCore
 import UnstuckData
 import UnstuckSync
 
+/// What the calendar's Edit-block sheet asks its host to do once the sheet has
+/// gone — the two actions that open a screen of their own.
+enum CalBlockFollowUp: Equatable {
+    case focus(CalBlockTaskActions)
+    case open(CalBlockTaskActions)
+}
+
 extension AppModel {
 
     // MARK: - block edit (CalBlockEditSheet)
@@ -39,6 +46,36 @@ extension AppModel {
             deleteBlock(block)
         } else {
             Task { try? await write.deleteCalBlock(id: blockId, nowISO: Self.isoNow()) }
+        }
+    }
+
+    // MARK: - task actions (CalBlockEditSheet · Mark done / Start focus / Open task)
+    //
+    // Each hands the ROW Today shows for the block (CalBlockTaskActions.row —
+    // the day's occurrence row for a series) to the very path a Today row
+    // uses, so a completion from the calendar is the same write as one from
+    // Today: completedAt, outbox, the shared-list notice, the reminder re-plan.
+
+    /// Mark done / Mark not done — Today's circle: `toggleDone(row)`. An
+    /// occurrence flips only that day's block (never the series), a plain task
+    /// its stored row. A task assigned out is not mine to complete (T3).
+    func toggleCalBlockDone(_ actions: CalBlockTaskActions) {
+        guard actions.canToggleDone else { return }
+        toggleDone(actions.row)
+    }
+
+    /// Focus / Open need a presentation of their own, so the sheet hands them
+    /// to its host, which runs this once the sheet has finished dismissing
+    /// (SwiftUI drops a cover or sheet presented while another is still up).
+    /// Focus is Today's `router.beginFocus(row)`; Open is Today's row tap,
+    /// `router.detailTask = row` — the editor on that day for an occurrence.
+    func performCalBlockFollowUp(_ followUp: CalBlockFollowUp) {
+        switch followUp {
+        case .focus(let actions):
+            guard actions.canFocus else { return }
+            router.beginFocus(actions.row)
+        case .open(let actions):
+            router.detailTask = actions.row
         }
     }
 

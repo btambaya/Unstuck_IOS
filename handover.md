@@ -148,6 +148,53 @@ Phase B together), Decision 1 = Theme + one Text size, Decision 2 = group and re
   through the session” first." Leave question: "Leave this session?" / "Your timer keeps running. You can pick it
   back up from Today." / Leave · Leave and don't ask again · Stay. Aliases: the reduced-form matcher + `facts`.
 
+## Calendar: complete / focus / open a task from its block (branch calblock/ios, 2026-09-24) — not shipped yet
+
+Ahmad (iOS screenshot, Calendar → Day → tap a task block): "Can't complete a task from calendar." The Edit-block
+sheet only had Start time / Duration / Unschedule. Web's cal-block-edit-modal has Start now · Mark complete · Open
+in tasks — the reference. Android's DayGrid.kt sheet has the same gap (its own branch).
+
+- **The sheet** (`CalBlockEditSheet`, CalendarFeature.swift — used by BOTH Day and Week) now has, under the title:
+  **Start focus** (coral fill, white — Focus is a coral surface) beside **Mark done / Mark not done** (outlined,
+  ink on surface, line2 stroke; icons are Today's context-menu ones), then **Open task** (bg2). Start time /
+  Duration / Unschedule unchanged. The title is struck through when done and carries Today's ↻ on a series day.
+  Accessibility labels + hints on all three; ids `cal-block-focus` / `cal-block-toggle-done` / `cal-block-open`.
+- **One path, Today's.** `calBlockTaskActions(block, tasks:, assignedOutIds:)` (UnstuckCore, CalBlockActions.swift)
+  picks the ROW Today shows (`taskForBlock`): the day's OCCURRENCE row (id = block id) for a series, else the task.
+  Mark done → `AppModel.toggleCalBlockDone` → `toggleDone(row)` (occurrence → that day's block only via
+  setOccurrenceDone, never the template; plain → the stored task row, completedAt, outbox, shared-list notice;
+  the reminder scheduler re-plans off the store). Focus → `router.beginFocus(row)`; Open → `router.detailTask = row`.
+  Mark done/not done closes the sheet (web's Mark complete does); the grid block strikes through.
+- **Focus / Open wait for the sheet to go** (`CalBlockFollowUp` → host's `onDismiss` → `performCalBlockFollowUp`):
+  the Focus cover and the editor live on MainTabScaffold, and SwiftUI drops a presentation made while this local
+  sheet is still up — the MonthView peek pattern.
+- **No actions:** external/Google and placeholder blocks (nil — they never open this sheet anyway), and a task
+  whose row is gone. **Assigned out** (my task handed to someone, T3): Open only + the editor's "You assigned this
+  to X — view only" line; `toggleCalBlockDone` / `.focus` also refuse it (defense in depth). Shared-WITH-me
+  blocks still open the read-only SharedTaskDetailSheet, never this sheet.
+- **Tests:** `CalBlockActionsTests` (core, 12: plain / done / occurrence / done occurrence / sibling day / Google +
+  legacy g_ / placeholder / missing task / assigned-out gates) and `CalBlockSheetActionTests` (app, 8, demo-boot
+  store: Mark done → task done + completedAt + outbox op; Mark not done clears it; occurrence ticks only its block
+  — tomorrow and the template untouched, no template write; undo; Focus/Open route the day's row; assigned-out
+  writes nothing; a Google event has no actions). Full suites green: core 1075, app 1166.
+- **Screenshots:** `UITests/HomeShots.swift` → `CalendarBlockSheetShots` (demo boot + new `UITEST_CALENDAR=1`, which
+  seeds a daily "Take vitamins" at the current hour and lands on Calendar — `DemoSeed.seedCalendarExtras`). Two
+  tests: 01-plain-open … 08-start-focus, and 09-occurrence-open-task / 10-occurrence-start-focus (Open / Focus on
+  a series DAY — the editor opens as that day, with "Skip today"). The runner does not see
+  `TEST_RUNNER_CALBLOCK_SHOTS_DIR` here; the shots land in the default `/tmp/unstuck-calblock-shots`.
+- **Review fix — the grid strikes by the sheet's rule** (`blockIsDone(block, task:)`, UnstuckCore Occurrences.swift,
+  port of web lib/occurrences `blockIsDone`, which the web Week grid already uses): a series DAY is done on its own
+  block, a one-off when its TASK is. The Day `blockCard`, Week `weekBlock` and Month peek read
+  `block.done || task.done`, so (a) a day ticked while the task repeated, then the repeat turned off (task carries
+  the tick, the block keeps done = true), then reopened — Mark not done reopened the task but the block STAYED
+  struck; (b) a series the old path ended (template done) struck every day, while the sheet said "Mark done" for
+  them and its toggle changed nothing visible. `calBlockTaskActions.done` reads the same function, so sheet and
+  grid are one rule. Android's DayGrid.kt:280 has the same `b.done || bt?.done` — port there too.
+  Tests: core +5 (`blockIsDone` cases, ended-series day, sheet == grid), app +1 (stale ticked block un-strikes after
+  Mark not done). Core 1080, app 1167 green.
+- **Seen, not changed (pre-existing, Today too):** the editor opened on a series DAY shows SCHEDULE as the series'
+  OLDEST block (`TaskEditor.scheduleText` → `myBlocks.first`), e.g. "09-23 17:00" for today's 09-24 occurrence.
+
 ## Bottom bar: the + sits in the row (branch tabbar/ios, 2026-09-24) — not shipped yet
 
 Ahmad: "Can the plus just be on same line as everything". The coral + was a 56-pt square lifted 28 pt above the bar

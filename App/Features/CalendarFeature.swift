@@ -412,6 +412,8 @@ private struct WeekView: View {
     @State private var weekOffset = 0
     /// Tap a task block → reschedule/resize/unschedule (same sheet as the Day grid).
     @State private var editingBlock: CalBlock?
+    /// The sheet's Start focus / Open task, run once it has dismissed.
+    @State private var pendingFollowUp: CalBlockFollowUp?
     /// Tap a SHARED block → the read-only shared-task detail (never the edit sheet).
     @State private var sharedDetail: SharedDetailTarget?
 
@@ -525,9 +527,10 @@ private struct WeekView: View {
                 .padding(.bottom, 96)
             }
         }
-        // Tap a task block → reschedule / resize / unschedule.
-        .sheet(item: $editingBlock) { block in
-            CalBlockEditSheet(vm: vm, block: block)
+        // Tap a task block → mark done / focus / open, reschedule / resize /
+        // unschedule. Focus and Open present once the sheet has gone.
+        .sheet(item: $editingBlock, onDismiss: flushFollowUp) { block in
+            CalBlockEditSheet(vm: vm, block: block) { pendingFollowUp = $0; editingBlock = nil }
         }
         // Tap a shared block → its read-only detail.
         .sheet(item: $sharedDetail) { target in
@@ -539,6 +542,12 @@ private struct WeekView: View {
             let w = CalWindow.week(offset: weekOffset)
             await model.shareState.loadSharedBlocks(from: w.from, to: w.to)
         }
+    }
+
+    private func flushFollowUp() {
+        guard let followUp = pendingFollowUp else { return }
+        pendingFollowUp = nil
+        model.performCalBlockFollowUp(followUp)
     }
 
     private func dayColumn(_ iso: String) -> some View {
@@ -602,8 +611,9 @@ private struct WeekView: View {
 
     private func weekBlock(_ b: CalBlock) -> some View {
         let bt = isTaskBlock(b) ? vm.tasks.first(where: { $0.id == b.taskId }) : nil
-        // For a recurring occurrence the completion lives on the block.
-        let done = b.done || bt?.done == true
+        // A repeating day is done on its own block, a one-off when its task
+        // is (blockIsDone — the Edit-block sheet reads the same rule).
+        let done = blockIsDone(b, task: bt)
         let fill = isTaskBlock(b) ? theme.palette.areaColor(bt?.lifeArea) : theme.palette.blueSoft
         return Text(b.taskName)
             .font(UFont.sans(8, .medium))
@@ -898,6 +908,8 @@ struct DayGridView: View {
     @State private var now = Date()
     /// Tap a task block → the reschedule/resize/unschedule sheet.
     @State private var editingBlock: CalBlock?
+    /// The sheet's Start focus / Open task, run once it has dismissed.
+    @State private var pendingFollowUp: CalBlockFollowUp?
     /// Tap a SHARED block → the read-only shared-task detail (never the edit sheet).
     @State private var sharedDetail: SharedDetailTarget?
 
@@ -935,9 +947,10 @@ struct DayGridView: View {
                 date = Date()
             }
         }
-        // Tap a task block → reschedule / resize / unschedule.
-        .sheet(item: $editingBlock) { block in
-            CalBlockEditSheet(vm: vm, block: block)
+        // Tap a task block → mark done / focus / open, reschedule / resize /
+        // unschedule. Focus and Open present once the sheet has gone.
+        .sheet(item: $editingBlock, onDismiss: flushFollowUp) { block in
+            CalBlockEditSheet(vm: vm, block: block) { pendingFollowUp = $0; editingBlock = nil }
         }
         // Tap a shared block → its read-only detail.
         .sheet(item: $sharedDetail) { target in
@@ -949,6 +962,12 @@ struct DayGridView: View {
             let w = CalWindow.week(containing: iso)
             await model.shareState.loadSharedBlocks(from: w.from, to: w.to)
         }
+    }
+
+    private func flushFollowUp() {
+        guard let followUp = pendingFollowUp else { return }
+        pendingFollowUp = nil
+        model.performCalBlockFollowUp(followUp)
     }
 
     /// Map a y-offset on the grid to a snapped HH:mm, 15-min steps, clamped
@@ -1094,8 +1113,10 @@ struct DayGridView: View {
     private func blockCard(_ block: CalBlock, width: CGFloat) -> some View {
         let h = max(24, CGFloat(block.durationMinutes) / 60 * pxPerHour)
         let bt = isTaskBlock(block) ? vm.tasks.first(where: { $0.id == block.taskId }) : nil
-        // For a recurring occurrence the completion lives on the block.
-        let done = block.done || bt?.done == true
+        // A repeating day is done on its own block, a one-off when its task
+        // is (blockIsDone — the Edit-block sheet reads the same rule, so the
+        // block it just ticked or reopened shows it).
+        let done = blockIsDone(block, task: bt)
         let fill: Color = isExternalBlock(block) ? theme.palette.blueSoft
             : (isTaskBlock(block) ? theme.palette.areaColor(bt?.lifeArea).opacity(0.5) : theme.palette.bg2)
         return VStack(alignment: .leading, spacing: 1) {
@@ -1171,21 +1192,29 @@ struct DayGridView: View {
     }
 }
 
-// MARK: - Block edit sheet (reschedule / resize / unschedule)
+// MARK: - Block edit sheet (mark done / focus / open · reschedule / resize / unschedule)
 
-/// Tap a scheduled task block → reschedule (free-slot chips), resize (duration
-/// chips), or unschedule. Mirrors the Android CalBlockEditSheet (and the web
-/// cal-block-edit-modal). External/Google blocks never reach here — the day
-/// grid only opens this for task blocks — and SHARED blocks (someone else's
-/// schedule, `SharedBlock`) can't even be passed in: they open the read-only
-/// SharedTaskDetailSheet instead. The model is @Observable, so the live block
-/// follows sequential edits without manual refresh.
+/// Tap a scheduled task block → Mark done / Mark not done, Start focus and
+/// Open task (the three things a Today row does — Ahmad, 2026-09-24: "Can't
+/// complete a task from calendar"), then reschedule (free-slot chips), resize
+/// (duration chips), or unschedule. Mirrors the web cal-block-edit-modal
+/// (Start now · Mark complete · Open in tasks) and the Android
+/// CalBlockEditSheet. External/Google blocks never reach here — the day grid
+/// only opens this for task blocks, and `calBlockTaskActions` answers nil for
+/// anything else — and SHARED blocks (someone else's schedule, `SharedBlock`)
+/// can't even be passed in: they open the read-only SharedTaskDetailSheet
+/// instead. The model is @Observable, so the live block follows sequential
+/// edits without manual refresh.
 struct CalBlockEditSheet: View {
     @Environment(AppModel.self) private var model
     @Environment(\.uTheme) private var theme
     @Environment(\.dismiss) private var dismiss
     let vm: CalendarModel
     let block: CalBlock
+    /// Start focus / Open task: the host closes this sheet and runs the
+    /// follow-up once it has gone (a second presentation made while this one
+    /// is still up is dropped).
+    var onFollowUp: (CalBlockFollowUp) -> Void = { _ in }
 
     private static let durations = [15, 25, 45, 60, 90]
 
@@ -1201,12 +1230,30 @@ struct CalBlockEditSheet: View {
         // Keep the current start at the head so it always shows as selected.
         var times = [live.startTime]
         for s in slots where !times.contains(s.startTime) { times.append(s.startTime) }
+        // Mark done / Start focus / Open task act on the row Today shows —
+        // the day's occurrence for a repeating series (nil: no task actions).
+        let actions = calBlockTaskActions(live, tasks: vm.tasks,
+                                          assignedOutIds: model.shareState.assignedOutIds)
+        let done = actions?.done ?? false
 
         return NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     SectionLabel("Edit block")
-                    Text(live.taskName).font(UFont.sans(18, .semibold)).foregroundStyle(theme.palette.ink)
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(live.taskName).font(UFont.sans(18, .semibold))
+                            .strikethrough(done)
+                            .foregroundStyle(done ? theme.palette.ink3 : theme.palette.ink)
+                        // One day of a repeating task — the same ↻ as its Today row.
+                        if actions?.isOccurrence == true {
+                            Text("↻").font(UFont.sans(14)).foregroundStyle(theme.palette.ink3)
+                                .accessibilityLabel("Repeats")
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityValue(done ? "Done" : "")
+
+                    if let actions { taskActions(actions) }
 
                     VStack(alignment: .leading, spacing: 7) {
                         SectionLabel("Start time")
@@ -1243,6 +1290,79 @@ struct CalBlockEditSheet: View {
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
         .presentationDetents([.medium, .large])
+    }
+
+    // MARK: task actions (Start focus · Mark done · Open task)
+
+    /// Start focus (coral — Focus is a coral surface) beside Mark done / Mark
+    /// not done, then Open task. A task assigned to someone else keeps Open
+    /// only, with the editor's "view only" line.
+    @ViewBuilder
+    private func taskActions(_ actions: CalBlockTaskActions) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if actions.canFocus || actions.canToggleDone {
+                HStack(spacing: 8) {
+                    if actions.canFocus {
+                        Button { onFollowUp(.focus(actions)) } label: {
+                            actionLabel("Start focus", icon: "play.fill")
+                                .foregroundStyle(.white)
+                                .background(theme.palette.coral,
+                                            in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Start focus")
+                        .accessibilityHint("Starts a focus session on \(actions.row.name)")
+                        .accessibilityIdentifier("cal-block-focus")
+                    }
+                    if actions.canToggleDone {
+                        // The same toggle as Today's circle, then the sheet
+                        // closes on the updated block (web's Mark complete).
+                        Button { model.toggleCalBlockDone(actions); dismiss() } label: {
+                            actionLabel(actions.toggleLabel, icon: actions.done ? "circle" : "checkmark.circle")
+                                .foregroundStyle(theme.palette.ink)
+                                .background(theme.palette.surface,
+                                            in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: Radius.md, style: .continuous)
+                                    .stroke(theme.palette.line2))
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(actions.toggleLabel)
+                        .accessibilityHint(actions.isOccurrence
+                                           ? "Just this day. The rest of the series is unchanged."
+                                           : "")
+                        .accessibilityIdentifier("cal-block-toggle-done")
+                    }
+                }
+            }
+            Button { onFollowUp(.open(actions)) } label: {
+                actionLabel("Open task", icon: "square.and.pencil")
+                    .foregroundStyle(theme.palette.ink)
+                    .background(theme.palette.bg2,
+                                in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Open task")
+            .accessibilityHint("Opens \(actions.row.name) in the task editor")
+            .accessibilityIdentifier("cal-block-open")
+            if !actions.canToggleDone, let who = model.shareState.assignedOut[actions.row.id] {
+                Text("You assigned this to \(shortName(who)) — view only")
+                    .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+            }
+        }
+    }
+
+    /// One action button's label: icon + words, full width of its slot, 44pt+
+    /// tall, one line (scales down a little rather than wrap).
+    private func actionLabel(_ title: String, icon: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon).font(.system(size: 13, weight: .semibold))
+                .accessibilityHidden(true)
+            Text(title).font(UFont.sans(14, .medium))
+                .lineLimit(1).minimumScaleFactor(0.8)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 11)
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .contentShape(RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
     }
 
     private func chipRow<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {

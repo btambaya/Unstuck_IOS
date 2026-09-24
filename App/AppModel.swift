@@ -990,6 +990,13 @@ final class AppModel {
             UserDefaults.standard.set(ProcessInfo.processInfo.environment["UITEST_INSIGHTS_DEEP"] == "1", forKey: "insights.deepDive")
             router.present(.insights)
         }
+        // Debug hook: land on the Calendar with a repeating series on today's
+        // Day grid (the Edit-block sheet's Mark done / Start focus / Open
+        // task screenshots — plain, done and occurrence).
+        if ProcessInfo.processInfo.environment["UITEST_CALENDAR"] == "1" {
+            DemoSeed.seedCalendarExtras(database)
+            router.select(.calendar)
+        }
         // Debug hook: replay the tester-reported BULK calendar turn through the
         // real assistant (scripted transport, no network) — crash isolation.
         // Debug hook: a canned one-line reply (no network, no LLM) so a UI walk

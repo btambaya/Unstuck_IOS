@@ -411,7 +411,7 @@ struct MonthDayPeekSheet: View {
                         // A series' day opens THAT day's occurrence (the block
                         // id), not the series (audit 2026-09-22, C3).
                         return PeekRow(id: b.id, title: b.taskName, meta: slotText(b.startTime, b.durationMinutes),
-                                       done: b.done || t?.done == true, tint: theme.palette.primaryDeep, dashed: false,
+                                       done: blockIsDone(b, task: t), tint: theme.palette.primaryDeep, dashed: false,
                                        action: b.taskId.map { MonthPeekAction.task(t?.recurrence != nil ? b.id : $0) })
                     })
                     section("Shared with you", shared.map { sb in
