@@ -93,8 +93,10 @@ struct CallMeSection: View {
                 if let error {
                     Text(error).font(UFont.sans(12)).foregroundStyle(theme.palette.red)
                 }
+                AIConsentNoteLine(host: .taskEditor)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .aiConsentSheet(.taskEditor)
             .task(id: task.id) { await load() }
             .task(id: task.id) { await observeMirror() }
         }
@@ -204,7 +206,9 @@ struct CallMeSection: View {
     private func toggle(_ on: Bool) {
         error = nil
         if on {
-            enabled = true
+            // A call is a conversation with the assistant: the first one asks
+            // for the AI-consent OK; "Not now" leaves the toggle off.
+            model.withAIConsent(.callsOn, from: .taskEditor) { enabled = true }
             return
         }
         enabled = false

@@ -164,6 +164,12 @@ extension AppModel {
             // The AI kill-switch wins: with the assistant off the link is
             // DROPPED — nothing opens and the stashed prompt is never sent.
             guard assistantEnabled else { return }
+            // Without the AI-consent OK nothing is sent: the prompt waits in
+            // the composer, and Send asks first (AppModel.withAIConsent).
+            guard aiConsentGranted else {
+                openAssistant(draft: prompt)
+                return
+            }
             openAssistant()
             if let prompt, !prompt.isEmpty { assistant.send(prompt) }
             return

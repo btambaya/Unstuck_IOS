@@ -60,6 +60,13 @@ struct AssistantSheet: View {
                 GeometryReader { geo in thread(viewport: geo.size.height) }
             }
 
+            // "Not now" on the AI-consent sheet: what didn't happen, and why.
+            if model.aiConsentNote?.host == .assistant {
+                AIConsentNoteLine(host: .assistant)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 20).padding(.vertical, 4)
+            }
+
             // Local notice (mic permission / STT unavailable) or the last turn's
             // error off the model (which survives close/reopen). A live region so
             // VoiceOver announces failures.
@@ -91,6 +98,8 @@ struct AssistantSheet: View {
         .presentationDetents([.large])
         .presentationDragIndicator(.visible)
         .fullScreenCover(isPresented: $showVoice) { VoiceModeScreen() }
+        // The AI-consent ask for a first message or Talk from this panel.
+        .aiConsentSheet(.assistant)
         .task {
             CrashBreadcrumbs.drop("assistant sheet open")
             let built = buildAssistantContext(model)
@@ -166,7 +175,8 @@ struct AssistantSheet: View {
             Spacer(minLength: 0)
 
             if model.voiceConfigured {
-                Button { showVoice = true } label: {
+                // Talk sends their voice to OpenAI — the first time, it asks.
+                Button { model.withAIConsent(.talk, from: .assistant) { showVoice = true } } label: {
                     HStack(spacing: 5) {
                         Image(systemName: "mic.fill").font(.system(size: 11))
                         Text("Talk").font(UFont.sans(12.5, .semibold))
@@ -389,10 +399,12 @@ struct AssistantSheet: View {
     /// no special-cased local execution, no new server surface.
     private func ask(_ message: String) {
         guard !assistant.sending else { return }
-        showChips = false
-        note = nil
-        assistant.send(message)
-        interview?.userSent()
+        model.withAIConsent(.chat, from: .assistant) {
+            showChips = false
+            note = nil
+            assistant.send(message)
+            interview?.userSent()
+        }
     }
 
     /// No `sending` gate: a message typed while a turn is in flight is QUEUED
@@ -405,16 +417,20 @@ struct AssistantSheet: View {
     private func send() {
         let t = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        input = ""
-        note = nil
-        showChips = false
         // Drop the keyboard on send. It used to stay up for the whole
         // exchange, so the reply you just asked for landed behind it (found
         // while capturing marketing shots: focus survived until the sheet was
         // re-presented). Tap the field again to keep typing.
         fieldFocused = false
-        assistant.send(t)
-        interview?.userSent()
+        // The first message asks for the AI-consent OK; "Not now" leaves the
+        // text in the field, unsent.
+        model.withAIConsent(.chat, from: .assistant) {
+            if input.trimmingCharacters(in: .whitespacesAndNewlines) == t { input = "" }
+            note = nil
+            showChips = false
+            assistant.send(t)
+            interview?.userSent()
+        }
     }
 
     /// The interview machine, wired exactly as the old Today card wired it:
@@ -559,5 +575,112 @@ private struct ThinkingRow: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityAddTraits(.updatesFrequently)
+    }
+}
+
+// MARK: - AI data-sharing consent (AIConsent)
+
+extension View {
+    /// Hosts the AI-consent sheet for `host`: it shows while the gate
+    /// (AppModel.withAIConsent) is asking from this surface. Swiping it away
+    /// counts as "Not now"; what the answer goes on to do runs once it's gone.
+    func aiConsentSheet(_ host: AIConsentHost) -> some View {
+        modifier(AIConsentSheetHost(host: host))
+    }
+}
+
+private struct AIConsentSheetHost: ViewModifier {
+    @Environment(AppModel.self) private var model
+    let host: AIConsentHost
+
+    func body(content: Content) -> some View {
+        content.sheet(isPresented: Binding(
+            get: { model.aiConsentAsk?.host == host },
+            set: { shown in if !shown, model.aiConsentAsk?.host == host { model.declineAIConsent() } }),
+                      onDismiss: { model.aiConsentSheetDismissed(from: host) }) {
+            AIConsentSheet()
+        }
+    }
+}
+
+/// "Your assistant uses OpenAI" — the disclosure + ask before anything the
+/// user types or says goes to the AI provider (guideline 5.1.2(i)). The same
+/// words as the web, everywhere it appears (AIConsent).
+struct AIConsentSheet: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    /// The ask this sheet came up for (AppModel.aiConsentSheetShown / Gone).
+    @State private var askId: UUID?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Mark(size: 20)
+                    .frame(width: 40, height: 40)
+                    .background(theme.palette.bg2, in: Circle())
+                    .accessibilityHidden(true)
+                Text(AIConsent.title)
+                    .font(UFont.serifItalic(26)).foregroundStyle(theme.palette.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityAddTraits(.isHeader)
+                Text(AIConsent.body)
+                    .font(UFont.sans(14.5)).foregroundStyle(theme.palette.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Link(destination: AIConsent.privacyURL) {
+                    HStack(spacing: 4) {
+                        Text(AIConsent.privacyLinkLabel).underline()
+                        Image(systemName: "arrow.up.right").font(.system(size: 11, weight: .semibold))
+                            .accessibilityHidden(true)
+                    }
+                    .font(UFont.sans(13.5, .semibold)).foregroundStyle(theme.palette.ink)
+                }
+                .accessibilityIdentifier("ai-consent-privacy")
+
+                Button { model.agreeAIConsent() } label: {
+                    Text(AIConsent.agreeLabel)
+                        .font(UFont.sans(15, .semibold)).foregroundStyle(theme.palette.bg)
+                        .frame(maxWidth: .infinity).padding(.vertical, 14)
+                        .background(theme.palette.ink, in: RoundedRectangle(cornerRadius: Radius.md, style: .continuous))
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 6)
+                .accessibilityIdentifier("ai-consent-agree")
+                Button { model.declineAIConsent() } label: {
+                    Text(AIConsent.declineLabel)
+                        .font(UFont.sans(14, .medium)).foregroundStyle(theme.palette.ink2)
+                        .frame(maxWidth: .infinity).padding(.vertical, 10)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("ai-consent-decline")
+            }
+            .padding(.horizontal, 22).padding(.top, 26).padding(.bottom, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(theme.palette.bg.ignoresSafeArea())
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .onAppear {
+            askId = model.aiConsentAsk?.id
+            model.aiConsentSheetShown(askId)
+        }
+        .onDisappear { model.aiConsentSheetGone(askId) }
+    }
+}
+
+/// A "Not now" line (AIConsent.decline) under the surface that asked — calm
+/// secondary ink, not an error.
+struct AIConsentNoteLine: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.uTheme) private var theme
+    let host: AIConsentHost
+
+    var body: some View {
+        if let note = model.aiConsentNote, note.host == host {
+            Text(note.text)
+                .font(UFont.sans(12)).foregroundStyle(theme.palette.ink3)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.updatesFrequently)
+        }
     }
 }

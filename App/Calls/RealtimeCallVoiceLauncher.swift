@@ -114,6 +114,9 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
         /// what's open, today's plan — for the call instructions. Default:
         /// nothing (tests; a store that isn't ready).
         var dayContext: (CallKind) -> [String] = { _ in [] }
+        /// AppModel.aiConsentGranted — without the account's OK the call
+        /// never connects to the assistant (AIConsent). Default: granted (tests).
+        var hasAIConsent: () -> Bool = { true }
     }
 
     /// Fallback B: the call session Talk should open with. Observable so the
@@ -155,6 +158,9 @@ final class RealtimeCallVoiceLauncher: CallVoiceLauncher {
         guard let deps else { onEnded(.failed("voice launcher not bound")); return }
         guard deps.isVoiceConfigured() else { onEnded(.failed("voice not configured")); return }
         guard let token = deps.accessToken(), !token.isEmpty else { onEnded(.failed("not signed in")); return }
+        // The receipt rule already declined a call without the OK; this
+        // catches one turned off between the ring and the answer.
+        guard deps.hasAIConsent() else { onEnded(.noAIConsent); return }
         generation += 1
         let gen = generation
         let config = makeConfig(session, deps: deps, generation: gen)
@@ -435,7 +441,8 @@ extension RealtimeCallVoiceLauncher.Deps {
                 let tasks = (try? model.taskRepo?.all()) ?? []
                 let blocks = (try? model.db?.fetchAllCalBlocks()) ?? []
                 return CallDayContext.lines(kind: kind, tasks: tasks, blocks: blocks, today: Clock.todayISO(), nowHM: localNowHM())
-            })
+            },
+            hasAIConsent: { [weak model] in model?.aiConsentGranted ?? false })
     }
 }
 

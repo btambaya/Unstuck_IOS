@@ -303,6 +303,8 @@ struct TodayView: View {
         // up (open_screen → insights / inbox / settings) so it presents once
         // the cover is fully gone.
         .fullScreenCover(isPresented: showTalk, onDismiss: { model.flushPendingDeepLink() }) { VoiceModeScreen() }
+        // The AI-consent ask for Talk from the pill's mic.
+        .aiConsentSheet(.today)
         .assistantLauncher()
         // The guided tour is about to navigate — close the locally-presented
         // sheets (they live on this view's @State, out of the router's reach).
@@ -380,7 +382,11 @@ struct TodayView: View {
                 .lineLimit(1).minimumScaleFactor(0.7)
             weekPill
             if model.assistantEnabled {
-                AssistantInputPill(onTalk: { model.router.showTalk = true }).padding(.top, 10)
+                // Talk sends their voice to OpenAI — the first time, it asks.
+                AssistantInputPill(onTalk: {
+                    model.withAIConsent(.talk, from: .today) { model.router.showTalk = true }
+                }).padding(.top, 10)
+                AIConsentNoteLine(host: .today).padding(.top, 6).padding(.horizontal, 4)
             }
         }
         .padding(.horizontal, 18).padding(.bottom, 4)

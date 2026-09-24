@@ -19,6 +19,7 @@
 
 import SwiftUI
 import AVFoundation
+import UnstuckCore
 import UnstuckDesign
 
 @MainActor
@@ -93,6 +94,10 @@ final class VoiceSessionModel {
             note = "Please sign in to use voice."; state = .error; return
         }
         guard model.voiceConfigured else { note = "Voice isn't set up yet."; state = .error; return }
+        // Talk sends the user's voice to the AI provider: never without the
+        // account's OK (AIConsent). The Talk buttons ask first; this is the
+        // backstop — nothing connects.
+        guard model.aiConsentGranted else { note = AIConsent.decline(.talk).note; state = .error; return }
         note = nil; state = .connecting
         reconnects = 0; ended = false
         AVAudioApplication.requestRecordPermission { [weak self] granted in
@@ -113,7 +118,8 @@ final class VoiceSessionModel {
     /// Before the mic permission lands, `start()`'s connect will take it.
     func takeOverPendingCall() {
         guard RealtimeCallVoiceLauncher.shared.pendingSession != nil, micGranted else { return }
-        guard let token = model.voiceAccessToken, !token.isEmpty, model.voiceConfigured else { return }
+        guard let token = model.voiceAccessToken, !token.isEmpty, model.voiceConfigured,
+              model.aiConsentGranted else { return }
         // Stop the current conversation; what it changed lands in the thread.
         client?.stop()
         client = nil

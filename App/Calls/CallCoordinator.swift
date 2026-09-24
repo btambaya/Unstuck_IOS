@@ -5,11 +5,15 @@
 //                     ├─ same uuid as the live call → duplicate push: state untouched
 //                     ├─ nobody signed in     → end .failed, silent (no outcome, no notes)
 //                     ├─ calls switched off   → end .declinedElsewhere, outcome declined, notify
+//                     ├─ no AI-consent OK     → end .declinedElsewhere, outcome declined, notify
+//                     │                         (never connected to the assistant — AIConsent)
 //                     ├─ outside call hours   → end .declinedElsewhere, outcome declined, notify
 //                     ├─ focus session live   → end .answeredElsewhere, outcome busy, notify
 //                     ├─ anchor known over    → end .remoteEnded, outcome stale (silent);
 //                     │                         one not synced here yet rings (web/Android audit 2026-09-23, A6)
-//                     └─ else ring; 30 s unanswered → .unanswered, outcome missed —
+//                     └─ else ring (the AI-consent OK is re-read meanwhile — the
+//                        launcher refuses at the answer if it went: outcome done, notify);
+//                        30 s unanswered → .unanswered, outcome missed —
 //                        the "I called about X" notification is handed to the
 //                        REPORTER and posted only once call-outcome answers
 //                        `retry: false` (a first miss is re-rung by the server
@@ -234,10 +238,18 @@ final class CallCoordinator {
         active = ActiveCall(session: session, phase: .ringing)
 
         // Receipt rules — evaluated locally, after reporting. Android order:
-        // signed in → the kill-switch → hours → focus → anchor.
+        // signed in → the kill-switch → hours → focus → anchor, with the
+        // AI-consent OK right after the kill-switch: a call is a
+        // conversation with the assistant, so without it the call never
+        // connects to the AI.
         if !environment.isCallsEnabled {
             endSilently(session, reason: .declinedElsewhere, outcome: .declined,
                         notification: CallNotifications.callsOff(session))
+            return
+        }
+        if !environment.hasAIConsent {
+            endSilently(session, reason: .declinedElsewhere, outcome: .declined,
+                        notification: CallNotifications.noAIConsent(session))
             return
         }
         if !environment.isWithinCallHours(session.receivedAt) {
@@ -254,6 +266,7 @@ final class CallCoordinator {
             endSilently(session, reason: .remoteEnded, outcome: .stale, notification: nil)
             return
         }
+        environment.callWillRing()
         ringTimer = clock.after(Self.ringTimeout) { [weak self] in self?.ringTimedOut(uuid: session.uuid) }
     }
 
@@ -371,6 +384,11 @@ final class CallCoordinator {
                 // skips for the minutes (077), so the row reads alike.
                 report(session, .done, outcomeNotes: [CallNotifications.minutesUsedOutcome])
                 notifier.post(CallNotifications.minutesUsed(session, line: line))
+            case .noAIConsent:
+                // Answered, but the OK was gone: nothing reached the
+                // assistant. The notes land with the way back on.
+                report(session, .done, outcomeNotes: [CallNotifications.noAIConsentOutcome])
+                notifier.post(CallNotifications.noAIConsent(session, answered: true))
             }
         }
         return true
@@ -496,6 +514,13 @@ final class CallCoordinator {
         guard environment.isSessionKnown else { deferredFallbackTap = payload; return }
         guard environment.isSignedIn else { return }
         let session = CallSession(payload: payload, receivedAt: clock.now)
+        // No AI-consent OK: Talk never opens with the call — declined, and
+        // the notes land with the reason (the receipt rule's twin).
+        guard environment.hasAIConsent else {
+            report(session, .declined)
+            notifier.post(CallNotifications.noAIConsent(session))
+            return
+        }
         report(session, .answered)
         if let h = onFallbackAnswer { h(session) } else { pendingFallback = session }
     }
@@ -579,6 +604,17 @@ enum CallNotifications {
         make(s, id: "unstuck.call.off.\(s.callId)", title: "I called about \(s.label)",
              body: body(s.notes) + "\n(calls are off on this iPhone — Settings › Calls)", quiet: true)
     }
+    /// The account hasn't agreed to AI data sharing: the call never connected
+    /// to the assistant. Declined quietly; the notes land with the way on.
+    /// `answered`: they picked up and it hung up at once (the OK was turned
+    /// off while it rang) — a normal alert, like minutesUsed, so they see why.
+    static func noAIConsent(_ s: CallSession, answered: Bool = false) -> CallNotification {
+        make(s, id: "unstuck.call.consent.\(s.callId)", title: "I called about \(s.label)",
+             body: body(s.notes) + "\n(calls use the assistant — turn on AI data sharing in Settings › Interface to take them)",
+             quiet: !answered, timeSensitive: false)
+    }
+    /// call_requests.outcome_notes for a call answered after the OK was turned off.
+    static let noAIConsentOutcome = "no AI consent"
     static func voiceFailed(_ s: CallSession) -> CallNotification {
         make(s, id: "unstuck.call.failed.\(s.callId)", title: "Couldn't start the call — here's what it was about", body: body(s.notes))
     }

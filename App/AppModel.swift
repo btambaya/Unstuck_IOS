@@ -366,6 +366,38 @@ final class AppModel {
     /// privacy policy makes. Device-local, never synced.
     var assistantEnabled: Bool { settings.assistantEnabled }
 
+    // MARK: AI data-sharing consent (AIConsent; the gate is `withAIConsent`)
+
+    /// This device's copy of the account's OK to share with OpenAI
+    /// (user_metadata `ai_consent_at` / `ai_consent_version`), persisted so the
+    /// gate answers offline and a call ringing before the app is up can be
+    /// judged. Observed: Settings, Calls and the gate read `aiConsentGranted`.
+    var aiConsentCache: AIConsent.Cache? = AIConsentStore.load() {
+        didSet { if aiConsentCache != oldValue { AIConsentStore.save(aiConsentCache) } }
+    }
+    /// The consent sheet on screen: which surface shows it and what agreeing
+    /// or declining go on to do. nil = none.
+    var aiConsentAsk: AIConsentAsk?
+    /// The last "Not now" line, shown by the surface that asked.
+    var aiConsentNote: AIConsentNote?
+    /// What the answer goes on to do, run once the sheet has gone (a Talk
+    /// cover can only present after it).
+    @ObservationIgnored var aiConsentFollowUp: (@MainActor () -> Void)?
+    /// A gate is reading the account before it asks (one at a time).
+    @ObservationIgnored var aiConsentChecking = false
+    /// App open asks once per launch (Calls on without an OK).
+    @ObservationIgnored var aiConsentAskedOnOpen = false
+    /// This launch's first read of the account has finished (or failed) —
+    /// app open never asks on a stale copy the account may already have fixed.
+    @ObservationIgnored var aiConsentResolved = false
+    @ObservationIgnored var aiConsentLastFetch: Date?
+    @ObservationIgnored var aiConsentPushGen = 0
+    /// The ask whose sheet actually came up (AIConsentSheet reports in).
+    @ObservationIgnored var aiConsentShownAskId: UUID?
+    /// How long an ask may wait for its surface to show it before it's
+    /// dropped (`presentAIConsentAsk`). Shortened by the tests.
+    @ObservationIgnored var aiConsentShowGrace: Duration = .seconds(2)
+
     /// The ONE way to open the Assistant panel (launcher, Siri deep link, the
     /// guided tour, Today's input pill). No-ops while the kill-switch is off,
     /// so a stale deep link or tour step can never resurrect a disabled
@@ -922,6 +954,10 @@ final class AppModel {
         // the three platforms show the same person. Not "Sarah": the seed has a
         // "Reply to Sarah" task, and a user replying to herself reads wrong.
         setCachedUserName("Maya")
+        // The demo persona has agreed to AI data sharing, so the assistant
+        // walks run as before; UITEST_AI_CONSENT=0 boots without the OK.
+        aiConsentCache = ProcessInfo.processInfo.environment["UITEST_AI_CONSENT"] == "0" ? nil
+            : AIConsent.Cache(userId: "ui-test", record: AIConsent.grant(at: Date()), pending: false)
         startCaptureArchiveObservation(database)
         configured = true
         signedIn = true
@@ -1204,6 +1240,10 @@ final class AppModel {
         // The microphone for calls booked elsewhere (C13) — the scenePhase
         // hook no-ops on a cold launch, for the same reason as the route above.
         startCallMicrophoneBackstop()
+        // The AI-consent OK for a session found at launch (the auth observer
+        // reads it only on a fresh sign-in; the scenePhase hook no-ops before
+        // the coordinator exists) — then app open's one look at Calls.
+        if signedIn { Task { await refreshAIConsent(force: true) } }
     }
 
     // MARK: background time for the outbox (audit 2026-09-22, C31)
@@ -1430,6 +1470,7 @@ final class AppModel {
                 // wiped device-local data on a flaky connection.
                 let isSignOut: Bool = { if case .signedOut = event { return true }; return false }()
                 let isSignedInEvent: Bool = { if case .signedIn = event { return true }; return false }()
+                let isInitialEvent: Bool = { if case .initialSession = event { return true }; return false }()
                 await MainActor.run {
                     guard let self else { return }
                     // Scrub device-local personal content only on a genuine
@@ -1448,6 +1489,14 @@ final class AppModel {
                     self.cachedUserId = AuthService.userId(from: session)
                     self.cachedHasPassword = AuthService.hasPassword(from: session)
                     self.cachedAccessToken = token
+                    // The account's AI-consent OK rides on the session's
+                    // user_metadata. The session saved at launch only fills
+                    // an empty copy — it can predate a change made on the web
+                    // (AIConsent.merge); the fresh read below settles it.
+                    if let uid = AuthService.userId(from: session) {
+                        self.adoptAIConsent(AuthService.aiConsent(from: session), userId: uid,
+                                            source: isInitialEvent ? .stored : .fresh)
+                    }
                     // PKCE: classify the just-EXCHANGED session via `amr` once —
                     // only a .signedIn carrying a token the probe hasn't seen
                     // (never the stored-session .initialSession / a refresh).
@@ -1494,6 +1543,9 @@ final class AppModel {
                             self.drainPendingSharedFocusLedger()
                         }
                         self.recordWakeWindowIfNeeded()
+                        // Read the AI-consent OK fresh (an OK given on the
+                        // web counts here) — then app open's one look.
+                        Task { await self.refreshAIConsent(force: true) }
                     }
                     // A circle invite link tapped while signed out stashed its
                     // code — ask (Accept / Not now) now that we're authenticated.
@@ -1974,6 +2026,15 @@ final class AppModel {
         interviewFlagPulledFor = nil
         _assistant?.clear()
         AssistantModel.scrubPersisted()
+        // The AI-consent copy belongs to this account (the next one reads
+        // its own from user_metadata), and so does this launch's app-open look.
+        aiConsentCache = nil
+        aiConsentAsk = nil
+        aiConsentNote = nil
+        aiConsentFollowUp = nil
+        aiConsentAskedOnOpen = false
+        aiConsentResolved = false
+        aiConsentLastFetch = nil
         Task { await ReminderScheduler.shared.cancelAll() }
         // One-true-shared-session: stop any in-flight drain and PARK the
         // signed-out account's pending ledger accruals under that account —
@@ -3112,6 +3173,262 @@ final class AppModel {
         let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("unstuck.sqlite").path
+    }
+}
+
+// MARK: - AI data-sharing consent (AIConsent)
+
+/// The surface a consent sheet is presented from — the one the gated action
+/// lives on (`.aiConsentSheet(_:)`, AssistantSheet.swift). SwiftUI can't
+/// present a sheet from a host that is already presenting one, so each
+/// surface hosts its own and only the one that asked shows it.
+enum AIConsentHost: Equatable {
+    /// App open with Calls on and no OK (MainTabScaffold).
+    case root
+    case assistant
+    /// Today's ask pill — its Talk mic.
+    case today
+    case callSettings
+    /// A task's "Call me about this".
+    case taskEditor
+    /// Settings → Interface → AI data sharing.
+    case settings
+}
+
+/// What the consent sheet was opened for, and what each answer goes on to do.
+struct AIConsentAsk: Identifiable {
+    let id = UUID()
+    let action: AIConsent.Action
+    let host: AIConsentHost
+    let onAgree: @MainActor () -> Void
+    let onDecline: @MainActor () -> Void
+}
+
+/// A "Not now" line and the surface that shows it.
+struct AIConsentNote: Equatable {
+    let host: AIConsentHost
+    let text: String
+}
+
+/// Where the device copy of the OK lives (the sign-out scrub removes it).
+enum AIConsentStore {
+    static let key = "unstuck.aiConsent"
+    /// Swappable so the tests run on a throwaway suite.
+    nonisolated(unsafe) static var defaults: UserDefaults = .standard
+
+    static func load() -> AIConsent.Cache? { AIConsent.decode(defaults.data(forKey: key)) }
+
+    static func save(_ cache: AIConsent.Cache?) {
+        if let cache, let data = AIConsent.encode(cache) {
+            defaults.set(data, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+}
+
+extension AppModel {
+    /// The signed-in account's OK counts right now (given, for this version).
+    var aiConsentGranted: Bool { AIConsent.isGranted(aiConsentCache, userId: cachedUserId) }
+
+    /// How long a gate waits for the account before it asks anyway.
+    static let aiConsentCheckTimeout: TimeInterval = 1.5
+
+    /// THE gate for everything that sends the user's words or voice to the AI
+    /// provider — a message, Talk, switching Calls on. With the OK, `proceed`
+    /// runs now. Without it the account is read once more (an OK given on
+    /// the web a moment ago counts), then the consent sheet asks from `host`:
+    /// "Agree and continue" runs `proceed` once the sheet has gone; "Not now"
+    /// runs `onDecline` and `host` shows AIConsent.decline's line.
+    func withAIConsent(_ action: AIConsent.Action, from host: AIConsentHost,
+                       onDecline: @escaping @MainActor () -> Void = {},
+                       _ proceed: @escaping @MainActor () -> Void) {
+        if aiConsentNote?.host == host { aiConsentNote = nil }
+        if aiConsentGranted { proceed(); return }
+        Task { await askForAIConsent(action, from: host, onDecline: onDecline, proceed) }
+    }
+
+    /// The asking half of `withAIConsent`. One sheet at a time: a second tap
+    /// while one is up (or the account is being read) does nothing.
+    func askForAIConsent(_ action: AIConsent.Action, from host: AIConsentHost,
+                         onDecline: @escaping @MainActor () -> Void = {},
+                         _ proceed: @escaping @MainActor () -> Void) async {
+        guard aiConsentAsk == nil, !aiConsentChecking else { return }
+        aiConsentChecking = true
+        await refreshAIConsent(force: true, timeout: Self.aiConsentCheckTimeout)
+        aiConsentChecking = false
+        if aiConsentGranted { proceed(); return }
+        guard aiConsentAsk == nil else { return }
+        presentAIConsentAsk(AIConsentAsk(action: action, host: host, onAgree: proceed, onDecline: onDecline))
+    }
+
+    /// Put `ask` up for its surface. If the sheet never comes up — the panel
+    /// was closed while the account was read, or its surface was already
+    /// presenting something — the ask is dropped after a moment. Left in
+    /// place it would silence every later gate (one sheet at a time) until
+    /// the next launch.
+    func presentAIConsentAsk(_ ask: AIConsentAsk) {
+        aiConsentAsk = ask
+        let grace = aiConsentShowGrace
+        Task { [weak self] in
+            try? await Task.sleep(for: grace)
+            guard let self, self.aiConsentAsk?.id == ask.id, self.aiConsentShownAskId != ask.id else { return }
+            self.aiConsentAsk = nil
+            // App open's one look didn't happen: a later foreground tries again.
+            if ask.action == .callsOnOpen { self.aiConsentAskedOnOpen = false }
+        }
+    }
+
+    /// The consent sheet came up for ask `id` (AIConsentSheet.onAppear).
+    func aiConsentSheetShown(_ id: UUID?) { aiConsentShownAskId = id }
+
+    /// The consent sheet for ask `id` has gone. An answer or a swipe has
+    /// normally settled it already; if its surface was torn down under it
+    /// (the panel closed by a deep link or the tour) it counts as "Not now".
+    func aiConsentSheetGone(_ id: UUID?) {
+        guard let id, aiConsentAsk?.id == id else { return }
+        aiConsentSheetDismissed()
+    }
+
+    /// "Agree and continue": recorded here at once (so it holds offline) and
+    /// written to the account; what was asked for runs once the sheet is gone.
+    func agreeAIConsent(now: Date = Date()) {
+        guard let ask = aiConsentAsk else { return }
+        setAIConsent(AIConsent.grant(at: now))
+        aiConsentNote = nil
+        aiConsentFollowUp = ask.onAgree
+        aiConsentAsk = nil
+    }
+
+    /// "Not now" (or the sheet swiped away): the action doesn't happen, Calls
+    /// go off when app open asked, and the surface says why once the sheet
+    /// is gone.
+    func declineAIConsent() {
+        guard let ask = aiConsentAsk else { return }
+        let decline = AIConsent.decline(ask.action)
+        if decline.turnCallsOff { turnCallsOffForAIConsent() }
+        let note = AIConsentNote(host: ask.host, text: decline.note)
+        aiConsentFollowUp = { [weak self] in
+            self?.aiConsentNote = note
+            ask.onDecline()
+        }
+        aiConsentAsk = nil
+    }
+
+    /// The sheet `host` showed has finished going away: run what the answer
+    /// asked for (an ask still open from that surface was swiped away).
+    func aiConsentSheetDismissed(from host: AIConsentHost? = nil) {
+        if let ask = aiConsentAsk, host == nil || ask.host == host { declineAIConsent() }
+        let followUp = aiConsentFollowUp
+        aiConsentFollowUp = nil
+        followUp?()
+    }
+
+    /// Settings → AI data sharing → off: cleared here and on the account, and
+    /// Calls go off with it (a call is a conversation with the assistant).
+    /// The assistant and Talk ask again before their next use.
+    func revokeAIConsent() {
+        setAIConsent(AIConsent.revoked(aiConsentCache?.record ?? .none))
+        turnCallsOffForAIConsent()
+        aiConsentNote = AIConsentNote(host: .settings, text: AIConsent.revokedNote)
+    }
+
+    /// Calls off for a missing OK: this phone's switch, and the proactive
+    /// calls the account would otherwise keep booking. Calls already booked
+    /// are declined quietly when they arrive; their notes still land.
+    func turnCallsOffForAIConsent() {
+        CallSettings.enabled = false
+        var prefs = callProactivePrefs
+        prefs.morningEnabled = false
+        prefs.eveningEnabled = false
+        prefs.afterBlockEnabled = false
+        setCallProactivePrefs(prefs)
+    }
+
+    /// Calls count as on for this account (AIConsent.callsAreOn): this phone
+    /// takes them, and a proactive call is on or a call is booked.
+    var callsAreOnForAIConsent: Bool {
+        let p = callProactivePrefs
+        let hasLiveCall = (try? coordinator?.callsMirror.live())?.isEmpty == false
+        return AIConsent.callsAreOn(deviceSwitch: CallSettings.enabled,
+                                    proactiveOn: p.morningEnabled || p.eveningEnabled || p.afterBlockEnabled,
+                                    hasLiveCall: hasLiveCall)
+    }
+
+    /// The account's answer landed (the auth stream's session, or a fresh
+    /// read). The device copy follows it — unless a change made here is still
+    /// on its way, or it's only the saved launch session (AIConsent.merge).
+    func adoptAIConsent(_ record: AIConsent.Record, userId: String, source: AIConsent.Source) {
+        aiConsentCache = AIConsent.merge(cache: aiConsentCache, server: record, userId: userId, source: source)
+    }
+
+    /// Bring the device copy up to date: a change made here that hasn't
+    /// landed is sent again (it wins); otherwise the account is read fresh
+    /// (GET /user) — at most once a minute unless `force`d. `timeout` bounds
+    /// a gate's wait. Then app open gets its look (Calls on without an OK).
+    func refreshAIConsent(force: Bool = false, timeout: TimeInterval? = nil) async {
+        guard let auth = coordinator?.auth, signedIn else { return }
+        if let cache = aiConsentCache, cache.pending, cache.userId == cachedUserId {
+            // A gate never waits on this write; the copy already says it.
+            if timeout == nil { await pushAIConsent(cache) } else { Task { await pushAIConsent(cache) } }
+            aiConsentResolved = true
+        } else if force || aiConsentLastFetch.map({ Date().timeIntervalSince($0) >= 60 }) ?? true {
+            aiConsentLastFetch = Date()
+            // A change made here while the read was out (Agree tapped) beats
+            // an answer the server gave before it landed.
+            let changeGen = aiConsentPushGen
+            let fetch: @Sendable () async -> AIConsentSnapshot? = { await auth.fetchAIConsent() }
+            let snapshot: AIConsentSnapshot?
+            if let timeout { snapshot = await AuthService.firstWithin(timeout, fetch) } else { snapshot = await fetch() }
+            if let snapshot, changeGen == aiConsentPushGen, snapshot.userId == (cachedUserId ?? snapshot.userId) {
+                adoptAIConsent(snapshot.record, userId: snapshot.userId, source: .fresh)
+            }
+            aiConsentResolved = true
+        }
+        askAboutCallsOnOpenIfNeeded()
+    }
+
+    /// App open with Calls on for this account and no OK: ask once per
+    /// launch; "Not now" turns Calls off and says so. Only once this launch
+    /// has read the account, and only over a bare scaffold — with anything
+    /// presented it waits for a later foreground.
+    func askAboutCallsOnOpenIfNeeded() {
+        guard aiConsentResolved, signedIn, onboarded, !pendingPasswordRecovery, !tourRunning,
+              aiConsentAsk == nil, !aiConsentChecking,
+              UIApplication.shared.applicationState == .active,
+              AIConsent.asksOnOpen(granted: aiConsentGranted, callsOn: callsAreOnForAIConsent,
+                                   askedThisLaunch: aiConsentAskedOnOpen),
+              !router.hasActivePresentation, !Self.anythingPresented() else { return }
+        aiConsentAskedOnOpen = true
+        presentAIConsentAsk(AIConsentAsk(action: .callsOnOpen, host: .root, onAgree: {}, onDecline: {}))
+    }
+
+    /// Something is presented over the tab scaffold that the router doesn't
+    /// track (Today's own Settings / Insights sheets).
+    static func anythingPresented() -> Bool {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .contains { $0.windowLevel == .normal && $0.rootViewController?.presentedViewController != nil }
+    }
+
+    /// Record `record` on this device (pending) and write it to the account.
+    private func setAIConsent(_ record: AIConsent.Record) {
+        let cache = AIConsent.Cache(userId: cachedUserId ?? aiConsentCache?.userId ?? "",
+                                    record: record, pending: true)
+        aiConsentCache = cache
+        Task { await pushAIConsent(cache) }
+    }
+
+    /// Send a change made here to user_metadata. One that doesn't land stays
+    /// pending and goes again on the next open; a newer change supersedes it.
+    func pushAIConsent(_ cache: AIConsent.Cache) async {
+        guard let auth = coordinator?.auth else { return }
+        aiConsentPushGen += 1
+        let gen = aiConsentPushGen
+        guard let landed = await auth.setAIConsent(cache.record),
+              gen == aiConsentPushGen, aiConsentCache?.userId == cache.userId else { return }
+        aiConsentCache = AIConsent.Cache(userId: cache.userId, record: landed, pending: false)
     }
 }
 

@@ -22,6 +22,12 @@ public enum EmailLinkOutcome: Sendable, Equatable {
     case failed(EmailLinkFailure)
 }
 
+/// The account's AI-consent record as the server just returned it.
+public struct AIConsentSnapshot: Sendable, Equatable {
+    public let userId: String
+    public let record: AIConsent.Record
+}
+
 public struct AuthService: Sendable {
     let client: SupabaseClient
 
@@ -120,6 +126,54 @@ public struct AuthService: Sendable {
                 data: ["full_name": .string(trimmed), "display_name": .string(trimmed)]))
             return .ok
         } catch { return .error(friendly(error)) }
+    }
+
+    // MARK: AI data-sharing consent (AIConsent)
+
+    /// The account's OK to share with the AI provider, as a user's
+    /// metadata carries it (`ai_consent_at` / `ai_consent_version`).
+    public static func aiConsent(from user: User?) -> AIConsent.Record {
+        aiConsent(fromMetadata: user?.userMetadata)
+    }
+
+    /// The same, from the session the auth stream hands over (no keychain read).
+    public static func aiConsent(from session: Supabase.Session?) -> AIConsent.Record {
+        aiConsent(from: session?.user)
+    }
+
+    static func aiConsent(fromMetadata meta: [String: AnyJSON]?) -> AIConsent.Record {
+        func string(_ key: String) -> String? {
+            guard let v = meta?[key], case let .string(s) = v, !s.isEmpty else { return nil }
+            return s
+        }
+        return AIConsent.Record(at: string(AIConsent.atKey), version: string(AIConsent.versionKey))
+    }
+
+    /// The user_metadata change for `record`: an OK writes both keys; "off"
+    /// sends `ai_consent_at: null`, which GoTrue treats as delete-the-key.
+    static func aiConsentData(_ record: AIConsent.Record) -> [String: AnyJSON] {
+        guard record.isGranted, let at = record.at, let version = record.version else {
+            return [AIConsent.atKey: .null]
+        }
+        return [AIConsent.atKey: .string(at), AIConsent.versionKey: .string(version)]
+    }
+
+    /// Write the OK (or clear it) to the account. Returns what the account
+    /// holds afterwards, or nil when the write didn't land (offline) — the
+    /// caller keeps its change pending and sends it again later.
+    public func setAIConsent(_ record: AIConsent.Record) async -> AIConsent.Record? {
+        do {
+            let user = try await client.auth.update(user: UserAttributes(data: Self.aiConsentData(record)))
+            return Self.aiConsent(from: user)
+        } catch { return nil }
+    }
+
+    /// The account's OK read fresh from the server (GET /user) — an OK given
+    /// on the web counts here at once, which the saved session can't tell.
+    /// nil = couldn't ask.
+    public func fetchAIConsent() async -> AIConsentSnapshot? {
+        guard let user = try? await client.auth.user() else { return nil }
+        return AIConsentSnapshot(userId: user.id.uuidString.lowercased(), record: Self.aiConsent(from: user))
     }
 
     /// Delete the account via the server-side `account-delete` Edge Function
