@@ -1,5 +1,5 @@
 {
-  "originHash" : "151bf733d25181cfd3dbdb3eea7e53afa92c6c3dd3f4b5b12b315026ded6b4ca",
+  "originHash" : "787ae63e9e46dc1a394786877aa508df2c24b15a5fec355d0f90aa868f1b4ccc",
   "pins" : [
     {
       "identity" : "grdb.swift",
@@ -15,8 +15,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/supabase/supabase-swift.git",
       "state" : {
-        "revision" : "dd29b624b9ceea87612d0b00457e1400f7d22c2e",
-        "version" : "2.46.0"
+        "revision" : "40344fb3a7007d772218c6ddf6bca9febd8cb226",
+        "version" : "2.55.2"
       }
     },
     {
