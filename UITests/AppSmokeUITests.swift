@@ -113,6 +113,43 @@ final class AppSmokeUITests: XCTestCase {
         snap("07-collection-detail")
     }
 
+    /// Ahmad, build 103: the Week view had no current-time line; the Day view
+    /// has one. The week now draws the same marker — across TODAY's column
+    /// only, on screen when the week opens (it scrolls to the hour before
+    /// now, like the Day grid), and gone on any other week.
+    func testWeekShowsTheNowLineOnTodaysColumn() throws {
+        launchToToday()
+        tapNav("Calendar")
+        expect(app.buttons["Day"].firstMatch, "the Calendar tab did not switch")
+        expect(app.staticTexts["NOW"].firstMatch, "the Day grid lost its NOW line")
+        app.buttons["Week"].firstMatch.tap(); usleep(1_000_000)
+
+        let line = app.descendants(matching: .any)["week-now-line"].firstMatch
+        expect(line, "the Week grid has no NOW line")
+        snap("04b-calendar-week-now")
+        let f = line.frame
+        let day = String(Calendar.current.component(.day, from: Date()))
+        let header = app.staticTexts.matching(NSPredicate(format: "label == %@", day)).firstMatch
+        print("WEEKNOW line=\(f) todayHeader=\(header.exists ? "\(header.frame)" : "missing") label=\(line.label)")
+        // One day column wide — not the whole grid.
+        XCTAssertGreaterThan(f.width, 20, "the NOW line is not a column wide")
+        XCTAssertLessThan(f.width, app.frame.width / 5, "the NOW line spans more than today's column")
+        // Today's column: the weekday row's date sits over it.
+        XCTAssertTrue(header.exists, "today's date is missing from the weekday row")
+        XCTAssertTrue(header.frame.midX > f.minX && header.frame.midX < f.maxX,
+                      "the NOW line (x \(Int(f.minX))…\(Int(f.maxX))) is not under today's date (x \(Int(header.frame.midX)))")
+        // On screen as the week opens: below the pinned weekday row, above the nav.
+        XCTAssertGreaterThan(f.minY, header.frame.maxY, "the NOW line is not in the hour grid")
+        XCTAssertLessThan(f.maxY, app.frame.height - 110, "the week did not open on the NOW line")
+        XCTAssertTrue(line.label.hasPrefix("Now"), "the NOW line has no spoken label")
+
+        // Another week has no line; back on this week it returns.
+        app.buttons["Next week"].firstMatch.tap(); usleep(800_000)
+        XCTAssertFalse(line.exists, "a NOW line on a week that isn't this one")
+        app.buttons["This week"].firstMatch.tap(); usleep(800_000)
+        XCTAssertTrue(line.waitForExistence(timeout: 4), "the NOW line did not come back on this week")
+    }
+
     /// Focus from a Today row: long-press a seeded row, pick "Focus" in its
     /// context menu, and a real session starts. (The Start-Next hero and its
     /// Focus button are gone from the home — 2026-09-18 — so the row's menu
@@ -613,22 +650,13 @@ final class CollectionKeyboardUITests: XCTestCase {
         shot("\(prefix)-open")
 
         // 1 · Hold the LAST row to edit it (the reported case).
-        let first = editLastItem("edit-last")
+        editLastItem("edit-last")
         shot(prefix)
         dumpTree("\(prefix)-edit-tree")
 
-        // The list must still scroll freely with the keyboard up: a flick up
-        // moves the row up (or it is already as high as the content allows);
-        // a flick down may carry it under the keyboard (the user moved it), and
-        // flicking back up brings it out again.
-        app.swipeUp(); usleep(800_000)
-        let up = measure("edit-last-swiped-up", edited(lastItem), card: editedRow(lastItem))
-        print("LISTKBD [edit-last-swiped-up] moved \(Int(first.minY - up.minY))pt")
-        shot("\(prefix)-edit-scrolled")
-        app.swipeDown(); usleep(800_000)
-        print("LISTKBD [edit-last-swiped-down] field=\(rect(edited(lastItem).frame))")
-        app.swipeUp(); usleep(500_000); app.swipeUp(); usleep(800_000)
-        measure("edit-last-swiped-back-up", edited(lastItem), card: editedRow(lastItem))
+        // Scrolling the list with the keyboard up now puts the keyboard away
+        // (build 104, Ahmad: a flick back up left it up over nothing) — that
+        // contract, and re-focusing afterwards, is testScrollingTheListPutsTheKeyboardAway.
 
         // Done editing → the keyboard goes and the nav is back at the bottom.
         app.typeText("\n")
@@ -667,6 +695,109 @@ final class CollectionKeyboardUITests: XCTestCase {
         shot("\(prefix)-dark-add")
         editLastItem("edit-last-dark")
         shot("\(prefix)-dark")
+    }
+
+    /// Scroll the list back toward its top the way a thumb does: one drag in
+    /// the list, starting under the pinned header and ending well ABOVE the
+    /// keyboard. (An interactive dismissal only follows a finger that reaches
+    /// the keyboard — this one never does, which is Ahmad's case: flick the
+    /// list down to see its top.)
+    private func dragListBackUp(_ tag: String) {
+        let h = app.frame.height, w = app.frame.width
+        let startY = h * 0.30
+        let endY = max(startY + 120, min(keyboardTop - 30, startY + 260))
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        let start = origin.withOffset(CGVector(dx: w / 2, dy: startY))
+        let end = origin.withOffset(CGVector(dx: w / 2, dy: endY))
+        print("LISTKBD [\(tag)] drag y \(Int(startY))→\(Int(endY)), keyboardTop=\(Int(keyboardTop))")
+        // A thumb's speed. (XCUITest's `.fast` is so quick the ScrollView
+        // never scrolled at all — the list must actually move for this to
+        // be the reported case.)
+        start.press(forDuration: 0.05, thenDragTo: end, withVelocity: 900, thenHoldForDuration: 0)
+        usleep(900_000)
+    }
+
+    /// Ahmad, build 103: with the keyboard up (the add field focused on open,
+    /// or a row being edited), scrolling the list back up left the keyboard
+    /// where it was — the field he'd been typing in scrolled away under it and
+    /// he was stuck with a keyboard and nothing to type into. Dragging the list
+    /// now puts the keyboard away; focusing a field again still lifts it
+    /// clear of the keyboard (the earlier fix).
+    func testScrollingTheListPutsTheKeyboardAway() throws {
+        XCTAssertTrue(app.buttons["Today"].firstMatch.waitForExistence(timeout: 15), "the demo boot never reached Today")
+        let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        let allow = springboard.buttons["Allow"].firstMatch
+        if allow.waitForExistence(timeout: 4) { allow.tap(); usleep(800_000) }
+
+        app.buttons["Collections"].firstMatch.tap(); usleep(700_000)
+        let list = app.staticTexts["Sync up"].firstMatch
+        XCTAssertTrue(list.waitForExistence(timeout: 8), "the long seeded list is missing")
+        list.tap()
+        XCTAssertTrue(app.buttons[firstItem].firstMatch.waitForExistence(timeout: 8),
+                      "the collection detail did not open")
+
+        // 1 · Opened with the add field focused: keyboard up, the field at the
+        // bottom of the long list, just above it.
+        raiseKeyboard()
+        measure("open-add-focused", addField, grow: addPillPadding)
+        shot("\(prefix)-scroll-open")
+        let before = addField.frame
+        dragListBackUp("add")
+        shot("\(prefix)-scroll-add-dragged")
+        print("LISTKBD [add-dragged] keyboardOnScreen=\(keyboardOnScreen) hasFocus=\(hasFocus) addField=\(rect(addField.frame))")
+        XCTAssertTrue(waitUntil { !self.keyboardOnScreen && !self.hasFocus },
+                      "[add] scrolling the list back up left the keyboard up")
+        XCTAssertGreaterThan(addField.frame.minY, before.minY + 40, "[add] the drag did not scroll the list")
+        // All the way to the top: the first row is back, the keyboard stays away.
+        for _ in 0..<3 { app.swipeDown(); usleep(500_000) }
+        let firstRow = app.buttons[firstItem].firstMatch
+        XCTAssertTrue(firstRow.exists && firstRow.isHittable, "[add] the list did not scroll back to its top")
+        XCTAssertFalse(keyboardOnScreen, "[add] the keyboard came back while scrolling to the top")
+        XCTAssertTrue(nav.waitForExistence(timeout: 4) && nav.isHittable, "[add] the bottom nav did not come back with the keyboard gone")
+
+        // 2 · The + still brings the add field into view above the keyboard.
+        app.buttons["Add to this collection"].firstMatch.tap()
+        XCTAssertTrue(waitUntil { self.hasFocus }, "the + did not focus the add field")
+        app.typeText("Book the venue")
+        XCTAssertTrue(waitUntil { self.keyboardOnScreen }, "the software keyboard never came on screen")
+        measure("add-after-drag", addField, grow: addPillPadding)
+        dragListBackUp("add-again")
+        XCTAssertTrue(waitUntil { !self.keyboardOnScreen && !self.hasFocus },
+                      "[add-again] scrolling the list back up left the keyboard up")
+
+        // 3 · A row being edited: hold the last row, keyboard up, drag the list.
+        let row = app.buttons[lastItem].firstMatch
+        XCTAssertTrue(scrollIntoReach(row), "the last row never came into reach")
+        row.press(forDuration: 0.8)
+        raiseKeyboard()
+        usleep(500_000)
+        measure("edit-last", edited(lastItem), card: editedRow(lastItem))
+        dragListBackUp("edit")
+        shot("\(prefix)-scroll-edit-dragged")
+        XCTAssertTrue(waitUntil { !self.keyboardOnScreen && !self.hasFocus },
+                      "[edit] scrolling the list back up left the keyboard up")
+        // The edit is not thrown away: the row is still open with its text,
+        // and tapping it brings the keyboard back with the row above it.
+        let field = edited(lastItem)
+        XCTAssertTrue(field.exists, "[edit] putting the keyboard away closed the row's edit")
+        XCTAssertTrue(scrollIntoReach(field), "the edited row never came back into reach")
+        field.tap()
+        raiseKeyboard()
+        usleep(500_000)
+        measure("edit-last-refocused", edited(lastItem), card: editedRow(lastItem))
+        app.typeText("\n")
+        XCTAssertTrue(waitUntil { !self.hasFocus }, "submitting the edit did not dismiss the keyboard")
+
+        // 4 · The Collections grid's search: dragging the grid puts it away too.
+        app.navigationBars.buttons.firstMatch.tap(); usleep(900_000)
+        let search = app.textFields.matching(NSPredicate(format: "placeholderValue == 'Search collections'")).firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 6), "the Collections search field is missing")
+        search.tap()
+        raiseKeyboard()
+        dragListBackUp("grid-search")
+        XCTAssertTrue(waitUntil { !self.keyboardOnScreen && !self.hasFocus },
+                      "[grid-search] dragging the grid left the keyboard up")
+        shot("\(prefix)-scroll-grid")
     }
 
     /// Keyboards that are NOT the collection's: a sheet's (New task — closed

@@ -250,6 +250,9 @@ struct ListsView: View {
             .padding(.horizontal, 18)
             .padding(.bottom, BottomNavBar.clearance)   // clear the bottom nav
         }
+        // Dragging the grid puts the search keyboard away (same rule as the
+        // detail below — the search pill scrolls off the top otherwise).
+        .scrollDismissesKeyboard(.immediately)
     }
 
     private func gridCard(_ col: ItemCollection) -> some View {
@@ -620,6 +623,18 @@ struct CollectionDetailView: View {
                 // just above the keyboard. (No keyboard: 20 pt more scroll room
                 // under the clearance that clears the nav — nothing visible moves.)
                 .safeAreaPadding(.bottom, 20)
+                // Dragging the list puts the keyboard away (Ahmad, build 103:
+                // with the add field or an edited row focused, scrolling back
+                // up left the keyboard up while the field scrolled off under
+                // it — nothing to type into and no way down short of scrolling
+                // back). A plain ScrollView never does this by default.
+                // `.immediately`, not `.interactively`: an interactive
+                // dismissal only follows a finger that reaches the keyboard,
+                // and a thumb flicking the list down to its top never does
+                // (CollectionKeyboardUITests measured both). Focusing a field
+                // again — tap it, or the bar's + — still scrolls it clear of
+                // the keyboard; an edited row keeps its draft.
+                .scrollDismissesKeyboard(.immediately)
                 // The + on this screen = "put the cursor in the ONE add field".
                 .onChange(of: model.router.collectionFabRequest) { _, req in
                     consumeFabRequest(req, proxy: proxy)
