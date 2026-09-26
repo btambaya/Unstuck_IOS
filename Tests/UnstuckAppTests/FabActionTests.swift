@@ -374,3 +374,62 @@ final class BarKeyboardTests: XCTestCase {
         XCTAssertFalse(MainTabScaffold.keyboardCovers(end: .null, screen: screen))
     }
 }
+
+// MARK: - dragging a list puts the keyboard away (Ahmad, build 103)
+
+/// With the keyboard up (the add field focused on open, or a row being
+/// edited), scrolling a collection back up left the keyboard where it was and
+/// the field scrolled off under it. SwiftUI's plain ScrollView never dismisses
+/// the keyboard by default, and `.interactively` only follows a finger that
+/// reaches the keyboard — a thumb flicking the list down to its top never does
+/// (CollectionKeyboardUITests measured both; its
+/// testScrollingTheListPutsTheKeyboardAway is the behavioural check). This
+/// guard runs in the unit suite on every merge, so the modifier can't be
+/// dropped or softened in a refactor unnoticed.
+final class ListKeyboardDismissGuardTests: XCTestCase {
+    private func code(_ rel: String, file: StaticString = #filePath, line: UInt = #line) -> String {
+        let root = URL(fileURLWithPath: #filePath)   // …/Tests/UnstuckAppTests/this.swift
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        guard let src = try? String(contentsOf: root.appendingPathComponent(rel), encoding: .utf8) else {
+            XCTFail("missing source \(rel)", file: file, line: line); return ""
+        }
+        // Code only: the comments name the other modes on purpose.
+        return src.split(separator: "\n", omittingEmptySubsequences: false).map { l -> Substring in
+            if let r = l.range(of: "//") { return l[..<r.lowerBound] }
+            return l
+        }.joined(separator: "\n")
+    }
+
+    private let immediately = ".scrollDismissesKeyboard(.immediately)"
+
+    private func slice(_ s: String, from a: String, to b: String) -> String {
+        guard let lo = s.range(of: a), let hi = s.range(of: b, range: lo.upperBound..<s.endIndex) else { return "" }
+        return String(s[lo.upperBound..<hi.lowerBound])
+    }
+
+    func testTheCollectionDetailListDismissesTheKeyboardOnADrag() {
+        let src = code("App/Features/CollectionsFeature.swift")
+        // The detail's ScrollView lives inside its ScrollViewReader, ahead of the + hand-off.
+        let detail = slice(src, from: "ScrollViewReader { proxy in", to: "consumeFabRequest(req, proxy: proxy)")
+        XCTAssertTrue(detail.contains(immediately), "the collection detail's list must put the keyboard away on a drag")
+    }
+
+    func testTheCollectionsGridDismissesTheSearchKeyboardOnADrag() {
+        let src = code("App/Features/CollectionsFeature.swift")
+        let grid = slice(src, from: "private func content(_ vm: CollectionsModel)", to: "private func gridCard(")
+        XCTAssertTrue(grid.contains(immediately), "the Collections grid must put the search keyboard away on a drag")
+    }
+
+    func testAreasAndTagsDismissTheKeyboardOnADrag() {
+        XCTAssertTrue(code("App/Features/TagsAreasFeature.swift").contains(immediately),
+                      "Areas & tags (inline add / rename rows) must put the keyboard away on a drag")
+    }
+
+    func testNoListSoftensItToInteractiveOrNever() {
+        for rel in ["App/Features/CollectionsFeature.swift", "App/Features/TagsAreasFeature.swift"] {
+            let src = code(rel)
+            XCTAssertFalse(src.contains(".scrollDismissesKeyboard(.interactively)"), "\(rel): interactive dismissal misses a flick that never reaches the keyboard")
+            XCTAssertFalse(src.contains(".scrollDismissesKeyboard(.never)"), "\(rel): the keyboard must go when the list is dragged")
+        }
+    }
+}

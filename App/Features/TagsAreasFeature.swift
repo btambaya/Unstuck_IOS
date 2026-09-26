@@ -113,6 +113,10 @@ struct TagsAreasView: View {
             .padding(.top, 8)
             .padding(.bottom, 96)
         }
+        // A list with inline add / rename rows, like a collection: dragging
+        // it puts the keyboard away so a field scrolled out of view never
+        // leaves the keyboard up over nothing (build 104).
+        .scrollDismissesKeyboard(.immediately)
         .background(theme.palette.bg.ignoresSafeArea())
     }
 }

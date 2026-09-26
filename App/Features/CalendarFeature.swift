@@ -421,12 +421,41 @@ private struct WeekView: View {
     private let wStart = 0
     private let wEnd = 24
     private let wHour: CGFloat = 44
+    /// The hour-label gutter left of the seven day columns (the weekday row
+    /// keeps the same blank so the columns line up; the NOW marker's column
+    /// maths starts after it).
+    private let wGutter: CGFloat = 26
     private let dows = ["M", "T", "W", "T", "F", "S", "S"]
 
     var body: some View {
+        // Re-read every minute: the NOW line moves, and at midnight today's
+        // coral weekday (on a Monday, "This week" itself) rolls over. The Day
+        // grid does the same on its own tick.
+        TimelineView(.everyMinute) { ctx in
+            content(now: ctx.date)
+        }
+        // Tap a task block → mark done / focus / open, reschedule / resize /
+        // unschedule. Focus and Open present once the sheet has gone.
+        .sheet(item: $editingBlock, onDismiss: flushFollowUp) { block in
+            CalBlockEditSheet(vm: vm, block: block) { pendingFollowUp = $0; editingBlock = nil }
+        }
+        // Tap a shared block → its read-only detail.
+        .sheet(item: $sharedDetail) { target in
+            SharedTaskDetailSheet(taskId: target.id)
+        }
+        // Load the shared layer for the visible week (cached per window;
+        // re-read on the shares-changed signal by ShareModel).
+        .task(id: weekOffset) {
+            let w = CalWindow.week(offset: weekOffset)
+            await model.shareState.loadSharedBlocks(from: w.from, to: w.to)
+        }
+    }
+
+    @ViewBuilder
+    private func content(now: Date) -> some View {
         let cal = Time.calendar
-        let weekdaySun1 = cal.component(.weekday, from: Date())          // 1=Sun … 7=Sat
-        let thisMonday = cal.date(byAdding: .day, value: -((weekdaySun1 + 5) % 7), to: cal.startOfDay(for: Date()))!
+        let weekdaySun1 = cal.component(.weekday, from: now)          // 1=Sun … 7=Sat
+        let thisMonday = cal.date(byAdding: .day, value: -((weekdaySun1 + 5) % 7), to: cal.startOfDay(for: now))!
         let monday = cal.date(byAdding: .day, value: weekOffset * 7, to: thisMonday)!
         let days = (0..<7).map { cal.date(byAdding: .day, value: $0, to: monday)! }
         let planned = days.map { d in vm.blocks(on: Clock.dateISO(d)).filter { isTaskBlock($0) }.reduce(0) { $0 + $1.durationMinutes } }
@@ -435,7 +464,7 @@ private struct WeekView: View {
         let flat = maxP == minP
         let busiest = flat ? "—" : dayLabels[planned.firstIndex(of: maxP) ?? 0]
         let lightest = flat ? "—" : dayLabels[planned.firstIndex(of: minP) ?? 0]
-        let todayISO = Clock.todayISO()
+        let todayISO = Clock.dateISO(now)
 
         // The week title + paging, the rollup and the weekday row stay PINNED
         // above the grid (like Month and the Day view's date header) — only the
@@ -485,7 +514,7 @@ private struct WeekView: View {
 
                 // Weekday header (gutter + 7 day labels)
                 HStack(spacing: 0) {
-                    Color.clear.frame(width: 26, height: 1)
+                    Color.clear.frame(width: wGutter, height: 1)
                     ForEach(Array(days.enumerated()), id: \.offset) { i, d in
                         let isToday = Clock.dateISO(d) == todayISO
                         VStack(spacing: 1) {
@@ -500,48 +529,91 @@ private struct WeekView: View {
             .padding(.horizontal, 18)
 
             // Hour grid — the only part that scrolls.
-            ScrollView {
-                VStack(alignment: .leading, spacing: 0) {
-                // Hour grid: time gutter + 7 day columns with positioned blocks.
-                HStack(alignment: .top, spacing: 0) {
-                    VStack(spacing: 0) {
-                        // Hour gutter in the phone's clock — "14:00" / "2 PM",
-                        // the same labels as the Day grid (a bare "14" read
-                        // 24-hour on a 12-hour phone; 2026-09-24).
-                        ForEach(wStart..<wEnd, id: \.self) { h in
-                            Text(ClockFormat.device.hourLabel(h)).font(UFont.mono(8))
-                                .lineLimit(1).minimumScaleFactor(0.7)
-                                .foregroundStyle(theme.palette.ink4)
-                                .frame(width: 26, height: wHour, alignment: .topLeading)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                    // Hour grid: time gutter + 7 day columns with positioned blocks.
+                    HStack(alignment: .top, spacing: 0) {
+                        VStack(spacing: 0) {
+                            // Hour gutter in the phone's clock — "14:00" / "2 PM",
+                            // the same labels as the Day grid (a bare "14" read
+                            // 24-hour on a 12-hour phone; 2026-09-24).
+                            ForEach(wStart..<wEnd, id: \.self) { h in
+                                Text(ClockFormat.device.hourLabel(h)).font(UFont.mono(8))
+                                    .lineLimit(1).minimumScaleFactor(0.7)
+                                    .foregroundStyle(theme.palette.ink4)
+                                    .frame(width: wGutter, height: wHour, alignment: .topLeading)
+                                    .id("week-hour-\(h)")
+                            }
+                        }
+                        ForEach(Array(days.enumerated()), id: \.offset) { _, d in
+                            dayColumn(Clock.dateISO(d))
                         }
                     }
-                    ForEach(Array(days.enumerated()), id: \.offset) { _, d in
-                        dayColumn(Clock.dateISO(d))
+                    .frame(height: wHour * CGFloat(wEnd - wStart))
+                    // NOW — over the blocks, as on the Day grid; never takes a tap.
+                    .overlay(alignment: .topLeading) {
+                        GeometryReader { geo in
+                            weekNowMarker(now: now, days: days, width: geo.size.width)
+                        }
+                        .allowsHitTesting(false)
                     }
-                }
-                .frame(height: wHour * CGFloat(wEnd - wStart))
-                .padding(.top, 6)
+                    .padding(.top, 6)
 
-                Color.clear.frame(height: 16)
+                    Color.clear.frame(height: 16)
+                    }
+                    .padding(.horizontal, 18)
+                    .padding(.bottom, BottomNavBar.clearance)
                 }
-                .padding(.horizontal, 18)
-                .padding(.bottom, BottomNavBar.clearance)
+                // Open on the hour before now, like the Day grid (and the web's
+                // week) — the grid starts at midnight, so the NOW line would
+                // otherwise sit below the fold for most of the day.
+                .onAppear { scrollToNow(proxy, now: now, days: days) }
             }
         }
-        // Tap a task block → mark done / focus / open, reschedule / resize /
-        // unschedule. Focus and Open present once the sheet has gone.
-        .sheet(item: $editingBlock, onDismiss: flushFollowUp) { block in
-            CalBlockEditSheet(vm: vm, block: block) { pendingFollowUp = $0; editingBlock = nil }
+    }
+
+    /// NOW on the week: the Day grid's coral rule (NowRule) across TODAY's
+    /// column only, a coral dot on that column's leading edge, and the Day
+    /// grid's "NOW" tag in the hour gutter at the same minute. Nothing when
+    /// today isn't in the visible week. The minute and the column come from
+    /// CalendarNowLine (UnstuckCore, unit-tested across time zones and DST) —
+    /// the same maths as the Day grid's line.
+    @ViewBuilder
+    private func weekNowMarker(now: Date, days: [Date], width: CGFloat) -> some View {
+        let cal = Time.calendar
+        if let col = CalendarNowLine.todayColumn(days: days, now: now, calendar: cal),
+           let minutes = CalendarNowLine.minutesIntoGrid(now: now, firstHour: wStart, lastHour: wEnd, calendar: cal) {
+            let y = CGFloat(CalendarNowLine.y(minutes: minutes, pointsPerHour: Double(wHour)))
+            let colW = CGFloat(CalendarNowLine.columnWidth(totalWidth: Double(width), gutter: Double(wGutter), columns: days.count))
+            let x = CGFloat(CalendarNowLine.columnLeading(index: col, totalWidth: Double(width), gutter: Double(wGutter), columns: days.count))
+            let dot: CGFloat = 7
+            ZStack(alignment: .topLeading) {
+                // The tag sits in the gutter, left-aligned like the hour labels.
+                NowTag(horizontalPadding: 4)
+                    .padding(.top, max(0, y - 8))
+                    .accessibilityHidden(true)
+                NowRule()
+                    .frame(width: colW)
+                    .accessibilityElement()
+                    .accessibilityLabel("Now, \(ClockFormat.device.time(now))")
+                    .accessibilityIdentifier("week-now-line")
+                    .padding(.leading, x).padding(.top, y)
+                Circle().fill(theme.palette.coral)
+                    .frame(width: dot, height: dot)
+                    .offset(x: x - dot / 2, y: y + NowRule.weight / 2 - dot / 2)
+                    .accessibilityHidden(true)
+            }
+            .frame(width: width, alignment: .topLeading)
         }
-        // Tap a shared block → its read-only detail.
-        .sheet(item: $sharedDetail) { target in
-            SharedTaskDetailSheet(taskId: target.id)
-        }
-        // Load the shared layer for the visible week (cached per window;
-        // re-read on the shares-changed signal by ShareModel).
-        .task(id: weekOffset) {
-            let w = CalWindow.week(offset: weekOffset)
-            await model.shareState.loadSharedBlocks(from: w.from, to: w.to)
+    }
+
+    private func scrollToNow(_ proxy: ScrollViewProxy, now: Date, days: [Date]) {
+        let cal = Time.calendar
+        guard CalendarNowLine.todayColumn(days: days, now: now, calendar: cal) != nil else { return }
+        let h = min(wEnd - 1, max(wStart, cal.component(.hour, from: now) - 1))
+        DispatchQueue.main.async {
+            withAnimation(.none) { proxy.scrollTo("week-hour-\(h)", anchor: .top) }
         }
     }
 
@@ -895,6 +967,31 @@ func layoutLanes(_ blocks: [CalBlock]) -> [LaidBlock] {
     }
 }
 
+// MARK: - NOW marker (Day + Week)
+
+/// The current-time rule: a 1.5 pt coral line. The Day grid draws it across
+/// the whole day; the Week grid across TODAY's column only (Ahmad, build 103:
+/// the week had no line). Coral is the NOW marker's colour on every grid.
+private struct NowRule: View {
+    @Environment(\.uTheme) private var theme
+    static let weight: CGFloat = 1.5
+    var body: some View {
+        Rectangle().fill(theme.palette.coral).frame(height: Self.weight)
+    }
+}
+
+/// The white-on-coral "NOW" tag at the line's leading end. The Week grid
+/// passes a tighter side padding so it fits its 26 pt hour gutter.
+private struct NowTag: View {
+    @Environment(\.uTheme) private var theme
+    var horizontalPadding: CGFloat = 6
+    var body: some View {
+        Text("NOW").font(UFont.mono(8, .bold)).foregroundStyle(.white)
+            .padding(.horizontal, horizontalPadding).padding(.vertical, 1)
+            .background(theme.palette.coral, in: Capsule())
+    }
+}
+
 // MARK: - Day grid (draggable hour grid + NOW line + unscheduled tray)
 
 /// Day view with a draggable unscheduled-task tray + a time grid + a NOW line.
@@ -1091,21 +1188,18 @@ struct DayGridView: View {
                         .onTapGesture { sharedDetail = SharedDetailTarget(id: sb.taskId, block: sb) }
                 }
             }
-            // NOW line on today's grid.
-            if iso == Clock.todayISO() {
-                let cal = Time.calendar
-                let nm = cal.component(.hour, from: now) * 60 + cal.component(.minute, from: now) - firstHour * 60
-                if nm >= 0 && nm <= (lastHour - firstHour) * 60 {
-                    let y = CGFloat(nm) / 60 * pxPerHour
-                    Rectangle().fill(theme.palette.coral).frame(height: 1.5)
-                        .padding(.leading, 64).padding(.trailing, 12)
-                        .offset(y: y)
-                    Text("NOW").font(UFont.mono(8, .bold)).foregroundStyle(.white)
-                        .padding(.horizontal, 6).padding(.vertical, 1)
-                        .background(theme.palette.coral, in: Capsule())
-                        .padding(.leading, 8)
-                        .offset(y: max(0, y - 8))
-                }
+            // NOW line on today's grid (the Week grid draws the same marker
+            // on today's column — NowRule / NowTag / CalendarNowLine).
+            if iso == Clock.todayISO(),
+               let nm = CalendarNowLine.minutesIntoGrid(now: now, firstHour: firstHour, lastHour: lastHour,
+                                                        calendar: Time.calendar) {
+                let y = CGFloat(CalendarNowLine.y(minutes: nm, pointsPerHour: Double(pxPerHour)))
+                NowRule()
+                    .padding(.leading, 64).padding(.trailing, 12)
+                    .offset(y: y)
+                NowTag()
+                    .padding(.leading, 8)
+                    .offset(y: max(0, y - 8))
             }
         }
         .frame(width: width, height: gridHeight, alignment: .topLeading)

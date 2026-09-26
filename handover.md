@@ -43,6 +43,30 @@ phases land. Newest status at the top.
 
 
 
+## Lists: a drag puts the keyboard away · Week: the NOW line (branch kbdnow/ios, 2026-09-26) — build 104
+
+Ahmad (build 103, iPhone), two reports.
+- **Keyboard stayed up while scrolling a list.** With the add field focused (it autofocuses on open) or a row
+  being edited, scrolling the collection back up left the keyboard where it was; the field scrolled off under
+  it and there was nothing to type into. Cause: `CollectionDetailView`'s ScrollView had no
+  `scrollDismissesKeyboard` (a plain ScrollView never dismisses the keyboard). Reproduced first with a new UI test
+  (a drag in the list that ends above the keyboard): focus kept, keyboard up. `.interactively` was measured and
+  failed the same way, because it only follows a finger that reaches the keyboard. So it is `.immediately` on the
+  detail list, the Collections grid (the search pill scrolls off too) and Areas & tags (inline add/rename rows).
+  Re-focusing still scrolls the field clear of the keyboard (the build-99 fix). An edited row keeps its draft
+  and stays open.
+- **Week had no current-time line.** The Day grid drew one inline, and `WeekView` had nothing. The rule and tag
+  are now shared views (`NowRule`, `NowTag`), and the minute/column maths is `CalendarNowLine` (UnstuckCore). The
+  Day grid is pixel-identical. The week draws the rule across TODAY's column only, with a coral dot on that column's
+  leading edge and the "NOW" tag in the hour gutter. It shows only when today is in the visible week and sits over
+  the blocks without taking taps. The week body runs in `TimelineView(.everyMinute)`, so the line moves each minute
+  and today's coral weekday and "This week" roll over at midnight. The week also opens on the hour before now,
+  like the Day grid and the web week.
+- Tests: `CalendarNowLineTests` (package; half-hour, +14, −11 and DST zones, the midnight roll-out, column geometry),
+  `ListKeyboardDismissGuardTests` (unit, source guard), UI `testScrollingTheListPutsTheKeyboardAway` and
+  `testWeekShowsTheNowLineOnTodaysColumn`. The old "scroll with the keyboard up" steps in
+  `testEditAndAddAtTheBottomStayAboveTheKeyboard` were removed (that contract changed).
+
 ## The bell shows every server card, not only calls (branch bellcards/ios, 2026-09-24) — not shipped yet
 
 A push swiped out of the tray left no record on the phone: the web bell reads every `notification_queue` card, but
